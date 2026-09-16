@@ -8,6 +8,13 @@ use crate::compositor::subsurface::{
 
 const WL_POINTER_WARP_SINCE: u32 = 11;
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::compositor) enum PointerConstraintDeactivationReason {
+    WorkspaceDeparture,
+    WindowMovedOffScene,
+    WindowMinimized,
+}
+
 impl CompositorState {
     #[cfg(test)]
     pub(in crate::compositor) fn activate_pointer_constraint_for_focused_surface(
@@ -1854,6 +1861,42 @@ impl CompositorState {
             .collect::<Vec<_>>();
         for id in ids {
             self.deactivate_pointer_constraint_by_id(id, true, emit_event, true);
+        }
+    }
+
+    pub(in crate::compositor) fn deactivate_pointer_constraints_for_departing_window_ids(
+        &mut self,
+        window_ids: &[WindowId],
+        reason: PointerConstraintDeactivationReason,
+    ) {
+        let departing_root_surface_ids = window_ids
+            .iter()
+            .filter_map(|window_id| {
+                let owner_id = self.workspace_owner_window_id(*window_id)?;
+                self.window(owner_id).map(|window| window.root_surface_id)
+            })
+            .collect::<HashSet<_>>();
+        if departing_root_surface_ids.is_empty() {
+            return;
+        }
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| {
+                departing_root_surface_ids.contains(&self.presentation_owner_root_for_surface(
+                    compositor_surface_id(&constraint.surface),
+                ))
+            })
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        pointer_debug_log(format!(
+            "pointer constraints deactivating for departing windows reason={reason:?} roots={departing_root_surface_ids:?} ids={ids:?}"
+        ));
+        for id in ids {
+            self.deactivate_pointer_constraint_by_id(id, true, true, true);
         }
     }
 

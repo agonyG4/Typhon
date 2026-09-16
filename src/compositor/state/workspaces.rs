@@ -3,6 +3,7 @@ use crate::wm::{
     WorkspaceLocation, WorkspaceSwitchOutcome,
 };
 
+use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,10 @@ impl CompositorState {
             self.departing_window_ids_for_scene_selection(previous_selection, new_selection);
         self.cancel_workspace_transition_state_for_window_ids(&departing_window_ids);
         let scene_update = self.rebuild_active_scene_view();
+        self.deactivate_pointer_constraints_for_departing_window_ids(
+            &departing_window_ids,
+            PointerConstraintDeactivationReason::WorkspaceDeparture,
+        );
         self.reconcile_idle_inhibition();
         self.mark_astrea_toplevel_structure_dirty();
         self.recompute_layer_keyboard_focus();
@@ -273,6 +278,10 @@ impl CompositorState {
         }
         self.cancel_workspace_transition_state_for_window_ids(&affected_windows);
         self.rebuild_active_scene_view();
+        self.deactivate_pointer_constraints_for_departing_window_ids(
+            &affected_windows,
+            PointerConstraintDeactivationReason::WorkspaceDeparture,
+        );
         self.reconcile_idle_inhibition();
         self.mark_astrea_toplevel_structure_dirty();
         self.queue_workspace_publication_commands();
@@ -484,6 +493,9 @@ impl CompositorState {
             };
             Some(prepared)
         };
+        if transition.active_scene_changed {
+            self.workspace_scene_transition_active = true;
+        }
         if layout_batch {
             self.begin_layout_reflow_batch();
         }
@@ -537,7 +549,6 @@ impl CompositorState {
             let _ = self.apply_prepared_tiled_migration(prepared);
         }
         if transition.active_scene_changed {
-            self.workspace_scene_transition_active = true;
             self.cancel_workspace_transition_state_for_window_ids(&departing_window_ids);
         }
         if !transition.active_scene_changed {
@@ -548,6 +559,10 @@ impl CompositorState {
             return true;
         }
         self.rebuild_active_scene_view();
+        self.deactivate_pointer_constraints_for_departing_window_ids(
+            &departing_window_ids,
+            PointerConstraintDeactivationReason::WindowMovedOffScene,
+        );
         self.reconcile_idle_inhibition();
         self.mark_astrea_toplevel_structure_dirty();
         if self

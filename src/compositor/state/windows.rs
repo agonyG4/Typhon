@@ -1,4 +1,5 @@
 use super::hit_testing::PointerSceneHit;
+use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
 use crate::animation_control::AnimationEffect;
 use crate::window_lifecycle_animation::{
@@ -1327,6 +1328,10 @@ impl CompositorState {
             lifecycle_decorations,
         );
         self.refresh_active_scene_surface_order();
+        self.deactivate_pointer_constraints_for_departing_window_ids(
+            &[window_id],
+            PointerConstraintDeactivationReason::WindowMinimized,
+        );
         self.mark_astrea_toplevel_dirty(window_id);
         if self.focused_root_surface_id() == Some(root_surface_id) {
             self.focused_surface = None;
