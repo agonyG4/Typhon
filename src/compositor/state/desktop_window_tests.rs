@@ -282,6 +282,8 @@ fn xwayland_shm_root_with_xrgb_child_uses_child_as_scanout_source() {
         SurfacePlacement::subsurface(330, 0, 0),
         DrmFormat::Xrgb8888,
     );
+    let root_buffer_id = root.buffer_identity().id();
+    let child_buffer_id = child.buffer_identity().id();
     install_x11_visual_tree(
         &mut state,
         root,
@@ -298,6 +300,10 @@ fn xwayland_shm_root_with_xrgb_child_uses_child_as_scanout_source() {
             .map(|candidate| (candidate.root_surface_id, candidate.surface_id)),
         Some((330, 331))
     );
+    let candidate = analysis.candidate.expect("child source candidate");
+    assert_eq!(candidate.buffer_identity.id(), child_buffer_id);
+    assert_ne!(candidate.buffer_identity.id(), root_buffer_id);
+    assert_eq!(candidate.buffer.format(), DrmFormat::Xrgb8888);
 }
 
 #[test]
