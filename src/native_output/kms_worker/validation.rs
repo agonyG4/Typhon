@@ -64,6 +64,7 @@ impl KmsCommitWorkerHandle {
             .attachable_primary(output_generation, crtc_id, target)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_established_presented_base(
         &self,
         revision: crate::native_output::presentation::plane::PlaneStateRevision,
@@ -97,6 +98,7 @@ impl KmsCommitWorkerHandle {
         invalidate_queued_dependents(&self.shared, predecessor, reason);
     }
 
+    #[cfg(test)]
     pub(crate) fn ack_pageflip(
         &self,
         token: PageFlipToken,

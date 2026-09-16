@@ -1,10 +1,16 @@
 use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsValidationBase,
-    KmsWorkerEvent, PendingBundleSnapshot,
+    CursorSidecar, CursorSidecarCoupling, EstablishedKmsBase, KmsCommitBundleIdentity,
+    KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent,
+    PendingBundleSnapshot,
 };
+use crate::native_output::presentation::plane::{
+    CursorRevision, CursorSidecarId, PresentedCursorDelivery,
+};
+use crate::native_output::{CursorPlaneAssignment, OutputReleasePlan, OutputTransaction};
 use oblivion_one::core::OutputId;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 struct AcceptingExecutor;
@@ -15,6 +21,59 @@ impl KmsCommitExecutor for AcceptingExecutor {
     }
 }
 
+fn offer_sidecar(handle: &KmsCommitWorkerHandle, mut sidecar: CursorSidecar) {
+    for _ in 0..1_000 {
+        match handle.offer_cursor_sidecar(sidecar) {
+            Ok(_) => return,
+            Err(error) if error.reason == super::KmsWorkerAdmissionError::AdmissionContention => {
+                sidecar = *error.sidecar;
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("sidecar offer failed: {:?}", error.reason),
+        }
+    }
+    panic!("sidecar offer remained contended");
+}
+
+fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
+    let transaction_id = crate::native_output::OutputTransactionId::new(
+        NonZeroU64::new(job.transaction_id.get().saturating_mul(100)).unwrap(),
+    );
+    let transaction = Arc::new(
+        OutputTransaction::cursor_plane_delta(
+            job.output_id,
+            transaction_id,
+            job.output_generation,
+            job.target.presentation_time,
+            job.target,
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            transaction_id.get(),
+            None,
+            OutputReleasePlan::Pageflip,
+        )
+        .unwrap(),
+    );
+    CursorSidecar {
+        id: CursorSidecarId::new(NonZeroU64::new(job.transaction_id.get()).unwrap()),
+        transaction,
+        revision: CursorRevision::initial(),
+        assignment: CursorPlaneAssignment::Atomic {
+            desired_epoch: job.transaction_id.get(),
+            state: None,
+        },
+        lease: None,
+        coupling: CursorSidecarCoupling::Independent,
+        created_at: job.target.presentation_time,
+        deadline: job.target,
+        crtc_id: job.crtc_id,
+        test_policy: KmsTestOnlyPolicy::Skip,
+        cursor_delivery: PresentedCursorDelivery::Hidden,
+        capability_key: None,
+        trace_reveal: None,
+        validation_base: job.validation_base,
+    }
+}
+
 #[test]
 fn wrong_output_pageflip_ack_preserves_inflight_and_queued_dependents() {
     let handle = KmsCommitWorkerHandle::start(Arc::new(AcceptingExecutor)).unwrap();
@@ -22,16 +81,25 @@ fn wrong_output_pageflip_ack_preserves_inflight_and_queued_dependents() {
     let first_identity = first.identity();
     let first_transaction_id = first.transaction_id;
 
-    reserve_for_test(&handle, first.kind).enqueue(first).unwrap();
-    wait_for_fence_event(&handle, 20_001, |event| {
-        matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.identity() == first_identity)
-    });
+    reserve_for_test(&handle, first.kind)
+        .enqueue(first)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        20_001,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.identity() == first_identity),
+    );
 
     let mut dependent = test_job(20_002);
     dependent.validation_base = KmsValidationBase::Predecessor(first_identity);
     reserve_for_test(&handle, dependent.kind)
         .enqueue(dependent)
         .unwrap();
+    let sidecar = test_sidecar(&test_job(20_003));
+    let sidecar_id = sidecar.id;
+    offer_sidecar(&handle, sidecar);
+    let expected_base = Some(EstablishedKmsBase::Pending(first_identity));
+    assert_eq!(handle.established_base_for_test(), expected_base);
 
     let wrong_identity = KmsCommitBundleIdentity {
         output_id: OutputId::from_raw(2).expect("test output identity is nonzero"),
@@ -52,6 +120,8 @@ fn wrong_output_pageflip_ack_preserves_inflight_and_queued_dependents() {
         Some(PendingBundleSnapshot::InFlight(first_identity))
     );
     assert_eq!(handle.queue_depth(), 1);
+    assert_eq!(handle.established_base_for_test(), expected_base);
+    assert_eq!(handle.pending_cursor_sidecar_id(), Some(sidecar_id));
 
     handle
         .ack_pageflip_identity(first_identity, first_transaction_id)

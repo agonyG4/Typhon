@@ -551,6 +551,15 @@ impl KmsCommitWorkerHandle {
             .is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn established_base_for_test(&self) -> Option<EstablishedKmsBase> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .established_base
+    }
+
     pub(crate) fn submission_active(&self) -> bool {
         let state = self
             .shared

@@ -588,6 +588,7 @@ impl WorkerShared {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_established_presented_base(
         &self,
         revision: crate::native_output::presentation::plane::PlaneStateRevision,
