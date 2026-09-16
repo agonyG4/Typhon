@@ -440,6 +440,42 @@ fn native_damage_accumulator_maps_render_scene_element_damage_to_output() {
 }
 
 #[test]
+fn native_damage_accumulator_projects_rotated_buffer_damage_like_rendering() {
+    let mut surface = test_renderable_surface(
+        4,
+        0,
+        0,
+        2,
+        3,
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]),
+    );
+    surface.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        test_buffer_identity(),
+        BufferSize::new(3, 2).unwrap(),
+        vec![0; 6],
+    );
+    surface.buffer_transform = wayland_server::protocol::wl_output::Transform::_90;
+    let elements = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0);
+
+    let damage = NativeDamageAccumulator::from_render_elements(200, 120, &elements);
+
+    assert_eq!(
+        damage.rects(),
+        &[NativeDamageRect {
+            x: 73,
+            y: 72,
+            width: 1,
+            height: 1,
+        }]
+    );
+}
+
+#[test]
 fn native_damage_accumulator_clips_partial_surface_damage_to_output() {
     let surface = test_renderable_surface(
         3,

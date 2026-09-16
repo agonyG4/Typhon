@@ -223,15 +223,6 @@ impl ViewportSourceRect {
             height,
         })
     }
-
-    pub(in crate::compositor) fn logical_size(self) -> Option<BufferSize> {
-        let width = self.width.ceil();
-        let height = self.height.ceil();
-        if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
-            return None;
-        }
-        BufferSize::new(width as u32, height as u32)
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -256,6 +247,7 @@ pub(in crate::compositor) struct SurfaceContentMapping {
     pub(in crate::compositor) viewport_destination: Option<BufferSize>,
 }
 
+use super::geometry::{SurfaceBufferMapping, SurfaceGeometryRect};
 use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
     SurfacePlacement, SurfaceRenderBackend,
@@ -267,7 +259,6 @@ use super::{
     shm::{ShmBufferData, invalid_shm_buffer},
 };
 use crate::compositor::{WindowConstraints, WindowId};
-use crate::cursor_geometry::logical_size;
 
 pub(super) type ToplevelSizeConstraints = WindowConstraints;
 
@@ -525,6 +516,7 @@ impl SurfaceData {
         buffer_size: Option<BufferSize>,
         buffer_scale: u32,
         viewport: SurfaceViewportCommit,
+        buffer_transform: wl_output::Transform,
     ) -> PendingSurfaceDamage {
         let surface_rects = self
             .pending_surface_damage
@@ -542,6 +534,7 @@ impl SurfaceData {
             buffer_size,
             buffer_scale,
             viewport,
+            buffer_transform,
         );
         PendingSurfaceDamage { damage }
     }
@@ -872,11 +865,23 @@ fn convert_pending_damage(
     buffer_size: Option<BufferSize>,
     buffer_scale: u32,
     viewport: SurfaceViewportCommit,
+    buffer_transform: wl_output::Transform,
 ) -> RenderableSurfaceDamage {
     if surface_rects.is_empty() && buffer_rects.is_empty() {
         return RenderableSurfaceDamage::Empty;
     }
     let Some(buffer_size) = buffer_size else {
+        return RenderableSurfaceDamage::Full;
+    };
+    let Some(mapping) = SurfaceBufferMapping::new(
+        buffer_size,
+        buffer_scale,
+        buffer_transform,
+        viewport.source.map(|source| {
+            SurfaceGeometryRect::new(source.x, source.y, source.width, source.height)
+        }),
+        viewport.destination,
+    ) else {
         return RenderableSurfaceDamage::Full;
     };
     let mut converted = Vec::with_capacity(surface_rects.len() + buffer_rects.len());
@@ -887,12 +892,14 @@ fn convert_pending_damage(
         converted.push(rect);
     }
     for PendingSurfaceDamageRect(rect) in surface_rects {
-        let mapped = match viewport.destination {
-            Some(destination) => {
-                map_viewport_damage(rect, destination, buffer_size, viewport.source)
-            }
-            None => map_scaled_surface_damage(rect, buffer_scale.max(1), buffer_size),
+        let Some(rect) = clip_pending_rect(
+            rect,
+            mapping.surface_extent().width,
+            mapping.surface_extent().height,
+        ) else {
+            continue;
         };
+        let mapped = mapping.map_surface_rect_to_buffer(rect);
         let Some(rect) = mapped else {
             return RenderableSurfaceDamage::Full;
         };
@@ -902,74 +909,6 @@ fn convert_pending_damage(
     }
     RenderableSurfaceDamage::from_rects(converted)
         .normalized_for_surface(buffer_size.width, buffer_size.height)
-}
-
-fn map_scaled_surface_damage(
-    rect: PendingDamageRect,
-    scale: u32,
-    buffer_size: BufferSize,
-) -> Option<Option<SurfaceDamageRect>> {
-    let scale = i64::from(scale);
-    let left = i64::from(rect.x).checked_mul(scale)?;
-    let top = i64::from(rect.y).checked_mul(scale)?;
-    let right = i64::from(rect.x)
-        .checked_add(i64::from(rect.width))?
-        .checked_mul(scale)?;
-    let bottom = i64::from(rect.y)
-        .checked_add(i64::from(rect.height))?
-        .checked_mul(scale)?;
-    Some(clip_i64_rect(
-        left,
-        top,
-        right,
-        bottom,
-        buffer_size.width,
-        buffer_size.height,
-    ))
-}
-
-fn map_viewport_damage(
-    rect: PendingDamageRect,
-    destination: BufferSize,
-    buffer_size: BufferSize,
-    source: Option<ViewportSourceRect>,
-) -> Option<Option<SurfaceDamageRect>> {
-    if destination.width == 0 || destination.height == 0 {
-        return None;
-    }
-    let left = i64::from(rect.x).clamp(0, i64::from(destination.width));
-    let top = i64::from(rect.y).clamp(0, i64::from(destination.height));
-    let right = i64::from(rect.x)
-        .checked_add(i64::from(rect.width))?
-        .clamp(0, i64::from(destination.width));
-    let bottom = i64::from(rect.y)
-        .checked_add(i64::from(rect.height))?
-        .clamp(0, i64::from(destination.height));
-    if right <= left || bottom <= top {
-        return Some(None);
-    }
-    let (source_x, source_y, source_width, source_height) = source
-        .map(|source| (source.x, source.y, source.width, source.height))
-        .unwrap_or((
-            0.0,
-            0.0,
-            f64::from(buffer_size.width),
-            f64::from(buffer_size.height),
-        ));
-    let scale_x = source_width / f64::from(destination.width);
-    let scale_y = source_height / f64::from(destination.height);
-    let mapped_left = (source_x + left as f64 * scale_x).floor() as i64;
-    let mapped_top = (source_y + top as f64 * scale_y).floor() as i64;
-    let mapped_right = (source_x + right as f64 * scale_x).ceil() as i64;
-    let mapped_bottom = (source_y + bottom as f64 * scale_y).ceil() as i64;
-    Some(clip_i64_rect(
-        mapped_left,
-        mapped_top,
-        mapped_right,
-        mapped_bottom,
-        buffer_size.width,
-        buffer_size.height,
-    ))
 }
 
 fn clip_pending_rect(
@@ -1073,6 +1012,7 @@ mod damage_space_tests {
             Some(size(20, 20)),
             1,
             SurfaceViewportCommit::default(),
+            wl_output::Transform::Normal,
         );
         let buffer = convert_pending_damage(
             Vec::new(),
@@ -1082,6 +1022,7 @@ mod damage_space_tests {
             Some(size(20, 20)),
             1,
             SurfaceViewportCommit::default(),
+            wl_output::Transform::Normal,
         );
 
         assert_eq!(surface, buffer);
@@ -1097,6 +1038,7 @@ mod damage_space_tests {
             Some(size(40, 40)),
             2,
             SurfaceViewportCommit::default(),
+            wl_output::Transform::Normal,
         );
 
         assert_eq!(
@@ -1123,6 +1065,7 @@ mod damage_space_tests {
                 source: None,
                 destination: Some(size(100, 50)),
             },
+            wl_output::Transform::Normal,
         );
 
         assert_eq!(
@@ -1149,6 +1092,7 @@ mod damage_space_tests {
                 source: ViewportSourceRect::new(20.0, 10.0, 100.0, 50.0),
                 destination: Some(size(400, 200)),
             },
+            wl_output::Transform::Normal,
         );
 
         assert_eq!(
@@ -1159,6 +1103,143 @@ mod damage_space_tests {
                 width: 50,
                 height: 25,
             }])
+        );
+    }
+
+    #[test]
+    fn surface_damage_with_source_only_maps_inside_source_region() {
+        let damage = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(0, 0, 100, 50).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(200, 100)),
+            1,
+            SurfaceViewportCommit {
+                source: ViewportSourceRect::new(20.0, 10.0, 100.0, 50.0),
+                destination: None,
+            },
+            wl_output::Transform::Normal,
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 20,
+                y: 10,
+                width: 100,
+                height: 50,
+            }])
+        );
+    }
+
+    #[test]
+    fn surface_damage_uses_transform_for_the_inverse_mapping() {
+        let damage = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(0, 0, 1, 1).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(3, 2)),
+            1,
+            SurfaceViewportCommit::default(),
+            wl_output::Transform::_90,
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            }])
+        );
+    }
+
+    #[test]
+    fn buffer_damage_stays_raw_when_buffer_transform_changes() {
+        let damage = convert_pending_damage(
+            Vec::new(),
+            vec![PendingBufferDamageRect(
+                PendingDamageRect::new(0, 0, 1, 1).unwrap(),
+            )],
+            Some(size(3, 2)),
+            1,
+            SurfaceViewportCommit::default(),
+            wl_output::Transform::_90,
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }])
+        );
+    }
+
+    #[test]
+    fn scaled_source_damage_uses_post_scale_viewport_coordinates() {
+        let damage = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(0, 0, 50, 25).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(200, 100)),
+            2,
+            SurfaceViewportCommit {
+                source: ViewportSourceRect::new(10.0, 5.0, 50.0, 25.0),
+                destination: None,
+            },
+            wl_output::Transform::Normal,
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 20,
+                y: 10,
+                width: 100,
+                height: 50,
+            }])
+        );
+    }
+
+    #[test]
+    fn viewport_source_validation_uses_transformed_scaled_extent() {
+        assert_eq!(
+            surface_size_for_state_with_buffer_size(
+                size(2, 4),
+                SurfaceViewportCommit {
+                    source: ViewportSourceRect::new(2.0, 0.0, 2.0, 2.0),
+                    destination: None,
+                },
+                1,
+                wl_output::Transform::_90,
+            )
+            .unwrap(),
+            size(2, 2)
+        );
+        assert!(
+            validate_viewport_source(
+                size(4, 2),
+                2,
+                wl_output::Transform::Normal,
+                ViewportSourceRect::new(0.0, 0.0, 2.0, 1.0),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_viewport_source(
+                size(2, 4),
+                1,
+                wl_output::Transform::_90,
+                ViewportSourceRect::new(2.01, 0.0, 2.0, 2.0),
+            )
+            .is_err()
         );
     }
 
@@ -1175,6 +1256,7 @@ mod damage_space_tests {
             Some(size(10, 10)),
             1,
             SurfaceViewportCommit::default(),
+            wl_output::Transform::Normal,
         );
 
         assert_eq!(damage.clipped_rects(10, 10).len(), 4);
@@ -1188,7 +1270,8 @@ mod damage_space_tests {
                 Vec::new(),
                 None,
                 1,
-                SurfaceViewportCommit::default()
+                SurfaceViewportCommit::default(),
+                wl_output::Transform::Normal
             ),
             RenderableSurfaceDamage::Empty
         );
@@ -1201,6 +1284,7 @@ mod damage_space_tests {
                 None,
                 1,
                 SurfaceViewportCommit::default(),
+                wl_output::Transform::Normal,
             ),
             RenderableSurfaceDamage::Full
         );
@@ -1583,7 +1667,7 @@ impl CurrentSurfaceBuffer {
     ) -> io::Result<SurfaceContentMapping> {
         let buffer_size =
             BufferSize::new(self.width()?, self.height()?).ok_or_else(invalid_shm_buffer)?;
-        validate_viewport_source(buffer_size, viewport.source)?;
+        validate_viewport_source(buffer_size, buffer_scale, buffer_transform, viewport.source)?;
         let surface_size = surface_size_for_state_with_buffer_size(
             buffer_size,
             viewport,
@@ -1672,12 +1756,12 @@ impl PendingSurfaceBuffer {
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
     ) -> io::Result<()> {
+        let surface_size = self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?;
         self.viewport_source = viewport.source;
         self.viewport_destination = viewport.destination;
         self.buffer_scale = buffer_scale;
         self.buffer_transform = buffer_transform;
-        self.surface_size =
-            Some(self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?);
+        self.surface_size = Some(surface_size);
         Ok(())
     }
 
@@ -1687,7 +1771,7 @@ impl PendingSurfaceBuffer {
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
     ) -> io::Result<BufferSize> {
-        self.validate_viewport_source(viewport.source)?;
+        self.validate_viewport_source(viewport.source, buffer_scale, buffer_transform)?;
         surface_size_for_state_with_buffer_size(
             BufferSize::new(self.data.width()?, self.data.height()?)
                 .ok_or_else(invalid_shm_buffer)?,
@@ -1697,13 +1781,20 @@ impl PendingSurfaceBuffer {
         )
     }
 
-    fn validate_viewport_source(&self, source: Option<ViewportSourceRect>) -> io::Result<()> {
+    fn validate_viewport_source(
+        &self,
+        source: Option<ViewportSourceRect>,
+        buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
+    ) -> io::Result<()> {
         let Some(source) = source else {
             return Ok(());
         };
         validate_viewport_source(
             BufferSize::new(self.data.width()?, self.data.height()?)
                 .ok_or_else(invalid_shm_buffer)?,
+            buffer_scale,
+            buffer_transform,
             Some(source),
         )
     }
@@ -1831,37 +1922,36 @@ fn surface_size_for_state_with_buffer_size(
     buffer_scale: u32,
     buffer_transform: wl_output::Transform,
 ) -> io::Result<BufferSize> {
-    if let Some(destination) = viewport.destination {
-        return Ok(destination);
-    }
-    if let Some(source) = viewport.source.and_then(ViewportSourceRect::logical_size) {
-        return Ok(source);
-    }
-    let size = logical_size(
-        buffer_size.width,
-        buffer_size.height,
+    SurfaceBufferMapping::new(
+        buffer_size,
         buffer_scale,
         buffer_transform,
+        viewport.source.map(|source| {
+            SurfaceGeometryRect::new(source.x, source.y, source.width, source.height)
+        }),
+        viewport.destination,
     )
-    .map_err(|_| invalid_shm_buffer())?;
-    BufferSize::new(size.width, size.height).ok_or_else(invalid_shm_buffer)
+    .map(SurfaceBufferMapping::surface_extent)
+    .ok_or_else(invalid_shm_buffer)
 }
 
 fn validate_viewport_source(
     buffer_size: BufferSize,
+    buffer_scale: u32,
+    buffer_transform: wl_output::Transform,
     source: Option<ViewportSourceRect>,
 ) -> io::Result<()> {
-    let Some(source) = source else {
-        return Ok(());
-    };
-    let width = f64::from(buffer_size.width);
-    let height = f64::from(buffer_size.height);
-    let tolerance = 1.0 / 256.0;
-    if source.x + source.width > width + tolerance || source.y + source.height > height + tolerance
-    {
-        return Err(invalid_shm_buffer());
-    }
-    Ok(())
+    SurfaceBufferMapping::new(
+        buffer_size,
+        buffer_scale,
+        buffer_transform,
+        source.map(|source| {
+            SurfaceGeometryRect::new(source.x, source.y, source.width, source.height)
+        }),
+        None,
+    )
+    .map(|_| ())
+    .ok_or_else(invalid_shm_buffer)
 }
 
 #[derive(Debug, Clone)]

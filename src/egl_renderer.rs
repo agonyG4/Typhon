@@ -869,10 +869,7 @@ fn append_lamp_grid(
         let v = row as f32 / rows_f;
         vertices.push(EglLampVertex {
             position: [x + width * u, y + height * v],
-            uv: [
-                uv.left() + (uv.right() - uv.left()) * u,
-                uv.top() + (uv.bottom() - uv.top()) * v,
-            ],
+            uv: uv.sample(u, v),
         });
     };
     for row in 0..rows {
@@ -3050,12 +3047,7 @@ impl GlesSceneRenderer {
                 compositor::scale_logical_extent(cursor.surface.height, output_scale),
             );
             let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
-            let uv = EglUvRect::new(
-                render_plan.content_uv.left,
-                render_plan.content_uv.top,
-                render_plan.content_uv.right,
-                render_plan.content_uv.bottom,
-            );
+            let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
             push_draw_command_with_uv(
                 &mut self.cursor_vertices,
                 &mut self.cursor_commands,
@@ -3313,12 +3305,7 @@ impl GlesSceneRenderer {
                                 target.width() as f32,
                                 target.height() as f32,
                             ),
-                            uv: EglUvRect::new(
-                                render_plan.content_uv.left,
-                                render_plan.content_uv.top,
-                                render_plan.content_uv.right,
-                                render_plan.content_uv.bottom,
-                            ),
+                            uv: EglUvRect::from_surface_uv_quad(render_plan.content_uv),
                         },
                         &mut transition_starts,
                         &mut rejected_transitions,
@@ -5664,12 +5651,7 @@ fn push_egl_render_plan(
     render_plan: compositor::SurfaceRenderPlan,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
-    let uv = EglUvRect::new(
-        render_plan.content_uv.left,
-        render_plan.content_uv.top,
-        render_plan.content_uv.right,
-        render_plan.content_uv.bottom,
-    );
+    let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
     let sampling = surface_sampling_for_plan(
         surface.buffer_size().width,
         surface.buffer_size().height,

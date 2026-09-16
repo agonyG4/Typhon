@@ -50,6 +50,13 @@ impl TestShmBuffer {
         self.attach_with_damage(surface, 0, 0, width, height);
     }
 
+    pub(in crate::compositor::tests) fn attach_without_damage(
+        &self,
+        surface: &client_wl_surface::WlSurface,
+    ) {
+        surface.attach(Some(&self.buffer), 0, 0);
+    }
+
     fn attach_with_damage(
         &self,
         surface: &client_wl_surface::WlSurface,

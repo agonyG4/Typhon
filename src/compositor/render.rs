@@ -7,7 +7,8 @@ use super::decoration::render_plan::{DecorationRenderPlan, DecorationRenderPrimi
 use super::decoration::types::DecorationRect;
 use super::{
     ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
-    SurfaceDamageRect, SurfaceRenderBackend,
+    SurfaceBufferMapping, SurfaceDamageRect, SurfaceGeometryRect, SurfaceRenderBackend,
+    SurfaceUvQuad,
 };
 use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
 use crate::presentation_animation::{PresentationGroupTransform, PresentationRect};
@@ -635,7 +636,7 @@ pub struct RenderSceneElement {
     visible_target: SurfaceTargetRect,
     backing_target: Option<SurfaceTargetRect>,
     content_regions: Vec<SurfaceRenderPlan>,
-    content_uv: SurfaceUvRect,
+    content_uv: SurfaceUvQuad,
     generation: u64,
     buffer_size: BufferSize,
     buffer_source: SurfaceBufferSource,
@@ -679,7 +680,7 @@ impl RenderSceneElement {
             backing_target: xwayland_visual_backing_target(surface, visual_aperture.as_ref()),
             content_uv: content_regions
                 .first()
-                .map_or(SurfaceUvRect::FULL, |plan| plan.content_uv),
+                .map_or(SurfaceUvQuad::FULL, |plan| plan.content_uv),
             content_regions,
             generation: surface.generation,
             buffer_size: surface.buffer_size(),
@@ -712,7 +713,8 @@ impl RenderSceneElement {
         &self.content_regions
     }
 
-    pub const fn content_uv(&self) -> SurfaceUvRect {
+    #[allow(dead_code)]
+    pub(crate) const fn content_uv(&self) -> SurfaceUvQuad {
         self.content_uv
     }
 
@@ -730,6 +732,37 @@ impl RenderSceneElement {
 
     pub const fn damage(&self) -> &RenderableSurfaceDamage {
         &self.damage
+    }
+
+    pub fn output_damage_target_for_buffer_rect(
+        &self,
+        target: SurfaceTargetRect,
+        rect: SurfaceDamageRect,
+    ) -> Option<SurfaceTargetRect> {
+        if target.width() == 0 || target.height() == 0 {
+            return None;
+        }
+        let Some(mapping) = self.content_regions.first().and_then(|plan| plan.mapping) else {
+            return Some(target);
+        };
+        let mapped = match mapping.map_buffer_rect_to_surface(rect) {
+            None => return Some(target),
+            Some(None) => return None,
+            Some(Some(mapped)) => mapped,
+        };
+        let extent = mapping.surface_extent();
+        let right_edge = mapped.x.saturating_add(mapped.width);
+        let bottom_edge = mapped.y.saturating_add(mapped.height);
+        let left = scale_rect_edge(mapped.x, extent.width, target.width(), false)?;
+        let top = scale_rect_edge(mapped.y, extent.height, target.height(), false)?;
+        let right = scale_rect_edge(right_edge, extent.width, target.width(), true)?;
+        let bottom = scale_rect_edge(bottom_edge, extent.height, target.height(), true)?;
+        (right > left && bottom > top).then_some(SurfaceTargetRect::new(
+            i32_saturating_add_u32(target.x(), left),
+            i32_saturating_add_u32(target.y(), top),
+            right - left,
+            bottom - top,
+        ))
     }
 }
 
@@ -2004,33 +2037,22 @@ fn output_damage_rect_for_element(
     target: SurfaceTargetRect,
     rect: SurfaceDamageRect,
 ) -> Option<OutputRect> {
-    if target.width == 0 || target.height == 0 {
+    element
+        .output_damage_target_for_buffer_rect(target, rect)
+        .map(|target| target.output_rect())
+}
+
+fn scale_rect_edge(value: u32, from_extent: u32, to_extent: u32, round_up: bool) -> Option<u32> {
+    if from_extent == 0 {
         return None;
     }
-
-    let buffer_size = element.buffer_size;
-    let left = scale_damage_floor(rect.x, buffer_size.width, target.width)?;
-    let top = scale_damage_floor(rect.y, buffer_size.height, target.height)?;
-    let right = scale_damage_ceil(
-        rect.x.saturating_add(rect.width),
-        buffer_size.width,
-        target.width,
-    )?;
-    let bottom = scale_damage_ceil(
-        rect.y.saturating_add(rect.height),
-        buffer_size.height,
-        target.height,
-    )?;
-    if right <= left || bottom <= top {
-        return None;
-    }
-
-    Some(OutputRect {
-        x: i32_saturating_add_u32(target.x, left),
-        y: i32_saturating_add_u32(target.y, top),
-        width: right - left,
-        height: bottom - top,
-    })
+    let numerator = u64::from(value).checked_mul(u64::from(to_extent))?;
+    let numerator = if round_up {
+        numerator.checked_add(u64::from(from_extent - 1))?
+    } else {
+        numerator
+    };
+    u32::try_from(numerator / u64::from(from_extent)).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2353,27 +2375,11 @@ fn subtract_rect_from_rect(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SurfaceUvRect {
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
-}
-
-impl SurfaceUvRect {
-    pub const FULL: Self = Self {
-        left: 0.0,
-        top: 0.0,
-        right: 1.0,
-        bottom: 1.0,
-    };
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceRenderPlan {
     pub visual_target: SurfaceTargetRect,
     pub content_target: SurfaceTargetRect,
-    pub content_uv: SurfaceUvRect,
+    pub content_uv: SurfaceUvQuad,
+    pub mapping: Option<SurfaceBufferMapping>,
     pub clip: Option<SurfaceTargetRect>,
 }
 
@@ -2388,7 +2394,8 @@ pub fn surface_render_plan(
         .unwrap_or_else(|| SurfaceRenderPlan {
             visual_target,
             content_target: SurfaceTargetRect::new(visual_target.x(), visual_target.y(), 0, 0),
-            content_uv: SurfaceUvRect::FULL,
+            content_uv: SurfaceUvQuad::FULL,
+            mapping: None,
             clip: visual_aperture.map(SurfaceVisualAperture::logical_target),
         })
 }
@@ -2414,10 +2421,14 @@ pub fn surface_render_plan_with_clip(
     visual_target: SurfaceTargetRect,
     visual_clip: Option<SurfaceTargetRect>,
 ) -> SurfaceRenderPlan {
+    let mapping = surface_buffer_mapping(surface);
     let mut plan = SurfaceRenderPlan {
         visual_target,
         content_target: visual_target,
-        content_uv: surface_base_uv(surface),
+        content_uv: mapping
+            .and_then(SurfaceBufferMapping::source_uv_quad)
+            .unwrap_or(SurfaceUvQuad::FULL),
+        mapping,
         clip: visual_clip,
     };
     if let Some(clip) = visual_clip {
@@ -2426,22 +2437,16 @@ pub fn surface_render_plan_with_clip(
     plan
 }
 
-fn surface_base_uv(surface: &RenderableSurface) -> SurfaceUvRect {
-    let Some(source) = surface.viewport_source else {
-        return SurfaceUvRect::FULL;
-    };
-    let buffer_size = surface.buffer_size();
-    if buffer_size.width == 0 || buffer_size.height == 0 {
-        return SurfaceUvRect::FULL;
-    }
-    let buffer_width = f64::from(buffer_size.width);
-    let buffer_height = f64::from(buffer_size.height);
-    SurfaceUvRect {
-        left: (source.x / buffer_width) as f32,
-        top: (source.y / buffer_height) as f32,
-        right: ((source.x + source.width) / buffer_width) as f32,
-        bottom: ((source.y + source.height) / buffer_height) as f32,
-    }
+fn surface_buffer_mapping(surface: &RenderableSurface) -> Option<SurfaceBufferMapping> {
+    SurfaceBufferMapping::new(
+        surface.buffer_size(),
+        surface.buffer_scale,
+        surface.buffer_transform,
+        surface.viewport_source.map(|source| {
+            SurfaceGeometryRect::new(source.x, source.y, source.width, source.height)
+        }),
+        surface.viewport_destination,
+    )
 }
 
 pub fn clip_surface_render_plan(
@@ -2474,16 +2479,14 @@ pub fn clip_surface_render_plan(
     let top_trim = (target.y - original.y) as f32 / original.height.max(1) as f32;
     let right_trim = (original.right() - target.right()) as f32 / original.width.max(1) as f32;
     let bottom_trim = (original.bottom() - target.bottom()) as f32 / original.height.max(1) as f32;
-    let uv_width = plan.content_uv.right - plan.content_uv.left;
-    let uv_height = plan.content_uv.bottom - plan.content_uv.top;
     SurfaceRenderPlan {
         content_target: target,
-        content_uv: SurfaceUvRect {
-            left: (plan.content_uv.left + uv_width * left_trim).clamp(0.0, 1.0),
-            top: (plan.content_uv.top + uv_height * top_trim).clamp(0.0, 1.0),
-            right: (plan.content_uv.right - uv_width * right_trim).clamp(0.0, 1.0),
-            bottom: (plan.content_uv.bottom - uv_height * bottom_trim).clamp(0.0, 1.0),
-        },
+        content_uv: plan.content_uv.sub_quad(
+            left_trim.clamp(0.0, 1.0),
+            top_trim.clamp(0.0, 1.0),
+            (1.0 - right_trim).clamp(0.0, 1.0),
+            (1.0 - bottom_trim).clamp(0.0, 1.0),
+        ),
         ..plan
     }
 }
@@ -2884,24 +2887,6 @@ pub fn scale_logical_extent(value: u32, output_scale: f64) -> u32 {
     }
 }
 
-fn scale_damage_floor(value: u32, from_extent: u32, to_extent: u32) -> Option<u32> {
-    if from_extent == 0 {
-        return None;
-    }
-    let scaled = u64::from(value).saturating_mul(u64::from(to_extent)) / u64::from(from_extent);
-    Some(scaled.min(u64::from(u32::MAX)) as u32)
-}
-
-fn scale_damage_ceil(value: u32, from_extent: u32, to_extent: u32) -> Option<u32> {
-    if from_extent == 0 {
-        return None;
-    }
-    let numerator = u64::from(value).saturating_mul(u64::from(to_extent));
-    let scaled =
-        numerator.saturating_add(u64::from(from_extent).saturating_sub(1)) / u64::from(from_extent);
-    Some(scaled.min(u64::from(u32::MAX)) as u32)
-}
-
 fn i32_saturating_add_u32(value: i32, addend: u32) -> i32 {
     i64::from(value)
         .saturating_add(i64::from(addend))
@@ -3011,7 +2996,7 @@ fn blit_surface_with_plan(
         return;
     }
 
-    if plan.content_uv == SurfaceUvRect::FULL
+    if plan.mapping.is_some_and(SurfaceBufferMapping::is_identity)
         && buffer_size.width == target.width
         && buffer_size.height == target.height
     {
@@ -3039,18 +3024,10 @@ fn blit_surface_with_plan(
         return;
     }
 
-    let target_width = target.width as i64;
-    let target_height = target.height as i64;
-    let uv_left = plan.content_uv.left;
-    let uv_top = plan.content_uv.top;
-    let uv_width = plan.content_uv.right - plan.content_uv.left;
-    let uv_height = plan.content_uv.bottom - plan.content_uv.top;
+    let target_width = target.width as f32;
+    let target_height = target.height as f32;
     for row_y in start_y..end_y {
         let local_y = row_y - i64::from(target.y);
-        let source_y = ((uv_top * buffer_size.height as f32)
-            + (local_y as f32 / target_height as f32) * uv_height * buffer_size.height as f32)
-            .floor() as i64;
-        let source_y = source_y.clamp(0, i64::from(buffer_size.height.saturating_sub(1))) as usize;
         let target_start = row_y as usize * frame_width + start_x as usize;
         let Some(target_row) =
             frame.get_mut(target_start..target_start + (end_x - start_x) as usize)
@@ -3059,11 +3036,18 @@ fn blit_surface_with_plan(
         };
         for (column, target_pixel) in target_row.iter_mut().enumerate() {
             let local_x = (start_x - i64::from(target.x)) + column as i64;
-            let source_x = ((uv_left * buffer_size.width as f32)
-                + (local_x as f32 / target_width as f32) * uv_width * buffer_size.width as f32)
-                .floor() as i64;
-            let source_x =
-                source_x.clamp(0, i64::from(buffer_size.width.saturating_sub(1))) as usize;
+            let uv = plan.content_uv.sample(
+                (local_x as f32 + 0.5) / target_width,
+                (local_y as f32 + 0.5) / target_height,
+            );
+            let source_x = (uv[0] * buffer_size.width as f32)
+                .floor()
+                .clamp(0.0, buffer_size.width.saturating_sub(1) as f32)
+                as usize;
+            let source_y = (uv[1] * buffer_size.height as f32)
+                .floor()
+                .clamp(0.0, buffer_size.height.saturating_sub(1) as f32)
+                as usize;
             let source_index = source_y * buffer_width + source_x;
             if let Some(source) = surface_pixels.get(source_index).copied() {
                 *target_pixel = blend_premultiplied_argb_over_opaque(source, *target_pixel);
@@ -3647,7 +3631,7 @@ mod tests {
 
         assert_eq!(plan.content_target.width(), 800);
         assert_eq!(plan.content_target.height(), 600);
-        assert_eq!(plan.content_uv, SurfaceUvRect::FULL);
+        assert_eq!(plan.content_uv, SurfaceUvQuad::FULL);
         assert_eq!(plan.clip, Some(SurfaceTargetRect::new(0, 0, 1000, 700)));
     }
 
@@ -3847,13 +3831,67 @@ mod tests {
         assert_eq!(plan.content_target.height(), 50);
         assert_eq!(
             plan.content_uv,
-            SurfaceUvRect {
-                left: 0.1,
-                top: 0.1,
-                right: 0.6,
-                bottom: 0.6,
+            SurfaceUvQuad {
+                top_left: [0.1, 0.1],
+                bottom_left: [0.1, 0.6],
+                bottom_right: [0.6, 0.6],
+                top_right: [0.6, 0.1],
             }
         );
+    }
+
+    #[test]
+    fn transformed_render_plan_clip_interpolates_source_corners() {
+        let mut surface = solid_test_surface(7, 0, 0, 2, 3, 0xffff_0000);
+        surface.buffer = shm_buffer(3, 2, vec![0; 6]);
+        surface.buffer_transform = wl_output::Transform::_90;
+        let plan = surface_render_plan_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 2, 3),
+            Some(SurfaceTargetRect::new(0, 0, 1, 3)),
+        );
+
+        assert_eq!(plan.content_target, SurfaceTargetRect::new(0, 0, 1, 3));
+        assert_eq!(plan.content_uv.top_left, [0.0, 1.0]);
+        assert_eq!(plan.content_uv.bottom_left, [1.0, 1.0]);
+        assert_eq!(plan.content_uv.bottom_right, [1.0, 0.5]);
+        assert_eq!(plan.content_uv.top_right, [0.0, 0.5]);
+    }
+
+    #[test]
+    fn flipped_render_plan_clip_interpolates_reversed_source_axis() {
+        let mut surface = solid_test_surface(7, 0, 0, 3, 2, 0xffff_0000);
+        surface.buffer_transform = wl_output::Transform::Flipped;
+        let plan = surface_render_plan_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 3, 2),
+            Some(SurfaceTargetRect::new(0, 0, 1, 2)),
+        );
+
+        assert_eq!(plan.content_target, SurfaceTargetRect::new(0, 0, 1, 2));
+        assert_eq!(plan.content_uv.top_left, [1.0, 0.0]);
+        assert_eq!(plan.content_uv.bottom_left, [1.0, 1.0]);
+        assert_eq!(plan.content_uv.bottom_right, [2.0 / 3.0, 1.0]);
+        assert_eq!(plan.content_uv.top_right, [2.0 / 3.0, 0.0]);
+    }
+
+    #[test]
+    fn viewport_transform_render_plan_clip_interpolates_cropped_source() {
+        let mut surface = solid_test_surface(7, 0, 0, 2, 2, 0xffff_0000);
+        surface.buffer = shm_buffer(2, 4, vec![0; 8]);
+        surface.buffer_transform = wl_output::Transform::_90;
+        surface.viewport_source = ViewportSourceRect::new(2.0, 0.0, 2.0, 2.0);
+        let plan = surface_render_plan_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 2, 2),
+            Some(SurfaceTargetRect::new(0, 0, 1, 2)),
+        );
+
+        assert_eq!(plan.content_target, SurfaceTargetRect::new(0, 0, 1, 2));
+        assert_eq!(plan.content_uv.top_left, [0.0, 0.5]);
+        assert_eq!(plan.content_uv.bottom_left, [1.0, 0.5]);
+        assert_eq!(plan.content_uv.bottom_right, [1.0, 0.25]);
+        assert_eq!(plan.content_uv.top_right, [0.0, 0.25]);
     }
 
     #[test]
@@ -3885,10 +3923,10 @@ mod tests {
             (near.content_target.width(), near.content_target.height()),
             (800, 600)
         );
-        assert_eq!(near.content_uv.left, 0.0);
-        assert_eq!(near.content_uv.top, 0.0);
-        assert_eq!(near.content_uv.right, 0.8);
-        assert!((near.content_uv.bottom - (600.0 / 700.0)).abs() < f32::EPSILON);
+        assert_eq!(near.content_uv.top_left, [0.0, 0.0]);
+        assert_eq!(near.content_uv.top_right, [0.8, 0.0]);
+        assert_eq!(near.content_uv.bottom_left, [0.0, 600.0 / 700.0]);
+        assert_eq!(near.content_uv.bottom_right, [0.8, 600.0 / 700.0]);
 
         let far_surface = RenderableSurface {
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
@@ -3903,10 +3941,10 @@ mod tests {
             (far.content_target.width(), far.content_target.height()),
             (800, 600)
         );
-        assert_eq!(far.content_uv.left, 0.2);
-        assert!((far.content_uv.top - (100.0 / 700.0)).abs() < f32::EPSILON);
-        assert_eq!(far.content_uv.right, 1.0);
-        assert_eq!(far.content_uv.bottom, 1.0);
+        assert_eq!(far.content_uv.top_left, [0.2, 100.0 / 700.0]);
+        assert_eq!(far.content_uv.top_right, [1.0, 100.0 / 700.0]);
+        assert_eq!(far.content_uv.bottom_left, [0.2, 1.0]);
+        assert_eq!(far.content_uv.bottom_right, [1.0, 1.0]);
     }
 
     #[test]
@@ -4933,8 +4971,128 @@ mod tests {
                 },
             )]
         );
-        assert_eq!(elements[0].content_uv(), SurfaceUvRect::FULL);
+        assert_eq!(elements[0].content_uv(), SurfaceUvQuad::FULL);
         assert_eq!(elements[0].buffer_size(), BufferSize::new(8, 4).unwrap());
+    }
+
+    #[test]
+    fn partial_damage_projects_through_buffer_transform() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 3,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(3, 2, vec![0xff00_00aa; 6]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::_90,
+            damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }]),
+        };
+        let element = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let damage = output_damage_rect_for_element(
+            &element,
+            element.visible_target(),
+            SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            damage,
+            OutputRect {
+                x: 73,
+                y: 72,
+                width: 1,
+                height: 1
+            }
+        );
+    }
+
+    #[test]
+    fn partial_damage_outside_viewport_source_has_no_output_projection() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(4, 2, vec![0xff00_00aa; 8]),
+            viewport_source: Some(ViewportSourceRect {
+                x: 1.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            }),
+            viewport_destination: Some(BufferSize::new(2, 2).unwrap()),
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![]),
+        };
+        let element = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            output_damage_rect_for_element(
+                &element,
+                element.visible_target(),
+                SurfaceDamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 2,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            output_damage_rect_for_element(
+                &element,
+                element.visible_target(),
+                SurfaceDamageRect {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 2,
+                },
+            ),
+            Some(OutputRect {
+                x: FIRST_SURFACE_OFFSET.0,
+                y: FIRST_SURFACE_OFFSET.1,
+                width: 1,
+                height: 2,
+            })
+        );
     }
 
     #[test]
@@ -5324,6 +5482,213 @@ mod tests {
         assert_eq!(frame[origin + 1], 0xff00_ff00);
         assert_eq!(frame[origin + 96], 0xff00_00ff);
         assert_eq!(frame[origin + 97], 0xffff_ffff);
+    }
+
+    #[test]
+    fn compose_output_applies_asymmetric_buffer_transforms() {
+        let transforms = [
+            (
+                wl_output::Transform::Normal,
+                [
+                    0xff00_00aa,
+                    0xff00_00bb,
+                    0xff00_00cc,
+                    0xff00_00dd,
+                    0xff00_00ee,
+                    0xff00_00ff,
+                ],
+                (3, 2),
+            ),
+            (
+                wl_output::Transform::_90,
+                [
+                    0xff00_00dd,
+                    0xff00_00aa,
+                    0xff00_00ee,
+                    0xff00_00bb,
+                    0xff00_00ff,
+                    0xff00_00cc,
+                ],
+                (2, 3),
+            ),
+            (
+                wl_output::Transform::_180,
+                [
+                    0xff00_00ff,
+                    0xff00_00ee,
+                    0xff00_00dd,
+                    0xff00_00cc,
+                    0xff00_00bb,
+                    0xff00_00aa,
+                ],
+                (3, 2),
+            ),
+            (
+                wl_output::Transform::_270,
+                [
+                    0xff00_00cc,
+                    0xff00_00ff,
+                    0xff00_00bb,
+                    0xff00_00ee,
+                    0xff00_00aa,
+                    0xff00_00dd,
+                ],
+                (2, 3),
+            ),
+            (
+                wl_output::Transform::Flipped,
+                [
+                    0xff00_00cc,
+                    0xff00_00bb,
+                    0xff00_00aa,
+                    0xff00_00ff,
+                    0xff00_00ee,
+                    0xff00_00dd,
+                ],
+                (3, 2),
+            ),
+            (
+                wl_output::Transform::Flipped90,
+                [
+                    0xff00_00aa,
+                    0xff00_00dd,
+                    0xff00_00bb,
+                    0xff00_00ee,
+                    0xff00_00cc,
+                    0xff00_00ff,
+                ],
+                (2, 3),
+            ),
+            (
+                wl_output::Transform::Flipped180,
+                [
+                    0xff00_00dd,
+                    0xff00_00ee,
+                    0xff00_00ff,
+                    0xff00_00aa,
+                    0xff00_00bb,
+                    0xff00_00cc,
+                ],
+                (3, 2),
+            ),
+            (
+                wl_output::Transform::Flipped270,
+                [
+                    0xff00_00ff,
+                    0xff00_00cc,
+                    0xff00_00ee,
+                    0xff00_00bb,
+                    0xff00_00dd,
+                    0xff00_00aa,
+                ],
+                (2, 3),
+            ),
+        ];
+
+        for (transform, expected, (width, height)) in transforms {
+            let surface = RenderableSurface {
+                surface_id: 7,
+                x: 0,
+                y: 0,
+                width,
+                height,
+                placement: SurfacePlacement::root(),
+                render_backend: SurfaceRenderBackend::NativeWayland,
+                render_placement: None,
+                visual_clip: None,
+                render_target_size: None,
+                generation: 0,
+                commit_sequence: SurfaceCommitSequence::initial(),
+                buffer: shm_buffer(
+                    3,
+                    2,
+                    vec![
+                        0xff00_00aa,
+                        0xff00_00bb,
+                        0xff00_00cc,
+                        0xff00_00dd,
+                        0xff00_00ee,
+                        0xff00_00ff,
+                    ],
+                ),
+                viewport_source: None,
+                viewport_destination: None,
+                buffer_scale: 1,
+                buffer_transform: transform,
+                damage: crate::compositor::RenderableSurfaceDamage::full(),
+            };
+            let mut frame = vec![0; 96 * 96];
+
+            compose_output(
+                &mut frame,
+                96,
+                96,
+                std::slice::from_ref(&surface),
+                DesktopVisualState::wallpaper_only(),
+            );
+
+            let origin = (72 * 96 + 72) as usize;
+            let mut actual = Vec::new();
+            for y in 0..height {
+                for x in 0..width {
+                    actual.push(frame[(72 + y) as usize * 96 + (72 + x) as usize]);
+                }
+            }
+            assert_eq!(actual, expected, "transform {transform:?}");
+            assert_eq!(frame[origin], expected[0]);
+        }
+    }
+
+    #[test]
+    fn compose_output_interprets_viewport_source_after_transform() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(
+                2,
+                4,
+                vec![
+                    0xff00_00aa,
+                    0xff00_00bb,
+                    0xff00_00cc,
+                    0xff00_00dd,
+                    0xff00_00ee,
+                    0xff00_00ff,
+                    0xff00_0011,
+                    0xff00_0022,
+                ],
+            ),
+            viewport_source: ViewportSourceRect::new(2.0, 0.0, 2.0, 2.0),
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::_90,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let mut frame = vec![0; 96 * 96];
+
+        compose_output(
+            &mut frame,
+            96,
+            96,
+            std::slice::from_ref(&surface),
+            DesktopVisualState::wallpaper_only(),
+        );
+
+        let origin = (72 * 96 + 72) as usize;
+        assert_eq!(frame[origin], 0xff00_00cc);
+        assert_eq!(frame[origin + 1], 0xff00_00aa);
+        assert_eq!(frame[origin + 96], 0xff00_00dd);
+        assert_eq!(frame[origin + 97], 0xff00_00bb);
     }
 
     #[test]

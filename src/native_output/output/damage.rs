@@ -539,17 +539,32 @@ impl NativeDamageRect {
             return None;
         }
 
-        let buffer_size = surface.buffer_size();
-        let left = scale_damage_floor(rect.x, buffer_size.width, surface.width)?;
-        let top = scale_damage_floor(rect.y, buffer_size.height, surface.height)?;
+        let mapping = oblivion_one::compositor::SurfaceBufferMapping::new(
+            surface.buffer_size(),
+            surface.buffer_scale,
+            surface.buffer_transform,
+            surface.viewport_source.map(|source| {
+                oblivion_one::compositor::SurfaceGeometryRect::new(
+                    source.x,
+                    source.y,
+                    source.width,
+                    source.height,
+                )
+            }),
+            surface.viewport_destination,
+        )?;
+        let rect = mapping.map_buffer_rect_to_surface(rect)??;
+        let extent = mapping.surface_extent();
+        let left = scale_damage_floor(rect.x, extent.width, surface.width)?;
+        let top = scale_damage_floor(rect.y, extent.height, surface.height)?;
         let right = scale_damage_ceil(
             rect.x.saturating_add(rect.width),
-            buffer_size.width,
+            extent.width,
             surface.width,
         )?;
         let bottom = scale_damage_ceil(
             rect.y.saturating_add(rect.height),
-            buffer_size.height,
+            extent.height,
             surface.height,
         )?;
         if right <= left || bottom <= top {
@@ -568,33 +583,13 @@ impl NativeDamageRect {
         element: &RenderSceneElement,
         rect: oblivion_one::compositor::SurfaceDamageRect,
     ) -> Option<Self> {
-        let target = element.visible_target();
-        if target.width() == 0 || target.height() == 0 {
-            return None;
-        }
-
-        let buffer_size = element.buffer_size();
-        let left = scale_damage_floor(rect.x, buffer_size.width, target.width())?;
-        let top = scale_damage_floor(rect.y, buffer_size.height, target.height())?;
-        let right = scale_damage_ceil(
-            rect.x.saturating_add(rect.width),
-            buffer_size.width,
-            target.width(),
-        )?;
-        let bottom = scale_damage_ceil(
-            rect.y.saturating_add(rect.height),
-            buffer_size.height,
-            target.height(),
-        )?;
-        if right <= left || bottom <= top {
-            return None;
-        }
-
+        let target =
+            element.output_damage_target_for_buffer_rect(element.visible_target(), rect)?;
         Some(Self {
-            x: i32_saturating_add_u32(target.x(), left),
-            y: i32_saturating_add_u32(target.y(), top),
-            width: right - left,
-            height: bottom - top,
+            x: target.x(),
+            y: target.y(),
+            width: target.width(),
+            height: target.height(),
         })
     }
 
@@ -1492,6 +1487,7 @@ pub(crate) fn native_repaint_cause_label(
     "unknown"
 }
 
+#[cfg(test)]
 pub(crate) fn scale_damage_floor(value: u32, from_extent: u32, to_extent: u32) -> Option<u32> {
     if from_extent == 0 {
         return None;
@@ -1500,6 +1496,7 @@ pub(crate) fn scale_damage_floor(value: u32, from_extent: u32, to_extent: u32) -
     Some(scaled.min(u64::from(u32::MAX)) as u32)
 }
 
+#[cfg(test)]
 pub(crate) fn scale_damage_ceil(value: u32, from_extent: u32, to_extent: u32) -> Option<u32> {
     if from_extent == 0 {
         return None;
@@ -1510,6 +1507,7 @@ pub(crate) fn scale_damage_ceil(value: u32, from_extent: u32, to_extent: u32) ->
     Some(scaled.min(u64::from(u32::MAX)) as u32)
 }
 
+#[cfg(test)]
 pub(crate) fn i32_saturating_add_u32(value: i32, addend: u32) -> i32 {
     i64::from(value)
         .saturating_add(i64::from(addend))

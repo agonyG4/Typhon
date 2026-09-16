@@ -83,6 +83,7 @@ mod effects;
 mod explicit_sync;
 mod frame_batch;
 mod fullscreen;
+pub(crate) mod geometry;
 pub mod gpu_protocol_capabilities;
 mod idle;
 mod input;
@@ -162,6 +163,10 @@ pub use frame_batch::{
     FrameCallbackTimingEvidence,
 };
 pub(crate) use frame_batch::{CompositorFrameBatch, DmabufGpuReleaseLease};
+pub use geometry::{
+    SurfaceBufferMapping, SurfaceGeometryRect, SurfaceUvQuad, transform_buffer_pixel,
+    transformed_buffer_size,
+};
 pub use state_data::ShmBufferLifetimeMetrics;
 pub(in crate::compositor) use state_data::{
     CurrentSurfaceBuffer, DmabufReleaseObligation, SurfaceBufferReleaseOutcome,

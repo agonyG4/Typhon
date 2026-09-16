@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::compositor::{transform_buffer_pixel, transformed_buffer_size};
+use crate::render_backend::buffer::BufferSize;
 use wayland_server::protocol::wl_output::Transform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +74,11 @@ pub fn logical_size(
     if buffer_scale == 0 {
         return Err(CursorGeometryError::ZeroBufferScale);
     }
-    let transformed = transformed_size(CursorSize::new(buffer_width, buffer_height), transform)?;
+    let transformed = transformed_buffer_size(
+        BufferSize::new(buffer_width, buffer_height).ok_or(CursorGeometryError::ZeroDimension)?,
+        transform,
+    )
+    .ok_or(CursorGeometryError::UnsupportedTransform)?;
     if transformed.width % buffer_scale != 0 || transformed.height % buffer_scale != 0 {
         return Err(CursorGeometryError::NonDivisibleBufferSize);
     }
@@ -97,19 +103,13 @@ pub fn transform_hotspot(
     validate_hotspot(hotspot, source)?;
     let x = i64::from(hotspot.x);
     let y = i64::from(hotspot.y);
-    let width = i64::from(source.width);
-    let height = i64::from(source.height);
-    let (x, y) = match transform {
-        Transform::Normal => (x, y),
-        Transform::_90 => (height - 1 - y, x),
-        Transform::_180 => (width - 1 - x, height - 1 - y),
-        Transform::_270 => (y, width - 1 - x),
-        Transform::Flipped => (width - 1 - x, y),
-        Transform::Flipped90 => (y, x),
-        Transform::Flipped180 => (x, height - 1 - y),
-        Transform::Flipped270 => (width - 1 - y, height - 1 - x),
-        _ => return Err(CursorGeometryError::UnsupportedTransform),
-    };
+    let (x, y) = transform_buffer_pixel(
+        u32::try_from(x).map_err(|_| CursorGeometryError::HotspotOutOfBounds)?,
+        u32::try_from(y).map_err(|_| CursorGeometryError::HotspotOutOfBounds)?,
+        BufferSize::new(source.width, source.height).ok_or(CursorGeometryError::ZeroDimension)?,
+        transform,
+    )
+    .ok_or(CursorGeometryError::UnsupportedTransform)?;
     Ok(CursorHotspot::new(
         i32::try_from(x).map_err(|_| CursorGeometryError::HotspotOutOfBounds)?,
         i32::try_from(y).map_err(|_| CursorGeometryError::HotspotOutOfBounds)?,
@@ -124,7 +124,11 @@ pub fn geometry_for_surface(
     hotspot: CursorHotspot,
     output_scale: f64,
 ) -> Result<CursorGeometry, CursorGeometryError> {
-    let transformed_buffer_size = transformed_size(buffer, transform)?;
+    let transformed_size = transformed_buffer_size(
+        BufferSize::new(buffer.width, buffer.height).ok_or(CursorGeometryError::ZeroDimension)?,
+        transform,
+    )
+    .ok_or(CursorGeometryError::UnsupportedTransform)?;
     let committed_logical_size =
         logical_size(buffer.width, buffer.height, buffer_scale, transform)?;
     let logical_size = viewport_destination.unwrap_or(committed_logical_size);
@@ -138,30 +142,12 @@ pub fn geometry_for_surface(
         scale_coordinate(hotspot.y, output_scale),
     );
     Ok(CursorGeometry {
-        transformed_buffer_size,
+        transformed_buffer_size: CursorSize::new(transformed_size.width, transformed_size.height),
         logical_size,
         logical_hotspot: hotspot,
         physical_size,
         physical_hotspot,
     })
-}
-
-fn transformed_size(
-    size: CursorSize,
-    transform: Transform,
-) -> Result<CursorSize, CursorGeometryError> {
-    if size.width == 0 || size.height == 0 {
-        return Err(CursorGeometryError::ZeroDimension);
-    }
-    match transform {
-        Transform::Normal | Transform::_180 | Transform::Flipped | Transform::Flipped180 => {
-            Ok(size)
-        }
-        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
-            Ok(CursorSize::new(size.height, size.width))
-        }
-        _ => Err(CursorGeometryError::UnsupportedTransform),
-    }
 }
 
 fn validate_hotspot(hotspot: CursorHotspot, size: CursorSize) -> Result<(), CursorGeometryError> {
@@ -296,7 +282,7 @@ mod tests {
         );
         assert_eq!(
             transform_hotspot(hotspot, source, Transform::Flipped270).unwrap(),
-            Hotspot::new(1, 1)
+            Hotspot::new(0, 2)
         );
     }
 

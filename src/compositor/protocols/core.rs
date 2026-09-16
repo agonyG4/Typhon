@@ -159,6 +159,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     buffer_size,
                     data.buffer_scale_for_change(buffer_scale_change),
                     data.viewport_for_change(viewport_change),
+                    data.buffer_transform_for_change(buffer_transform_change),
                 );
                 let damage = match attachment {
                     Some(PendingSurfaceAttachment::Buffer(_)) => Some(damage.damage),

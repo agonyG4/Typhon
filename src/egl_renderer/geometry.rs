@@ -382,43 +382,53 @@ fn subtract_rect(source: EglRect, excluded: EglRect, pieces: &mut [Option<EglRec
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct EglUvRect {
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
+    top_left: [f32; 2],
+    bottom_left: [f32; 2],
+    bottom_right: [f32; 2],
+    top_right: [f32; 2],
 }
 
 impl EglUvRect {
     const FULL: Self = Self {
-        left: 0.0,
-        top: 0.0,
-        right: 1.0,
-        bottom: 1.0,
+        top_left: [0.0, 0.0],
+        bottom_left: [0.0, 1.0],
+        bottom_right: [1.0, 1.0],
+        top_right: [1.0, 0.0],
     };
 
     pub(super) const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
         Self {
-            left,
-            top,
-            right,
-            bottom,
+            top_left: [left, top],
+            bottom_left: [left, bottom],
+            bottom_right: [right, bottom],
+            top_right: [right, top],
         }
     }
 
-    pub(super) const fn left(self) -> f32 {
-        self.left
+    pub(super) const fn from_surface_uv_quad(
+        quad: oblivion_one::compositor::SurfaceUvQuad,
+    ) -> Self {
+        Self {
+            top_left: quad.top_left,
+            bottom_left: quad.bottom_left,
+            bottom_right: quad.bottom_right,
+            top_right: quad.top_right,
+        }
     }
 
-    pub(super) const fn top(self) -> f32 {
-        self.top
-    }
-
-    pub(super) const fn right(self) -> f32 {
-        self.right
-    }
-
-    pub(super) const fn bottom(self) -> f32 {
-        self.bottom
+    pub(super) fn sample(self, u: f32, v: f32) -> [f32; 2] {
+        let top = [
+            self.top_left[0] + (self.top_right[0] - self.top_left[0]) * u,
+            self.top_left[1] + (self.top_right[1] - self.top_left[1]) * u,
+        ];
+        let bottom = [
+            self.bottom_left[0] + (self.bottom_right[0] - self.bottom_left[0]) * u,
+            self.bottom_left[1] + (self.bottom_right[1] - self.bottom_left[1]) * u,
+        ];
+        [
+            top[0] + (bottom[0] - top[0]) * v,
+            top[1] + (bottom[1] - top[1]) * v,
+        ]
     }
 }
 
@@ -513,6 +523,31 @@ pub(super) fn push_draw_command_with_uv(
     output_height: u32,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
+    push_draw_command_with_quad(
+        vertices,
+        commands,
+        layer,
+        rect,
+        uv,
+        sampling,
+        output_width,
+        output_height,
+        framebuffer_origin,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_draw_command_with_quad(
+    vertices: &mut Vec<EglTexturedVertex>,
+    commands: &mut Vec<EglDrawCommand>,
+    layer: EglDrawLayer,
+    rect: EglRect,
+    uv: EglUvRect,
+    sampling: SurfaceSampling,
+    output_width: u32,
+    output_height: u32,
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
     let vertex_start = vertices.len() as u32;
     push_textured_quad(
         vertices,
@@ -545,18 +580,33 @@ pub(super) fn surface_sampling_for_plan(
     target_height: u32,
     uv: EglUvRect,
 ) -> SurfaceSampling {
-    let source_left = f64::from(source_width) * f64::from(uv.left);
-    let source_top = f64::from(source_height) * f64::from(uv.top);
-    let source_right = f64::from(source_width) * f64::from(uv.right);
-    let source_bottom = f64::from(source_height) * f64::from(uv.bottom);
+    let points = [uv.top_left, uv.bottom_left, uv.bottom_right, uv.top_right];
+    let source_left = points
+        .iter()
+        .map(|point| f64::from(point[0]) * f64::from(source_width))
+        .fold(f64::INFINITY, f64::min);
+    let source_top = points
+        .iter()
+        .map(|point| f64::from(point[1]) * f64::from(source_height))
+        .fold(f64::INFINITY, f64::min);
+    let source_right = points
+        .iter()
+        .map(|point| f64::from(point[0]) * f64::from(source_width))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let source_bottom = points
+        .iter()
+        .map(|point| f64::from(point[1]) * f64::from(source_height))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let horizontal_extent = edge_extent(uv.top_left, uv.top_right, source_width, source_height);
+    let vertical_extent = edge_extent(uv.top_left, uv.bottom_left, source_width, source_height);
     const PIXEL_TOLERANCE: f64 = 0.0001;
     let pixel_aligned = |value: f64| (value - value.round()).abs() <= PIXEL_TOLERANCE;
     let one_to_one_crop = pixel_aligned(source_left)
         && pixel_aligned(source_top)
         && pixel_aligned(source_right)
         && pixel_aligned(source_bottom)
-        && (source_right - source_left - f64::from(target_width)).abs() <= PIXEL_TOLERANCE
-        && (source_bottom - source_top - f64::from(target_height)).abs() <= PIXEL_TOLERANCE
+        && (horizontal_extent - f64::from(target_width)).abs() <= PIXEL_TOLERANCE
+        && (vertical_extent - f64::from(target_height)).abs() <= PIXEL_TOLERANCE
         && target_width > 0
         && target_height > 0;
     if one_to_one_crop {
@@ -564,6 +614,11 @@ pub(super) fn surface_sampling_for_plan(
     } else {
         SurfaceSampling::ScaledLinear
     }
+}
+
+fn edge_extent(first: [f32; 2], second: [f32; 2], width: u32, height: u32) -> f64 {
+    (f64::from(first[0] - second[0]).abs() * f64::from(width))
+        + (f64::from(first[1] - second[1]).abs() * f64::from(height))
 }
 
 fn push_textured_quad(
@@ -596,27 +651,27 @@ fn push_textured_quad(
     vertices.extend_from_slice(&[
         EglTexturedVertex {
             position: [left, top],
-            uv: [uv.left, uv.top],
+            uv: uv.top_left,
         },
         EglTexturedVertex {
             position: [left, bottom],
-            uv: [uv.left, uv.bottom],
+            uv: uv.bottom_left,
         },
         EglTexturedVertex {
             position: [right, bottom],
-            uv: [uv.right, uv.bottom],
+            uv: uv.bottom_right,
         },
         EglTexturedVertex {
             position: [left, top],
-            uv: [uv.left, uv.top],
+            uv: uv.top_left,
         },
         EglTexturedVertex {
             position: [right, bottom],
-            uv: [uv.right, uv.bottom],
+            uv: uv.bottom_right,
         },
         EglTexturedVertex {
             position: [right, top],
-            uv: [uv.right, uv.top],
+            uv: uv.top_right,
         },
     ]);
 }
@@ -720,6 +775,69 @@ mod tests {
             ),
             SurfaceSampling::ScaledLinear
         );
+    }
+
+    #[test]
+    fn oriented_surface_uv_quad_is_emitted_at_all_four_output_corners() {
+        let uv = EglUvRect {
+            top_left: [1.0, 0.0],
+            bottom_left: [0.0, 0.0],
+            bottom_right: [0.0, 1.0],
+            top_right: [1.0, 1.0],
+        };
+        let mut vertices = Vec::new();
+        push_textured_quad(
+            &mut vertices,
+            EglRect::new(0.0, 0.0, 20.0, 10.0),
+            uv,
+            20,
+            10,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(vertices[0].uv, uv.top_left);
+        assert_eq!(vertices[1].uv, uv.bottom_left);
+        assert_eq!(vertices[2].uv, uv.bottom_right);
+        assert_eq!(vertices[5].uv, uv.top_right);
+    }
+
+    #[test]
+    fn all_buffer_transforms_reach_egl_quad_corners() {
+        let transforms = [
+            wayland_server::protocol::wl_output::Transform::Normal,
+            wayland_server::protocol::wl_output::Transform::_90,
+            wayland_server::protocol::wl_output::Transform::_180,
+            wayland_server::protocol::wl_output::Transform::_270,
+            wayland_server::protocol::wl_output::Transform::Flipped,
+            wayland_server::protocol::wl_output::Transform::Flipped90,
+            wayland_server::protocol::wl_output::Transform::Flipped180,
+            wayland_server::protocol::wl_output::Transform::Flipped270,
+        ];
+        let raw_size = oblivion_one::render_backend::buffer::BufferSize::new(3, 2).unwrap();
+        for transform in transforms {
+            let quad = oblivion_one::compositor::SurfaceBufferMapping::new(
+                raw_size, 1, transform, None, None,
+            )
+            .unwrap()
+            .source_uv_quad()
+            .unwrap();
+            let uv = EglUvRect::from_surface_uv_quad(quad);
+            let mut vertices = Vec::new();
+            push_textured_quad(
+                &mut vertices,
+                EglRect::new(0.0, 0.0, 20.0, 20.0),
+                uv,
+                20,
+                20,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+
+            assert_eq!(vertices[0].uv, uv.top_left, "transform {transform:?}");
+            assert_eq!(vertices[1].uv, uv.bottom_left, "transform {transform:?}");
+            assert_eq!(vertices[2].uv, uv.bottom_right, "transform {transform:?}");
+            assert_eq!(vertices[5].uv, uv.top_right, "transform {transform:?}");
+        }
     }
 
     #[test]

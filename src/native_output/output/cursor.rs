@@ -1,6 +1,8 @@
 use super::cursor_buffer::*;
 use super::*;
+use oblivion_one::compositor::{transform_buffer_pixel, transformed_buffer_size};
 use oblivion_one::cursor_theme::CompositorCursorImage;
+use oblivion_one::render_backend::buffer::BufferSize;
 use std::sync::Arc;
 
 pub(crate) const NATIVE_HARDWARE_CURSOR_SIZE: u32 = 64;
@@ -1115,44 +1117,26 @@ fn transform_cursor_pixels(
     if pixels.len() < count {
         return None;
     }
-    let rotated = matches!(
-        transform,
-        wayland_server::protocol::wl_output::Transform::_90
-            | wayland_server::protocol::wl_output::Transform::_270
-            | wayland_server::protocol::wl_output::Transform::Flipped90
-            | wayland_server::protocol::wl_output::Transform::Flipped270
-    );
-    let output_width = if rotated { height } else { width };
-    let output_height = if rotated { width } else { height };
-    let mut output = vec![0; output_width.checked_mul(output_height)?];
-    for y in 0..output_height {
-        for x in 0..output_width {
-            let (source_x, source_y) = cursor_source_coordinate(x, y, width, height, transform);
-            output[y * output_width + x] = pixels[source_y * width + source_x];
+    let source_size = BufferSize::new(u32::try_from(width).ok()?, u32::try_from(height).ok()?)?;
+    let output_size = transformed_buffer_size(source_size, transform)?;
+    let mut output =
+        vec![0; usize::try_from(output_size.width.checked_mul(output_size.height)?).ok()?];
+    for source_y in 0..height {
+        for source_x in 0..width {
+            let (output_x, output_y) = transform_buffer_pixel(
+                u32::try_from(source_x).ok()?,
+                u32::try_from(source_y).ok()?,
+                source_size,
+                transform,
+            )?;
+            output[usize::try_from(output_y).ok()? * output_size.width as usize
+                + usize::try_from(output_x).ok()?] = pixels[source_y * width + source_x];
         }
     }
-    Some((output, (output_width, output_height)))
-}
-
-fn cursor_source_coordinate(
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    transform: wayland_server::protocol::wl_output::Transform,
-) -> (usize, usize) {
-    use wayland_server::protocol::wl_output::Transform;
-    match transform {
-        Transform::Normal => (x, y),
-        Transform::_90 => (y, height - 1 - x),
-        Transform::_180 => (width - 1 - x, height - 1 - y),
-        Transform::_270 => (height - 1 - y, x),
-        Transform::Flipped => (width - 1 - x, y),
-        Transform::Flipped90 => (y, x),
-        Transform::Flipped180 => (x, height - 1 - y),
-        Transform::Flipped270 => (height - 1 - y, width - 1 - x),
-        _ => (x.min(width - 1), y.min(height - 1)),
-    }
+    Some((
+        output,
+        (output_size.width as usize, output_size.height as usize),
+    ))
 }
 
 #[cfg(test)]
@@ -1179,51 +1163,13 @@ fn normalize_cursor_hotspot(
     {
         return None;
     }
-    let (x, y) = match transform {
-        wayland_server::protocol::wl_output::Transform::Normal => (hotspot_x, hotspot_y),
-        wayland_server::protocol::wl_output::Transform::_90 => (
-            i32::try_from(source_height)
-                .ok()?
-                .saturating_sub(1 + hotspot_y),
-            hotspot_x,
-        ),
-        wayland_server::protocol::wl_output::Transform::_180 => (
-            i32::try_from(source_width)
-                .ok()?
-                .saturating_sub(1 + hotspot_x),
-            i32::try_from(source_height)
-                .ok()?
-                .saturating_sub(1 + hotspot_y),
-        ),
-        wayland_server::protocol::wl_output::Transform::_270 => (
-            hotspot_y,
-            i32::try_from(source_width)
-                .ok()?
-                .saturating_sub(1 + hotspot_x),
-        ),
-        wayland_server::protocol::wl_output::Transform::Flipped => (
-            i32::try_from(source_width)
-                .ok()?
-                .saturating_sub(1 + hotspot_x),
-            hotspot_y,
-        ),
-        wayland_server::protocol::wl_output::Transform::Flipped90 => (hotspot_y, hotspot_x),
-        wayland_server::protocol::wl_output::Transform::Flipped180 => (
-            hotspot_x,
-            i32::try_from(source_height)
-                .ok()?
-                .saturating_sub(1 + hotspot_y),
-        ),
-        wayland_server::protocol::wl_output::Transform::Flipped270 => (
-            i32::try_from(source_width)
-                .ok()?
-                .saturating_sub(1 + hotspot_y),
-            i32::try_from(source_height)
-                .ok()?
-                .saturating_sub(1 + hotspot_x),
-        ),
-        _ => return None,
-    };
+    let source_size = BufferSize::new(source_width, source_height)?;
+    let (x, y) = transform_buffer_pixel(
+        u32::try_from(hotspot_x).ok()?,
+        u32::try_from(hotspot_y).ok()?,
+        source_size,
+        transform,
+    )?;
     let x = i64::from(x)
         .saturating_mul(i64::from(target_width))
         .checked_div(i64::from(transformed_width))?;

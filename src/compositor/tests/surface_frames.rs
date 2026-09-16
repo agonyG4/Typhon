@@ -1404,6 +1404,103 @@ fn wayland_bufferless_mapping_commit_publishes_viewport_resets_and_scale() {
 }
 
 #[test]
+fn wayland_damage_request_order_is_independent_of_mapping_updates() {
+    let run = |kind: u8, mapping_first: bool| {
+        let socket_name = unique_socket_name();
+        let server = OwnCompositorServer::bind(&socket_name).unwrap();
+        let socket_path = runtime_socket_path(&socket_name);
+        let (commands, server_thread) = spawn_controllable_test_server(server);
+        let stream = UnixStream::connect(&socket_path).unwrap();
+        let connection = Connection::from_socket(stream).unwrap();
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+        let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg_surface.get_toplevel(&qh, ());
+        let viewport = viewporter.get_viewport(&surface, &qh, ());
+        let (buffer_width, buffer_height) = match kind {
+            0 => (3, 2),
+            1 | 2 => (4, 2),
+            _ => panic!("unknown mapping test kind"),
+        };
+        let buffer = TestShmBuffer::new(&shm, &qh, buffer_width, buffer_height).unwrap();
+
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+        let apply_mapping = || match kind {
+            0 => surface.set_buffer_transform(wayland_client::protocol::wl_output::Transform::_90),
+            1 => surface.set_buffer_scale(2),
+            2 => {
+                viewport.set_source(1.0, 0.0, 2.0, 2.0);
+                viewport.set_destination(2, 2);
+            }
+            _ => unreachable!(),
+        };
+        let apply_damage = || surface.damage(0, 0, 1, 1);
+        apply_mapping();
+        buffer.attach(&surface, buffer_width, buffer_height);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+        commands
+            .send(ServerCommand::MarkRenderDamagePresented)
+            .unwrap();
+        wait_for_server_commands(&commands);
+
+        buffer.attach_without_damage(&surface);
+        if mapping_first {
+            apply_mapping();
+            apply_damage();
+        } else {
+            apply_damage();
+            apply_mapping();
+        }
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+        let server = stop_controllable_test_server(commands, server_thread);
+        server.renderable_surfaces()[0].damage.clone()
+    };
+
+    for kind in 0..=2 {
+        let expected = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: match kind {
+                0 => 0,
+                1 => 0,
+                2 => 1,
+                _ => unreachable!(),
+            },
+            y: match kind {
+                0 => 1,
+                1 | 2 => 0,
+                _ => unreachable!(),
+            },
+            width: match kind {
+                0 => 1,
+                1 => 2,
+                2 => 1,
+                _ => unreachable!(),
+            },
+            height: match kind {
+                0 => 1,
+                1 => 2,
+                2 => 1,
+                _ => unreachable!(),
+            },
+        }]);
+        assert_eq!(run(kind, false), expected, "mapping kind {kind}");
+        assert_eq!(run(kind, true), expected, "mapping kind {kind}");
+    }
+}
+
+#[test]
 fn wayland_bufferless_viewport_destroy_resets_retained_mapping() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
