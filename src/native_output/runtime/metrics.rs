@@ -1,3 +1,4 @@
+use super::presentation_metrics::build_buffering_performance_snapshot;
 use super::resource_efficiency::ResourceEfficiencyMetrics;
 use super::*;
 use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
@@ -7,9 +8,8 @@ use crate::native_output::{
     scanout::NativePaintStats,
 };
 use oblivion_one::control_snapshots::{
-    BufferingPerformanceSnapshot, KmsPerformanceSnapshot, PerformanceSnapshot,
-    RepaintPerformanceSnapshot, SignedTimingSummarySnapshot, TimingSummarySnapshot,
-    WorkerTimingPerformanceSnapshot,
+    KmsPerformanceSnapshot, PerformanceSnapshot, RepaintPerformanceSnapshot,
+    SignedTimingSummarySnapshot, TimingSummarySnapshot, WorkerTimingPerformanceSnapshot,
 };
 use oblivion_one::native::scheduler::{
     SchedulerWakeDeadline, SchedulerWakeDeadlineKind, apply_atomic_commit_lane_guard,
@@ -282,55 +282,12 @@ impl NativeRuntime {
         PerformanceSnapshot {
             compositor_cpu_render,
             repaint: self.render_telemetry.control_snapshot(),
-            buffering: BufferingPerformanceSnapshot {
-                reactive_double_frames: buffering.reactive_double_frames,
-                predictive_triple_frames: buffering.predictive_triple_frames,
-                future_primary_credit: self.adaptive_buffering.future_primary_credit(),
-                extra_credit_grants: self.adaptive_buffering.extra_credit_grants(),
-                extra_credit_revokes: self.adaptive_buffering.extra_credit_revokes(),
-                o1_credit2_useful_hits: buffering.o1_credit2_useful_hits,
-                o1_credit2_unnecessary_hits: buffering.o1_credit2_unnecessary_hits,
-                o1_credit2_ineffective_misses: buffering.o1_credit2_ineffective_misses,
-                o1_credit2_granted_not_consumed: buffering.o1_credit2_granted_not_consumed,
-                o1_credit2_drain_events: buffering.o1_credit2_drain_events,
-                o1_credit2_refill_suppressed_while_draining: buffering
-                    .o1_credit2_refill_suppressed_while_draining,
-                pre_render_abandoned: self.presentation_deadline.pre_render_abandoned(),
-                predicted_independent_render_ready_service_ns: service_prediction
-                    .main_event_loop_wake_guard_ns
-                    .saturating_add(service_prediction.render_risk_ns),
-                predicted_independent_kms_lead_ns: service_prediction.kms_total_lead_ns,
-                predicted_independent_total_service_ns: service_prediction
-                    .independent_total_cost_ns,
-                predicted_warm_paired_total_service_ns: service_prediction
-                    .warm_paired_total_cost_ns,
-                predicted_independent_p90_floor_ns: service_prediction.independent_p90_floor_ns,
-                predicted_worker_non_ioctl_lead_ns: service_prediction.worker_non_ioctl_lead_ns,
-                predicted_miss_recovery_remaining: service_prediction.miss_recovery_remaining
-                    as u64,
-                predicted_total_service_ns: service_prediction.total_cost_ns,
-                last_overlap_required_ns: self.adaptive_buffering.last_overlap_required_ns(),
-                positive_overlap_observations: self
-                    .adaptive_buffering
-                    .positive_overlap_observations(),
-                nonpositive_overlap_observations: self
-                    .adaptive_buffering
-                    .nonpositive_overlap_observations(),
-                render_ahead_attempts: buffering.render_ahead_attempts,
-                render_ahead_ready: buffering.render_ahead_ready,
-                ready_submits: buffering.ready_submits,
-                triple_entries_predicted: buffering.triple_entries_predicted,
-                triple_entries_render_miss: buffering.triple_entries_render_miss,
-                triple_entries_submit_miss: buffering.triple_entries_submit_miss,
-                triple_entries_presentation_miss: buffering.triple_entries_presentation_miss,
-                triple_exits: buffering.triple_exits,
-                ready_pull_in_attempts: buffering.ready_pull_in_attempts,
-                ready_pull_in_successes: buffering.ready_pull_in_successes,
-                ready_pull_in_rejected_too_late: buffering.ready_pull_in_rejected_too_late,
-                ready_pull_in_rejected_owned: buffering.ready_pull_in_rejected_owned,
-                ready_pull_in_rejected_identity: buffering.ready_pull_in_rejected_identity,
-                ready_pull_in_advanced_intervals: buffering.ready_pull_in_advanced_intervals,
-            },
+            buffering: build_buffering_performance_snapshot(
+                buffering,
+                &self.adaptive_buffering,
+                self.presentation_deadline.pre_render_abandoned(),
+                &service_prediction,
+            ),
             kms: KmsPerformanceSnapshot {
                 mode_refresh_interval_ns: presentation_timing.mode().refresh_interval_ns(),
                 mode_blanking_interval_ns: presentation_timing.mode().blanking_interval_ns(),

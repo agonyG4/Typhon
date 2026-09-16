@@ -1,5 +1,7 @@
 use super::*;
+use crate::native_output::pacing::NativeBufferingMetrics;
 use oblivion_one::compositor::SurfaceDamagePresentation;
+use oblivion_one::control_snapshots::BufferingPerformanceSnapshot;
 use oblivion_one::native::adaptive_buffering::{AdaptiveBufferingController, RenderPrediction};
 
 #[allow(clippy::too_many_arguments)]
@@ -110,6 +112,56 @@ pub(super) fn build_render_begin_fields(
     ];
     fields.extend(snapshot_fields(buffer_snapshot));
     fields
+}
+
+pub(super) fn build_buffering_performance_snapshot(
+    buffering: NativeBufferingMetrics,
+    adaptive_buffering: &AdaptiveBufferingController,
+    pre_render_abandoned: u64,
+    prediction: &RenderPrediction,
+) -> BufferingPerformanceSnapshot {
+    BufferingPerformanceSnapshot {
+        reactive_double_frames: buffering.reactive_double_frames,
+        predictive_triple_frames: buffering.predictive_triple_frames,
+        future_primary_credit: adaptive_buffering.future_primary_credit(),
+        extra_credit_grants: adaptive_buffering.extra_credit_grants(),
+        extra_credit_revokes: adaptive_buffering.extra_credit_revokes(),
+        o1_credit2_useful_hits: buffering.o1_credit2_useful_hits,
+        o1_credit2_unnecessary_hits: buffering.o1_credit2_unnecessary_hits,
+        o1_credit2_ineffective_misses: buffering.o1_credit2_ineffective_misses,
+        o1_credit2_granted_not_consumed: buffering.o1_credit2_granted_not_consumed,
+        o1_credit2_drain_events: buffering.o1_credit2_drain_events,
+        o1_credit2_refill_suppressed_while_draining: buffering
+            .o1_credit2_refill_suppressed_while_draining,
+        pre_render_abandoned,
+        predicted_independent_render_ready_service_ns: prediction
+            .main_event_loop_wake_guard_ns
+            .saturating_add(prediction.render_risk_ns),
+        predicted_independent_kms_lead_ns: prediction.kms_total_lead_ns,
+        predicted_independent_total_service_ns: prediction.independent_total_cost_ns,
+        predicted_warm_paired_total_service_ns: prediction.warm_paired_total_cost_ns,
+        predicted_independent_p90_floor_ns: prediction.independent_p90_floor_ns,
+        predicted_worker_non_ioctl_lead_ns: prediction.worker_non_ioctl_lead_ns,
+        predicted_miss_recovery_remaining: prediction.miss_recovery_remaining as u64,
+        predicted_total_service_ns: prediction.total_cost_ns,
+        last_overlap_required_ns: adaptive_buffering.last_overlap_required_ns(),
+        positive_overlap_observations: adaptive_buffering.positive_overlap_observations(),
+        nonpositive_overlap_observations: adaptive_buffering.nonpositive_overlap_observations(),
+        render_ahead_attempts: buffering.render_ahead_attempts,
+        render_ahead_ready: buffering.render_ahead_ready,
+        ready_submits: buffering.ready_submits,
+        triple_entries_predicted: buffering.triple_entries_predicted,
+        triple_entries_render_miss: buffering.triple_entries_render_miss,
+        triple_entries_submit_miss: buffering.triple_entries_submit_miss,
+        triple_entries_presentation_miss: buffering.triple_entries_presentation_miss,
+        triple_exits: buffering.triple_exits,
+        ready_pull_in_attempts: buffering.ready_pull_in_attempts,
+        ready_pull_in_successes: buffering.ready_pull_in_successes,
+        ready_pull_in_rejected_too_late: buffering.ready_pull_in_rejected_too_late,
+        ready_pull_in_rejected_owned: buffering.ready_pull_in_rejected_owned,
+        ready_pull_in_rejected_identity: buffering.ready_pull_in_rejected_identity,
+        ready_pull_in_advanced_intervals: buffering.ready_pull_in_advanced_intervals,
+    }
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -334,4 +386,126 @@ pub(super) fn log_output_pipeline_snapshot(
             NativePerfField::bool("terminal_ownership_valid", terminal_ownership_valid),
         ]
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_buffering_performance_snapshot;
+    use crate::native_output::pacing::NativeBufferingMetrics;
+    use oblivion_one::native::adaptive_buffering::{
+        AdaptiveBufferingController, AdaptiveRenderJournal, AdaptiveTripleBufferPolicy,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn buffering_snapshot_builder_preserves_metric_sources() {
+        let buffering = NativeBufferingMetrics {
+            reactive_double_frames: 1,
+            predictive_triple_frames: 2,
+            render_ahead_attempts: 3,
+            render_ahead_ready: 4,
+            ready_submits: 5,
+            triple_entries_predicted: 6,
+            triple_entries_render_miss: 7,
+            triple_entries_submit_miss: 8,
+            triple_entries_presentation_miss: 9,
+            triple_exits: 10,
+            o1_credit2_useful_hits: 11,
+            o1_credit2_unnecessary_hits: 12,
+            o1_credit2_ineffective_misses: 13,
+            o1_credit2_granted_not_consumed: 14,
+            o1_credit2_drain_events: 15,
+            o1_credit2_refill_suppressed_while_draining: 16,
+            ready_pull_in_attempts: 17,
+            ready_pull_in_successes: 18,
+            ready_pull_in_rejected_too_late: 19,
+            ready_pull_in_rejected_owned: 20,
+            ready_pull_in_rejected_identity: 21,
+            ready_pull_in_advanced_intervals: 22,
+        };
+        let adaptive = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        let prediction = AdaptiveRenderJournal::default()
+            .prediction_with_kms_guard(Duration::from_millis(10), 100_000);
+
+        let snapshot = build_buffering_performance_snapshot(buffering, &adaptive, 23, &prediction);
+
+        assert_eq!(snapshot.reactive_double_frames, 1);
+        assert_eq!(snapshot.predictive_triple_frames, 2);
+        assert_eq!(
+            snapshot.future_primary_credit,
+            adaptive.future_primary_credit()
+        );
+        assert_eq!(snapshot.extra_credit_grants, adaptive.extra_credit_grants());
+        assert_eq!(
+            snapshot.extra_credit_revokes,
+            adaptive.extra_credit_revokes()
+        );
+        assert_eq!(snapshot.o1_credit2_useful_hits, 11);
+        assert_eq!(snapshot.o1_credit2_unnecessary_hits, 12);
+        assert_eq!(snapshot.o1_credit2_ineffective_misses, 13);
+        assert_eq!(snapshot.o1_credit2_granted_not_consumed, 14);
+        assert_eq!(snapshot.o1_credit2_drain_events, 15);
+        assert_eq!(snapshot.o1_credit2_refill_suppressed_while_draining, 16);
+        assert_eq!(snapshot.pre_render_abandoned, 23);
+        assert_eq!(
+            snapshot.predicted_independent_render_ready_service_ns,
+            prediction
+                .main_event_loop_wake_guard_ns
+                .saturating_add(prediction.render_risk_ns)
+        );
+        assert_eq!(
+            snapshot.predicted_independent_kms_lead_ns,
+            prediction.kms_total_lead_ns
+        );
+        assert_eq!(
+            snapshot.predicted_independent_total_service_ns,
+            prediction.independent_total_cost_ns
+        );
+        assert_eq!(
+            snapshot.predicted_warm_paired_total_service_ns,
+            prediction.warm_paired_total_cost_ns
+        );
+        assert_eq!(
+            snapshot.predicted_independent_p90_floor_ns,
+            prediction.independent_p90_floor_ns
+        );
+        assert_eq!(
+            snapshot.predicted_worker_non_ioctl_lead_ns,
+            prediction.worker_non_ioctl_lead_ns
+        );
+        assert_eq!(
+            snapshot.predicted_miss_recovery_remaining,
+            prediction.miss_recovery_remaining as u64
+        );
+        assert_eq!(
+            snapshot.predicted_total_service_ns,
+            prediction.total_cost_ns
+        );
+        assert_eq!(
+            snapshot.last_overlap_required_ns,
+            adaptive.last_overlap_required_ns()
+        );
+        assert_eq!(
+            snapshot.positive_overlap_observations,
+            adaptive.positive_overlap_observations()
+        );
+        assert_eq!(
+            snapshot.nonpositive_overlap_observations,
+            adaptive.nonpositive_overlap_observations()
+        );
+        assert_eq!(snapshot.render_ahead_attempts, 3);
+        assert_eq!(snapshot.render_ahead_ready, 4);
+        assert_eq!(snapshot.ready_submits, 5);
+        assert_eq!(snapshot.triple_entries_predicted, 6);
+        assert_eq!(snapshot.triple_entries_render_miss, 7);
+        assert_eq!(snapshot.triple_entries_submit_miss, 8);
+        assert_eq!(snapshot.triple_entries_presentation_miss, 9);
+        assert_eq!(snapshot.triple_exits, 10);
+        assert_eq!(snapshot.ready_pull_in_attempts, 17);
+        assert_eq!(snapshot.ready_pull_in_successes, 18);
+        assert_eq!(snapshot.ready_pull_in_rejected_too_late, 19);
+        assert_eq!(snapshot.ready_pull_in_rejected_owned, 20);
+        assert_eq!(snapshot.ready_pull_in_rejected_identity, 21);
+        assert_eq!(snapshot.ready_pull_in_advanced_intervals, 22);
+    }
 }
