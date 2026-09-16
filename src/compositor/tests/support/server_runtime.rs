@@ -160,6 +160,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ToggleMaximizeFocused,
     ToggleFocusedWindowLayout,
     ToggleFullscreenFocused,
+    ActivateWorkspace {
+        workspace: u32,
+    },
     ToggleDefaultSpecialWorkspace,
     MoveFocusedWindowToOrFromSpecialWorkspace,
     MoveFocusedWindowToWorkspace {
@@ -599,6 +602,11 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::ToggleFullscreenFocused => {
                         server.toggle_fullscreen_focused_window();
+                    }
+                    ServerCommand::ActivateWorkspace { workspace } => {
+                        if let Some(workspace) = WorkspaceId::new(workspace) {
+                            server.activate_workspace(workspace);
+                        }
                     }
                     ServerCommand::ToggleDefaultSpecialWorkspace => {
                         server.toggle_default_special_workspace();
