@@ -28,14 +28,6 @@ impl CompositorState {
             output_size,
             |root_surface_id| self.window_id_for_surface(root_surface_id).is_some(),
             |root_surface_id| self.layer_surfaces.contains_key(&root_surface_id),
-            |root_surface_id| {
-                self.current_visual_root_window_geometry(root_surface_id)
-                    .is_some_and(|geometry| {
-                        geometry.width == self.output_size.width
-                            && geometry.height == self.output_size.height
-                            && geometry.placement == SurfacePlacement::absolute_root_at(0, 0)
-                    })
-            },
             |surface, target| self.presentation_coverage_opacity(surface, target, output_size),
         )
     }

@@ -81,7 +81,6 @@ pub(crate) fn analyze_presentation_coverage(
     output_size: BufferSize,
     is_application_group: impl Fn(u32) -> bool,
     is_layer_group: impl Fn(u32) -> bool,
-    covers_output: impl Fn(u32) -> bool,
     surface_opacity: impl Fn(&RenderableSurface, SurfaceTargetRect) -> PresentationCoverageOpacity,
 ) -> PresentationCoverageAnalysis {
     let output_rect = SurfaceTargetRect::new(0, 0, output_size.width, output_size.height);
@@ -90,7 +89,11 @@ pub(crate) fn analyze_presentation_coverage(
     let covering_group_index = groups.iter().enumerate().rev().find_map(|(index, group)| {
         (is_application_group(group.root_surface_id())
             && !popup_surface_ids.contains(&group.root_surface_id())
-            && covers_output(group.root_surface_id()))
+            && group.surface_indices().iter().any(|surface_index| {
+                render_targets
+                    .get(*surface_index)
+                    .is_some_and(|target| target.intersection(output_rect) == Some(output_rect))
+            }))
         .then_some(index)
     });
 
@@ -303,7 +306,6 @@ mod tests {
             BufferSize::new(1280, 800).expect("test output size"),
             |root| apps.contains(&root),
             |root| layers.contains(&root),
-            |root| root == 10,
             |surface, _target| {
                 if surface.surface_id == 10 {
                     PresentationCoverageOpacity::OpaqueXrgb8888
@@ -441,7 +443,6 @@ mod tests {
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 10 || root == 40,
             |root| root == 50,
-            |root| root == 10,
             |surface, _target| {
                 if surface.surface_id == 10 {
                     PresentationCoverageOpacity::OpaqueXrgb8888
@@ -484,7 +485,6 @@ mod tests {
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 1 || root == 10,
             |_| false,
-            |root| root == 10,
             |_, _| PresentationCoverageOpacity::Unknown,
         );
 
@@ -516,7 +516,6 @@ mod tests {
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 10,
             |_| false,
-            |root| root == 10,
             |_, _| PresentationCoverageOpacity::OpaqueXrgb8888,
         );
 
