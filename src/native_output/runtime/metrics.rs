@@ -296,10 +296,18 @@ impl NativeRuntime {
                 o1_credit2_refill_suppressed_while_draining: buffering
                     .o1_credit2_refill_suppressed_while_draining,
                 pre_render_abandoned: self.presentation_deadline.pre_render_abandoned(),
-                predicted_render_ready_service_ns: service_prediction
+                predicted_independent_render_ready_service_ns: service_prediction
                     .main_event_loop_wake_guard_ns
                     .saturating_add(service_prediction.render_risk_ns),
-                predicted_kms_lead_ns: service_prediction.kms_total_lead_ns,
+                predicted_independent_kms_lead_ns: service_prediction.kms_total_lead_ns,
+                predicted_independent_total_service_ns: service_prediction
+                    .independent_total_cost_ns,
+                predicted_warm_paired_total_service_ns: service_prediction
+                    .warm_paired_total_cost_ns,
+                predicted_independent_p90_floor_ns: service_prediction.independent_p90_floor_ns,
+                predicted_worker_non_ioctl_lead_ns: service_prediction.worker_non_ioctl_lead_ns,
+                predicted_miss_recovery_remaining: service_prediction.miss_recovery_remaining
+                    as u64,
                 predicted_total_service_ns: service_prediction.total_cost_ns,
                 last_overlap_required_ns: self.adaptive_buffering.last_overlap_required_ns(),
                 positive_overlap_observations: self

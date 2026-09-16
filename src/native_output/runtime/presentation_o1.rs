@@ -1,4 +1,4 @@
-use oblivion_one::native::adaptive_buffering::AdaptiveBufferingController;
+use oblivion_one::native::adaptive_buffering::{AdaptiveBufferingController, RenderPrediction};
 use oblivion_one::native::buffering::{O1AdmissionObservation, PipelineServiceEstimate};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use std::time::Duration;
@@ -70,11 +70,24 @@ pub(super) fn overlap_required_for_current_opportunity(
     )
 }
 
+pub(super) fn pipeline_service_estimate_for_prediction(
+    prediction: &RenderPrediction,
+) -> PipelineServiceEstimate {
+    PipelineServiceEstimate::new(
+        prediction.main_event_loop_wake_guard_ns,
+        prediction.render_risk_ns,
+        prediction.kms_dispatch_budget_ns,
+        prediction.kms_apply_guard_ns,
+    )
+    .with_selected_end_to_end_service_ns(prediction.total_cost_ns)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::observe_current_o1_opportunity;
+    use super::{observe_current_o1_opportunity, overlap_required_for_current_opportunity};
     use oblivion_one::native::adaptive_buffering::{
-        AdaptiveBufferingController, AdaptiveTripleBufferPolicy, TripleCapability,
+        AdaptiveBufferingController, AdaptiveTripleBufferPolicy, PredictionEstimatorMode,
+        RenderPrediction, TripleCapability,
     };
     use oblivion_one::native::presentation_deadline::{
         MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
@@ -122,5 +135,53 @@ mod tests {
         assert_eq!(retry.desired_credit_after, 2);
         assert!(!retry.granted_extra_credit);
         assert_eq!(adaptive.extra_credit_grants(), 1);
+    }
+
+    fn selected_prediction() -> RenderPrediction {
+        RenderPrediction {
+            ewma_render_ns: 10_000_000,
+            upper_render_deviation_ns: 0,
+            p90_recent_render_ns: 1_000_000,
+            render_risk_ns: 10_000_000,
+            p95_wake_lateness_ns: 1_000_000,
+            p95_atomic_submit_ns: 1_000_000,
+            p95_worker_queue_residency_ns: 0,
+            p95_worker_pre_submit_ns: 0,
+            p95_worker_dispatch_ns: 0,
+            p95_atomic_ioctl_ns: 1_000_000,
+            main_event_loop_wake_guard_ns: 1_000_000,
+            kms_dispatch_budget_ns: 1_000_000,
+            kms_apply_guard_ns: 1_000_000,
+            kms_total_lead_ns: 2_000_000,
+            p95_target_slip_ns: 0,
+            paired_service_p95_ns: 4_500_000,
+            paired_service_samples: 20,
+            estimator_mode: PredictionEstimatorMode::WarmPaired,
+            independent_total_cost_ns: 13_000_000,
+            warm_paired_total_cost_ns: 6_500_000,
+            independent_p90_floor_ns: 3_000_000,
+            worker_non_ioctl_lead_ns: 0,
+            miss_recovery_remaining: 0,
+            total_cost_ns: 6_500_000,
+            idle_wake_guard: false,
+        }
+    }
+
+    #[test]
+    fn o1_overlap_uses_selected_prediction_total_from_integration_boundary() {
+        let prediction = selected_prediction();
+        let estimate = super::pipeline_service_estimate_for_prediction(&prediction);
+        let overlap_required_ns = overlap_required_for_current_opportunity(
+            Some(predecessor()),
+            Duration::from_millis(6),
+            estimate,
+        );
+
+        assert_eq!(estimate.end_to_end_service_ns(), 6_500_000);
+        assert_eq!(
+            estimate.latest_successor_render_start(MonotonicTimestampNs::new(16_000_000)),
+            MonotonicTimestampNs::new(9_500_000)
+        );
+        assert_eq!(overlap_required_ns, 500_000);
     }
 }

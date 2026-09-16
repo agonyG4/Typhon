@@ -24,7 +24,7 @@ use super::presentation_metrics::{
 };
 use super::presentation_o1::{
     admission_observation_for_frame, observe_current_o1_opportunity,
-    overlap_required_for_current_opportunity,
+    overlap_required_for_current_opportunity, pipeline_service_estimate_for_prediction,
 };
 use super::presentation_pipeline::build_output_pipeline_snapshot_with_presented;
 use super::presentation_protocol::{
@@ -38,7 +38,6 @@ use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
 use oblivion_one::compositor::FrameCallbackAdmission;
-use oblivion_one::native::buffering::PipelineServiceEstimate;
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
 
@@ -372,7 +371,7 @@ impl NativeRuntime {
             }
         };
         adaptive_buffering.apply_capability(triple_capability);
-        #[rustfmt::skip] let estimate = PipelineServiceEstimate::new(prediction.main_event_loop_wake_guard_ns, prediction.render_risk_ns, prediction.kms_dispatch_budget_ns, prediction.kms_apply_guard_ns);
+        let estimate = pipeline_service_estimate_for_prediction(&prediction);
         let overlap_required_ns =
             overlap_required_for_current_opportunity(pending_target, refresh_interval, estimate);
         let o1_demand =

@@ -1256,6 +1256,29 @@ mod tests {
     }
 
     #[test]
+    fn prediction_summary_exposes_selected_estimator_arithmetic() {
+        let journal = oblivion_one::native::adaptive_buffering::AdaptiveRenderJournal::default();
+        let prediction =
+            journal.prediction_with_kms_guard(std::time::Duration::from_millis(10), 100_000);
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.note_prediction(prediction);
+
+        let summary = pacing.content_summary_line();
+        for field in [
+            "prediction_independent_total_cost_ns=5350000",
+            "prediction_warm_paired_total_cost_ns=1350000",
+            "prediction_independent_p90_floor_ns=1350000",
+            "prediction_worker_non_ioctl_lead_ns=250000",
+            "prediction_miss_recovery_remaining=0",
+            "prediction_estimator_mode=cold_start",
+            "prediction_total_cost_ns=5350000",
+        ] {
+            assert!(summary.contains(field), "missing estimator field {field}");
+        }
+    }
+
+    #[test]
     fn fast_client_population_requires_continuous_exact_surface_content() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -4705,6 +4728,26 @@ impl NativeFramePacing {
                 PacingField::u64(
                     "prediction_render_risk_ns",
                     prediction.map_or(0, |value| value.render_risk_ns),
+                ),
+                PacingField::u64(
+                    "prediction_independent_total_cost_ns",
+                    prediction.map_or(0, |value| value.independent_total_cost_ns),
+                ),
+                PacingField::u64(
+                    "prediction_warm_paired_total_cost_ns",
+                    prediction.map_or(0, |value| value.warm_paired_total_cost_ns),
+                ),
+                PacingField::u64(
+                    "prediction_independent_p90_floor_ns",
+                    prediction.map_or(0, |value| value.independent_p90_floor_ns),
+                ),
+                PacingField::u64(
+                    "prediction_worker_non_ioctl_lead_ns",
+                    prediction.map_or(0, |value| value.worker_non_ioctl_lead_ns),
+                ),
+                PacingField::usize(
+                    "prediction_miss_recovery_remaining",
+                    prediction.map_or(0, |value| value.miss_recovery_remaining),
                 ),
                 PacingField::u64(
                     "prediction_p95_wake_lateness_ns",

@@ -213,6 +213,7 @@ pub struct PipelineServiceEstimate {
     pub render_risk_ns: u64,
     pub kms_dispatch_budget_ns: u64,
     pub kms_apply_guard_ns: u64,
+    selected_end_to_end_service_ns: u64,
 }
 
 impl PipelineServiceEstimate {
@@ -227,7 +228,19 @@ impl PipelineServiceEstimate {
             render_risk_ns,
             kms_dispatch_budget_ns,
             kms_apply_guard_ns,
+            selected_end_to_end_service_ns: main_wake_guard_ns
+                .saturating_add(render_risk_ns)
+                .saturating_add(kms_dispatch_budget_ns)
+                .saturating_add(kms_apply_guard_ns),
         }
+    }
+
+    pub const fn with_selected_end_to_end_service_ns(
+        mut self,
+        selected_end_to_end_service_ns: u64,
+    ) -> Self {
+        self.selected_end_to_end_service_ns = selected_end_to_end_service_ns;
+        self
     }
 
     pub const fn render_ready_service_ns(self) -> u64 {
@@ -240,8 +253,7 @@ impl PipelineServiceEstimate {
     }
 
     pub const fn end_to_end_service_ns(self) -> u64 {
-        self.render_ready_service_ns()
-            .saturating_add(self.kms_lead_ns())
+        self.selected_end_to_end_service_ns
     }
 
     pub fn latest_successor_render_start(
@@ -251,9 +263,7 @@ impl PipelineServiceEstimate {
         MonotonicTimestampNs::new(
             successor_presentation
                 .get()
-                .saturating_sub(self.kms_apply_guard_ns)
-                .saturating_sub(self.kms_dispatch_budget_ns)
-                .saturating_sub(self.render_ready_service_ns()),
+                .saturating_sub(self.end_to_end_service_ns()),
         )
     }
 
@@ -343,6 +353,23 @@ mod tests {
                 MonotonicTimestampNs::new(108_000),
             ),
             0
+        );
+    }
+
+    #[test]
+    fn selected_end_to_end_total_controls_o1_deadline_and_overlap() {
+        let estimate = PipelineServiceEstimate::new(1_000, 3_000, 500, 500)
+            .with_selected_end_to_end_service_ns(6_500);
+        let successor = MonotonicTimestampNs::new(20_000);
+
+        assert_eq!(estimate.end_to_end_service_ns(), 6_500);
+        assert_eq!(
+            estimate.latest_successor_render_start(successor),
+            MonotonicTimestampNs::new(13_500)
+        );
+        assert_eq!(
+            estimate.overlap_required_ns(MonotonicTimestampNs::new(15_000), successor),
+            1_500
         );
     }
 

@@ -606,8 +606,20 @@ pub struct BufferingPerformanceSnapshot {
     pub o1_credit2_drain_events: u64,
     pub o1_credit2_refill_suppressed_while_draining: u64,
     pub pre_render_abandoned: u64,
-    pub predicted_render_ready_service_ns: u64,
-    pub predicted_kms_lead_ns: u64,
+    #[serde(alias = "predictedRenderReadyServiceNs")]
+    pub predicted_independent_render_ready_service_ns: u64,
+    #[serde(alias = "predictedKmsLeadNs")]
+    pub predicted_independent_kms_lead_ns: u64,
+    #[serde(default)]
+    pub predicted_independent_total_service_ns: u64,
+    #[serde(default)]
+    pub predicted_warm_paired_total_service_ns: u64,
+    #[serde(default)]
+    pub predicted_independent_p90_floor_ns: u64,
+    #[serde(default)]
+    pub predicted_worker_non_ioctl_lead_ns: u64,
+    #[serde(default)]
+    pub predicted_miss_recovery_remaining: u64,
     pub predicted_total_service_ns: u64,
     pub last_overlap_required_ns: u64,
     pub positive_overlap_observations: u64,
@@ -914,8 +926,13 @@ mod tests {
                 "o1Credit2DrainEvents": 0,
                 "o1Credit2RefillSuppressedWhileDraining": 0,
                 "preRenderAbandoned": 0,
-                "predictedRenderReadyServiceNs": 0,
-                "predictedKmsLeadNs": 0,
+                "predictedIndependentRenderReadyServiceNs": 0,
+                "predictedIndependentKmsLeadNs": 0,
+                "predictedIndependentTotalServiceNs": 0,
+                "predictedWarmPairedTotalServiceNs": 0,
+                "predictedIndependentP90FloorNs": 0,
+                "predictedWorkerNonIoctlLeadNs": 0,
+                "predictedMissRecoveryRemaining": 0,
                 "predictedTotalServiceNs": 0,
                 "lastOverlapRequiredNs": 0,
                 "positiveOverlapObservations": 0,

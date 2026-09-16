@@ -43,6 +43,26 @@ pub(super) fn build_render_begin_fields(
         PacingField::u64("prediction_p90_ns", prediction.p90_recent_render_ns),
         PacingField::u64("prediction_render_risk_ns", prediction.render_risk_ns),
         PacingField::u64(
+            "prediction_independent_total_cost_ns",
+            prediction.independent_total_cost_ns,
+        ),
+        PacingField::u64(
+            "prediction_warm_paired_total_cost_ns",
+            prediction.warm_paired_total_cost_ns,
+        ),
+        PacingField::u64(
+            "prediction_independent_p90_floor_ns",
+            prediction.independent_p90_floor_ns,
+        ),
+        PacingField::u64(
+            "prediction_worker_non_ioctl_lead_ns",
+            prediction.worker_non_ioctl_lead_ns,
+        ),
+        PacingField::usize(
+            "prediction_miss_recovery_remaining",
+            prediction.miss_recovery_remaining,
+        ),
+        PacingField::u64(
             "prediction_worker_queue_residency_ns",
             prediction.p95_worker_queue_residency_ns,
         ),
@@ -68,6 +88,18 @@ pub(super) fn build_render_begin_fields(
             prediction.kms_apply_guard_ns,
         ),
         PacingField::u64("prediction_kms_total_lead_ns", prediction.kms_total_lead_ns),
+        PacingField::u64(
+            "prediction_paired_service_p95_ns",
+            prediction.paired_service_p95_ns,
+        ),
+        PacingField::usize(
+            "prediction_paired_service_samples",
+            prediction.paired_service_samples,
+        ),
+        PacingField::str(
+            "prediction_estimator_mode",
+            prediction.estimator_mode.as_str(),
+        ),
         PacingField::u64(
             "main_event_loop_wake_guard_ns",
             prediction.main_event_loop_wake_guard_ns,

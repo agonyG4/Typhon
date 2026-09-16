@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 const SAMPLE_CAPACITY: usize = 120;
+const WARM_PAIRED_MIN_SAMPLES: usize = 20;
+const MISS_RECOVERY_PAIRED_SUCCESSES: usize = 20;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +211,11 @@ pub struct RenderPrediction {
     pub paired_service_p95_ns: u64,
     pub paired_service_samples: usize,
     pub estimator_mode: PredictionEstimatorMode,
+    pub independent_total_cost_ns: u64,
+    pub warm_paired_total_cost_ns: u64,
+    pub independent_p90_floor_ns: u64,
+    pub worker_non_ioctl_lead_ns: u64,
+    pub miss_recovery_remaining: usize,
     pub total_cost_ns: u64,
     pub idle_wake_guard: bool,
 }
@@ -343,16 +350,13 @@ impl AdaptiveRenderJournal {
 
     pub fn note_proven_deadline_miss(&mut self) {
         self.missed_deadlines = self.missed_deadlines.saturating_add(1);
-        self.miss_recovery_remaining = self
-            .miss_recovery_remaining
-            .saturating_add(1)
-            .min(SAMPLE_CAPACITY);
+        self.miss_recovery_remaining = MISS_RECOVERY_PAIRED_SUCCESSES;
     }
 
     pub fn prediction_estimator_mode(&self) -> PredictionEstimatorMode {
         if self.miss_recovery_remaining > 0 {
             PredictionEstimatorMode::MissRecovery
-        } else if self.paired_service_samples_ns.len() >= 20 {
+        } else if self.paired_service_samples_ns.len() >= WARM_PAIRED_MIN_SAMPLES {
             PredictionEstimatorMode::WarmPaired
         } else {
             PredictionEstimatorMode::ColdStart
@@ -441,7 +445,7 @@ impl AdaptiveRenderJournal {
         } else {
             central_risk.max(p90)
         };
-        if (1..20).contains(&self.render_samples_ns.len()) {
+        if (1..WARM_PAIRED_MIN_SAMPLES).contains(&self.render_samples_ns.len()) {
             render_risk =
                 render_risk.max(self.render_samples_ns.iter().copied().max().unwrap_or(0));
         }
@@ -457,15 +461,16 @@ impl AdaptiveRenderJournal {
         let exported_submission_budget = nearest_rank(&self.submission_budget_samples_ns, 95);
         let kms_dispatch_budget = if exported_submission_budget != 0 {
             exported_submission_budget
-        } else if self.atomic_submit_samples_ns.len() < 20 {
+        } else if self.atomic_submit_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES {
             measured_dispatch_budget.max(250_000)
         } else {
             measured_dispatch_budget
         };
         let ceiling = 2_000_000_u64.min(refresh_ns / 4).max(500_000);
         let dynamic_margin = p95_wake.saturating_add(250_000).clamp(500_000, ceiling);
-        let main_event_loop_wake_guard = if self.wake_lateness_samples_ns.len() < 20
-            || self.atomic_submit_samples_ns.len() < 20
+        let main_event_loop_wake_guard = if self.wake_lateness_samples_ns.len()
+            < WARM_PAIRED_MIN_SAMPLES
+            || self.atomic_submit_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES
         {
             dynamic_margin.max(1_000_000)
         } else {
@@ -473,9 +478,27 @@ impl AdaptiveRenderJournal {
         };
         let kms_total_lead = kms_dispatch_budget.saturating_add(kms_apply_guard_ns);
         let paired_service_p95_ns = nearest_rank(&self.paired_service_samples_ns, 95);
-        let mut total = render_risk
+        let independent_total_cost_ns = render_risk
             .saturating_add(main_event_loop_wake_guard)
             .saturating_add(kms_total_lead);
+        let worker_non_ioctl_lead_ns = kms_dispatch_budget.saturating_sub(p95_ioctl);
+        let warm_paired_total_cost_ns = paired_service_p95_ns
+            .saturating_add(main_event_loop_wake_guard)
+            .saturating_add(worker_non_ioctl_lead_ns)
+            .saturating_add(kms_apply_guard_ns);
+        let independent_p90_floor_ns = p90
+            .saturating_add(main_event_loop_wake_guard)
+            .saturating_add(kms_dispatch_budget)
+            .saturating_add(kms_apply_guard_ns);
+        let estimator_mode = self.prediction_estimator_mode();
+        let mut total = match estimator_mode {
+            PredictionEstimatorMode::ColdStart | PredictionEstimatorMode::MissRecovery => {
+                independent_total_cost_ns
+            }
+            PredictionEstimatorMode::WarmPaired => {
+                warm_paired_total_cost_ns.max(independent_p90_floor_ns)
+            }
+        };
         if idle {
             total = total.max(refresh_ns.saturating_sub(100_000));
         }
@@ -497,7 +520,12 @@ impl AdaptiveRenderJournal {
             p95_target_slip_ns: nearest_rank(&self.target_slip_samples_ns, 95),
             paired_service_p95_ns,
             paired_service_samples: self.paired_service_samples_ns.len(),
-            estimator_mode: self.prediction_estimator_mode(),
+            estimator_mode,
+            independent_total_cost_ns,
+            warm_paired_total_cost_ns,
+            independent_p90_floor_ns,
+            worker_non_ioctl_lead_ns,
+            miss_recovery_remaining: self.miss_recovery_remaining,
             total_cost_ns: total,
             idle_wake_guard: idle,
         }
@@ -974,6 +1002,30 @@ mod tests {
         }
     }
 
+    fn record_uniform_prediction_inputs(
+        journal: &mut AdaptiveRenderJournal,
+        render_sample_ns: u64,
+        paired_render_service_ns: u64,
+        submit_service_ns: u64,
+        wake_lateness_ns: u64,
+        ioctl_ns: u64,
+        kms_dispatch_budget_ns: u64,
+    ) {
+        for sample in 0..WARM_PAIRED_MIN_SAMPLES {
+            let base_ns = 100_000_000 + sample as u64 * 10_000_000;
+            journal.record_render_sample(render_sample_ns, MonotonicTimestampNs::new(base_ns));
+            journal.record_wake_lateness(wake_lateness_ns);
+            journal.record_atomic_submit(ioctl_ns);
+            journal.record_submission_budget(kms_dispatch_budget_ns);
+            journal.record_frame_service_observation(service_observation(
+                base_ns,
+                base_ns + paired_render_service_ns,
+                base_ns + paired_render_service_ns + 1_000_000,
+                base_ns + paired_render_service_ns + 1_000_000 + submit_service_ns,
+            ));
+        }
+    }
+
     #[test]
     fn paired_service_excludes_ready_binding_and_predecessor_waits() {
         let mut journal = AdaptiveRenderJournal::default();
@@ -982,6 +1034,54 @@ mod tests {
         let prediction = journal.prediction(Duration::from_millis(10));
         assert_eq!(prediction.paired_service_samples, 1);
         assert_eq!(prediction.paired_service_p95_ns, 1_300);
+    }
+
+    #[test]
+    fn warm_mode_selects_paired_service_instead_of_independent_deviation() {
+        fn journal_with_paired_service(paired_service_ns: u64) -> AdaptiveRenderJournal {
+            let mut journal = AdaptiveRenderJournal::default();
+            for sample in 0..20 {
+                let base_ns = 10_000_000 + sample * 10_000_000;
+                journal.record_render_sample(
+                    if sample == 19 { 10_000_000 } else { 1_000_000 },
+                    MonotonicTimestampNs::new(base_ns),
+                );
+                journal.record_frame_service_observation(service_observation(
+                    base_ns,
+                    base_ns + paired_service_ns.saturating_sub(1_000_000),
+                    base_ns + 5_000_000,
+                    base_ns + 6_000_000,
+                ));
+            }
+            journal
+        }
+
+        let low_paired =
+            journal_with_paired_service(2_000_000).prediction(Duration::from_millis(10));
+        let high_paired =
+            journal_with_paired_service(8_000_000).prediction(Duration::from_millis(10));
+
+        assert_eq!(
+            low_paired.estimator_mode,
+            PredictionEstimatorMode::WarmPaired
+        );
+        assert_eq!(
+            high_paired.estimator_mode,
+            PredictionEstimatorMode::WarmPaired
+        );
+        assert_eq!(
+            low_paired.render_risk_ns, high_paired.render_risk_ns,
+            "independent render risk remains shared diagnostic state"
+        );
+        assert!(
+            high_paired.upper_render_deviation_ns >= 8_000_000,
+            "the regression must include a large independent render tail"
+        );
+        assert!(low_paired.render_risk_ns >= 10_000_000);
+        assert!(
+            low_paired.total_cost_ns < high_paired.total_cost_ns,
+            "WarmPaired must select paired service cost instead of sticky independent risk"
+        );
     }
 
     #[test]
@@ -1007,41 +1107,229 @@ mod tests {
             prediction.estimator_mode,
             PredictionEstimatorMode::WarmPaired
         );
-        assert!(prediction.total_cost_ns < 7_000_000);
+        assert_eq!(prediction.worker_non_ioctl_lead_ns, 2_050_000);
+        assert_eq!(prediction.independent_total_cost_ns, 5_050_000);
+        assert_eq!(prediction.warm_paired_total_cost_ns, 11_050_000);
+        assert_eq!(prediction.independent_p90_floor_ns, 5_050_000);
+        assert_eq!(prediction.total_cost_ns, 11_050_000);
     }
 
     #[test]
-    fn miss_recovery_is_bounded_and_decays_after_paired_successes() {
+    fn warm_estimator_uses_saturating_worker_residual_and_p90_floor() {
+        for (kms_budget_ns, ioctl_ns, expected_residual_ns) in [
+            (700_000, 400_000, 300_000),
+            (400_000, 400_000, 0),
+            (300_000, 400_000, 0),
+        ] {
+            let mut journal = AdaptiveRenderJournal::default();
+            record_uniform_prediction_inputs(
+                &mut journal,
+                1_000_000,
+                6_000_000,
+                1_000_000,
+                0,
+                ioctl_ns,
+                kms_budget_ns,
+            );
+            let prediction = journal.prediction_with_kms_guard(Duration::from_millis(10), 100_000);
+            let expected_warm_ns = 7_000_000 + 1_000_000 / 2 + expected_residual_ns + 100_000;
+            let expected_floor_ns = 1_000_000 + 1_000_000 / 2 + kms_budget_ns + 100_000;
+
+            assert_eq!(prediction.worker_non_ioctl_lead_ns, expected_residual_ns);
+            assert_eq!(prediction.warm_paired_total_cost_ns, expected_warm_ns);
+            assert_eq!(prediction.independent_p90_floor_ns, expected_floor_ns);
+            assert_eq!(
+                prediction.total_cost_ns,
+                expected_warm_ns.max(expected_floor_ns)
+            );
+        }
+    }
+
+    #[test]
+    fn warm_paired_service_counts_submit_ioctl_exactly_once() {
         let mut journal = AdaptiveRenderJournal::default();
-        for sample in 0..20 {
+        record_uniform_prediction_inputs(
+            &mut journal,
+            1_000_000,
+            3_000_000,
+            500_000,
+            250_000,
+            500_000,
+            1_200_000,
+        );
+
+        let prediction = journal.prediction_with_kms_guard(Duration::from_millis(10), 100_000);
+
+        assert_eq!(prediction.paired_service_p95_ns, 3_500_000);
+        assert_eq!(prediction.p95_atomic_ioctl_ns, 500_000);
+        assert_eq!(prediction.kms_dispatch_budget_ns, 1_200_000);
+        assert_eq!(prediction.worker_non_ioctl_lead_ns, 700_000);
+        assert_eq!(prediction.warm_paired_total_cost_ns, 4_800_000);
+        assert_eq!(prediction.total_cost_ns, 4_800_000);
+        assert_ne!(
+            prediction.total_cost_ns,
+            prediction
+                .paired_service_p95_ns
+                .saturating_add(prediction.main_event_loop_wake_guard_ns)
+                .saturating_add(prediction.kms_dispatch_budget_ns)
+                .saturating_add(prediction.kms_apply_guard_ns),
+            "the submit ioctl must not be paid for a second time"
+        );
+    }
+
+    #[test]
+    fn warm_estimator_never_undercuts_independent_p90_floor() {
+        let mut journal = AdaptiveRenderJournal::default();
+        record_uniform_prediction_inputs(
+            &mut journal,
+            10_000_000,
+            500_000,
+            100_000,
+            0,
+            100_000,
+            500_000,
+        );
+
+        let prediction = journal.prediction_with_kms_guard(Duration::from_millis(20), 100_000);
+
+        assert_eq!(prediction.warm_paired_total_cost_ns, 1_600_000);
+        assert_eq!(prediction.independent_p90_floor_ns, 11_100_000);
+        assert_eq!(prediction.total_cost_ns, 11_100_000);
+    }
+
+    #[test]
+    fn fewer_than_warm_samples_keep_cold_independent_selection() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..WARM_PAIRED_MIN_SAMPLES - 1 {
+            let base_ns = 100_000_000 + sample as u64 * 10_000_000;
             journal.record_frame_service_observation(service_observation(
-                sample * 10_000,
-                sample * 10_000 + 1_000,
-                sample * 10_000 + 2_000,
-                sample * 10_000 + 3_000,
+                base_ns,
+                base_ns + 8_000_000,
+                base_ns + 9_000_000,
+                base_ns + 10_000_000,
             ));
         }
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+
+        assert_eq!(
+            prediction.estimator_mode,
+            PredictionEstimatorMode::ColdStart
+        );
+        assert_eq!(
+            prediction.total_cost_ns,
+            prediction.independent_total_cost_ns
+        );
+    }
+
+    #[test]
+    fn miss_recovery_requires_clean_exact_horizon_and_resets_on_miss() {
+        let mut journal = AdaptiveRenderJournal::default();
+        record_uniform_prediction_inputs(&mut journal, 1_000_000, 1_000_000, 1_000_000, 0, 0, 0);
         assert_eq!(
             journal.prediction_estimator_mode(),
             PredictionEstimatorMode::WarmPaired
         );
 
         journal.note_proven_deadline_miss();
-        journal.note_proven_deadline_miss();
-        assert_eq!(journal.missed_deadlines, 2);
+        let recovering = journal.prediction(Duration::from_millis(10));
+        assert_eq!(journal.missed_deadlines, 1);
+        assert_eq!(
+            recovering.miss_recovery_remaining,
+            MISS_RECOVERY_PAIRED_SUCCESSES
+        );
+        assert_eq!(
+            recovering.estimator_mode,
+            PredictionEstimatorMode::MissRecovery
+        );
+        assert_eq!(
+            recovering.total_cost_ns,
+            recovering.independent_total_cost_ns
+        );
+
+        for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES - 1 {
+            let offset_ns = sample as u64 * 10_000;
+            journal.record_frame_service_observation(service_observation(
+                1_000_000 + offset_ns,
+                1_001_000 + offset_ns,
+                1_002_000 + offset_ns,
+                1_003_000 + offset_ns,
+            ));
+        }
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .miss_recovery_remaining,
+            1
+        );
         assert_eq!(
             journal.prediction_estimator_mode(),
             PredictionEstimatorMode::MissRecovery
         );
 
-        for sample in 0..20 {
+        let mut approximate = service_observation(2_000_000, 2_001_000, 2_002_000, 2_003_000);
+        approximate.fence_signaled_at = Some((
+            MonotonicTimestampNs::new(2_001_000),
+            FenceTimestampQuality::ObservedApproximate,
+        ));
+        journal.record_frame_service_observation(approximate);
+        let mut incomplete = service_observation(3_000_000, 3_001_000, 3_002_000, 3_003_000);
+        incomplete.submit_returned_at = None;
+        journal.record_frame_service_observation(incomplete);
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .miss_recovery_remaining,
+            1
+        );
+
+        journal.record_frame_service_observation(service_observation(
+            4_000_000, 4_001_000, 4_002_000, 4_003_000,
+        ));
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::WarmPaired
+        );
+
+        journal.note_proven_deadline_miss();
+        for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES / 2 {
+            let offset_ns = sample as u64 * 10_000;
             journal.record_frame_service_observation(service_observation(
-                1_000_000 + sample * 10_000,
-                1_001_000 + sample * 10_000,
-                1_002_000 + sample * 10_000,
-                1_003_000 + sample * 10_000,
+                5_000_000 + offset_ns,
+                5_001_000 + offset_ns,
+                5_002_000 + offset_ns,
+                5_003_000 + offset_ns,
             ));
         }
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .miss_recovery_remaining,
+            MISS_RECOVERY_PAIRED_SUCCESSES / 2
+        );
+        journal.note_proven_deadline_miss();
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .miss_recovery_remaining,
+            MISS_RECOVERY_PAIRED_SUCCESSES
+        );
+        for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES - 1 {
+            let offset_ns = sample as u64 * 10_000;
+            journal.record_frame_service_observation(service_observation(
+                6_000_000 + offset_ns,
+                6_001_000 + offset_ns,
+                6_002_000 + offset_ns,
+                6_003_000 + offset_ns,
+            ));
+        }
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::MissRecovery
+        );
+        journal.record_frame_service_observation(service_observation(
+            7_000_000, 7_001_000, 7_002_000, 7_003_000,
+        ));
         assert_eq!(
             journal.prediction_estimator_mode(),
             PredictionEstimatorMode::WarmPaired
