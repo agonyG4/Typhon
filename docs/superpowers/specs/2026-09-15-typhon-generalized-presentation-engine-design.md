@@ -6,12 +6,13 @@ Status: approved design; production implementation blocked by the prerequisite g
 ## Decision
 
 Do not implement the generalized Presentation Engine in the current checkout.
-The canonical scene foundations required by the task are not present. Adding
-presentation primitives now would require inventing a second scene identity or
-an interim scene graph, which is explicitly prohibited.
+The canonical scene identity and visual-topology foundations are now present,
+but frame-level SceneNode evidence and the physical presentation contract are
+not. Adding presentation primitives now would require inventing an interim
+frame contract, which is explicitly prohibited.
 
-The implementation may begin only after the Phase 1 and Phase 2 foundation work
-described below has landed and is present at the new baseline.
+The implementation may begin only after the remaining frame and physical
+foundation work described below has landed and is present at the new baseline.
 
 ## Repository baseline and evidence
 
@@ -41,17 +42,18 @@ still apply.
 
 * The typed logical `OutputId` foundation is implemented. It is distinct from
   `OutputTransactionId`, output/backend generation, and physical DRM IDs.
-* There is no stable or generational `SceneNodeId`. Presentation geometry is
-  keyed by `root_surface_id: u32`; lifecycle presentation is keyed by
-  `WindowId`; protocol surface and subsurface relationships use `u32` surface
-  IDs.
-* `ActiveSceneView` is an ordered `Vec<RenderableSurface>` with `HashMap<u32,
-  usize>` indexing. It is not a canonical generic scene containing stable node
-  metadata.
-* The existing hierarchy is protocol/window-specific. `parent_surface_id`,
-  `WindowVisualGroup`, and `VisualStackGroup` do not provide a generic
-  `SceneNodeId` hierarchy with inherited presentation resolution across client
-  content, subsurfaces, decorations, and compositor-owned effects.
+* `SceneNodeId` is now a stable, stale-safe typed identity. It is monotonically
+  allocated and never reused during the compositor session. Presentation
+  geometry remains keyed by `root_surface_id: u32` and lifecycle presentation
+  remains keyed by `WindowId` until the later Presentation Engine migration.
+* `ActiveSceneView` remains an ordered `Vec<RenderableSurface>` with its
+  existing `HashMap<u32, usize>` indexing, and now carries derived
+  `surface_id -> SceneNodeId` and reverse active-index mappings. It is still a
+  projection, not a replacement renderer scene or presentation authority.
+* `CanonicalSceneRegistry` now provides a sidecar identity/topology layer with
+  `SceneOwner`, `SceneRole`, semantic-domain assignment, explicit
+  `visual_parent`, and reverse visual-child indexing. Existing protocol,
+  window, stacking, geometry, and render authorities remain unchanged.
 * `CompositorState` currently owns separate
   `PresentationAnimator`, `WindowLifecycleAnimator`,
   `presented_presentation`, `presented_lifecycle`, and
@@ -72,15 +74,23 @@ still apply.
 
 ## Current prerequisite status
 
-As of the Phase 1A identity closure, the prerequisite status is:
+As of the logical-output and scene-identity foundation closures, the
+prerequisite status is:
 
 * **OutputId foundation:** implemented internally. `NativeRuntime`, scene
   history, transaction ledgers, Direct Scanout identities, cursor identities,
   KMS bundle identities, and exact pageflip acknowledgements are output-bound.
-* **SceneNodeId foundation:** still missing.
-* **Generic scene hierarchy and metadata:** still missing.
+* **SceneNodeId foundation:** implemented internally with stable,
+  monotonically allocated, never-reused IDs.
+* **Canonical identity/topology metadata:** implemented for live surfaces,
+  WindowGroup nodes, server-decoration nodes, semantic domains, and
+  visual-parent relationships. Existing geometry and stacking authorities are
+  deliberately not duplicated.
+* **ActiveScene identity projection:** implemented through derived canonical
+  node references while preserving existing surface-based APIs and ordering.
+* **Frame-level SceneNode evidence:** still missing.
 * **Presentation Engine v2:** still gated; it must wait for the scene-node
-  and canonical-scene foundations.
+  frame-evidence and physical-presentation foundations.
 
 Typhon remains a single-output product. This internal `OutputId` foundation
 does not add hotplug, multi-output layout, or a multi-output product model.
@@ -137,19 +147,20 @@ they do not each apply a root transform independently.
    native frame planning, physical ledger entries, damage history, Direct
    Scanout diagnostics, and ACK qualification. The current one-output behavior
    remains a compatibility product policy, not an implicit identity default.
-2. Add a stable/generational `SceneNodeId` allocator owned by the canonical
-   scene. Stale node generations must be rejected rather than aliasing a new
-   node.
-3. Make canonical scene metadata explicit: node kind, semantic role/domain,
-   content/resource identity, canonical geometry, visibility, opacity/clip,
-   and parent/group relationship. The scene must represent the window root,
-   client subtree, subsurfaces, decorations, and compositor-owned effect
-   participation without requiring an animation-specific identity.
-4. Make the canonical scene the source for the active-scene projection. Adapt
-   `ActiveSceneView` and frame projections without changing layout behavior,
-   configure behavior, X11 geometry, or existing buffer ownership semantics.
-5. Add foundation tests for node generation reuse, parent/child ownership,
-   output-qualified projection, semantic metadata, and no-animation parity.
+2. **Completed — SceneNodeId foundation.** A typed, monotonic,
+   stale-safe allocator is owned by compositor scene state. IDs are never
+   reused during the compositor session, so they cannot alias a later object.
+3. **Completed — canonical identity/topology metadata.** The registry tracks
+   scene source/owner, semantic role/domain assignment, stable WindowGroup and
+   server-decoration identities, and validated visual-parent relationships for
+   surfaces. Existing geometry, visibility, opacity/clip, stacking, damage,
+   buffer, and effect authorities remain separate.
+4. **Completed — ActiveScene identity projection.** `ActiveSceneView` retains
+   its existing surface-based APIs and ordering while exposing derived
+   canonical node mappings without changing layout, configure, X11 geometry,
+   or buffer ownership semantics.
+5. Add immutable frame-level SceneNode evidence and the physical promotion
+   contract before implementing sparse presentation state.
 
 ### Phase 2 — frame and physical contracts
 
@@ -221,7 +232,7 @@ After Phase 1/2, a focused `src/presentation/` module may contain:
 ```text
 mod.rs          public internal wiring and compatibility exports
 time.rs         absolute animation/presentation time
-ids.rs          OutputId, SceneNodeId, transaction and revision IDs
+ids.rs          transaction and revision IDs; core owns OutputId and SceneNodeId
 curve.rs        easing, analytical spring, typed interpolation
 state.rs        resolved properties and coordinate-space contracts
 transaction.rs atomic semantic membership/publication
