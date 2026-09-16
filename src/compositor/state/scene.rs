@@ -18,6 +18,14 @@ impl CompositorState {
         self.scene_registry.metadata(node)
     }
 
+    pub(in crate::compositor) fn scene_node_id_for_server_decoration(
+        &self,
+        window_id: WindowId,
+    ) -> Option<SceneNodeId> {
+        self.scene_registry
+            .node_for_source(SceneSource::ServerDecoration(window_id))
+    }
+
     pub(in crate::compositor) fn ensure_surface_scene_node(
         &mut self,
         surface_id: u32,

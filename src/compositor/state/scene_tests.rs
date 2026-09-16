@@ -230,6 +230,10 @@ fn active_scene_projection_keeps_canonical_identity_across_visibility() {
     assert_eq!(state.scene_node_id_for_surface(surface_id), Some(node));
     state.rebuild_active_scene_view();
     assert_eq!(state.active_scene_node_for_surface(surface_id), Some(node));
+    assert_eq!(
+        state.active_scene_surface_scene_nodes_in_order(),
+        &[node]
+    );
 
     assert_eq!(
         state.active_scene_surface_index_for_node(node),
@@ -242,6 +246,43 @@ fn active_scene_projection_keeps_canonical_identity_across_visibility() {
     state.test_map_surface(surface_id, 32, 32, SurfacePlacement::root());
     state.rebuild_active_scene_view();
     assert_eq!(state.active_scene_node_for_surface(surface_id), Some(node));
+    drop(display);
+}
+
+#[test]
+fn visual_parent_metadata_does_not_change_existing_render_order() {
+    let mut state = CompositorState::default();
+    let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let client = test_client(&mut display);
+    let lower_id = test_surface_for_client(&mut state, &mut display, &client);
+    let upper_id = test_surface_for_client(&mut state, &mut display, &client);
+    state.test_publish_surface(lower_id, 20, 20, SurfacePlacement::root_at(0, 0));
+    state.test_publish_surface(upper_id, 20, 20, SurfacePlacement::root_at(0, 0));
+    state.rebuild_active_scene_view();
+
+    let before = state
+        .active_scene_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let lower_node = state.scene_node_id_for_surface(lower_id).unwrap();
+    let upper_node = state.scene_node_id_for_surface(upper_id).unwrap();
+    state
+        .scene_registry
+        .set_visual_parent(upper_node, Some(lower_node))
+        .expect("valid visual parent");
+    state.rebuild_active_scene_view();
+
+    let after = state
+        .active_scene_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    assert_eq!(
+        state.active_scene_surface_scene_nodes_in_order(),
+        &[lower_node, upper_node]
+    );
     drop(display);
 }
 

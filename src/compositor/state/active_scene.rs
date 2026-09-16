@@ -25,6 +25,7 @@ pub(in crate::compositor) struct ActiveSceneView {
     surfaces: Vec<RenderableSurface>,
     surface_indices: HashMap<u32, usize>,
     surface_scene_nodes: HashMap<u32, SceneNodeId>,
+    surface_scene_nodes_in_order: Vec<SceneNodeId>,
     scene_node_indices: HashMap<SceneNodeId, usize>,
     surface_origins: Vec<(i32, i32)>,
     popup_surface_ids: Vec<u32>,
@@ -44,6 +45,10 @@ impl ActiveSceneView {
 
     pub(in crate::compositor) fn surface_origins(&self) -> &[(i32, i32)] {
         &self.surface_origins
+    }
+
+    pub(in crate::compositor) fn surface_scene_nodes_in_order(&self) -> &[SceneNodeId] {
+        &self.surface_scene_nodes_in_order
     }
 
     #[allow(dead_code)]
@@ -538,20 +543,23 @@ impl CompositorState {
             .enumerate()
             .map(|(index, surface)| (surface.surface_id, index))
             .collect();
-        let surface_scene_nodes = surfaces
+        let surface_scene_nodes_in_order = surfaces
             .iter()
             .map(|surface| {
-                let node = self
-                    .scene_node_id_for_surface(surface.surface_id)
-                    .expect("active renderable surface has no canonical scene node");
-                (surface.surface_id, node)
+                self.scene_node_id_for_surface(surface.surface_id)
+                    .expect("active renderable surface has no canonical scene node")
             })
-            .collect::<HashMap<_, _>>();
-        let scene_node_indices = surfaces
+            .collect::<Vec<_>>();
+        let surface_scene_nodes = surfaces
             .iter()
+            .zip(surface_scene_nodes_in_order.iter().copied())
+            .map(|(surface, node)| (surface.surface_id, node))
+            .collect::<HashMap<_, _>>();
+        let scene_node_indices = surface_scene_nodes_in_order
+            .iter()
+            .copied()
             .enumerate()
-            .map(|(index, surface)| {
-                let node = surface_scene_nodes[&surface.surface_id];
+            .map(|(index, node)| {
                 (node, index)
             })
             .collect();
@@ -577,6 +585,7 @@ impl CompositorState {
         self.active_scene_view.surfaces = surfaces;
         self.active_scene_view.surface_indices = surface_indices;
         self.active_scene_view.surface_scene_nodes = surface_scene_nodes;
+        self.active_scene_view.surface_scene_nodes_in_order = surface_scene_nodes_in_order;
         self.active_scene_view.scene_node_indices = scene_node_indices;
         self.active_scene_view.surface_origins = surface_origins;
         self.active_scene_view.popup_surface_ids = popup_surface_ids;
@@ -751,6 +760,12 @@ impl CompositorState {
 
     pub(in crate::compositor) fn active_scene_surface_origins(&self) -> &[(i32, i32)] {
         self.active_scene_view.surface_origins()
+    }
+
+    pub(in crate::compositor) fn active_scene_surface_scene_nodes_in_order(
+        &self,
+    ) -> &[SceneNodeId] {
+        self.active_scene_view.surface_scene_nodes_in_order()
     }
 
     pub(in crate::compositor) fn active_scene_surface_index(

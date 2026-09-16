@@ -172,6 +172,55 @@ fn x11_decoration_mode_precedence_controls_rendering_hit_testing_and_extents() {
 }
 
 #[test]
+fn server_decoration_scene_node_survives_visibility_mode_transitions() {
+    let mut state = x11_state(test_surface(55));
+    let handle = x11_test_handle();
+    let window_id = state.window_id_for_x11_handle(handle).expect("X11 window");
+    let node = state
+        .scene_node_id_for_server_decoration(window_id)
+        .expect("server decoration scene node");
+
+    assert_eq!(
+        state.scene_node_id_for_server_decoration(window_id),
+        Some(node)
+    );
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_decoration_hints
+        .gtk_frame_extents = Some(X11FrameExtents {
+        left: 1,
+        right: 0,
+        top: 0,
+        bottom: 0,
+    });
+    assert!(decoration_instances(&state).is_empty());
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Fullscreen);
+    assert!(decoration_instances(&state).is_empty());
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Normal);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_decoration_hints
+        .gtk_frame_extents = None;
+    assert_eq!(
+        state.scene_node_id_for_server_decoration(window_id),
+        Some(node)
+    );
+}
+
+#[test]
 fn x11_decoration_transition_clears_stale_native_interaction_state() {
     let mut state = x11_state(test_surface(51));
     let handle = x11_test_handle();
