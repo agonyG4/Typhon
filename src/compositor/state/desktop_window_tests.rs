@@ -379,6 +379,58 @@ fn xwayland_surface_behind_or_outside_child_source_does_not_block_scanout() {
 }
 
 #[test]
+fn xwayland_root_painted_above_child_remains_the_conservative_source() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(33).expect("generation"));
+    let root = x11_shm_surface(
+        338,
+        output_width,
+        output_height,
+        SurfacePlacement::absolute_root_at(0, 0),
+    );
+    let child = x11_scanout_surface(
+        339,
+        output_width,
+        output_height,
+        SurfacePlacement::subsurface(338, 0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    insert_x11(&mut state, x11_output_snapshot(generation, 338, 338));
+    state.append_renderable_surface(child);
+    state.append_renderable_surface(root);
+    for surface_id in state
+        .renderable_surfaces
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>()
+    {
+        state.surface_presentation_generations.insert(surface_id, 1);
+    }
+    state.rebuild_active_scene_view();
+
+    let analysis = state.direct_scanout_scene_analysis();
+
+    assert!(analysis.candidate.is_none());
+    assert_eq!(
+        analysis
+            .coverage
+            .covering_application_group
+            .as_ref()
+            .and_then(|group| group.covering_surface.as_ref())
+            .map(|surface| surface.surface_id),
+        Some(338)
+    );
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::NonDmabuf)
+    );
+}
+
+#[test]
 fn xwayland_visible_ssd_blocks_direct_scanout() {
     let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
