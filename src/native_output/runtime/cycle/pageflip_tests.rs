@@ -1,7 +1,8 @@
 use super::*;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitJob, KmsCommitTestPolicy, KmsPrimaryCursorPresentation,
-    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerDispatchTailObservation,
+    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerDispatchModel,
+    KmsWorkerDispatchTailObservation,
 };
 use crate::native_output::presentation::kms_timing::KmsPresentationTimingObservation;
 use crate::native_output::presentation::plane::{
@@ -46,13 +47,43 @@ fn apply_recovery_evidence(
     apply_guard_before_ns: u64,
     apply_guard_after_ns: u64,
     apply_guard_increased: bool,
+    apply_guard_cap_hit: bool,
 ) -> KmsPresentationTimingObservation {
     KmsPresentationTimingObservation {
         accepted,
         apply_guard_before_ns,
         apply_guard_after_ns,
         apply_guard_increased,
+        apply_guard_cap_hit,
     }
+}
+
+#[test]
+fn dispatch_budget_diagnostics_distinguish_used_from_post_adaptation_budget() {
+    let window = crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+        1_000_000, 0, 100_000, 100_000,
+    )
+    .unwrap();
+    let mut model = KmsWorkerDispatchModel::default();
+    let _observation = model.observe_submission_deadline(
+        window.commit_complete_deadline_ns(),
+        window.commit_complete_deadline_ns() + 10_000,
+        true,
+    );
+    let budget_after_adaptation_ns = model.budget().dispatch_budget_ns;
+    assert_eq!(window.dispatch_budget_ns(), 100_000);
+    assert!(budget_after_adaptation_ns > window.dispatch_budget_ns());
+
+    let fields = dispatch_budget_diagnostic_fields(
+        Some(window.dispatch_budget_ns()),
+        Some(budget_after_adaptation_ns),
+    );
+    assert_eq!(
+        pacing_line("proven_deadline_miss", &fields),
+        format!(
+            "typhon pacing: event=proven_deadline_miss dispatch_budget_used_ns=100000 dispatch_budget_after_adaptation_ns={budget_after_adaptation_ns}"
+        )
+    );
 }
 
 #[test]
@@ -72,7 +103,7 @@ fn render_misses_always_reset_independent_recovery_horizon() {
             Some(dispatch_recovery_evidence(
                 true, true, 12_000, 100_000, 162_000, true, false
             )),
-            Some(apply_recovery_evidence(true, 100_000, 150_000, true)),
+            Some(apply_recovery_evidence(true, 100_000, 150_000, true, false)),
         ),
         EstimatorRecoveryDisposition::ResetIndependentHorizon,
         "pending render readiness evidence retains precedence over KMS evidence"
@@ -110,13 +141,15 @@ fn apply_recovery_requires_accepted_guard_increase() {
         recovery_disposition(
             ProvenDeadlineMiss::KmsApplyGuard,
             None,
-            Some(apply_recovery_evidence(true, 100_000, 150_000, true)),
+            Some(apply_recovery_evidence(true, 100_000, 150_000, true, false)),
         ),
         EstimatorRecoveryDisposition::PreserveEstimatorState
     );
     for evidence in [
-        apply_recovery_evidence(false, 100_000, 100_000, false),
-        apply_recovery_evidence(true, 100_000, 100_000, false),
+        apply_recovery_evidence(false, 100_000, 100_000, false, false),
+        apply_recovery_evidence(true, 100_000, 100_000, false, false),
+        apply_recovery_evidence(true, 3_000_000, 3_000_000, false, true),
+        apply_recovery_evidence(true, 2_987_500, 3_000_000, true, true),
     ] {
         assert_eq!(
             recovery_disposition(ProvenDeadlineMiss::KmsApplyGuard, None, Some(evidence)),

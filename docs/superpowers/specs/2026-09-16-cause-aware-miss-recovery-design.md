@@ -31,8 +31,11 @@ non-binding, capped, or incomplete evidence resets the independent horizon.
 
 An apply-guard miss preserves state only when the authoritative presentation
 timing model accepted the matching pageflip observation and actually increased
-its adaptive apply guard. Stale timing identity, rejected observations, and a
-saturated guard retain the conservative fallback.
+its adaptive apply guard without clipping the requested correction at its cap.
+Stale timing identity, rejected observations, saturated guards, and partially
+clipped increases retain the conservative fallback. Preservation therefore
+requires the responsible adaptive model to absorb its requested correction
+completely, not merely to report a positive observed increase.
 
 Every proven miss still increments total miss accounting. Preservation means
 preservation exactly: an already-active `MissRecovery` horizon is neither
@@ -46,8 +49,10 @@ for the same frame.
 Dispatch evidence is created beside the worker's exact dequeue and submission
 timestamps and is carried through `KmsSubmittedOwnership` for the matching
 pageflip token. Recovery never reconstructs fair dispatch from aggregate
-timing snapshots. Queue residency remains upstream ownership evidence and is
-excluded from paired service and selected KMS service cost.
+timing snapshots. The pageflip trace distinguishes the submit-window dispatch
+budget used by that job from the dispatch budget after the worker observes and
+adapts to the miss. Queue residency remains upstream ownership evidence and
+is excluded from paired service and selected KMS service cost.
 
 Apply evidence is returned at the timing-model observation boundary with its
 acceptance result and adaptive-guard before/after values. The pageflip path

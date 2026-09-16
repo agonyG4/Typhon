@@ -41,21 +41,43 @@ fn recovery_disposition(
         ProvenDeadlineMiss::ExactRender | ProvenDeadlineMiss::GuardedApproximateRender => {
             EstimatorRecoveryDisposition::ResetIndependentHorizon
         }
-        ProvenDeadlineMiss::KmsDispatch => dispatch_tail
-            .is_some_and(|observation| {
+        ProvenDeadlineMiss::KmsDispatch => {
+            let absorbed = dispatch_tail.is_some_and(|observation| {
                 observation.binding_target
                     && observation.fair_dispatch_chance
                     && observation.deadline_overrun_ns > 0
                     && observation.increased
                     && !observation.cap_hit
-            })
-            .then_some(EstimatorRecoveryDisposition::PreserveEstimatorState)
-            .unwrap_or(EstimatorRecoveryDisposition::ResetIndependentHorizon),
-        ProvenDeadlineMiss::KmsApplyGuard => apply_guard
-            .is_some_and(|observation| observation.accepted && observation.apply_guard_increased)
-            .then_some(EstimatorRecoveryDisposition::PreserveEstimatorState)
-            .unwrap_or(EstimatorRecoveryDisposition::ResetIndependentHorizon),
+            });
+            if absorbed {
+                EstimatorRecoveryDisposition::PreserveEstimatorState
+            } else {
+                EstimatorRecoveryDisposition::ResetIndependentHorizon
+            }
+        }
+        ProvenDeadlineMiss::KmsApplyGuard => {
+            let absorbed = apply_guard.is_some_and(|observation| {
+                observation.accepted
+                    && observation.apply_guard_increased
+                    && !observation.apply_guard_cap_hit
+            });
+            if absorbed {
+                EstimatorRecoveryDisposition::PreserveEstimatorState
+            } else {
+                EstimatorRecoveryDisposition::ResetIndependentHorizon
+            }
+        }
     }
+}
+
+fn dispatch_budget_diagnostic_fields(
+    used_ns: Option<u64>,
+    after_adaptation_ns: Option<u64>,
+) -> [PacingField; 2] {
+    [
+        PacingField::option_u64("dispatch_budget_used_ns", used_ns),
+        PacingField::option_u64("dispatch_budget_after_adaptation_ns", after_adaptation_ns),
+    ]
 }
 
 fn presented_primary_from_worker_job(
@@ -1039,8 +1061,10 @@ impl NativeRuntime {
                         .find(|ownership| ownership.job.token == pageflip_token);
                     let dispatch_tail_observation = submitted_ownership
                         .and_then(|ownership| ownership.dispatch_tail_observation);
-                    let dispatch_submission_budget_ns =
-                        submitted_ownership.map_or(0, |ownership| ownership.submission_budget_ns);
+                    let dispatch_budget_used_ns = submitted_ownership
+                        .map(|ownership| ownership.job.submit_window.dispatch_budget_ns());
+                    let dispatch_budget_after_adaptation_ns =
+                        submitted_ownership.map(|ownership| ownership.submission_budget_ns);
                     let pending_identity =
                         explicit.swapchain()?.pending_identity().ok_or_else(|| {
                             io::Error::other("composited pageflip has no pending identity")
@@ -1538,11 +1562,13 @@ impl NativeRuntime {
                                     "dispatch_tail_guard_cap_hit",
                                     observation.cap_hit,
                                 ),
-                                PacingField::u64(
-                                    "dispatch_submission_budget_ns",
-                                    dispatch_submission_budget_ns,
-                                ),
                             ]);
+                        }
+                        if matches!(miss, ProvenDeadlineMiss::KmsDispatch) {
+                            recovery_fields.extend(dispatch_budget_diagnostic_fields(
+                                dispatch_budget_used_ns,
+                                dispatch_budget_after_adaptation_ns,
+                            ));
                         }
                         if let Some(observation) = apply_guard_observation {
                             recovery_fields.extend([
@@ -1561,6 +1587,10 @@ impl NativeRuntime {
                                 PacingField::bool(
                                     "apply_guard_increased",
                                     observation.apply_guard_increased,
+                                ),
+                                PacingField::bool(
+                                    "apply_guard_cap_hit",
+                                    observation.apply_guard_cap_hit,
                                 ),
                             ]);
                         }

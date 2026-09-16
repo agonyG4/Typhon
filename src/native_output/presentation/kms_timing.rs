@@ -276,6 +276,7 @@ pub(crate) struct KmsPresentationTimingObservation {
     pub(crate) apply_guard_before_ns: u64,
     pub(crate) apply_guard_after_ns: u64,
     pub(crate) apply_guard_increased: bool,
+    pub(crate) apply_guard_cap_hit: bool,
 }
 
 impl KmsPresentationTimingModel {
@@ -373,8 +374,10 @@ impl KmsPresentationTimingModel {
                 apply_guard_before_ns,
                 apply_guard_after_ns: apply_guard_before_ns,
                 apply_guard_increased: false,
+                apply_guard_cap_hit: false,
             };
         }
+        let mut apply_guard_cap_hit = false;
         match outcome {
             KmsPresentationOutcome::TargetHit => {
                 self.target_hits = self.target_hits.saturating_add(1);
@@ -398,10 +401,12 @@ impl KmsPresentationTimingModel {
             KmsPresentationOutcome::KmsApplyGuardMiss => {
                 self.apply_guard_misses = self.apply_guard_misses.saturating_add(1);
                 self.stable_target_hits = 0;
-                self.adaptive_apply_guard_ns = self
+                let requested_apply_guard_ns = self
                     .adaptive_apply_guard_ns
-                    .saturating_add(APPLY_GUARD_STEP_NS)
-                    .min(MAX_ADAPTIVE_APPLY_GUARD_NS);
+                    .saturating_add(APPLY_GUARD_STEP_NS);
+                apply_guard_cap_hit = requested_apply_guard_ns > MAX_ADAPTIVE_APPLY_GUARD_NS;
+                self.adaptive_apply_guard_ns =
+                    requested_apply_guard_ns.min(MAX_ADAPTIVE_APPLY_GUARD_NS);
             }
         }
         let apply_guard_after_ns = self.adaptive_apply_guard_ns;
@@ -410,6 +415,7 @@ impl KmsPresentationTimingModel {
             apply_guard_before_ns,
             apply_guard_after_ns,
             apply_guard_increased: apply_guard_after_ns > apply_guard_before_ns,
+            apply_guard_cap_hit,
         }
     }
 }
@@ -552,6 +558,7 @@ mod tests {
 
         assert!(observation.accepted);
         assert!(observation.apply_guard_increased);
+        assert!(!observation.apply_guard_cap_hit);
         assert_eq!(
             observation.apply_guard_after_ns,
             observation
@@ -575,9 +582,40 @@ mod tests {
 
         assert!(observation.accepted);
         assert!(!observation.apply_guard_increased);
+        assert!(observation.apply_guard_cap_hit);
         assert_eq!(
             observation.apply_guard_after_ns,
             observation.apply_guard_before_ns
         );
+    }
+
+    #[test]
+    fn partially_clipped_apply_guard_reports_cap_hit() {
+        let timing = KmsModeTiming::from_mode(&mode(325_000, 2200, 1125), 6_060_606);
+        let mut model = KmsPresentationTimingModel::new(timing, 7);
+
+        for _ in 0..APPLY_HIT_DECAY_SAMPLES {
+            model.observe_pageflip(7, timing.key(), KmsPresentationOutcome::TargetHit);
+        }
+        while model.adaptive_apply_guard_ns() + APPLY_GUARD_STEP_NS <= MAX_ADAPTIVE_APPLY_GUARD_NS {
+            model.observe_pageflip(7, timing.key(), KmsPresentationOutcome::KmsApplyGuardMiss);
+        }
+        let before = model.adaptive_apply_guard_ns();
+        assert!(before < MAX_ADAPTIVE_APPLY_GUARD_NS);
+        assert!(MAX_ADAPTIVE_APPLY_GUARD_NS - before < APPLY_GUARD_STEP_NS);
+
+        let observation = model.observe_pageflip_with_evidence(
+            7,
+            timing.key(),
+            KmsPresentationOutcome::KmsApplyGuardMiss,
+        );
+
+        assert_eq!(observation.apply_guard_before_ns, before);
+        assert_eq!(
+            observation.apply_guard_after_ns,
+            MAX_ADAPTIVE_APPLY_GUARD_NS
+        );
+        assert!(observation.apply_guard_increased);
+        assert!(observation.apply_guard_cap_hit);
     }
 }
