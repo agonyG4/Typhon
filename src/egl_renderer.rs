@@ -3957,6 +3957,33 @@ impl GlesSceneRenderer {
         Ok(rects)
     }
 
+    pub(crate) fn clear_effect_scene_work(
+        &mut self,
+        rects: &[OutputRect],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        self.establish_ordinary_scene_state();
+        unsafe {
+            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            self.gl.enable(glow::SCISSOR_TEST);
+            for rect in rects {
+                let y = match framebuffer_origin {
+                    OutputFramebufferOrigin::BottomLeft => self
+                        .current_size
+                        .1
+                        .saturating_sub(rect.y.max(0) as u32 + rect.height)
+                        as i32,
+                    OutputFramebufferOrigin::TopLeftScanout => rect.y,
+                };
+                self.gl
+                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            self.gl.disable(glow::SCISSOR_TEST);
+        }
+        Ok(())
+    }
+
     pub(crate) fn draw_effect_scene_range(
         &mut self,
         rects: &[OutputRect],
@@ -7044,10 +7071,15 @@ mod tests {
             )
             .expect("visual-group blur graph executes in real GLES");
             let after_replays = harness.renderer.last_frame_stats().draw_command_replays;
+            let expected_replays = match effects::effect_debug_config().capture_mode() {
+                effects::EffectDebugCaptureMode::Replay => 3,
+                effects::EffectDebugCaptureMode::Framebuffer => 2,
+            };
             assert_eq!(
                 after_replays.saturating_sub(before_replays),
-                3,
-                "step {step}: capture replays one background command and the final scene replays both commands"
+                expected_replays,
+                "step {step}: capture policy {:?} must keep scene ordering without replaying the framebuffer capture",
+                effects::effect_debug_config().capture_mode(),
             );
 
             let mut first_gl_error = None;
@@ -7207,6 +7239,15 @@ mod tests {
             &events,
             &["event=effect_pass_execute_end", "kind=SceneCapture"],
         );
+        let expected_capture_mode = match effects::effect_debug_config().capture_mode() {
+            effects::EffectDebugCaptureMode::Replay => "replay",
+            effects::EffectDebugCaptureMode::Framebuffer => "framebuffer_blit",
+        };
+        assert!(events[capture_execute_end].contains(&format!(
+            "capture_mode={expected_capture_mode} backdrop_capture_policy={} kawase_execution_policy={}",
+            effects::effect_debug_config().capture_mode().as_str(),
+            effects::effect_debug_config().kawase_mode().as_str(),
+        )));
         let composite_resources_end = trace_event_index(
             &events,
             &["event=effect_pass_resources_end", "kind=Composite"],
@@ -7240,6 +7281,33 @@ mod tests {
         let overlay_end = trace_event_index(&events, &["event=effect_overlay_draw_end"]);
         let graph_execute_end = trace_event_index(&events, &["event=effect_graph_execute_end"]);
 
+        let framebuffer_capture_advance = if matches!(
+            effects::effect_debug_config().capture_mode(),
+            effects::EffectDebugCaptureMode::Framebuffer
+        ) {
+            let begin = trace_event_index(
+                &events,
+                &[
+                    "event=effect_scene_replay_begin",
+                    "kind=SceneCapture",
+                    "reason=framebuffer_capture",
+                ],
+            );
+            let end = trace_event_index(
+                &events,
+                &[
+                    "event=effect_scene_replay_end",
+                    "kind=SceneCapture",
+                    "reason=framebuffer_capture",
+                ],
+            );
+            assert!(begin < end);
+            assert!(end < capture_execute_end);
+            Some((begin, end))
+        } else {
+            None
+        };
+
         assert!(capture_execute_end < composite_resources_end);
         assert!(composite_resources_end < replay_begin);
         assert!(replay_begin < replay_end);
@@ -7250,9 +7318,22 @@ mod tests {
         assert!(final_replay_end < overlay_begin);
         assert!(overlay_begin < overlay_end);
         assert!(overlay_end < graph_execute_end);
-        assert!(events[replay_begin].contains("scene_cursor_start=0"));
-        assert!(events[replay_begin].contains("scene_cursor_end=1"));
-        assert!(events[replay_begin].contains("command_count=1"));
+        let expected_composite_cursor = if framebuffer_capture_advance.is_some() {
+            (
+                "scene_cursor_start=1",
+                "scene_cursor_end=1",
+                "command_count=0",
+            )
+        } else {
+            (
+                "scene_cursor_start=0",
+                "scene_cursor_end=1",
+                "command_count=1",
+            )
+        };
+        assert!(events[replay_begin].contains(expected_composite_cursor.0));
+        assert!(events[replay_begin].contains(expected_composite_cursor.1));
+        assert!(events[replay_begin].contains(expected_composite_cursor.2));
         assert!(events[final_replay_begin].contains("scene_cursor_start=1"));
         assert!(events[final_replay_begin].contains("scene_cursor_end=2"));
         assert!(events[final_replay_begin].contains("command_count=1"));

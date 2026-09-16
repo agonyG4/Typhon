@@ -5,17 +5,19 @@ use oblivion_one::effects::{
     CompiledFrameGraph, CompiledRenderPass, EffectAlphaMode, EffectColorConversion,
     EffectExecutionDemand, EffectNodeKind, EffectRegion, GraphPassId, GraphTextureId,
     GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
-    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind,
-    ShaderModuleId, logical_rect_to_physical_coverage,
+    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK,
+    MAX_EFFECT_REGION_RECTS, RenderPassKind, ShaderModuleId, logical_rect_to_physical_coverage,
 };
 
+use super::super::damage::OutputDamage;
 use super::super::geometry::{
     EglDrawCommand, EglDrawLayer, SurfaceConsumerPlan, add_surface_consumers_for_capture_indices,
     add_surface_consumers_for_command_range,
 };
 use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
 use super::{
-    FrameTraceSummary, PassTraceSummary, blur, capture,
+    EffectDebugCaptureMode, EffectDebugKawaseMode, FrameTraceSummary, PassTraceSummary, blur,
+    capture, effect_debug_config,
     resources::{PooledEffectTexture, release_dead_graph_textures},
     shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
@@ -733,6 +735,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
@@ -771,6 +774,22 @@ pub(crate) fn execute_graph_passes(
     result
 }
 
+fn scene_advance_reason(
+    pass: &CompiledRenderPass,
+    framebuffer_capture: bool,
+) -> Option<&'static str> {
+    if !pass.checkpoint_dependencies.is_empty()
+        && matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        )
+    {
+        return Some("checkpoint_dependency");
+    }
+    (pass.kind == RenderPassKind::SceneCapture && framebuffer_capture)
+        .then_some("framebuffer_capture")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_graph_passes_inner(
     renderer: &mut GlesSceneRenderer,
@@ -786,6 +805,10 @@ fn execute_graph_passes_inner(
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
+    let debug_config = *effect_debug_config();
+    let framebuffer_capture = !lifecycle_backdrop
+        && repaint_plan.is_some()
+        && debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer;
     let repaint_rects = if let Some(rects) = explicit_repaint_rects {
         rects.to_vec()
     } else {
@@ -794,6 +817,16 @@ fn execute_graph_passes_inner(
             framebuffer_origin,
         )?
     };
+    let scene_work_rects = scene_work_rects(
+        &repaint_rects,
+        graph,
+        selection,
+        renderer.current_size,
+        framebuffer_capture,
+    );
+    if framebuffer_capture {
+        renderer.clear_effect_scene_work(&scene_work_rects, framebuffer_origin)?;
+    }
     let mut scene_cursor = 0;
     for pass in &graph.passes {
         if !selection.executed_passes.contains(&pass.id) {
@@ -846,6 +879,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -863,6 +897,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -881,17 +916,14 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
             );
         }
         resource_result?;
-        if matches!(
-            pass.kind,
-            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
-        ) && !pass.checkpoint_dependencies.is_empty()
-        {
+        if let Some(scene_advance_reason) = scene_advance_reason(pass, framebuffer_capture) {
             let (draw_end, _) = composition_range(
                 &renderer.commands,
                 pass.anchor,
@@ -903,13 +935,13 @@ fn execute_graph_passes_inner(
                     renderer.effect_trace.scene_replay_boundary(
                         "begin",
                         pass,
-                        "checkpoint_dependency",
+                        scene_advance_reason,
                         scene_cursor,
                         draw_end,
                     );
                 }
                 renderer.draw_effect_scene_range(
-                    &repaint_rects,
+                    &scene_work_rects,
                     scene_cursor,
                     draw_end,
                     framebuffer_origin,
@@ -918,7 +950,7 @@ fn execute_graph_passes_inner(
                     renderer.effect_trace.scene_replay_boundary(
                         "end",
                         pass,
-                        "checkpoint_dependency",
+                        scene_advance_reason,
                         scene_cursor,
                         draw_end,
                     );
@@ -946,7 +978,7 @@ fn execute_graph_passes_inner(
                 );
             }
             renderer.draw_effect_scene_range(
-                &repaint_rects,
+                &scene_work_rects,
                 scene_cursor,
                 draw_end,
                 framebuffer_origin,
@@ -974,6 +1006,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -999,6 +1032,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -1020,6 +1054,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -1063,6 +1098,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -1086,6 +1122,7 @@ fn execute_graph_passes_inner(
                     pass,
                     demand,
                     &execution_damage.region,
+                    &scene_work_rects,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -1103,7 +1140,7 @@ fn execute_graph_passes_inner(
         );
     }
     renderer.draw_effect_scene_range(
-        &repaint_rects,
+        &scene_work_rects,
         scene_cursor,
         final_scene_cursor_end,
         framebuffer_origin,
@@ -1291,11 +1328,15 @@ fn pass_output_texture_domain(
 }
 
 fn is_direct_framebuffer_capture(pass: &CompiledRenderPass, lifecycle_backdrop: bool) -> bool {
-    matches!(
-        pass.kind,
-        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
-    ) && ((lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture)
-        || !pass.checkpoint_dependencies.is_empty())
+    match pass.kind {
+        RenderPassKind::SceneCapture => {
+            lifecycle_backdrop
+                || !pass.checkpoint_dependencies.is_empty()
+                || effect_debug_config().capture_mode() == EffectDebugCaptureMode::Framebuffer
+        }
+        RenderPassKind::SurfaceCapture => !pass.checkpoint_dependencies.is_empty(),
+        _ => false,
+    }
 }
 
 fn capture_execution_damage(
@@ -1530,6 +1571,7 @@ fn pass_trace_summary(
     pass: &CompiledRenderPass,
     demand: &EffectExecutionDemand,
     execution_damage: &EffectRegion,
+    scene_work_rects: &[OutputRect],
     framebuffer_origin: OutputFramebufferOrigin,
     lifecycle_backdrop: bool,
 ) -> PassTraceSummary {
@@ -1549,16 +1591,19 @@ fn pass_trace_summary(
         output_plan.is_some_and(|texture| texture.source == GraphTextureSource::Output);
     let target_flip_y =
         effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
-    let direct_capture = matches!(
-        pass.kind,
-        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
-    ) && ((lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture)
-        || !pass.checkpoint_dependencies.is_empty());
+    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop);
     let conservative_pass_demand = direct_capture
         || demand.is_conservative_full()
         || demand.instance_is_conservative_full(pass.instance);
+    let debug_full_kawase = effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full
+        && matches!(
+            pass.kind,
+            RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+        );
     let conservative_pass_demand_kind = if direct_capture {
         "direct_framebuffer_capture"
+    } else if debug_full_kawase {
+        "debug_full_kawase"
     } else if conservative_pass_demand
         && matches!(
             pass.kind,
@@ -1639,6 +1684,10 @@ fn pass_trace_summary(
         }),
         conservative_pass_demand,
         conservative_pass_demand_kind,
+        backdrop_capture_policy: Some(effect_debug_config().capture_mode().as_str()),
+        kawase_execution_policy: Some(effect_debug_config().kawase_mode().as_str()),
+        scene_work_damage_rects: scene_work_rects.len(),
+        scene_work_damage_bounding_box: output_rects_bounding_box(scene_work_rects),
     }
 }
 
@@ -2980,6 +3029,156 @@ fn full_output_rect(size: (u32, u32)) -> OutputRect {
     OutputRect::new(0, 0, size.0, size.1)
 }
 
+fn scene_work_rects(
+    repaint_rects: &[OutputRect],
+    graph: &CompiledFrameGraph,
+    selection: &EffectExecutionSelection,
+    output_size: (u32, u32),
+    framebuffer_capture: bool,
+) -> Vec<OutputRect> {
+    if !framebuffer_capture {
+        return repaint_rects.to_vec();
+    }
+
+    let mut rects = repaint_rects.to_vec();
+    for pass in &graph.passes {
+        if pass.kind != RenderPassKind::SceneCapture
+            || !selection.executed_passes.contains(&pass.id)
+        {
+            continue;
+        }
+        let Some(output) = pass.output else {
+            continue;
+        };
+        let Some(texture) = graph.textures.iter().find(|texture| texture.id == output) else {
+            continue;
+        };
+        let Some(rect) = clipped_output_rect(texture.domain, output_size) else {
+            continue;
+        };
+        if !rects.contains(&rect) {
+            rects.push(rect);
+        }
+    }
+
+    let coalesced = OutputDamage::rects(output_size.0, output_size.1, rects);
+    let coalesced = match coalesced {
+        OutputDamage::Empty => return Vec::new(),
+        OutputDamage::Full => return vec![full_output_rect(output_size)],
+        OutputDamage::Rects(rects) => rects,
+    };
+    disjoint_output_rects(coalesced, output_size)
+}
+
+fn disjoint_output_rects(rects: Vec<OutputRect>, output_size: (u32, u32)) -> Vec<OutputRect> {
+    let mut disjoint = Vec::new();
+    for source in rects {
+        let mut fragments = vec![source];
+        for represented in &disjoint {
+            let mut next = Vec::new();
+            for fragment in fragments {
+                next.extend(subtract_output_rect(fragment, *represented));
+            }
+            fragments = next;
+            if fragments.is_empty() {
+                break;
+            }
+        }
+        disjoint.extend(fragments);
+        if disjoint.len() > MAX_EFFECT_REGION_RECTS {
+            return vec![full_output_rect(output_size)];
+        }
+    }
+    disjoint
+}
+
+fn subtract_output_rect(source: OutputRect, excluded: OutputRect) -> Vec<OutputRect> {
+    let left = i64::from(source.x).max(i64::from(excluded.x));
+    let top = i64::from(source.y).max(i64::from(excluded.y));
+    let right = (i64::from(source.x) + i64::from(source.width))
+        .min(i64::from(excluded.x) + i64::from(excluded.width));
+    let bottom = (i64::from(source.y) + i64::from(source.height))
+        .min(i64::from(excluded.y) + i64::from(excluded.height));
+    if left >= right || top >= bottom {
+        return vec![source];
+    }
+
+    let mut result = Vec::with_capacity(4);
+    let push = |result: &mut Vec<OutputRect>, x: i64, y: i64, right: i64, bottom: i64| {
+        if right > x && bottom > y {
+            result.push(OutputRect::new(
+                i32::try_from(x).expect("scene work x fits i32"),
+                i32::try_from(y).expect("scene work y fits i32"),
+                u32::try_from(right - x).expect("scene work width fits u32"),
+                u32::try_from(bottom - y).expect("scene work height fits u32"),
+            ));
+        }
+    };
+    let source_right = i64::from(source.x) + i64::from(source.width);
+    let source_bottom = i64::from(source.y) + i64::from(source.height);
+    push(
+        &mut result,
+        i64::from(source.x),
+        i64::from(source.y),
+        source_right,
+        top,
+    );
+    push(
+        &mut result,
+        i64::from(source.x),
+        bottom,
+        source_right,
+        source_bottom,
+    );
+    push(&mut result, i64::from(source.x), top, left, bottom);
+    push(&mut result, right, top, source_right, bottom);
+    result
+}
+
+fn clipped_output_rect(
+    rect: oblivion_one::effects::EffectRect,
+    output_size: (u32, u32),
+) -> Option<OutputRect> {
+    let left = i64::from(rect.x).clamp(0, i64::from(output_size.0));
+    let top = i64::from(rect.y).clamp(0, i64::from(output_size.1));
+    let right = i64::from(rect.right()).clamp(0, i64::from(output_size.0));
+    let bottom = i64::from(rect.bottom()).clamp(0, i64::from(output_size.1));
+    (right > left && bottom > top).then(|| {
+        OutputRect::new(
+            i32::try_from(left).expect("output width fits i32"),
+            i32::try_from(top).expect("output height fits i32"),
+            u32::try_from(right - left).expect("output rect width fits u32"),
+            u32::try_from(bottom - top).expect("output rect height fits u32"),
+        )
+    })
+}
+
+fn output_rects_bounding_box(rects: &[OutputRect]) -> Option<(i32, i32, u32, u32)> {
+    let first = rects.first().copied()?;
+    let (left, top, right, bottom) = rects.iter().skip(1).fold(
+        (
+            i64::from(first.x),
+            i64::from(first.y),
+            i64::from(first.x) + i64::from(first.width),
+            i64::from(first.y) + i64::from(first.height),
+        ),
+        |(left, top, right, bottom), rect| {
+            (
+                left.min(i64::from(rect.x)),
+                top.min(i64::from(rect.y)),
+                right.max(i64::from(rect.x) + i64::from(rect.width)),
+                bottom.max(i64::from(rect.y) + i64::from(rect.height)),
+            )
+        },
+    );
+    Some((
+        i32::try_from(left).ok()?,
+        i32::try_from(top).ok()?,
+        u32::try_from(right - left).ok()?,
+        u32::try_from(bottom - top).ok()?,
+    ))
+}
+
 fn effect_capture_output_rects(
     damage: &EffectRegion,
     target_domain: Option<oblivion_one::effects::EffectRect>,
@@ -3655,6 +3854,106 @@ mod tests {
             )
             .collect();
         demand
+    }
+
+    #[test]
+    fn framebuffer_capture_orders_scene_advance_by_capture_policy() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let ordinary_capture = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            Vec::new(),
+        );
+        assert_eq!(
+            scene_advance_reason(&ordinary_capture, true),
+            Some("framebuffer_capture")
+        );
+        assert_eq!(scene_advance_reason(&ordinary_capture, false), None);
+
+        let checkpoint_capture = test_pass(
+            3,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            vec![GraphPassId::new(2).unwrap()],
+        );
+        assert_eq!(
+            scene_advance_reason(&checkpoint_capture, false),
+            Some("checkpoint_dependency")
+        );
+
+        let surface_capture = test_pass(
+            4,
+            RenderPassKind::SurfaceCapture,
+            instance,
+            Vec::new(),
+            output,
+            Vec::new(),
+        );
+        assert_eq!(scene_advance_reason(&surface_capture, true), None);
+    }
+
+    #[test]
+    fn framebuffer_scene_work_includes_selected_backdrop_capture_domains() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let capture_id = GraphTextureId::new(1).unwrap();
+        let capture_domain = oblivion_one::effects::EffectRect::new(40, 30, 60, 50).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            capture_id,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![test_texture(
+                1,
+                GraphTextureSource::CapturedScene,
+                capture_domain,
+            )],
+            instances: Vec::new(),
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let selection = EffectExecutionSelection {
+            executed_passes: vec![pass.id],
+            ..EffectExecutionSelection::default()
+        };
+        let work = scene_work_rects(
+            &[OutputRect::new(5, 6, 7, 8)],
+            &graph,
+            &selection,
+            (200, 150),
+            true,
+        );
+
+        assert!(work.contains(&OutputRect::new(5, 6, 7, 8)));
+        assert!(work.contains(&OutputRect::new(40, 30, 60, 50)));
+        assert!(work.len() <= MAX_EFFECT_REGION_RECTS);
+
+        let coalesced = scene_work_rects(
+            &[OutputRect::new(5, 6, 50, 40)],
+            &graph,
+            &selection,
+            (200, 150),
+            true,
+        );
+        assert_eq!(coalesced.len(), 3);
+        for (index, first) in coalesced.iter().enumerate() {
+            for second in coalesced.iter().skip(index + 1) {
+                assert!(
+                    subtract_output_rect(*first, *second).len() == 1,
+                    "scene-work scissors must not overlap: {first:?} and {second:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -33,7 +33,10 @@ pub(crate) use shader_cache::generate_fragment_wrapper;
 pub(crate) use shader_cache::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
 };
-pub(crate) use trace::{EffectExecutionTrace, FrameTraceSummary, PassTraceSummary};
+pub(crate) use trace::{
+    EffectDebugCaptureMode, EffectDebugKawaseMode, EffectExecutionTrace, FrameTraceSummary,
+    PassTraceSummary, effect_debug_config,
+};
 #[cfg(test)]
 pub(crate) use trace::{
     clear_test_events as clear_effect_trace_test_events,

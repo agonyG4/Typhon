@@ -7,6 +7,7 @@ use oblivion_one::{
 };
 
 use super::OutputFramebufferOrigin;
+use super::effects::{EffectDebugKawaseMode, effect_debug_config};
 
 pub(crate) const MAX_PARTIAL_REPAINT_RECTS: usize = 8;
 pub(crate) const MAX_DAMAGE_HISTORY_FRAMES: usize = 8;
@@ -306,7 +307,12 @@ pub(crate) fn effect_execution_demand_for_repaint_plan(
         super::effect_region_from_output_damage(&plan.repair_damage, output_width, output_height);
     let conservative_full = plan.mode == RepaintMode::Full
         || (!repair_region.is_empty() && repair_region.bounding_rect().is_none());
-    oblivion_one::effects::plan_effect_execution_demand(graph, &repair_region, conservative_full)
+    oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+        graph,
+        &repair_region,
+        conservative_full,
+        effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full,
+    )
 }
 
 pub(crate) fn resolve_effect_execution_for_repaint_plan(

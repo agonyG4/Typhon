@@ -11,6 +11,8 @@ use oblivion_one::effects::{
 use super::resources::PooledEffectTexture;
 
 const TRACE_ENV: &str = "TYPHON_EFFECT_EXEC_TRACE";
+const DEBUG_CAPTURE_MODE_ENV: &str = "TYPHON_EFFECT_DEBUG_CAPTURE_MODE";
+const DEBUG_KAWASE_MODE_ENV: &str = "TYPHON_EFFECT_DEBUG_KAWASE_MODE";
 const MAX_TRACE_INPUTS: usize = 8;
 
 #[cfg(test)]
@@ -44,6 +46,96 @@ fn tracing_enabled() -> bool {
     *ENABLED.get_or_init(|| trace_config().enabled())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectDebugCaptureMode {
+    Replay,
+    Framebuffer,
+}
+
+impl EffectDebugCaptureMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replay => "replay",
+            Self::Framebuffer => "framebuffer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectDebugKawaseMode {
+    Partial,
+    Full,
+}
+
+impl EffectDebugKawaseMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectDebugConfig {
+    capture_mode: EffectDebugCaptureMode,
+    kawase_mode: EffectDebugKawaseMode,
+}
+
+impl EffectDebugConfig {
+    pub(crate) fn from_env_values(
+        capture_mode: Option<&OsStr>,
+        kawase_mode: Option<&OsStr>,
+    ) -> Self {
+        Self {
+            capture_mode: parse_debug_capture_mode(capture_mode),
+            kawase_mode: parse_debug_kawase_mode(kawase_mode),
+        }
+    }
+
+    pub(crate) const fn capture_mode(self) -> EffectDebugCaptureMode {
+        self.capture_mode
+    }
+
+    pub(crate) const fn kawase_mode(self) -> EffectDebugKawaseMode {
+        self.kawase_mode
+    }
+}
+
+fn parse_debug_capture_mode(value: Option<&OsStr>) -> EffectDebugCaptureMode {
+    match value.and_then(OsStr::to_str) {
+        None => EffectDebugCaptureMode::Replay,
+        Some("replay") => EffectDebugCaptureMode::Replay,
+        Some("framebuffer") => EffectDebugCaptureMode::Framebuffer,
+        Some(value) => {
+            eprintln!("warning: invalid {DEBUG_CAPTURE_MODE_ENV}={value:?}; using replay");
+            EffectDebugCaptureMode::Replay
+        }
+    }
+}
+
+fn parse_debug_kawase_mode(value: Option<&OsStr>) -> EffectDebugKawaseMode {
+    match value.and_then(OsStr::to_str) {
+        None => EffectDebugKawaseMode::Partial,
+        Some("partial") => EffectDebugKawaseMode::Partial,
+        Some("full") => EffectDebugKawaseMode::Full,
+        Some(value) => {
+            eprintln!("warning: invalid {DEBUG_KAWASE_MODE_ENV}={value:?}; using partial");
+            EffectDebugKawaseMode::Partial
+        }
+    }
+}
+
+pub(crate) fn effect_debug_config() -> &'static EffectDebugConfig {
+    static CONFIG: OnceLock<EffectDebugConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        EffectDebugConfig::from_env_values(
+            std::env::var_os(DEBUG_CAPTURE_MODE_ENV).as_deref(),
+            std::env::var_os(DEBUG_KAWASE_MODE_ENV).as_deref(),
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameTraceSummary {
     pub(crate) render_generation: Option<u64>,
@@ -71,6 +163,10 @@ pub(crate) struct PassTraceFields<'a> {
     pub(crate) output_id: Option<u64>,
     pub(crate) capture_mode: Option<&'static str>,
     pub(crate) capture_commands: Option<usize>,
+    pub(crate) backdrop_capture_policy: Option<&'static str>,
+    pub(crate) kawase_execution_policy: Option<&'static str>,
+    pub(crate) scene_work_damage_rects: usize,
+    pub(crate) scene_work_damage_bbox: Option<(i32, i32, u32, u32)>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +183,10 @@ pub(crate) struct PassTraceSummary {
     pub(crate) scratch_fbo_present: Option<bool>,
     pub(crate) conservative_pass_demand: bool,
     pub(crate) conservative_pass_demand_kind: &'static str,
+    pub(crate) backdrop_capture_policy: Option<&'static str>,
+    pub(crate) kawase_execution_policy: Option<&'static str>,
+    pub(crate) scene_work_damage_rects: usize,
+    pub(crate) scene_work_damage_bounding_box: Option<(i32, i32, u32, u32)>,
 }
 
 #[cfg(test)]
@@ -105,8 +205,12 @@ pub(crate) fn format_pass_trace_line(fields: PassTraceFields<'_>) -> String {
     let capture_commands = fields
         .capture_commands
         .map_or_else(|| "none".to_owned(), |count| count.to_string());
+    let scene_work_damage_bbox = fields.scene_work_damage_bbox.map_or_else(
+        || "none".to_owned(),
+        |(x, y, width, height)| format!("{x},{y},{width},{height}"),
+    );
     format!(
-        "event=effect_pass_{} pass={} instance={} kind={} inputs={} output={} capture_mode={} capture_commands={}",
+        "event=effect_pass_{} pass={} instance={} kind={} inputs={} output={} capture_mode={} backdrop_capture_policy={} kawase_execution_policy={} scene_work_damage_rects={} scene_work_damage_bbox={} capture_commands={}",
         fields.boundary,
         fields.pass_id,
         fields.instance_id,
@@ -114,6 +218,10 @@ pub(crate) fn format_pass_trace_line(fields: PassTraceFields<'_>) -> String {
         input_ids,
         output_id,
         capture_mode,
+        fields.backdrop_capture_policy.unwrap_or("replay"),
+        fields.kawase_execution_policy.unwrap_or("partial"),
+        fields.scene_work_damage_rects,
+        scene_work_damage_bbox,
         capture_commands,
     )
 }
@@ -383,7 +491,7 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} backdrop_capture_policy={} kawase_execution_policy={} scene_work_damage_rects={} scene_work_damage_bbox={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
@@ -401,6 +509,13 @@ impl EffectExecutionTrace {
                 bbox,
                 pass.checkpoint_dependencies.len(),
                 summary.capture_mode.unwrap_or("none"),
+                summary.backdrop_capture_policy.unwrap_or("replay"),
+                summary.kawase_execution_policy.unwrap_or("partial"),
+                summary.scene_work_damage_rects,
+                summary.scene_work_damage_bounding_box.map_or_else(
+                    || "none".to_owned(),
+                    |(x, y, width, height)| format!("{x},{y},{width},{height}"),
+                ),
                 summary.conservative_pass_demand,
                 summary.conservative_pass_demand_kind,
                 summary
@@ -514,6 +629,28 @@ mod tests {
     }
 
     #[test]
+    fn debug_effect_modes_have_safe_defaults_and_reject_invalid_values() {
+        let defaults = EffectDebugConfig::from_env_values(None, None);
+        assert_eq!(defaults.capture_mode(), EffectDebugCaptureMode::Replay);
+        assert_eq!(defaults.kawase_mode(), EffectDebugKawaseMode::Partial);
+
+        let framebuffer_full = EffectDebugConfig::from_env_values(
+            Some(OsStr::new("framebuffer")),
+            Some(OsStr::new("full")),
+        );
+        assert_eq!(
+            framebuffer_full.capture_mode(),
+            EffectDebugCaptureMode::Framebuffer
+        );
+        assert_eq!(framebuffer_full.kawase_mode(), EffectDebugKawaseMode::Full);
+
+        let invalid =
+            EffectDebugConfig::from_env_values(Some(OsStr::new("blit")), Some(OsStr::new("all")));
+        assert_eq!(invalid.capture_mode(), EffectDebugCaptureMode::Replay);
+        assert_eq!(invalid.kawase_mode(), EffectDebugKawaseMode::Partial);
+    }
+
+    #[test]
     fn disabled_trace_does_not_evaluate_event_formatter() {
         let trace = EffectExecutionTrace::disabled_for_test();
         let formatted = Cell::new(false);
@@ -547,11 +684,19 @@ mod tests {
             output_id: Some(12),
             capture_mode: Some("replay"),
             capture_commands: Some(13),
+            backdrop_capture_policy: Some("replay"),
+            kawase_execution_policy: Some("partial"),
+            scene_work_damage_rects: 2,
+            scene_work_damage_bbox: Some((1, 2, 30, 40)),
         });
 
         assert!(line.contains("event=effect_pass_begin"));
         assert!(line.contains("pass=7"));
         assert!(line.contains("inputs=2,3,4,5,6,7,8"));
+        assert!(line.contains("backdrop_capture_policy=replay"));
+        assert!(line.contains("kawase_execution_policy=partial"));
+        assert!(line.contains("scene_work_damage_rects=2"));
+        assert!(line.contains("scene_work_damage_bbox=1,2,30,40"));
         assert!(!line.contains("shader"));
         assert!(!line.contains("scene_commands"));
     }
@@ -605,18 +750,20 @@ mod tests {
     #[test]
     fn demand_plan_trace_line_includes_bounded_planner_stats() {
         let trace = EffectExecutionTrace::enabled_for_test();
-        let mut summary = FrameTraceSummary::default();
-        summary.demand_plan = Some(oblivion_one::effects::EffectDemandPlanStats {
-            repair_rect_count: 71,
-            dependency_edge_count: 6,
-            dependency_propagations: 6,
-            max_instance_region_rect_count: 72,
-            region_representation_overflows: 3,
-            visible_clip_fallbacks: 2,
-            work_region_bbox_coalesces: 1,
-            conservative_full: false,
-            ..Default::default()
-        });
+        let summary = FrameTraceSummary {
+            demand_plan: Some(oblivion_one::effects::EffectDemandPlanStats {
+                repair_rect_count: 71,
+                dependency_edge_count: 6,
+                dependency_propagations: 6,
+                max_instance_region_rect_count: 72,
+                region_representation_overflows: 3,
+                visible_clip_fallbacks: 2,
+                work_region_bbox_coalesces: 1,
+                conservative_full: false,
+                ..Default::default()
+            }),
+            ..FrameTraceSummary::default()
+        };
 
         clear_test_events();
         trace.frame_boundary("effect_demand_plan", "end", summary);

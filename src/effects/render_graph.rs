@@ -548,6 +548,15 @@ pub fn plan_effect_execution_demand(
     repair_region: &EffectRegion,
     conservative_full: bool,
 ) -> EffectExecutionDemand {
+    plan_effect_execution_demand_with_kawase_mode(graph, repair_region, conservative_full, false)
+}
+
+pub fn plan_effect_execution_demand_with_kawase_mode(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+) -> EffectExecutionDemand {
     let repair_rect_count = repair_region.rects().len();
     if conservative_full
         || (!repair_region.is_empty() && repair_region.bounding_rect().is_none())
@@ -684,7 +693,7 @@ pub fn plan_effect_execution_demand(
             ..EffectDemandPlanStats::default()
         },
     };
-    plan_effect_pass_execution_demand(graph, &mut demand);
+    plan_effect_pass_execution_demand(graph, &mut demand, full_kawase);
     demand
 }
 
@@ -1123,6 +1132,7 @@ fn update_pass_plan_stats(
 fn plan_effect_pass_execution_demand(
     graph: &CompiledFrameGraph,
     demand: &mut EffectExecutionDemand,
+    full_kawase: bool,
 ) {
     if demand.is_conservative_full() {
         demand.passes = conservative_pass_demands(graph, &demand.instances);
@@ -1187,6 +1197,18 @@ fn plan_effect_pass_execution_demand(
         .iter()
         .map(|pass| instance_is_selected(demand, pass.instance))
         .collect::<Vec<_>>();
+    if full_kawase {
+        for (pass_index, pass) in graph.passes.iter().enumerate() {
+            if selected_passes[pass_index]
+                && matches!(
+                    pass.kind,
+                    RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+                )
+            {
+                pass_regions[pass_index] = full_pass_region(graph, pass);
+            }
+        }
+    }
     let mut pass_dependency_propagations = 0usize;
     let mut visited_edges = Vec::new();
     for pass_index in (0..graph.passes.len()).rev() {
@@ -1286,6 +1308,15 @@ fn plan_effect_pass_execution_demand(
         if conservative_instances.contains(&pass.instance) {
             pass_regions[pass_index] =
                 conservative_pass_region(graph, pass, demand.output_region(pass.instance));
+        }
+        if full_kawase
+            && selected_passes[pass_index]
+            && matches!(
+                pass.kind,
+                RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+            )
+        {
+            pass_regions[pass_index] = full_pass_region(graph, pass);
         }
     }
     demand.conservative_instances = conservative_instances;
@@ -4890,6 +4921,80 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.instance == instance)
                 .all(|pass| demand.pass_output_region(pass.id).is_some())
+        );
+    }
+
+    #[test]
+    fn full_kawase_debug_mode_expands_only_internal_passes() {
+        let (scene, registry) = blur_scene();
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &EffectRegion::empty(), output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("visible blur must compile to an effect graph");
+        };
+        let repair = EffectRegion::from_rect(EffectRect::new(220, 140, 12, 10).unwrap());
+        let demand = plan_effect_execution_demand_with_kawase_mode(&graph, &repair, false, true);
+
+        for pass in graph.passes.iter().filter(|pass| {
+            matches!(
+                pass.kind,
+                RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+            )
+        }) {
+            let output = graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == pass.output.unwrap())
+                .expect("Kawase output texture");
+            assert_eq!(
+                demand.pass_output_region(pass.id),
+                Some(&EffectRegion::from_rect(output.domain)),
+                "debug full-Kawase mode must fully execute {:?}",
+                pass.kind,
+            );
+        }
+
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .expect("blur capture");
+        let capture_output = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == capture.output.expect("capture output"))
+            .expect("blur capture texture");
+        let capture_demand = demand
+            .pass_output_region(capture.id)
+            .expect("full-Kawase capture demand");
+        for y in capture_output.domain.y..capture_output.domain.bottom() {
+            for x in capture_output.domain.x..capture_output.domain.right() {
+                assert!(
+                    capture_demand.contains_point(x, y),
+                    "full internal Kawase demand must propagate to the SceneCapture producer at ({x}, {y})"
+                );
+            }
+        }
+
+        let composite = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Composite)
+            .expect("blur composite");
+        let composite_demand = demand
+            .pass_output_region(composite.id)
+            .expect("composite demand");
+        let composite_output = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == composite.output.unwrap())
+            .expect("composite output texture");
+        assert_ne!(
+            composite_demand,
+            &EffectRegion::from_rect(composite_output.domain),
+            "full internal Kawase must not broaden final visible demand"
         );
     }
 
