@@ -118,15 +118,18 @@ pub(crate) fn analyze_presentation_coverage(
             })
         })
         .collect::<Vec<_>>();
-    let covering_order = surface_details.iter().enumerate().rev().find_map(
-        |(group_order, surface)| {
-            surface
-                .target
-                .intersection(output_rect)
-                .is_some_and(|intersection| intersection == output_rect)
-                .then_some(group_order)
-        },
-    );
+    let covering_order =
+        surface_details
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(group_order, surface)| {
+                surface
+                    .target
+                    .intersection(output_rect)
+                    .is_some_and(|intersection| intersection == output_rect)
+                    .then_some(group_order)
+            });
     let covering_surface = covering_order.and_then(|order| surface_details.get(order).cloned());
     let visible_surface_ids_above_covering = covering_order
         .map(|covering_order| {
@@ -152,7 +155,9 @@ pub(crate) fn analyze_presentation_coverage(
         }),
         opacity: covering_surface
             .as_ref()
-            .map_or(PresentationCoverageOpacity::Unknown, |surface| surface.opacity),
+            .map_or(PresentationCoverageOpacity::Unknown, |surface| {
+                surface.opacity
+            }),
         visible_content_above: Vec::new(),
     };
 
@@ -410,7 +415,10 @@ mod tests {
             .covering_application_group
             .expect("covering application group");
         assert_eq!(
-            group.covering_surface.as_ref().map(|surface| surface.surface_id),
+            group
+                .covering_surface
+                .as_ref()
+                .map(|surface| surface.surface_id),
             Some(11)
         );
         assert_eq!(group.visible_surface_ids_above_covering, vec![12]);

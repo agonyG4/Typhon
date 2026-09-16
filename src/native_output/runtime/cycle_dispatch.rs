@@ -11,11 +11,11 @@ use oblivion_one::control_snapshots::{
     FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot, PositionSnapshot,
     StatusSnapshot, TrustedEffectsReloadSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
-use oblivion_one::render_backend::buffer::SurfaceBufferSource;
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
 };
 use oblivion_one::native::event_loop::NativeWakeup;
+use oblivion_one::render_backend::buffer::SurfaceBufferSource;
 use serde::{Deserialize, Deserializer};
 
 #[inline]
@@ -3003,8 +3003,8 @@ impl DirectScanoutDoctorScene {
                     .collect()
             })
             .unwrap_or_default();
-        let group_surfaces_truncated = group
-            .is_some_and(|group| group.surface_details.len() > MAX_GROUP_SURFACES);
+        let group_surfaces_truncated =
+            group.is_some_and(|group| group.surface_details.len() > MAX_GROUP_SURFACES);
         let visible_above = analysis
             .coverage
             .visible_content_above

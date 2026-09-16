@@ -115,13 +115,8 @@ fn x11_shm_surface(
     height: u32,
     placement: SurfacePlacement,
 ) -> RenderableSurface {
-    let mut surface = x11_scanout_surface(
-        surface_id,
-        width,
-        height,
-        placement,
-        DrmFormat::Xrgb8888,
-    );
+    let mut surface =
+        x11_scanout_surface(surface_id, width, height, placement, DrmFormat::Xrgb8888);
     let identity = BufferIdAllocator::default()
         .allocate()
         .expect("XWayland test SHM buffer identity");
@@ -146,16 +141,16 @@ fn install_x11_visual_tree(
     for child in children {
         state.append_renderable_surface(child);
     }
-    state.surface_presentation_generations.insert(root_surface_id, 1);
+    state
+        .surface_presentation_generations
+        .insert(root_surface_id, 1);
     let surface_ids = state
         .renderable_surfaces
         .iter()
         .map(|surface| surface.surface_id)
         .collect::<Vec<_>>();
     for surface_id in surface_ids {
-        state
-            .surface_presentation_generations
-            .insert(surface_id, 1);
+        state.surface_presentation_generations.insert(surface_id, 1);
     }
     state.rebuild_active_scene_view();
 }
@@ -325,12 +320,7 @@ fn xwayland_surface_above_child_source_has_a_precise_scene_blocker() {
         SurfacePlacement::subsurface(332, 0, 0),
         DrmFormat::Xrgb8888,
     );
-    let above = x11_shm_surface(
-        334,
-        64,
-        64,
-        SurfacePlacement::subsurface(332, 0, 0),
-    );
+    let above = x11_shm_surface(334, 64, 64, SurfacePlacement::subsurface(332, 0, 0));
     install_x11_visual_tree(
         &mut state,
         root,
@@ -341,11 +331,13 @@ fn xwayland_surface_above_child_source_has_a_precise_scene_blocker() {
     let analysis = state.direct_scanout_scene_analysis();
 
     assert!(analysis.candidate.is_none());
-    assert!(analysis
-        .blockers
-        .reasons()
-        .iter()
-        .any(|reason| reason.as_str() == "owner_tree_content_above_source"));
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .iter()
+            .any(|reason| reason.as_str() == "owner_tree_content_above_source")
+    );
 }
 
 #[test]
@@ -367,12 +359,7 @@ fn xwayland_surface_behind_or_outside_child_source_does_not_block_scanout() {
         SurfacePlacement::subsurface(335, 0, 0),
         DrmFormat::Xrgb8888,
     );
-    let outside = x11_shm_surface(
-        337,
-        64,
-        64,
-        SurfacePlacement::subsurface(335, 2_000, 0),
-    );
+    let outside = x11_shm_surface(337, 64, 64, SurfacePlacement::subsurface(335, 2_000, 0));
     install_x11_visual_tree(
         &mut state,
         root,
