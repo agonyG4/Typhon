@@ -6,6 +6,7 @@ use crate::compositor::direct_scanout::{
 use crate::compositor::presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageContentKind,
 };
+use crate::compositor::render::SurfaceTargetRect;
 use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
 use crate::wm::WorkspaceLocation;
 use wayland_server::Resource;
@@ -66,8 +67,8 @@ impl CompositorState {
         if self.presented_presentation_is_non_identity(root_surface_id) {
             blockers.push(DirectScanoutSceneRejection::AnimationTransform);
         }
-        if covering_group.surface_ids.len() > 1 {
-            blockers.push(DirectScanoutSceneRejection::OwnerTreeHasAdditionalSurface);
+        if !covering_group.visible_surface_ids_above_covering.is_empty() {
+            blockers.push(DirectScanoutSceneRejection::OwnerTreeContentAboveSource);
         }
         for visible_content in &coverage.visible_content_above {
             let rejection = match visible_content.kind {
@@ -89,9 +90,21 @@ impl CompositorState {
             blockers.push(rejection);
         }
 
-        let Some(root) = active_surfaces
+        let Some(covering_surface) = covering_group.covering_surface.as_ref() else {
+            blockers.push(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput);
+            if self.has_pending_frame_prepare_work() {
+                blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
+            }
+            return DirectScanoutSceneAnalysis {
+                coverage,
+                candidate: None,
+                blockers,
+            };
+        };
+        let source_surface_id = covering_surface.surface_id;
+        let Some(source) = active_surfaces
             .iter()
-            .find(|surface| surface.surface_id == root_surface_id)
+            .find(|surface| surface.surface_id == source_surface_id)
         else {
             blockers.push(DirectScanoutSceneRejection::OwnerRootBufferMissing);
             if self.has_pending_frame_prepare_work() {
@@ -104,14 +117,8 @@ impl CompositorState {
             };
         };
 
-        if active_surfaces.iter().any(|surface| {
-            surface.surface_id != root_surface_id
-                && self.root_surface_id_for_surface(surface.surface_id) == root_surface_id
-        }) {
-            blockers.push(DirectScanoutSceneRejection::OwnerTreeHasAdditionalSurface);
-        }
-        let buffer = root.dmabuf_handle().cloned();
-        if root.buffer_source() != SurfaceBufferSource::Dmabuf {
+        let buffer = source.dmabuf_handle().cloned();
+        if source.buffer_source() != SurfaceBufferSource::Dmabuf {
             blockers.push(DirectScanoutSceneRejection::NonDmabuf);
         }
         if buffer.is_none() {
@@ -127,30 +134,27 @@ impl CompositorState {
             if let Err(rejection) = direct_scanout_viewport_compatibility(
                 buffer.size(),
                 output_size,
-                root.buffer_scale,
-                root.buffer_transform,
-                root.viewport_source,
-                root.viewport_destination,
+                source.buffer_scale,
+                source.buffer_transform,
+                source.viewport_source,
+                source.viewport_destination,
             ) {
                 blockers.push(rejection);
             }
         }
-        if root.visual_clip.is_some() {
+        if source.visual_clip.is_some() {
             blockers.push(DirectScanoutSceneRejection::VisualClipPresent);
         }
         if self.active_toplevel_resizes.contains_key(&root_surface_id)
-            || root
+            || source
                 .render_placement
-                .is_some_and(|placement| placement != root.placement)
-            || root.render_target_size.is_some()
+                .is_some_and(|placement| placement != source.placement)
+            || source.render_target_size.is_some()
         {
             blockers.push(DirectScanoutSceneRejection::ResizePreviewActive);
         }
-        if root.x != 0
-            || root.y != 0
-            || root.width != output_size.width
-            || root.height != output_size.height
-            || root.placement != SurfacePlacement::absolute_root_at(0, 0)
+        if covering_surface.target
+            != SurfaceTargetRect::new(0, 0, output_size.width, output_size.height)
         {
             blockers.push(DirectScanoutSceneRejection::PlacementMismatch);
         }
@@ -159,7 +163,7 @@ impl CompositorState {
         }
         let surface_presentation_generation = self
             .surface_presentation_generations
-            .get(&root.surface_id)
+            .get(&source.surface_id)
             .copied();
         if surface_presentation_generation.is_none() {
             blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
@@ -181,24 +185,24 @@ impl CompositorState {
                     Some(surface_presentation_generation),
                     Some(presented_window_rect),
                 ) => Some(DirectScanoutSceneCandidate {
-                    surface_id: root.surface_id,
+                    surface_id: source.surface_id,
                     root_surface_id,
                     presented_window_rect,
                     content_epoch: self
-                        .surface_content_epoch(root.surface_id)
-                        .map_or(root.commit_sequence.get(), |sequence| sequence.get()),
-                    generation: root.generation,
+                        .surface_content_epoch(source.surface_id)
+                        .map_or(source.commit_sequence.get(), |sequence| sequence.get()),
+                    generation: source.generation,
                     surface_presentation_generation,
-                    commit_sequence: root.commit_sequence,
-                    buffer_identity: root.buffer_identity().clone(),
+                    commit_sequence: source.commit_sequence,
+                    buffer_identity: source.buffer_identity().clone(),
                     buffer,
                     buffer_size: output_size,
                     output_size,
-                    viewport_identity_metadata_present: root.viewport_source.is_some()
-                        || root.viewport_destination.is_some(),
+                    viewport_identity_metadata_present: source.viewport_source.is_some()
+                        || source.viewport_destination.is_some(),
                     presentation: self
                         .surface_resources
-                        .get(&root.surface_id)
+                        .get(&source.surface_id)
                         .and_then(|surface| surface.data::<SurfaceData>())
                         .map_or(SurfacePresentationMetadata::default(), |data| {
                             data.current_presentation()
