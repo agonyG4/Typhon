@@ -203,6 +203,13 @@ fn removing_a_parent_detaches_children_without_destroying_them() {
         registry.node_for_source(SceneSource::Surface(2)),
         Some(child)
     );
+    let replacement = register_surface(
+        &mut registry,
+        3,
+        SceneRole::ClientSurface,
+        SceneDomainAssignment::Explicit(SceneDomain::Content),
+    );
+    assert_ne!(replacement, parent);
 }
 
 #[test]
