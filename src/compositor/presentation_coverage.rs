@@ -63,14 +63,10 @@ pub struct PresentationCoverageAnalysis {
 }
 
 impl PresentationCoverageAnalysis {
-    pub const fn geometrically_covers_output(&self) -> bool {
-        match self.covering_application_group.as_ref() {
-            Some(group) => match &group.covering_surface {
-                Some(_) => true,
-                None => false,
-            },
-            None => false,
-        }
+    pub fn geometrically_covers_output(&self) -> bool {
+        self.covering_application_group
+            .as_ref()
+            .is_some_and(|group| group.covering_surface.is_some())
     }
 
     pub const fn can_occlude_behind_content(&self) -> bool {
