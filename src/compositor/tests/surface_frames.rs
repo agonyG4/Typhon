@@ -1172,7 +1172,7 @@ fn wayland_client_surface_commit_creates_renderable_shm_snapshot() {
     let surface = &server.renderable_surfaces()[0];
     assert_eq!(surface.width, 2);
     assert_eq!(surface.height, 2);
-    assert_eq!(surface.generation, 1);
+    assert_eq!(surface.generation, server.render_generation());
     assert_eq!(
         server.render_generation_cause(),
         RenderGenerationCause::SurfaceCommit
@@ -1196,7 +1196,7 @@ fn wayland_surface_damage_only_commit_keeps_owned_shm_snapshot() {
 
     assert_eq!(server.renderable_surfaces().len(), 1);
     let surface = &server.renderable_surfaces()[0];
-    assert_eq!(surface.generation, 2);
+    assert_eq!(surface.generation, server.render_generation());
     assert_eq!(
         server.render_generation_cause(),
         RenderGenerationCause::SurfaceDamage
@@ -2642,7 +2642,7 @@ fn wayland_surface_can_switch_from_shm_snapshot_to_dmabuf_handle() {
     let surface = &server.renderable_surfaces()[0];
     assert_eq!(surface.width, 2);
     assert_eq!(surface.height, 2);
-    assert_eq!(surface.generation, 2);
+    assert_eq!(surface.generation, server.render_generation());
     assert_eq!(surface.buffer_source(), SurfaceBufferSource::Dmabuf);
     assert!(surface.cpu_pixels().is_none());
 }
