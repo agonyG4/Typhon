@@ -1,6 +1,6 @@
 use super::*;
-use std::os::unix::net::UnixStream;
 use std::num::NonZeroU64;
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use crate::xwayland::xwm::{X11Geometry, X11PublishedState, X11WindowSnapshot, X11WindowTypes};
@@ -87,6 +87,103 @@ fn role_metadata_changes_without_replacing_surface_scene_identity() {
 }
 
 #[test]
+fn subsurface_role_uses_parent_surface_and_detaches_only_live_edge() {
+    let mut state = CompositorState::default();
+    let (parent_display, parent_id) = test_surface(&mut state);
+    let (child_display, child_id) = test_surface(&mut state);
+    state
+        .assign_surface_role(child_id, SurfaceRole::Subsurface { parent_id })
+        .expect("subsurface role");
+    let parent_node = state.scene_node_id_for_surface(parent_id).unwrap();
+
+    assert_eq!(
+        state
+            .scene_node_metadata_for_surface(child_id)
+            .unwrap()
+            .visual_parent,
+        Some(parent_node)
+    );
+    state.deactivate_role_instance(child_id);
+    let metadata = state.scene_node_metadata_for_surface(child_id).unwrap();
+    assert_eq!(metadata.role, SceneRole::Subsurface);
+    assert_eq!(metadata.visual_parent, None);
+    drop(parent_display);
+    drop(child_display);
+}
+
+#[test]
+fn role_rollback_restores_unassigned_scene_metadata() {
+    let mut state = CompositorState::default();
+    let (display, surface_id) = test_surface(&mut state);
+    state
+        .assign_surface_role(surface_id, SurfaceRole::DragIcon)
+        .expect("drag icon role");
+    state.rollback_surface_role_reservation(surface_id, SurfaceRole::DragIcon);
+    let metadata = state.scene_node_metadata_for_surface(surface_id).unwrap();
+
+    assert_eq!(metadata.role, SceneRole::UnassignedSurface);
+    assert_eq!(
+        metadata.domain,
+        SceneDomainAssignment::Inherit {
+            fallback: SceneDomain::Content
+        }
+    );
+    drop(display);
+}
+
+#[test]
+fn input_surface_roles_receive_input_domain_without_render_changes() {
+    let mut state = CompositorState::default();
+    let (cursor_display, cursor_id) = test_surface(&mut state);
+    let (drag_display, drag_id) = test_surface(&mut state);
+    state
+        .assign_surface_role(cursor_id, SurfaceRole::Cursor)
+        .expect("cursor role");
+    state
+        .assign_surface_role(drag_id, SurfaceRole::DragIcon)
+        .expect("drag icon role");
+
+    assert_eq!(
+        state
+            .scene_node_metadata_for_surface(cursor_id)
+            .unwrap()
+            .domain,
+        SceneDomainAssignment::Explicit(SceneDomain::Input)
+    );
+    assert_eq!(
+        state
+            .scene_node_metadata_for_surface(drag_id)
+            .unwrap()
+            .domain,
+        SceneDomainAssignment::Explicit(SceneDomain::Input)
+    );
+    drop(cursor_display);
+    drop(drag_display);
+}
+
+#[test]
+fn active_scene_projection_keeps_canonical_identity_across_visibility() {
+    let mut state = CompositorState::default();
+    let (display, surface_id) = test_surface(&mut state);
+    state.test_publish_surface(surface_id, 32, 32, SurfacePlacement::root());
+    state.rebuild_active_scene_view();
+    let node = state.active_scene_node_for_surface(surface_id).unwrap();
+
+    assert_eq!(
+        state.active_scene_surface_index_for_node(node),
+        state.active_scene_surface_index(surface_id)
+    );
+    state.test_unmap_surface(surface_id);
+    state.rebuild_active_scene_view();
+    assert!(state.active_scene_node_for_surface(surface_id).is_none());
+    assert!(state.scene_node_id_for_surface(surface_id).is_some());
+    state.test_map_surface(surface_id, 32, 32, SurfacePlacement::root());
+    state.rebuild_active_scene_view();
+    assert_eq!(state.active_scene_node_for_surface(surface_id), Some(node));
+    drop(display);
+}
+
+#[test]
 fn desktop_window_has_stable_group_and_decoration_nodes() {
     let mut state = CompositorState::default();
     let (_display, surface_id) = test_surface(&mut state);
@@ -115,11 +212,17 @@ fn desktop_window_has_stable_group_and_decoration_nodes() {
         Some(group)
     );
     assert_eq!(
-        state.scene_registry.metadata(decoration).unwrap().visual_parent,
+        state
+            .scene_registry
+            .metadata(decoration)
+            .unwrap()
+            .visual_parent,
         Some(group)
     );
 
-    state.remove_desktop_window(window_id).expect("remove window");
+    state
+        .remove_desktop_window(window_id)
+        .expect("remove window");
     assert!(
         state
             .scene_registry
