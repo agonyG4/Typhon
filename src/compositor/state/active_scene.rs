@@ -182,6 +182,7 @@ impl CompositorState {
                 window_id,
                 DesktopWindow::new_xdg(window_id, root_surface_id),
             );
+            self.ensure_window_scene_nodes(window_id, root_surface_id);
             self.window_stacking.push(window_id);
         }
         self.fullscreen_presentation =
