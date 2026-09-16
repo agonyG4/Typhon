@@ -101,6 +101,49 @@ fn role_metadata_changes_without_replacing_surface_scene_identity() {
 }
 
 #[test]
+fn popup_and_layer_roles_keep_surface_scene_identity() {
+    let mut state = CompositorState::default();
+    let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let client = test_client(&mut display);
+    let popup_id = test_surface_for_client(&mut state, &mut display, &client);
+    let layer_id = test_surface_for_client(&mut state, &mut display, &client);
+    let popup_node = state.scene_node_id_for_surface(popup_id).unwrap();
+    let layer_node = state.scene_node_id_for_surface(layer_id).unwrap();
+
+    state
+        .assign_surface_role(popup_id, SurfaceRole::XdgPopup)
+        .expect("popup role");
+    state
+        .assign_surface_role(layer_id, SurfaceRole::LayerSurface)
+        .expect("layer role");
+
+    assert_eq!(state.scene_node_id_for_surface(popup_id), Some(popup_node));
+    assert_eq!(state.scene_node_id_for_surface(layer_id), Some(layer_node));
+    assert_eq!(
+        state
+            .scene_node_metadata_for_surface(popup_id)
+            .unwrap()
+            .role,
+        SceneRole::PopupSurface
+    );
+    assert_eq!(
+        state
+            .scene_node_metadata_for_surface(layer_id)
+            .unwrap()
+            .role,
+        SceneRole::LayerSurface
+    );
+    assert_eq!(
+        state
+            .scene_node_metadata_for_surface(layer_id)
+            .unwrap()
+            .domain,
+        SceneDomainAssignment::Explicit(SceneDomain::Chrome)
+    );
+    drop(display);
+}
+
+#[test]
 fn subsurface_role_uses_parent_surface_and_detaches_only_live_edge() {
     let mut state = CompositorState::default();
     let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
@@ -183,8 +226,10 @@ fn active_scene_projection_keeps_canonical_identity_across_visibility() {
     let mut state = CompositorState::default();
     let (display, surface_id) = test_surface(&mut state);
     state.test_publish_surface(surface_id, 32, 32, SurfacePlacement::root());
+    let node = state.scene_node_id_for_surface(surface_id).unwrap();
+    assert_eq!(state.scene_node_id_for_surface(surface_id), Some(node));
     state.rebuild_active_scene_view();
-    let node = state.active_scene_node_for_surface(surface_id).unwrap();
+    assert_eq!(state.active_scene_node_for_surface(surface_id), Some(node));
 
     assert_eq!(
         state.active_scene_surface_index_for_node(node),
