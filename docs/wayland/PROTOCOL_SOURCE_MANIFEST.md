@@ -210,9 +210,10 @@ their existing versions.
   standardized XDG Settings schema, and live `SettingChanged` notification
   qualification remains pending on Linux.
 
-- Typhon remains single-output. The current output geometry/mode/scale/name/
-  description and `done` policy is preserved; no `OutputId` or hotplug model
-  is introduced.
+- Typhon remains a single-output product. The current output
+  geometry/mode/scale/name/description and `done` policy is preserved; there
+  is no hotplug or multi-output product model yet, but Typhon now has an
+  internal typed logical `OutputId` foundation.
 - `wl_touch` is not advertised as a seat capability. A `get_touch` request is
   therefore a required `wl_seat.missing_capability` error.
 - `wl_pointer.warp` is advertised through the core seat version 11. Explicit

@@ -34,12 +34,13 @@ files. The only partial parse range relevant to this audit is
 directly. The graph evidence was checked for every inspected source path, with
 the best-effort caveat that the graph is not a proof of source completeness.
 
-The current checkout has these relevant properties:
+The original pre-Phase-1A audit recorded these relevant properties. The
+current-state qualification below supersedes the output-identity portion of
+that historical evidence; the remaining scene and presentation-engine gates
+still apply.
 
-* There is no typed `OutputId`. `PhysicalOutputId(u8)` is a private
-  single-output membership helper, and `OutputTransactionId` identifies a KMS
-  submission rather than a physical output. Output generation is currently a
-  scalar in the native-output path.
+* The typed logical `OutputId` foundation is implemented. It is distinct from
+  `OutputTransactionId`, output/backend generation, and physical DRM IDs.
 * There is no stable or generational `SceneNodeId`. Presentation geometry is
   keyed by `root_surface_id: u32`; lifecycle presentation is keyed by
   `WindowId`; protocol surface and subsurface relationships use `u32` surface
@@ -63,11 +64,26 @@ The current checkout has these relevant properties:
   separately. Pageflip promotion is physically authoritative, but the worker
   still publishes the two conceptual paths separately.
 * The current HEAD does not contain the requested post-pending architecture
-  documents for `OutputId`, generic scene nodes, semantic domains,
+  documents for generic scene nodes, semantic domains,
   presentation, damage, frame flow, testing, and guardrails. Current
   architecture/effects/frame-pacing documents and the deleted historical
   presentation-foundation documents were treated as context, not as a
   substitute for the missing current-baseline foundation.
+
+## Current prerequisite status
+
+As of the Phase 1A identity closure, the prerequisite status is:
+
+* **OutputId foundation:** implemented internally. `NativeRuntime`, scene
+  history, transaction ledgers, Direct Scanout identities, cursor identities,
+  KMS bundle identities, and exact pageflip acknowledgements are output-bound.
+* **SceneNodeId foundation:** still missing.
+* **Generic scene hierarchy and metadata:** still missing.
+* **Presentation Engine v2:** still gated; it must wait for the scene-node
+  and canonical-scene foundations.
+
+Typhon remains a single-output product. This internal `OutputId` foundation
+does not add hotplug, multi-output layout, or a multi-output product model.
 
 ## Architecture after the prerequisites
 
@@ -116,11 +132,11 @@ they do not each apply a root transform independently.
 
 ### Phase 1 — canonical output and scene foundations
 
-1. Add a real typed `OutputId` and an output generation/epoch. Thread it
-   through output projection, native frame planning, physical ledger entries,
-   damage history, Direct Scanout diagnostics, and ACK qualification. Keep the
-   current one-output behavior as a cheap adapter, but do not encode output
-   zero in new APIs.
+1. **Completed — OutputId foundation.** A real typed `OutputId` and the
+   existing output/backend generation are threaded through output projection,
+   native frame planning, physical ledger entries, damage history, Direct
+   Scanout diagnostics, and ACK qualification. The current one-output behavior
+   remains a compatibility product policy, not an implicit identity default.
 2. Add a stable/generational `SceneNodeId` allocator owned by the canonical
    scene. Stale node generations must be rejected rather than aliasing a new
    node.
