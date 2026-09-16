@@ -63,6 +63,89 @@ fn xdg_role_after_subsurface_is_rejected_and_healthy_client_survives() {
 }
 
 #[test]
+fn viewport_source_only_fractional_width_is_a_bad_size_error() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let viewport = viewporter.get_viewport(&surface, &qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 4).unwrap();
+
+    viewport.set_source(0.0, 0.0, 2.5, 2.0);
+    buffer.attach(&surface, 4, 4);
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let observed = expect_protocol_error(
+        &connection,
+        "wp_viewport",
+        client_wp_viewport::Error::BadSize as u32,
+    );
+    assert_eq!(observed.object_id, viewport.id().protocol_id());
+
+    drop(viewport);
+    drop(surface);
+    drop(shm);
+    drop(compositor);
+    drop(globals);
+    drop(queue);
+    drop(qh);
+    drop(connection);
+    let _ = commands.send(ServerCommand::Stop);
+    let server = server_thread.join().unwrap();
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 1);
+}
+
+#[test]
+fn viewport_source_one_fixed_unit_outside_buffer_is_out_of_buffer() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let viewport = viewporter.get_viewport(&surface, &qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 4).unwrap();
+
+    viewport.set_source(0.0, 0.0, 4.0 + 1.0 / 256.0, 4.0);
+    viewport.set_destination(4, 4);
+    buffer.attach(&surface, 4, 4);
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let observed = expect_protocol_error(
+        &connection,
+        "wp_viewport",
+        client_wp_viewport::Error::OutOfBuffer as u32,
+    );
+    assert_eq!(observed.object_id, viewport.id().protocol_id());
+
+    drop(viewport);
+    drop(surface);
+    drop(shm);
+    drop(compositor);
+    drop(globals);
+    drop(queue);
+    drop(qh);
+    drop(connection);
+    let _ = commands.send(ServerCommand::Stop);
+    let server = server_thread.join().unwrap();
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 1);
+}
+
+#[test]
 fn xdg_role_after_cursor_surface_is_rejected_and_healthy_client_survives() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();

@@ -397,14 +397,27 @@ impl NativeSceneSnapshot {
                     oblivion_one::compositor::RenderableSurfaceDamage::HistoryLost => {
                         NativeSurfaceDamageEvidence::HistoryLost
                     }
-                    oblivion_one::compositor::RenderableSurfaceDamage::Full
-                    | oblivion_one::compositor::RenderableSurfaceDamage::Partial(_) => {
+                    oblivion_one::compositor::RenderableSurfaceDamage::Full => {
+                        let target = element.visible_target();
+                        NativeSurfaceDamageEvidence::Known(
+                            (target.width() > 0 && target.height() > 0)
+                                .then_some(NativeDamageRect {
+                                    x: target.x(),
+                                    y: target.y(),
+                                    width: target.width(),
+                                    height: target.height(),
+                                })
+                                .into_iter()
+                                .collect(),
+                        )
+                    }
+                    oblivion_one::compositor::RenderableSurfaceDamage::Partial(_) => {
                         NativeSurfaceDamageEvidence::Known(
                             element
                                 .damage()
                                 .clipped_rects(buffer_size.width, buffer_size.height)
                                 .into_iter()
-                                .filter_map(|rect| {
+                                .flat_map(|rect| {
                                     NativeDamageRect::from_render_element_damage(element, rect)
                                 })
                                 .collect(),
@@ -529,68 +542,20 @@ impl NativeDamageRect {
             .or(visible)
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_surface_damage(
-        surface: &RenderableSurface,
-        origin: (i32, i32),
-        rect: oblivion_one::compositor::SurfaceDamageRect,
-    ) -> Option<Self> {
-        if surface.width == 0 || surface.height == 0 {
-            return None;
-        }
-
-        let mapping = oblivion_one::compositor::SurfaceBufferMapping::new(
-            surface.buffer_size(),
-            surface.buffer_scale,
-            surface.buffer_transform,
-            surface.viewport_source.map(|source| {
-                oblivion_one::compositor::SurfaceGeometryRect::new(
-                    source.x,
-                    source.y,
-                    source.width,
-                    source.height,
-                )
-            }),
-            surface.viewport_destination,
-        )?;
-        let rect = mapping.map_buffer_rect_to_surface(rect)??;
-        let extent = mapping.surface_extent();
-        let left = scale_damage_floor(rect.x, extent.width, surface.width)?;
-        let top = scale_damage_floor(rect.y, extent.height, surface.height)?;
-        let right = scale_damage_ceil(
-            rect.x.saturating_add(rect.width),
-            extent.width,
-            surface.width,
-        )?;
-        let bottom = scale_damage_ceil(
-            rect.y.saturating_add(rect.height),
-            extent.height,
-            surface.height,
-        )?;
-        if right <= left || bottom <= top {
-            return None;
-        }
-
-        Some(Self {
-            x: i32_saturating_add_u32(origin.0, left),
-            y: i32_saturating_add_u32(origin.1, top),
-            width: right - left,
-            height: bottom - top,
-        })
-    }
-
     pub(crate) fn from_render_element_damage(
         element: &RenderSceneElement,
         rect: oblivion_one::compositor::SurfaceDamageRect,
-    ) -> Option<Self> {
-        let target =
-            element.output_damage_target_for_buffer_rect(element.visible_target(), rect)?;
-        Some(Self {
-            x: target.x(),
-            y: target.y(),
-            width: target.width(),
-            height: target.height(),
-        })
+    ) -> Vec<Self> {
+        element
+            .output_damage_targets_for_buffer_rect(rect)
+            .into_iter()
+            .map(|target| Self {
+                x: target.x(),
+                y: target.y(),
+                width: target.width(),
+                height: target.height(),
+            })
+            .collect()
     }
 
     pub(crate) fn clipped_to_output(self, output_width: u32, output_height: u32) -> Option<Self> {
@@ -815,18 +780,16 @@ impl NativeDamageAccumulator {
 
     #[cfg(test)]
     pub(crate) fn add_surface(&mut self, surface: &RenderableSurface, origin: (i32, i32)) {
-        let buffer_size = surface.buffer_size();
-        for rect in surface
-            .damage
-            .clipped_rects(buffer_size.width, buffer_size.height)
-        {
-            let Some(rect) = NativeDamageRect::from_surface_damage(surface, origin, rect)
-                .and_then(|rect| rect.clipped_to_output(self.output_width, self.output_height))
-            else {
-                continue;
-            };
-            self.rects.push(rect);
-        }
+        let element = RenderSceneElement::from_surface(
+            surface,
+            oblivion_one::compositor::SurfaceTargetRect::new(
+                origin.0,
+                origin.1,
+                surface.width,
+                surface.height,
+            ),
+        );
+        self.add_render_element(&element);
     }
 
     #[cfg(test)]
@@ -836,12 +799,11 @@ impl NativeDamageAccumulator {
             .damage()
             .clipped_rects(buffer_size.width, buffer_size.height)
         {
-            let Some(rect) = NativeDamageRect::from_render_element_damage(element, rect)
-                .and_then(|rect| rect.clipped_to_output(self.output_width, self.output_height))
-            else {
-                continue;
-            };
-            self.rects.push(rect);
+            for rect in NativeDamageRect::from_render_element_damage(element, rect) {
+                if let Some(rect) = rect.clipped_to_output(self.output_width, self.output_height) {
+                    self.rects.push(rect);
+                }
+            }
         }
     }
 
@@ -1485,31 +1447,4 @@ pub(crate) fn native_repaint_cause_label(
         return "accepted_client";
     }
     "unknown"
-}
-
-#[cfg(test)]
-pub(crate) fn scale_damage_floor(value: u32, from_extent: u32, to_extent: u32) -> Option<u32> {
-    if from_extent == 0 {
-        return None;
-    }
-    let scaled = u64::from(value).saturating_mul(u64::from(to_extent)) / u64::from(from_extent);
-    Some(scaled.min(u64::from(u32::MAX)) as u32)
-}
-
-#[cfg(test)]
-pub(crate) fn scale_damage_ceil(value: u32, from_extent: u32, to_extent: u32) -> Option<u32> {
-    if from_extent == 0 {
-        return None;
-    }
-    let numerator = u64::from(value).saturating_mul(u64::from(to_extent));
-    let scaled =
-        numerator.saturating_add(u64::from(from_extent).saturating_sub(1)) / u64::from(from_extent);
-    Some(scaled.min(u64::from(u32::MAX)) as u32)
-}
-
-#[cfg(test)]
-pub(crate) fn i32_saturating_add_u32(value: i32, addend: u32) -> i32 {
-    i64::from(value)
-        .saturating_add(i64::from(addend))
-        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }

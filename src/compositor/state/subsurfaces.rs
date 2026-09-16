@@ -1996,27 +1996,24 @@ impl CompositorState {
                 _ => {}
             }
         }
-        if commit.attachment.is_none()
-            && let Some(surface) = self.surface_resource_by_id(surface_id)
-            && let Some(data) = surface.data::<SurfaceData>()
-            && let Some(current) = self.current_surface_buffers.get(&surface_id)
-            && current
-                .content_mapping_for_state(
-                    data.viewport_for_change(commit.viewport_destination),
-                    data.buffer_scale_for_change(commit.buffer_scale),
-                    data.buffer_transform_for_change(commit.buffer_transform),
-                    commit.offset,
-                )
-                .is_err()
-        {
-            if let Some(client) = surface.client() {
-                self.post_protocol_error(
-                    &client,
-                    &surface,
-                    wl_surface::Error::InvalidSize,
-                    "buffer dimensions are not integral after transform and scale".to_string(),
-                );
-            }
+        let mapping_error = if commit.attachment.is_none() {
+            self.surface_resource_by_id(surface_id).and_then(|surface| {
+                let data = surface.data::<SurfaceData>()?;
+                let current = self.current_surface_buffers.get(&surface_id)?;
+                current
+                    .content_mapping_for_state(
+                        data.viewport_for_change(commit.viewport_destination),
+                        data.buffer_scale_for_change(commit.buffer_scale),
+                        data.buffer_transform_for_change(commit.buffer_transform),
+                        commit.offset,
+                    )
+                    .err()
+            })
+        } else {
+            None
+        };
+        if let Some(error) = mapping_error {
+            self.post_surface_mapping_error(surface_id, error);
             self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
             return;
         }
@@ -2034,30 +2031,23 @@ impl CompositorState {
         }
         match commit.attachment.as_mut() {
             Some(PendingSurfaceAttachment::Buffer(pending)) => {
-                if let Some(surface) = self.surface_resource_by_id(surface_id)
-                    && let Some(data) = surface.data::<SurfaceData>()
-                {
+                let mapping_error = self.surface_resource_by_id(surface_id).and_then(|surface| {
+                    let data = surface.data::<SurfaceData>()?;
                     let viewport = data.viewport_for_change(commit.viewport_destination);
                     let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
                     let buffer_transform =
                         data.buffer_transform_for_change(commit.buffer_transform);
-                    if pending
-                        .apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
-                        .is_err()
-                    {
-                        if let Some(client) = surface.client() {
-                            self.post_protocol_error(
-                                &client,
-                                &surface,
-                                wl_surface::Error::InvalidSize,
-                                "buffer dimensions are not integral after transform and scale"
-                                    .to_string(),
-                            );
-                        }
-                        self.release_pending_surface_buffer(pending.clone());
-                        self.complete_frame_callbacks(std::mem::take(&mut commit.frame_callbacks));
-                        return;
-                    }
+                    Some(pending.apply_committed_surface_state(
+                        viewport,
+                        buffer_scale,
+                        buffer_transform,
+                    ))
+                });
+                if let Some(Err(error)) = mapping_error {
+                    self.post_surface_mapping_error(surface_id, error);
+                    self.release_pending_surface_buffer(pending.clone());
+                    self.complete_frame_callbacks(std::mem::take(&mut commit.frame_callbacks));
+                    return;
                 }
                 self.finalize_pending_buffer_resize_capture(
                     surface_id,
@@ -2093,22 +2083,14 @@ impl CompositorState {
         external_content_update_dependencies: Vec<ContentUpdateRef>,
         submission_kind: SurfaceTreeSubmissionKind,
     ) {
-        if !self.prepare_surface_tree_surface_state(&mut nodes) {
+        if let Err((error_surface_id, error)) = self.prepare_surface_tree_surface_state(&mut nodes)
+        {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
-                    "oblivion-one compositor: surface_commit validation failed surface={surface_id}"
+                    "oblivion-one compositor: surface_commit validation failed surface={error_surface_id}"
                 );
             }
-            if let Some(surface) = self.surface_resource_by_id(surface_id)
-                && let Some(client) = surface.client()
-            {
-                self.post_protocol_error(
-                    &client,
-                    &surface,
-                    wl_surface::Error::InvalidSize,
-                    "buffer dimensions are not integral after transform and scale".to_string(),
-                );
-            }
+            self.post_surface_mapping_error(error_surface_id, error);
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
         }
@@ -2599,44 +2581,81 @@ impl CompositorState {
     pub(in crate::compositor) fn prepare_surface_tree_surface_state(
         &self,
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
-    ) -> bool {
+    ) -> Result<(), (u32, SurfaceMappingError)> {
         for (surface_id, commit) in nodes {
             let Some(surface) = self.surface_resource_by_id(*surface_id) else {
-                return false;
+                return Err((*surface_id, SurfaceMappingError::InvalidBufferSize));
             };
             let Some(data) = surface.data::<SurfaceData>() else {
-                return false;
+                return Err((*surface_id, SurfaceMappingError::InvalidBufferSize));
             };
             let viewport = data.viewport_for_change(commit.viewport_destination);
             let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
             let buffer_transform = data.buffer_transform_for_change(commit.buffer_transform);
-            match commit.attachment.as_mut() {
+            let result = match commit.attachment.as_mut() {
                 Some(PendingSurfaceAttachment::Buffer(pending)) => {
-                    if pending
-                        .apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
-                        .is_err()
-                    {
-                        return false;
-                    }
+                    pending.apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
                 }
-                Some(PendingSurfaceAttachment::RemoveContent) => {}
+                Some(PendingSurfaceAttachment::RemoveContent) => Ok(()),
                 None => {
-                    if let Some(current) = self.current_surface_buffers.get(surface_id)
-                        && current
+                    if let Some(current) = self.current_surface_buffers.get(surface_id) {
+                        current
                             .content_mapping_for_state(
                                 viewport,
                                 buffer_scale,
                                 buffer_transform,
                                 commit.offset,
                             )
-                            .is_err()
-                    {
-                        return false;
+                            .map(|_| ())
+                    } else {
+                        Ok(())
                     }
                 }
+            };
+            if let Err(error) = result {
+                return Err((*surface_id, error));
             }
         }
-        true
+        Ok(())
+    }
+
+    fn post_surface_mapping_error(&mut self, surface_id: u32, error: SurfaceMappingError) {
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            return;
+        };
+        let Some(client) = surface.client() else {
+            return;
+        };
+        let viewport = surface
+            .data::<SurfaceData>()
+            .and_then(SurfaceData::viewport_resource);
+        match (viewport, error) {
+            (Some(viewport), SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination) => {
+                self.post_protocol_error(
+                    &client,
+                    &viewport,
+                    wp_viewport::Error::BadSize,
+                    "viewport source width and height must be integral when destination is unset",
+                )
+            }
+            (Some(viewport), SurfaceMappingError::ViewportSourceOutOfBounds) => {
+                self.post_protocol_error(
+                    &client,
+                    &viewport,
+                    wp_viewport::Error::OutOfBuffer,
+                    "viewport source rectangle is outside the buffer",
+                );
+            }
+            (None, SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination)
+            | (None, SurfaceMappingError::ViewportSourceOutOfBounds)
+            | (_, SurfaceMappingError::InvalidBufferSize)
+            | (_, SurfaceMappingError::BufferScaleNotIntegral) => self.post_protocol_error(
+                &client,
+                &surface,
+                wl_surface::Error::InvalidSize,
+                "surface buffer mapping is invalid",
+            ),
+        }
     }
 
     pub(in crate::compositor) fn prepare_surface_tree_acquires(

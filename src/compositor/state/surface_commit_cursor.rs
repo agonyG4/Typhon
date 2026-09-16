@@ -135,9 +135,7 @@ impl CompositorState {
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
             return false;
         };
-        let mapping_changed = current
-            .current_content_mapping()
-            .map_or(true, |previous| previous != mapping);
+        let mapping_changed = current.current_content_mapping() != Ok(mapping);
         if damage.is_none() && !mapping_changed {
             if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
                 current.update_content_mapping(mapping, commit_sequence);

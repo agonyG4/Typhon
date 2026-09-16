@@ -6,6 +6,56 @@ use oblivion_one::presentation_animation::PresentationFrameSnapshot;
 use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 
 #[test]
+fn native_partial_damage_matches_render_element_visible_projection() {
+    let surface = RenderableSurface {
+        visual_clip: Some(
+            oblivion_one::compositor::SurfaceVisualAperture::logical_only(
+                oblivion_one::compositor::SurfaceTargetRect::new(50, 0, 50, 100),
+            ),
+        ),
+        damage: RenderableSurfaceDamage::Partial(vec![
+            oblivion_one::compositor::SurfaceDamageRect {
+                x: 75,
+                y: 10,
+                width: 10,
+                height: 10,
+            },
+        ]),
+        ..test_renderable_surface(7, 0, 0, 100, 100, RenderableSurfaceDamage::Empty)
+    };
+    let elements = oblivion_one::compositor::render_scene_elements_for_surfaces(
+        std::slice::from_ref(&surface),
+        1.0,
+    );
+    let element = &elements[0];
+    let software_projection = element
+        .output_damage_targets_for_buffer_rect(oblivion_one::compositor::SurfaceDamageRect {
+            x: 75,
+            y: 10,
+            width: 10,
+            height: 10,
+        })
+        .into_iter()
+        .map(|target| NativeDamageRect {
+            x: target.x(),
+            y: target.y(),
+            width: target.width(),
+            height: target.height(),
+        })
+        .collect::<Vec<_>>();
+    let expected = vec![NativeDamageRect {
+        x: 147,
+        y: 82,
+        width: 10,
+        height: 10,
+    }];
+    assert_eq!(software_projection, expected);
+
+    let damage = NativeDamageAccumulator::from_render_elements(220, 220, &elements);
+    assert_eq!(damage.rects(), expected.as_slice());
+}
+
+#[test]
 fn c2_native_snapshot_workloads_report_surface_and_visual_group_reconstruction() {
     for surface_count in [1_usize, 16, 128] {
         let surfaces = (0..surface_count)

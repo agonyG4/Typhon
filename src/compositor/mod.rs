@@ -164,8 +164,8 @@ pub use frame_batch::{
 };
 pub(crate) use frame_batch::{CompositorFrameBatch, DmabufGpuReleaseLease};
 pub use geometry::{
-    SurfaceBufferMapping, SurfaceGeometryRect, SurfaceUvQuad, transform_buffer_pixel,
-    transformed_buffer_size,
+    SurfaceBufferMapping, SurfaceGeometryRect, SurfaceMappingError, SurfaceUvQuad,
+    transform_buffer_pixel, transformed_buffer_size,
 };
 pub use state_data::ShmBufferLifetimeMetrics;
 pub(in crate::compositor) use state_data::{

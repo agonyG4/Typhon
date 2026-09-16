@@ -3,7 +3,7 @@ use super::super::*;
 impl Dispatch<wp_viewporter::WpViewporter, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_viewporter::WpViewporter,
         request: wp_viewporter::Request,
         _data: &(),
@@ -13,7 +13,27 @@ impl Dispatch<wp_viewporter::WpViewporter, ()> for CompositorState {
         match request {
             wp_viewporter::Request::Destroy => {}
             wp_viewporter::Request::GetViewport { id, surface } => {
-                data_init.init(id, ViewportData { surface });
+                if surface
+                    .data::<SurfaceData>()
+                    .is_some_and(|data| data.viewport_resource().is_some())
+                {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wp_viewporter::Error::ViewportExists,
+                        "wl_surface already has a viewport".to_string(),
+                    );
+                    return;
+                }
+                let viewport = data_init.init(
+                    id,
+                    ViewportData {
+                        surface: surface.clone(),
+                    },
+                );
+                if let Some(surface_data) = surface.data::<SurfaceData>() {
+                    let _ = surface_data.register_viewport_resource(viewport);
+                }
             }
             other => {
                 let _ = other;
@@ -42,6 +62,7 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
         };
         match request {
             wp_viewport::Request::Destroy => {
+                surface_data.clear_viewport_resource(resource.id().protocol_id());
                 surface_data.set_pending_viewport_source(None);
                 surface_data.set_pending_viewport_destination(None);
             }

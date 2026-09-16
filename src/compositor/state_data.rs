@@ -247,7 +247,7 @@ pub(in crate::compositor) struct SurfaceContentMapping {
     pub(in crate::compositor) viewport_destination: Option<BufferSize>,
 }
 
-use super::geometry::{SurfaceBufferMapping, SurfaceGeometryRect};
+use super::geometry::{SurfaceBufferMapping, SurfaceGeometryRect, SurfaceMappingError};
 use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
     SurfacePlacement, SurfaceRenderBackend,
@@ -259,6 +259,7 @@ use super::{
     shm::{ShmBufferData, invalid_shm_buffer},
 };
 use crate::compositor::{WindowConstraints, WindowId};
+use wayland_protocols::wp::viewporter::server::wp_viewport;
 
 pub(super) type ToplevelSizeConstraints = WindowConstraints;
 
@@ -362,6 +363,7 @@ pub(super) struct SurfaceData {
     pub(super) pending_pacing: Mutex<PendingSurfacePacingState>,
     pub(super) presentation: Mutex<SurfacePresentationState>,
     viewport: Mutex<SurfaceViewportState>,
+    viewport_resource: Mutex<Option<wp_viewport::WpViewport>>,
     buffer_scale: Mutex<SurfaceBufferScaleState>,
     buffer_transform: Mutex<SurfaceBufferTransformState>,
     input_region: Mutex<SurfaceInputRegionState>,
@@ -578,6 +580,35 @@ impl SurfaceData {
         if let Ok(mut viewport) = self.viewport.lock() {
             viewport.pending_destination = Some(destination);
         }
+    }
+
+    pub(super) fn register_viewport_resource(&self, resource: wp_viewport::WpViewport) -> bool {
+        let Ok(mut current) = self.viewport_resource.lock() else {
+            return false;
+        };
+        if current.as_ref().is_some_and(Resource::is_alive) {
+            return false;
+        }
+        *current = Some(resource);
+        true
+    }
+
+    pub(super) fn clear_viewport_resource(&self, resource_id: u32) {
+        if let Ok(mut current) = self.viewport_resource.lock()
+            && current
+                .as_ref()
+                .is_some_and(|resource| resource.id().protocol_id() == resource_id)
+        {
+            *current = None;
+        }
+    }
+
+    pub(super) fn viewport_resource(&self) -> Option<wp_viewport::WpViewport> {
+        self.viewport_resource
+            .lock()
+            .ok()
+            .and_then(|resource| resource.as_ref().cloned())
+            .filter(Resource::is_alive)
     }
 
     pub(super) fn set_pending_viewport_source(&self, source: Option<ViewportSourceRect>) {
@@ -873,7 +904,7 @@ fn convert_pending_damage(
     let Some(buffer_size) = buffer_size else {
         return RenderableSurfaceDamage::Full;
     };
-    let Some(mapping) = SurfaceBufferMapping::new(
+    let Ok(mapping) = SurfaceBufferMapping::new(
         buffer_size,
         buffer_scale,
         buffer_transform,
@@ -1224,22 +1255,28 @@ mod damage_space_tests {
             size(2, 2)
         );
         assert!(
-            validate_viewport_source(
+            surface_size_for_state_with_buffer_size(
                 size(4, 2),
+                SurfaceViewportCommit {
+                    source: ViewportSourceRect::new(0.0, 0.0, 2.0, 1.0),
+                    destination: None,
+                },
                 2,
                 wl_output::Transform::Normal,
-                ViewportSourceRect::new(0.0, 0.0, 2.0, 1.0),
             )
-            .is_ok()
+            .is_ok(),
         );
         assert!(
-            validate_viewport_source(
+            surface_size_for_state_with_buffer_size(
                 size(2, 4),
+                SurfaceViewportCommit {
+                    source: ViewportSourceRect::new(2.01, 0.0, 2.0, 2.0),
+                    destination: None,
+                },
                 1,
                 wl_output::Transform::_90,
-                ViewportSourceRect::new(2.01, 0.0, 2.0, 2.0),
             )
-            .is_err()
+            .is_err(),
         );
     }
 
@@ -1664,10 +1701,14 @@ impl CurrentSurfaceBuffer {
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
         offset: Option<(i32, i32)>,
-    ) -> io::Result<SurfaceContentMapping> {
-        let buffer_size =
-            BufferSize::new(self.width()?, self.height()?).ok_or_else(invalid_shm_buffer)?;
-        validate_viewport_source(buffer_size, buffer_scale, buffer_transform, viewport.source)?;
+    ) -> Result<SurfaceContentMapping, SurfaceMappingError> {
+        let buffer_size = BufferSize::new(
+            self.width()
+                .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+            self.height()
+                .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+        )
+        .ok_or(SurfaceMappingError::InvalidBufferSize)?;
         let surface_size = surface_size_for_state_with_buffer_size(
             buffer_size,
             viewport,
@@ -1685,7 +1726,9 @@ impl CurrentSurfaceBuffer {
         })
     }
 
-    pub(super) fn current_content_mapping(&self) -> io::Result<SurfaceContentMapping> {
+    pub(super) fn current_content_mapping(
+        &self,
+    ) -> Result<SurfaceContentMapping, SurfaceMappingError> {
         self.content_mapping_for_state(
             SurfaceViewportCommit {
                 source: self.viewport_source(),
@@ -1755,7 +1798,7 @@ impl PendingSurfaceBuffer {
         viewport: SurfaceViewportCommit,
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
-    ) -> io::Result<()> {
+    ) -> Result<(), SurfaceMappingError> {
         let surface_size = self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?;
         self.viewport_source = viewport.source;
         self.viewport_destination = viewport.destination;
@@ -1770,32 +1813,20 @@ impl PendingSurfaceBuffer {
         viewport: SurfaceViewportCommit,
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
-    ) -> io::Result<BufferSize> {
-        self.validate_viewport_source(viewport.source, buffer_scale, buffer_transform)?;
+    ) -> Result<BufferSize, SurfaceMappingError> {
         surface_size_for_state_with_buffer_size(
-            BufferSize::new(self.data.width()?, self.data.height()?)
-                .ok_or_else(invalid_shm_buffer)?,
+            BufferSize::new(
+                self.data
+                    .width()
+                    .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+                self.data
+                    .height()
+                    .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+            )
+            .ok_or(SurfaceMappingError::InvalidBufferSize)?,
             viewport,
             buffer_scale,
             buffer_transform,
-        )
-    }
-
-    fn validate_viewport_source(
-        &self,
-        source: Option<ViewportSourceRect>,
-        buffer_scale: u32,
-        buffer_transform: wl_output::Transform,
-    ) -> io::Result<()> {
-        let Some(source) = source else {
-            return Ok(());
-        };
-        validate_viewport_source(
-            BufferSize::new(self.data.width()?, self.data.height()?)
-                .ok_or_else(invalid_shm_buffer)?,
-            buffer_scale,
-            buffer_transform,
-            Some(source),
         )
     }
 
@@ -1921,7 +1952,7 @@ fn surface_size_for_state_with_buffer_size(
     viewport: SurfaceViewportCommit,
     buffer_scale: u32,
     buffer_transform: wl_output::Transform,
-) -> io::Result<BufferSize> {
+) -> Result<BufferSize, SurfaceMappingError> {
     SurfaceBufferMapping::new(
         buffer_size,
         buffer_scale,
@@ -1932,26 +1963,6 @@ fn surface_size_for_state_with_buffer_size(
         viewport.destination,
     )
     .map(SurfaceBufferMapping::surface_extent)
-    .ok_or_else(invalid_shm_buffer)
-}
-
-fn validate_viewport_source(
-    buffer_size: BufferSize,
-    buffer_scale: u32,
-    buffer_transform: wl_output::Transform,
-    source: Option<ViewportSourceRect>,
-) -> io::Result<()> {
-    SurfaceBufferMapping::new(
-        buffer_size,
-        buffer_scale,
-        buffer_transform,
-        source.map(|source| {
-            SurfaceGeometryRect::new(source.x, source.y, source.width, source.height)
-        }),
-        None,
-    )
-    .map(|_| ())
-    .ok_or_else(invalid_shm_buffer)
 }
 
 #[derive(Debug, Clone)]

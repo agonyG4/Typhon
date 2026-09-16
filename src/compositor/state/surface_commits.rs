@@ -461,9 +461,7 @@ impl CompositorState {
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
             return false;
         };
-        let mapping_changed = current
-            .current_content_mapping()
-            .map_or(true, |previous| previous != mapping);
+        let mapping_changed = current.current_content_mapping() != Ok(mapping);
         let window_geometry_changed =
             self.committed_window_geometry_changed(surface_id, window_geometry);
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;

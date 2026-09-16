@@ -734,35 +734,59 @@ impl RenderSceneElement {
         &self.damage
     }
 
-    pub fn output_damage_target_for_buffer_rect(
+    pub fn output_damage_targets_for_buffer_rect(
         &self,
-        target: SurfaceTargetRect,
         rect: SurfaceDamageRect,
-    ) -> Option<SurfaceTargetRect> {
-        if target.width() == 0 || target.height() == 0 {
-            return None;
+    ) -> Vec<SurfaceTargetRect> {
+        let visible_content_targets = || {
+            self.content_regions
+                .iter()
+                .map(|plan| plan.content_target)
+                .filter(|target| target.width() > 0 && target.height() > 0)
+                .collect::<Vec<_>>()
+        };
+        if self.target.width() == 0 || self.target.height() == 0 {
+            return Vec::new();
         }
-        let Some(mapping) = self.content_regions.first().and_then(|plan| plan.mapping) else {
-            return Some(target);
+        let Some(mapping) = self.content_regions.iter().find_map(|plan| plan.mapping) else {
+            return visible_content_targets();
         };
         let mapped = match mapping.map_buffer_rect_to_surface(rect) {
-            None => return Some(target),
-            Some(None) => return None,
+            None => return visible_content_targets(),
+            Some(None) => return Vec::new(),
             Some(Some(mapped)) => mapped,
         };
         let extent = mapping.surface_extent();
         let right_edge = mapped.x.saturating_add(mapped.width);
         let bottom_edge = mapped.y.saturating_add(mapped.height);
-        let left = scale_rect_edge(mapped.x, extent.width, target.width(), false)?;
-        let top = scale_rect_edge(mapped.y, extent.height, target.height(), false)?;
-        let right = scale_rect_edge(right_edge, extent.width, target.width(), true)?;
-        let bottom = scale_rect_edge(bottom_edge, extent.height, target.height(), true)?;
-        (right > left && bottom > top).then_some(SurfaceTargetRect::new(
-            i32_saturating_add_u32(target.x(), left),
-            i32_saturating_add_u32(target.y(), top),
+        let Some(left) = scale_rect_edge(mapped.x, extent.width, self.target.width(), false) else {
+            return visible_content_targets();
+        };
+        let Some(top) = scale_rect_edge(mapped.y, extent.height, self.target.height(), false)
+        else {
+            return visible_content_targets();
+        };
+        let Some(right) = scale_rect_edge(right_edge, extent.width, self.target.width(), true)
+        else {
+            return visible_content_targets();
+        };
+        let Some(bottom) = scale_rect_edge(bottom_edge, extent.height, self.target.height(), true)
+        else {
+            return visible_content_targets();
+        };
+        if right <= left || bottom <= top {
+            return Vec::new();
+        }
+        let projected = SurfaceTargetRect::new(
+            i32_saturating_add_u32(self.target.x(), left),
+            i32_saturating_add_u32(self.target.y(), top),
             right - left,
             bottom - top,
-        ))
+        );
+        self.content_regions
+            .iter()
+            .filter_map(|plan| projected.intersection(plan.content_target))
+            .collect()
     }
 }
 
@@ -2017,13 +2041,11 @@ fn partial_scene_damage_rects(
                     .damage
                     .clipped_rects(element.buffer_size.width, element.buffer_size.height)
                 {
-                    let Some(rect) =
-                        output_damage_rect_for_element(element, snapshot.visible_target, rect)
-                            .and_then(|rect| rect.clipped_to_output(frame_width, frame_height))
-                    else {
-                        continue;
-                    };
-                    damage_rects.push(rect);
+                    for rect in output_damage_rects_for_element(element, rect) {
+                        if let Some(rect) = rect.clipped_to_output(frame_width, frame_height) {
+                            damage_rects.push(rect);
+                        }
+                    }
                 }
             }
         }
@@ -2032,14 +2054,15 @@ fn partial_scene_damage_rects(
     Some(coalesce_output_rects(damage_rects))
 }
 
-fn output_damage_rect_for_element(
+fn output_damage_rects_for_element(
     element: &RenderSceneElement,
-    target: SurfaceTargetRect,
     rect: SurfaceDamageRect,
-) -> Option<OutputRect> {
+) -> Vec<OutputRect> {
     element
-        .output_damage_target_for_buffer_rect(target, rect)
-        .map(|target| target.output_rect())
+        .output_damage_targets_for_buffer_rect(rect)
+        .into_iter()
+        .map(SurfaceTargetRect::output_rect)
+        .collect()
 }
 
 fn scale_rect_edge(value: u32, from_extent: u32, to_extent: u32, round_up: bool) -> Option<u32> {
@@ -2447,6 +2470,7 @@ fn surface_buffer_mapping(surface: &RenderableSurface) -> Option<SurfaceBufferMa
         }),
         surface.viewport_destination,
     )
+    .ok()
 }
 
 pub fn clip_surface_render_plan(
@@ -4626,6 +4650,62 @@ mod tests {
     }
 
     #[test]
+    fn desktop_partial_rebuild_projects_damage_before_visual_clip() {
+        let mut renderer = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 220 * 220];
+        let initial_surface = RenderableSurface {
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                50, 0, 50, 100,
+            ))),
+            ..solid_test_surface(7, 0, 0, 100, 100, 0xffff_0000)
+        };
+        renderer.compose_with_generation(
+            &mut frame,
+            220,
+            220,
+            std::slice::from_ref(&initial_surface),
+            1,
+            DesktopVisualState::wallpaper_only(),
+        );
+
+        let updated_surface = RenderableSurface {
+            generation: 2,
+            damage: RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 75,
+                y: 10,
+                width: 10,
+                height: 10,
+            }]),
+            buffer: shm_buffer(100, 100, vec![0xff00_ff00; 100 * 100]),
+            ..initial_surface
+        };
+        renderer.compose_with_generation(
+            &mut frame,
+            220,
+            220,
+            std::slice::from_ref(&updated_surface),
+            2,
+            DesktopVisualState::wallpaper_only(),
+        );
+
+        assert_eq!(
+            renderer.last_rebuild_kind(),
+            DesktopSceneRebuildKind::Partial
+        );
+        assert_eq!(
+            renderer.last_rebuild_damage_rects,
+            vec![OutputRect {
+                x: 75,
+                y: 10,
+                width: 10,
+                height: 10,
+            }]
+        );
+        assert_eq!(frame[15 * 220 + 80], 0xff00_ff00);
+        assert_eq!(frame[15 * 220 + 90], 0xffff_0000);
+    }
+
+    #[test]
     fn desktop_scene_renderer_reusing_frame_copies_only_partial_damage() {
         let mut renderer = DesktopSceneRenderer::default();
         let mut frame = vec![0; 96 * 96];
@@ -5007,9 +5087,8 @@ mod tests {
             .next()
             .unwrap();
 
-        let damage = output_damage_rect_for_element(
+        let damage = output_damage_rects_for_element(
             &element,
-            element.visible_target(),
             SurfaceDamageRect {
                 x: 0,
                 y: 0,
@@ -5017,6 +5096,8 @@ mod tests {
                 height: 1,
             },
         )
+        .into_iter()
+        .next()
         .unwrap();
 
         assert_eq!(
@@ -5063,9 +5144,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            output_damage_rect_for_element(
+            output_damage_rects_for_element(
                 &element,
-                element.visible_target(),
                 SurfaceDamageRect {
                     x: 0,
                     y: 0,
@@ -5073,12 +5153,11 @@ mod tests {
                     height: 2,
                 },
             ),
-            None
+            Vec::<OutputRect>::new()
         );
         assert_eq!(
-            output_damage_rect_for_element(
+            output_damage_rects_for_element(
                 &element,
-                element.visible_target(),
                 SurfaceDamageRect {
                     x: 1,
                     y: 0,
@@ -5086,12 +5165,232 @@ mod tests {
                     height: 2,
                 },
             ),
-            Some(OutputRect {
+            vec![OutputRect {
                 x: FIRST_SURFACE_OFFSET.0,
                 y: FIRST_SURFACE_OFFSET.1,
                 width: 1,
                 height: 2,
-            })
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_damage_is_projected_from_full_target_before_visual_clip() {
+        let surface = solid_test_surface(7, 0, 0, 100, 100, 0xff00_00aa);
+        let element = RenderSceneElement::from_surface_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 100),
+            Some(SurfaceTargetRect::new(50, 0, 50, 100)),
+        );
+
+        assert_eq!(
+            output_damage_rects_for_element(
+                &element,
+                SurfaceDamageRect {
+                    x: 75,
+                    y: 10,
+                    width: 10,
+                    height: 10,
+                },
+            ),
+            vec![OutputRect {
+                x: 75,
+                y: 10,
+                width: 10,
+                height: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_damage_outside_visual_clip_has_no_output_projection() {
+        let surface = solid_test_surface(7, 0, 0, 100, 100, 0xff00_00aa);
+        let element = RenderSceneElement::from_surface_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 100),
+            Some(SurfaceTargetRect::new(50, 0, 50, 100)),
+        );
+
+        assert_eq!(
+            output_damage_rects_for_element(
+                &element,
+                SurfaceDamageRect {
+                    x: 25,
+                    y: 10,
+                    width: 10,
+                    height: 10,
+                },
+            ),
+            Vec::<OutputRect>::new()
+        );
+    }
+
+    #[test]
+    fn partial_damage_asymmetric_clip_preserves_each_full_target_edge() {
+        let surface = solid_test_surface(7, 0, 0, 100, 100, 0xff00_00aa);
+        let element = RenderSceneElement::from_surface_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 100),
+            Some(SurfaceTargetRect::new(23, 7, 38, 86)),
+        );
+
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 23,
+                y: 7,
+                width: 6,
+                height: 6,
+            }),
+            vec![SurfaceTargetRect::new(23, 7, 6, 6)]
+        );
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 55,
+                y: 81,
+                width: 6,
+                height: 6,
+            }),
+            vec![SurfaceTargetRect::new(55, 81, 6, 6)]
+        );
+    }
+
+    #[test]
+    fn partial_damage_intersects_each_disjoint_aperture_region() {
+        let surface = solid_test_surface(7, 0, 0, 100, 100, 0xff00_00aa);
+        let aperture = SurfaceVisualAperture {
+            logical_target: SurfaceTargetRect::new(0, 0, 100, 100),
+            committed_content_target: Some(SurfaceTargetRect::new(10, 10, 20, 80)),
+            committed_extent_regions: vec![SurfaceTargetRect::new(70, 10, 20, 80)],
+        };
+        let element = RenderSceneElement::from_surface_with_aperture(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 100),
+            Some(aperture),
+        );
+
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 15,
+                y: 20,
+                width: 5,
+                height: 10,
+            }),
+            vec![SurfaceTargetRect::new(15, 20, 5, 10)]
+        );
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 75,
+                y: 20,
+                width: 5,
+                height: 10,
+            }),
+            vec![SurfaceTargetRect::new(75, 20, 5, 10)]
+        );
+    }
+
+    #[test]
+    fn partial_damage_spanning_aperture_regions_preserves_the_hole() {
+        let surface = solid_test_surface(7, 0, 0, 100, 100, 0xff00_00aa);
+        let aperture = SurfaceVisualAperture {
+            logical_target: SurfaceTargetRect::new(0, 0, 100, 100),
+            committed_content_target: Some(SurfaceTargetRect::new(10, 10, 20, 80)),
+            committed_extent_regions: vec![SurfaceTargetRect::new(70, 10, 20, 80)],
+        };
+        let element = RenderSceneElement::from_surface_with_aperture(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 100),
+            Some(aperture),
+        );
+
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 15,
+                y: 20,
+                width: 65,
+                height: 10,
+            }),
+            vec![
+                SurfaceTargetRect::new(15, 20, 15, 10),
+                SurfaceTargetRect::new(70, 20, 10, 10),
+            ]
+        );
+        assert!(
+            element
+                .output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                    x: 40,
+                    y: 20,
+                    width: 20,
+                    height: 10,
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_damage_with_viewport_and_clip_uses_full_target_coordinates() {
+        let mut surface = solid_test_surface(7, 0, 0, 100, 100, 0xff00_00aa);
+        surface.viewport_source = Some(ViewportSourceRect::new(20.0, 0.0, 60.0, 100.0).unwrap());
+        surface.viewport_destination = Some(BufferSize::new(100, 100).unwrap());
+        let element = RenderSceneElement::from_surface_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 100),
+            Some(SurfaceTargetRect::new(50, 0, 50, 100)),
+        );
+
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 60,
+                y: 20,
+                width: 10,
+                height: 10,
+            }),
+            vec![SurfaceTargetRect::new(66, 20, 18, 10)]
+        );
+    }
+
+    #[test]
+    fn partial_damage_with_transform_and_clip_uses_full_target_coordinates() {
+        let mut surface = solid_test_surface(7, 0, 0, 100, 60, 0xff00_00aa);
+        surface.buffer = shm_buffer(60, 100, vec![0xff00_00aa; 60 * 100]);
+        surface.buffer_transform = wl_output::Transform::_90;
+        let element = RenderSceneElement::from_surface_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 60),
+            Some(SurfaceTargetRect::new(50, 0, 50, 60)),
+        );
+
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 0,
+                y: 20,
+                width: 10,
+                height: 10,
+            }),
+            vec![SurfaceTargetRect::new(70, 0, 10, 10)]
+        );
+    }
+
+    #[test]
+    fn partial_damage_with_transform_viewport_and_clip_uses_shared_mapping() {
+        let mut surface = solid_test_surface(7, 0, 0, 100, 60, 0xff00_00aa);
+        surface.buffer = shm_buffer(60, 100, vec![0xff00_00aa; 60 * 100]);
+        surface.buffer_transform = wl_output::Transform::_90;
+        surface.viewport_source = Some(ViewportSourceRect::new(20.0, 0.0, 60.0, 60.0).unwrap());
+        surface.viewport_destination = Some(BufferSize::new(100, 60).unwrap());
+        let element = RenderSceneElement::from_surface_with_clip(
+            &surface,
+            SurfaceTargetRect::new(0, 0, 100, 60),
+            Some(SurfaceTargetRect::new(50, 0, 50, 60)),
+        );
+
+        assert_eq!(
+            element.output_damage_targets_for_buffer_rect(SurfaceDamageRect {
+                x: 0,
+                y: 20,
+                width: 10,
+                height: 10,
+            }),
+            vec![SurfaceTargetRect::new(83, 0, 17, 10)]
         );
     }
 

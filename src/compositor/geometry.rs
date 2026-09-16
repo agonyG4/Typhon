@@ -79,6 +79,14 @@ pub struct SurfaceBufferMapping {
     destination: Option<BufferSize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceMappingError {
+    InvalidBufferSize,
+    BufferScaleNotIntegral,
+    ViewportSourceNonIntegralWithoutDestination,
+    ViewportSourceOutOfBounds,
+}
+
 #[allow(dead_code)]
 impl SurfaceBufferMapping {
     pub fn new(
@@ -87,38 +95,49 @@ impl SurfaceBufferMapping {
         buffer_transform: Transform,
         source: Option<SurfaceGeometryRect>,
         destination: Option<BufferSize>,
-    ) -> Option<Self> {
-        if raw_size.width == 0 || raw_size.height == 0 || buffer_scale == 0 {
-            return None;
+    ) -> Result<Self, SurfaceMappingError> {
+        if raw_size.width == 0 || raw_size.height == 0 {
+            return Err(SurfaceMappingError::InvalidBufferSize);
         }
-        let transformed_size = transformed_buffer_size(raw_size, buffer_transform)?;
+        if buffer_scale == 0 {
+            return Err(SurfaceMappingError::BufferScaleNotIntegral);
+        }
+        let transformed_size = transformed_buffer_size(raw_size, buffer_transform)
+            .ok_or(SurfaceMappingError::InvalidBufferSize)?;
         if transformed_size.width % buffer_scale != 0 || transformed_size.height % buffer_scale != 0
         {
-            return None;
+            return Err(SurfaceMappingError::BufferScaleNotIntegral);
         }
         let logical_extent = BufferSize::new(
             transformed_size.width / buffer_scale,
             transformed_size.height / buffer_scale,
-        )?;
+        )
+        .ok_or(SurfaceMappingError::InvalidBufferSize)?;
         let full_source = SurfaceGeometryRect::new(
             0.0,
             0.0,
             f64::from(logical_extent.width),
             f64::from(logical_extent.height),
         );
+        let explicit_source = source.is_some();
         let source = source.unwrap_or(full_source);
-        if !valid_source(source, logical_extent) {
-            return None;
+        valid_source(source, logical_extent)?;
+        if explicit_source
+            && destination.is_none()
+            && (!is_integral(source.width) || !is_integral(source.height))
+        {
+            return Err(SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination);
         }
         if destination.is_some_and(|destination| destination.width == 0 || destination.height == 0)
         {
-            return None;
+            return Err(SurfaceMappingError::InvalidBufferSize);
         }
         let surface_extent = match destination {
             Some(destination) => destination,
-            None => BufferSize::new(ceil_extent(source.width)?, ceil_extent(source.height)?)?,
+            None => BufferSize::new(source.width as u32, source.height as u32)
+                .ok_or(SurfaceMappingError::InvalidBufferSize)?,
         };
-        Some(Self {
+        Ok(Self {
             raw_size,
             transformed_size,
             logical_extent,
@@ -386,9 +405,11 @@ pub fn transform_buffer_pixel(
     (x < transformed.width && y < transformed.height).then_some((x, y))
 }
 
-fn valid_source(source: SurfaceGeometryRect, logical_extent: BufferSize) -> bool {
-    const TOLERANCE: f64 = 1.0 / 256.0;
-    source.x.is_finite()
+fn valid_source(
+    source: SurfaceGeometryRect,
+    logical_extent: BufferSize,
+) -> Result<(), SurfaceMappingError> {
+    if source.x.is_finite()
         && source.y.is_finite()
         && source.width.is_finite()
         && source.height.is_finite()
@@ -396,15 +417,17 @@ fn valid_source(source: SurfaceGeometryRect, logical_extent: BufferSize) -> bool
         && source.y >= 0.0
         && source.width > 0.0
         && source.height > 0.0
-        && source.x + source.width <= f64::from(logical_extent.width) + TOLERANCE
-        && source.y + source.height <= f64::from(logical_extent.height) + TOLERANCE
+        && source.x + source.width <= f64::from(logical_extent.width)
+        && source.y + source.height <= f64::from(logical_extent.height)
+    {
+        Ok(())
+    } else {
+        Err(SurfaceMappingError::ViewportSourceOutOfBounds)
+    }
 }
 
-fn ceil_extent(value: f64) -> Option<u32> {
-    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
-        return None;
-    }
-    Some(value.ceil() as u32)
+fn is_integral(value: f64) -> bool {
+    value.fract() == 0.0
 }
 
 fn round_and_clip_points(
@@ -699,6 +722,150 @@ mod tests {
                 bottom_right: [1.0, 0.0],
                 top_right: [0.0, 0.0],
             }
+        );
+    }
+
+    #[test]
+    fn source_only_fractional_width_is_rejected() {
+        let mapping = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(0.5, 1.25, 10.5, 20.0)),
+            None,
+        );
+
+        assert!(mapping.is_err());
+    }
+
+    #[test]
+    fn source_only_fractional_height_is_rejected() {
+        let mapping = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(0.5, 1.25, 10.0, 20.5)),
+            None,
+        );
+
+        assert!(mapping.is_err());
+    }
+
+    #[test]
+    fn fractional_source_origin_with_integer_source_size_is_valid_without_destination() {
+        let mapping = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(0.5, 1.25, 10.0, 20.0)),
+            None,
+        );
+
+        assert_eq!(mapping.unwrap().surface_extent(), size(10, 20));
+    }
+
+    #[test]
+    fn fractional_source_size_is_valid_with_destination() {
+        let mapping = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(0.5, 1.25, 10.5, 20.5)),
+            Some(size(20, 30)),
+        );
+
+        assert_eq!(mapping.unwrap().surface_extent(), size(20, 30));
+    }
+
+    #[test]
+    fn source_boundary_is_strictly_fixed_point() {
+        let exact = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(0.0, 0.0, 100.0, 100.0)),
+            Some(size(100, 100)),
+        );
+        let one_fixed_unit_outside = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(
+                0.0,
+                0.0,
+                100.0 + 1.0 / 256.0,
+                100.0,
+            )),
+            Some(size(100, 100)),
+        );
+        let bottom_one_fixed_unit_outside = SurfaceBufferMapping::new(
+            size(100, 100),
+            1,
+            Transform::Normal,
+            Some(SurfaceGeometryRect::new(
+                0.0,
+                0.0,
+                100.0,
+                100.0 + 1.0 / 256.0,
+            )),
+            Some(size(100, 100)),
+        );
+
+        assert!(exact.is_ok());
+        assert!(one_fixed_unit_outside.is_err());
+        assert!(bottom_one_fixed_unit_outside.is_err());
+    }
+
+    #[test]
+    fn transformed_and_scaled_source_boundaries_use_effective_extent() {
+        let exact = SurfaceBufferMapping::new(
+            size(8, 6),
+            2,
+            Transform::_90,
+            Some(SurfaceGeometryRect::new(0.0, 0.0, 3.0, 4.0)),
+            None,
+        );
+        let outside = SurfaceBufferMapping::new(
+            size(8, 6),
+            2,
+            Transform::_90,
+            Some(SurfaceGeometryRect::new(0.0, 0.0, 3.0 + 1.0 / 256.0, 4.0)),
+            None,
+        );
+        let bottom_outside = SurfaceBufferMapping::new(
+            size(8, 6),
+            2,
+            Transform::_90,
+            Some(SurfaceGeometryRect::new(0.0, 0.0, 3.0, 4.0 + 1.0 / 256.0)),
+            None,
+        );
+
+        assert!(exact.is_ok());
+        assert!(outside.is_err());
+        assert!(bottom_outside.is_err());
+    }
+
+    #[test]
+    fn viewport_mapping_reports_viewporter_geometry_errors() {
+        assert_eq!(
+            SurfaceBufferMapping::new(
+                size(10, 10),
+                1,
+                Transform::Normal,
+                Some(SurfaceGeometryRect::new(0.0, 0.0, 2.5, 2.0)),
+                None,
+            ),
+            Err(SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination)
+        );
+        assert_eq!(
+            SurfaceBufferMapping::new(
+                size(10, 10),
+                1,
+                Transform::Normal,
+                Some(SurfaceGeometryRect::new(0.0, 0.0, 10.0 + 1.0 / 256.0, 2.0)),
+                Some(size(10, 10)),
+            ),
+            Err(SurfaceMappingError::ViewportSourceOutOfBounds)
         );
     }
 }
