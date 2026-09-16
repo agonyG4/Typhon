@@ -185,8 +185,10 @@ fn scene_domain_for_surface(
                 .layer_surfaces
                 .get(&surface_id)
                 .map(|role| match role.committed.layer {
-                    Layer::Background => SceneDomain::Desktop,
-                    Layer::Bottom | Layer::Top | Layer::Overlay => SceneDomain::Chrome,
+                    crate::compositor::layer_shell::Layer::Background => SceneDomain::Desktop,
+                    crate::compositor::layer_shell::Layer::Bottom
+                    | crate::compositor::layer_shell::Layer::Top
+                    | crate::compositor::layer_shell::Layer::Overlay => SceneDomain::Chrome,
                 })
                 .unwrap_or(SceneDomain::Chrome);
             SceneDomainAssignment::Explicit(domain)
