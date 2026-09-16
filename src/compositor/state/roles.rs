@@ -740,14 +740,14 @@ impl CompositorState {
         requested: SurfaceRole,
     ) {
         let expected_permanent = requested.permanent();
-        let should_remove = self
-            .surface_role_lifecycles
-            .get(&surface_id)
-            .is_some_and(|lifecycle| {
-                lifecycle.permanent == expected_permanent
-                    && lifecycle.live_instance.is_none()
-                    && !lifecycle.xdg_association
-            });
+        let should_remove =
+            self.surface_role_lifecycles
+                .get(&surface_id)
+                .is_some_and(|lifecycle| {
+                    lifecycle.permanent == expected_permanent
+                        && lifecycle.live_instance.is_none()
+                        && !lifecycle.xdg_association
+                });
         if should_remove {
             self.surface_role_lifecycles.remove(&surface_id);
             self.sync_scene_surface_metadata(surface_id);

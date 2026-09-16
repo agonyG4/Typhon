@@ -25,9 +25,9 @@ mod presentation_coverage;
 mod resize;
 mod roles;
 mod scene;
+mod scene_order;
 #[cfg(test)]
 mod scene_tests;
-mod scene_order;
 mod scene_work;
 mod selection_runtime;
 mod shortcut_inhibition;

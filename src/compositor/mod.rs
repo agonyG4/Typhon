@@ -126,8 +126,8 @@ mod toplevel_publication_state;
 mod window_backend;
 mod window_state;
 mod workspace_protocol;
-pub use crate::core::{SceneNodeId, WindowId};
 pub(crate) use crate::core::{OutputId, OutputIdAllocator};
+pub use crate::core::{SceneNodeId, WindowId};
 use commit_debug::*;
 pub use desktop_window::{
     DesktopStackLayer, DesktopWindowKind, WindowConstraints, WindowMetadata, X11DesktopRole,
@@ -138,7 +138,6 @@ pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
     classify_x11_role, x11_placement_policy,
 };
-pub(crate) use scene::*;
 pub use dmabuf::{DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
@@ -169,6 +168,7 @@ pub use geometry::{
     SurfaceBufferMapping, SurfaceGeometryRect, SurfaceMappingError, SurfaceUvQuad,
     transform_buffer_pixel, transformed_buffer_size,
 };
+pub(crate) use scene::*;
 pub use state_data::ShmBufferLifetimeMetrics;
 pub(in crate::compositor) use state_data::{
     CurrentSurfaceBuffer, DmabufReleaseObligation, SurfaceBufferReleaseOutcome,
