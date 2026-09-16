@@ -304,8 +304,8 @@ mod tests {
             |root| apps.contains(&root),
             |root| layers.contains(&root),
             |root| root == 10,
-            |root| {
-                if root == 10 {
+            |surface, _target| {
+                if surface.surface_id == 10 {
                     PresentationCoverageOpacity::OpaqueXrgb8888
                 } else {
                     PresentationCoverageOpacity::Unknown
@@ -329,6 +329,23 @@ mod tests {
             Some(PresentationCoverageApplicationGroup {
                 root_surface_id: 10,
                 surface_ids: vec![10],
+                surface_details: vec![PresentationCoverageSurface {
+                    surface_id: 10,
+                    target: SurfaceTargetRect::new(0, 0, 1280, 800),
+                    opacity: PresentationCoverageOpacity::OpaqueXrgb8888,
+                    backend: SurfaceRenderBackend::NativeWayland,
+                    buffer_source: SurfaceBufferSource::Shm,
+                    format: None,
+                }],
+                covering_surface: Some(PresentationCoverageSurface {
+                    surface_id: 10,
+                    target: SurfaceTargetRect::new(0, 0, 1280, 800),
+                    opacity: PresentationCoverageOpacity::OpaqueXrgb8888,
+                    backend: SurfaceRenderBackend::NativeWayland,
+                    buffer_source: SurfaceBufferSource::Shm,
+                    format: None,
+                }),
+                visible_surface_ids_above_covering: Vec::new(),
             })
         );
         assert!(analysis.can_occlude_behind_content());
@@ -360,6 +377,52 @@ mod tests {
     }
 
     #[test]
+    fn selects_highest_full_output_surface_as_visual_scanout_source() {
+        let root = test_surface(10, 0, 0, 1280, 800);
+        let mut source = test_surface(11, 0, 0, 1280, 800);
+        source.placement = SurfacePlacement::subsurface(10, 0, 0);
+        let mut above = test_surface(12, 0, 0, 32, 32);
+        above.placement = SurfacePlacement::subsurface(10, 0, 0);
+        let surfaces = vec![root, source, above];
+        let origins = render::surface_origins(&surfaces);
+        let render_targets = render::surface_render_space_targets(&surfaces, &origins, 1.0);
+        let analysis = analyze_presentation_coverage(
+            &surfaces,
+            &[],
+            &render_targets,
+            &[],
+            BufferSize::new(1280, 800).expect("test output size"),
+            |root| root == 10,
+            |_| false,
+            |root| root == 10,
+            |surface, _target| {
+                if surface.surface_id == 11 {
+                    PresentationCoverageOpacity::OpaqueXrgb8888
+                } else {
+                    PresentationCoverageOpacity::Unknown
+                }
+            },
+        );
+
+        let group = analysis
+            .covering_application_group
+            .expect("covering application group");
+        assert_eq!(
+            group.covering_surface.as_ref().map(|surface| surface.surface_id),
+            Some(11)
+        );
+        assert_eq!(group.visible_surface_ids_above_covering, vec![12]);
+        assert_eq!(
+            group
+                .surface_details
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
     fn popup_and_layer_content_above_are_recorded_separately() {
         let surfaces = vec![
             test_surface(10, 0, 0, 1280, 800),
@@ -379,8 +442,8 @@ mod tests {
             |root| root == 10 || root == 40,
             |root| root == 50,
             |root| root == 10,
-            |root| {
-                if root == 10 {
+            |surface, _target| {
+                if surface.surface_id == 10 {
                     PresentationCoverageOpacity::OpaqueXrgb8888
                 } else {
                     PresentationCoverageOpacity::Unknown
@@ -422,7 +485,7 @@ mod tests {
             |root| root == 1 || root == 10,
             |_| false,
             |root| root == 10,
-            |_| PresentationCoverageOpacity::Unknown,
+            |_, _| PresentationCoverageOpacity::Unknown,
         );
 
         assert!(analysis.geometrically_covers_output());
@@ -454,7 +517,7 @@ mod tests {
             |root| root == 10,
             |_| false,
             |root| root == 10,
-            |_| PresentationCoverageOpacity::OpaqueXrgb8888,
+            |_, _| PresentationCoverageOpacity::OpaqueXrgb8888,
         );
 
         assert_eq!(
