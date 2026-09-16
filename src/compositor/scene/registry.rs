@@ -56,6 +56,7 @@ impl CanonicalSceneRegistry {
         self.source_index.get(&source).copied()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn metadata(&self, id: SceneNodeId) -> Option<&SceneNodeMetadata> {
         self.nodes.get(&id)
     }
@@ -128,6 +129,7 @@ impl CanonicalSceneRegistry {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn visual_children(&self, parent: SceneNodeId) -> &[SceneNodeId] {
         self.children_by_visual_parent
             .get(&parent)
@@ -135,6 +137,7 @@ impl CanonicalSceneRegistry {
             .unwrap_or(&[])
     }
 
+    #[allow(dead_code)]
     pub(crate) fn resolve_domain(&self, id: SceneNodeId) -> Option<SceneDomain> {
         let mut current = id;
         let mut fallback = None;

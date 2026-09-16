@@ -9,6 +9,7 @@ impl CompositorState {
             .node_for_source(SceneSource::Surface(surface_id))
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn scene_node_metadata_for_surface(
         &self,
         surface_id: u32,

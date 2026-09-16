@@ -46,6 +46,7 @@ impl ActiveSceneView {
         &self.surface_origins
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn scene_node_id_for_surface(
         &self,
         surface_id: u32,
@@ -53,6 +54,7 @@ impl ActiveSceneView {
         self.surface_scene_nodes.get(&surface_id).copied()
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn surface_index_for_scene_node(
         &self,
         scene_node_id: SceneNodeId,
@@ -761,6 +763,7 @@ impl CompositorState {
             .copied()
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn active_scene_node_for_surface(
         &self,
         surface_id: u32,
@@ -768,6 +771,7 @@ impl CompositorState {
         self.active_scene_view.scene_node_id_for_surface(surface_id)
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn active_scene_surface_index_for_node(
         &self,
         scene_node_id: SceneNodeId,
