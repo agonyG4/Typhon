@@ -103,6 +103,7 @@ impl CompositorState {
             geometry.frame.placement = placement;
         }
         let root_surface_id = window.root_surface_id;
+        self.ensure_window_scene_nodes(window.id, root_surface_id);
         self.window_by_root_surface
             .insert(root_surface_id, window.id);
         if let WindowBackend::X11(handle) = window.backend {
@@ -227,6 +228,7 @@ impl CompositorState {
         self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window = self.desktop_windows.remove(&id)?;
+        self.remove_window_scene_nodes(id);
         for child in self.desktop_windows.values_mut() {
             if child.relationships.parent == Some(id) {
                 child.relationships.parent = None;
@@ -259,6 +261,7 @@ impl CompositorState {
         if !should_detach {
             return false;
         }
+        self.detach_surface_from_window_scene(surface_id);
         self.window_by_root_surface.remove(&surface_id);
         if let Some(window) = self.window_mut(window_id) {
             window.x11_surface_id = None;
@@ -296,6 +299,7 @@ impl CompositorState {
         if let Some(old_surface_id) = old_surface_id
             && self.window_by_root_surface.get(&old_surface_id) == Some(&window_id)
         {
+            self.detach_surface_from_window_scene(old_surface_id);
             self.window_by_root_surface.remove(&old_surface_id);
         }
         self.window_by_root_surface.insert(surface_id, window_id);
@@ -304,6 +308,7 @@ impl CompositorState {
             .ok_or(X11SurfaceAttachmentError::UnknownWindow)?;
         window.root_surface_id = surface_id;
         window.x11_surface_id = Some(surface_id);
+        self.attach_surface_to_window_scene(surface_id, window_id);
         self.mark_astrea_toplevel_structure_dirty();
         if let Some(placement) = replacement_placement {
             let active_visual_placement = self

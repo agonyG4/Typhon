@@ -215,6 +215,7 @@ impl CompositorState {
                 wm_capabilities_sent: false,
             },
         );
+        self.sync_scene_surface_metadata(surface_id);
     }
 
     pub(in crate::compositor) fn register_popup_surface(
@@ -269,6 +270,7 @@ impl CompositorState {
                 grab_generation: None,
             },
         );
+        self.sync_scene_surface_metadata(surface_id);
         popup_debug_log(|| {
             format!(
                 "popup_create popup={surface_id} owner_root={owner_root_id} parent={parent_owner:?}"

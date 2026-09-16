@@ -410,6 +410,7 @@ impl CompositorState {
         );
         self.layer_surfaces.insert(surface_id, role);
         self.store_surface_placement(surface_id, SurfacePlacement::root());
+        self.sync_scene_surface_metadata(surface_id);
         layer_shell_debug_log(|| format!("create surface={surface_id}"));
     }
 
@@ -790,6 +791,7 @@ impl CompositorState {
                 || previous.keyboard_interactivity != captured.state.keyboard_interactivity;
         }
         let committed_change = role.mapped && mapped_changed;
+        self.sync_scene_surface_metadata(surface_id);
         if rerun_focus {
             self.recompute_layer_keyboard_focus();
         }

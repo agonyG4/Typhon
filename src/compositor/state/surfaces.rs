@@ -106,6 +106,8 @@ impl CompositorState {
                 .contains_key(&surface.surface_id),
             "duplicate RenderableSurface ID appended"
         );
+        #[cfg(test)]
+        self.ensure_surface_scene_node(surface.surface_id);
         let index = self.renderable_surfaces.len();
         let surface_id = surface.surface_id;
         self.renderable_surfaces.push(surface);
@@ -1187,6 +1189,7 @@ impl CompositorState {
         surface: wl_surface::WlSurface,
     ) {
         self.surface_resources.entry(surface_id).or_insert(surface);
+        self.ensure_surface_scene_node(surface_id);
     }
 
     pub(in crate::compositor) fn register_surface_client(
@@ -1469,6 +1472,7 @@ impl CompositorState {
             .retain(|(_, surface)| !removed_surface_ids.contains(&compositor_surface_id(surface)));
         self.pointer_enter_serials
             .retain(|entry| !removed_surface_ids.contains(&compositor_surface_id(&entry.surface)));
+        self.remove_surface_scene_node(surface_id);
     }
 }
 

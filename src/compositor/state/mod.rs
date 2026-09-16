@@ -24,6 +24,9 @@ mod pointer_constraints;
 mod presentation_coverage;
 mod resize;
 mod roles;
+mod scene;
+#[cfg(test)]
+mod scene_tests;
 mod scene_order;
 mod scene_work;
 mod selection_runtime;

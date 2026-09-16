@@ -126,7 +126,7 @@ mod toplevel_publication_state;
 mod window_backend;
 mod window_state;
 mod workspace_protocol;
-pub use crate::core::WindowId;
+pub use crate::core::{SceneNodeId, WindowId};
 pub(crate) use crate::core::{OutputId, OutputIdAllocator};
 use commit_debug::*;
 pub use desktop_window::{

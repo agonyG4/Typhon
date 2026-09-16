@@ -689,6 +689,7 @@ impl CompositorState {
         let current = self.surface_role_for_error(surface_id);
         let lifecycle = self.surface_role_lifecycles.entry(surface_id).or_default();
         activate_role_instance(lifecycle, requested, current)?;
+        self.sync_scene_surface_metadata(surface_id);
         if surface_tree_debug_enabled() {
             eprintln!(
                 "oblivion-one compositor: surface_role surface={surface_id} old={} new={} parent={:?}",
@@ -704,8 +705,15 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn deactivate_role_instance(&mut self, surface_id: u32) {
-        if let Some(lifecycle) = self.surface_role_lifecycles.get_mut(&surface_id) {
+        let deactivated = if let Some(lifecycle) = self.surface_role_lifecycles.get_mut(&surface_id)
+        {
             lifecycle.live_instance = None;
+            true
+        } else {
+            false
+        };
+        if deactivated {
+            self.sync_scene_surface_metadata(surface_id);
         }
     }
 
@@ -732,16 +740,17 @@ impl CompositorState {
         requested: SurfaceRole,
     ) {
         let expected_permanent = requested.permanent();
-        if self
+        let should_remove = self
             .surface_role_lifecycles
             .get(&surface_id)
             .is_some_and(|lifecycle| {
                 lifecycle.permanent == expected_permanent
                     && lifecycle.live_instance.is_none()
                     && !lifecycle.xdg_association
-            })
-        {
+            });
+        if should_remove {
             self.surface_role_lifecycles.remove(&surface_id);
+            self.sync_scene_surface_metadata(surface_id);
         }
     }
 
