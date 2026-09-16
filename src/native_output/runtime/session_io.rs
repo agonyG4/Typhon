@@ -3,6 +3,16 @@ use super::*;
 use oblivion_one::compositor::FrameBatchDiscardReason;
 use oblivion_one::native::kms::KmsBackendKind;
 
+fn validate_pending_session_recovery_output(
+    current_output_id: OutputId,
+    pending_output_id: OutputId,
+) -> NativeResult<()> {
+    if current_output_id != pending_output_id {
+        return Err(io::Error::other("session recovery output identity mismatch").into());
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeIoOperation {
@@ -461,9 +471,7 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self
             .pending_session_recovery
             .expect("session recovery remains pending until generation rebind");
-        if recovery.output_id != self.output_id {
-            return Err(io::Error::other("session recovery output identity mismatch").into());
-        }
+        validate_pending_session_recovery_output(self.output_id, recovery.output_id)?;
         let snapshot_revision_before = self.presented_planes.revision;
         let (had_presented_primary, primary_kind) =
             self.presented_planes
@@ -934,15 +942,25 @@ mod tests {
     #[test]
     fn session_recovery_keeps_logical_output_id_when_drm_generation_changes() {
         let output_id = OutputId::from_raw(7).expect("nonzero output id");
+        let old_drm_generation = 41;
+        let new_drm_generation = 42;
         let recovery = PendingSessionRecovery {
             output_id,
             scanout: NativeScanoutRecovery::Dumb(FramebufferId::new(1).unwrap()),
-            generation: 42,
+            generation: new_drm_generation,
             cursor: crate::native_output::presentation::plane::PresentedCursorState::hidden(),
         };
 
         assert_eq!(recovery.output_id, output_id);
-        assert_ne!(41, recovery.generation);
+        assert_eq!(recovery.output_id.get(), 7);
+        assert_eq!(old_drm_generation, 41);
+        assert_eq!(recovery.generation, new_drm_generation);
+        assert_ne!(old_drm_generation, recovery.generation);
+        validate_pending_session_recovery_output(output_id, recovery.output_id)
+            .expect("matching logical output survives a DRM generation change");
+
+        let wrong_output_id = OutputId::from_raw(8).expect("nonzero output id");
+        assert!(validate_pending_session_recovery_output(output_id, wrong_output_id).is_err());
     }
 
     #[test]
