@@ -137,6 +137,7 @@ pub(crate) enum KmsCommitWorkerStartError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsWorkerAckError {
     NoInFlightCommit,
+    OutputMismatch,
     TokenMismatch,
     TransactionMismatch,
     GenerationMismatch,

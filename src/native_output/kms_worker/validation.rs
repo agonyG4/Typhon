@@ -152,6 +152,13 @@ impl KmsCommitWorkerHandle {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::NoInFlightCommit);
         };
+        if inflight.bundle.output_id != identity.output_id {
+            self.shared
+                .metrics
+                .result_mismatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(KmsWorkerAckError::OutputMismatch);
+        }
         if inflight.token != identity.token {
             self.shared
                 .metrics
