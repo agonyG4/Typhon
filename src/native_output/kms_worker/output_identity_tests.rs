@@ -1,15 +1,20 @@
 use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    CursorSidecar, CursorSidecarCoupling, EstablishedKmsBase, KmsCommitBundleIdentity,
-    KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent,
-    PendingBundleSnapshot,
+    CursorSidecar, CursorSidecarCoupling, EstablishedKmsBase, KmsBundleOwners,
+    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy,
+    KmsValidationBase, KmsWorkerEvent, PendingBundleSnapshot,
 };
 use crate::native_output::presentation::plane::{
     CursorRevision, CursorSidecarId, PresentedCursorDelivery,
 };
-use crate::native_output::{CursorPlaneAssignment, OutputReleasePlan, OutputTransaction};
+use crate::native_output::{
+    CursorPlaneAssignment, OutputReleasePlan, OutputSlotId, OutputTransaction,
+};
+use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::core::OutputId;
+use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -74,12 +79,54 @@ fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
     }
 }
 
+fn test_job_with_cursor_owner(token: u64) -> KmsCommitJob {
+    let mut job = test_job(token);
+    let transaction = Arc::new(
+        OutputTransaction::composited(
+            job.output_id,
+            job.transaction_id,
+            job.output_generation,
+            MonotonicTimestampNs::new(0),
+            job.target,
+            NativeOutputPacingMode::ReactiveDouble,
+            token,
+            1,
+            1,
+            OutputSlotId::new(0).unwrap(),
+            42,
+            Some(CursorPlaneAssignment::Atomic {
+                desired_epoch: token,
+                state: None,
+            }),
+            CompositorFrameBatchId::new(NonZeroU64::new(token).unwrap()),
+        )
+        .unwrap(),
+    );
+    job.kind = crate::native_output::runtime::AtomicCommitKind::CompositedPrimary {
+        transaction_id: job.transaction_id,
+        frame_id: token,
+        framebuffer_id: 42,
+    };
+    job.owners = KmsBundleOwners::for_transaction(
+        job.kind,
+        transaction,
+        Some(CursorRevision::initial()),
+        None,
+    )
+    .unwrap();
+    job
+}
+
 #[test]
 fn wrong_output_pageflip_ack_preserves_inflight_and_queued_dependents() {
     let handle = KmsCommitWorkerHandle::start(Arc::new(AcceptingExecutor)).unwrap();
-    let first = test_job(20_001);
+    let first = test_job_with_cursor_owner(20_001);
     let first_identity = first.identity();
     let first_transaction_id = first.transaction_id;
+    assert_eq!(
+        first_identity.cursor_transaction_id,
+        Some(first_transaction_id)
+    );
 
     reserve_for_test(&handle, first.kind)
         .enqueue(first)
