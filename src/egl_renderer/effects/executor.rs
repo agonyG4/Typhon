@@ -16,9 +16,12 @@ use super::super::geometry::{
 };
 use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
 use super::{
-    EffectDebugCaptureMode, EffectDebugKawaseMode, FrameTraceSummary, PassTraceSummary, blur,
-    capture, effect_debug_config,
-    resources::{PooledEffectTexture, release_dead_graph_textures},
+    EffectDebugCaptureMode, EffectDebugConfig, EffectDebugKawaseMode, FrameTraceSummary,
+    PassTraceSummary, blur, capture, effect_debug_config,
+    resources::{
+        EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture,
+        release_dead_graph_textures,
+    },
     shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
 
@@ -526,7 +529,35 @@ pub(crate) fn plan_effect_surface_consumers(
     repaint_rects: &[OutputRect],
     output_size: (u32, u32),
 ) -> SurfaceConsumerPlan {
+    plan_effect_surface_consumers_with_debug_config(
+        graph,
+        demand,
+        selection,
+        commands,
+        repaint_rects,
+        output_size,
+        *effect_debug_config(),
+    )
+}
+
+pub(crate) fn plan_effect_surface_consumers_with_debug_config(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    commands: &[EglDrawCommand],
+    repaint_rects: &[OutputRect],
+    output_size: (u32, u32),
+    debug_config: EffectDebugConfig,
+) -> SurfaceConsumerPlan {
     let mut plan = SurfaceConsumerPlan::default();
+    let scene_work = scene_work_regions(
+        repaint_rects,
+        graph,
+        selection,
+        output_size,
+        false,
+        debug_config,
+    );
     let mut scene_cursor = 0;
     let layers = commands
         .iter()
@@ -556,7 +587,7 @@ pub(crate) fn plan_effect_surface_consumers(
                 commands,
                 scene_cursor,
                 draw_end,
-                repaint_rects,
+                &scene_work.scene_work_rects,
             );
             scene_cursor = scene_cursor.max(draw_end.min(commands.len()));
         }
@@ -571,7 +602,7 @@ pub(crate) fn plan_effect_surface_consumers(
                 commands,
                 scene_cursor,
                 draw_end,
-                repaint_rects,
+                &scene_work.scene_work_rects,
             );
             scene_cursor = scene_cursor.max(next_cursor.min(commands.len()));
         }
@@ -590,7 +621,7 @@ pub(crate) fn plan_effect_surface_consumers(
             let execution_damage = prepare_effect_execution_region(
                 graph,
                 pass,
-                capture_execution_damage(graph, demand, pass, false),
+                capture_execution_damage(graph, demand, pass, false, debug_config),
             );
             let target_domain = pass
                 .output
@@ -611,7 +642,7 @@ pub(crate) fn plan_effect_surface_consumers(
         commands,
         scene_cursor,
         commands.len(),
-        repaint_rects,
+        &scene_work.scene_work_rects,
     );
     plan.finish();
     plan
@@ -624,6 +655,26 @@ pub(crate) fn execute_effect_graph(
     repaint_plan: &super::super::damage::RepaintPlan,
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
+) -> RendererResult<EffectExecutionStats> {
+    execute_effect_graph_with_debug_config(
+        renderer,
+        graph,
+        framebuffer_origin,
+        repaint_plan,
+        demand,
+        selection,
+        *effect_debug_config(),
+    )
+}
+
+pub(crate) fn execute_effect_graph_with_debug_config(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_plan: &super::super::damage::RepaintPlan,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
 ) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
     let trace_summary = effect_trace_summary(renderer, graph, Some(repaint_plan), selection);
@@ -642,6 +693,7 @@ pub(crate) fn execute_effect_graph(
         None,
         demand,
         selection,
+        debug_config,
         false,
         true,
     );
@@ -708,6 +760,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         Some(repaint_rects),
         demand,
         selection,
+        *effect_debug_config(),
         true,
         false,
     );
@@ -745,6 +798,7 @@ pub(crate) fn execute_graph_passes(
     explicit_repaint_rects: Option<&[OutputRect]>,
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
 ) -> RendererResult<EffectExecutionStats> {
@@ -764,6 +818,7 @@ pub(crate) fn execute_graph_passes(
         explicit_repaint_rects,
         demand,
         selection,
+        debug_config,
         lifecycle_backdrop,
         draw_overlays,
         graph_scope,
@@ -800,12 +855,12 @@ fn execute_graph_passes_inner(
     explicit_repaint_rects: Option<&[OutputRect]>,
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
-    let debug_config = *effect_debug_config();
     let framebuffer_capture = !lifecycle_backdrop
         && repaint_plan.is_some()
         && debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer;
@@ -817,125 +872,179 @@ fn execute_graph_passes_inner(
             framebuffer_origin,
         )?
     };
-    let scene_work_rects = scene_work_rects(
+    let scene_work = scene_work_regions(
         &repaint_rects,
         graph,
         selection,
         renderer.current_size,
-        framebuffer_capture,
+        lifecycle_backdrop,
+        debug_config,
     );
-    if framebuffer_capture {
-        renderer.clear_effect_scene_work(&scene_work_rects, framebuffer_origin)?;
-    }
-    let mut scene_cursor = 0;
-    for pass in &graph.passes {
-        if !selection.executed_passes.contains(&pass.id) {
-            continue;
+    let scene_work_rects = &scene_work.scene_work_rects;
+    let output_size = renderer.current_size;
+    let mut scene_work_preservation =
+        if framebuffer_capture && !scene_work.extra_scene_work.is_empty() {
+            Some(capture_scene_work_preservation(
+                renderer,
+                output_size,
+                framebuffer_origin,
+            )?)
+        } else {
+            None
+        };
+    let execution_result = (|| -> RendererResult<EffectExecutionStats> {
+        if framebuffer_capture {
+            renderer.clear_effect_scene_work(scene_work_rects, framebuffer_origin)?;
         }
-        let execution_damage = prepare_effect_execution_region(
-            graph,
-            pass,
-            capture_execution_damage(graph, demand, pass, lifecycle_backdrop),
-        );
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.execution_region(
+        let mut scene_cursor = 0;
+        for pass in &graph.passes {
+            if !selection.executed_passes.contains(&pass.id) {
+                continue;
+            }
+            let execution_damage = prepare_effect_execution_region(
+                graph,
                 pass,
-                execution_damage.input_rect_count,
-                execution_damage.region.rects().len(),
-                execution_damage.duplicate_rects_removed,
-                execution_damage.overlap_fragments_generated,
-                execution_damage.fallback,
+                capture_execution_damage(graph, demand, pass, lifecycle_backdrop, debug_config),
             );
-            if let Some((input_rect_count, clip_rect_count)) = pass.visible_clip_fallback {
-                renderer.effect_trace.visible_clip_fallback(
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.execution_region(
                     pass,
-                    input_rect_count,
-                    clip_rect_count,
+                    execution_damage.input_rect_count,
+                    execution_damage.region.rects().len(),
+                    execution_damage.duplicate_rects_removed,
+                    execution_damage.overlap_fragments_generated,
+                    execution_damage.fallback,
+                );
+                if let Some((input_rect_count, clip_rect_count)) = pass.visible_clip_fallback {
+                    renderer.effect_trace.visible_clip_fallback(
+                        pass,
+                        input_rect_count,
+                        clip_rect_count,
+                    );
+                }
+                let is_final_output_pass = matches!(
+                    pass.kind,
+                    RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+                );
+                for fallback in demand.visible_clip_fallbacks().iter().filter(|fallback| {
+                    fallback.instance == pass.instance
+                        && (fallback.pass == Some(pass.id)
+                            || (fallback.pass.is_none() && is_final_output_pass))
+                }) {
+                    renderer.effect_trace.visible_clip_fallback(
+                        pass,
+                        fallback.input_rect_count,
+                        fallback.clip_rect_count,
+                    );
+                }
+                renderer.effect_trace.pass_boundary(
+                    "begin",
+                    pass,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
                 );
             }
-            let is_final_output_pass = matches!(
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.pass_boundary(
+                    "resources_begin",
+                    pass,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
+                );
+            }
+            let resource_result = ensure_pass_textures(renderer, graph, pass, textures, &mut stats);
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.pass_boundary(
+                    "resources_end",
+                    pass,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
+                );
+            }
+            resource_result?;
+            if let Some(scene_advance_reason) = scene_advance_reason(pass, framebuffer_capture) {
+                let (draw_end, _) = composition_range(
+                    &renderer.commands,
+                    pass.anchor,
+                    pass.visual_group,
+                    pass.anchor_scope,
+                );
+                if draw_end > scene_cursor {
+                    if renderer.effect_trace.enabled() {
+                        renderer.effect_trace.scene_replay_boundary(
+                            "begin",
+                            pass,
+                            scene_advance_reason,
+                            scene_cursor,
+                            draw_end,
+                        );
+                    }
+                    renderer.draw_effect_scene_range(
+                        &scene_work_rects,
+                        scene_cursor,
+                        draw_end,
+                        framebuffer_origin,
+                    )?;
+                    if renderer.effect_trace.enabled() {
+                        renderer.effect_trace.scene_replay_boundary(
+                            "end",
+                            pass,
+                            scene_advance_reason,
+                            scene_cursor,
+                            draw_end,
+                        );
+                    }
+                    scene_cursor = draw_end;
+                }
+            }
+            if matches!(
                 pass.kind,
                 RenderPassKind::Composite | RenderPassKind::OutputPostProcess
-            );
-            for fallback in demand.visible_clip_fallbacks().iter().filter(|fallback| {
-                fallback.instance == pass.instance
-                    && (fallback.pass == Some(pass.id)
-                        || (fallback.pass.is_none() && is_final_output_pass))
-            }) {
-                renderer.effect_trace.visible_clip_fallback(
-                    pass,
-                    fallback.input_rect_count,
-                    fallback.clip_rect_count,
+            ) {
+                let (draw_end, next_cursor) = composition_range(
+                    &renderer.commands,
+                    pass.anchor,
+                    pass.visual_group,
+                    pass.anchor_scope,
                 );
-            }
-            renderer.effect_trace.pass_boundary(
-                "begin",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "resources_begin",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        let resource_result = ensure_pass_textures(renderer, graph, pass, textures, &mut stats);
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "resources_end",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        resource_result?;
-        if let Some(scene_advance_reason) = scene_advance_reason(pass, framebuffer_capture) {
-            let (draw_end, _) = composition_range(
-                &renderer.commands,
-                pass.anchor,
-                pass.visual_group,
-                pass.anchor_scope,
-            );
-            if draw_end > scene_cursor {
                 if renderer.effect_trace.enabled() {
                     renderer.effect_trace.scene_replay_boundary(
                         "begin",
                         pass,
-                        scene_advance_reason,
+                        "composite_advance",
                         scene_cursor,
                         draw_end,
                     );
@@ -950,225 +1059,223 @@ fn execute_graph_passes_inner(
                     renderer.effect_trace.scene_replay_boundary(
                         "end",
                         pass,
-                        scene_advance_reason,
+                        "composite_advance",
                         scene_cursor,
                         draw_end,
                     );
                 }
-                scene_cursor = draw_end;
+                scene_cursor = next_cursor.max(scene_cursor);
             }
-        }
-        if matches!(
-            pass.kind,
-            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
-        ) {
-            let (draw_end, next_cursor) = composition_range(
-                &renderer.commands,
-                pass.anchor,
-                pass.visual_group,
-                pass.anchor_scope,
-            );
             if renderer.effect_trace.enabled() {
-                renderer.effect_trace.scene_replay_boundary(
-                    "begin",
+                renderer.effect_trace.pass_boundary(
+                    "validate_begin",
                     pass,
-                    "composite_advance",
-                    scene_cursor,
-                    draw_end,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
                 );
             }
-            renderer.draw_effect_scene_range(
-                &scene_work_rects,
-                scene_cursor,
-                draw_end,
+            let validation_result = validate_effect_pass_resources(
+                renderer,
+                graph,
+                pass,
+                textures,
+                &execution_damage.region,
                 framebuffer_origin,
-            )?;
+            );
             if renderer.effect_trace.enabled() {
-                renderer.effect_trace.scene_replay_boundary(
+                renderer.effect_trace.pass_boundary(
+                    "validate_end",
+                    pass,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
+                );
+            }
+            if let Err(error) = validation_result {
+                renderer.effect_trace.invariant_failure(&error);
+                return Err(Box::new(error));
+            }
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.pass_boundary(
+                    "execute_begin",
+                    pass,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
+                );
+            }
+            let pass_timing = graph_scope.and_then(|scope| {
+                if renderer.capture_in_progress {
+                    return None;
+                }
+                renderer.effect_gpu_profiler.begin_pass(
+                    &renderer.gl,
+                    scope,
+                    u64::from(pass.id.get()),
+                    pass.instance.get(),
+                    pass.kind,
+                    effect_region_pixels(&execution_damage.region),
+                )
+            });
+            let execute_result = execute_pass(
+                renderer,
+                graph,
+                textures,
+                pass,
+                framebuffer_origin,
+                &execution_damage.region,
+                lifecycle_backdrop,
+                debug_config,
+                &mut stats,
+            );
+            renderer
+                .effect_gpu_profiler
+                .end_pass(&renderer.gl, pass_timing);
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.pass_boundary(
+                    "execute_end",
+                    pass,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
+                );
+            }
+            if let Err(error) = execute_result {
+                if let Some(invariant) = error.downcast_ref::<EffectExecutionInvariantError>() {
+                    renderer.effect_trace.invariant_failure(invariant);
+                }
+                return Err(error);
+            }
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.pass_boundary(
                     "end",
                     pass,
-                    "composite_advance",
-                    scene_cursor,
-                    draw_end,
+                    graph,
+                    textures,
+                    pass_trace_summary(
+                        renderer,
+                        graph,
+                        pass,
+                        demand,
+                        &execution_damage.region,
+                        &scene_work_rects,
+                        framebuffer_origin,
+                        lifecycle_backdrop,
+                        debug_config,
+                    ),
                 );
             }
-            scene_cursor = next_cursor.max(scene_cursor);
+            release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
+            stats.passes = stats.passes.saturating_add(1);
         }
+        let final_scene_cursor_end = renderer.commands.len();
         if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "validate_begin",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
+            renderer.effect_trace.final_scene_replay_boundary(
+                "begin",
+                scene_cursor,
+                final_scene_cursor_end,
             );
         }
-        let validation_result = validate_effect_pass_resources(
-            renderer,
-            graph,
-            pass,
-            textures,
-            &execution_damage.region,
-            framebuffer_origin,
-        );
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "validate_end",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        if let Err(error) = validation_result {
-            renderer.effect_trace.invariant_failure(&error);
-            return Err(Box::new(error));
-        }
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "execute_begin",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        let pass_timing = graph_scope.and_then(|scope| {
-            if renderer.capture_in_progress {
-                return None;
-            }
-            renderer.effect_gpu_profiler.begin_pass(
-                &renderer.gl,
-                scope,
-                u64::from(pass.id.get()),
-                pass.instance.get(),
-                pass.kind,
-                effect_region_pixels(&execution_damage.region),
-            )
-        });
-        let execute_result = execute_pass(
-            renderer,
-            graph,
-            textures,
-            pass,
-            framebuffer_origin,
-            &execution_damage.region,
-            lifecycle_backdrop,
-            &mut stats,
-        );
-        renderer
-            .effect_gpu_profiler
-            .end_pass(&renderer.gl, pass_timing);
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "execute_end",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        if let Err(error) = execute_result {
-            if let Some(invariant) = error.downcast_ref::<EffectExecutionInvariantError>() {
-                renderer.effect_trace.invariant_failure(invariant);
-            }
-            return Err(error);
-        }
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.pass_boundary(
-                "end",
-                pass,
-                graph,
-                textures,
-                pass_trace_summary(
-                    renderer,
-                    graph,
-                    pass,
-                    demand,
-                    &execution_damage.region,
-                    &scene_work_rects,
-                    framebuffer_origin,
-                    lifecycle_backdrop,
-                ),
-            );
-        }
-        release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
-        stats.passes = stats.passes.saturating_add(1);
-    }
-    let final_scene_cursor_end = renderer.commands.len();
-    if renderer.effect_trace.enabled() {
-        renderer.effect_trace.final_scene_replay_boundary(
-            "begin",
+        renderer.draw_effect_scene_range(
+            &scene_work_rects,
             scene_cursor,
             final_scene_cursor_end,
-        );
-    }
-    renderer.draw_effect_scene_range(
-        &scene_work_rects,
-        scene_cursor,
-        final_scene_cursor_end,
-        framebuffer_origin,
-    )?;
-    if renderer.effect_trace.enabled() {
-        renderer.effect_trace.final_scene_replay_boundary(
-            "end",
-            scene_cursor,
-            final_scene_cursor_end,
-        );
-    }
-    if draw_overlays {
-        if renderer.effect_trace.enabled() {
-            renderer.effect_trace.overlay_boundary("begin");
-        }
-        renderer.draw_lifecycle_overlays(
-            &repaint_rects,
             framebuffer_origin,
-            repaint_plan.expect("ordinary effect execution needs a repaint plan"),
         )?;
-        renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
         if renderer.effect_trace.enabled() {
-            renderer.effect_trace.overlay_boundary("end");
+            renderer.effect_trace.final_scene_replay_boundary(
+                "end",
+                scene_cursor,
+                final_scene_cursor_end,
+            );
         }
+        if let Some(preservation) = scene_work_preservation.take() {
+            let restore_result = restore_scene_work_preservation(
+                renderer,
+                &preservation,
+                &scene_work.extra_scene_work,
+                framebuffer_origin,
+            );
+            let release_result = renderer.effect_resources.release(preservation.texture);
+            restore_result?;
+            release_result?;
+        }
+        if draw_overlays {
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.overlay_boundary("begin");
+            }
+            renderer.draw_lifecycle_overlays(
+                &repaint_rects,
+                framebuffer_origin,
+                repaint_plan.expect("ordinary effect execution needs a repaint plan"),
+            )?;
+            renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.overlay_boundary("end");
+            }
+        }
+        renderer.establish_ordinary_scene_state();
+        stats.instances = selection.executed_instances.len();
+        Ok(stats)
+    })();
+    let cleanup_result = if let Some(preservation) = scene_work_preservation.take() {
+        let restore_result = restore_scene_work_preservation(
+            renderer,
+            &preservation,
+            &scene_work.extra_scene_work,
+            framebuffer_origin,
+        );
+        let release_result = renderer.effect_resources.release(preservation.texture);
+        restore_result.and(release_result.map_err(Into::into))
+    } else {
+        Ok(())
+    };
+    match (execution_result, cleanup_result) {
+        (Ok(stats), Ok(())) => Ok(stats),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
-    renderer.establish_ordinary_scene_state();
-    stats.instances = selection.executed_instances.len();
-    Ok(stats)
 }
 
 fn effect_region_pixels(region: &EffectRegion) -> u64 {
@@ -1327,12 +1434,16 @@ fn pass_output_texture_domain(
         })
 }
 
-fn is_direct_framebuffer_capture(pass: &CompiledRenderPass, lifecycle_backdrop: bool) -> bool {
+fn is_direct_framebuffer_capture(
+    pass: &CompiledRenderPass,
+    lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
+) -> bool {
     match pass.kind {
         RenderPassKind::SceneCapture => {
             lifecycle_backdrop
                 || !pass.checkpoint_dependencies.is_empty()
-                || effect_debug_config().capture_mode() == EffectDebugCaptureMode::Framebuffer
+                || debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer
         }
         RenderPassKind::SurfaceCapture => !pass.checkpoint_dependencies.is_empty(),
         _ => false,
@@ -1344,8 +1455,9 @@ fn capture_execution_damage(
     demand: &EffectExecutionDemand,
     pass: &CompiledRenderPass,
     lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
 ) -> EffectRegion {
-    if is_direct_framebuffer_capture(pass, lifecycle_backdrop) {
+    if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
         pass_output_texture_domain(graph, pass)
     } else {
         effective_pass_damage(graph, demand, pass)
@@ -1574,6 +1686,7 @@ fn pass_trace_summary(
     scene_work_rects: &[OutputRect],
     framebuffer_origin: OutputFramebufferOrigin,
     lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
 ) -> PassTraceSummary {
     if !renderer.effect_trace.enabled() {
         return PassTraceSummary::default();
@@ -1591,11 +1704,11 @@ fn pass_trace_summary(
         output_plan.is_some_and(|texture| texture.source == GraphTextureSource::Output);
     let target_flip_y =
         effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
-    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop);
+    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
     let conservative_pass_demand = direct_capture
         || demand.is_conservative_full()
         || demand.instance_is_conservative_full(pass.instance);
-    let debug_full_kawase = effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full
+    let debug_full_kawase = debug_config.kawase_mode() == EffectDebugKawaseMode::Full
         && matches!(
             pass.kind,
             RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
@@ -1684,8 +1797,8 @@ fn pass_trace_summary(
         }),
         conservative_pass_demand,
         conservative_pass_demand_kind,
-        backdrop_capture_policy: Some(effect_debug_config().capture_mode().as_str()),
-        kawase_execution_policy: Some(effect_debug_config().kawase_mode().as_str()),
+        backdrop_capture_policy: Some(debug_config.capture_mode().as_str()),
+        kawase_execution_policy: Some(debug_config.kawase_mode().as_str()),
         scene_work_damage_rects: scene_work_rects.len(),
         scene_work_damage_bounding_box: output_rects_bounding_box(scene_work_rects),
     }
@@ -1788,6 +1901,7 @@ fn execute_pass(
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     match pass.kind {
@@ -1800,6 +1914,7 @@ fn execute_pass(
                 framebuffer_origin,
                 execution_damage,
                 lifecycle_backdrop,
+                debug_config,
                 stats,
             )?;
             stats.scene_captures = stats.scene_captures.saturating_add(1);
@@ -2482,6 +2597,7 @@ fn execute_capture(
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     let output = pass
@@ -2491,7 +2607,7 @@ fn execute_capture(
         .get(&output)
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
-    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop);
+    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
     let capture_rects = if direct_capture {
         vec![full_output_rect((target_plan.width, target_plan.height))]
     } else {
@@ -2597,10 +2713,150 @@ struct GlBlitRect {
     y1: i32,
 }
 
+impl GlBlitRect {
+    const fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GraphTextureCaptureBlit {
     source: GlBlitRect,
     destination: GlBlitRect,
+}
+
+fn scene_work_preservation_blit_rects(
+    rect: OutputRect,
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> Option<GraphTextureCaptureBlit> {
+    let left = i64::from(rect.x).clamp(0, i64::from(output_size.0));
+    let top = i64::from(rect.y).clamp(0, i64::from(output_size.1));
+    let right = (i64::from(rect.x) + i64::from(rect.width)).clamp(0, i64::from(output_size.0));
+    let bottom = (i64::from(rect.y) + i64::from(rect.height)).clamp(0, i64::from(output_size.1));
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let left = i32::try_from(left).ok()?;
+    let top = i32::try_from(top).ok()?;
+    let right = i32::try_from(right).ok()?;
+    let bottom = i32::try_from(bottom).ok()?;
+    let height = i32::try_from(output_size.1).ok()?;
+    let source = GlBlitRect::new(left, height - bottom, right, height - top);
+    let destination = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => source,
+        OutputFramebufferOrigin::TopLeftScanout => GlBlitRect::new(left, bottom, right, top),
+    };
+    Some(GraphTextureCaptureBlit {
+        source,
+        destination,
+    })
+}
+
+struct SceneWorkPreservation {
+    texture: PooledEffectTexture,
+}
+
+fn capture_scene_work_preservation(
+    renderer: &mut GlesSceneRenderer,
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<SceneWorkPreservation> {
+    let key = EffectTextureKey::new(
+        output_size.0,
+        output_size.1,
+        EffectTextureFormat::Rgba8,
+        EffectTextureFilter::Nearest,
+        oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
+    );
+    let texture = renderer.effect_resources.acquire(&renderer.gl, key)?;
+    let result = (|| {
+        let transfer = scene_work_preservation_blit_rects(
+            full_output_rect(output_size),
+            output_size,
+            framebuffer_origin,
+        )
+        .ok_or_else(|| io::Error::other("scene-work preservation output is empty"))?;
+        let output_framebuffer = renderer.active_output_framebuffer;
+        renderer.bind_active_output_framebuffer();
+        let draw_framebuffer = renderer
+            .effect_resources
+            .bind_draw_target(&renderer.gl, &texture)?;
+        unsafe {
+            renderer.gl.disable(glow::SCISSOR_TEST);
+            renderer
+                .gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, output_framebuffer);
+            renderer
+                .gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
+            renderer.gl.blit_framebuffer(
+                transfer.source.x0,
+                transfer.source.y0,
+                transfer.source.x1,
+                transfer.source.y1,
+                transfer.destination.x0,
+                transfer.destination.y0,
+                transfer.destination.x1,
+                transfer.destination.y1,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })();
+    renderer.establish_ordinary_scene_state();
+    match result {
+        Ok(()) => Ok(SceneWorkPreservation { texture }),
+        Err(error) => {
+            let _ = renderer.effect_resources.release(texture);
+            Err(error)
+        }
+    }
+}
+
+fn restore_scene_work_preservation(
+    renderer: &mut GlesSceneRenderer,
+    preservation: &SceneWorkPreservation,
+    extra_scene_work: &[OutputRect],
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    let output_framebuffer = renderer.active_output_framebuffer;
+    let read_framebuffer = renderer
+        .effect_resources
+        .bind_read_target(&renderer.gl, &preservation.texture)?;
+    unsafe {
+        renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer
+            .gl
+            .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read_framebuffer));
+        renderer
+            .gl
+            .bind_framebuffer(glow::DRAW_FRAMEBUFFER, output_framebuffer);
+        for rect in extra_scene_work {
+            let Some(transfer) = scene_work_preservation_blit_rects(
+                *rect,
+                renderer.current_size,
+                framebuffer_origin,
+            ) else {
+                continue;
+            };
+            renderer.gl.blit_framebuffer(
+                transfer.source.x0,
+                transfer.source.y0,
+                transfer.source.x1,
+                transfer.source.y1,
+                transfer.destination.x0,
+                transfer.destination.y0,
+                transfer.destination.x1,
+                transfer.destination.y1,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+        }
+    }
+    renderer.establish_ordinary_scene_state();
+    Ok(())
 }
 
 /// Effect coordinate contract:
@@ -3029,15 +3285,27 @@ fn full_output_rect(size: (u32, u32)) -> OutputRect {
     OutputRect::new(0, 0, size.0, size.1)
 }
 
-fn scene_work_rects(
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SceneWorkRegions {
+    scene_work_rects: Vec<OutputRect>,
+    extra_scene_work: Vec<OutputRect>,
+}
+
+fn scene_work_regions(
     repaint_rects: &[OutputRect],
     graph: &CompiledFrameGraph,
     selection: &EffectExecutionSelection,
     output_size: (u32, u32),
-    framebuffer_capture: bool,
-) -> Vec<OutputRect> {
+    lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
+) -> SceneWorkRegions {
+    let framebuffer_capture =
+        !lifecycle_backdrop && debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer;
     if !framebuffer_capture {
-        return repaint_rects.to_vec();
+        return SceneWorkRegions {
+            scene_work_rects: repaint_rects.to_vec(),
+            extra_scene_work: Vec::new(),
+        };
     }
 
     let mut rects = repaint_rects.to_vec();
@@ -3062,12 +3330,31 @@ fn scene_work_rects(
     }
 
     let coalesced = OutputDamage::rects(output_size.0, output_size.1, rects);
-    let coalesced = match coalesced {
-        OutputDamage::Empty => return Vec::new(),
-        OutputDamage::Full => return vec![full_output_rect(output_size)],
+    let scene_work_rects = match coalesced {
+        OutputDamage::Empty => Vec::new(),
+        OutputDamage::Full => vec![full_output_rect(output_size)],
         OutputDamage::Rects(rects) => rects,
     };
-    disjoint_output_rects(coalesced, output_size)
+    let scene_work_rects = disjoint_output_rects(scene_work_rects, output_size);
+    let mut extra_scene_work = Vec::new();
+    for scene_rect in &scene_work_rects {
+        let mut fragments = vec![*scene_rect];
+        for repaint_rect in repaint_rects {
+            let mut next = Vec::new();
+            for fragment in fragments {
+                next.extend(subtract_output_rect(fragment, *repaint_rect));
+            }
+            fragments = next;
+            if fragments.is_empty() {
+                break;
+            }
+        }
+        extra_scene_work.extend(fragments);
+    }
+    SceneWorkRegions {
+        scene_work_rects,
+        extra_scene_work,
+    }
 }
 
 fn disjoint_output_rects(rects: Vec<OutputRect>, output_size: (u32, u32)) -> Vec<OutputRect> {
@@ -3926,25 +4213,39 @@ mod tests {
             executed_passes: vec![pass.id],
             ..EffectExecutionSelection::default()
         };
-        let work = scene_work_rects(
+        let config = EffectDebugConfig::new(
+            EffectDebugCaptureMode::Framebuffer,
+            EffectDebugKawaseMode::Partial,
+        );
+        let regions = scene_work_regions(
             &[OutputRect::new(5, 6, 7, 8)],
             &graph,
             &selection,
             (200, 150),
-            true,
+            false,
+            config,
         );
+        let work = &regions.scene_work_rects;
 
         assert!(work.contains(&OutputRect::new(5, 6, 7, 8)));
         assert!(work.contains(&OutputRect::new(40, 30, 60, 50)));
+        assert!(!regions.extra_scene_work.is_empty());
+        assert!(
+            regions.extra_scene_work.iter().all(|rect| {
+                subtract_output_rect(*rect, OutputRect::new(5, 6, 7, 8)).len() == 1
+            })
+        );
         assert!(work.len() <= MAX_EFFECT_REGION_RECTS);
 
-        let coalesced = scene_work_rects(
+        let coalesced = scene_work_regions(
             &[OutputRect::new(5, 6, 50, 40)],
             &graph,
             &selection,
             (200, 150),
-            true,
-        );
+            false,
+            config,
+        )
+        .scene_work_rects;
         assert_eq!(coalesced.len(), 3);
         for (index, first) in coalesced.iter().enumerate() {
             for second in coalesced.iter().skip(index + 1) {
@@ -4644,7 +4945,7 @@ mod tests {
         let demand = planned_demand(instance, demanded.clone(), vec![(pass.id, demanded)]);
 
         assert_eq!(
-            capture_execution_damage(&graph, &demand, &pass, false),
+            capture_execution_damage(&graph, &demand, &pass, false, *effect_debug_config()),
             EffectRegion::from_rect(domain)
         );
     }
@@ -4837,6 +5138,99 @@ mod tests {
 
         assert!(plan.surface_ids().contains(&1));
         assert!(!plan.surface_ids().contains(&2));
+    }
+
+    #[test]
+    fn effect_surface_consumer_plan_framebuffer_scene_work_includes_upper_surface() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let output = GraphTextureId::new(1).unwrap();
+        let capture_domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap();
+        let mut pass = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            Vec::new(),
+        );
+        pass.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(2);
+        pass.anchor_scope = oblivion_one::compositor::EffectAnchorScope::Surface;
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![test_texture(
+                1,
+                GraphTextureSource::CapturedScene,
+                capture_domain,
+            )],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(capture_domain),
+                capture_region: EffectRegion::from_rect(capture_domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demand = EffectExecutionDemand::new(
+            vec![oblivion_one::effects::EffectInstanceExecutionDemand {
+                id: instance,
+                output_region: EffectRegion::from_rect(capture_domain),
+            }],
+            EffectRegion::from_rect(capture_domain),
+        );
+        let selection = select_effect_execution(&graph, &demand);
+        let command = |layer, x, width| EglDrawCommand {
+            layer,
+            visual_group: None,
+            bounds: EglRect::new(x, 0.0, width, 20.0),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(EglDrawLayer::Surface(1), 0.0, 20.0),
+            command(EglDrawLayer::Surface(2), 60.0, 20.0),
+        ];
+        let config = super::super::trace::EffectDebugConfig::new(
+            super::super::trace::EffectDebugCaptureMode::Framebuffer,
+            super::super::trace::EffectDebugKawaseMode::Partial,
+        );
+
+        let plan = plan_effect_surface_consumers_with_debug_config(
+            &graph,
+            &demand,
+            &selection,
+            &commands,
+            &[OutputRect::new(0, 0, 4, 4)],
+            (100, 100),
+            config,
+        );
+
+        assert!(plan.surface_ids().contains(&1));
+        assert!(plan.surface_ids().contains(&2));
+    }
+
+    #[test]
+    fn scene_work_preservation_maps_framebuffer_origins() {
+        let rect = OutputRect::new(10, 20, 30, 40);
+        let bottom_left = scene_work_preservation_blit_rects(
+            rect,
+            (100, 80),
+            OutputFramebufferOrigin::BottomLeft,
+        )
+        .expect("bottom-left preservation rects");
+        assert_eq!(bottom_left.source, GlBlitRect::new(10, 20, 40, 60));
+        assert_eq!(bottom_left.destination, GlBlitRect::new(10, 20, 40, 60));
+
+        let top_left = scene_work_preservation_blit_rects(
+            rect,
+            (100, 80),
+            OutputFramebufferOrigin::TopLeftScanout,
+        )
+        .expect("top-left preservation rects");
+        assert_eq!(top_left.source, GlBlitRect::new(10, 20, 40, 60));
+        assert_eq!(top_left.destination, GlBlitRect::new(10, 60, 40, 20));
     }
 
     #[test]

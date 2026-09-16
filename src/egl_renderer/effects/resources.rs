@@ -524,6 +524,14 @@ impl EffectGlResourceCache {
         self.bind_render_target_to(gl, texture, glow::DRAW_FRAMEBUFFER)
     }
 
+    pub(crate) fn bind_read_target(
+        &mut self,
+        gl: &glow::Context,
+        texture: &PooledEffectTexture,
+    ) -> Result<glow::Framebuffer, Box<dyn std::error::Error>> {
+        self.bind_render_target_to(gl, texture, glow::READ_FRAMEBUFFER)
+    }
+
     fn bind_render_target_to(
         &mut self,
         gl: &glow::Context,

@@ -6804,6 +6804,442 @@ mod tests {
         renderer.scene_geometry_dirty = true;
     }
 
+    fn install_diagnostic_scene(
+        harness: &mut GlesEffectTestHarness,
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+    ) {
+        let width = harness.renderer.current_size.0;
+        let height = harness.renderer.current_size.1;
+        let mut background = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                background.extend_from_slice(&[
+                    24_u8.saturating_add((x * 3 % 180) as u8),
+                    18_u8.saturating_add((y * 5 % 180) as u8),
+                    32_u8.saturating_add(((x + y) * 2 % 160) as u8),
+                    255,
+                ]);
+            }
+        }
+        let background_image = create_uploaded_resource(&harness.gl, width, height)
+            .expect("diagnostic background texture creates");
+        write_rgba_bytes_to_resource(
+            &harness.gl,
+            &background_image,
+            SurfaceDamageRect::full(width, height),
+            &background,
+        );
+        harness.renderer.surface_resources.insert(
+            7,
+            EglSurfaceResource {
+                image: background_image,
+                dmabuf_key: None,
+                buffer_lifetime: None,
+                shm_synced_commit: None,
+            },
+        );
+        let translucent_surface = [
+            112_u8, 18, 12, 128, 112, 18, 12, 128, 112, 18, 12, 128, 112, 18, 12, 128,
+        ];
+        let target_image = create_uploaded_resource(&harness.gl, 2, 2)
+            .expect("diagnostic translucent surface texture creates");
+        write_rgba_bytes_to_resource(
+            &harness.gl,
+            &target_image,
+            SurfaceDamageRect::full(2, 2),
+            &translucent_surface,
+        );
+        harness.renderer.surface_resources.insert(
+            42,
+            EglSurfaceResource {
+                image: target_image,
+                dmabuf_key: None,
+                buffer_lifetime: None,
+                shm_synced_commit: None,
+            },
+        );
+        harness.renderer.vertices.clear();
+        harness.renderer.commands.clear();
+        push_draw_command(
+            &mut harness.renderer.vertices,
+            &mut harness.renderer.commands,
+            EglDrawLayer::Surface(7),
+            EglRect::new(0.0, 0.0, width as f32, height as f32),
+            width,
+            height,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        let target_command = harness.renderer.commands.len();
+        push_draw_command(
+            &mut harness.renderer.vertices,
+            &mut harness.renderer.commands,
+            EglDrawLayer::Surface(42),
+            EglRect::new(
+                rect.x as f32,
+                rect.y as f32,
+                rect.width as f32,
+                rect.height as f32,
+            ),
+            width,
+            height,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        harness.renderer.commands[target_command].visual_group = Some(visual_group);
+        harness.renderer.scene_geometry_dirty = true;
+    }
+
+    fn diagnostic_graph(
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+        source_damage: &EffectRegion,
+        output_bounds: EffectRect,
+    ) -> oblivion_one::effects::CompiledFrameGraph {
+        let scene = moving_visual_group_blur_scene(rect, visual_group);
+        let (_, registry) = moving_blur_scene(rect);
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            source_damage,
+            output_bounds,
+            &registry,
+        )
+        .expect("diagnostic blur graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("diagnostic blur must compile to an effect graph");
+        };
+        graph
+    }
+
+    fn diagnostic_repaint_plan(repair: OutputRect, full: bool) -> RepaintPlan {
+        let damage = if full {
+            OutputDamage::Full
+        } else {
+            OutputDamage::rects(128, 96, [repair])
+        };
+        RepaintPlan {
+            render_damage: damage.clone(),
+            repair_damage: damage,
+            buffer_age: (!full).then_some(2),
+            mode: if full {
+                RepaintMode::Full
+            } else {
+                RepaintMode::Partial
+            },
+            fallback_reason: None,
+        }
+    }
+
+    fn read_diagnostic_pixels(harness: &GlesEffectTestHarness) -> Vec<u8> {
+        let width = harness.renderer.current_size.0;
+        let height = harness.renderer.current_size.1;
+        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+        unsafe {
+            harness.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            harness.gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        pixels
+    }
+
+    fn diagnostic_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
+        let physical_y = height.saturating_sub(y).saturating_sub(1);
+        let index = ((physical_y * width + x) * 4) as usize;
+        pixels[index..index + 4]
+            .try_into()
+            .expect("diagnostic pixel has four channels")
+    }
+
+    fn execute_diagnostic_frame(
+        harness: &mut GlesEffectTestHarness,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        plan: &RepaintPlan,
+        region: EffectRegion,
+        conservative_full: bool,
+        config: effects::EffectDebugConfig,
+    ) {
+        let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+            graph,
+            &region,
+            conservative_full,
+            config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
+        );
+        let selection = effects::select_effect_execution(graph, &demand);
+        effects::execute_effect_graph_with_debug_config(
+            &mut harness.renderer,
+            graph,
+            OutputFramebufferOrigin::BottomLeft,
+            plan,
+            &demand,
+            &selection,
+            config,
+        )
+        .expect("diagnostic frame renders");
+    }
+
+    fn diagnostic_region(rect: OutputRect) -> EffectRegion {
+        EffectRegion::from_rect(
+            EffectRect::new(rect.x, rect.y, rect.width, rect.height)
+                .expect("diagnostic repair region"),
+        )
+    }
+
+    fn diagnostic_pixel_is_inside(rect: OutputRect, x: u32, y: u32) -> bool {
+        rect.x <= x as i32
+            && (x as i32) < rect.x + rect.width as i32
+            && rect.y <= y as i32
+            && (y as i32) < rect.y + rect.height as i32
+    }
+
+    fn assert_diagnostic_matrix_pixels(
+        actual: &[u8],
+        previous: &[u8],
+        full_reference: &[u8],
+        width: u32,
+        height: u32,
+        repair: OutputRect,
+        tolerance: u8,
+        label: &str,
+    ) {
+        for y in 0..height {
+            for x in 0..width {
+                let expected = if diagnostic_pixel_is_inside(repair, x, y) {
+                    diagnostic_pixel(full_reference, width, height, x, y)
+                } else {
+                    diagnostic_pixel(previous, width, height, x, y)
+                };
+                let actual_pixel = diagnostic_pixel(actual, width, height, x, y);
+                for (channel, (actual, expected)) in actual_pixel.iter().zip(expected).enumerate() {
+                    assert!(
+                        actual.abs_diff(expected) <= tolerance,
+                        "{label} pixel mismatch at ({x}, {y}) channel {channel}: actual={}, expected={}, tolerance={tolerance}",
+                        actual,
+                        expected,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_framebuffer_extra_scene_work_preserves_prior_pixels() {
+        let mut harness = GlesEffectTestHarness::new(128, 96);
+        let output_bounds = EffectRect::new(0, 0, 128, 96).expect("diagnostic output bounds");
+        let target_rect = EffectRect::new(24, 20, 80, 56).expect("diagnostic target bounds");
+        let repair = OutputRect::new(60, 44, 4, 4);
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        install_diagnostic_scene(&mut harness, target_rect, visual_group);
+        let graph = diagnostic_graph(
+            target_rect,
+            visual_group,
+            &EffectRegion::from_rect(output_bounds),
+            output_bounds,
+        );
+        let capture = graph
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+            .expect("diagnostic blur capture texture");
+        assert!(capture.domain.width >= repair.width.saturating_mul(4));
+        assert!(capture.domain.height >= repair.height.saturating_mul(4));
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Framebuffer,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let full_plan = diagnostic_repaint_plan(repair, true);
+        let full_demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+            &graph,
+            &EffectRegion::from_rect(output_bounds),
+            true,
+            false,
+        );
+        let full_selection = effects::select_effect_execution(&graph, &full_demand);
+        effects::execute_effect_graph_with_debug_config(
+            &mut harness.renderer,
+            &graph,
+            OutputFramebufferOrigin::BottomLeft,
+            &full_plan,
+            &full_demand,
+            &full_selection,
+            config,
+        )
+        .expect("diagnostic full frame renders");
+        let previous = read_diagnostic_pixels(&harness);
+
+        let partial_plan = diagnostic_repaint_plan(repair, false);
+        // The graph keeps its visible capture domain while this frame's small
+        // presentation repair supplies the execution demand below.
+        let partial_source_damage = EffectRegion::empty();
+        let partial_graph = diagnostic_graph(
+            target_rect,
+            visual_group,
+            &partial_source_damage,
+            output_bounds,
+        );
+        let repair_region = diagnostic_region(repair);
+        let partial_demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+            &partial_graph,
+            &repair_region,
+            false,
+            false,
+        );
+        let partial_selection = effects::select_effect_execution(&partial_graph, &partial_demand);
+        effects::execute_effect_graph_with_debug_config(
+            &mut harness.renderer,
+            &partial_graph,
+            OutputFramebufferOrigin::BottomLeft,
+            &partial_plan,
+            &partial_demand,
+            &partial_selection,
+            config,
+        )
+        .expect("diagnostic partial frame renders");
+        let after = read_diagnostic_pixels(&harness);
+        let width = harness.renderer.current_size.0;
+        let height = harness.renderer.current_size.1;
+        for y in 0..height {
+            for x in 0..width {
+                if repair.x <= x as i32
+                    && (x as i32) < repair.x + repair.width as i32
+                    && repair.y <= y as i32
+                    && (y as i32) < repair.y + repair.height as i32
+                {
+                    continue;
+                }
+                assert_eq!(
+                    diagnostic_pixel(&after, width, height, x, y),
+                    diagnostic_pixel(&previous, width, height, x, y),
+                    "outside-repair pixel changed at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_debug_matrix_preserves_partial_framebuffer_pixels() {
+        let output_bounds = EffectRect::new(0, 0, 128, 96).expect("diagnostic output bounds");
+        let target_rect = EffectRect::new(24, 20, 80, 56).expect("diagnostic target bounds");
+        let repair = OutputRect::new(60, 44, 4, 4);
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        let policies = [
+            (
+                "replay+partial",
+                effects::EffectDebugConfig::new(
+                    effects::EffectDebugCaptureMode::Replay,
+                    effects::EffectDebugKawaseMode::Partial,
+                ),
+            ),
+            (
+                "replay+full",
+                effects::EffectDebugConfig::new(
+                    effects::EffectDebugCaptureMode::Replay,
+                    effects::EffectDebugKawaseMode::Full,
+                ),
+            ),
+            (
+                "framebuffer+partial",
+                effects::EffectDebugConfig::new(
+                    effects::EffectDebugCaptureMode::Framebuffer,
+                    effects::EffectDebugKawaseMode::Partial,
+                ),
+            ),
+            (
+                "framebuffer+full",
+                effects::EffectDebugConfig::new(
+                    effects::EffectDebugCaptureMode::Framebuffer,
+                    effects::EffectDebugKawaseMode::Full,
+                ),
+            ),
+        ];
+
+        for (label, config) in policies {
+            let mut candidate = GlesEffectTestHarness::new(128, 96);
+            install_diagnostic_scene(&mut candidate, target_rect, visual_group);
+            let full_source_damage = EffectRegion::from_rect(output_bounds);
+            let candidate_graph = diagnostic_graph(
+                target_rect,
+                visual_group,
+                &full_source_damage,
+                output_bounds,
+            );
+            let full_plan = diagnostic_repaint_plan(repair, true);
+            execute_diagnostic_frame(
+                &mut candidate,
+                &candidate_graph,
+                &full_plan,
+                EffectRegion::from_rect(output_bounds),
+                true,
+                config,
+            );
+            let previous = read_diagnostic_pixels(&candidate);
+            let partial_plan = diagnostic_repaint_plan(repair, false);
+            let partial_source_damage = EffectRegion::empty();
+            let partial_graph = diagnostic_graph(
+                target_rect,
+                visual_group,
+                &partial_source_damage,
+                output_bounds,
+            );
+            let capture = partial_graph
+                .textures
+                .iter()
+                .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+                .expect("diagnostic partial blur capture texture");
+            assert!(
+                capture.domain.width >= repair.width.saturating_mul(4),
+                "{label}"
+            );
+            assert!(
+                capture.domain.height >= repair.height.saturating_mul(4),
+                "{label}"
+            );
+            execute_diagnostic_frame(
+                &mut candidate,
+                &partial_graph,
+                &partial_plan,
+                diagnostic_region(repair),
+                false,
+                config,
+            );
+            let actual = read_diagnostic_pixels(&candidate);
+            drop(candidate);
+
+            let mut reference = GlesEffectTestHarness::new(128, 96);
+            install_diagnostic_scene(&mut reference, target_rect, visual_group);
+            let reference_graph = diagnostic_graph(
+                target_rect,
+                visual_group,
+                &full_source_damage,
+                output_bounds,
+            );
+            execute_diagnostic_frame(
+                &mut reference,
+                &reference_graph,
+                &full_plan,
+                EffectRegion::from_rect(output_bounds),
+                true,
+                config,
+            );
+            let full_reference = read_diagnostic_pixels(&reference);
+            assert_diagnostic_matrix_pixels(
+                &actual,
+                &previous,
+                &full_reference,
+                128,
+                96,
+                repair,
+                2,
+                label,
+            );
+        }
+    }
+
     #[test]
     fn moving_blur_domain_reuses_real_gles_resources() {
         let mut harness = GlesEffectTestHarness::new(256, 192);

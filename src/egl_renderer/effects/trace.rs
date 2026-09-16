@@ -83,6 +83,17 @@ pub(crate) struct EffectDebugConfig {
 }
 
 impl EffectDebugConfig {
+    #[cfg(test)]
+    pub(crate) const fn new(
+        capture_mode: EffectDebugCaptureMode,
+        kawase_mode: EffectDebugKawaseMode,
+    ) -> Self {
+        Self {
+            capture_mode,
+            kawase_mode,
+        }
+    }
+
     pub(crate) fn from_env_values(
         capture_mode: Option<&OsStr>,
         kawase_mode: Option<&OsStr>,

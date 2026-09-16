@@ -18,6 +18,8 @@ pub(crate) use executor::{
 pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;
 #[cfg(test)]
 pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_SHADER;
+#[cfg(test)]
+pub(crate) use executor::execute_effect_graph_with_debug_config;
 pub(crate) use executor::{
     execute_effect_graph, execute_effect_graph_for_lifecycle, plan_effect_surface_consumers,
     select_effect_execution,
@@ -34,8 +36,8 @@ pub(crate) use shader_cache::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
 };
 pub(crate) use trace::{
-    EffectDebugCaptureMode, EffectDebugKawaseMode, EffectExecutionTrace, FrameTraceSummary,
-    PassTraceSummary, effect_debug_config,
+    EffectDebugCaptureMode, EffectDebugConfig, EffectDebugKawaseMode, EffectExecutionTrace,
+    FrameTraceSummary, PassTraceSummary, effect_debug_config,
 };
 #[cfg(test)]
 pub(crate) use trace::{
