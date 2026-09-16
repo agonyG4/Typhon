@@ -1,6 +1,7 @@
 //! Owned, immutable values that may cross into the Atomic submit thread.
 
 use super::super::runtime::AtomicCommitKind;
+use super::timing::KmsWorkerDispatchTailObservation;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::pacing::WorkerPacingTicket;
@@ -148,6 +149,7 @@ pub(crate) struct KmsSubmittedOwnership {
     pub(crate) ioctl_duration_ns: u64,
     pub(crate) dispatch_duration_ns: u64,
     pub(crate) submission_budget_ns: u64,
+    pub(crate) dispatch_tail_observation: Option<KmsWorkerDispatchTailObservation>,
 }
 
 #[derive(Debug)]

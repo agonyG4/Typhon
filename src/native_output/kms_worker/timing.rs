@@ -11,7 +11,10 @@ pub(crate) const MAX_DISPATCH_TAIL_GUARD_NS: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KmsWorkerDispatchTailObservation {
+    pub(crate) binding_target: bool,
+    pub(crate) fair_dispatch_chance: bool,
     pub(crate) deadline_overrun_ns: u64,
+    pub(crate) guard_before_ns: u64,
     pub(crate) guard_ns: u64,
     pub(crate) increased: bool,
     pub(crate) decayed: bool,
@@ -86,6 +89,7 @@ impl KmsWorkerDispatchModel {
         fair_dispatch_chance: bool,
     ) -> KmsWorkerDispatchTailObservation {
         let deadline_overrun_ns = submit_returned_at_ns.saturating_sub(commit_complete_deadline_ns);
+        let guard_before_ns = self.adaptive_tail_guard_ns;
         let mut increased = false;
         let mut decayed = false;
         let mut cap_hit = false;
@@ -93,11 +97,10 @@ impl KmsWorkerDispatchModel {
             if deadline_overrun_ns > 0 {
                 let requested_increase =
                     deadline_overrun_ns.saturating_add(DISPATCH_TAIL_SAFETY_QUANTUM_NS);
-                let prior_guard = self.adaptive_tail_guard_ns;
-                let next_guard = prior_guard.saturating_add(requested_increase);
+                let next_guard = guard_before_ns.saturating_add(requested_increase);
                 cap_hit = next_guard > MAX_DISPATCH_TAIL_GUARD_NS;
                 self.adaptive_tail_guard_ns = next_guard.min(MAX_DISPATCH_TAIL_GUARD_NS);
-                increased = self.adaptive_tail_guard_ns > prior_guard;
+                increased = self.adaptive_tail_guard_ns > guard_before_ns;
                 self.clean_completion_streak = 0;
             } else {
                 self.clean_completion_streak = self.clean_completion_streak.saturating_add(1);
@@ -111,7 +114,10 @@ impl KmsWorkerDispatchModel {
             }
         }
         KmsWorkerDispatchTailObservation {
+            binding_target: false,
+            fair_dispatch_chance,
             deadline_overrun_ns,
+            guard_before_ns,
             guard_ns: self.adaptive_tail_guard_ns,
             increased,
             decayed,

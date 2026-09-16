@@ -89,6 +89,32 @@ fn late_payload_dispatch_overrun_does_not_update_tail_metrics() {
 }
 
 #[test]
+fn dispatch_tail_observation_carries_exact_recovery_evidence() {
+    let mut model = KmsWorkerDispatchModel::default();
+    let mut fair = model.observe_submission_deadline(1_000_000, 1_012_230, true);
+    fair.binding_target = true;
+
+    assert!(fair.binding_target);
+    assert!(fair.fair_dispatch_chance);
+    assert_eq!(fair.guard_before_ns, 0);
+    assert_eq!(fair.guard_ns, 62_230);
+
+    let mut unfair = model.observe_submission_deadline(2_000_000, 2_012_230, false);
+    unfair.binding_target = true;
+    assert!(!unfair.fair_dispatch_chance);
+}
+
+#[test]
+fn clipped_dispatch_tail_increase_is_not_recovery_evidence() {
+    let mut model = KmsWorkerDispatchModel::default();
+    let mut clipped = model.observe_submission_deadline(1_000_000, 2_000_000, true);
+    clipped.binding_target = true;
+
+    assert!(clipped.increased);
+    assert!(clipped.cap_hit);
+}
+
+#[test]
 fn reactive_double_does_not_wait_for_a_late_planned_worker_wake() {
     assert!(!worker_wait_is_armed(
         PresentationTargetReason::ReactiveDouble,

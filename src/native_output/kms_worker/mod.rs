@@ -37,7 +37,9 @@ pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitF
 pub(crate) use thread::{
     KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerQuiesceHandle, ValidationBaseInvalidationReason,
 };
-pub(crate) use timing::{KmsWorkerDispatchBudget, KmsWorkerDispatchModel};
+pub(crate) use timing::{
+    KmsWorkerDispatchBudget, KmsWorkerDispatchModel, KmsWorkerDispatchTailObservation,
+};
 
 #[cfg(test)]
 mod direct_lease_tests;

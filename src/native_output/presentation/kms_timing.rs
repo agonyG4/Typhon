@@ -270,6 +270,14 @@ pub(crate) struct KmsPresentationTimingSnapshot {
     pub(crate) unreachable_targets: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KmsPresentationTimingObservation {
+    pub(crate) accepted: bool,
+    pub(crate) apply_guard_before_ns: u64,
+    pub(crate) apply_guard_after_ns: u64,
+    pub(crate) apply_guard_increased: bool,
+}
+
 impl KmsPresentationTimingModel {
     pub(crate) fn new(mode: KmsModeTiming, output_generation: u64) -> Self {
         Self {
@@ -348,8 +356,24 @@ impl KmsPresentationTimingModel {
         mode_key: KmsModeTimingKey,
         outcome: KmsPresentationOutcome,
     ) -> bool {
+        self.observe_pageflip_with_evidence(output_generation, mode_key, outcome)
+            .accepted
+    }
+
+    pub(crate) fn observe_pageflip_with_evidence(
+        &mut self,
+        output_generation: u64,
+        mode_key: KmsModeTimingKey,
+        outcome: KmsPresentationOutcome,
+    ) -> KmsPresentationTimingObservation {
+        let apply_guard_before_ns = self.adaptive_apply_guard_ns;
         if self.output_generation != output_generation || self.mode.key() != mode_key {
-            return false;
+            return KmsPresentationTimingObservation {
+                accepted: false,
+                apply_guard_before_ns,
+                apply_guard_after_ns: apply_guard_before_ns,
+                apply_guard_increased: false,
+            };
         }
         match outcome {
             KmsPresentationOutcome::TargetHit => {
@@ -380,7 +404,13 @@ impl KmsPresentationTimingModel {
                     .min(MAX_ADAPTIVE_APPLY_GUARD_NS);
             }
         }
-        true
+        let apply_guard_after_ns = self.adaptive_apply_guard_ns;
+        KmsPresentationTimingObservation {
+            accepted: true,
+            apply_guard_before_ns,
+            apply_guard_after_ns,
+            apply_guard_increased: apply_guard_after_ns > apply_guard_before_ns,
+        }
     }
 }
 
@@ -508,5 +538,46 @@ mod tests {
             KmsPresentationOutcome::KmsApplyGuardMiss
         ));
         assert_eq!(model.adaptive_apply_guard_ns(), guard);
+    }
+
+    #[test]
+    fn apply_observation_reports_acceptance_and_guard_change() {
+        let timing = KmsModeTiming::from_mode(&mode(325_000, 2200, 1125), 6_060_606);
+        let mut model = KmsPresentationTimingModel::new(timing, 7);
+        let observation = model.observe_pageflip_with_evidence(
+            7,
+            timing.key(),
+            KmsPresentationOutcome::KmsApplyGuardMiss,
+        );
+
+        assert!(observation.accepted);
+        assert!(observation.apply_guard_increased);
+        assert_eq!(
+            observation.apply_guard_after_ns,
+            observation
+                .apply_guard_before_ns
+                .saturating_add(APPLY_GUARD_STEP_NS)
+        );
+    }
+
+    #[test]
+    fn saturated_apply_guard_is_accepted_but_not_recovery_evidence() {
+        let timing = KmsModeTiming::from_mode(&mode(325_000, 2200, 1125), 6_060_606);
+        let mut model = KmsPresentationTimingModel::new(timing, 7);
+        for _ in 0..100 {
+            model.observe_pageflip(7, timing.key(), KmsPresentationOutcome::KmsApplyGuardMiss);
+        }
+        let observation = model.observe_pageflip_with_evidence(
+            7,
+            timing.key(),
+            KmsPresentationOutcome::KmsApplyGuardMiss,
+        );
+
+        assert!(observation.accepted);
+        assert!(!observation.apply_guard_increased);
+        assert_eq!(
+            observation.apply_guard_after_ns,
+            observation.apply_guard_before_ns
+        );
     }
 }

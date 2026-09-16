@@ -10,7 +10,7 @@ use super::super::*;
 use super::cycle_direct;
 use crate::native_output::kms_worker::{
     KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
-    KmsWorkerQueuedCancellation,
+    KmsWorkerDispatchTailObservation, KmsWorkerQueuedCancellation,
 };
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
@@ -29,6 +29,32 @@ fn pageflip_identity(
         token,
         output_generation,
         crtc_id,
+    }
+}
+
+fn recovery_disposition(
+    miss: ProvenDeadlineMiss,
+    dispatch_tail: Option<KmsWorkerDispatchTailObservation>,
+    apply_guard: Option<KmsPresentationTimingObservation>,
+) -> EstimatorRecoveryDisposition {
+    match miss {
+        ProvenDeadlineMiss::ExactRender | ProvenDeadlineMiss::GuardedApproximateRender => {
+            EstimatorRecoveryDisposition::ResetIndependentHorizon
+        }
+        ProvenDeadlineMiss::KmsDispatch => dispatch_tail
+            .is_some_and(|observation| {
+                observation.binding_target
+                    && observation.fair_dispatch_chance
+                    && observation.deadline_overrun_ns > 0
+                    && observation.increased
+                    && !observation.cap_hit
+            })
+            .then_some(EstimatorRecoveryDisposition::PreserveEstimatorState)
+            .unwrap_or(EstimatorRecoveryDisposition::ResetIndependentHorizon),
+        ProvenDeadlineMiss::KmsApplyGuard => apply_guard
+            .is_some_and(|observation| observation.accepted && observation.apply_guard_increased)
+            .then_some(EstimatorRecoveryDisposition::PreserveEstimatorState)
+            .unwrap_or(EstimatorRecoveryDisposition::ResetIndependentHorizon),
     }
 }
 
@@ -1008,6 +1034,13 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("composited pageflip token is zero"))?;
+                    let submitted_ownership = submitted_worker_ownership
+                        .iter()
+                        .find(|ownership| ownership.job.token == pageflip_token);
+                    let dispatch_tail_observation = submitted_ownership
+                        .and_then(|ownership| ownership.dispatch_tail_observation);
+                    let dispatch_submission_budget_ns =
+                        submitted_ownership.map_or(0, |ownership| ownership.submission_budget_ns);
                     let pending_identity =
                         explicit.swapchain()?.pending_identity().ok_or_else(|| {
                             io::Error::other("composited pageflip has no pending identity")
@@ -1388,13 +1421,15 @@ impl NativeRuntime {
                             actual_logical_sequence,
                         ))
                     };
+                    let mut apply_guard_observation = None;
                     if let Some(outcome) = outcome {
                         if let Some(mode_key) = frame.submit_window.mode_key() {
-                            presentation_timing.observe_pageflip(
-                                *drm_file_generation,
-                                mode_key,
-                                outcome,
-                            );
+                            apply_guard_observation =
+                                Some(presentation_timing.observe_pageflip_with_evidence(
+                                    *drm_file_generation,
+                                    mode_key,
+                                    outcome,
+                                ));
                         }
                         let classified_miss = match (outcome, frame.fence_signal) {
                             (KmsPresentationOutcome::RenderReadinessMiss, Some((_, quality))) => {
@@ -1431,8 +1466,105 @@ impl NativeRuntime {
                         submit_started_at: Some(frame.submit_started_at),
                         submit_returned_at: Some(frame.submit_returned_at),
                     });
-                    if proven_miss.is_some() {
-                        render_journal.note_proven_deadline_miss();
+                    if let Some(miss) = proven_miss {
+                        let disposition = recovery_disposition(
+                            miss,
+                            dispatch_tail_observation,
+                            apply_guard_observation,
+                        );
+                        let recovery_remaining_before = render_journal
+                            .prediction(frame.target.refresh_interval)
+                            .miss_recovery_remaining;
+                        render_journal.note_proven_deadline_miss(disposition);
+                        let recovery_remaining_after = render_journal
+                            .prediction(frame.target.refresh_interval)
+                            .miss_recovery_remaining;
+                        let mut recovery_fields = vec![
+                            PacingField::u64("frame_id", frame.frame_id),
+                            PacingField::u64("pageflip_token", pageflip_token.get()),
+                            PacingField::str("miss_cause", miss.as_str()),
+                            PacingField::str("recovery_disposition", disposition.as_str()),
+                            PacingField::usize(
+                                "recovery_remaining_before",
+                                recovery_remaining_before,
+                            ),
+                            PacingField::usize(
+                                "recovery_remaining_after",
+                                recovery_remaining_after,
+                            ),
+                            PacingField::str(
+                                "recovery_estimator_mode_after",
+                                render_journal
+                                    .prediction(frame.target.refresh_interval)
+                                    .estimator_mode
+                                    .as_str(),
+                            ),
+                            PacingField::bool(
+                                "dispatch_evidence_available",
+                                dispatch_tail_observation.is_some(),
+                            ),
+                            PacingField::bool(
+                                "apply_timing_observation_available",
+                                apply_guard_observation.is_some(),
+                            ),
+                        ];
+                        if let Some(observation) = dispatch_tail_observation {
+                            recovery_fields.extend([
+                                PacingField::bool(
+                                    "dispatch_target_binding",
+                                    observation.binding_target,
+                                ),
+                                PacingField::bool(
+                                    "dispatch_fair_chance",
+                                    observation.fair_dispatch_chance,
+                                ),
+                                PacingField::u64(
+                                    "dispatch_deadline_overrun_ns",
+                                    observation.deadline_overrun_ns,
+                                ),
+                                PacingField::u64(
+                                    "dispatch_tail_guard_before_ns",
+                                    observation.guard_before_ns,
+                                ),
+                                PacingField::u64(
+                                    "dispatch_tail_guard_after_ns",
+                                    observation.guard_ns,
+                                ),
+                                PacingField::bool(
+                                    "dispatch_tail_guard_increased",
+                                    observation.increased,
+                                ),
+                                PacingField::bool(
+                                    "dispatch_tail_guard_cap_hit",
+                                    observation.cap_hit,
+                                ),
+                                PacingField::u64(
+                                    "dispatch_submission_budget_ns",
+                                    dispatch_submission_budget_ns,
+                                ),
+                            ]);
+                        }
+                        if let Some(observation) = apply_guard_observation {
+                            recovery_fields.extend([
+                                PacingField::bool(
+                                    "apply_timing_observation_accepted",
+                                    observation.accepted,
+                                ),
+                                PacingField::u64(
+                                    "apply_guard_before_ns",
+                                    observation.apply_guard_before_ns,
+                                ),
+                                PacingField::u64(
+                                    "apply_guard_after_ns",
+                                    observation.apply_guard_after_ns,
+                                ),
+                                PacingField::bool(
+                                    "apply_guard_increased",
+                                    observation.apply_guard_increased,
+                                ),
+                            ]);
+                        }
+                        frame_pacing.log("proven_deadline_miss", recovery_fields);
                     }
                     let desired_credit_before = adaptive_buffering.desired_credit();
                     let buffering_mode_before = adaptive_buffering.mode();

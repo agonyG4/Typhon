@@ -152,6 +152,33 @@ pub enum ProvenDeadlineMiss {
     KmsApplyGuard,
 }
 
+impl ProvenDeadlineMiss {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRender => "exact_render",
+            Self::GuardedApproximateRender => "guarded_approximate_render",
+            Self::KmsDispatch => "kms_dispatch",
+            Self::KmsApplyGuard => "kms_apply_guard",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimatorRecoveryDisposition {
+    ResetIndependentHorizon,
+    PreserveEstimatorState,
+}
+
+impl EstimatorRecoveryDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResetIndependentHorizon => "reset_independent_horizon",
+            Self::PreserveEstimatorState => "preserve_estimator_state",
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn merge_presentation_miss(
     existing: Option<ProvenDeadlineMiss>,
@@ -348,9 +375,11 @@ impl AdaptiveRenderJournal {
         self.miss_recovery_remaining = self.miss_recovery_remaining.saturating_sub(1);
     }
 
-    pub fn note_proven_deadline_miss(&mut self) {
+    pub fn note_proven_deadline_miss(&mut self, disposition: EstimatorRecoveryDisposition) {
         self.missed_deadlines = self.missed_deadlines.saturating_add(1);
-        self.miss_recovery_remaining = MISS_RECOVERY_PAIRED_SUCCESSES;
+        if disposition == EstimatorRecoveryDisposition::ResetIndependentHorizon {
+            self.miss_recovery_remaining = MISS_RECOVERY_PAIRED_SUCCESSES;
+        }
     }
 
     pub fn prediction_estimator_mode(&self) -> PredictionEstimatorMode {
@@ -1231,7 +1260,7 @@ mod tests {
             PredictionEstimatorMode::WarmPaired
         );
 
-        journal.note_proven_deadline_miss();
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
         let recovering = journal.prediction(Duration::from_millis(10));
         assert_eq!(journal.missed_deadlines, 1);
         assert_eq!(
@@ -1291,7 +1320,7 @@ mod tests {
             PredictionEstimatorMode::WarmPaired
         );
 
-        journal.note_proven_deadline_miss();
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
         for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES / 2 {
             let offset_ns = sample as u64 * 10_000;
             journal.record_frame_service_observation(service_observation(
@@ -1307,7 +1336,7 @@ mod tests {
                 .miss_recovery_remaining,
             MISS_RECOVERY_PAIRED_SUCCESSES / 2
         );
-        journal.note_proven_deadline_miss();
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
         assert_eq!(
             journal
                 .prediction(Duration::from_millis(10))
@@ -1333,6 +1362,48 @@ mod tests {
         assert_eq!(
             journal.prediction_estimator_mode(),
             PredictionEstimatorMode::WarmPaired
+        );
+    }
+
+    #[test]
+    fn cause_specific_recovery_preserves_warm_state_and_active_recovery() {
+        let mut journal = AdaptiveRenderJournal::default();
+        record_uniform_prediction_inputs(&mut journal, 1_000_000, 1_000_000, 1_000_000, 0, 0, 0);
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::WarmPaired
+        );
+
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::PreserveEstimatorState);
+        assert_eq!(journal.missed_deadlines, 1);
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::WarmPaired
+        );
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .miss_recovery_remaining,
+            0
+        );
+
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
+        for _ in 0..5 {
+            journal.record_frame_service_observation(service_observation(
+                1_000_000, 1_001_000, 1_002_000, 1_003_000,
+            ));
+        }
+        let remaining = journal
+            .prediction(Duration::from_millis(10))
+            .miss_recovery_remaining;
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::PreserveEstimatorState);
+        assert_eq!(journal.missed_deadlines, 3);
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .miss_recovery_remaining,
+            remaining,
+            "a self-recovered KMS miss must not clear or reset active recovery"
         );
     }
 

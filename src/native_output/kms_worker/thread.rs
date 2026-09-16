@@ -1024,19 +1024,21 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     // that acquired executable worker ownership by its planned wake gives
                     // the worker a fair chance to meet the dispatch deadline and may train
                     // the adaptive tail guard.
+                    let binding_target = job.target.is_binding();
                     let fair_dispatch_chance =
-                        job.target.is_binding() && dequeued_at.get() <= planned_worker_wake_at;
+                        binding_target && dequeued_at.get() <= planned_worker_wake_at;
                     dispatch_model.record(
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
                         submit_duration_ns,
                         dispatch_duration_ns,
                     );
-                    let dispatch_tail = dispatch_model.observe_submission_deadline(
+                    let mut dispatch_tail = dispatch_model.observe_submission_deadline(
                         job.submit_window.commit_complete_deadline_ns(),
                         submit_returned_at,
                         fair_dispatch_chance,
                     );
+                    dispatch_tail.binding_target = binding_target;
                     shared.metrics.timing.record_dispatch_tail(dispatch_tail);
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
                     let submission_budget_ns = dispatch_budget.dispatch_budget_ns;
@@ -1081,6 +1083,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             ioctl_duration_ns: submit_duration_ns,
                             dispatch_duration_ns,
                             submission_budget_ns,
+                            dispatch_tail_observation: Some(dispatch_tail),
                         },
                     };
                     if !publish_event(&shared, event) {

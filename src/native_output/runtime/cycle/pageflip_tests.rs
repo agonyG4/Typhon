@@ -1,12 +1,14 @@
 use super::*;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitJob, KmsCommitTestPolicy, KmsPrimaryCursorPresentation,
-    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerDispatchTailObservation,
 };
+use crate::native_output::presentation::kms_timing::KmsPresentationTimingObservation;
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorPlanePoint, CursorRevision, KmsCommitBundleId, PresentedCursorDelivery,
     PresentedCursorState, PresentedPlaneSnapshot,
 };
+use oblivion_one::native::adaptive_buffering::{EstimatorRecoveryDisposition, ProvenDeadlineMiss};
 use oblivion_one::native::kms::FramebufferId;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -16,6 +18,115 @@ fn seat_disable_wins_over_a_same_batch_recovery_fence_wake() {
     assert!(!should_continue_resuming_recovery(true, true, true));
     assert!(should_continue_resuming_recovery(true, true, false));
     assert!(!should_continue_resuming_recovery(true, false, false));
+}
+
+fn dispatch_recovery_evidence(
+    binding_target: bool,
+    fair_dispatch_chance: bool,
+    deadline_overrun_ns: u64,
+    guard_before_ns: u64,
+    guard_ns: u64,
+    increased: bool,
+    cap_hit: bool,
+) -> KmsWorkerDispatchTailObservation {
+    KmsWorkerDispatchTailObservation {
+        binding_target,
+        fair_dispatch_chance,
+        deadline_overrun_ns,
+        guard_before_ns,
+        guard_ns,
+        increased,
+        decayed: false,
+        cap_hit,
+    }
+}
+
+fn apply_recovery_evidence(
+    accepted: bool,
+    apply_guard_before_ns: u64,
+    apply_guard_after_ns: u64,
+    apply_guard_increased: bool,
+) -> KmsPresentationTimingObservation {
+    KmsPresentationTimingObservation {
+        accepted,
+        apply_guard_before_ns,
+        apply_guard_after_ns,
+        apply_guard_increased,
+    }
+}
+
+#[test]
+fn render_misses_always_reset_independent_recovery_horizon() {
+    for miss in [
+        ProvenDeadlineMiss::ExactRender,
+        ProvenDeadlineMiss::GuardedApproximateRender,
+    ] {
+        assert_eq!(
+            recovery_disposition(miss, None, None),
+            EstimatorRecoveryDisposition::ResetIndependentHorizon
+        );
+    }
+    assert_eq!(
+        recovery_disposition(
+            ProvenDeadlineMiss::ExactRender,
+            Some(dispatch_recovery_evidence(
+                true, true, 12_000, 100_000, 162_000, true, false
+            )),
+            Some(apply_recovery_evidence(true, 100_000, 150_000, true)),
+        ),
+        EstimatorRecoveryDisposition::ResetIndependentHorizon,
+        "pending render readiness evidence retains precedence over KMS evidence"
+    );
+}
+
+#[test]
+fn dispatch_recovery_requires_complete_matching_worker_evidence() {
+    let recovered = dispatch_recovery_evidence(true, true, 12_000, 100_000, 162_000, true, false);
+    assert_eq!(
+        recovery_disposition(ProvenDeadlineMiss::KmsDispatch, Some(recovered), None),
+        EstimatorRecoveryDisposition::PreserveEstimatorState
+    );
+
+    for evidence in [
+        dispatch_recovery_evidence(false, true, 12_000, 100_000, 162_000, true, false),
+        dispatch_recovery_evidence(true, false, 12_000, 100_000, 100_000, false, false),
+        dispatch_recovery_evidence(true, true, 0, 100_000, 100_000, false, false),
+        dispatch_recovery_evidence(true, true, 12_000, 100_000, 112_000, true, true),
+    ] {
+        assert_eq!(
+            recovery_disposition(ProvenDeadlineMiss::KmsDispatch, Some(evidence), None),
+            EstimatorRecoveryDisposition::ResetIndependentHorizon
+        );
+    }
+    assert_eq!(
+        recovery_disposition(ProvenDeadlineMiss::KmsDispatch, None, None),
+        EstimatorRecoveryDisposition::ResetIndependentHorizon
+    );
+}
+
+#[test]
+fn apply_recovery_requires_accepted_guard_increase() {
+    assert_eq!(
+        recovery_disposition(
+            ProvenDeadlineMiss::KmsApplyGuard,
+            None,
+            Some(apply_recovery_evidence(true, 100_000, 150_000, true)),
+        ),
+        EstimatorRecoveryDisposition::PreserveEstimatorState
+    );
+    for evidence in [
+        apply_recovery_evidence(false, 100_000, 100_000, false),
+        apply_recovery_evidence(true, 100_000, 100_000, false),
+    ] {
+        assert_eq!(
+            recovery_disposition(ProvenDeadlineMiss::KmsApplyGuard, None, Some(evidence)),
+            EstimatorRecoveryDisposition::ResetIndependentHorizon
+        );
+    }
+    assert_eq!(
+        recovery_disposition(ProvenDeadlineMiss::KmsApplyGuard, None, None),
+        EstimatorRecoveryDisposition::ResetIndependentHorizon
+    );
 }
 
 fn worker_test_target() -> PresentationTarget {

@@ -615,6 +615,7 @@ fn terminal_worker_transports_preserve_both_bundle_owners() {
             ioctl_duration_ns: 1,
             dispatch_duration_ns: 1,
             submission_budget_ns: 1,
+            dispatch_tail_observation: None,
         };
     assert_two_owners(&submitted.job, primary_id, cursor_id);
 

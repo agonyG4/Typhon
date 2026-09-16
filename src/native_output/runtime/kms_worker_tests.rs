@@ -286,6 +286,7 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
         ioctl_duration_ns: 1,
         dispatch_duration_ns: 1,
         submission_budget_ns: 1_000_000,
+        dispatch_tail_observation: None,
     };
     let mut emergency = Vec::new();
 
