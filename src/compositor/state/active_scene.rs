@@ -162,6 +162,9 @@ impl CompositorState {
         windows: &[(u32, WindowId)],
         fullscreen_owner: Option<u32>,
     ) {
+        for surface in &surfaces {
+            self.ensure_surface_scene_node(surface.surface_id);
+        }
         self.renderable_surfaces = surfaces;
         self.rebuild_renderable_surface_index();
         self.surface_placements = self
@@ -761,8 +764,7 @@ impl CompositorState {
         &self,
         surface_id: u32,
     ) -> Option<SceneNodeId> {
-        self.active_scene_view
-            .scene_node_id_for_surface(surface_id)
+        self.active_scene_view.scene_node_id_for_surface(surface_id)
     }
 
     pub(in crate::compositor) fn active_scene_surface_index_for_node(

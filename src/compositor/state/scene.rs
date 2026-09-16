@@ -17,7 +17,10 @@ impl CompositorState {
         self.scene_registry.metadata(node)
     }
 
-    pub(in crate::compositor) fn ensure_surface_scene_node(&mut self, surface_id: u32) -> SceneNodeId {
+    pub(in crate::compositor) fn ensure_surface_scene_node(
+        &mut self,
+        surface_id: u32,
+    ) -> SceneNodeId {
         if let Some(node) = self.scene_node_id_for_surface(surface_id) {
             return node;
         }
@@ -68,10 +71,8 @@ impl CompositorState {
         window_id: WindowId,
         root_surface_id: u32,
     ) {
-        let group = self.ensure_window_scene_node(
-            SceneSource::WindowGroup(window_id),
-            SceneRole::WindowGroup,
-        );
+        let group = self
+            .ensure_window_scene_node(SceneSource::WindowGroup(window_id), SceneRole::WindowGroup);
         let decoration = self.ensure_window_scene_node(
             SceneSource::ServerDecoration(window_id),
             SceneRole::ServerDecoration,
@@ -148,9 +149,7 @@ impl CompositorState {
                     SceneRole::ServerDecoration => {
                         SceneDomainAssignment::Explicit(SceneDomain::Chrome)
                     }
-                    SceneRole::WindowGroup => {
-                        SceneDomainAssignment::Explicit(SceneDomain::Content)
-                    }
+                    SceneRole::WindowGroup => SceneDomainAssignment::Explicit(SceneDomain::Content),
                     _ => unreachable!(),
                 },
             )
@@ -184,12 +183,7 @@ fn scene_domain_for_surface(
             let domain = state
                 .layer_surfaces
                 .get(&surface_id)
-                .map(|role| match role.committed.layer {
-                    crate::compositor::layer_shell::Layer::Background => SceneDomain::Desktop,
-                    crate::compositor::layer_shell::Layer::Bottom
-                    | crate::compositor::layer_shell::Layer::Top
-                    | crate::compositor::layer_shell::Layer::Overlay => SceneDomain::Chrome,
-                })
+                .map(|role| scene_domain_for_layer(role.committed.layer))
                 .unwrap_or(SceneDomain::Chrome);
             SceneDomainAssignment::Explicit(domain)
         }
@@ -198,6 +192,33 @@ fn scene_domain_for_surface(
         | None => SceneDomainAssignment::Inherit {
             fallback: SceneDomain::Content,
         },
+    }
+}
+
+fn scene_domain_for_layer(layer: crate::compositor::layer_shell::Layer) -> SceneDomain {
+    match layer {
+        crate::compositor::layer_shell::Layer::Background => SceneDomain::Desktop,
+        crate::compositor::layer_shell::Layer::Bottom
+        | crate::compositor::layer_shell::Layer::Top
+        | crate::compositor::layer_shell::Layer::Overlay => SceneDomain::Chrome,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_semantic_domains_are_metadata_only_and_conservative() {
+        use crate::compositor::layer_shell::Layer;
+
+        assert_eq!(
+            scene_domain_for_layer(Layer::Background),
+            SceneDomain::Desktop
+        );
+        assert_eq!(scene_domain_for_layer(Layer::Bottom), SceneDomain::Chrome);
+        assert_eq!(scene_domain_for_layer(Layer::Top), SceneDomain::Chrome);
+        assert_eq!(scene_domain_for_layer(Layer::Overlay), SceneDomain::Chrome);
     }
 }
 

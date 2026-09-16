@@ -6,16 +6,30 @@ use std::sync::Arc;
 use crate::xwayland::xwm::{X11Geometry, X11PublishedState, X11WindowSnapshot, X11WindowTypes};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 
-fn test_surface(state: &mut CompositorState) -> (wayland_server::Display<CompositorState>, u32) {
-    let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+fn test_client(display: &mut wayland_server::Display<CompositorState>) -> wayland_server::Client {
     let mut display_handle = display.handle();
     let (server_end, _peer) = UnixStream::pair().expect("test client socket");
-    let client = display_handle
+    display_handle
         .insert_client(server_end, Arc::new(()))
-        .expect("test client");
+        .expect("test client")
+}
+
+fn test_surface_for_client(
+    state: &mut CompositorState,
+    display: &mut wayland_server::Display<CompositorState>,
+    client: &wayland_server::Client,
+) -> u32 {
+    let display_handle = display.handle();
     let surface =
-        state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
-    (display, compositor_surface_id(&surface))
+        state.test_create_unmapped_surface_resource_at_version(client, &display_handle, 1);
+    compositor_surface_id(&surface)
+}
+
+fn test_surface(state: &mut CompositorState) -> (wayland_server::Display<CompositorState>, u32) {
+    let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let client = test_client(&mut display);
+    let surface_id = test_surface_for_client(state, &mut display, &client);
+    (display, surface_id)
 }
 
 fn test_x11_snapshot(generation: XwaylandGeneration, surface_id: u32) -> X11WindowSnapshot {
@@ -89,8 +103,10 @@ fn role_metadata_changes_without_replacing_surface_scene_identity() {
 #[test]
 fn subsurface_role_uses_parent_surface_and_detaches_only_live_edge() {
     let mut state = CompositorState::default();
-    let (parent_display, parent_id) = test_surface(&mut state);
-    let (child_display, child_id) = test_surface(&mut state);
+    let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let client = test_client(&mut display);
+    let parent_id = test_surface_for_client(&mut state, &mut display, &client);
+    let child_id = test_surface_for_client(&mut state, &mut display, &client);
     state
         .assign_surface_role(child_id, SurfaceRole::Subsurface { parent_id })
         .expect("subsurface role");
@@ -107,8 +123,7 @@ fn subsurface_role_uses_parent_surface_and_detaches_only_live_edge() {
     let metadata = state.scene_node_metadata_for_surface(child_id).unwrap();
     assert_eq!(metadata.role, SceneRole::Subsurface);
     assert_eq!(metadata.visual_parent, None);
-    drop(parent_display);
-    drop(child_display);
+    drop(display);
 }
 
 #[test]
@@ -118,6 +133,7 @@ fn role_rollback_restores_unassigned_scene_metadata() {
     state
         .assign_surface_role(surface_id, SurfaceRole::DragIcon)
         .expect("drag icon role");
+    state.deactivate_role_instance(surface_id);
     state.rollback_surface_role_reservation(surface_id, SurfaceRole::DragIcon);
     let metadata = state.scene_node_metadata_for_surface(surface_id).unwrap();
 
@@ -134,8 +150,10 @@ fn role_rollback_restores_unassigned_scene_metadata() {
 #[test]
 fn input_surface_roles_receive_input_domain_without_render_changes() {
     let mut state = CompositorState::default();
-    let (cursor_display, cursor_id) = test_surface(&mut state);
-    let (drag_display, drag_id) = test_surface(&mut state);
+    let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let client = test_client(&mut display);
+    let cursor_id = test_surface_for_client(&mut state, &mut display, &client);
+    let drag_id = test_surface_for_client(&mut state, &mut display, &client);
     state
         .assign_surface_role(cursor_id, SurfaceRole::Cursor)
         .expect("cursor role");
@@ -157,8 +175,7 @@ fn input_surface_roles_receive_input_domain_without_render_changes() {
             .domain,
         SceneDomainAssignment::Explicit(SceneDomain::Input)
     );
-    drop(cursor_display);
-    drop(drag_display);
+    drop(display);
 }
 
 #[test]
@@ -190,7 +207,7 @@ fn desktop_window_has_stable_group_and_decoration_nodes() {
     state
         .assign_surface_role(surface_id, SurfaceRole::XdgToplevel)
         .expect("toplevel role");
-    let window_id = state.allocate_window_id().expect("window id");
+    let window_id = WindowId::from_raw(17).expect("window id");
     state
         .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
         .expect("desktop window");
@@ -220,6 +237,20 @@ fn desktop_window_has_stable_group_and_decoration_nodes() {
         Some(group)
     );
 
+    state.ensure_window_scene_nodes(window_id, surface_id);
+    assert_eq!(
+        state
+            .scene_registry
+            .node_for_source(SceneSource::WindowGroup(window_id)),
+        Some(group)
+    );
+    assert_eq!(
+        state
+            .scene_registry
+            .node_for_source(SceneSource::ServerDecoration(window_id)),
+        Some(decoration)
+    );
+
     state
         .remove_desktop_window(window_id)
         .expect("remove window");
@@ -241,8 +272,10 @@ fn desktop_window_has_stable_group_and_decoration_nodes() {
 #[test]
 fn xwayland_surface_replacement_preserves_window_group_identity() {
     let mut state = CompositorState::default();
-    let (display_a, surface_a) = test_surface(&mut state);
-    let (display_b, surface_b) = test_surface(&mut state);
+    let mut display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let client = test_client(&mut display);
+    let surface_a = test_surface_for_client(&mut state, &mut display, &client);
+    let surface_b = test_surface_for_client(&mut state, &mut display, &client);
     state
         .assign_surface_role(surface_a, SurfaceRole::Xwayland)
         .expect("first xwayland role");
@@ -252,7 +285,7 @@ fn xwayland_surface_replacement_preserves_window_group_identity() {
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
     let snapshot = test_x11_snapshot(generation, surface_a);
     let handle = snapshot.handle;
-    let window_id = state.allocate_window_id().expect("window id");
+    let window_id = WindowId::from_raw(18).expect("window id");
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("xwayland window");
@@ -295,6 +328,5 @@ fn xwayland_surface_replacement_preserves_window_group_identity() {
         Some(group)
     );
     assert_ne!(node_a, node_b);
-    drop(display_a);
-    drop(display_b);
+    drop(display);
 }
