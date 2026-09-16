@@ -1,7 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::*;
 
-use oblivion_one::compositor::DirectScanoutSceneAnalysis;
+use oblivion_one::compositor::{DirectScanoutSceneAnalysis, SurfaceRenderBackend};
 use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
 };
@@ -11,6 +11,7 @@ use oblivion_one::control_snapshots::{
     FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot, PositionSnapshot,
     StatusSnapshot, TrustedEffectsReloadSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
+use oblivion_one::render_backend::buffer::SurfaceBufferSource;
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
 };
@@ -2114,6 +2115,10 @@ mod tests {
         let scene = DirectScanoutDoctorScene {
             scene_candidate: false,
             scene_root: None,
+            scanout_source: None,
+            group_surfaces: Vec::new(),
+            group_surfaces_truncated: false,
+            visible_above: Vec::new(),
             opacity: "unknown",
             scene_blockers: vec!["application_content_above", "popup_visible"],
             semantic_solitary_fullscreen: false,
@@ -2139,6 +2144,15 @@ mod tests {
         let scene = DirectScanoutDoctorScene {
             scene_candidate: true,
             scene_root: Some(42),
+            scanout_source: Some(43),
+            group_surfaces: vec![
+                "{id:42 order:0 backend:xwayland buffer_source:shm format:unknown target:0,0,1920,1080 relation:below_source}"
+                    .to_string(),
+                "{id:43 order:1 backend:xwayland buffer_source:dmabuf format:0x34325258 target:0,0,1920,1080 relation:source}"
+                    .to_string(),
+            ],
+            group_surfaces_truncated: false,
+            visible_above: Vec::new(),
             opacity: "opaque_xrgb8888",
             scene_blockers: Vec::new(),
             semantic_solitary_fullscreen: false,
@@ -2167,6 +2181,8 @@ mod tests {
         );
 
         assert!(detail.contains("scene_candidate=true scene_root=42"));
+        assert!(detail.contains("scanout_source=43"));
+        assert!(detail.contains("group_surfaces_truncated=false"));
         assert!(detail.contains("semantic_solitary_fullscreen=false"));
         assert!(detail.contains("candidate_checks:3"));
         assert!(detail.contains("import_failures:1"));
@@ -2926,6 +2942,10 @@ fn doctor_check_with_detail(
 struct DirectScanoutDoctorScene {
     scene_candidate: bool,
     scene_root: Option<u32>,
+    scanout_source: Option<u32>,
+    group_surfaces: Vec<String>,
+    group_surfaces_truncated: bool,
+    visible_above: Vec<String>,
     opacity: &'static str,
     scene_blockers: Vec<&'static str>,
     semantic_solitary_fullscreen: bool,
@@ -2936,13 +2956,85 @@ impl DirectScanoutDoctorScene {
         analysis: &DirectScanoutSceneAnalysis,
         semantic_solitary_fullscreen: bool,
     ) -> Self {
+        const MAX_GROUP_SURFACES: usize = 32;
+        let group = analysis.coverage.covering_application_group.as_ref();
+        let scene_root = group.map(|group| group.root_surface_id);
+        let scanout_source = group.and_then(|group| {
+            group
+                .covering_surface
+                .as_ref()
+                .map(|surface| surface.surface_id)
+        });
+        let source_order = group.and_then(|group| {
+            let source_id = scanout_source?;
+            group
+                .surface_details
+                .iter()
+                .position(|surface| surface.surface_id == source_id)
+        });
+        let group_surfaces = group
+            .map(|group| {
+                group
+                    .surface_details
+                    .iter()
+                    .take(MAX_GROUP_SURFACES)
+                    .enumerate()
+                    .map(|(order, surface)| {
+                        let relation = match source_order {
+                            Some(source_order) if order < source_order => "below_source",
+                            Some(source_order) if order == source_order => "source",
+                            Some(_) => "above_source",
+                            None => "unselected",
+                        };
+                        format!(
+                            "{{id:{} order:{} backend:{} buffer_source:{} format:{} target:{},{},{},{} relation:{}}}",
+                            surface.surface_id,
+                            order,
+                            direct_scanout_doctor_backend(surface.backend),
+                            direct_scanout_doctor_buffer_source(surface.buffer_source),
+                            direct_scanout_doctor_format(surface.format),
+                            surface.target.x(),
+                            surface.target.y(),
+                            surface.target.width(),
+                            surface.target.height(),
+                            relation,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let group_surfaces_truncated = group
+            .is_some_and(|group| group.surface_details.len() > MAX_GROUP_SURFACES);
+        let visible_above = analysis
+            .coverage
+            .visible_content_above
+            .iter()
+            .map(|content| {
+                format!(
+                    "{{root:{} kind:{}}}",
+                    content.root_surface_id,
+                    match content.kind {
+                        oblivion_one::compositor::PresentationCoverageContentKind::Application => {
+                            "application"
+                        }
+                        oblivion_one::compositor::PresentationCoverageContentKind::Popup => "popup",
+                        oblivion_one::compositor::PresentationCoverageContentKind::LayerShell => {
+                            "layer_shell"
+                        }
+                        oblivion_one::compositor::PresentationCoverageContentKind::ServerSideDecoration => {
+                            "server_side_decoration"
+                        }
+                    }
+                )
+            })
+            .collect();
         Self {
             scene_candidate: analysis.candidate.is_some(),
-            scene_root: analysis
-                .coverage
-                .covering_application_group
-                .as_ref()
-                .map(|group| group.root_surface_id),
+            scene_root,
+            scanout_source,
+            group_surfaces,
+            group_surfaces_truncated,
+            visible_above,
             opacity: analysis.coverage.opacity.as_str(),
             scene_blockers: analysis
                 .blockers
@@ -2953,6 +3045,29 @@ impl DirectScanoutDoctorScene {
             semantic_solitary_fullscreen,
         }
     }
+}
+
+fn direct_scanout_doctor_backend(backend: SurfaceRenderBackend) -> &'static str {
+    match backend {
+        SurfaceRenderBackend::NativeWayland => "wayland",
+        SurfaceRenderBackend::Xwayland => "xwayland",
+    }
+}
+
+fn direct_scanout_doctor_buffer_source(source: SurfaceBufferSource) -> &'static str {
+    match source {
+        SurfaceBufferSource::Shm => "shm",
+        SurfaceBufferSource::Dmabuf => "dmabuf",
+    }
+}
+
+fn direct_scanout_doctor_format(
+    format: Option<oblivion_one::render_backend::buffer::DrmFormat>,
+) -> String {
+    format.map_or_else(
+        || "unknown".to_string(),
+        |format| format!("0x{:08x}", format.as_fourcc()),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2977,15 +3092,22 @@ fn format_direct_scanout_doctor_detail(
     let scene_root = scene
         .scene_root
         .map_or_else(|| "none".to_string(), |root| root.to_string());
+    let scanout_source = scene
+        .scanout_source
+        .map_or_else(|| "none".to_string(), |surface| surface.to_string());
     let scene_blockers = if scene.scene_blockers.is_empty() {
         "none".to_string()
     } else {
         scene.scene_blockers.join(",")
     };
     format!(
-        "scene_candidate={} scene_root={} opacity={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
+        "scene_candidate={} scene_root={} scanout_source={} group_surfaces=[{}] group_surfaces_truncated={} visible_above=[{}] opacity={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
         scene.scene_candidate,
         scene_root,
+        scanout_source,
+        scene.group_surfaces.join(","),
+        scene.group_surfaces_truncated,
+        scene.visible_above.join(","),
         scene.opacity,
         scene_blockers,
         scene.semantic_solitary_fullscreen,
