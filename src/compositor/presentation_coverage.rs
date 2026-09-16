@@ -65,7 +65,10 @@ pub struct PresentationCoverageAnalysis {
 impl PresentationCoverageAnalysis {
     pub const fn geometrically_covers_output(&self) -> bool {
         match self.covering_application_group.as_ref() {
-            Some(group) => group.covering_surface.is_some(),
+            Some(group) => match &group.covering_surface {
+                Some(_) => true,
+                None => false,
+            },
             None => false,
         }
     }
