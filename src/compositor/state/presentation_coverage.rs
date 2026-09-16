@@ -36,35 +36,30 @@ impl CompositorState {
                             && geometry.placement == SurfacePlacement::absolute_root_at(0, 0)
                     })
             },
-            |root_surface_id| self.presentation_coverage_opacity(root_surface_id, output_size),
+            |surface, target| self.presentation_coverage_opacity(surface, target, output_size),
         )
     }
 
     fn presentation_coverage_opacity(
         &self,
-        root_surface_id: u32,
+        surface: &RenderableSurface,
+        target: SurfaceTargetRect,
         output_size: BufferSize,
     ) -> PresentationCoverageOpacity {
-        let Some(root) = self
-            .active_scene_surfaces()
-            .iter()
-            .find(|surface| surface.surface_id == root_surface_id)
-        else {
-            return PresentationCoverageOpacity::Unknown;
-        };
-        let proven = root.buffer_source() == SurfaceBufferSource::Dmabuf
-            && root
+        let output_target = SurfaceTargetRect::new(0, 0, output_size.width, output_size.height);
+        let proven = target.intersection(output_target) == Some(output_target)
+            && surface.buffer_source() == SurfaceBufferSource::Dmabuf
+            && surface
                 .dmabuf_handle()
                 .is_some_and(|buffer| buffer.format() == DrmFormat::Xrgb8888)
-            && root
+            && surface
                 .dmabuf_handle()
                 .is_some_and(|buffer| buffer.size() == output_size)
-            && root.visual_clip.is_none()
-            && root
+            && surface.visual_clip.is_none()
+            && surface
                 .render_placement
-                .is_none_or(|placement| placement == root.placement)
-            && root.render_target_size.is_none()
-            && root.placement == SurfacePlacement::absolute_root_at(0, 0);
+                .is_none_or(|placement| placement == surface.placement)
+            && surface.render_target_size.is_none();
         if proven {
             PresentationCoverageOpacity::OpaqueXrgb8888
         } else {

@@ -1,5 +1,6 @@
 use super::{DecorationRenderInstance, RenderableSurface, SurfaceTargetRect, WindowVisualGroup};
-use crate::render_backend::buffer::BufferSize;
+use crate::compositor::surface::SurfaceRenderBackend;
+use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PresentationCoverageOpacity {
@@ -30,9 +31,22 @@ pub enum PresentationCoverageContentKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentationCoverageSurface {
+    pub surface_id: u32,
+    pub target: SurfaceTargetRect,
+    pub opacity: PresentationCoverageOpacity,
+    pub backend: SurfaceRenderBackend,
+    pub buffer_source: SurfaceBufferSource,
+    pub format: Option<DrmFormat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresentationCoverageApplicationGroup {
     pub root_surface_id: u32,
     pub surface_ids: Vec<u32>,
+    pub surface_details: Vec<PresentationCoverageSurface>,
+    pub covering_surface: Option<PresentationCoverageSurface>,
+    pub visible_surface_ids_above_covering: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +82,9 @@ pub(crate) fn analyze_presentation_coverage(
     is_application_group: impl Fn(u32) -> bool,
     is_layer_group: impl Fn(u32) -> bool,
     covers_output: impl Fn(u32) -> bool,
-    group_opacity: impl Fn(u32) -> PresentationCoverageOpacity,
+    surface_opacity: impl Fn(&RenderableSurface, SurfaceTargetRect) -> PresentationCoverageOpacity,
 ) -> PresentationCoverageAnalysis {
+    let output_rect = SurfaceTargetRect::new(0, 0, output_size.width, output_size.height);
     let groups =
         WindowVisualGroup::stack_order_with_popups(surfaces, decorations, popup_surface_ids);
     let covering_group_index = groups.iter().enumerate().rev().find_map(|(index, group)| {
@@ -84,6 +99,42 @@ pub(crate) fn analyze_presentation_coverage(
     };
     let covering_group = &groups[covering_group_index];
     let covering_root_surface_id = covering_group.root_surface_id();
+    let surface_details = covering_group
+        .surface_indices()
+        .iter()
+        .filter_map(|index| {
+            let surface = surfaces.get(*index)?;
+            let target = render_targets.get(*index).copied()?;
+            Some(PresentationCoverageSurface {
+                surface_id: surface.surface_id,
+                target,
+                opacity: surface_opacity(surface, target),
+                backend: surface.render_backend,
+                buffer_source: surface.buffer_source(),
+                format: surface.dmabuf_handle().map(|buffer| buffer.format()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let covering_order = surface_details.iter().enumerate().rev().find_map(
+        |(group_order, surface)| {
+            surface
+                .target
+                .intersection(output_rect)
+                .is_some_and(|intersection| intersection == output_rect)
+                .then_some(group_order)
+        },
+    );
+    let covering_surface = covering_order.and_then(|order| surface_details.get(order).cloned());
+    let visible_surface_ids_above_covering = covering_order
+        .map(|covering_order| {
+            surface_details
+                .iter()
+                .skip(covering_order.saturating_add(1))
+                .filter(|surface| surface.target.intersects(output_rect))
+                .map(|surface| surface.surface_id)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut analysis = PresentationCoverageAnalysis {
         covering_application_group: Some(PresentationCoverageApplicationGroup {
             root_surface_id: covering_root_surface_id,
@@ -92,8 +143,13 @@ pub(crate) fn analyze_presentation_coverage(
                 .iter()
                 .filter_map(|index| surfaces.get(*index).map(|surface| surface.surface_id))
                 .collect(),
+            surface_details,
+            covering_surface: covering_surface.clone(),
+            visible_surface_ids_above_covering,
         }),
-        opacity: group_opacity(covering_root_surface_id),
+        opacity: covering_surface
+            .as_ref()
+            .map_or(PresentationCoverageOpacity::Unknown, |surface| surface.opacity),
         visible_content_above: Vec::new(),
     };
 
