@@ -55,6 +55,17 @@ fn direct_content_classifier_treats_output_generation_change_as_new_content() {
     );
 }
 
+#[test]
+fn direct_primary_lease_keeps_source_and_owner_surface_ids_separate() {
+    let key = test_key();
+    let (lease, _cleanup_count) =
+        DirectPrimaryLease::test_fixture_with_probe_and_root(key, 42, 9001);
+
+    assert_eq!(lease.surface_id(), key.content.surface_id);
+    assert_eq!(lease.root_surface_id(), 9001);
+    assert!(lease.validate_against(key, key.content.surface_id, 42));
+}
+
 fn test_target() -> PresentationTarget {
     let now = MonotonicTimestampNs::new(10);
     PresentationTarget {

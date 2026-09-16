@@ -127,6 +127,17 @@ impl DirectPrimaryLease {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_fixture_with_probe_and_root(
+        key: DirectScanoutCandidateKey,
+        framebuffer_id: u32,
+        root_surface_id: u32,
+    ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+        let (mut lease, cleanup_count) = Self::test_fixture_with_probe(key, framebuffer_id);
+        lease.root_surface_id = root_surface_id;
+        (lease, cleanup_count)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_fixture_with_probe_and_damage(
         key: DirectScanoutCandidateKey,
         framebuffer_id: u32,
