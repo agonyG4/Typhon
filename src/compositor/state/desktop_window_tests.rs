@@ -109,6 +109,57 @@ fn x11_scanout_surface(
     }
 }
 
+fn x11_shm_surface(
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    placement: SurfacePlacement,
+) -> RenderableSurface {
+    let mut surface = x11_scanout_surface(
+        surface_id,
+        width,
+        height,
+        placement,
+        DrmFormat::Xrgb8888,
+    );
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("XWayland test SHM buffer identity");
+    let size = BufferSize::new(width, height).expect("XWayland test SHM buffer size");
+    surface.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        identity,
+        size,
+        vec![0xff00_0000; (width * height) as usize],
+    );
+    surface
+}
+
+fn install_x11_visual_tree(
+    state: &mut CompositorState,
+    root: RenderableSurface,
+    children: impl IntoIterator<Item = RenderableSurface>,
+    snapshot: X11WindowSnapshot,
+) {
+    let root_surface_id = root.surface_id;
+    insert_x11(state, snapshot);
+    state.append_renderable_surface(root);
+    for child in children {
+        state.append_renderable_surface(child);
+    }
+    state.surface_presentation_generations.insert(root_surface_id, 1);
+    let surface_ids = state
+        .renderable_surfaces
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    for surface_id in surface_ids {
+        state
+            .surface_presentation_generations
+            .insert(surface_id, 1);
+    }
+    state.rebuild_active_scene_view();
+}
+
 fn x11_output_snapshot(
     generation: XwaylandGeneration,
     xid: u32,
@@ -210,6 +261,128 @@ fn xwayland_borderless_xrgb_window_is_a_direct_scanout_candidate_without_fullscr
     let analysis = state.direct_scanout_scene_analysis();
     assert!(analysis.blockers.is_empty(), "{:#?}", analysis.blockers);
     assert!(analysis.candidate.is_some());
+}
+
+#[test]
+fn xwayland_shm_root_with_xrgb_child_uses_child_as_scanout_source() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(30).expect("generation"));
+    let root = x11_shm_surface(
+        330,
+        output_width,
+        output_height,
+        SurfacePlacement::absolute_root_at(0, 0),
+    );
+    let child = x11_scanout_surface(
+        331,
+        output_width,
+        output_height,
+        SurfacePlacement::subsurface(330, 0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    install_x11_visual_tree(
+        &mut state,
+        root,
+        [child],
+        x11_output_snapshot(generation, 330, 330),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+
+    assert_eq!(
+        analysis
+            .candidate
+            .as_ref()
+            .map(|candidate| (candidate.root_surface_id, candidate.surface_id)),
+        Some((330, 331))
+    );
+}
+
+#[test]
+fn xwayland_surface_above_child_source_has_a_precise_scene_blocker() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(31).expect("generation"));
+    let root = x11_shm_surface(
+        332,
+        output_width,
+        output_height,
+        SurfacePlacement::absolute_root_at(0, 0),
+    );
+    let child = x11_scanout_surface(
+        333,
+        output_width,
+        output_height,
+        SurfacePlacement::subsurface(332, 0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    let above = x11_shm_surface(
+        334,
+        64,
+        64,
+        SurfacePlacement::subsurface(332, 0, 0),
+    );
+    install_x11_visual_tree(
+        &mut state,
+        root,
+        [child, above],
+        x11_output_snapshot(generation, 332, 332),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+
+    assert!(analysis.candidate.is_none());
+    assert!(analysis
+        .blockers
+        .reasons()
+        .iter()
+        .any(|reason| reason.as_str() == "owner_tree_content_above_source"));
+}
+
+#[test]
+fn xwayland_surface_behind_or_outside_child_source_does_not_block_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(32).expect("generation"));
+    let root = x11_shm_surface(
+        335,
+        output_width,
+        output_height,
+        SurfacePlacement::absolute_root_at(0, 0),
+    );
+    let child = x11_scanout_surface(
+        336,
+        output_width,
+        output_height,
+        SurfacePlacement::subsurface(335, 0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    let outside = x11_shm_surface(
+        337,
+        64,
+        64,
+        SurfacePlacement::subsurface(335, 2_000, 0),
+    );
+    install_x11_visual_tree(
+        &mut state,
+        root,
+        [child, outside],
+        x11_output_snapshot(generation, 335, 335),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+
+    assert_eq!(
+        analysis
+            .candidate
+            .as_ref()
+            .map(|candidate| (candidate.root_surface_id, candidate.surface_id)),
+        Some((335, 336))
+    );
 }
 
 #[test]
