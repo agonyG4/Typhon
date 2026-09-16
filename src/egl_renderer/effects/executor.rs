@@ -457,13 +457,21 @@ struct PreparedEffectRegion {
     fallback: Option<&'static str>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EffectExecutionInvariantError {
     MissingPassOutput(GraphPassId),
     UnknownTexture(GraphTextureId),
+    UninitializedInputRegion {
+        consumer: GraphPassId,
+        input: GraphTextureId,
+        missing: EffectRegion,
+    },
     SampledOutputTexture(GraphTextureId),
     MissingTextureResource(GraphTextureId),
-    FeedbackTextureAlias { input: u64, output: u64 },
+    FeedbackTextureAlias {
+        input: u64,
+        output: u64,
+    },
     InvalidTextureDimensions(GraphTextureId),
     InvalidTextureDomain(GraphTextureId),
     CaptureDomainOutsideOutput(GraphTextureId),
@@ -549,6 +557,29 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
     output_size: (u32, u32),
     debug_config: EffectDebugConfig,
 ) -> SurfaceConsumerPlan {
+    plan_effect_surface_consumers_with_debug_config_and_materialization_policy(
+        graph,
+        demand,
+        selection,
+        commands,
+        repaint_rects,
+        output_size,
+        debug_config,
+        SceneCaptureMaterializationPolicy::Exact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_effect_surface_consumers_with_debug_config_and_materialization_policy(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    commands: &[EglDrawCommand],
+    repaint_rects: &[OutputRect],
+    output_size: (u32, u32),
+    debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
+) -> SurfaceConsumerPlan {
     let mut plan = SurfaceConsumerPlan::default();
     let scene_work = scene_work_regions(
         repaint_rects,
@@ -627,8 +658,17 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
                 .output
                 .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
                 .map(|texture| texture.domain);
-            let capture_rects =
-                effect_capture_output_rects(&execution_damage.region, target_domain, output_size);
+            let capture_rects = capture_materialization_plan(
+                &execution_damage.region,
+                target_domain,
+                output_size,
+                if pass.kind == RenderPassKind::SceneCapture {
+                    materialization_policy
+                } else {
+                    SceneCaptureMaterializationPolicy::Exact
+                },
+            )
+            .output_rects;
             add_surface_consumers_for_capture_indices(
                 &mut plan,
                 commands,
@@ -676,6 +716,29 @@ pub(crate) fn execute_effect_graph_with_debug_config(
     selection: &EffectExecutionSelection,
     debug_config: EffectDebugConfig,
 ) -> RendererResult<EffectExecutionStats> {
+    execute_effect_graph_with_debug_config_and_materialization_policy(
+        renderer,
+        graph,
+        framebuffer_origin,
+        repaint_plan,
+        demand,
+        selection,
+        debug_config,
+        SceneCaptureMaterializationPolicy::Exact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_effect_graph_with_debug_config_and_materialization_policy(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_plan: &super::super::damage::RepaintPlan,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
+) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
     let trace_summary = effect_trace_summary(renderer, graph, Some(repaint_plan), selection);
     renderer
@@ -694,6 +757,7 @@ pub(crate) fn execute_effect_graph_with_debug_config(
         demand,
         selection,
         debug_config,
+        materialization_policy,
         false,
         true,
     );
@@ -761,6 +825,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         demand,
         selection,
         *effect_debug_config(),
+        SceneCaptureMaterializationPolicy::Exact,
         true,
         false,
     );
@@ -788,6 +853,14 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum SceneCaptureMaterializationPolicy {
+    Exact,
+    BoundingBox,
+    FullDomain,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
@@ -799,6 +872,7 @@ pub(crate) fn execute_graph_passes(
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
     debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
 ) -> RendererResult<EffectExecutionStats> {
@@ -819,6 +893,7 @@ pub(crate) fn execute_graph_passes(
         demand,
         selection,
         debug_config,
+        materialization_policy,
         lifecycle_backdrop,
         draw_overlays,
         graph_scope,
@@ -856,11 +931,16 @@ fn execute_graph_passes_inner(
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
     debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
+    #[cfg(any(debug_assertions, test))]
+    // Validity belongs to this graph execution and logical texture ID. A
+    // pooled physical allocation never carries validity into this map.
+    let mut valid_regions = std::collections::HashMap::<GraphTextureId, EffectRegion>::new();
     let framebuffer_capture = !lifecycle_backdrop
         && repaint_plan.is_some()
         && debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer;
@@ -948,7 +1028,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -967,7 +1047,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -987,7 +1067,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -1013,7 +1093,7 @@ fn execute_graph_passes_inner(
                         );
                     }
                     renderer.draw_effect_scene_range(
-                        &scene_work_rects,
+                        scene_work_rects,
                         scene_cursor,
                         draw_end,
                         framebuffer_origin,
@@ -1050,7 +1130,7 @@ fn execute_graph_passes_inner(
                     );
                 }
                 renderer.draw_effect_scene_range(
-                    &scene_work_rects,
+                    scene_work_rects,
                     scene_cursor,
                     draw_end,
                     framebuffer_origin,
@@ -1078,7 +1158,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -1105,7 +1185,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -1113,6 +1193,16 @@ fn execute_graph_passes_inner(
                 );
             }
             if let Err(error) = validation_result {
+                renderer.effect_trace.invariant_failure(&error);
+                return Err(Box::new(error));
+            }
+            #[cfg(any(debug_assertions, test))]
+            if let Err(error) = validate_current_frame_input_regions(
+                graph,
+                pass,
+                &execution_damage.region,
+                &valid_regions,
+            ) {
                 renderer.effect_trace.invariant_failure(&error);
                 return Err(Box::new(error));
             }
@@ -1128,7 +1218,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -1157,6 +1247,7 @@ fn execute_graph_passes_inner(
                 &execution_damage.region,
                 lifecycle_backdrop,
                 debug_config,
+                materialization_policy,
                 &mut stats,
             );
             renderer
@@ -1174,7 +1265,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -1186,6 +1277,23 @@ fn execute_graph_passes_inner(
                     renderer.effect_trace.invariant_failure(invariant);
                 }
                 return Err(error);
+            }
+            #[cfg(any(debug_assertions, test))]
+            {
+                let output_region = record_current_frame_output_region(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage.region,
+                    lifecycle_backdrop,
+                    debug_config,
+                    materialization_policy,
+                )
+                .map_err(|error| {
+                    renderer.effect_trace.invariant_failure(&error);
+                    Box::new(error) as Box<dyn std::error::Error>
+                })?;
+                valid_regions.insert(pass.output.expect("validated pass output"), output_region);
             }
             if renderer.effect_trace.enabled() {
                 renderer.effect_trace.pass_boundary(
@@ -1199,7 +1307,7 @@ fn execute_graph_passes_inner(
                         pass,
                         demand,
                         &execution_damage.region,
-                        &scene_work_rects,
+                        scene_work_rects,
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
@@ -1218,7 +1326,7 @@ fn execute_graph_passes_inner(
             );
         }
         renderer.draw_effect_scene_range(
-            &scene_work_rects,
+            scene_work_rects,
             scene_cursor,
             final_scene_cursor_end,
             framebuffer_origin,
@@ -1576,6 +1684,99 @@ fn validate_effect_pass_resources(
     Ok(())
 }
 
+#[cfg(any(debug_assertions, test))]
+fn validate_current_frame_input_regions(
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+    execution_damage: &EffectRegion,
+    valid_regions: &std::collections::HashMap<GraphTextureId, EffectRegion>,
+) -> Result<(), EffectExecutionInvariantError> {
+    let output = pass
+        .output
+        .ok_or(EffectExecutionInvariantError::MissingPassOutput(pass.id))?;
+    let output_plan = graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == output)
+        .ok_or(EffectExecutionInvariantError::UnknownTexture(output))?;
+
+    for input_id in &pass.inputs {
+        let input_plan = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == *input_id)
+            .ok_or(EffectExecutionInvariantError::UnknownTexture(*input_id))?;
+        if matches!(input_plan.source, GraphTextureSource::Static(_)) {
+            continue;
+        }
+        let required = oblivion_one::effects::required_input_region(
+            pass,
+            execution_damage,
+            output_plan,
+            input_plan,
+        )
+        .ok_or(EffectExecutionInvariantError::UninitializedInputRegion {
+            consumer: pass.id,
+            input: *input_id,
+            missing: EffectRegion::from_rect(input_plan.domain),
+        })?;
+        let valid = valid_regions
+            .get(input_id)
+            .cloned()
+            .unwrap_or_else(EffectRegion::empty);
+        let missing = required.subtract(&valid);
+        if !missing.is_empty() {
+            return Err(EffectExecutionInvariantError::UninitializedInputRegion {
+                consumer: pass.id,
+                input: *input_id,
+                missing,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(debug_assertions, test))]
+fn record_current_frame_output_region(
+    renderer: &GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+    execution_damage: &EffectRegion,
+    lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
+) -> Result<EffectRegion, EffectExecutionInvariantError> {
+    let output = pass
+        .output
+        .ok_or(EffectExecutionInvariantError::MissingPassOutput(pass.id))?;
+    let output_plan = graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == output)
+        .ok_or(EffectExecutionInvariantError::UnknownTexture(output))?;
+    if matches!(
+        pass.kind,
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+    ) {
+        if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+            return Ok(EffectRegion::from_rect(output_plan.domain));
+        }
+        let policy = if pass.kind == RenderPassKind::SceneCapture {
+            materialization_policy
+        } else {
+            SceneCaptureMaterializationPolicy::Exact
+        };
+        return Ok(capture_materialization_plan(
+            execution_damage,
+            Some(output_plan.domain),
+            renderer.current_size,
+            policy,
+        )
+        .region);
+    }
+    Ok(execution_damage.intersect_rect(output_plan.domain))
+}
+
 fn validate_domain_mapping(
     texture: &oblivion_one::effects::GraphTexturePlan,
 ) -> Result<(), EffectExecutionInvariantError> {
@@ -1902,6 +2103,7 @@ fn execute_pass(
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     match pass.kind {
@@ -1915,6 +2117,7 @@ fn execute_pass(
                 execution_damage,
                 lifecycle_backdrop,
                 debug_config,
+                materialization_policy,
                 stats,
             )?;
             stats.scene_captures = stats.scene_captures.saturating_add(1);
@@ -2598,6 +2801,7 @@ fn execute_capture(
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    materialization_policy: SceneCaptureMaterializationPolicy,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     let output = pass
@@ -2608,14 +2812,46 @@ fn execute_capture(
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
     let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
+    let materialization = if direct_capture {
+        None
+    } else {
+        Some(capture_materialization_plan(
+            execution_damage,
+            Some(target_plan.domain),
+            renderer.current_size,
+            if pass.kind == RenderPassKind::SceneCapture {
+                materialization_policy
+            } else {
+                SceneCaptureMaterializationPolicy::Exact
+            },
+        ))
+    };
     let capture_rects = if direct_capture {
         vec![full_output_rect((target_plan.width, target_plan.height))]
     } else {
-        capture_clear_rects(execution_damage, target_plan)
+        materialization
+            .as_ref()
+            .expect("replay capture has a materialization plan")
+            .output_rects
+            .clone()
     };
     stats.capture_execution_pixels = stats
         .capture_execution_pixels
         .saturating_add(output_rect_pixels(&capture_rects));
+    if let Some(materialization) = materialization.as_ref()
+        && renderer.effect_trace.enabled()
+    {
+        renderer.effect_trace.capture_materialization(
+            pass,
+            materialization.region.rects().len(),
+            materialization
+                .region
+                .bounding_rect()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height)),
+            materialization.output_rects.len(),
+            output_rect_pixels(&capture_rects),
+        );
+    }
     if direct_capture {
         capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
         return Ok(());
@@ -2687,11 +2923,11 @@ fn execute_capture(
         pass.visual_group,
         pass.anchor_scope,
     );
-    let scissors = effect_capture_output_rects(
-        execution_damage,
-        Some(target_plan.domain),
-        renderer.current_size,
-    );
+    let scissors = materialization
+        .as_ref()
+        .expect("replay capture has a materialization plan")
+        .output_rects
+        .clone();
     renderer.draw_capture_commands_for_regions(
         &indices,
         &scissors,
@@ -3523,11 +3759,48 @@ fn effect_damage_to_texture_rects(
         .collect()
 }
 
+#[cfg(test)]
 fn capture_clear_rects(
     damage: &EffectRegion,
     target: &oblivion_one::effects::GraphTexturePlan,
 ) -> Vec<OutputRect> {
     effect_damage_to_texture_rects(damage, target, OutputFramebufferOrigin::BottomLeft)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CaptureMaterializationPlan {
+    region: EffectRegion,
+    output_rects: Vec<OutputRect>,
+}
+
+fn capture_materialization_plan(
+    execution_damage: &EffectRegion,
+    target_domain: Option<oblivion_one::effects::EffectRect>,
+    output_size: (u32, u32),
+    policy: SceneCaptureMaterializationPolicy,
+) -> CaptureMaterializationPlan {
+    let region = match policy {
+        SceneCaptureMaterializationPolicy::Exact => target_domain.map_or_else(
+            || execution_damage.clone(),
+            |domain| execution_damage.intersect_rect(domain),
+        ),
+        SceneCaptureMaterializationPolicy::BoundingBox => execution_damage
+            .bounding_rect()
+            .map_or_else(EffectRegion::empty, |rect| {
+                target_domain.map_or_else(
+                    || EffectRegion::from_rect(rect),
+                    |domain| EffectRegion::from_rect(rect).intersect_rect(domain),
+                )
+            }),
+        SceneCaptureMaterializationPolicy::FullDomain => {
+            target_domain.map_or_else(|| execution_damage.clone(), EffectRegion::from_rect)
+        }
+    };
+    let output_rects = effect_capture_output_rects(&region, target_domain, output_size);
+    CaptureMaterializationPlan {
+        region,
+        output_rects,
+    }
 }
 
 fn effect_rect_to_texture_rect(
@@ -4297,6 +4570,98 @@ mod tests {
             ),
             EffectPassBlendMode::PremultipliedSourceOver
         );
+    }
+
+    #[test]
+    fn capture_materialization_plan_keeps_region_and_raster_rects_authoritative() {
+        let domain = oblivion_one::effects::EffectRect::new(100, 80, 120, 90).unwrap();
+        let mut execution = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(108, 88, 12, 10).unwrap(),
+        );
+        execution.push(oblivion_one::effects::EffectRect::new(180, 132, 8, 7).unwrap());
+
+        let exact = capture_materialization_plan(
+            &execution,
+            Some(domain),
+            (320, 240),
+            SceneCaptureMaterializationPolicy::Exact,
+        );
+        assert_eq!(exact.region, execution);
+        assert_eq!(exact.output_rects.len(), 2);
+
+        let bounding_box = capture_materialization_plan(
+            &execution,
+            Some(domain),
+            (320, 240),
+            SceneCaptureMaterializationPolicy::BoundingBox,
+        );
+        assert_eq!(
+            bounding_box.region,
+            EffectRegion::from_rect(
+                oblivion_one::effects::EffectRect::new(108, 88, 80, 51).unwrap()
+            )
+        );
+        assert_eq!(bounding_box.output_rects.len(), 1);
+
+        let full_domain = capture_materialization_plan(
+            &execution,
+            Some(domain),
+            (320, 240),
+            SceneCaptureMaterializationPolicy::FullDomain,
+        );
+        assert_eq!(full_domain.region, EffectRegion::from_rect(domain));
+        assert_eq!(
+            full_domain.output_rects,
+            vec![OutputRect::new(100, 80, 120, 90)]
+        );
+    }
+
+    #[test]
+    fn current_frame_validity_guard_rejects_unproduced_input_texels() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 64, 48).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Fragment,
+            instance,
+            vec![input],
+            output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let execution =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(12, 14, 9, 7).unwrap());
+        let error = validate_current_frame_input_regions(
+            &graph,
+            &pass,
+            &execution,
+            &std::collections::HashMap::new(),
+        )
+        .expect_err("an unproduced input must be rejected before sampling");
+        assert!(matches!(
+            error,
+            EffectExecutionInvariantError::UninitializedInputRegion {
+                consumer,
+                input: actual_input,
+                missing,
+            } if consumer == pass.id && actual_input == input && !missing.is_empty()
+        ));
     }
 
     #[test]

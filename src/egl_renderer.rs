@@ -6549,9 +6549,10 @@ mod tests {
         SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
     };
     use oblivion_one::effects::{
-        DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode,
-        EffectNodeId, EffectParameterBlock, EffectProgram, EffectProgramId, EffectSource,
-        EffectWorkingSpace, GraphTexturePhysicalRect, GraphTextureSource, validate_effect_program,
+        CustomFragmentSpec, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
+        EffectFootprint, EffectFrameDemand, EffectNode, EffectNodeId, EffectParameterBlock,
+        EffectProgram, EffectProgramId, EffectSource, EffectWorkingSpace, GraphTexturePhysicalRect,
+        GraphTextureSource, ShaderModuleId, validate_effect_program,
     };
     use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
     use oblivion_one::render_backend::buffer::{
@@ -6707,6 +6708,15 @@ mod tests {
     }
 
     fn moving_blur_scene(rect: EffectRect) -> (ResolvedEffectScene, EffectRegistry) {
+        moving_blur_scene_with_spec(rect, 4.0, 2, 1.0)
+    }
+
+    fn moving_blur_scene_with_spec(
+        rect: EffectRect,
+        radius: f32,
+        passes: u8,
+        scale: f32,
+    ) -> (ResolvedEffectScene, EffectRegistry) {
         let source = EffectNodeId::new(1).expect("source id");
         let blur = EffectNodeId::new(2).expect("blur id");
         let program = validate_effect_program(EffectProgram {
@@ -6716,7 +6726,7 @@ mod tests {
                 EffectNode::dual_kawase(
                     blur,
                     source,
-                    DualKawaseBlurSpec::new(4.0, 2, 1.0).expect("blur spec"),
+                    DualKawaseBlurSpec::new(radius, passes, scale).expect("blur spec"),
                 ),
             ],
             output: blur,
@@ -6753,7 +6763,17 @@ mod tests {
         rect: EffectRect,
         visual_group: VisualGroupId,
     ) -> ResolvedEffectScene {
-        let (mut scene, _) = moving_blur_scene(rect);
+        moving_visual_group_blur_scene_with_spec(rect, visual_group, 4.0, 2, 1.0)
+    }
+
+    fn moving_visual_group_blur_scene_with_spec(
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+        radius: f32,
+        passes: u8,
+        scale: f32,
+    ) -> ResolvedEffectScene {
+        let (mut scene, _) = moving_blur_scene_with_spec(rect, radius, passes, scale);
         let instance = scene.instances.first_mut().expect("moving blur instance");
         instance.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
         instance.visual_group = Some(visual_group);
@@ -6840,7 +6860,7 @@ mod tests {
             },
         );
         let translucent_surface = [
-            112_u8, 18, 12, 128, 112, 18, 12, 128, 112, 18, 12, 128, 112, 18, 12, 128,
+            112_u8, 18, 12, 128, 18, 112, 12, 160, 18, 12, 112, 96, 112, 112, 12, 192,
         ];
         let target_image = create_uploaded_resource(&harness.gl, 2, 2)
             .expect("diagnostic translucent surface texture creates");
@@ -6895,8 +6915,29 @@ mod tests {
         source_damage: &EffectRegion,
         output_bounds: EffectRect,
     ) -> oblivion_one::effects::CompiledFrameGraph {
-        let scene = moving_visual_group_blur_scene(rect, visual_group);
-        let (_, registry) = moving_blur_scene(rect);
+        diagnostic_graph_with_spec(
+            rect,
+            visual_group,
+            source_damage,
+            output_bounds,
+            4.0,
+            2,
+            1.0,
+        )
+    }
+
+    fn diagnostic_graph_with_spec(
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+        source_damage: &EffectRegion,
+        output_bounds: EffectRect,
+        radius: f32,
+        passes: u8,
+        scale: f32,
+    ) -> oblivion_one::effects::CompiledFrameGraph {
+        let scene =
+            moving_visual_group_blur_scene_with_spec(rect, visual_group, radius, passes, scale);
+        let (_, registry) = moving_blur_scene_with_spec(rect, radius, passes, scale);
         let plan = oblivion_one::effects::compile_frame_execution_plan(
             &scene,
             source_damage,
@@ -6910,11 +6951,115 @@ mod tests {
         graph
     }
 
+    fn diagnostic_graph_with_linear_neighbor_stage(
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+        source_damage: &EffectRegion,
+        output_bounds: EffectRect,
+    ) -> oblivion_one::effects::CompiledFrameGraph {
+        let source = EffectNodeId::new(1).expect("custom diagnostic source id");
+        let blur = EffectNodeId::new(2).expect("custom diagnostic blur id");
+        let custom = EffectNodeId::new(3).expect("custom diagnostic stage id");
+        let program_id = EffectProgramId::new(2).expect("custom diagnostic program id");
+        let custom_shader = ShaderModuleId::new(9_001).expect("custom diagnostic shader id");
+        let program = validate_effect_program(EffectProgram {
+            id: program_id,
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::dual_kawase(
+                    blur,
+                    source,
+                    DualKawaseBlurSpec::new(4.0, 2, 0.5).expect("custom diagnostic blur spec"),
+                ),
+                EffectNode::custom_fragment(
+                    custom,
+                    blur,
+                    CustomFragmentSpec {
+                        shader: custom_shader,
+                        declared_footprint: EffectFootprint::symmetric(1),
+                        uniforms: Vec::new(),
+                        auxiliary_inputs: Vec::new(),
+                    },
+                )
+                .expect("custom diagnostic stage validates"),
+            ],
+            output: custom,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: oblivion_one::effects::EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .expect("custom diagnostic program validates");
+        let mut registry = EffectRegistry::empty();
+        registry
+            .insert(program)
+            .expect("custom diagnostic program inserts");
+        let mut scene = moving_visual_group_blur_scene_with_spec(rect, visual_group, 4.0, 2, 0.5);
+        scene.instances[0].program = program_id;
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            source_damage,
+            output_bounds,
+            &registry,
+        )
+        .expect("custom diagnostic graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("custom diagnostic graph must compile to an effect graph");
+        };
+        graph
+    }
+
+    fn install_custom_linear_neighbor_shader(harness: &mut GlesEffectTestHarness) {
+        let custom_shader = ShaderModuleId::new(9_001).expect("custom diagnostic shader id");
+        let shader_key =
+            effects::ShaderProgramKey::new(custom_shader, 0, EffectWorkingSpace::LinearSrgb);
+        let source = effects::generate_fragment_wrapper(
+            r#"vec4 typhon_effect_main(TyphonEffectContext ctx) {
+                vec2 delta = vec2(0.75) / ctx.texture_size;
+                return (typhon_sample_primary(ctx.uv + delta) +
+                    typhon_sample_primary(ctx.uv - delta)) * 0.5;
+            }"#,
+            &[],
+        )
+        .expect("custom diagnostic shader wraps");
+        harness.renderer.effect_shaders =
+            effects::ShaderProgramCache::new(effects::builtin_shader_program_count() + 1)
+                .expect("custom diagnostic shader cache creates");
+        harness
+            .renderer
+            .effect_shaders
+            .prewarm_builtins(&harness.gl)
+            .expect("custom diagnostic builtins prewarm");
+        harness
+            .renderer
+            .effect_shaders
+            .prewarm(
+                &harness.gl,
+                shader_key,
+                effects::DUAL_KAWASE_VERTEX_SHADER,
+                &source,
+            )
+            .expect("custom diagnostic shader prewarms");
+    }
+
     fn diagnostic_repaint_plan(repair: OutputRect, full: bool) -> RepaintPlan {
+        diagnostic_repaint_plan_for_repairs(&[repair], full)
+    }
+
+    fn diagnostic_repaint_plan_for_repairs(repairs: &[OutputRect], full: bool) -> RepaintPlan {
+        diagnostic_repaint_plan_for_repairs_in_size(repairs, full, (128, 96))
+    }
+
+    fn diagnostic_repaint_plan_for_repairs_in_size(
+        repairs: &[OutputRect],
+        full: bool,
+        output_size: (u32, u32),
+    ) -> RepaintPlan {
         let damage = if full {
             OutputDamage::Full
         } else {
-            OutputDamage::rects(128, 96, [repair])
+            OutputDamage::rects(output_size.0, output_size.1, repairs.iter().copied())
         };
         RepaintPlan {
             render_damage: damage.clone(),
@@ -6964,6 +7109,26 @@ mod tests {
         conservative_full: bool,
         config: effects::EffectDebugConfig,
     ) {
+        execute_diagnostic_frame_with_capture_materialization(
+            harness,
+            graph,
+            plan,
+            region,
+            conservative_full,
+            config,
+            effects::SceneCaptureMaterializationPolicy::Exact,
+        );
+    }
+
+    fn execute_diagnostic_frame_with_capture_materialization(
+        harness: &mut GlesEffectTestHarness,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        plan: &RepaintPlan,
+        region: EffectRegion,
+        conservative_full: bool,
+        config: effects::EffectDebugConfig,
+        materialization_policy: effects::SceneCaptureMaterializationPolicy,
+    ) {
         let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
             graph,
             &region,
@@ -6971,7 +7136,7 @@ mod tests {
             config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
         );
         let selection = effects::select_effect_execution(graph, &demand);
-        effects::execute_effect_graph_with_debug_config(
+        effects::execute_effect_graph_with_debug_config_and_materialization_policy(
             &mut harness.renderer,
             graph,
             OutputFramebufferOrigin::BottomLeft,
@@ -6979,15 +7144,24 @@ mod tests {
             &demand,
             &selection,
             config,
+            materialization_policy,
         )
         .expect("diagnostic frame renders");
     }
 
     fn diagnostic_region(rect: OutputRect) -> EffectRegion {
-        EffectRegion::from_rect(
-            EffectRect::new(rect.x, rect.y, rect.width, rect.height)
-                .expect("diagnostic repair region"),
-        )
+        diagnostic_region_for_repairs(&[rect])
+    }
+
+    fn diagnostic_region_for_repairs(repairs: &[OutputRect]) -> EffectRegion {
+        let mut region = EffectRegion::empty();
+        for repair in repairs {
+            region.push(
+                EffectRect::new(repair.x, repair.y, repair.width, repair.height)
+                    .expect("diagnostic repair region"),
+            );
+        }
+        region
     }
 
     fn diagnostic_pixel_is_inside(rect: OutputRect, x: u32, y: u32) -> bool {
@@ -6997,6 +7171,49 @@ mod tests {
             && (y as i32) < rect.y + rect.height as i32
     }
 
+    fn diagnostic_pixel_is_inside_repairs(repairs: &[OutputRect], x: u32, y: u32) -> bool {
+        repairs
+            .iter()
+            .copied()
+            .any(|repair| diagnostic_pixel_is_inside(repair, x, y))
+    }
+
+    fn diagnostic_matrix_mismatch_counts(
+        actual: &[u8],
+        previous: &[u8],
+        full_reference: &[u8],
+        width: u32,
+        height: u32,
+        repairs: &[OutputRect],
+        tolerance: u8,
+    ) -> (usize, usize) {
+        let mut outside = 0;
+        let mut inside = 0;
+        for y in 0..height {
+            for x in 0..width {
+                let expected = if diagnostic_pixel_is_inside_repairs(repairs, x, y) {
+                    diagnostic_pixel(full_reference, width, height, x, y)
+                } else {
+                    diagnostic_pixel(previous, width, height, x, y)
+                };
+                let actual_pixel = diagnostic_pixel(actual, width, height, x, y);
+                let mismatch = actual_pixel
+                    .iter()
+                    .zip(expected)
+                    .any(|(actual, expected)| actual.abs_diff(expected) > tolerance);
+                if mismatch {
+                    if diagnostic_pixel_is_inside_repairs(repairs, x, y) {
+                        inside += 1;
+                    } else {
+                        outside += 1;
+                    }
+                }
+            }
+        }
+        (outside, inside)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn assert_diagnostic_matrix_pixels(
         actual: &[u8],
         previous: &[u8],
@@ -7238,6 +7455,572 @@ mod tests {
                 label,
             );
         }
+    }
+
+    #[test]
+    fn replay_partial_whole_graph_is_independent_of_poisoned_capture_contents() {
+        let output_bounds = EffectRect::new(0, 0, 512, 384).expect("diagnostic output bounds");
+        let target_rect = EffectRect::new(145, 148, 321, 181).expect("diagnostic target bounds");
+        let repair = OutputRect::new(292, 220, 5, 3);
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+
+        let render_poisoned_candidate = |poison: [f32; 4]| {
+            let mut candidate = GlesEffectTestHarness::new(512, 384);
+            install_diagnostic_scene(&mut candidate, target_rect, visual_group);
+            let graph = diagnostic_graph_with_spec(
+                target_rect,
+                visual_group,
+                &EffectRegion::empty(),
+                output_bounds,
+                4.0,
+                2,
+                0.5,
+            );
+            let full_plan =
+                diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, (512, 384));
+            execute_diagnostic_frame(
+                &mut candidate,
+                &graph,
+                &full_plan,
+                EffectRegion::from_rect(output_bounds),
+                true,
+                config,
+            );
+            let previous = read_diagnostic_pixels(&candidate);
+            assert!(
+                candidate
+                    .renderer
+                    .effect_resources
+                    .poison_cached_textures(&candidate.gl, poison)
+                    > 0,
+                "diagnostic candidate must reuse a pooled texture"
+            );
+
+            let partial_graph = &graph;
+            let partial_demand =
+                oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+                    partial_graph,
+                    &diagnostic_region(repair),
+                    false,
+                    false,
+                );
+            let partial_capture = partial_graph
+                .passes
+                .iter()
+                .find(|pass| pass.kind == oblivion_one::effects::RenderPassKind::SceneCapture)
+                .expect("partial diagnostic capture pass");
+            let partial_composite = partial_graph
+                .passes
+                .iter()
+                .find(|pass| pass.kind == oblivion_one::effects::RenderPassKind::Composite)
+                .expect("partial diagnostic composite pass");
+            assert!(
+                partial_demand
+                    .pass_output_region(partial_capture.id)
+                    .is_some()
+            );
+            assert!(
+                partial_demand
+                    .pass_output_region(partial_composite.id)
+                    .is_some()
+            );
+            let partial_plan =
+                diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, (512, 384));
+            execute_diagnostic_frame(
+                &mut candidate,
+                partial_graph,
+                &partial_plan,
+                diagnostic_region(repair),
+                false,
+                config,
+            );
+            (previous, read_diagnostic_pixels(&candidate))
+        };
+
+        let (previous_a, actual_a) = render_poisoned_candidate([1.0, 0.0, 1.0, 1.0]);
+        let (previous_b, actual_b) = render_poisoned_candidate([0.0, 1.0, 0.0, 1.0]);
+
+        let mut reference = GlesEffectTestHarness::new(512, 384);
+        install_diagnostic_scene(&mut reference, target_rect, visual_group);
+        let reference_graph = diagnostic_graph_with_spec(
+            target_rect,
+            visual_group,
+            &EffectRegion::from_rect(output_bounds),
+            output_bounds,
+            4.0,
+            2,
+            0.5,
+        );
+        execute_diagnostic_frame(
+            &mut reference,
+            &reference_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, (512, 384)),
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+        );
+        let full_reference = read_diagnostic_pixels(&reference);
+
+        assert_diagnostic_matrix_pixels(
+            &actual_a,
+            &previous_a,
+            &full_reference,
+            512,
+            384,
+            repair,
+            2,
+            "replay+partial poison A",
+        );
+        assert_diagnostic_matrix_pixels(
+            &actual_b,
+            &previous_b,
+            &full_reference,
+            512,
+            384,
+            repair,
+            2,
+            "replay+partial poison B",
+        );
+        for (index, (poison_a, poison_b)) in actual_a.iter().zip(&actual_b).enumerate() {
+            assert_eq!(
+                poison_a, poison_b,
+                "replay+partial output depends on pooled poison at byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_partial_whole_graph_with_linear_post_blur_sampling_is_poison_independent() {
+        let output_bounds = EffectRect::new(0, 0, 512, 384).expect("diagnostic output bounds");
+        let target_rect = EffectRect::new(145, 148, 321, 181).expect("diagnostic target bounds");
+        let repair = OutputRect::new(292, 220, 5, 3);
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+
+        let render_candidate = |poison: [f32; 4]| {
+            let mut candidate = GlesEffectTestHarness::new(512, 384);
+            install_diagnostic_scene(&mut candidate, target_rect, visual_group);
+            install_custom_linear_neighbor_shader(&mut candidate);
+            let graph = diagnostic_graph_with_linear_neighbor_stage(
+                target_rect,
+                visual_group,
+                &EffectRegion::empty(),
+                output_bounds,
+            );
+            execute_diagnostic_frame(
+                &mut candidate,
+                &graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, (512, 384)),
+                EffectRegion::from_rect(output_bounds),
+                true,
+                config,
+            );
+            let previous = read_diagnostic_pixels(&candidate);
+            assert!(
+                candidate
+                    .renderer
+                    .effect_resources
+                    .poison_cached_textures(&candidate.gl, poison)
+                    > 0,
+                "custom diagnostic candidate must reuse a pooled texture"
+            );
+            execute_diagnostic_frame(
+                &mut candidate,
+                &graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, (512, 384)),
+                diagnostic_region(repair),
+                false,
+                config,
+            );
+            (previous, read_diagnostic_pixels(&candidate))
+        };
+
+        let (previous_a, actual_a) = render_candidate([1.0, 0.0, 1.0, 1.0]);
+        let (previous_b, actual_b) = render_candidate([0.0, 1.0, 0.0, 1.0]);
+
+        let mut reference = GlesEffectTestHarness::new(512, 384);
+        install_diagnostic_scene(&mut reference, target_rect, visual_group);
+        install_custom_linear_neighbor_shader(&mut reference);
+        let reference_graph = diagnostic_graph_with_linear_neighbor_stage(
+            target_rect,
+            visual_group,
+            &EffectRegion::from_rect(output_bounds),
+            output_bounds,
+        );
+        execute_diagnostic_frame(
+            &mut reference,
+            &reference_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, (512, 384)),
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+        );
+        let full_reference = read_diagnostic_pixels(&reference);
+        let (outside_a, inside_a) = diagnostic_matrix_mismatch_counts(
+            &actual_a,
+            &previous_a,
+            &full_reference,
+            512,
+            384,
+            &[repair],
+            2,
+        );
+        let (outside_b, inside_b) = diagnostic_matrix_mismatch_counts(
+            &actual_b,
+            &previous_b,
+            &full_reference,
+            512,
+            384,
+            &[repair],
+            2,
+        );
+        assert_eq!(
+            outside_a, 0,
+            "linear post-blur poison A changed outside repair"
+        );
+        assert_eq!(
+            inside_a, 0,
+            "linear post-blur poison A differs from reference"
+        );
+        assert_eq!(
+            outside_b, 0,
+            "linear post-blur poison B changed outside repair"
+        );
+        assert_eq!(
+            inside_b, 0,
+            "linear post-blur poison B differs from reference"
+        );
+        assert_eq!(
+            actual_a, actual_b,
+            "linear post-blur output depends on poison"
+        );
+    }
+
+    #[test]
+    fn replay_partial_poison_sweep_finds_no_uninitialized_capture_samples() {
+        let cases = [
+            (
+                (128, 96),
+                EffectRect::new(24, 20, 80, 56).unwrap(),
+                OutputRect::new(60, 44, 4, 4),
+                1,
+                1.0,
+            ),
+            (
+                (256, 192),
+                EffectRect::new(97, 61, 121, 87).unwrap(),
+                OutputRect::new(151, 103, 5, 3),
+                2,
+                0.5,
+            ),
+            (
+                (512, 384),
+                EffectRect::new(145, 148, 321, 181).unwrap(),
+                OutputRect::new(292, 220, 5, 3),
+                3,
+                0.75,
+            ),
+            (
+                (1920, 1080),
+                EffectRect::new(145, 148, 1112, 873).unwrap(),
+                OutputRect::new(647, 901, 12, 10),
+                2,
+                0.5,
+            ),
+            (
+                (512, 384),
+                EffectRect::new(0, 0, 512, 384).unwrap(),
+                OutputRect::new(257, 193, 3, 3),
+                4,
+                0.5,
+            ),
+            (
+                (513, 385),
+                EffectRect::new(17, 19, 479, 347).unwrap(),
+                OutputRect::new(256, 192, 3, 3),
+                4,
+                0.0625,
+            ),
+            (
+                (511, 383),
+                EffectRect::new(3, 5, 503, 371).unwrap(),
+                OutputRect::new(253, 191, 5, 3),
+                3,
+                0.9375,
+            ),
+        ];
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+
+        for (output_size, target_rect, repair, passes, scale) in cases {
+            let output_bounds = EffectRect::new(0, 0, output_size.0, output_size.1)
+                .expect("diagnostic output bounds");
+            let mut outputs = Vec::new();
+            for poison in [[1.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0]] {
+                let mut candidate = GlesEffectTestHarness::new(output_size.0, output_size.1);
+                install_diagnostic_scene(&mut candidate, target_rect, visual_group);
+                let graph = diagnostic_graph_with_spec(
+                    target_rect,
+                    visual_group,
+                    &EffectRegion::empty(),
+                    output_bounds,
+                    4.0,
+                    passes,
+                    scale,
+                );
+                execute_diagnostic_frame(
+                    &mut candidate,
+                    &graph,
+                    &diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, output_size),
+                    EffectRegion::from_rect(output_bounds),
+                    true,
+                    config,
+                );
+                let previous = read_diagnostic_pixels(&candidate);
+                assert!(
+                    candidate
+                        .renderer
+                        .effect_resources
+                        .poison_cached_textures(&candidate.gl, poison)
+                        > 0,
+                    "poison sweep candidate must reuse a pooled texture"
+                );
+                execute_diagnostic_frame(
+                    &mut candidate,
+                    &graph,
+                    &diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, output_size),
+                    diagnostic_region(repair),
+                    false,
+                    config,
+                );
+                let actual = read_diagnostic_pixels(&candidate);
+                let (outside, inside) = diagnostic_matrix_mismatch_counts(
+                    &actual,
+                    &previous,
+                    &previous,
+                    output_size.0,
+                    output_size.1,
+                    &[repair],
+                    2,
+                );
+                assert_eq!(
+                    outside, 0,
+                    "poison sweep changed outside repair for size={output_size:?} target={target_rect:?} passes={passes} scale={scale}"
+                );
+                assert_eq!(
+                    inside, 0,
+                    "poison sweep changed repair for size={output_size:?} target={target_rect:?} passes={passes} scale={scale}"
+                );
+                outputs.push(actual);
+            }
+            assert_eq!(
+                outputs[0], outputs[1],
+                "poison sweep output depends on pooled contents for size={output_size:?} target={target_rect:?} passes={passes} scale={scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_partial_capture_materialization_localization_matrix() {
+        let output_bounds = EffectRect::new(0, 0, 512, 384).expect("diagnostic output bounds");
+        let target_rect = EffectRect::new(180, 130, 100, 80).expect("diagnostic target bounds");
+        let repairs = [
+            OutputRect::new(208, 150, 4, 4),
+            OutputRect::new(248, 190, 4, 4),
+        ];
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+
+        let mut reference = GlesEffectTestHarness::new(512, 384);
+        install_diagnostic_scene(&mut reference, target_rect, visual_group);
+        let reference_graph = diagnostic_graph(
+            target_rect,
+            visual_group,
+            &EffectRegion::from_rect(output_bounds),
+            output_bounds,
+        );
+        execute_diagnostic_frame(
+            &mut reference,
+            &reference_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&repairs, true, (512, 384)),
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+        );
+        let full_reference = read_diagnostic_pixels(&reference);
+        drop(reference);
+
+        let policies = [
+            ("Exact", effects::SceneCaptureMaterializationPolicy::Exact),
+            (
+                "BoundingBox",
+                effects::SceneCaptureMaterializationPolicy::BoundingBox,
+            ),
+            (
+                "FullDomain",
+                effects::SceneCaptureMaterializationPolicy::FullDomain,
+            ),
+        ];
+        let mut outcomes = Vec::with_capacity(policies.len());
+        for (label, policy) in policies {
+            let mut candidate = GlesEffectTestHarness::new(512, 384);
+            install_diagnostic_scene(&mut candidate, target_rect, visual_group);
+            let full_graph = diagnostic_graph(
+                target_rect,
+                visual_group,
+                &EffectRegion::empty(),
+                output_bounds,
+            );
+            execute_diagnostic_frame(
+                &mut candidate,
+                &full_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&repairs, true, (512, 384)),
+                EffectRegion::from_rect(output_bounds),
+                true,
+                config,
+            );
+            let previous = read_diagnostic_pixels(&candidate);
+            assert!(
+                candidate
+                    .renderer
+                    .effect_resources
+                    .poison_cached_textures(&candidate.gl, [1.0, 0.0, 1.0, 1.0])
+                    > 0,
+                "localization candidate must reuse a pooled texture"
+            );
+
+            let partial_graph = &full_graph;
+            execute_diagnostic_frame_with_capture_materialization(
+                &mut candidate,
+                partial_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&repairs, false, (512, 384)),
+                diagnostic_region_for_repairs(&repairs),
+                false,
+                config,
+                policy,
+            );
+            let actual = read_diagnostic_pixels(&candidate);
+            let (outside, inside) = diagnostic_matrix_mismatch_counts(
+                &actual,
+                &previous,
+                &full_reference,
+                512,
+                384,
+                &repairs,
+                2,
+            );
+            outcomes.push((label, outside, inside));
+        }
+        assert_eq!(
+            outcomes,
+            vec![("Exact", 0, 0), ("BoundingBox", 0, 0), ("FullDomain", 0, 0)],
+            "capture materialization localization result; the current fixture does not reproduce a validity mismatch"
+        );
+    }
+
+    #[test]
+    fn replay_partial_translated_capture_domain_reuses_pool_without_stale_content() {
+        let output_bounds = EffectRect::new(0, 0, 256, 192).expect("diagnostic output bounds");
+        let rect_a = EffectRect::new(96, 72, 64, 48).expect("first blur bounds");
+        let rect_b = EffectRect::new(112, 80, 64, 48).expect("translated blur bounds");
+        let repairs = [
+            OutputRect::new(rect_a.x, rect_a.y, rect_a.width, rect_a.height),
+            OutputRect::new(rect_b.x, rect_b.y, rect_b.width, rect_b.height),
+        ];
+        let visual_group = VisualGroupId::new(9).expect("diagnostic visual group");
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+
+        let mut candidate = GlesEffectTestHarness::new(256, 192);
+        install_diagnostic_scene(&mut candidate, rect_a, visual_group);
+        let graph_a = diagnostic_graph(rect_a, visual_group, &EffectRegion::empty(), output_bounds);
+        execute_diagnostic_frame(
+            &mut candidate,
+            &graph_a,
+            &diagnostic_repaint_plan_for_repairs_in_size(&repairs, true, (256, 192)),
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+        );
+        let previous = read_diagnostic_pixels(&candidate);
+
+        install_diagnostic_scene(&mut candidate, rect_b, visual_group);
+        let graph_b = diagnostic_graph(rect_b, visual_group, &EffectRegion::empty(), output_bounds);
+        let capture_a = graph_a
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+            .expect("first capture texture");
+        let capture_b = graph_b
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+            .expect("translated capture texture");
+        assert_ne!(capture_a.domain, capture_b.domain);
+        assert_eq!(
+            (capture_a.width, capture_a.height),
+            (capture_b.width, capture_b.height)
+        );
+        assert!(
+            candidate
+                .renderer
+                .effect_resources
+                .poison_cached_textures(&candidate.gl, [0.0, 1.0, 1.0, 1.0])
+                > 0,
+            "translated candidate must reuse a pooled texture"
+        );
+
+        execute_diagnostic_frame(
+            &mut candidate,
+            &graph_b,
+            &diagnostic_repaint_plan_for_repairs_in_size(&repairs, false, (256, 192)),
+            diagnostic_region_for_repairs(&repairs),
+            false,
+            config,
+        );
+        let actual = read_diagnostic_pixels(&candidate);
+        drop(candidate);
+
+        let mut reference = GlesEffectTestHarness::new(256, 192);
+        install_diagnostic_scene(&mut reference, rect_b, visual_group);
+        execute_diagnostic_frame(
+            &mut reference,
+            &graph_b,
+            &diagnostic_repaint_plan_for_repairs_in_size(&repairs, true, (256, 192)),
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+        );
+        let full_reference = read_diagnostic_pixels(&reference);
+        let (outside, inside) = diagnostic_matrix_mismatch_counts(
+            &actual,
+            &previous,
+            &full_reference,
+            256,
+            192,
+            &repairs,
+            2,
+        );
+        assert_eq!(
+            outside, 0,
+            "translated replay changed pixels outside repair"
+        );
+        assert_eq!(inside, 0, "translated replay differs from full reference");
     }
 
     #[test]

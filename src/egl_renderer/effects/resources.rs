@@ -597,6 +597,33 @@ impl EffectGlResourceCache {
         }
         self.pool.cleanup_size_history();
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_cached_textures(&mut self, gl: &glow::Context, color: [f32; 4]) -> usize {
+        let cached = self
+            .pool
+            .textures
+            .values()
+            .flatten()
+            .filter(|texture| !texture.checked_out)
+            .cloned()
+            .collect::<Vec<_>>();
+        let cached_count = cached.len();
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.clear_color(color[0], color[1], color[2], color[3]);
+        }
+        for texture in cached {
+            self.bind_render_target(gl, &texture)
+                .expect("cached effect texture is a valid poison target");
+            unsafe {
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        }
+        self.unbind_render_target(gl);
+        cached_count
+    }
 }
 
 fn texture_key(texture: &GraphTexturePlan) -> EffectTextureKey {

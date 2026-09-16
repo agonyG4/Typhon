@@ -1058,7 +1058,12 @@ fn map_region_to_input_texture(
     Some(result)
 }
 
-fn required_input_region(
+/// Returns the current logical input region needed to rasterize a pass output
+/// region. The result is expressed in the input texture's logical domain and
+/// includes the implemented shader sampling footprint and linear-filter
+/// support. Executors use this same calculation when checking producer
+/// validity before a pass samples an input.
+pub fn required_input_region(
     pass: &CompiledRenderPass,
     demanded_output: &EffectRegion,
     output: &GraphTexturePlan,
@@ -1079,6 +1084,77 @@ fn required_input_region(
         logical_mapping,
         linear_filter_support,
     )
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct EffectDependencyCoverage {
+    consumer_pass: GraphPassId,
+    producer_pass: GraphPassId,
+    required_input: EffectRegion,
+    produced_output: EffectRegion,
+}
+
+#[cfg(test)]
+fn debug_effect_dependency_coverage(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+) -> Vec<EffectDependencyCoverage> {
+    let producers = texture_producers(graph);
+    let mut coverage = Vec::new();
+    for pass in &graph.passes {
+        let Some(demanded_output) = demand.pass_output_region(pass.id) else {
+            continue;
+        };
+        if demanded_output.is_empty() {
+            continue;
+        }
+        let Some(output_id) = pass.output else {
+            continue;
+        };
+        let Some(output) = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == output_id)
+        else {
+            continue;
+        };
+        for input_id in &pass.inputs {
+            let Some(input_index) = graph
+                .textures
+                .iter()
+                .position(|texture| texture.id == *input_id)
+            else {
+                continue;
+            };
+            let input = &graph.textures[input_index];
+            if matches!(input.source, GraphTextureSource::Static(_)) {
+                continue;
+            }
+            let Some(producer) = producers.get(input_index).copied() else {
+                continue;
+            };
+            let Some(producer_pass_index) = producer.pass_index else {
+                continue;
+            };
+            let Some(required_input) = required_input_region(pass, demanded_output, output, input)
+            else {
+                continue;
+            };
+            let producer_pass = &graph.passes[producer_pass_index];
+            let produced_output = demand
+                .pass_output_region(producer_pass.id)
+                .cloned()
+                .unwrap_or_else(EffectRegion::empty);
+            coverage.push(EffectDependencyCoverage {
+                consumer_pass: pass.id,
+                producer_pass: producer_pass.id,
+                required_input,
+                produced_output,
+            });
+        }
+    }
+    coverage
 }
 
 fn full_region_is_demanded(region: &EffectRegion, domain: EffectRect) -> bool {
@@ -4996,6 +5072,128 @@ mod tests {
             &EffectRegion::from_rect(composite_output.domain),
             "full internal Kawase must not broaden final visible demand"
         );
+    }
+
+    #[test]
+    fn partial_kawase_dependency_coverage_reports_every_graph_edge() {
+        let (scene, registry) = blur_scene();
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &EffectRegion::empty(), output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("visible blur must compile to an effect graph");
+        };
+        let mut repair = EffectRegion::from_rect(EffectRect::new(220, 140, 12, 10).unwrap());
+        repair.push(EffectRect::new(350, 200, 8, 9).unwrap());
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+        let coverage = debug_effect_dependency_coverage(&graph, &demand);
+
+        assert!(
+            coverage.len() >= 4,
+            "complete Kawase graph coverage is inspected"
+        );
+        for edge in coverage {
+            let missing = edge.required_input.subtract(&edge.produced_output);
+            assert!(
+                missing.is_empty(),
+                "consumer pass {} samples {:?} from producer pass {}, but only {:?} is proven produced",
+                edge.consumer_pass.get(),
+                missing,
+                edge.producer_pass.get(),
+                edge.produced_output,
+            );
+        }
+    }
+
+    #[test]
+    fn partial_kawase_dependency_coverage_matches_gles_sampling_oracle() {
+        for (visible, scale, output_bounds, repair) in [
+            (
+                EffectRect::new(180, 130, 100, 80).unwrap(),
+                1.0,
+                EffectRect::new(0, 0, 512, 384).unwrap(),
+                EffectRegion::from_rect(EffectRect::new(228, 168, 4, 4).unwrap()),
+            ),
+            (
+                EffectRect::new(145, 148, 321, 181).unwrap(),
+                0.5,
+                EffectRect::new(0, 0, 1920, 1080).unwrap(),
+                EffectRegion::from_rect(EffectRect::new(647, 901, 12, 10).unwrap()),
+            ),
+        ] {
+            let (scene, registry) =
+                blur_scene_with_region_and_scale(EffectRegion::from_rect(visible), scale);
+            let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+                &scene,
+                &EffectRegion::empty(),
+                output_bounds,
+                &registry,
+            )
+            .unwrap() else {
+                panic!("visible blur must compile to an effect graph");
+            };
+            let demand = plan_effect_execution_demand(&graph, &repair, false);
+            for edge in debug_effect_dependency_coverage(&graph, &demand) {
+                let consumer = graph
+                    .passes
+                    .iter()
+                    .find(|pass| pass.id == edge.consumer_pass)
+                    .expect("coverage consumer pass");
+                let output_id = consumer.output.expect("coverage consumer output");
+                let output = graph
+                    .textures
+                    .iter()
+                    .find(|texture| texture.id == output_id)
+                    .expect("coverage consumer texture");
+                let input_id = consumer.inputs[0];
+                let input = graph
+                    .textures
+                    .iter()
+                    .find(|texture| texture.id == input_id)
+                    .expect("coverage input texture");
+                let demand_region = demand
+                    .pass_output_region(consumer.id)
+                    .expect("coverage consumer demand");
+                let (radius_x, radius_y, logical_mapping) = match consumer.kind {
+                    RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample => {
+                        let radius = f64::from(consumer.blur_radius.expect("Kawase radius"));
+                        (radius, radius, false)
+                    }
+                    RenderPassKind::Composite | RenderPassKind::OutputPostProcess => {
+                        (0.0, 0.0, true)
+                    }
+                    _ => continue,
+                };
+                for demanded in demand_region.rects() {
+                    let output_coverage = logical_rect_to_physical_coverage(*demanded, output)
+                        .expect("consumer demand rasterizes");
+                    let sampled = reference_sampled_texels(
+                        consumer.kind,
+                        output_coverage,
+                        output,
+                        input,
+                        radius_x,
+                        radius_y,
+                        logical_mapping,
+                        true,
+                    );
+                    for (x, y) in sampled {
+                        assert!(
+                            physical_region_contains(&edge.produced_output, input, x, y),
+                            "GLES {:?} edge {} -> {} samples unproduced physical texel ({x},{y}); required={:?}, produced={:?}, output={:?}, input={:?}",
+                            consumer.kind,
+                            edge.producer_pass.get(),
+                            edge.consumer_pass.get(),
+                            edge.required_input,
+                            edge.produced_output,
+                            output,
+                            input,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -470,6 +470,29 @@ impl EffectExecutionTrace {
         });
     }
 
+    pub(crate) fn capture_materialization(
+        &self,
+        pass: &CompiledRenderPass,
+        logical_rect_count: usize,
+        logical_bounding_box: Option<(i32, i32, u32, u32)>,
+        physical_rect_count: usize,
+        physical_pixels: u64,
+    ) {
+        self.event(|| {
+            let bbox = logical_bounding_box.map_or_else(
+                || "none".to_owned(),
+                |(x, y, width, height)| format!("{x},{y},{width},{height}"),
+            );
+            format!(
+                "event=effect_capture_materialization frame_id={} instance={} pass={} kind={} logical_rects={logical_rect_count} logical_bbox={bbox} physical_rects={physical_rect_count} physical_pixels={physical_pixels}",
+                optional_u64(self.frame_id),
+                pass.instance.get(),
+                pass.id.get(),
+                render_pass_kind_name(pass.kind),
+            )
+        });
+    }
+
     pub(crate) fn pass_boundary(
         &self,
         boundary: &'static str,
@@ -868,5 +891,45 @@ mod tests {
         assert!(line.contains("duplicate_rects_removed=1"));
         assert!(line.contains("overlap_fragments_generated=4"));
         assert!(line.contains("fallback=work_region_bbox_coalesce"));
+    }
+
+    #[test]
+    fn capture_materialization_trace_reports_logical_and_physical_work() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let pass = CompiledRenderPass {
+            id: oblivion_one::effects::GraphPassId::new(11).unwrap(),
+            kind: RenderPassKind::SceneCapture,
+            inputs: Vec::new(),
+            output: Some(GraphTextureId::new(12).unwrap()),
+            damage: EffectRegion::empty(),
+            instance: EffectInstanceId::new(6).unwrap(),
+            anchor: EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
+        };
+
+        clear_test_events();
+        trace.capture_materialization(&pass, 2, Some((10, 20, 40, 30)), 2, 1_200);
+        let line = take_test_events()
+            .pop()
+            .expect("capture materialization trace event");
+
+        assert!(line.contains("event=effect_capture_materialization"));
+        assert!(line.contains("instance=6"));
+        assert!(line.contains("pass=11"));
+        assert!(line.contains("kind=SceneCapture"));
+        assert!(line.contains("logical_rects=2"));
+        assert!(line.contains("logical_bbox=10,20,40,30"));
+        assert!(line.contains("physical_rects=2"));
+        assert!(line.contains("physical_pixels=1200"));
     }
 }
