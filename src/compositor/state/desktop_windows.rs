@@ -225,6 +225,12 @@ impl CompositorState {
         &mut self,
         id: WindowId,
     ) -> Option<DesktopWindow> {
+        if self
+            .pending_x11_activation
+            .is_some_and(|pending| pending.window_id == id)
+        {
+            self.pending_x11_activation = None;
+        }
         self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window = self.desktop_windows.remove(&id)?;
@@ -1509,6 +1515,7 @@ impl CompositorState {
                 window, ..
             }
             | crate::compositor::window_backend::WindowBackendCommand::Close { window }
+            | crate::compositor::window_backend::WindowBackendCommand::Map { window }
             | crate::compositor::window_backend::WindowBackendCommand::SetActivated { window, .. }
             | crate::compositor::window_backend::WindowBackendCommand::Restack { window }
             | crate::compositor::window_backend::WindowBackendCommand::PublishState { window, .. }

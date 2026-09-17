@@ -3,8 +3,9 @@ use super::support::frame_buffer_client::create_test_buffered_toplevel;
 use super::support::locked_relative::{runtime_socket_path, unique_socket_name};
 use super::support::registry_state::RegistryTestState;
 use super::support::server_runtime::{
-    ServerCommand, capture_lifecycle_effect_path, capture_minimize_anchor,
-    capture_resolved_effect_scene, create_test_shm_file, spawn_controllable_test_server,
+    ServerCommand, apply_xwayland_association_event, capture_lifecycle_effect_path,
+    capture_minimize_anchor, capture_resolved_effect_scene, capture_window_id_for_surface,
+    capture_x11_window_state, create_test_shm_file, spawn_controllable_test_server,
     spawn_test_server, stop_controllable_test_server, stop_test_server, wait_for_server_commands,
 };
 use super::support::window_ops::create_buffered_toplevel_then_window_commands;
@@ -14,7 +15,8 @@ use crate::astrea_toplevel_management::client::{
     astrea_toplevel_v1 as client_astrea_toplevel_v1,
 };
 use crate::xwayland::xwm::{
-    X11Geometry, X11PublishedState, X11WindowSnapshot, X11WindowTypes, XwmCommand, XwmEvent,
+    X11Geometry, X11PublishedState, X11WindowSnapshot, X11WindowTypes, XwmAssociationEvent,
+    XwmCommand, XwmEvent,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 use std::collections::HashMap;
@@ -1052,6 +1054,8 @@ fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
         })
         .unwrap();
     ready_receiver.recv().unwrap();
+    let window_id = capture_window_id_for_surface(&commands, surface_id)
+        .expect("managed X11 window should have a stable WindowId");
 
     let manager_connection =
         Connection::from_socket(UnixStream::connect(runtime_socket_path(&socket_name)).unwrap())
@@ -1076,15 +1080,66 @@ fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
     assert_eq!(state.toplevels.values().next().unwrap().kind, Some(1));
 
     let handle = state.handles[0].clone();
+    let handle_id = handle.id();
+    let identifier = state.toplevels.get(&handle_id).unwrap().identifier.clone();
+    let app_id = state.toplevels.get(&handle_id).unwrap().app_id.clone();
     handle.activate(0, 1);
     manager_connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     handle.minimize(0, 2);
     manager_connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    apply_xwayland_association_event(
+        &commands,
+        XwmAssociationEvent::Removed {
+            generation,
+            window: x11_handle,
+            surface_id,
+        },
+    );
+    manager_connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_x11_window_state(&commands, window_id),
+        Some((None, true))
+    );
+    assert_eq!(state.handles.len(), 1);
+    assert_eq!(
+        state
+            .events
+            .iter()
+            .filter(|event| **event == "toplevel")
+            .count(),
+        1
+    );
+    let toplevel = state.toplevels.get(&handle_id).unwrap();
+    assert!(!toplevel.closed);
+    assert_eq!(toplevel.identifier, identifier);
+    assert_eq!(toplevel.app_id, app_id);
+    assert_eq!(toplevel.kind, Some(1));
+    assert!(toplevel.state.unwrap_or_default() & 2 != 0);
     handle.restore(0, 3);
     manager_connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    let restored = state.toplevels.get(&handle_id).unwrap();
+    assert!(!restored.closed);
+    assert_eq!(restored.identifier, identifier);
+    assert_eq!(restored.app_id, app_id);
+    assert!(restored.state.unwrap_or_default() & 2 == 0);
+    let (restore_backend_reply, restore_backend_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureXwaylandBackendCommands(
+            restore_backend_reply,
+        ))
+        .unwrap();
+    assert!(
+        restore_backend_receiver
+            .recv()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, XwmCommand::Map(window) if *window == x11_handle)),
+        "associationless X11 restore must request an X11 remap"
+    );
     handle.close(0, 4);
     manager_connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
@@ -1093,7 +1148,6 @@ fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
         state.action_dones,
         [(0, 1, 0, 1), (0, 2, 1, 0), (0, 3, 2, 0), (0, 4, 3, 0)]
     );
-    assert!(!state.toplevels.values().next().unwrap().closed);
     let (backend_reply, backend_receiver) = mpsc::channel();
     commands
         .send(ServerCommand::CaptureXwaylandBackendCommands(backend_reply))
@@ -1105,6 +1159,20 @@ fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
             .iter()
             .any(|command| matches!(command, XwmCommand::Close(window) if *window == x11_handle))
     );
+
+    let (withdraw_reply, withdraw_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::ApplyXwaylandWindowEvent {
+            event: Box::new(XwmEvent::WindowWithdrawn(x11_handle)),
+            reply: withdraw_reply,
+        })
+        .unwrap();
+    withdraw_receiver.recv().unwrap();
+    manager_connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.handles.len(), 1);
+    assert!(state.toplevels.values().next().unwrap().closed);
+    assert_eq!(state.manager_dones.last().unwrap().2, 0);
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }

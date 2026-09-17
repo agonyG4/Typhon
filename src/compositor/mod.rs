@@ -761,6 +761,7 @@ pub struct CompositorState {
     pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
     pub(in crate::compositor) next_window_id: u64,
+    pub(in crate::compositor) pending_x11_activation: Option<PendingX11Activation>,
     pub(in crate::compositor) workspace_manager: WorkspaceManager,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
@@ -936,6 +937,12 @@ pub struct CompositorState {
     compliance_metrics: CoreComplianceMetrics,
     protocol_error_trace: ProtocolErrorTrace,
     surface_pipeline_trace: SurfacePipelineTrace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct PendingX11Activation {
+    pub(in crate::compositor) window_id: WindowId,
+    pub(in crate::compositor) handle: X11WindowHandle,
 }
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

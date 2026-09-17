@@ -315,8 +315,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
         event: Box<crate::xwayland::xwm::XwmEvent>,
         reply: Sender<Vec<crate::xwayland::xwm::XwmCommand>>,
     },
+    ApplyXwaylandAssociationEvent(crate::xwayland::xwm::XwmAssociationEvent),
     CaptureXwaylandAssociationEvents(Sender<Vec<crate::xwayland::XwaylandAssociationEvent>>),
     CaptureXwaylandBackendCommands(Sender<Vec<crate::xwayland::xwm::XwmCommand>>),
+    CaptureX11WindowState {
+        window_id: WindowId,
+        reply: Sender<Option<(Option<u32>, bool)>>,
+    },
     AuthorizeAstreaShellPid(u32),
     ClearAstreaShellAuthorization,
     EmitAstreaShortcut {
@@ -1469,11 +1474,21 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::ApplyXwaylandWindowEvent { event, reply } => {
                         let _ = reply.send(server.apply_xwayland_window_event(*event));
                     }
+                    ServerCommand::ApplyXwaylandAssociationEvent(event) => {
+                        server.apply_xwayland_association_event(event);
+                    }
                     ServerCommand::CaptureXwaylandAssociationEvents(reply) => {
                         let _ = reply.send(server.take_xwayland_association_events());
                     }
                     ServerCommand::CaptureXwaylandBackendCommands(reply) => {
                         let _ = reply.send(server.take_xwayland_backend_commands(0));
+                    }
+                    ServerCommand::CaptureX11WindowState { window_id, reply } => {
+                        let state = server
+                            .state
+                            .window(window_id)
+                            .map(|window| (window.x11_surface_id, window.state.is_minimized()));
+                        let _ = reply.send(state);
                     }
                     ServerCommand::AuthorizeAstreaShellPid(pid) => {
                         server.authorize_astrea_shell_pid(pid);
@@ -2040,6 +2055,29 @@ pub(in crate::compositor::tests) fn capture_window_id_for_surface(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report window for surface")
+}
+
+pub(in crate::compositor::tests) fn apply_xwayland_association_event(
+    commands: &Sender<ServerCommand>,
+    event: crate::xwayland::xwm::XwmAssociationEvent,
+) {
+    commands
+        .send(ServerCommand::ApplyXwaylandAssociationEvent(event))
+        .unwrap();
+    wait_for_server_commands(commands);
+}
+
+pub(in crate::compositor::tests) fn capture_x11_window_state(
+    commands: &Sender<ServerCommand>,
+    window_id: WindowId,
+) -> Option<(Option<u32>, bool)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureX11WindowState { window_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report X11 window state")
 }
 
 pub(in crate::compositor::tests) fn capture_window_management(

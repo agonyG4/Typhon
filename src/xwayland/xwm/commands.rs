@@ -14,8 +14,8 @@ use x11rb::{
 };
 
 use super::{
-    ConfigureSource, X11ConfigureFlags, X11Geometry, X11PublishedState, X11StackMode, Xwm,
-    XwmCommand, XwmError, XwmEvent,
+    ConfigureSource, X11ConfigureFlags, X11Geometry, X11PublishedState, X11StackMode,
+    X11WindowLifecycle, Xwm, XwmCommand, XwmError, XwmEvent,
     atoms::XwmAtomName,
     ewmh::publishable_state,
     focus::{FocusModel, FocusRepair, FocusTransitionId, focus_model, should_send_take_focus},
@@ -219,6 +219,15 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
 
     match command {
         XwmCommand::Map(handle) => {
+            if xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.lifecycle == X11WindowLifecycle::Iconic)
+            {
+                xwm.windows
+                    .mark_map_requested(handle)
+                    .map_err(XwmError::InvalidCommand)?;
+            }
             if !xwm
                 .windows
                 .map_command_is_new(handle)

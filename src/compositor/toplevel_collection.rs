@@ -90,12 +90,7 @@ impl CompositorState {
                     Some(X11DesktopRole::Dialog) => AstreaToplevelKind::X11Dialog,
                     _ => return None,
                 };
-                (window.kind == DesktopWindowKind::Managed
-                    && window
-                        .x11_surface_id
-                        .and_then(|surface_id| self.surface_resource_by_id(surface_id))
-                        .is_some())
-                .then_some(kind)
+                (window.kind == DesktopWindowKind::Managed).then_some(kind)
             }
         }
     }

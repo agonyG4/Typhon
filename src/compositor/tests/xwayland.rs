@@ -445,14 +445,14 @@ fn astrea_occupancy_uses_only_eligible_live_x11_roles() {
             .server
             .state
             .astrea_toplevel_kind_if_eligible(window_id),
-        None
+        Some(crate::compositor::AstreaToplevelKind::X11Toplevel)
     );
     assert!(
         fixture
             .server
             .state
             .regular_workspace_occupancy()
-            .is_empty()
+            .contains(&crate::wm::WorkspaceId::new(1).unwrap())
     );
 }
 
@@ -1040,6 +1040,122 @@ fn destroying_xwayland_surface_preserves_x11_window_identity() {
 }
 
 #[test]
+fn activating_associationless_iconic_x11_window_requests_remap_and_cancels_on_removal() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let _ = fixture.server.state.take_backend_commands();
+
+    fixture
+        .server
+        .state
+        .unregister_surface_resource(fixture.surface_id);
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .and_then(|window| window.x11_surface_id),
+        None
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .activate_desktop_window_action(window_id),
+        crate::compositor::state::WindowActionOutcome::Changed
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .take_backend_commands()
+            .into_iter()
+            .any(|command| matches!(
+                command,
+                crate::compositor::window_backend::WindowBackendCommand::Map { window }
+                    if window == window_id
+            ))
+    );
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+
+    fixture
+        .server
+        .state
+        .remove_desktop_window(window_id)
+        .expect("withdrawn X11 window");
+    assert!(fixture.server.state.pending_x11_activation.is_none());
+}
+
+#[test]
+fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let _ = fixture.server.state.take_backend_commands();
+    fixture
+        .server
+        .state
+        .unregister_surface_resource(fixture.parent_surface_id);
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .activate_desktop_window_action(window_id),
+        crate::compositor::state::WindowActionOutcome::Changed
+    );
+    let _ = fixture.server.state.take_backend_commands();
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.popup_surface_id,
+        });
+
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .and_then(|window| window.x11_surface_id),
+        Some(fixture.popup_surface_id)
+    );
+    assert!(fixture.server.state.pending_x11_activation.is_none());
+    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+}
+
+#[test]
 fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
     let mut fixture = stationary_pointer_xwayland_fixture();
     let mut snapshot = fake_snapshot();
@@ -1055,6 +1171,25 @@ fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
         .state
         .window_id_for_x11_handle(handle)
         .expect("admitted X11 window");
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Removed {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.parent_surface_id,
+        });
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .astrea_toplevel_kind_if_eligible(window_id),
+        Some(crate::compositor::AstreaToplevelKind::X11Toplevel)
+    );
 
     fixture
         .server

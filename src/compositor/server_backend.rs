@@ -200,6 +200,13 @@ impl OwnCompositorServer {
                     };
                     Some(XwmCommand::Close(handle))
                 }
+                crate::compositor::window_backend::WindowBackendCommand::Map { window } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::Map(handle))
+                }
                 crate::compositor::window_backend::WindowBackendCommand::SetActivated {
                     window,
                     activated,

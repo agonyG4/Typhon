@@ -91,12 +91,28 @@ impl CompositorState {
         if window.kind != DesktopWindowKind::Managed || !window.is_normal_x11_role() {
             return WindowActivationOutcome::Unavailable;
         }
+        let backend = window.backend;
+        let was_minimized = window.state.is_minimized();
         let root_surface_id = window.root_surface_id;
-        if self.surface_resource_by_id(root_surface_id).is_none() {
+        if matches!(backend, WindowBackend::Xdg(_))
+            && self.surface_resource_by_id(root_surface_id).is_none()
+        {
             return WindowActivationOutcome::Unavailable;
         }
-        let was_minimized = window.state.is_minimized();
         if was_minimized && !self.restore_minimized_desktop_window_contents(window_id) {
+            return WindowActivationOutcome::Unavailable;
+        }
+        let root_surface_id = self
+            .window(window_id)
+            .map(|window| window.root_surface_id)
+            .unwrap_or(root_surface_id);
+        if self.surface_resource_by_id(root_surface_id).is_none() {
+            if let WindowBackend::X11(handle) = backend
+                && was_minimized
+            {
+                self.pending_x11_activation = Some(PendingX11Activation { window_id, handle });
+                return WindowActivationOutcome::Changed;
+            }
             return WindowActivationOutcome::Unavailable;
         }
         let focus_outcome = self.focus_desktop_window(window_id, reason);
@@ -1405,6 +1421,12 @@ impl CompositorState {
         self.refresh_active_scene_surface_order();
         if let Some(surface_id) = x11_surface_id {
             let _ = self.adopt_current_xwayland_surface_content(surface_id);
+        } else if let Some(window) = self.window(window_id)
+            && matches!(window.backend, WindowBackend::X11(_))
+        {
+            self.backend_commands.push(
+                crate::compositor::window_backend::WindowBackendCommand::Map { window: window_id },
+            );
         }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);
@@ -1501,6 +1523,27 @@ impl CompositorState {
             lifecycle_decorations,
         );
         true
+    }
+
+    pub(in crate::compositor) fn complete_pending_x11_activation(
+        &mut self,
+        handle: X11WindowHandle,
+    ) {
+        let Some(pending) = self.pending_x11_activation else {
+            return;
+        };
+        if pending.handle != handle {
+            return;
+        }
+        if self.window_id_for_x11_handle(handle) != Some(pending.window_id) {
+            self.pending_x11_activation = None;
+            return;
+        }
+        if self.activate_desktop_window(pending.window_id, WindowFocusReason::ShellActivation)
+            != WindowActivationOutcome::Unavailable
+        {
+            self.pending_x11_activation = None;
+        }
     }
 
     pub(in crate::compositor) fn toggle_root_window_mode(

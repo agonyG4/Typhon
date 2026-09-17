@@ -135,6 +135,7 @@ impl OwnCompositorServer {
                 {
                     self.state.focus_surface(surface);
                 }
+                self.state.complete_pending_x11_activation(window);
                 self.state.refresh_pointer_focus_at_last_position();
             }
             XwmAssociationEvent::Removed {
