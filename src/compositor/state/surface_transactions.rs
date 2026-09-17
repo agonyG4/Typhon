@@ -189,7 +189,7 @@ impl PendingSurfaceTreeTransaction {
         if self
             .nodes
             .iter()
-            .any(|(_, commit)| commit.pacing.is_boundary())
+            .any(|(_, commit)| commit.pacing.is_boundary() || commit.lineage.merge_frozen)
         {
             TransactionOrdering::PacingProtected
         } else {
@@ -291,7 +291,7 @@ impl CompositorState {
             explicit_sync,
             offset,
             viewport_destination,
-            viewport_error_owner: _,
+            viewport_error_owner,
             buffer_scale,
             buffer_transform,
             opaque_region,
@@ -314,26 +314,50 @@ impl CompositorState {
         let Some(data) = surface.data::<SurfaceData>() else {
             return;
         };
+        let prospective_viewport = data.viewport_for_change(viewport_destination);
+        let prospective_buffer_scale = data.buffer_scale_for_change(buffer_scale);
+        let prospective_buffer_transform = data.buffer_transform_for_change(buffer_transform);
+        let effective_viewport_error_owner = if viewport_destination.source.is_some() {
+            viewport_error_owner.clone()
+        } else {
+            data.committed_viewport_error_owner()
+        };
+        let retained_mapping = if attachment.is_none() {
+            match self.current_surface_buffers.get(&surface_id) {
+                Some(current) => match current.content_mapping_for_state(
+                    prospective_viewport,
+                    prospective_buffer_scale,
+                    prospective_buffer_transform,
+                    offset,
+                ) {
+                    Ok(mapping) => Some(mapping),
+                    Err(error) => {
+                        debug_assert!(
+                            false,
+                            "SurfaceTree preflight admitted an invalid retained mapping: {error:?}"
+                        );
+                        self.post_surface_mapping_error(
+                            surface_id,
+                            error,
+                            effective_viewport_error_owner,
+                        );
+                        self.complete_frame_callbacks(frame_callbacks);
+                        self.discard_presentation_feedbacks(presentation_feedbacks);
+                        if let Some(resize_commit) = resize_commit {
+                            self.release_resize_capture(surface_id, resize_commit.commit_sequence);
+                        }
+                        return;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         data.apply_presentation(presentation);
-        let viewport = data.apply_viewport_change(viewport_destination);
-        let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
-        let committed_buffer_transform = data.apply_buffer_transform_change(buffer_transform);
-        // These values come from this exact cached Content Update. Applying
-        // them before capturing the retained mapping keeps delayed
-        // publication independent from newer pending protocol state.
-        let retained_mapping = self
-            .current_surface_buffers
-            .get(&surface_id)
-            .and_then(|current| {
-                current
-                    .content_mapping_for_state(
-                        viewport,
-                        committed_buffer_scale,
-                        committed_buffer_transform,
-                        offset,
-                    )
-                    .ok()
-            });
+        data.apply_viewport_change_with_owner(viewport_destination, viewport_error_owner);
+        data.apply_buffer_scale_change(buffer_scale);
+        data.apply_buffer_transform_change(buffer_transform);
         let opaque_region_changed = data.apply_opaque_region_change(opaque_region);
         let renderable_index = self.renderable_surface_index(surface_id);
         let (opaque_width, opaque_height) = retained_mapping

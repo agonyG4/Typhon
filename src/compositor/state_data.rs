@@ -232,6 +232,13 @@ pub(in crate::compositor) struct SurfaceViewportCommit {
 }
 
 impl SurfaceViewportCommit {
+    pub(super) fn apply_change(self, change: PendingViewportChange) -> Self {
+        Self {
+            source: change.source.unwrap_or(self.source),
+            destination: change.destination.unwrap_or(self.destination),
+        }
+    }
+
     pub(super) fn validate_viewport_state_without_buffer(self) -> Result<(), SurfaceMappingError> {
         SurfaceBufferMapping::validate_viewport_state_without_buffer(
             self.source.map(|source| {
@@ -240,13 +247,21 @@ impl SurfaceViewportCommit {
             self.destination,
         )
     }
+
+    pub(super) fn surface_size_for_buffer_size(
+        self,
+        buffer_size: BufferSize,
+        buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
+    ) -> Result<BufferSize, SurfaceMappingError> {
+        surface_size_for_state_with_buffer_size(buffer_size, self, buffer_scale, buffer_transform)
+    }
 }
 
 /// The complete effective mapping of the pixels retained by a surface.
 ///
-/// This is deliberately a value rather than a collection of optional deltas:
-/// a bufferless commit publishes this snapshot for its exact Content Update,
-/// so publication never has to reconstruct mapping from older buffer state.
+/// This is deliberately a value rather than a collection of optional deltas,
+/// so validation and pending-buffer preparation share one derived mapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::compositor) struct SurfaceContentMapping {
     pub(in crate::compositor) x: i32,
@@ -375,6 +390,7 @@ pub(super) struct SurfaceData {
     pub(super) presentation: Mutex<SurfacePresentationState>,
     viewport: Mutex<SurfaceViewportState>,
     viewport_resource: Mutex<Option<wp_viewport::WpViewport>>,
+    viewport_error_owner: Mutex<Option<wp_viewport::WpViewport>>,
     buffer_scale: Mutex<SurfaceBufferScaleState>,
     buffer_transform: Mutex<SurfaceBufferTransformState>,
     input_region: Mutex<SurfaceInputRegionState>,
@@ -622,6 +638,13 @@ impl SurfaceData {
             .filter(Resource::is_alive)
     }
 
+    pub(super) fn committed_viewport_error_owner(&self) -> Option<wp_viewport::WpViewport> {
+        self.viewport_error_owner
+            .lock()
+            .ok()
+            .and_then(|owner| owner.as_ref().cloned())
+    }
+
     pub(super) fn set_pending_viewport_source(&self, source: Option<ViewportSourceRect>) {
         if let Ok(mut viewport) = self.viewport.lock() {
             viewport.pending_source = Some(source);
@@ -638,10 +661,16 @@ impl SurfaceData {
             .unwrap_or_default()
     }
 
-    pub(super) fn apply_viewport_change(
+    pub(super) fn apply_viewport_change_with_owner(
         &self,
         change: PendingViewportChange,
+        owner: Option<wp_viewport::WpViewport>,
     ) -> SurfaceViewportCommit {
+        if change.source.is_some()
+            && let Ok(mut viewport_error_owner) = self.viewport_error_owner.lock()
+        {
+            *viewport_error_owner = owner;
+        }
         self.viewport
             .lock()
             .map(|mut viewport| {
@@ -1650,6 +1679,16 @@ impl CurrentSurfaceBuffer {
         }
     }
 
+    pub(super) fn buffer_size(&self) -> Result<BufferSize, SurfaceMappingError> {
+        BufferSize::new(
+            self.width()
+                .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+            self.height()
+                .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+        )
+        .ok_or(SurfaceMappingError::InvalidBufferSize)
+    }
+
     pub(super) const fn is_shm(&self) -> bool {
         match self {
             Self::Unmaterialized(buffer) => buffer.data.is_shm(),
@@ -1804,19 +1843,53 @@ impl SafeShmRelease {
 }
 
 impl PendingSurfaceBuffer {
+    pub(super) fn buffer_size(&self) -> Result<BufferSize, SurfaceMappingError> {
+        BufferSize::new(
+            self.data
+                .width()
+                .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+            self.data
+                .height()
+                .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
+        )
+        .ok_or(SurfaceMappingError::InvalidBufferSize)
+    }
+
     pub(super) fn apply_committed_surface_state(
         &mut self,
         viewport: SurfaceViewportCommit,
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
     ) -> Result<(), SurfaceMappingError> {
-        let surface_size = self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?;
-        self.viewport_source = viewport.source;
-        self.viewport_destination = viewport.destination;
-        self.buffer_scale = buffer_scale;
-        self.buffer_transform = buffer_transform;
-        self.surface_size = Some(surface_size);
+        let mapping = self.content_mapping_for_state(viewport, buffer_scale, buffer_transform)?;
+        self.apply_content_mapping(mapping);
         Ok(())
+    }
+
+    pub(super) fn content_mapping_for_state(
+        &self,
+        viewport: SurfaceViewportCommit,
+        buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
+    ) -> Result<SurfaceContentMapping, SurfaceMappingError> {
+        let surface_size = self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?;
+        Ok(SurfaceContentMapping {
+            x: self.x,
+            y: self.y,
+            surface_size,
+            buffer_scale,
+            buffer_transform,
+            viewport_source: viewport.source,
+            viewport_destination: viewport.destination,
+        })
+    }
+
+    pub(super) fn apply_content_mapping(&mut self, mapping: SurfaceContentMapping) {
+        self.viewport_source = mapping.viewport_source;
+        self.viewport_destination = mapping.viewport_destination;
+        self.buffer_scale = mapping.buffer_scale;
+        self.buffer_transform = mapping.buffer_transform;
+        self.surface_size = Some(mapping.surface_size);
     }
 
     pub(super) fn surface_size_for_state(
@@ -1826,15 +1899,7 @@ impl PendingSurfaceBuffer {
         buffer_transform: wl_output::Transform,
     ) -> Result<BufferSize, SurfaceMappingError> {
         surface_size_for_state_with_buffer_size(
-            BufferSize::new(
-                self.data
-                    .width()
-                    .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
-                self.data
-                    .height()
-                    .map_err(|_| SurfaceMappingError::InvalidBufferSize)?,
-            )
-            .ok_or(SurfaceMappingError::InvalidBufferSize)?,
+            self.buffer_size()?,
             viewport,
             buffer_scale,
             buffer_transform,
