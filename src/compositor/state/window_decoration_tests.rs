@@ -103,7 +103,14 @@ fn x11_decoration_mode_precedence_controls_rendering_hit_testing_and_extents() {
         DecorationMode::ServerSide
     );
     assert_eq!(state.x11_decoration_frame_extents(handle), [0, 0, 26, 0]);
-    assert_eq!(decoration_instances(&state).len(), 1);
+    let instances = decoration_instances(&state);
+    assert_eq!(instances.len(), 1);
+    assert_eq!(
+        instances[0].scene_node_id(),
+        state
+            .scene_node_id_for_server_decoration(window_id)
+            .expect("server decoration scene node")
+    );
     assert!(matches!(
         state.decoration_hit_for_root_at(50, (0, 0), 100.0, -10.0),
         Some(DecorationHit::Titlebar)

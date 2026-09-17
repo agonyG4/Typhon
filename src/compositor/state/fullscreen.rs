@@ -490,27 +490,57 @@ impl CompositorState {
     pub(in crate::compositor) fn native_frame_renderable_surfaces_with_metrics(
         &self,
     ) -> (Cow<'_, [RenderableSurface]>, FullscreenRenderPlanMetrics) {
+        let (surfaces, _, metrics) = self.native_frame_renderable_surfaces_with_composition_plan();
+        (surfaces, metrics)
+    }
+
+    pub(in crate::compositor) fn native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan(
+        &self,
+    ) -> (
+        Cow<'_, [RenderableSurface]>,
+        Cow<'_, [SceneNodeId]>,
+        FullscreenCompositionPlan,
+        FullscreenRenderPlanMetrics,
+    ) {
         let surfaces: Cow<'_, [RenderableSurface]> = Cow::Borrowed(self.active_scene_surfaces());
+        let scene_nodes: Cow<'_, [SceneNodeId]> =
+            Cow::Borrowed(self.active_scene_surface_scene_nodes_in_order());
+        debug_assert_eq!(surfaces.len(), scene_nodes.len());
         let eligibility = self.fullscreen_presentation_eligibility();
         let plan = self.fullscreen_composition_plan_for_eligibility(eligibility);
         let metrics = self.fullscreen_render_plan_metrics_for_plan(&plan, eligibility);
         if !plan.mode.is_dominant() {
-            return (surfaces, metrics);
+            return (surfaces, scene_nodes, plan, metrics);
+        }
+
+        let mut filtered_surfaces = Vec::with_capacity(surfaces.len());
+        let mut filtered_scene_nodes = Vec::with_capacity(scene_nodes.len());
+        for (surface, scene_node) in surfaces.iter().zip(scene_nodes.iter().copied()) {
+            if plan.allows_presentation_root(
+                self.presentation_owner_root_for_surface(surface.surface_id),
+            ) {
+                filtered_surfaces.push(surface.clone());
+                filtered_scene_nodes.push(scene_node);
+            }
         }
         (
-            Cow::Owned(
-                surfaces
-                    .iter()
-                    .filter(|surface| {
-                        plan.allows_presentation_root(
-                            self.presentation_owner_root_for_surface(surface.surface_id),
-                        )
-                    })
-                    .cloned()
-                    .collect(),
-            ),
+            Cow::Owned(filtered_surfaces),
+            Cow::Owned(filtered_scene_nodes),
+            plan,
             metrics,
         )
+    }
+
+    pub(in crate::compositor) fn native_frame_renderable_surfaces_with_composition_plan(
+        &self,
+    ) -> (
+        Cow<'_, [RenderableSurface]>,
+        FullscreenCompositionPlan,
+        FullscreenRenderPlanMetrics,
+    ) {
+        let (surfaces, _, plan, metrics) =
+            self.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
+        (surfaces, plan, metrics)
     }
 
     pub(in crate::compositor) fn apply_presentation_to_native_frame_surfaces<'a>(

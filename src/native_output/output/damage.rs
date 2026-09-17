@@ -223,6 +223,7 @@ impl NativeOutputDamage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeClientCursorDamageState {
     pub(crate) surface_id: u32,
+    pub(crate) scene_node_id: SceneNodeId,
     pub(crate) generation: u64,
     pub(crate) hotspot_x: i32,
     pub(crate) hotspot_y: i32,
@@ -236,8 +237,14 @@ pub(crate) struct NativeCursorDamageBounds {
     pub(crate) previous_software: Option<NativeDamageRect>,
     pub(crate) software: Option<NativeDamageRect>,
 }
-
 impl NativeClientCursorDamageState {
+    pub(crate) fn same_visual_state(&self, other: &Self) -> bool {
+        self.surface_id == other.surface_id
+            && self.generation == other.generation
+            && self.hotspot_x == other.hotspot_x
+            && self.hotspot_y == other.hotspot_y
+            && self.rect == other.rect
+    }
     pub(crate) fn from_cursor(
         width: u32,
         height: u32,
@@ -245,6 +252,7 @@ impl NativeClientCursorDamageState {
     ) -> Self {
         Self {
             surface_id: cursor.surface.surface_id,
+            scene_node_id: cursor.scene_node_id,
             generation: cursor.surface.generation,
             hotspot_x: cursor.hotspot_x,
             hotspot_y: cursor.hotspot_y,
@@ -277,7 +285,6 @@ pub(crate) fn native_cursor_rect(
         })?
         .clipped_to_output(output_width, output_height)
 }
-
 pub(crate) fn native_theme_cursor_rect(
     output_width: u32,
     output_height: u32,
@@ -293,7 +300,6 @@ pub(crate) fn native_theme_cursor_rect(
         image.height,
     )
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeDamageKind {
     Empty,
@@ -310,7 +316,6 @@ impl NativeDamageKind {
         }
     }
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeDamageRect {
     pub(crate) x: i32,
@@ -318,19 +323,18 @@ pub(crate) struct NativeDamageRect {
     pub(crate) width: u32,
     pub(crate) height: u32,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NativeSurfaceDamageEvidence {
     AuthoritativeEmpty,
     Known(Vec<NativeDamageRect>),
     HistoryLost,
 }
-
 /// Geometry and mapped damage metadata for a scene. It deliberately excludes
 /// `RenderableSurface::buffer`, so submitted-frame history never owns a copy
 /// of client pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeSceneSurfaceSnapshot {
+    pub(crate) scene_node_id: SceneNodeId,
     pub(crate) surface_id: u32,
     pub(crate) visual_root_surface_id: u32,
     pub(crate) bounds: Option<NativeDamageRect>,
@@ -338,7 +342,6 @@ pub(crate) struct NativeSceneSurfaceSnapshot {
     pub(crate) content_generation: u64,
     pub(crate) commit_sequence: u64,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NativeSceneSnapshot {
     pub(crate) surfaces: Vec<NativeSceneSurfaceSnapshot>,
@@ -360,11 +363,38 @@ impl NativeSceneSnapshot {
         Self::from_surfaces_with_popup_ids(surfaces, decorations, &[])
     }
 
+    #[cfg(test)]
     pub(crate) fn from_surfaces_with_popup_ids(
         surfaces: &[RenderableSurface],
         decorations: Vec<DecorationSceneSnapshot>,
         popup_surface_ids: &[u32],
     ) -> Self {
+        let scene_node_ids = surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                SceneNodeId::from_raw((index as u64).saturating_add(1)).expect("test scene node id")
+            })
+            .collect::<Vec<_>>();
+        Self::from_surfaces_with_scene_nodes(
+            surfaces,
+            &scene_node_ids,
+            decorations,
+            popup_surface_ids,
+        )
+    }
+
+    pub(crate) fn from_surfaces_with_scene_nodes(
+        surfaces: &[RenderableSurface],
+        scene_node_ids: &[SceneNodeId],
+        decorations: Vec<DecorationSceneSnapshot>,
+        popup_surface_ids: &[u32],
+    ) -> Self {
+        assert_eq!(
+            surfaces.len(),
+            scene_node_ids.len(),
+            "native scene surface and SceneNode projections must stay aligned"
+        );
         #[cfg(test)]
         note_native_snapshot_build();
         let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
@@ -385,7 +415,8 @@ impl NativeSceneSnapshot {
         let surfaces: Vec<NativeSceneSurfaceSnapshot> = elements
             .iter()
             .zip(surfaces)
-            .map(|(element, surface)| {
+            .zip(scene_node_ids.iter().copied())
+            .map(|((element, surface), scene_node_id)| {
                 #[cfg(test)]
                 note_native_snapshot_surface_projection();
                 let RenderSceneElementId::Surface(surface_id) = element.id();
@@ -425,6 +456,7 @@ impl NativeSceneSnapshot {
                     }
                 };
                 NativeSceneSurfaceSnapshot {
+                    scene_node_id,
                     surface_id,
                     visual_root_surface_id: visual_root_by_surface_id
                         .get(&surface_id)
@@ -948,8 +980,10 @@ pub(crate) fn native_output_damage_for_repaint_with_cursor(
     } else {
         NativeOutputDamage::full_output(width, height)
     };
-    if cursor_damage.previous_client != cursor_damage.client
-        || cursor_damage.previous_software != cursor_damage.software
+    if client_cursor_damage_changed(
+        cursor_damage.previous_client.as_ref(),
+        cursor_damage.client.as_ref(),
+    ) || cursor_damage.previous_software != cursor_damage.software
     {
         damage = damage.union_surface_rects(
             cursor_damage
@@ -964,6 +998,15 @@ pub(crate) fn native_output_damage_for_repaint_with_cursor(
     damage
 }
 
+fn client_cursor_damage_changed(
+    previous: Option<&NativeClientCursorDamageState>,
+    current: Option<&NativeClientCursorDamageState>,
+) -> bool {
+    previous.zip(current).map_or(
+        previous.is_some() || current.is_some(),
+        |(previous, current)| !previous.same_visual_state(current),
+    )
+}
 #[cfg(test)]
 pub(crate) fn native_output_damage_for_scene_and_cursor(
     width: u32,
@@ -1032,8 +1075,10 @@ pub(crate) fn native_output_damage_for_scene_and_cursor_with_decorations(
     } else {
         NativeOutputDamage::empty()
     };
-    if cursor_damage.previous_client != cursor_damage.client
-        || cursor_damage.previous_software != cursor_damage.software
+    if client_cursor_damage_changed(
+        cursor_damage.previous_client.as_ref(),
+        cursor_damage.client.as_ref(),
+    ) || cursor_damage.previous_software != cursor_damage.software
     {
         damage = damage.union_surface_rects(
             cursor_damage
@@ -1121,8 +1166,10 @@ pub(crate) fn native_output_damage_for_scene_snapshots(
             },
         ));
     }
-    if cursor_damage.previous_client != cursor_damage.client
-        || cursor_damage.previous_software != cursor_damage.software
+    if client_cursor_damage_changed(
+        cursor_damage.previous_client.as_ref(),
+        cursor_damage.client.as_ref(),
+    ) || cursor_damage.previous_software != cursor_damage.software
     {
         damage = damage.union_surface_rects(
             cursor_damage

@@ -82,6 +82,60 @@ impl NativeSceneHistory {
         self.presented.as_ref().map(|snapshot| snapshot.frame_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn presented_scene_node_for_surface(&self, surface_id: u32) -> Option<SceneNodeId> {
+        self.presented.as_ref().and_then(|snapshot| {
+            snapshot
+                .scene
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .map(|surface| surface.scene_node_id)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn presented_decoration_scene_node(
+        &self,
+        window_id: WindowId,
+    ) -> Option<SceneNodeId> {
+        self.presented.as_ref().and_then(|snapshot| {
+            snapshot
+                .scene
+                .decorations
+                .iter()
+                .find(|decoration| decoration.identity().0 == window_id)
+                .map(DecorationSceneSnapshot::scene_node_id)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn presented_client_cursor_scene_node(&self) -> Option<SceneNodeId> {
+        self.presented
+            .as_ref()
+            .and_then(|snapshot| snapshot.cursor_damage.client)
+            .map(|cursor| cursor.scene_node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submitted_scene_node_for_surface(
+        &self,
+        token: u64,
+        surface_id: u32,
+    ) -> Option<SceneNodeId> {
+        self.submitted
+            .iter()
+            .find(|(submitted_token, _)| *submitted_token == token)
+            .and_then(|(_, snapshot)| {
+                snapshot
+                    .scene
+                    .surfaces
+                    .iter()
+                    .find(|surface| surface.surface_id == surface_id)
+                    .map(|surface| surface.scene_node_id)
+            })
+    }
+
     pub(crate) fn submitted_frame_id(&self, token: u64) -> Option<u64> {
         self.submitted
             .iter()

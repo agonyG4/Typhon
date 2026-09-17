@@ -10,6 +10,7 @@ use super::{
     SurfaceBufferMapping, SurfaceDamageRect, SurfaceGeometryRect, SurfaceRenderBackend,
     SurfaceUvQuad,
 };
+use crate::core::SceneNodeId;
 use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
 use crate::presentation_animation::{PresentationGroupTransform, PresentationRect};
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
@@ -75,6 +76,7 @@ pub struct DesktopComposeRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorationSceneSnapshot {
+    scene_node_id: SceneNodeId,
     window_id: WindowId,
     root_surface_id: u32,
     bounds: DecorationRect,
@@ -82,7 +84,12 @@ pub struct DecorationSceneSnapshot {
 }
 
 impl DecorationSceneSnapshot {
-    pub fn from_bounds(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit decoration snapshot construction keeps its identity and visual fields together"
+    )]
+    pub fn from_bounds_with_scene_node(
+        scene_node_id: SceneNodeId,
         window_id: WindowId,
         root_surface_id: u32,
         x: i32,
@@ -92,11 +99,39 @@ impl DecorationSceneSnapshot {
         visual_signature: u64,
     ) -> Self {
         Self {
+            scene_node_id,
             window_id,
             root_surface_id,
             bounds: DecorationRect::new(x, y, width, height),
             visual_signature,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn from_bounds(
+        window_id: WindowId,
+        root_surface_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        visual_signature: u64,
+    ) -> Self {
+        Self::from_bounds_with_scene_node(
+            SceneNodeId::from_raw(u64::from(root_surface_id).max(1))
+                .expect("test decoration scene node"),
+            window_id,
+            root_surface_id,
+            x,
+            y,
+            width,
+            height,
+            visual_signature,
+        )
+    }
+
+    pub fn scene_node_id(&self) -> SceneNodeId {
+        self.scene_node_id
     }
 
     pub fn identity(&self) -> (WindowId, u32) {
@@ -124,6 +159,7 @@ pub struct DecorationRenderInstance {
     pub(crate) origin_y: i32,
     pub(crate) window_id: WindowId,
     pub(crate) root_surface_id: u32,
+    pub(crate) scene_node_id: SceneNodeId,
 }
 
 impl DecorationRenderInstance {
@@ -139,8 +175,13 @@ impl DecorationRenderInstance {
         self.root_surface_id
     }
 
+    pub const fn scene_node_id(&self) -> SceneNodeId {
+        self.scene_node_id
+    }
+
     pub fn scene_snapshot(&self) -> DecorationSceneSnapshot {
-        DecorationSceneSnapshot::from_bounds(
+        DecorationSceneSnapshot::from_bounds_with_scene_node(
+            self.scene_node_id,
             self.window_id,
             self.root_surface_id,
             self.origin_x.saturating_add(self.plan.layout.outer.x),
@@ -182,6 +223,8 @@ impl DecorationRenderInstance {
             origin_y,
             window_id,
             root_surface_id,
+            scene_node_id: SceneNodeId::from_raw(window_id.get().max(1))
+                .expect("test decoration scene node"),
         }
     }
 
@@ -228,6 +271,7 @@ impl DecorationRenderInstance {
             origin_y: mapped_origin.1,
             window_id: self.window_id,
             root_surface_id: self.root_surface_id,
+            scene_node_id: self.scene_node_id,
         })
     }
 }
@@ -3311,6 +3355,8 @@ mod tests {
             origin_y: 0,
             window_id,
             root_surface_id,
+            scene_node_id: SceneNodeId::from_raw(window_id.get().max(1))
+                .expect("test decoration scene node"),
         }
     }
 
@@ -4868,6 +4914,7 @@ mod tests {
             origin_y,
             window_id: WindowId::from_raw(1).expect("test window id"),
             root_surface_id: 1,
+            scene_node_id: SceneNodeId::from_raw(1).expect("test decoration scene node"),
         }
     }
 
@@ -6178,6 +6225,7 @@ mod tests {
             visual_state: DesktopVisualState::with_cursor(0, 0),
             client_cursor: Some(crate::compositor::ClientCursorRenderState {
                 surface: &cursor_surface,
+                scene_node_id: SceneNodeId::from_raw(1).expect("test cursor scene node"),
                 logical_x: 2,
                 logical_y: 3,
                 hotspot_x: 0,
@@ -6198,6 +6246,7 @@ mod tests {
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: Some(crate::compositor::ClientCursorRenderState {
                 surface: &cursor_surface,
+                scene_node_id: SceneNodeId::from_raw(1).expect("test cursor scene node"),
                 logical_x: 8,
                 logical_y: 9,
                 hotspot_x: 0,

@@ -796,8 +796,19 @@ pub(super) fn planned_client_cursor_software_work(
     plan.is_some_and(|plan| {
         plan.decision.pacing_constraint == CursorPacingConstraint::ReactiveDouble
     }) && !client_cursor_hardware_usable
-        && last_damage != current_damage.as_ref()
+        && client_cursor_damage_changed(last_damage, current_damage.as_ref())
         && (client_surface_content_active || last_damage.is_some())
+}
+
+fn client_cursor_damage_changed(
+    previous: Option<&NativeClientCursorDamageState>,
+    current: Option<&NativeClientCursorDamageState>,
+) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => !previous.same_visual_state(current),
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 pub(super) fn planned_hardware_cursor_work_pending(

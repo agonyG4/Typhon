@@ -28,6 +28,9 @@ mod cycle_dispatch;
 mod direct_plan;
 mod dmabuf_release;
 mod frame;
+mod frame_scene_identity;
+#[cfg(test)]
+mod frame_scene_identity_tests;
 mod input_transition_guard;
 mod kms_worker;
 mod kms_worker_startup;

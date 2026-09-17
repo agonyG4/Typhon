@@ -611,6 +611,7 @@ impl RenderGenerationCause {
 #[derive(Debug, Clone, Copy)]
 pub struct ClientCursorRenderState<'a> {
     pub surface: &'a RenderableSurface,
+    pub scene_node_id: SceneNodeId,
     pub logical_x: i32,
     pub logical_y: i32,
     pub hotspot_x: i32,

@@ -5,6 +5,7 @@ use crate::egl_renderer::{
 };
 use oblivion_one::compositor::{
     AnimationTime, FullscreenRenderPlanMetrics, PresentationSceneSample, ResolvedEffectScene,
+    SceneNodeId,
 };
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
 use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
@@ -40,6 +41,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
     let snapshot = NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new());
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Owned(renderer_surfaces.clone()),
+        surface_scene_node_ids: Cow::Owned(vec![SceneNodeId::from_raw(1).unwrap()]),
         decorations: Vec::new(),
         popup_surface_ids: Cow::Owned(Vec::new()),
         external_overlay_surface_ids: Vec::new(),
@@ -124,6 +126,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
     let snapshot = NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new());
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Borrowed(&surfaces),
+        surface_scene_node_ids: Cow::Borrowed(&[SceneNodeId::from_raw(1).unwrap()]),
         decorations: Vec::new(),
         popup_surface_ids: Cow::Borrowed(&[]),
         external_overlay_surface_ids: Vec::new(),

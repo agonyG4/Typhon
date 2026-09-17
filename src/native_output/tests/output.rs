@@ -578,6 +578,7 @@ fn native_output_damage_for_cursor_motion_is_not_full_output() {
 fn native_output_damage_for_client_cursor_motion_covers_old_and_new_bounds() {
     let previous = NativeClientCursorDamageState {
         surface_id: 9,
+        scene_node_id: SceneNodeId::from_raw(1).expect("test cursor scene node"),
         generation: 1,
         hotspot_x: 0,
         hotspot_y: 0,

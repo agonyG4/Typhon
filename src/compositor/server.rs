@@ -18,9 +18,10 @@ use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
     AnimationTime, DirectScanoutSceneAnalysis, EffectFrameDemandSnapshot,
-    NativeFramePresentationTargets, PresentationAnimationMetrics, PresentationFrameSnapshot,
-    PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentedWindowGeometry,
-    ResolvedEffectScene, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
+    FullscreenCompositionPlan, NativeFramePresentationTargets, PresentationAnimationMetrics,
+    PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
+    PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene, SceneNodeId,
+    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
     SurfaceResourceSyncState, compositor_surface_id,
 };
 #[cfg(test)]
@@ -1092,6 +1093,33 @@ impl OwnCompositorServer {
         &self,
     ) -> (Cow<'_, [RenderableSurface]>, FullscreenRenderPlanMetrics) {
         self.state.native_frame_renderable_surfaces_with_metrics()
+    }
+
+    pub fn native_frame_renderable_surfaces_with_composition_plan(
+        &self,
+    ) -> (
+        Cow<'_, [RenderableSurface]>,
+        FullscreenCompositionPlan,
+        FullscreenRenderPlanMetrics,
+    ) {
+        self.state
+            .native_frame_renderable_surfaces_with_composition_plan()
+    }
+
+    pub fn native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan(
+        &self,
+    ) -> (
+        Cow<'_, [RenderableSurface]>,
+        Cow<'_, [SceneNodeId]>,
+        FullscreenCompositionPlan,
+        FullscreenRenderPlanMetrics,
+    ) {
+        self.state
+            .native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan()
+    }
+
+    pub fn active_scene_surface_scene_nodes_in_order(&self) -> &[SceneNodeId] {
+        self.state.active_scene_surface_scene_nodes_in_order()
     }
 
     pub fn native_frame_presentation_targets(

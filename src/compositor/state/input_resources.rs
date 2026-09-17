@@ -550,8 +550,12 @@ impl CompositorState {
         }
         let active = self.focused_client_cursor.as_ref()?.surface()?;
         let surface = self.client_cursor_surfaces.get(&active.surface_id)?;
+        let scene_node_id = self
+            .scene_node_id_for_surface(active.surface_id)
+            .expect("client cursor surface has no canonical scene node");
         Some(ClientCursorRenderState {
             surface,
+            scene_node_id,
             logical_x: (self.last_pointer_x.round() as i32).saturating_sub(active.hotspot_x),
             logical_y: (self.last_pointer_y.round() as i32).saturating_sub(active.hotspot_y),
             hotspot_x: active.hotspot_x,

@@ -65,6 +65,7 @@ fn compatibility_renderer_skip_retires_logical_generation_and_terminally_owns_ba
     let mut queued_redraw_requested = true;
     let previous_client_cursor_damage = NativeClientCursorDamageState {
         surface_id: 7,
+        scene_node_id: SceneNodeId::from_raw(1).expect("test cursor scene node"),
         generation: 1,
         hotspot_x: 0,
         hotspot_y: 0,
@@ -72,6 +73,7 @@ fn compatibility_renderer_skip_retires_logical_generation_and_terminally_owns_ba
     };
     let current_client_cursor_damage = NativeClientCursorDamageState {
         surface_id: 7,
+        scene_node_id: SceneNodeId::from_raw(1).expect("test cursor scene node"),
         generation: 2,
         hotspot_x: 1,
         hotspot_y: 2,

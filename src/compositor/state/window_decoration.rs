@@ -562,12 +562,16 @@ impl super::super::CompositorState {
                     },
                     output_scale,
                 );
+                let scene_node_id = self
+                    .scene_node_id_for_server_decoration(window_id)
+                    .expect("server decoration has no canonical scene node");
                 Some(DecorationRenderInstance {
                     origin_x: root_origin_x.saturating_sub(layout.client.x),
                     origin_y: root_origin_y.saturating_sub(layout.client.y),
                     plan,
                     window_id,
                     root_surface_id: surface.surface_id,
+                    scene_node_id,
                 })
             })
             .collect()

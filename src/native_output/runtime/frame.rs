@@ -5,69 +5,26 @@ use std::borrow::Cow;
 use oblivion_one::compositor::{
     AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
     PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample, ResolvedEffectScene,
+    SceneNodeId,
 };
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SnapshotWorkCounters {
-    snapshot_finalizations: usize,
-    snapshot_owned_clones: usize,
-    identity_computations: usize,
-}
+use super::frame_scene_identity::visibility_signature;
+use super::frame_scene_identity::{
+    assert_surface_scene_node_alignment, filter_surface_scene_nodes, finalize_snapshot,
+};
 
 #[cfg(test)]
-thread_local! {
-    static SNAPSHOT_WORK_COUNTERS: std::cell::Cell<SnapshotWorkCounters> =
-        const {
-            std::cell::Cell::new(SnapshotWorkCounters {
-                snapshot_finalizations: 0,
-                snapshot_owned_clones: 0,
-                identity_computations: 0,
-            })
-        };
-}
-
-#[cfg(test)]
-fn reset_snapshot_work_counters() {
-    SNAPSHOT_WORK_COUNTERS.with(|counters| counters.set(SnapshotWorkCounters::default()));
-}
-
-#[cfg(test)]
-fn snapshot_work_counters() -> SnapshotWorkCounters {
-    SNAPSHOT_WORK_COUNTERS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn note_snapshot_finalization() {
-    SNAPSHOT_WORK_COUNTERS.with(|counters| {
-        let mut value = counters.get();
-        value.snapshot_finalizations += 1;
-        counters.set(value);
-    });
-}
-
-#[cfg(test)]
-fn note_snapshot_owned_clone() {
-    SNAPSHOT_WORK_COUNTERS.with(|counters| {
-        let mut value = counters.get();
-        value.snapshot_owned_clones += 1;
-        counters.set(value);
-    });
-}
-
-#[cfg(test)]
-fn note_identity_computation() {
-    SNAPSHOT_WORK_COUNTERS.with(|counters| {
-        let mut value = counters.get();
-        value.identity_computations += 1;
-        counters.set(value);
-    });
-}
+use super::frame_scene_identity::{
+    note_identity_computation, note_snapshot_finalization, note_snapshot_owned_clone,
+    reset_snapshot_work_counters, snapshot_work_counters,
+};
 
 #[derive(Debug)]
 pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) surfaces: Cow<'a, [RenderableSurface]>,
+    pub(crate) surface_scene_node_ids: Cow<'a, [SceneNodeId]>,
     pub(crate) decorations: Vec<DecorationRenderInstance>,
     pub(crate) popup_surface_ids: Cow<'a, [u32]>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
@@ -91,23 +48,24 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     }
 
     pub(crate) fn from_server_at(server: &'a OwnCompositorServer, at: AnimationTime) -> Self {
-        let (canonical_surfaces, visibility) =
-            server.native_frame_renderable_surfaces_with_metrics();
+        let (canonical_surfaces, canonical_scene_nodes, _fullscreen_plan, visibility) =
+            server.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
         let lifecycle = server.lifecycle_scene_sample_at(at);
         let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
         let lifecycle_decorations =
             server.lifecycle_decoration_render_instances(&lifecycle, &lifecycle_surfaces);
-        let canonical_surfaces = if server.lifecycle_render_suppressed_roots().is_empty() {
-            canonical_surfaces
-        } else {
-            Cow::Owned(
-                canonical_surfaces
-                    .iter()
-                    .filter(|surface| !server.lifecycle_surface_is_suppressed(surface.surface_id))
-                    .cloned()
-                    .collect(),
-            )
-        };
+        let (canonical_surfaces, canonical_scene_nodes) =
+            if server.lifecycle_render_suppressed_roots().is_empty() {
+                (canonical_surfaces, canonical_scene_nodes)
+            } else {
+                filter_surface_scene_nodes(canonical_surfaces, canonical_scene_nodes, |surface| {
+                    !server.lifecycle_surface_is_suppressed(surface.surface_id)
+                })
+            };
+        assert_surface_scene_node_alignment(
+            canonical_surfaces.as_ref(),
+            canonical_scene_nodes.as_ref(),
+        );
         let targets = server.native_frame_presentation_targets(canonical_surfaces.as_ref());
         let presentation = server.presentation_scene_sample_for_targets_at(at, &targets);
         let decorations = server
@@ -131,8 +89,9 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
         let effects = server.resolved_effect_scene_for_presentation(&presentation);
-        let snapshot = NativeSceneSnapshot::from_surfaces_with_popup_ids(
+        let snapshot = NativeSceneSnapshot::from_surfaces_with_scene_nodes(
             surfaces.as_ref(),
+            canonical_scene_nodes.as_ref(),
             decorations
                 .iter()
                 .map(DecorationRenderInstance::scene_snapshot)
@@ -152,6 +111,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         }
         Self {
             surfaces,
+            surface_scene_node_ids: canonical_scene_nodes,
             decorations,
             popup_surface_ids,
             external_overlay_surface_ids,
@@ -172,6 +132,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     pub(crate) fn into_owned(self) -> ResolvedNativeFrameScene<'static> {
         ResolvedNativeFrameScene {
             surfaces: Cow::Owned(self.surfaces.into_owned()),
+            surface_scene_node_ids: Cow::Owned(self.surface_scene_node_ids.into_owned()),
             decorations: self.decorations,
             popup_surface_ids: Cow::Owned(self.popup_surface_ids.into_owned()),
             external_overlay_surface_ids: self.external_overlay_surface_ids,
@@ -213,6 +174,18 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     }
 
     fn debug_assert_snapshot_consistency(&self) {
+        assert_surface_scene_node_alignment(
+            self.surfaces.as_ref(),
+            self.surface_scene_node_ids.as_ref(),
+        );
+        debug_assert!(
+            self.surface_scene_node_ids.iter().copied().eq(self
+                .snapshot
+                .surfaces
+                .iter()
+                .map(|surface| surface.scene_node_id)),
+            "resolved frame scene and its snapshot diverged on SceneNode identity"
+        );
         debug_assert!(
             self.surface_ids().eq(self
                 .snapshot
@@ -234,55 +207,6 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     pub(crate) fn scene_identity_signature(&self) -> u64 {
         self.scene_identity_signature
     }
-}
-
-fn visibility_signature(metrics: FullscreenRenderPlanMetrics) -> u64 {
-    let mut signature = 0xcbf2_9ce4_8422_2325_u64;
-    for value in [
-            metrics.fullscreen_active as u64,
-            u64::from(metrics.owner_root_surface_id.unwrap_or(0)),
-            metrics.solitary_tree_active as u64,
-            metrics.culled_surface_count as u64,
-            metrics.wallpaper_culled as u64,
-            metrics.visible_overlay_count as u64,
-            metrics.rejection.map_or(0, |rejection| {
-                match rejection {
-                    oblivion_one::compositor::FullscreenPresentationRejection::NoFullscreenOwner => 1,
-                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerMissing => 2,
-                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerMinimized => 3,
-                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerDoesNotCoverOutput => 4,
-                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerOpacityUnknown => 5,
-                    oblivion_one::compositor::FullscreenPresentationRejection::OverlayVisible => 6,
-                    oblivion_one::compositor::FullscreenPresentationRejection::SoftwareCursorVisible => 7,
-                    oblivion_one::compositor::FullscreenPresentationRejection::TransformOrScaleIncompatible => 8,
-                }
-            }),
-        ] {
-            signature ^= value;
-            signature = signature.wrapping_mul(0x1000_0000_01b3);
-        }
-    signature
-}
-
-fn finalize_snapshot(
-    mut snapshot: NativeSceneSnapshot,
-    external_overlay_surface_ids: &[u32],
-    visibility: FullscreenRenderPlanMetrics,
-    effects: &ResolvedEffectScene,
-) -> (NativeSceneSnapshot, u64) {
-    snapshot.external_overlay_surface_ids = external_overlay_surface_ids.to_vec();
-    snapshot.visibility_signature = visibility_signature(visibility);
-    snapshot.effect_damage = effects
-        .instances
-        .iter()
-        .fold(EffectRegion::empty(), |damage, instance| {
-            damage.union(&instance.region)
-        });
-    snapshot.effect_identity_signature = effects.signature;
-    let mut scene_identity_signature = snapshot.identity_signature();
-    scene_identity_signature ^= effects.signature;
-    scene_identity_signature = scene_identity_signature.wrapping_mul(0x1000_0000_01b3);
-    (snapshot, scene_identity_signature)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -880,6 +804,7 @@ mod tests {
             let surfaces: &[RenderableSurface] = &[];
             let resolved = ResolvedNativeFrameScene {
                 surfaces: Cow::Borrowed(surfaces),
+                surface_scene_node_ids: Cow::Borrowed(&[]),
                 decorations: Vec::new(),
                 popup_surface_ids: Cow::Borrowed(popup_surface_ids),
                 external_overlay_surface_ids: Vec::new(),
