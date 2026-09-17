@@ -92,6 +92,12 @@ impl CompositorState {
             if let Some((surface_id, decision)) =
                 self.surface_tree_async_publication_rejection(&transaction)
             {
+                let canceled_root_surface_id = transaction.root_surface_id;
+                let canceled_refs = transaction
+                    .nodes
+                    .iter()
+                    .map(|(surface_id, commit)| commit.content_update_ref(*surface_id))
+                    .collect();
                 let (commit_sequence, buffer_id) = transaction
                     .nodes
                     .iter()
@@ -145,6 +151,12 @@ impl CompositorState {
                     decision,
                 );
                 self.discard_surface_tree_transaction_with_decision(transaction, decision);
+                pacing_deadline_changed |= self.discard_surface_tree_dependents_from_queue(
+                    &mut transactions,
+                    canceled_root_surface_id,
+                    canceled_refs,
+                    decision,
+                );
                 continue;
             }
             pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();

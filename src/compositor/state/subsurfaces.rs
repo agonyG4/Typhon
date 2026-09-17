@@ -233,6 +233,38 @@ mod tests {
         }
     }
 
+    fn queue_blocked_pacing_predecessor(
+        state: &mut CompositorState,
+        client: &wayland_server::Client,
+        display_handle: &wayland_server::DisplayHandle,
+        surface_id: u32,
+        blocker_object_id: u32,
+        mut commit: CachedSubsurfaceCommit,
+    ) -> (ContentUpdateRef, ContentUpdateRef) {
+        commit.pacing.fifo_set_barrier = true;
+        let predecessor = commit.content_update_ref(surface_id);
+        let blocker =
+            test_blocking_external_dependency(state, client, display_handle, blocker_object_id);
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, commit)],
+            vec![blocker],
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+        (predecessor, blocker)
+    }
+
+    fn release_blocking_dependency(state: &mut CompositorState, blocker: ContentUpdateRef) {
+        state.surface_publications.insert(
+            blocker.surface_id,
+            SurfacePublicationState {
+                latest_published: Some(blocker.commit_sequence),
+                ..SurfacePublicationState::default()
+            },
+        );
+    }
+
     fn test_real_merge_frozen_candidate(
         state: &mut CompositorState,
         client: &wayland_server::Client,
@@ -2071,6 +2103,365 @@ mod tests {
         assert!(nodes[0].1.resize_commit.is_some());
         assert!(nodes[2].1.resize_commit.is_none());
     }
+
+    #[test]
+    fn separate_pending_destination_prepares_later_attachment_against_predecessor() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let mut first = test_mergeable_commit(210);
+        first.viewport_destination.destination =
+            Some(Some(BufferSize::new(50, 50).expect("destination")));
+        let (first_ref, blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(211);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            80,
+        )));
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, second)],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        let pending = &state.pending_surface_tree_transactions[1].nodes[0].1;
+        let pending = match pending.attachment.as_ref() {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected prepared buffer, got {other:?}"),
+        };
+        assert_eq!(pending.surface_size, Some(BufferSize::new(50, 50).unwrap()));
+        assert_eq!(
+            pending.viewport_destination,
+            Some(BufferSize::new(50, 50).unwrap())
+        );
+
+        release_blocking_dependency(&mut state, blocker);
+        state.commit_ready_surface_tree_transactions();
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        let current = state
+            .current_surface_buffers
+            .get(&surface_id)
+            .expect("published current buffer");
+        assert_eq!(
+            current.viewport_destination(),
+            Some(BufferSize::new(50, 50).unwrap())
+        );
+        assert_eq!(
+            current.current_content_mapping().unwrap().surface_size,
+            BufferSize::new(50, 50).unwrap()
+        );
+    }
+
+    #[test]
+    fn separate_pending_scale_prepares_later_attachment_at_predecessor_scale() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let mut first = test_mergeable_commit(220);
+        first.buffer_scale = Some(2);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(221);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            50,
+        )));
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, second)],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected prepared buffer, got {other:?}"),
+        };
+        assert_eq!(pending.buffer_scale, 2);
+        assert_eq!(pending.surface_size, Some(BufferSize::new(50, 25).unwrap()));
+    }
+
+    #[test]
+    fn separate_pending_transform_prepares_later_attachment_at_predecessor_transform() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let mut first = test_mergeable_commit(230);
+        first.buffer_transform = Some(wl_output::Transform::_90);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(231);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            50,
+        )));
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, second)],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected prepared buffer, got {other:?}"),
+        };
+        assert_eq!(pending.buffer_transform, wl_output::Transform::_90);
+        assert_eq!(
+            pending.surface_size,
+            Some(BufferSize::new(50, 100).unwrap())
+        );
+    }
+
+    #[test]
+    fn separate_pending_viewport_reset_accepts_final_valid_composition() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .data::<SurfaceData>()
+            .expect("surface data")
+            .apply_viewport_change_with_owner(
+                PendingViewportChange {
+                    source: Some(Some(
+                        ViewportSourceRect::new(0.0, 0.0, 2.5, 2.0).expect("source"),
+                    )),
+                    destination: Some(Some(BufferSize::new(4, 4).expect("destination"))),
+                },
+                None,
+            );
+        let mut first = test_mergeable_commit(240);
+        first.viewport_destination.source = Some(None);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(241);
+        second.lineage.predecessor = Some(first_ref);
+        second.viewport_destination.destination = Some(None);
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, second)],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+    }
+
+    #[test]
+    fn separate_pending_viewport_reset_rejects_final_invalid_composition_with_source_owner() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .clone();
+        let source_owner = client
+            .create_resource::<wp_viewport::WpViewport, ViewportData, CompositorState>(
+                &display_handle,
+                2,
+                ViewportData {
+                    surface: surface.clone(),
+                },
+            )
+            .expect("source viewport resource");
+        let later_owner = client
+            .create_resource::<wp_viewport::WpViewport, ViewportData, CompositorState>(
+                &display_handle,
+                3,
+                ViewportData { surface },
+            )
+            .expect("later viewport resource");
+        let mut first = test_mergeable_commit(250);
+        first.viewport_destination = PendingViewportChange {
+            source: Some(Some(
+                ViewportSourceRect::new(0.0, 0.0, 2.5, 2.0).expect("source"),
+            )),
+            destination: Some(Some(BufferSize::new(4, 4).expect("destination"))),
+        };
+        first.viewport_error_owner = Some(source_owner.clone());
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            4,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(251);
+        second.lineage.predecessor = Some(first_ref);
+        second.viewport_destination.destination = Some(None);
+        second.viewport_error_owner = Some(later_owner);
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, second)],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        let record = state
+            .protocol_error_trace
+            .records()
+            .last()
+            .expect("cross-transaction viewport error record");
+        assert_eq!(record.resource_id, Some(source_owner.id().protocol_id()));
+        assert_eq!(record.error_code, Some(wp_viewport::Error::BadSize as u32));
+    }
+
+    #[test]
+    fn canceling_surface_retires_predecessor_and_later_projected_transaction_together() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let mut first = test_mergeable_commit(260);
+        first.viewport_destination.destination =
+            Some(Some(BufferSize::new(50, 50).expect("destination")));
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(261);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            80,
+        )));
+        state.submit_surface_tree_nodes_with_kind(
+            surface_id,
+            vec![(surface_id, second)],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected prepared buffer, got {other:?}"),
+        };
+        assert_eq!(pending.surface_size, Some(BufferSize::new(50, 50).unwrap()));
+
+        let release_before = state.buffer_release_metrics();
+        state.cancel_pending_surface_trees_for_surface(
+            surface_id,
+            AcquireWatchCancelReason::SurfaceDestroyed,
+        );
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert!(!state.current_surface_buffers.contains_key(&surface_id));
+        assert!(state.renderable_surface(surface_id).is_none());
+        let release_after = state.buffer_release_metrics();
+        assert_eq!(
+            release_after.buffer_releases_completed,
+            release_before.buffer_releases_completed + 1
+        );
+    }
+
+    #[test]
+    fn root_cancellation_discards_pending_dependents_after_topology_churn() {
+        let mut state = CompositorState::default();
+        let (_display, _client, surface_id) = test_surface_and_client(&mut state);
+        let first = test_mergeable_commit(270);
+        let first_ref = first.content_update_ref(surface_id);
+        let mut second = test_mergeable_commit(271);
+        second.lineage.predecessor = Some(first_ref);
+
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(1),
+                root_surface_id: 700,
+                nodes: vec![(surface_id, first)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+                dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(2),
+                root_surface_id: 701,
+                nodes: vec![(surface_id, second)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+                dependencies: Vec::new(),
+                external_content_update_dependencies: vec![first_ref],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+        state
+            .cancel_pending_surface_trees_for_root(700, AcquireWatchCancelReason::SurfaceDestroyed);
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+    }
 }
 
 struct ContentUpdateCandidateExtractor<'a> {
@@ -2190,6 +2581,42 @@ fn transaction_covers_content_update_ref(
     reference: ContentUpdateRef,
 ) -> bool {
     transaction_node_index_covering_content_update_ref(transaction, reference).is_some()
+}
+
+fn transaction_references_any_content_update(
+    transaction: &PendingSurfaceTreeTransaction,
+    references: &[ContentUpdateRef],
+) -> bool {
+    let references_node = |commit: &CachedSubsurfaceCommit| {
+        commit
+            .lineage
+            .predecessor
+            .is_some_and(|predecessor| references.contains(&predecessor))
+            || commit
+                .lineage
+                .child_dependencies
+                .iter()
+                .any(|dependency| references.contains(dependency))
+    };
+    transaction
+        .external_content_update_dependencies
+        .iter()
+        .any(|dependency| references.contains(dependency))
+        || transaction
+            .nodes
+            .iter()
+            .any(|(_, commit)| references_node(commit))
+}
+
+fn add_unique_content_update_ref(
+    references: &mut Vec<ContentUpdateRef>,
+    reference: ContentUpdateRef,
+) -> bool {
+    if references.contains(&reference) {
+        return false;
+    }
+    references.push(reference);
+    true
 }
 
 fn can_coalesce_pending_surface_tree_transaction(
@@ -2900,37 +3327,38 @@ impl CompositorState {
     ) -> Option<(SurfaceMappingError, Option<wp_viewport::WpViewport>)> {
         let surface = self.surface_resource_by_id(surface_id)?;
         let data = surface.data::<SurfaceData>()?;
-        let viewport_error_owner = if commit.viewport_destination.source.is_some() {
-            commit.viewport_error_owner.clone()
-        } else {
-            data.committed_viewport_error_owner()
+        let mut effective_state = match EffectiveSurfaceMappingState::from_surface(
+            data,
+            self.current_surface_buffers.get(&surface_id),
+        ) {
+            Ok(state) => state,
+            Err(error) => return Some((error, data.committed_viewport_error_owner())),
         };
-        let viewport = data.viewport_for_change(commit.viewport_destination);
-        let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
-        let buffer_transform = data.buffer_transform_for_change(commit.buffer_transform);
-        let error = match commit.attachment.as_ref() {
-            Some(PendingSurfaceAttachment::Buffer(pending)) => pending
-                .surface_size_for_state(viewport, buffer_scale, buffer_transform)
-                .err(),
-            Some(PendingSurfaceAttachment::RemoveContent) => {
-                viewport.validate_viewport_state_without_buffer().err()
+        let mut references = Vec::new();
+        if let Some(predecessor) = commit.lineage.predecessor {
+            references.push(predecessor);
+        }
+        references.extend(commit.lineage.child_dependencies.iter().copied());
+        for transaction in self.pending_surface_tree_mapping_prefix(
+            self.root_surface_id_for_surface(surface_id),
+            &references,
+        ) {
+            for (pending_surface_id, pending_commit) in &transaction.nodes {
+                if *pending_surface_id != surface_id {
+                    continue;
+                }
+                if let Err((error, viewport_error_owner)) =
+                    effective_state.apply_commit(pending_commit)
+                {
+                    debug_assert!(
+                        false,
+                        "admitted pending surface-tree mapping became invalid while projecting: {error:?}"
+                    );
+                    return Some((error, viewport_error_owner));
+                }
             }
-            None => self
-                .current_surface_buffers
-                .get(&surface_id)
-                .map(|current| {
-                    current
-                        .content_mapping_for_state(
-                            viewport,
-                            buffer_scale,
-                            buffer_transform,
-                            commit.offset,
-                        )
-                        .err()
-                })
-                .unwrap_or_else(|| viewport.validate_viewport_state_without_buffer().err()),
-        }?;
-        Some((error, viewport_error_owner))
+        }
+        effective_state.apply_commit(commit).err()
     }
 
     fn submit_surface_tree_nodes_with_kind(
@@ -2940,8 +3368,12 @@ impl CompositorState {
         external_content_update_dependencies: Vec<ContentUpdateRef>,
         submission_kind: SurfaceTreeSubmissionKind,
     ) {
-        if let Err((error_surface_id, error, viewport_error_owner)) =
-            self.validate_surface_tree_surface_state(&nodes)
+        if let Err((error_surface_id, error, viewport_error_owner)) = self
+            .validate_surface_tree_surface_state(
+                surface_id,
+                &nodes,
+                &external_content_update_dependencies,
+            )
         {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -2958,8 +3390,12 @@ impl CompositorState {
         {
             nodes = self.canonicalize_coalescible_surface_tree_nodes(nodes);
         }
-        if let Err((error_surface_id, error, viewport_error_owner)) =
-            self.prepare_surface_tree_surface_state(&mut nodes)
+        if let Err((error_surface_id, error, viewport_error_owner)) = self
+            .prepare_surface_tree_surface_state(
+                surface_id,
+                &mut nodes,
+                &external_content_update_dependencies,
+            )
         {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -3197,8 +3633,12 @@ impl CompositorState {
             dependencies,
             external_content_update_dependencies,
         );
-        if let Err((error_surface_id, error, viewport_error_owner)) =
-            self.prepare_surface_tree_surface_state(&mut transaction.nodes)
+        if let Err((error_surface_id, error, viewport_error_owner)) = self
+            .prepare_surface_tree_surface_state(
+                transaction.root_surface_id,
+                &mut transaction.nodes,
+                &transaction.external_content_update_dependencies,
+            )
         {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -3484,16 +3924,29 @@ impl CompositorState {
 
     fn validate_surface_tree_surface_state(
         &self,
+        root_surface_id: u32,
         nodes: &[(u32, CachedSubsurfaceCommit)],
+        external_content_update_dependencies: &[ContentUpdateRef],
     ) -> Result<(), (u32, SurfaceMappingError, Option<wp_viewport::WpViewport>)> {
-        self.derive_surface_tree_surface_state(nodes).map(|_| ())
+        self.derive_surface_tree_surface_state(
+            root_surface_id,
+            nodes,
+            external_content_update_dependencies,
+        )
+        .map(|_| ())
     }
 
     pub(in crate::compositor) fn prepare_surface_tree_surface_state(
         &self,
+        root_surface_id: u32,
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
+        external_content_update_dependencies: &[ContentUpdateRef],
     ) -> Result<(), (u32, SurfaceMappingError, Option<wp_viewport::WpViewport>)> {
-        let mappings = self.derive_surface_tree_surface_state(nodes)?;
+        let mappings = self.derive_surface_tree_surface_state(
+            root_surface_id,
+            nodes,
+            external_content_update_dependencies,
+        )?;
         for ((_, commit), mapping) in nodes.iter_mut().zip(mappings) {
             if let Some(mapping) = mapping {
                 let Some(PendingSurfaceAttachment::Buffer(pending)) = commit.attachment.as_mut()
@@ -3509,13 +3962,15 @@ impl CompositorState {
 
     fn derive_surface_tree_surface_state(
         &self,
+        root_surface_id: u32,
         nodes: &[(u32, CachedSubsurfaceCommit)],
+        external_content_update_dependencies: &[ContentUpdateRef],
     ) -> Result<
         Vec<Option<SurfaceContentMapping>>,
         (u32, SurfaceMappingError, Option<wp_viewport::WpViewport>),
     > {
         let mut effective_states = HashMap::new();
-        let mut mappings = Vec::with_capacity(nodes.len());
+        let mut references = external_content_update_dependencies.to_vec();
         for (surface_id, commit) in nodes {
             if !effective_states.contains_key(surface_id) {
                 let initial = match self.surface_resource_by_id(*surface_id) {
@@ -3537,6 +3992,27 @@ impl CompositorState {
                 };
                 effective_states.insert(*surface_id, initial);
             }
+            if let Some(predecessor) = commit.lineage.predecessor {
+                references.push(predecessor);
+            }
+            references.extend(commit.lineage.child_dependencies.iter().copied());
+        }
+        for transaction in self.pending_surface_tree_mapping_prefix(root_surface_id, &references) {
+            for (surface_id, commit) in &transaction.nodes {
+                let Some(effective_state) = effective_states.get_mut(surface_id) else {
+                    continue;
+                };
+                if let Err((error, viewport_error_owner)) = effective_state.apply_commit(commit) {
+                    debug_assert!(
+                        false,
+                        "admitted pending surface-tree mapping became invalid while projecting: {error:?}"
+                    );
+                    return Err((*surface_id, error, viewport_error_owner));
+                }
+            }
+        }
+        let mut mappings = Vec::with_capacity(nodes.len());
+        for (surface_id, commit) in nodes {
             let mapping = effective_states
                 .get_mut(surface_id)
                 .expect("effective state inserted above")
@@ -3549,6 +4025,145 @@ impl CompositorState {
             }
         }
         Ok(mappings)
+    }
+
+    fn pending_surface_tree_mapping_prefix<'a>(
+        &'a self,
+        root_surface_id: u32,
+        candidate_references: &[ContentUpdateRef],
+    ) -> Vec<&'a PendingSurfaceTreeTransaction> {
+        let transactions = &self.pending_surface_tree_transactions;
+        let mut selected = vec![false; transactions.len()];
+        for (index, transaction) in transactions.iter().enumerate() {
+            if transaction.root_surface_id == root_surface_id {
+                selected[index] = true;
+            }
+        }
+
+        let mut references = Vec::new();
+        for reference in candidate_references {
+            add_unique_content_update_ref(&mut references, *reference);
+        }
+
+        let mut next_reference = 0;
+        loop {
+            while let Some(reference) = references.get(next_reference).copied() {
+                next_reference += 1;
+                if let Some(index) = transactions.iter().position(|transaction| {
+                    transaction_covers_content_update_ref(transaction, reference)
+                }) {
+                    selected[index] = true;
+                }
+            }
+
+            let mut changed = false;
+            for index in 0..transactions.len() {
+                if !selected[index] {
+                    continue;
+                }
+                let transaction = &transactions[index];
+                for prior_index in 0..index {
+                    if transactions[prior_index].root_surface_id == transaction.root_surface_id
+                        && !selected[prior_index]
+                    {
+                        selected[prior_index] = true;
+                        changed = true;
+                    }
+                }
+                for dependency in &transaction.external_content_update_dependencies {
+                    changed |= add_unique_content_update_ref(&mut references, *dependency);
+                }
+                for (_, commit) in &transaction.nodes {
+                    if let Some(predecessor) = commit.lineage.predecessor {
+                        changed |= add_unique_content_update_ref(&mut references, predecessor);
+                    }
+                    for dependency in &commit.lineage.child_dependencies {
+                        changed |= add_unique_content_update_ref(&mut references, *dependency);
+                    }
+                }
+            }
+            if !changed && next_reference >= references.len() {
+                break;
+            }
+        }
+
+        let selected_indices = selected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| selected.then_some(index))
+            .collect::<Vec<_>>();
+        if selected_indices.len() < 2 {
+            return selected_indices
+                .into_iter()
+                .map(|index| &transactions[index])
+                .collect();
+        }
+
+        let mut indegree = vec![0usize; transactions.len()];
+        let mut successors = vec![Vec::new(); transactions.len()];
+        let mut add_edge = |predecessor: usize, dependent: usize| {
+            if predecessor == dependent || successors[predecessor].contains(&dependent) {
+                return;
+            }
+            successors[predecessor].push(dependent);
+            indegree[dependent] = indegree[dependent].saturating_add(1);
+        };
+        for dependent in selected_indices.iter().copied() {
+            for predecessor in selected_indices.iter().copied() {
+                if predecessor < dependent
+                    && transactions[predecessor].root_surface_id
+                        == transactions[dependent].root_surface_id
+                {
+                    add_edge(predecessor, dependent);
+                }
+            }
+            let transaction = &transactions[dependent];
+            let mut transaction_references = Vec::new();
+            transaction_references.extend(
+                transaction
+                    .external_content_update_dependencies
+                    .iter()
+                    .copied(),
+            );
+            for (_, commit) in &transaction.nodes {
+                if let Some(predecessor) = commit.lineage.predecessor {
+                    transaction_references.push(predecessor);
+                }
+                transaction_references.extend(commit.lineage.child_dependencies.iter().copied());
+            }
+            for reference in transaction_references {
+                if let Some(predecessor) = selected_indices.iter().copied().find(|index| {
+                    transaction_covers_content_update_ref(&transactions[*index], reference)
+                }) {
+                    add_edge(predecessor, dependent);
+                }
+            }
+        }
+
+        let mut emitted = vec![false; transactions.len()];
+        let mut order = Vec::with_capacity(selected_indices.len());
+        for _ in 0..selected_indices.len() {
+            let Some(next) = selected_indices
+                .iter()
+                .copied()
+                .find(|index| !emitted[*index] && indegree[*index] == 0)
+            else {
+                debug_assert!(false, "surface-tree pending transaction ordering cycle");
+                return selected_indices
+                    .into_iter()
+                    .map(|index| &transactions[index])
+                    .collect();
+            };
+            emitted[next] = true;
+            order.push(next);
+            for successor in &successors[next] {
+                indegree[*successor] = indegree[*successor].saturating_sub(1);
+            }
+        }
+        order
+            .into_iter()
+            .map(|index| &transactions[index])
+            .collect()
     }
 
     pub(in crate::compositor) fn post_surface_mapping_error(
@@ -4113,6 +4728,7 @@ impl CompositorState {
         reason: AcquireWatchCancelReason,
     ) -> ReleasedSurfaceTreeState {
         let mut retained = Vec::new();
+        let mut canceled_refs = Vec::new();
         let mut pacing_deadline_changed = false;
         let mut released = ReleasedSurfaceTreeState {
             callbacks: Vec::new(),
@@ -4120,6 +4736,12 @@ impl CompositorState {
         };
         for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
             if transaction.root_surface_id == root_surface_id {
+                canceled_refs.extend(
+                    transaction
+                        .nodes
+                        .iter()
+                        .map(|(surface_id, commit)| commit.content_update_ref(*surface_id)),
+                );
                 pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
                 let transaction =
                     self.release_pending_surface_tree_transaction(transaction, reason);
@@ -4138,6 +4760,10 @@ impl CompositorState {
             }
         }
         self.pending_surface_tree_transactions = retained;
+        let (callbacks, dependent_pacing_deadline_changed) =
+            self.cancel_pending_surface_tree_dependents(canceled_refs, reason);
+        pacing_deadline_changed |= dependent_pacing_deadline_changed;
+        released.callbacks.extend(callbacks);
         if pacing_deadline_changed {
             self.invalidate_surface_pacing_deadline_cache();
         }
@@ -4151,6 +4777,7 @@ impl CompositorState {
         reason: AcquireWatchCancelReason,
     ) {
         let mut retained = Vec::new();
+        let mut canceled_refs = Vec::new();
         let mut pacing_deadline_changed = false;
         let mut callbacks = Vec::new();
         for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
@@ -4159,6 +4786,11 @@ impl CompositorState {
                 .iter()
                 .any(|(node_surface_id, _)| *node_surface_id == surface_id)
             {
+                canceled_refs.extend(
+                    transaction.nodes.iter().map(|(node_surface_id, commit)| {
+                        commit.content_update_ref(*node_surface_id)
+                    }),
+                );
                 pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
                 let root_surface_id = transaction.root_surface_id;
                 let released = self.release_pending_surface_tree_transaction(transaction, reason);
@@ -4171,11 +4803,108 @@ impl CompositorState {
             }
         }
         self.pending_surface_tree_transactions = retained;
+        let (dependent_callbacks, dependent_pacing_deadline_changed) =
+            self.cancel_pending_surface_tree_dependents(canceled_refs, reason);
+        pacing_deadline_changed |= dependent_pacing_deadline_changed;
+        callbacks.extend(dependent_callbacks);
         if pacing_deadline_changed {
             self.invalidate_surface_pacing_deadline_cache();
         }
         self.rebuild_scene_work_index();
         self.complete_frame_callbacks(callbacks);
+    }
+
+    fn cancel_pending_surface_tree_dependents(
+        &mut self,
+        canceled_refs: Vec<ContentUpdateRef>,
+        reason: AcquireWatchCancelReason,
+    ) -> (Vec<wl_callback::WlCallback>, bool) {
+        let mut canceled_refs = canceled_refs;
+        let mut callbacks = Vec::new();
+        let mut pacing_deadline_changed = false;
+        loop {
+            let mut retained = Vec::new();
+            let mut newly_canceled_refs = Vec::new();
+            for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
+                if transaction_references_any_content_update(&transaction, &canceled_refs) {
+                    newly_canceled_refs.extend(
+                        transaction
+                            .nodes
+                            .iter()
+                            .map(|(surface_id, commit)| commit.content_update_ref(*surface_id)),
+                    );
+                    pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
+                    let root_surface_id = transaction.root_surface_id;
+                    let released =
+                        self.release_pending_surface_tree_transaction(transaction, reason);
+                    callbacks.extend(released.callbacks);
+                    if let Some(resize_commit) = released.resize_commit {
+                        self.release_detached_resize_capture(root_surface_id, resize_commit);
+                    }
+                } else {
+                    retained.push(transaction);
+                }
+            }
+            self.pending_surface_tree_transactions = retained;
+            if newly_canceled_refs.is_empty() {
+                break;
+            }
+            canceled_refs.extend(newly_canceled_refs);
+        }
+        (callbacks, pacing_deadline_changed)
+    }
+
+    pub(in crate::compositor) fn discard_surface_tree_dependents_from_queue(
+        &mut self,
+        transactions: &mut Vec<PendingSurfaceTreeTransaction>,
+        canceled_root_surface_id: u32,
+        canceled_refs: Vec<ContentUpdateRef>,
+        decision: SurfacePublicationDecision,
+    ) -> bool {
+        let mut canceled_roots = vec![canceled_root_surface_id];
+        let mut canceled_refs = canceled_refs;
+        let mut pacing_deadline_changed = false;
+        loop {
+            let mut retained = Vec::new();
+            let mut newly_canceled_roots = Vec::new();
+            let mut newly_canceled_refs = Vec::new();
+            for transaction in std::mem::take(transactions) {
+                if canceled_roots.contains(&transaction.root_surface_id)
+                    || transaction_references_any_content_update(&transaction, &canceled_refs)
+                {
+                    newly_canceled_roots.push(transaction.root_surface_id);
+                    newly_canceled_refs.extend(
+                        transaction
+                            .nodes
+                            .iter()
+                            .map(|(surface_id, commit)| commit.content_update_ref(*surface_id)),
+                    );
+                    pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
+                    let root_surface_id = transaction.root_surface_id;
+                    let released = self.release_pending_surface_tree_transaction(
+                        transaction,
+                        AcquireWatchCancelReason::SurfaceDestroyed,
+                    );
+                    if let Some(resize_commit) = released.resize_commit {
+                        self.release_detached_resize_capture(root_surface_id, resize_commit);
+                    }
+                    if decision == SurfacePublicationDecision::TerminalClient {
+                        self.discard_frame_callbacks(released.callbacks);
+                    } else {
+                        self.complete_frame_callbacks(released.callbacks);
+                    }
+                } else {
+                    retained.push(transaction);
+                }
+            }
+            *transactions = retained;
+            if newly_canceled_roots.is_empty() && newly_canceled_refs.is_empty() {
+                break;
+            }
+            canceled_roots.extend(newly_canceled_roots);
+            canceled_refs.extend(newly_canceled_refs);
+        }
+        pacing_deadline_changed
     }
 
     pub(in crate::compositor) fn release_pending_surface_tree_transaction(
