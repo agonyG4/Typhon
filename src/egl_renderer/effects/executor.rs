@@ -3582,8 +3582,6 @@ fn full_output_rect(size: (u32, u32)) -> OutputRect {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SceneWorkRegions {
-    presentation_work: Vec<OutputRect>,
-    framebuffer_checkpoint_work: Vec<OutputRect>,
     scene_work_rects: Vec<OutputRect>,
     extra_scene_work: Vec<OutputRect>,
 }
@@ -3645,8 +3643,6 @@ fn scene_work_regions(
         extra_scene_work.extend(fragments);
     }
     SceneWorkRegions {
-        presentation_work,
-        framebuffer_checkpoint_work: checkpoint_work,
         scene_work_rects,
         extra_scene_work,
     }

@@ -19,6 +19,8 @@ pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;
 #[cfg(test)]
 pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_SHADER;
 #[cfg(test)]
+pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
+#[cfg(test)]
 pub(crate) use executor::{
     SceneCaptureMaterializationPolicy, execute_effect_graph_with_debug_config,
     execute_effect_graph_with_debug_config_and_materialization_policy,
