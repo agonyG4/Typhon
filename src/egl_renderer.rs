@@ -7910,6 +7910,114 @@ mod tests {
     }
 
     #[test]
+    fn native_faithful_stacked_dock_checkpoint_replay_partial_matches_full_current_reference() {
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).expect("native output bounds");
+        let a = NativeStackedBackdropEffectSpec {
+            id: 1,
+            target_bounds: EffectRect::new(90, 144, 952, 889).expect("native A bounds"),
+            anchor: oblivion_one::compositor::EffectAnchor::BeforeSurface(11),
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            visual_group: Some(VisualGroupId::new(11).expect("native A visual group")),
+            scene_order: oblivion_one::compositor::EffectSceneOrder {
+                group_order: 1,
+                surface_order: 0,
+                phase: 0,
+            },
+        };
+        let b = NativeStackedBackdropEffectSpec {
+            id: 2,
+            target_bounds: EffectRect::new(786, 1000, 348, 56).expect("native B bounds"),
+            anchor: oblivion_one::compositor::EffectAnchor::BeforeSurface(7),
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
+            visual_group: Some(VisualGroupId::new(7).expect("native B visual group")),
+            scene_order: oblivion_one::compositor::EffectSceneOrder {
+                group_order: 2,
+                surface_order: 0,
+                phase: 0,
+            },
+        };
+        let (scene, registry) = native_stacked_backdrop_scene(a, b, 4.0, 2, 1.0);
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            output_bounds,
+            &registry,
+        )
+        .expect("native Dock graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("native Dock graph must compile to an effect graph");
+        };
+        let captures = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .collect::<Vec<_>>();
+        assert_eq!(captures.len(), 2);
+        let checkpoint = captures
+            .iter()
+            .find(|pass| !pass.checkpoint_dependencies.is_empty())
+            .expect("native Dock B checkpoint dependency");
+        assert_eq!(checkpoint.checkpoint_dependencies.len(), 1);
+    }
+
+    #[test]
+    fn native_faithful_topbar_checkpoint_replay_partial_matches_full_current_reference() {
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).expect("native output bounds");
+        let a = NativeStackedBackdropEffectSpec {
+            id: 11,
+            target_bounds: EffectRect::new(0, 100, 240, 120).expect("native TopBar A bounds"),
+            anchor: oblivion_one::compositor::EffectAnchor::BeforeSurface(11),
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            visual_group: Some(VisualGroupId::new(11).expect("native TopBar A group")),
+            scene_order: oblivion_one::compositor::EffectSceneOrder {
+                group_order: 1,
+                surface_order: 0,
+                phase: 0,
+            },
+        };
+        let b = NativeStackedBackdropEffectSpec {
+            id: 12,
+            target_bounds: EffectRect::new(24, 24, 72, 17).expect("native TopBar B bounds"),
+            anchor: oblivion_one::compositor::EffectAnchor::BeforeSurface(13),
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
+            visual_group: Some(VisualGroupId::new(13).expect("native TopBar B group")),
+            scene_order: oblivion_one::compositor::EffectSceneOrder {
+                group_order: 2,
+                surface_order: 0,
+                phase: 0,
+            },
+        };
+        let (scene, registry) = native_stacked_backdrop_scene(a, b, 4.0, 2, 1.0);
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            output_bounds,
+            &registry,
+        )
+        .expect("native TopBar graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("native TopBar graph must compile to an effect graph");
+        };
+        let checkpoint = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .expect("native TopBar B checkpoint dependency");
+        let checkpoint_texture = graph
+            .textures
+            .iter()
+            .find(|texture| Some(texture.id) == checkpoint.output)
+            .expect("native TopBar checkpoint texture");
+        assert_eq!(
+            checkpoint_texture.domain,
+            EffectRect::new(0, 0, 120, 65).expect("native TopBar checkpoint domain")
+        );
+    }
+
+    #[test]
     fn stacked_checkpoint_replay_partial_matches_full_current_reference() {
         let output_size = (1920, 1080);
         let output_bounds =
