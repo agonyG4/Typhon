@@ -49,6 +49,31 @@ fn fullscreen_identity_viewport_xrgb_dmabuf_is_direct_scanout_candidate() {
 }
 
 #[test]
+fn fullscreen_identity_viewport_xbgr_dmabuf_is_direct_scanout_candidate() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_dmabuf_feedback(
+        crate::render_backend::egl_gles::EglGlesDmabufFeedback::from_formats([
+            crate::render_backend::egl_gles::EglGlesDmabufFormat::new(
+                DrmFormat::Xbgr8888,
+                crate::render_backend::buffer::DrmModifier::LINEAR,
+            ),
+        ]),
+        None,
+        None,
+    );
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_fullscreen_identity_viewport_xbgr_dmabuf(&socket_path, &commands).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    let candidate = capture_direct_scanout_candidate(&commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(candidate.format, DrmFormat::Xbgr8888);
+}
+
+#[test]
 fn output_sized_normal_window_is_not_fullscreen_but_is_scene_candidate() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -89,7 +114,7 @@ fn output_sized_argb_dmabuf_is_not_an_opaque_scanout_candidate() {
     );
     assert_eq!(
         capture_direct_scanout_candidate(&commands),
-        Err(DirectScanoutSceneRejection::FormatNotOpaqueXrgb8888)
+        Err(DirectScanoutSceneRejection::FormatNotProvenOpaque)
     );
 
     let _server = stop_controllable_test_server(commands, server_thread);

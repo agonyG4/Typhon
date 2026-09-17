@@ -473,11 +473,16 @@ mod tests {
     use super::*;
     use std::{os::fd::OwnedFd, sync::Mutex};
 
+    use oblivion_one::render_backend::buffer::{
+        BufferSize, DmabufPlane, DmabufPlaneDescriptor,
+    };
+
     #[derive(Default)]
     struct FakeIo {
         next_handle: Mutex<u32>,
         next_fb: Mutex<u32>,
         events: Mutex<Vec<String>>,
+        formats: Mutex<Vec<u32>>,
         fail_prime: Mutex<bool>,
         fail_add: Mutex<bool>,
     }
@@ -494,13 +499,14 @@ mod tests {
 
         fn add_framebuffer(
             &self,
-            _descriptor: &ExplicitFramebufferDescriptor,
+            descriptor: &ExplicitFramebufferDescriptor,
         ) -> io::Result<FramebufferId> {
             if *self.fail_add.lock().unwrap() {
                 return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
             let mut next = self.next_fb.lock().unwrap();
             *next = next.saturating_add(1).max(1);
+            self.formats.lock().unwrap().push(descriptor.format());
             self.events.lock().unwrap().push("add_fb".into());
             Ok(FramebufferId::new(*next).unwrap())
         }
@@ -532,6 +538,94 @@ mod tests {
             )],
         )
         .unwrap()
+    }
+
+    fn validation_buffer(
+        format: DrmFormat,
+        descriptors: &[DmabufPlaneDescriptor],
+    ) -> DmabufBufferHandle {
+        DmabufBufferHandle::new(
+            BufferSize::new(4, 4).unwrap(),
+            format,
+            descriptors
+                .iter()
+                .map(|descriptor| {
+                    DmabufPlane::new(
+                        OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+                        *descriptor,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn valid_descriptor(plane_index: u32) -> DmabufPlaneDescriptor {
+        DmabufPlaneDescriptor {
+            plane_index,
+            offset: 0,
+            stride: 16,
+            modifier: DrmModifier::LINEAR,
+        }
+    }
+
+    #[test]
+    fn valid_xbgr8888_direct_import_passes_structural_validation() {
+        let buffer = validation_buffer(DrmFormat::Xbgr8888, &[valid_descriptor(0)]);
+
+        validate_direct_dma_buf(&buffer).expect("valid XBGR8888 direct buffer");
+    }
+
+    #[test]
+    fn xbgr8888_direct_import_rejects_invalid_layout_metadata() {
+        let mut too_small_stride = valid_descriptor(0);
+        too_small_stride.stride = 15;
+        assert!(validate_direct_dma_buf(&validation_buffer(
+            DrmFormat::Xbgr8888,
+            &[too_small_stride],
+        ))
+        .is_err());
+
+        let mut nonzero_offset = valid_descriptor(0);
+        nonzero_offset.offset = 4;
+        assert!(validate_direct_dma_buf(&validation_buffer(
+            DrmFormat::Xbgr8888,
+            &[nonzero_offset],
+        ))
+        .is_err());
+
+        let mut invalid_modifier = valid_descriptor(0);
+        invalid_modifier.modifier = DrmModifier::INVALID;
+        assert!(validate_direct_dma_buf(&validation_buffer(
+            DrmFormat::Xbgr8888,
+            &[invalid_modifier],
+        ))
+        .is_err());
+
+        assert!(validate_direct_dma_buf(&validation_buffer(
+            DrmFormat::Xbgr8888,
+            &[valid_descriptor(0), valid_descriptor(1)],
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn xbgr8888_framebuffer_import_preserves_exact_fourcc() {
+        let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+        let identity = ids.allocate().unwrap();
+        let buffer = validation_buffer(DrmFormat::Xbgr8888, &[valid_descriptor(0)]);
+        let io = Arc::new(FakeIo::default());
+
+        let imported = ImportedDirectFramebuffer::import(
+            io.clone(),
+            Arc::new(AtomicU64::new(0)),
+            &identity,
+            &buffer,
+        )
+        .unwrap();
+
+        assert_eq!(imported.format, DrmFormat::XBGR8888_FOURCC);
+        assert_eq!(io.formats.lock().unwrap().as_slice(), &[DrmFormat::XBGR8888_FOURCC]);
     }
 
     #[test]

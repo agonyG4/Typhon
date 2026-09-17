@@ -887,6 +887,24 @@ pub(in crate::compositor::tests) fn create_test_dmabuf_buffer_with_size(
     width: i32,
     height: i32,
 ) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
+    create_test_dmabuf_buffer_with_format(
+        dmabuf,
+        qh,
+        pixel,
+        width,
+        height,
+        DrmFormat::ARGB8888_FOURCC,
+    )
+}
+
+fn create_test_dmabuf_buffer_with_format(
+    dmabuf: &client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<RegistryTestState>,
+    pixel: u32,
+    width: i32,
+    height: i32,
+    format: u32,
+) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
     let pixels = vec![pixel; usize::try_from(width.saturating_mul(height))?];
     let file = create_test_shm_file(&pixels)?;
     let stride = u32::try_from(width.saturating_mul(4))?;
@@ -895,7 +913,7 @@ pub(in crate::compositor::tests) fn create_test_dmabuf_buffer_with_size(
     Ok(params.create_immed(
         width,
         height,
-        DRM_FORMAT_ARGB8888,
+        format,
         client_zwp_linux_buffer_params_v1::Flags::empty(),
         qh,
         (),
@@ -909,19 +927,31 @@ pub(in crate::compositor::tests) fn create_test_xrgb_dmabuf_buffer_with_size(
     width: i32,
     height: i32,
 ) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
-    let pixels = vec![pixel; usize::try_from(width.saturating_mul(height))?];
-    let file = create_test_shm_file(&pixels)?;
-    let stride = u32::try_from(width.saturating_mul(4))?;
-    let params = dmabuf.create_params(qh, ());
-    params.add(file.as_fd(), 0, 0, stride, 0, 0);
-    Ok(params.create_immed(
+    create_test_dmabuf_buffer_with_format(
+        dmabuf,
+        qh,
+        pixel,
         width,
         height,
         DrmFormat::XRGB8888_FOURCC,
-        client_zwp_linux_buffer_params_v1::Flags::empty(),
+    )
+}
+
+pub(in crate::compositor::tests) fn create_test_xbgr_dmabuf_buffer_with_size(
+    dmabuf: &client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<RegistryTestState>,
+    pixel: u32,
+    width: i32,
+    height: i32,
+) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
+    create_test_dmabuf_buffer_with_format(
+        dmabuf,
         qh,
-        (),
-    ))
+        pixel,
+        width,
+        height,
+        DrmFormat::XBGR8888_FOURCC,
+    )
 }
 
 pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dmabuf(
@@ -934,7 +964,7 @@ pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dma
         Some((0.0, 0.0, 1280.0, 800.0)),
         Some((1280, 800)),
         true,
-        true,
+        DrmFormat::XRGB8888_FOURCC,
     )
 }
 
@@ -948,7 +978,7 @@ pub(in crate::compositor::tests) fn create_normal_identity_viewport_xrgb_dmabuf(
         Some((0.0, 0.0, 1280.0, 800.0)),
         Some((1280, 800)),
         false,
-        true,
+        DrmFormat::XRGB8888_FOURCC,
     )
 }
 
@@ -962,7 +992,7 @@ pub(in crate::compositor::tests) fn create_normal_identity_viewport_argb_dmabuf(
         Some((0.0, 0.0, 1280.0, 800.0)),
         Some((1280, 800)),
         false,
-        false,
+        DrmFormat::ARGB8888_FOURCC,
     )
 }
 
@@ -972,7 +1002,28 @@ pub(in crate::compositor::tests) fn create_fullscreen_viewport_xrgb_dmabuf(
     source: Option<(f64, f64, f64, f64)>,
     destination: Option<(i32, i32)>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
-    create_viewport_dmabuf(socket_path, commands, source, destination, true, true)
+    create_viewport_dmabuf(
+        socket_path,
+        commands,
+        source,
+        destination,
+        true,
+        DrmFormat::XRGB8888_FOURCC,
+    )
+}
+
+pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xbgr_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_viewport_dmabuf(
+        socket_path,
+        commands,
+        Some((0.0, 0.0, 1280.0, 800.0)),
+        Some((1280, 800)),
+        true,
+        DrmFormat::XBGR8888_FOURCC,
+    )
 }
 
 fn create_viewport_dmabuf(
@@ -981,7 +1032,7 @@ fn create_viewport_dmabuf(
     source: Option<(f64, f64, f64, f64)>,
     destination: Option<(i32, i32)>,
     fullscreen: bool,
-    xrgb: bool,
+    format: u32,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
@@ -1012,11 +1063,14 @@ fn create_viewport_dmabuf(
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
-    let buffer = if xrgb {
-        create_test_xrgb_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_4466, width, height)?
-    } else {
-        create_test_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_4466, width, height)?
-    };
+    let buffer = create_test_dmabuf_buffer_with_format(
+        &dmabuf,
+        &qh,
+        0xff22_4466,
+        width,
+        height,
+        format,
+    )?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width, height);
     surface.commit();

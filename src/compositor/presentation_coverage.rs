@@ -315,7 +315,7 @@ mod tests {
             |root| layers.contains(&root),
             |surface, _target| {
                 if surface.surface_id == 10 {
-                    PresentationCoverageOpacity::OpaqueXrgb8888
+            PresentationCoverageOpacity::OpaqueRgb8888
                 } else {
                     PresentationCoverageOpacity::Unknown
                 }
@@ -341,7 +341,7 @@ mod tests {
                 surface_details: vec![PresentationCoverageSurface {
                     surface_id: 10,
                     target: SurfaceTargetRect::new(0, 0, 1280, 800),
-                    opacity: PresentationCoverageOpacity::OpaqueXrgb8888,
+                    opacity: PresentationCoverageOpacity::OpaqueRgb8888,
                     backend: SurfaceRenderBackend::NativeWayland,
                     buffer_source: SurfaceBufferSource::Shm,
                     format: None,
@@ -349,7 +349,7 @@ mod tests {
                 covering_surface: Some(PresentationCoverageSurface {
                     surface_id: 10,
                     target: SurfaceTargetRect::new(0, 0, 1280, 800),
-                    opacity: PresentationCoverageOpacity::OpaqueXrgb8888,
+                    opacity: PresentationCoverageOpacity::OpaqueRgb8888,
                     backend: SurfaceRenderBackend::NativeWayland,
                     buffer_source: SurfaceBufferSource::Shm,
                     format: None,
@@ -405,7 +405,7 @@ mod tests {
             |_| false,
             |surface, _target| {
                 if surface.surface_id == 11 {
-                    PresentationCoverageOpacity::OpaqueXrgb8888
+                    PresentationCoverageOpacity::OpaqueRgb8888
                 } else {
                     PresentationCoverageOpacity::Unknown
                 }
@@ -454,7 +454,7 @@ mod tests {
             |root| root == 50,
             |surface, _target| {
                 if surface.surface_id == 10 {
-                    PresentationCoverageOpacity::OpaqueXrgb8888
+                    PresentationCoverageOpacity::OpaqueRgb8888
                 } else {
                     PresentationCoverageOpacity::Unknown
                 }
@@ -525,7 +525,7 @@ mod tests {
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 10,
             |_| false,
-            |_, _| PresentationCoverageOpacity::OpaqueXrgb8888,
+            |_, _| PresentationCoverageOpacity::OpaqueRgb8888,
         );
 
         assert_eq!(

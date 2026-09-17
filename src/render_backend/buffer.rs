@@ -483,6 +483,12 @@ mod identity_tests {
             vec![0],
             DrmFormat::Xrgb8888,
         );
+        let xbgr = CommittedSurfaceBuffer::shm_snapshot_with_format(
+            allocator.allocate().expect("xbgr identity"),
+            size,
+            vec![0],
+            DrmFormat::Xbgr8888,
+        );
         let other = CommittedSurfaceBuffer::shm_snapshot_with_format(
             allocator.allocate().expect("other identity"),
             size,
@@ -498,8 +504,28 @@ mod identity_tests {
             crate::blur_policy::SurfaceAlphaCapability::Opaque
         );
         assert_eq!(
+            xbgr.alpha_capability(),
+            crate::blur_policy::SurfaceAlphaCapability::Opaque
+        );
+        assert_eq!(
             other.alpha_capability(),
             crate::blur_policy::SurfaceAlphaCapability::Unknown
         );
+    }
+
+    #[test]
+    fn drm_format_roundtrips_explicit_opaque_rgb8888_formats() {
+        let xrgb = u32::from_le_bytes(*b"XR24");
+        let xbgr = u32::from_le_bytes(*b"XB24");
+
+        assert_eq!(DrmFormat::from_fourcc(xrgb), DrmFormat::Xrgb8888);
+        assert_eq!(DrmFormat::from_fourcc(xbgr), DrmFormat::Xbgr8888);
+        assert_ne!(DrmFormat::from_fourcc(xrgb), DrmFormat::from_fourcc(xbgr));
+        assert_eq!(DrmFormat::Xrgb8888.as_fourcc(), xrgb);
+        assert_eq!(DrmFormat::Xbgr8888.as_fourcc(), xbgr);
+        assert!(DrmFormat::Xrgb8888.is_opaque_rgb8888());
+        assert!(DrmFormat::Xbgr8888.is_opaque_rgb8888());
+        assert!(!DrmFormat::Argb8888.is_opaque_rgb8888());
+        assert!(!DrmFormat::Other(xbgr).is_opaque_rgb8888());
     }
 }
