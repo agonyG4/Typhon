@@ -88,9 +88,15 @@ prerequisite status is:
   deliberately not duplicated.
 * **ActiveScene identity projection:** implemented through derived canonical
   node references while preserving existing surface-based APIs and ordering.
-* **Frame-level SceneNode evidence:** still missing.
+* **Immutable frame-level SceneNode evidence:** implemented. Native frame
+  resolution freezes the ordered surface/node pairing, server-decoration node
+  metadata, and client-cursor node metadata in the existing native scene
+  snapshot package.
+* **Physical SceneNode promotion contract:** implemented. `NativeSceneHistory`
+  promotes the exact frozen evidence on immediate/pageflip promotion and does
+  not reconstruct identity from current compositor state.
 * **Presentation Engine v2:** still gated; it must wait for the scene-node
-  frame-evidence and physical-presentation foundations.
+  transaction/revision and sample foundations.
 
 Typhon remains a single-output product. This internal `OutputId` foundation
 does not add hotplug, multi-output layout, or a multi-output product model.
@@ -159,8 +165,10 @@ they do not each apply a root transform independently.
    its existing surface-based APIs and ordering while exposing derived
    canonical node mappings without changing layout, configure, X11 geometry,
    or buffer ownership semantics.
-5. Add immutable frame-level SceneNode evidence and the physical promotion
-   contract before implementing sparse presentation state.
+5. **Completed — immutable frame-level SceneNode evidence and physical
+   promotion.** Native frame snapshots carry exact canonical node identity for
+   surfaces, server decorations, and client cursors; `NativeSceneHistory`
+   remains the sole physical promotion authority.
 
 ### Phase 2 — frame and physical contracts
 

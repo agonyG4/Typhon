@@ -1,7 +1,7 @@
 # Typhon Scene Identity and Canonical Visual Topology Foundation
 
 Date: 2026-09-16
-Status: approved design; implementation in progress
+Status: implemented and verified on the current repository baseline
 
 ## Decision
 
@@ -19,9 +19,9 @@ tree and not a second physical-presentation authority.
 Implementation starts from:
 
 ```text
-HEAD: 88987138b5776fd0b2f1f9c9b30eac849353c3fa
+HEAD: 14e955dd (Phase 2A frame-identity implementation and tests)
 Codebase Memory: home-agony-GitHub-Typhon, indexed and ready
-Graph: 27,630 nodes / 198,247 edges
+Graph: 27,994 nodes / 201,333 edges (current index status)
 Source-layout baseline: 53 diagnostics
 ```
 
@@ -165,4 +165,3 @@ visual-parent mutations are cycle-safe and reverse-indexed, parent removal
 cannot leave dangling references, WindowGroup identity survives XWayland root
 replacement, existing stacking and renderer paths remain authoritative, and
 metadata-only changes do not advance render generations or schedule work.
-
