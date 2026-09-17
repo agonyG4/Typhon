@@ -1855,17 +1855,6 @@ impl PendingSurfaceBuffer {
         .ok_or(SurfaceMappingError::InvalidBufferSize)
     }
 
-    pub(super) fn apply_committed_surface_state(
-        &mut self,
-        viewport: SurfaceViewportCommit,
-        buffer_scale: u32,
-        buffer_transform: wl_output::Transform,
-    ) -> Result<(), SurfaceMappingError> {
-        let mapping = self.content_mapping_for_state(viewport, buffer_scale, buffer_transform)?;
-        self.apply_content_mapping(mapping);
-        Ok(())
-    }
-
     pub(super) fn content_mapping_for_state(
         &self,
         viewport: SurfaceViewportCommit,

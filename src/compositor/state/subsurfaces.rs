@@ -13,6 +13,9 @@ struct PreparedContentUpdateCandidate {
     external_content_update_dependencies: Vec<ContentUpdateRef>,
 }
 
+type SurfaceMappingProjection =
+    Result<Option<SurfaceContentMapping>, (SurfaceMappingError, Option<wp_viewport::WpViewport>)>;
+
 #[derive(Debug, Clone, Copy)]
 enum EffectiveContentState {
     Retained(BufferSize),
@@ -118,6 +121,7 @@ mod tests {
     use crate::compositor::state_data::{PendingViewportChange, ViewportSourceRect};
     use crate::render_backend::buffer::BufferSize;
     use wayland_protocols::wp::viewporter::server::wp_viewport;
+    use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel};
 
     fn test_mergeable_commit(sequence: u64) -> CachedSubsurfaceCommit {
         let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
@@ -263,6 +267,68 @@ mod tests {
                 ..SurfacePublicationState::default()
             },
         );
+    }
+
+    fn install_test_resize_capture(
+        state: &mut CompositorState,
+        client: &wayland_server::Client,
+        display_handle: &wayland_server::DisplayHandle,
+        surface_id: u32,
+    ) {
+        let surface = state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .clone();
+        let xdg_surface = client
+            .create_resource::<xdg_surface::XdgSurface, XdgSurfaceData, CompositorState>(
+                display_handle,
+                20,
+                XdgSurfaceData {
+                    surface: surface.clone(),
+                    reservation: XdgAssociationReservation::Fresh,
+                },
+            )
+            .expect("test xdg surface resource");
+        let toplevel = client
+            .create_resource::<xdg_toplevel::XdgToplevel, XdgToplevelData, CompositorState>(
+                display_handle,
+                21,
+                XdgToplevelData { surface },
+            )
+            .expect("test xdg toplevel resource");
+        let window_id = WindowId::from_raw(1).expect("test window id");
+        state.toplevel_surfaces.insert(
+            surface_id,
+            ToplevelSurface {
+                window_id,
+                xdg_surface,
+                toplevel,
+                pending_constraints: None,
+                wm_capabilities_sent: false,
+            },
+        );
+        let interaction_id = ResizeInteractionId::new(1);
+        state.active_toplevel_resizes.insert(
+            surface_id,
+            ActiveToplevelResize {
+                interaction_id,
+                flow_sequence: 1,
+                edges: ResizeEdges::BOTTOM_RIGHT,
+                activated_at: Instant::now(),
+            },
+        );
+        let desired = PendingResizeConfigure {
+            surface_id,
+            width: 50,
+            height: 50,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id,
+        };
+        let flow = state.resize_configure_flows.entry(surface_id).or_default();
+        assert!(flow.mark_sent(desired, 7, 1));
+        assert_eq!(flow.ack(7), ResizeAckDecision::Matched);
     }
 
     fn test_real_merge_frozen_candidate(
@@ -432,6 +498,381 @@ mod tests {
         commit.commit_sequence = SurfaceCommitSequence(sequence);
         commit.pacing.fifo_set_barrier = true;
         commit
+    }
+
+    #[test]
+    fn real_commit_surface_tree_projects_pending_viewport_before_buffer_mapping() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .clone();
+        let source_owner = client
+            .create_resource::<wp_viewport::WpViewport, ViewportData, CompositorState>(
+                &display_handle,
+                2,
+                ViewportData {
+                    surface: surface.clone(),
+                },
+            )
+            .expect("source viewport resource");
+        let later_owner = client
+            .create_resource::<wp_viewport::WpViewport, ViewportData, CompositorState>(
+                &display_handle,
+                3,
+                ViewportData { surface },
+            )
+            .expect("later viewport resource");
+        state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .data::<SurfaceData>()
+            .expect("surface data")
+            .apply_viewport_change_with_owner(
+                PendingViewportChange {
+                    source: Some(Some(
+                        ViewportSourceRect::new(0.0, 0.0, 2.5, 2.0).expect("source"),
+                    )),
+                    destination: Some(Some(BufferSize::new(4, 4).expect("destination"))),
+                },
+                Some(source_owner),
+            );
+
+        let mut first = test_mergeable_commit(300);
+        first.viewport_destination.source = Some(None);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            4,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(301);
+        second.lineage.predecessor = Some(first_ref);
+        second.viewport_destination.destination = Some(None);
+        second.viewport_error_owner = Some(later_owner);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            5,
+            100,
+            80,
+        )));
+        assert!(matches!(
+            state.derive_surface_mapping_for_commit(surface_id, &second),
+            Some(Ok(Some(_)))
+        ));
+        let release_before = state.buffer_release_metrics();
+
+        state.commit_surface_tree_request(surface_id, second);
+
+        assert!(state.protocol_error_trace.records().next().is_none());
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected admitted buffer, got {other:?}"),
+        };
+        assert_eq!(pending.viewport_source, None);
+        assert_eq!(pending.viewport_destination, None);
+        assert_eq!(
+            pending.surface_size,
+            Some(BufferSize::new(100, 80).unwrap())
+        );
+        let release_after = state.buffer_release_metrics();
+        assert_eq!(
+            release_after.buffer_releases_completed, release_before.buffer_releases_completed,
+            "admitted buffer was not released by direct admission"
+        );
+    }
+
+    #[test]
+    fn real_commit_surface_tree_captures_resize_size_after_projected_mapping() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        install_test_resize_capture(&mut state, &client, &display_handle, surface_id);
+
+        let mut first = test_mergeable_commit(310);
+        first.viewport_destination.destination =
+            Some(Some(BufferSize::new(50, 50).expect("destination")));
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(311);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            80,
+        )));
+        assert!(matches!(
+            state.derive_surface_mapping_for_commit(surface_id, &second),
+            Some(Ok(Some(_)))
+        ));
+
+        state.commit_surface_tree_request(surface_id, second);
+
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected admitted buffer, got {other:?}"),
+        };
+        assert_eq!(pending.surface_size, Some(BufferSize::new(50, 50).unwrap()));
+        assert_eq!(
+            pending
+                .resize_commit
+                .as_deref()
+                .and_then(|snapshot| snapshot.committed_size),
+            Some((50, 50))
+        );
+    }
+
+    #[test]
+    fn real_commit_surface_tree_projects_pending_scale_before_buffer_mapping() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        install_test_resize_capture(&mut state, &client, &display_handle, surface_id);
+        let mut first = test_mergeable_commit(320);
+        first.buffer_scale = Some(2);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(321);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            50,
+        )));
+        state.commit_surface_tree_request(surface_id, second);
+
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected admitted buffer, got {other:?}"),
+        };
+        assert_eq!(pending.buffer_scale, 2);
+        assert_eq!(pending.surface_size, Some(BufferSize::new(50, 25).unwrap()));
+        assert_eq!(
+            pending
+                .resize_commit
+                .as_deref()
+                .and_then(|snapshot| snapshot.committed_size),
+            Some((50, 25))
+        );
+    }
+
+    #[test]
+    fn real_commit_surface_tree_projects_pending_transform_before_buffer_mapping() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        install_test_resize_capture(&mut state, &client, &display_handle, surface_id);
+        let mut first = test_mergeable_commit(330);
+        first.buffer_transform = Some(wl_output::Transform::_90);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(331);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            3,
+            100,
+            50,
+        )));
+        state.commit_surface_tree_request(surface_id, second);
+
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected admitted buffer, got {other:?}"),
+        };
+        assert_eq!(pending.buffer_transform, wl_output::Transform::_90);
+        assert_eq!(
+            pending.surface_size,
+            Some(BufferSize::new(50, 100).unwrap())
+        );
+        assert_eq!(
+            pending
+                .resize_commit
+                .as_deref()
+                .and_then(|snapshot| snapshot.committed_size),
+            Some((50, 100))
+        );
+    }
+
+    #[test]
+    fn real_commit_surface_tree_reports_projected_historical_viewport_owner() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .clone();
+        let source_owner = client
+            .create_resource::<wp_viewport::WpViewport, ViewportData, CompositorState>(
+                &display_handle,
+                2,
+                ViewportData {
+                    surface: surface.clone(),
+                },
+            )
+            .expect("source viewport resource");
+        let later_owner = client
+            .create_resource::<wp_viewport::WpViewport, ViewportData, CompositorState>(
+                &display_handle,
+                3,
+                ViewportData { surface },
+            )
+            .expect("later viewport resource");
+        let mut first = test_mergeable_commit(340);
+        first.viewport_destination = PendingViewportChange {
+            source: Some(Some(
+                ViewportSourceRect::new(0.0, 0.0, 2.5, 2.0).expect("source"),
+            )),
+            destination: Some(Some(BufferSize::new(4, 4).expect("destination"))),
+        };
+        first.viewport_error_owner = Some(source_owner.clone());
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            4,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(341);
+        second.lineage.predecessor = Some(first_ref);
+        second.viewport_destination.destination = Some(None);
+        second.viewport_error_owner = Some(later_owner);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            5,
+            100,
+            80,
+        )));
+        state.commit_surface_tree_request(surface_id, second);
+
+        let record = state
+            .protocol_error_trace
+            .records()
+            .last()
+            .expect("projected viewport error record");
+        assert_eq!(record.resource_id, Some(source_owner.id().protocol_id()));
+        assert_eq!(record.error_code, Some(wp_viewport::Error::BadSize as u32));
+    }
+
+    #[test]
+    fn real_commit_surface_tree_replaces_removed_content_with_projected_mapping() {
+        let mut state = CompositorState::default();
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        state
+            .surface_resource_by_id(surface_id)
+            .expect("surface resource")
+            .data::<SurfaceData>()
+            .expect("surface data")
+            .apply_viewport_change_with_owner(
+                PendingViewportChange {
+                    source: Some(Some(
+                        ViewportSourceRect::new(0.0, 0.0, 2.5, 2.0).expect("source"),
+                    )),
+                    destination: Some(Some(BufferSize::new(4, 4).expect("destination"))),
+                },
+                None,
+            );
+        let old = test_pending_shm_buffer(&mut state, &client, &display_handle, 2, 1, 1);
+        state
+            .current_surface_buffers
+            .insert(surface_id, CurrentSurfaceBuffer::from(old));
+
+        let mut first = test_mergeable_commit(350);
+        first.attachment = Some(PendingSurfaceAttachment::RemoveContent);
+        let (first_ref, _blocker) = queue_blocked_pacing_predecessor(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            3,
+            first,
+        );
+
+        let mut second = test_mergeable_commit(351);
+        second.lineage.predecessor = Some(first_ref);
+        second.attachment = Some(PendingSurfaceAttachment::Buffer(test_pending_shm_buffer(
+            &mut state,
+            &client,
+            &display_handle,
+            4,
+            100,
+            80,
+        )));
+        state.commit_surface_tree_request(surface_id, second);
+
+        let pending = match state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .attachment
+            .as_ref()
+        {
+            Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer,
+            other => panic!("expected admitted replacement buffer, got {other:?}"),
+        };
+        assert!(pending.viewport_source.is_some());
+        assert_eq!(
+            pending.viewport_destination,
+            Some(BufferSize::new(4, 4).unwrap())
+        );
+        assert_eq!(pending.surface_size, Some(BufferSize::new(4, 4).unwrap()));
     }
 
     #[test]
@@ -3249,14 +3690,19 @@ impl CompositorState {
             }
         }
         let synchronized = self.is_effectively_synchronized_subsurface(surface_id);
-        if !synchronized
-            && let Some((error, viewport_error_owner)) =
-                self.surface_mapping_error_for_commit(surface_id, &commit)
-        {
-            self.post_surface_mapping_error(surface_id, error, viewport_error_owner);
-            self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
-            return;
-        }
+        let direct_mapping = if synchronized {
+            None
+        } else {
+            match self.derive_surface_mapping_for_commit(surface_id, &commit) {
+                Some(Ok(mapping)) => mapping,
+                Some(Err((error, viewport_error_owner))) => {
+                    self.post_surface_mapping_error(surface_id, error, viewport_error_owner);
+                    self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
+                    return;
+                }
+                None => None,
+            }
+        };
         if synchronized {
             self.cache_synchronized_subsurface_commit(surface_id, commit);
             return;
@@ -3271,27 +3717,8 @@ impl CompositorState {
         }
         match commit.attachment.as_mut() {
             Some(PendingSurfaceAttachment::Buffer(pending)) => {
-                let mapping_error = self.surface_resource_by_id(surface_id).and_then(|surface| {
-                    let data = surface.data::<SurfaceData>()?;
-                    let viewport = data.viewport_for_change(commit.viewport_destination);
-                    let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
-                    let buffer_transform =
-                        data.buffer_transform_for_change(commit.buffer_transform);
-                    Some(pending.apply_committed_surface_state(
-                        viewport,
-                        buffer_scale,
-                        buffer_transform,
-                    ))
-                });
-                if let Some(Err(error)) = mapping_error {
-                    self.post_surface_mapping_error(
-                        surface_id,
-                        error,
-                        commit.viewport_error_owner.clone(),
-                    );
-                    self.release_pending_surface_buffer(pending.clone());
-                    self.complete_frame_callbacks(std::mem::take(&mut commit.frame_callbacks));
-                    return;
+                if let Some(mapping) = direct_mapping {
+                    pending.apply_content_mapping(mapping);
                 }
                 self.finalize_pending_buffer_resize_capture(
                     surface_id,
@@ -3320,11 +3747,11 @@ impl CompositorState {
         );
     }
 
-    fn surface_mapping_error_for_commit(
+    fn derive_surface_mapping_for_commit(
         &self,
         surface_id: u32,
         commit: &CachedSubsurfaceCommit,
-    ) -> Option<(SurfaceMappingError, Option<wp_viewport::WpViewport>)> {
+    ) -> Option<SurfaceMappingProjection> {
         let surface = self.surface_resource_by_id(surface_id)?;
         let data = surface.data::<SurfaceData>()?;
         let mut effective_state = match EffectiveSurfaceMappingState::from_surface(
@@ -3332,7 +3759,7 @@ impl CompositorState {
             self.current_surface_buffers.get(&surface_id),
         ) {
             Ok(state) => state,
-            Err(error) => return Some((error, data.committed_viewport_error_owner())),
+            Err(error) => return Some(Err((error, data.committed_viewport_error_owner()))),
         };
         let mut references = Vec::new();
         if let Some(predecessor) = commit.lineage.predecessor {
@@ -3354,11 +3781,11 @@ impl CompositorState {
                         false,
                         "admitted pending surface-tree mapping became invalid while projecting: {error:?}"
                     );
-                    return Some((error, viewport_error_owner));
+                    return Some(Err((error, viewport_error_owner)));
                 }
             }
         }
-        effective_state.apply_commit(commit).err()
+        Some(effective_state.apply_commit(commit))
     }
 
     fn submit_surface_tree_nodes_with_kind(
