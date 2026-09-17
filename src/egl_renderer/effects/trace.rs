@@ -493,6 +493,42 @@ impl EffectExecutionTrace {
         });
     }
 
+    pub(crate) fn checkpoint_source_validity(
+        &self,
+        pass: &CompiledRenderPass,
+        required_rect_count: usize,
+        required_bounding_box: Option<(i32, i32, u32, u32)>,
+        valid_rect_count: usize,
+        valid_bounding_box: Option<(i32, i32, u32, u32)>,
+        missing_rect_count: usize,
+        missing_bounding_box: Option<(i32, i32, u32, u32)>,
+        missing_pixels: u64,
+    ) {
+        self.event(|| {
+            let format_bbox = |bbox: Option<(i32, i32, u32, u32)>| {
+                bbox.map_or_else(|| "none".to_owned(), |(x, y, width, height)| {
+                    format!("{x},{y},{width},{height}")
+                })
+            };
+            format!(
+                "event=effect_checkpoint_source_validity frame_id={} pass={} instance={} kind={} anchor={:?} checkpoints={} required_rects={} required_bbox={} valid_rects={} valid_bbox={} missing_rects={} missing_bbox={} missing_pixels={}",
+                optional_u64(self.frame_id),
+                pass.id.get(),
+                pass.instance.get(),
+                render_pass_kind_name(pass.kind),
+                pass.anchor,
+                pass.checkpoint_dependencies.len(),
+                required_rect_count,
+                format_bbox(required_bounding_box),
+                valid_rect_count,
+                format_bbox(valid_bounding_box),
+                missing_rect_count,
+                format_bbox(missing_bounding_box),
+                missing_pixels,
+            )
+        });
+    }
+
     pub(crate) fn pass_boundary(
         &self,
         boundary: &'static str,

@@ -6549,10 +6549,13 @@ mod tests {
         SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
     };
     use oblivion_one::effects::{
-        CustomFragmentSpec, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
-        EffectFootprint, EffectFrameDemand, EffectNode, EffectNodeId, EffectParameterBlock,
-        EffectProgram, EffectProgramId, EffectSource, EffectWorkingSpace, GraphTexturePhysicalRect,
-        GraphTextureSource, ShaderModuleId, validate_effect_program,
+        CompiledFrameGraph, CompiledRenderPass, CustomFragmentSpec, DualKawaseBlurSpec,
+        EffectAlphaMode, EffectColorConversion, EffectFailurePolicy, EffectFootprint,
+        EffectFrameDemand, EffectInstanceExecutionDemand, EffectNode, EffectNodeId,
+        EffectParameterBlock, EffectPassExecutionDemand, EffectProgram, EffectProgramId,
+        EffectSource, EffectWorkingSpace, GraphTextureId, GraphTexturePhysicalRect,
+        GraphTexturePlan, GraphTextureSource, RenderPassKind, ShaderModuleId,
+        validate_effect_program,
     };
     use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
     use oblivion_one::render_backend::buffer::{
@@ -6951,6 +6954,41 @@ mod tests {
         graph
     }
 
+    fn stacked_diagnostic_graph_with_spec(
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+        source_damage: &EffectRegion,
+        output_bounds: EffectRect,
+        radius: f32,
+        passes: u8,
+        scale: f32,
+    ) -> oblivion_one::effects::CompiledFrameGraph {
+        let (mut scene, registry) = moving_blur_scene_with_spec(rect, radius, passes, scale);
+        let first = scene
+            .instances
+            .first_mut()
+            .expect("stacked first blur instance");
+        first.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+        first.visual_group = Some(visual_group);
+        first.anchor_scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+        first.scene_order = oblivion_one::compositor::EffectSceneOrder::for_anchor(first.anchor);
+        let mut second = first.clone();
+        second.id = oblivion_one::effects::EffectInstanceId::new(2).expect("stacked second id");
+        second.signature = second.signature.saturating_add(1);
+        scene = ResolvedEffectScene::new(1, vec![first.clone(), second]);
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            source_damage,
+            output_bounds,
+            &registry,
+        )
+        .expect("stacked diagnostic graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("stacked diagnostic graph must compile to an effect graph");
+        };
+        graph
+    }
+
     fn diagnostic_graph_with_linear_neighbor_stage(
         rect: EffectRect,
         visual_group: VisualGroupId,
@@ -7093,12 +7131,291 @@ mod tests {
         pixels
     }
 
+    fn update_diagnostic_background(
+        harness: &GlesEffectTestHarness,
+        repair: OutputRect,
+        color: [u8; 4],
+    ) {
+        let resource = &harness
+            .renderer
+            .surface_resources
+            .get(&7)
+            .expect("diagnostic background resource")
+            .image;
+        let pixels = vec![color; repair.width as usize * repair.height as usize]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        write_rgba_bytes_to_resource(
+            &harness.gl,
+            resource,
+            SurfaceDamageRect {
+                x: repair.x as u32,
+                y: repair.y as u32,
+                width: repair.width,
+                height: repair.height,
+            },
+            &pixels,
+        );
+    }
+
+    fn poison_diagnostic_output(harness: &GlesEffectTestHarness, color: [f32; 4]) {
+        harness.renderer.bind_active_output_framebuffer();
+        unsafe {
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness.gl.disable(glow::BLEND);
+            harness
+                .gl
+                .clear_color(color[0], color[1], color[2], color[3]);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        harness.renderer.establish_ordinary_scene_state();
+    }
+
     fn diagnostic_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
         let physical_y = height.saturating_sub(y).saturating_sub(1);
         let index = ((physical_y * width + x) * 4) as usize;
         pixels[index..index + 4]
             .try_into()
             .expect("diagnostic pixel has four channels")
+    }
+
+    fn diagnostic_pixel_for_origin(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        origin: OutputFramebufferOrigin,
+    ) -> [u8; 4] {
+        let physical_y = match origin {
+            OutputFramebufferOrigin::BottomLeft => height.saturating_sub(y).saturating_sub(1),
+            OutputFramebufferOrigin::TopLeftScanout => y,
+        };
+        let index = ((physical_y * width + x) * 4) as usize;
+        pixels[index..index + 4]
+            .try_into()
+            .expect("diagnostic pixel has four channels")
+    }
+
+    fn diagnostic_matrix_mismatch_counts_for_origin(
+        actual: &[u8],
+        previous: &[u8],
+        full_reference: &[u8],
+        width: u32,
+        height: u32,
+        repairs: &[OutputRect],
+        tolerance: u8,
+        origin: OutputFramebufferOrigin,
+    ) -> (usize, usize) {
+        let mut outside = 0;
+        let mut inside = 0;
+        for y in 0..height {
+            for x in 0..width {
+                let inside_repair = diagnostic_pixel_is_inside_repairs(repairs, x, y);
+                let expected = if inside_repair {
+                    diagnostic_pixel_for_origin(full_reference, width, height, x, y, origin)
+                } else {
+                    diagnostic_pixel_for_origin(previous, width, height, x, y, origin)
+                };
+                let actual_pixel = diagnostic_pixel_for_origin(actual, width, height, x, y, origin);
+                if actual_pixel
+                    .iter()
+                    .zip(expected)
+                    .any(|(actual, expected)| actual.abs_diff(expected) > tolerance)
+                {
+                    if inside_repair {
+                        inside += 1;
+                    } else {
+                        outside += 1;
+                    }
+                }
+            }
+        }
+        (outside, inside)
+    }
+
+    fn translated_capture_test_graph() -> (
+        CompiledFrameGraph,
+        GraphTexturePlan,
+        EffectRegion,
+        OutputRect,
+    ) {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1)
+            .expect("translated capture instance id");
+        let pass_id =
+            oblivion_one::effects::GraphPassId::new(1).expect("translated capture pass id");
+        let texture_id = GraphTextureId::new(1).expect("translated capture texture id");
+        let domain = EffectRect::new(56, 56, 8, 8).expect("translated capture domain");
+        let target = GraphTexturePlan {
+            id: texture_id,
+            source: GraphTextureSource::CapturedScene,
+            width: domain.width,
+            height: domain.height,
+            domain,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: None,
+            last_use: None,
+        };
+        let pass = CompiledRenderPass {
+            id: pass_id,
+            kind: RenderPassKind::SceneCapture,
+            inputs: Vec::new(),
+            output: Some(texture_id),
+            damage: EffectRegion::empty(),
+            instance,
+            anchor: oblivion_one::compositor::EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Opaque,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
+            visible_clip_fallback: None,
+        };
+        let materialization =
+            EffectRect::new(62, 62, 2, 2).expect("translated capture materialization region");
+        let materialization_region = EffectRegion::from_rect(materialization);
+        let graph = CompiledFrameGraph {
+            passes: vec![pass],
+            textures: vec![target.clone()],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        (
+            graph,
+            target,
+            materialization_region,
+            OutputRect::new(62, 62, 2, 2),
+        )
+    }
+
+    #[test]
+    fn replay_capture_clears_translated_texture_scissor_in_gles() {
+        let mut harness = GlesEffectTestHarness::new(64, 64);
+        let (graph, target, materialization_region, output_rect) = translated_capture_test_graph();
+        let pass_id = graph.passes[0].id;
+        let instance = graph.passes[0].instance;
+        let mut demand = oblivion_one::effects::EffectExecutionDemand::new(
+            vec![EffectInstanceExecutionDemand {
+                id: instance,
+                output_region: materialization_region.clone(),
+            }],
+            materialization_region.clone(),
+        );
+        demand.passes = vec![EffectPassExecutionDemand {
+            id: pass_id,
+            output_region: materialization_region.clone(),
+        }];
+        let selection = effects::select_effect_execution(&graph, &demand);
+        let plan = diagnostic_repaint_plan_for_repairs_in_size(&[output_rect], false, (64, 64));
+
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let poisoned = harness
+                .renderer
+                .effect_resources
+                .acquire_plan(&harness.gl, &target)
+                .expect("translated capture poison texture acquires");
+            harness
+                .renderer
+                .effect_resources
+                .bind_render_target(&harness.gl, &poisoned)
+                .expect("translated capture poison target binds");
+            unsafe {
+                harness.gl.disable(glow::SCISSOR_TEST);
+                harness.gl.disable(glow::BLEND);
+                harness.gl.clear_color(1.0, 0.0, 1.0, 1.0);
+                harness.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            harness
+                .renderer
+                .effect_resources
+                .unbind_render_target(&harness.gl);
+            harness
+                .renderer
+                .effect_resources
+                .release(poisoned)
+                .expect("translated capture poison texture releases");
+
+            effects::execute_effect_graph_with_debug_config(
+                &mut harness.renderer,
+                &graph,
+                origin,
+                &plan,
+                &demand,
+                &selection,
+                effects::EffectDebugConfig::new(
+                    effects::EffectDebugCaptureMode::Replay,
+                    effects::EffectDebugKawaseMode::Partial,
+                ),
+            )
+            .expect("translated capture graph renders");
+
+            let inspected = harness
+                .renderer
+                .effect_resources
+                .acquire_plan(&harness.gl, &target)
+                .expect("translated capture inspection texture acquires");
+            harness
+                .renderer
+                .effect_resources
+                .bind_render_target(&harness.gl, &inspected)
+                .expect("translated capture inspection target binds");
+            let mut pixels = vec![0_u8; 8 * 8 * 4];
+            unsafe {
+                harness.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                harness.gl.read_pixels(
+                    0,
+                    0,
+                    8,
+                    8,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixels)),
+                );
+            }
+            harness
+                .renderer
+                .effect_resources
+                .unbind_render_target(&harness.gl);
+            harness
+                .renderer
+                .effect_resources
+                .release(inspected)
+                .expect("translated capture inspection texture releases");
+
+            for y in 0..8 {
+                for x in 0..8 {
+                    let index = ((y * 8 + x) * 4) as usize;
+                    let actual: [u8; 4] = pixels[index..index + 4]
+                        .try_into()
+                        .expect("translated capture pixel has four channels");
+                    let expected = if (6..8).contains(&x) && (0..2).contains(&y) {
+                        [0, 0, 0, 0]
+                    } else {
+                        [255, 0, 255, 255]
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "translated capture clear mismatch at local texture ({x}, {y}) for {origin:?}; output rect {output_rect:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn execute_diagnostic_frame(
@@ -7109,25 +7426,25 @@ mod tests {
         conservative_full: bool,
         config: effects::EffectDebugConfig,
     ) {
-        execute_diagnostic_frame_with_capture_materialization(
+        execute_diagnostic_frame_with_origin(
             harness,
             graph,
             plan,
             region,
             conservative_full,
             config,
-            effects::SceneCaptureMaterializationPolicy::Exact,
+            OutputFramebufferOrigin::BottomLeft,
         );
     }
 
-    fn execute_diagnostic_frame_with_capture_materialization(
+    fn execute_diagnostic_frame_with_origin(
         harness: &mut GlesEffectTestHarness,
         graph: &oblivion_one::effects::CompiledFrameGraph,
         plan: &RepaintPlan,
         region: EffectRegion,
         conservative_full: bool,
         config: effects::EffectDebugConfig,
-        materialization_policy: effects::SceneCaptureMaterializationPolicy,
+        framebuffer_origin: OutputFramebufferOrigin,
     ) {
         let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
             graph,
@@ -7136,15 +7453,14 @@ mod tests {
             config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
         );
         let selection = effects::select_effect_execution(graph, &demand);
-        effects::execute_effect_graph_with_debug_config_and_materialization_policy(
+        effects::execute_effect_graph_with_debug_config(
             &mut harness.renderer,
             graph,
-            OutputFramebufferOrigin::BottomLeft,
+            framebuffer_origin,
             plan,
             &demand,
             &selection,
             config,
-            materialization_policy,
         )
         .expect("diagnostic frame renders");
     }
@@ -7594,6 +7910,197 @@ mod tests {
     }
 
     #[test]
+    fn stacked_checkpoint_replay_partial_matches_full_current_reference() {
+        let output_size = (1920, 1080);
+        let output_bounds =
+            EffectRect::new(0, 0, output_size.0, output_size.1).expect("stacked output bounds");
+        let target_rect = EffectRect::new(786, 1000, 348, 56).expect("Dock target bounds");
+        let repair = OutputRect::new(900, 1010, 8, 8);
+        let visual_group = VisualGroupId::new(9).expect("stacked visual group");
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+
+        let render_candidate = |poison: Option<[f32; 4]>| {
+            let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+            install_diagnostic_scene(&mut harness, target_rect, visual_group);
+            let graph = stacked_diagnostic_graph_with_spec(
+                target_rect,
+                visual_group,
+                &EffectRegion::empty(),
+                output_bounds,
+                4.0,
+                2,
+                1.0,
+            );
+            let captures = graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                captures.len(),
+                2,
+                "stacked graph must have A and B captures"
+            );
+            let checkpoint_capture = captures
+                .iter()
+                .copied()
+                .find(|pass| !pass.checkpoint_dependencies.is_empty())
+                .expect("B must have a checkpoint dependency");
+            assert_eq!(checkpoint_capture.checkpoint_dependencies.len(), 1);
+            let checkpoint_texture = graph
+                .textures
+                .iter()
+                .find(|texture| Some(texture.id) == checkpoint_capture.output)
+                .expect("B capture texture");
+            assert_eq!(
+                checkpoint_texture.domain,
+                EffectRect::new(762, 976, 396, 104).expect("native Dock checkpoint domain")
+            );
+
+            let full_region = EffectRegion::from_rect(output_bounds);
+            execute_diagnostic_frame_with_origin(
+                &mut harness,
+                &graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, output_size),
+                full_region,
+                true,
+                config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            let previous = read_diagnostic_pixels(&harness);
+
+            update_diagnostic_background(&harness, repair, [236, 28, 42, 255]);
+            if let Some(poison) = poison {
+                poison_diagnostic_output(&harness, poison);
+            }
+            harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+            effects::clear_effect_trace_test_events();
+            execute_diagnostic_frame_with_origin(
+                &mut harness,
+                &graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, output_size),
+                diagnostic_region(repair),
+                false,
+                config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            let candidate = read_diagnostic_pixels(&harness);
+            let events = effects::take_effect_trace_test_events();
+            let checkpoint_id = checkpoint_capture.id.get().to_string();
+            let capture_event = events
+                .iter()
+                .find(|line| {
+                    line.contains("event=effect_pass_execute_end")
+                        && line.contains("kind=SceneCapture")
+                        && line.contains(&format!("pass={checkpoint_id}"))
+                })
+                .expect("B execute trace event");
+            assert!(capture_event.contains("checkpoints=1"));
+            assert!(capture_event.contains("capture_mode=framebuffer_blit"));
+            assert!(capture_event.contains("backdrop_capture_policy=replay"));
+            assert!(capture_event.contains("kawase_execution_policy=partial"));
+            assert!(capture_event.contains("framebuffer_origin=top_left_scanout"));
+            let validity_event = events
+                .iter()
+                .find(|line| {
+                    line.contains("event=effect_checkpoint_source_validity")
+                        && line.contains(&format!("pass={checkpoint_id}"))
+                })
+                .expect("B checkpoint source validity trace event");
+            assert!(validity_event.contains("missing_pixels=0"));
+            (previous, candidate, events)
+        };
+
+        let (previous, candidate, _) = render_candidate(None);
+        let mut reference = GlesEffectTestHarness::new(output_size.0, output_size.1);
+        install_diagnostic_scene(&mut reference, target_rect, visual_group);
+        let reference_graph = stacked_diagnostic_graph_with_spec(
+            target_rect,
+            visual_group,
+            &EffectRegion::empty(),
+            output_bounds,
+            4.0,
+            2,
+            1.0,
+        );
+        let full_repair = diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, output_size);
+        update_diagnostic_background(&reference, repair, [236, 28, 42, 255]);
+        execute_diagnostic_frame_with_origin(
+            &mut reference,
+            &reference_graph,
+            &full_repair,
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        let full_current_reference = read_diagnostic_pixels(&reference);
+        let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
+            &candidate,
+            &previous,
+            &full_current_reference,
+            output_size.0,
+            output_size.1,
+            &[repair],
+            2,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        assert_eq!(
+            inside, 0,
+            "checkpoint candidate differs from full current reference"
+        );
+        assert_eq!(outside, 0, "unpoisoned candidate changed outside repair");
+
+        let (_, poison_a, _) = render_candidate(Some([1.0, 0.0, 1.0, 1.0]));
+        let (_, poison_b, _) = render_candidate(Some([0.0, 1.0, 0.0, 1.0]));
+        for y in repair.y as u32..(repair.y as u32 + repair.height) {
+            for x in repair.x as u32..(repair.x as u32 + repair.width) {
+                assert_eq!(
+                    diagnostic_pixel_for_origin(
+                        &poison_a,
+                        output_size.0,
+                        output_size.1,
+                        x,
+                        y,
+                        OutputFramebufferOrigin::TopLeftScanout,
+                    ),
+                    diagnostic_pixel_for_origin(
+                        &poison_b,
+                        output_size.0,
+                        output_size.1,
+                        x,
+                        y,
+                        OutputFramebufferOrigin::TopLeftScanout,
+                    ),
+                    "B output depends on poison at ({x}, {y})"
+                );
+                assert_eq!(
+                    diagnostic_pixel_for_origin(
+                        &poison_a,
+                        output_size.0,
+                        output_size.1,
+                        x,
+                        y,
+                        OutputFramebufferOrigin::TopLeftScanout,
+                    ),
+                    diagnostic_pixel_for_origin(
+                        &full_current_reference,
+                        output_size.0,
+                        output_size.1,
+                        x,
+                        y,
+                        OutputFramebufferOrigin::TopLeftScanout,
+                    ),
+                    "poisoned B output differs from full current reference at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replay_partial_whole_graph_with_linear_post_blur_sampling_is_poison_independent() {
         let output_bounds = EffectRect::new(0, 0, 512, 384).expect("diagnostic output bounds");
         let target_rect = EffectRect::new(145, 148, 321, 181).expect("diagnostic target bounds");
@@ -7765,6 +8272,27 @@ mod tests {
         for (output_size, target_rect, repair, passes, scale) in cases {
             let output_bounds = EffectRect::new(0, 0, output_size.0, output_size.1)
                 .expect("diagnostic output bounds");
+            let mut reference = GlesEffectTestHarness::new(output_size.0, output_size.1);
+            install_diagnostic_scene(&mut reference, target_rect, visual_group);
+            let reference_graph = diagnostic_graph_with_spec(
+                target_rect,
+                visual_group,
+                &EffectRegion::empty(),
+                output_bounds,
+                4.0,
+                passes,
+                scale,
+            );
+            execute_diagnostic_frame(
+                &mut reference,
+                &reference_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(&[repair], true, output_size),
+                EffectRegion::from_rect(output_bounds),
+                true,
+                config,
+            );
+            let full_reference = read_diagnostic_pixels(&reference);
+            drop(reference);
             let mut outputs = Vec::new();
             for poison in [[1.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0]] {
                 let mut candidate = GlesEffectTestHarness::new(output_size.0, output_size.1);
@@ -7807,7 +8335,7 @@ mod tests {
                 let (outside, inside) = diagnostic_matrix_mismatch_counts(
                     &actual,
                     &previous,
-                    &previous,
+                    &full_reference,
                     output_size.0,
                     output_size.1,
                     &[repair],
@@ -7831,7 +8359,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_partial_capture_materialization_localization_matrix() {
+    fn replay_partial_fragmented_capture_materialization_is_a_non_regression() {
         let output_bounds = EffectRect::new(0, 0, 512, 384).expect("diagnostic output bounds");
         let target_rect = EffectRect::new(180, 130, 100, 80).expect("diagnostic target bounds");
         let repairs = [
@@ -7863,72 +8391,54 @@ mod tests {
         let full_reference = read_diagnostic_pixels(&reference);
         drop(reference);
 
-        let policies = [
-            ("Exact", effects::SceneCaptureMaterializationPolicy::Exact),
-            (
-                "BoundingBox",
-                effects::SceneCaptureMaterializationPolicy::BoundingBox,
-            ),
-            (
-                "FullDomain",
-                effects::SceneCaptureMaterializationPolicy::FullDomain,
-            ),
-        ];
-        let mut outcomes = Vec::with_capacity(policies.len());
-        for (label, policy) in policies {
-            let mut candidate = GlesEffectTestHarness::new(512, 384);
-            install_diagnostic_scene(&mut candidate, target_rect, visual_group);
-            let full_graph = diagnostic_graph(
-                target_rect,
-                visual_group,
-                &EffectRegion::empty(),
-                output_bounds,
-            );
-            execute_diagnostic_frame(
-                &mut candidate,
-                &full_graph,
-                &diagnostic_repaint_plan_for_repairs_in_size(&repairs, true, (512, 384)),
-                EffectRegion::from_rect(output_bounds),
-                true,
-                config,
-            );
-            let previous = read_diagnostic_pixels(&candidate);
-            assert!(
-                candidate
-                    .renderer
-                    .effect_resources
-                    .poison_cached_textures(&candidate.gl, [1.0, 0.0, 1.0, 1.0])
-                    > 0,
-                "localization candidate must reuse a pooled texture"
-            );
-
-            let partial_graph = &full_graph;
-            execute_diagnostic_frame_with_capture_materialization(
-                &mut candidate,
-                partial_graph,
-                &diagnostic_repaint_plan_for_repairs_in_size(&repairs, false, (512, 384)),
-                diagnostic_region_for_repairs(&repairs),
-                false,
-                config,
-                policy,
-            );
-            let actual = read_diagnostic_pixels(&candidate);
-            let (outside, inside) = diagnostic_matrix_mismatch_counts(
-                &actual,
-                &previous,
-                &full_reference,
-                512,
-                384,
-                &repairs,
-                2,
-            );
-            outcomes.push((label, outside, inside));
-        }
-        assert_eq!(
-            outcomes,
-            vec![("Exact", 0, 0), ("BoundingBox", 0, 0), ("FullDomain", 0, 0)],
-            "capture materialization localization result; the current fixture does not reproduce a validity mismatch"
+        let mut candidate = GlesEffectTestHarness::new(512, 384);
+        install_diagnostic_scene(&mut candidate, target_rect, visual_group);
+        let graph = diagnostic_graph(
+            target_rect,
+            visual_group,
+            &EffectRegion::empty(),
+            output_bounds,
         );
+        execute_diagnostic_frame(
+            &mut candidate,
+            &graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&repairs, true, (512, 384)),
+            EffectRegion::from_rect(output_bounds),
+            true,
+            config,
+        );
+        let previous = read_diagnostic_pixels(&candidate);
+        assert!(
+            candidate
+                .renderer
+                .effect_resources
+                .poison_cached_textures(&candidate.gl, [1.0, 0.0, 1.0, 1.0])
+                > 0,
+            "fragmented materialization candidate must reuse a pooled texture"
+        );
+        execute_diagnostic_frame(
+            &mut candidate,
+            &graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&repairs, false, (512, 384)),
+            diagnostic_region_for_repairs(&repairs),
+            false,
+            config,
+        );
+        let actual = read_diagnostic_pixels(&candidate);
+        let (outside, inside) = diagnostic_matrix_mismatch_counts(
+            &actual,
+            &previous,
+            &full_reference,
+            512,
+            384,
+            &repairs,
+            2,
+        );
+        assert_eq!(
+            outside, 0,
+            "fragmented replay changed pixels outside repair"
+        );
+        assert_eq!(inside, 0, "fragmented replay differs from full reference");
     }
 
     #[test]
