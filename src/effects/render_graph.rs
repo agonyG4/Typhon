@@ -3306,6 +3306,47 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn three_overlapping_backdrop_effects_expose_two_checkpoint_dependencies() {
+        let (scene, registry) = blur_scene();
+        let mut second = scene.instances[0].clone();
+        second.id = EffectInstanceId::new(2).unwrap();
+        second.signature = second.signature.saturating_add(1);
+        let mut third = scene.instances[0].clone();
+        third.id = EffectInstanceId::new(3).unwrap();
+        third.signature = third.signature.saturating_add(2);
+        let scene = ResolvedEffectScene::new(1, vec![scene.instances[0].clone(), second, third]);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("overlapping effects must compile to an effect graph");
+        };
+        let captures = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .collect::<Vec<_>>();
+
+        assert_eq!(captures.len(), 3);
+        assert!(captures[0].checkpoint_dependencies.is_empty());
+        assert_eq!(captures[1].checkpoint_dependencies.len(), 1);
+        assert!(captures[2].checkpoint_dependencies.len() >= 2);
+        assert!(
+            captures[2]
+                .checkpoint_dependencies
+                .iter()
+                .all(|dependency| {
+                    graph.passes.iter().any(|pass| {
+                        pass.id == *dependency && pass.kind == RenderPassKind::Composite
+                    })
+                })
+        );
+    }
+
     fn repeated_region(rect: EffectRect, count: usize) -> EffectRegion {
         let mut region = EffectRegion::empty();
         for _ in 0..count {

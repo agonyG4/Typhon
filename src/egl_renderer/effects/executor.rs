@@ -1098,7 +1098,7 @@ fn execute_graph_passes_inner(
                 let required = pass_output_texture_domain(graph, pass);
                 let required_effect_region =
                     checkpoint_dependency_influence_region(graph, pass, &required);
-                let mut valid_effect_region = EffectRegion::empty();
+                let mut dependency_validity = Vec::new();
                 for dependency in &pass.checkpoint_dependencies {
                     let Some(dependency_pass) = graph
                         .passes
@@ -1107,15 +1107,24 @@ fn execute_graph_passes_inner(
                     else {
                         continue;
                     };
-                    if let Some(valid) = effect_valid_regions.get(&dependency_pass.instance) {
-                        valid_effect_region =
-                            valid_effect_region.union(&valid.intersect(&required));
-                    }
+                    let dependency_influence = graph
+                        .instances
+                        .iter()
+                        .find(|instance| instance.id == dependency_pass.instance)
+                        .map(|instance| instance.output_influence_region.intersect(&required))
+                        .unwrap_or_else(EffectRegion::empty);
+                    let dependency_valid = effect_valid_regions
+                        .get(&dependency_pass.instance)
+                        .cloned()
+                        .unwrap_or_else(EffectRegion::empty);
+                    dependency_validity.push((dependency_influence, dependency_valid));
                 }
-                let semantic_valid_region = scene_valid_region
-                    .subtract(&required_effect_region)
-                    .union(&valid_effect_region);
-                let validity = checkpoint_source_validity(&required, &semantic_valid_region);
+                let validity = checkpoint_source_semantic_validity(
+                    &required,
+                    &scene_valid_region,
+                    &required_effect_region,
+                    &dependency_validity,
+                );
                 if renderer.effect_trace.enabled() {
                     renderer.effect_trace.checkpoint_source_validity(
                         pass,
@@ -1418,6 +1427,23 @@ fn checkpoint_source_validity(
             .map(|rect| (rect.x, rect.y, rect.width, rect.height)),
         missing: required.subtract(valid),
     }
+}
+
+fn checkpoint_source_semantic_validity(
+    required: &EffectRegion,
+    scene_valid: &EffectRegion,
+    dependency_influence: &EffectRegion,
+    dependencies: &[(EffectRegion, EffectRegion)],
+) -> CheckpointSourceValidity {
+    let mut missing = required
+        .subtract(dependency_influence)
+        .subtract(scene_valid);
+    for (influence, valid) in dependencies {
+        let required_from_dependency = required.intersect(influence);
+        missing = missing.union(&required_from_dependency.subtract(valid));
+    }
+    let semantic_valid = required.subtract(&missing);
+    checkpoint_source_validity(required, &semantic_valid)
 }
 
 fn output_rects_to_effect_region(rects: &[OutputRect]) -> EffectRegion {
@@ -4720,14 +4746,94 @@ mod tests {
         let partial_dependency_output = EffectRegion::from_rect(
             oblivion_one::effects::EffectRect::new(900, 1010, 8, 8).unwrap(),
         );
-        let semantic_valid = required
-            .subtract(&dependency_influence)
-            .union(&partial_dependency_output);
-        let validity = checkpoint_source_validity(&required, &semantic_valid);
+        let validity = checkpoint_source_semantic_validity(
+            &required,
+            &required.subtract(&dependency_influence),
+            &dependency_influence,
+            &[(dependency_influence.clone(), partial_dependency_output)],
+        );
 
         assert!(!validity.missing.is_empty());
         assert!(validity.missing.contains_point(800, 1004));
         assert!(!validity.missing.contains_point(902, 1012));
+    }
+
+    #[test]
+    fn checkpoint_semantic_validity_does_not_mask_missing_overlapping_dependency() {
+        let required = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(100, 100, 20, 20).unwrap(),
+        );
+        let dependency_a_influence = required.clone();
+        let dependency_c_influence = required.clone();
+        let dependency_a_valid = required.clone();
+        let dependency_c_valid = EffectRegion::empty();
+        let dependency_influence = dependency_a_influence
+            .union(&dependency_c_influence)
+            .intersect(&required);
+        let validity = checkpoint_source_semantic_validity(
+            &required,
+            &EffectRegion::empty(),
+            &dependency_influence,
+            &[
+                (dependency_a_influence, dependency_a_valid),
+                (dependency_c_influence, dependency_c_valid),
+            ],
+        );
+
+        assert!(validity.missing.contains_point(110, 110));
+        assert_eq!(effect_region_pixels(&validity.missing), 400);
+    }
+
+    #[test]
+    fn checkpoint_semantic_validity_accepts_fully_valid_overlapping_dependencies() {
+        let required = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(100, 100, 20, 20).unwrap(),
+        );
+        let dependency_a_influence = required.clone();
+        let dependency_c_influence = required.clone();
+        let dependency_a_valid = required.clone();
+        let dependency_c_valid = required.clone();
+        let dependency_influence = dependency_a_influence
+            .union(&dependency_c_influence)
+            .intersect(&required);
+        let validity = checkpoint_source_semantic_validity(
+            &required,
+            &EffectRegion::empty(),
+            &dependency_influence,
+            &[
+                (dependency_a_influence, dependency_a_valid),
+                (dependency_c_influence, dependency_c_valid),
+            ],
+        );
+
+        assert!(validity.missing.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_semantic_validity_accepts_disjoint_dependency_coverage() {
+        let required = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(100, 100, 40, 20).unwrap(),
+        );
+        let dependency_a_influence = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(100, 100, 20, 20).unwrap(),
+        );
+        let dependency_c_influence = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(120, 100, 20, 20).unwrap(),
+        );
+        let dependency_influence = dependency_a_influence
+            .union(&dependency_c_influence)
+            .intersect(&required);
+        let validity = checkpoint_source_semantic_validity(
+            &required,
+            &EffectRegion::empty(),
+            &dependency_influence,
+            &[
+                (dependency_a_influence.clone(), dependency_a_influence),
+                (dependency_c_influence.clone(), dependency_c_influence),
+            ],
+        );
+
+        assert!(validity.missing.is_empty());
     }
 
     #[test]
