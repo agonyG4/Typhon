@@ -830,7 +830,7 @@ fn compatibility_no_visual_change_with_callback_owns_one_terminal_batch() {
 }
 
 #[test]
-fn compatibility_no_visual_change_with_presentation_feedback_owns_one_terminal_batch() {
+fn compatibility_no_visual_change_leaves_current_presentation_feedback_pending() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -848,7 +848,7 @@ fn compatibility_no_visual_change_with_presentation_feedback_owns_one_terminal_b
         })
         .unwrap();
     assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
-    assert!(!capture_pending_frame_work(&commands));
+    assert!(capture_pending_frame_work(&commands));
 
     let (prepared_reply, prepared_receiver) = std::sync::mpsc::channel();
     commands

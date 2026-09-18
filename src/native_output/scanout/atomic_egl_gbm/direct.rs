@@ -22,7 +22,8 @@ fn settle_no_visual_change_transaction(
     let Some(frame_id) = server.prepared_frame_id() else {
         return Ok(true);
     };
-    let frame_batch_id = server.take_frame_batch_for_render(frame_id);
+    let frame_batch_id =
+        server.take_frame_batch_for_render_with_presentation_samples(frame_id, std::iter::empty());
     if !server.commit_timing_submission_is_safe_for_batch(
         frame_batch_id,
         target.presentation_time,
@@ -395,7 +396,24 @@ impl AtomicEglGbmScanout {
         });
 
         let frame_id = self.swapchain()?.next_frame_id();
-        let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
+        let mut presentation_samples = server
+            .presentation_commit_key_for_surface_commit_with_generation(
+                candidate.surface_id,
+                candidate.surface_presentation_generation,
+                candidate.commit_sequence,
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(cursor_source_key) = cursor_source_key
+            && let Some(key) = server.presentation_commit_key_for_surface_commit(
+                cursor_source_key.surface_id,
+                oblivion_one::compositor::SurfaceCommitSequence(cursor_source_key.commit_sequence),
+            )
+        {
+            presentation_samples.push(key);
+        }
+        let protocol_batch_id = server
+            .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples);
         let mut sampled_surface_ids = vec![candidate.surface_id];
         if let Some(cursor_source_key) = cursor_source_key {
             sampled_surface_ids.push(cursor_source_key.surface_id);

@@ -1063,6 +1063,114 @@ fn valid_cursor_surface_commit_exposes_hotspot_adjusted_overlay_snapshot() {
 }
 
 #[test]
+fn software_client_cursor_feedback_is_presented_for_the_exact_cursor_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let serial = state
+        .pointer_enter_serial
+        .expect("expected pointer enter serial before set_cursor");
+    let cursor_surface = compositor.create_surface(&qh, ());
+    let feedback = presentation.feedback(&cursor_surface, &qh, ());
+    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureNativeFrameBatch {
+            frame_id: 701,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 701,
+            batch_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    // Hiding the client cursor does not supersede its current Content Update,
+    // but it must remove that update from both scheduling eligibility and the
+    // concrete sample set.
+    let _hidden_feedback = presentation.feedback(&cursor_surface, &qh, ());
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    pointer.set_cursor(serial, None, 0, 0);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!capture_frame_eligible_presentation_feedback_work(
+        &commands
+    ));
+
+    let (hidden_batch_reply, hidden_batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureNativeFrameBatch {
+            frame_id: 702,
+            reply: hidden_batch_reply,
+        })
+        .unwrap();
+    let hidden_batch_id = hidden_batch_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 702,
+            batch_id: hidden_batch_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 1);
+    assert_eq!(state.presentation_discarded_count, 0);
+    assert_eq!(
+        state.presentation_feedback_event_log,
+        vec![(feedback.id().protocol_id(), "presented")]
+    );
+}
+
+#[test]
 fn same_buffer_cursor_damage_commit_preserves_owned_content_identity() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

@@ -159,7 +159,7 @@ impl CompositorState {
         for feedback in self
             .pending_presentation_feedbacks
             .iter()
-            .chain(self.visible_pending_presentation_feedbacks.iter())
+            .chain(self.frame_eligible_pending_presentation_feedbacks.iter())
         {
             index.add_feedback(self.scene_work_owner_for_surface(feedback.surface_id));
         }

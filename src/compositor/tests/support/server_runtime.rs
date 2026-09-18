@@ -282,6 +282,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePendingFrameCallbacks(Sender<bool>),
     CaptureOnlyPendingSurfaceFrameCallbacks(Sender<bool>),
     CapturePendingFrameWork(Sender<bool>),
+    CaptureFrameEligiblePresentationFeedbackWork(Sender<bool>),
     CaptureFrameCallbackMetrics(Sender<FrameCallbackMetrics>),
     CompleteProtocolOnlyFrameTick(Sender<ProtocolOnlyCompletion>),
     CaptureIdleInhibited(Sender<bool>),
@@ -376,6 +377,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     FinishFrame,
     FinishFrameWithPresentation(FramePresentation),
     CaptureFrameBatch {
+        frame_id: u64,
+        reply: Sender<CompositorFrameBatchId>,
+    },
+    CaptureNativeFrameBatch {
         frame_id: u64,
         reply: Sender<CompositorFrameBatchId>,
     },
@@ -1366,6 +1371,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CapturePendingFrameWork(reply) => {
                         let _ = reply.send(server.has_unowned_frame_work());
                     }
+                    ServerCommand::CaptureFrameEligiblePresentationFeedbackWork(reply) => {
+                        let _ = reply.send(
+                            server
+                                .state
+                                .has_frame_eligible_pending_presentation_feedbacks(),
+                        );
+                    }
                     ServerCommand::CaptureFrameCallbackMetrics(reply) => {
                         let _ = reply.send(server.frame_callback_metrics());
                     }
@@ -1647,6 +1659,10 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureFrameBatch { frame_id, reply } => {
                         let _ = reply.send(server.take_frame_batch_for_render(frame_id));
+                    }
+                    ServerCommand::CaptureNativeFrameBatch { frame_id, reply } => {
+                        let _ =
+                            reply.send(server.test_take_native_frame_batch_for_render(frame_id));
                     }
                     ServerCommand::CaptureFrameBatchSurfaceIds { batch_id, reply } => {
                         let _ =
@@ -2580,6 +2596,18 @@ pub(in crate::compositor::tests) fn capture_pending_frame_work(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report pending frame work")
+}
+
+pub(in crate::compositor::tests) fn capture_frame_eligible_presentation_feedback_work(
+    commands: &Sender<ServerCommand>,
+) -> bool {
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameEligiblePresentationFeedbackWork(
+            reply,
+        ))
+        .unwrap();
+    receiver.recv_timeout(Duration::from_secs(1)).unwrap()
 }
 
 pub(in crate::compositor::tests) fn capture_frame_callback_metrics(

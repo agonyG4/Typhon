@@ -21,8 +21,9 @@ use crate::compositor::{
     FullscreenCompositionPlan, NativeFramePresentationTargets, PresentationAnimationMetrics,
     PresentationCoverageContent, PresentationCoverageContentKind, PresentationFrameSnapshot,
     PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentedWindowGeometry,
-    ResolvedEffectScene, SceneNodeId, ShmBufferLifetimeMetrics, SurfaceCommitSequence,
-    SurfaceLocalityMetrics, SurfaceResourceSyncState, compositor_surface_id,
+    RenderableSurface, ResolvedEffectScene, SceneNodeId, ShmBufferLifetimeMetrics,
+    SurfaceCommitSequence, SurfaceLocalityMetrics, SurfacePresentationCommitKey,
+    SurfaceResourceSyncState, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -76,12 +77,11 @@ use super::{
     InteractionUpdateOutcome, OutputId, OutputPosition, OutputRect, PendingProcessLaunch,
     PointerAxisFrame, PointerConstraintTransitionSnapshot, PresentationClock,
     PresentationProtocolCapabilities, ProtocolOnlyCompletion, RenderGenerationCause,
-    RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    SurfacePacingMetrics, SurfacePipelineEvent, SurfacePresentationMetadata,
-    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowId,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
-    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
+    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
+    SubsurfaceTransactionMetrics, SurfaceDamagePresentation, SurfacePacingMetrics,
+    SurfacePipelineEvent, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
+    WindowFocusReason, WindowId, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
+    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
         ResolvedPointerConstraintBackendRequest,
@@ -1524,6 +1524,37 @@ impl OwnCompositorServer {
         self.state.client_cursor_render_state()
     }
 
+    pub fn presentation_commit_key_for_surface_commit(
+        &self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> Option<SurfacePresentationCommitKey> {
+        self.state
+            .presentation_commit_key_for_surface_commit(surface_id, commit_sequence)
+    }
+
+    pub fn presentation_commit_key_for_surface_commit_with_generation(
+        &self,
+        surface_id: u32,
+        presentation_generation: u64,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> Option<SurfacePresentationCommitKey> {
+        self.state
+            .presentation_commit_key_for_surface_commit_with_generation(
+                surface_id,
+                presentation_generation,
+                commit_sequence,
+            )
+    }
+
+    pub fn presentation_commit_key_for_renderable_surface(
+        &self,
+        surface: &RenderableSurface,
+    ) -> Option<SurfacePresentationCommitKey> {
+        self.state
+            .presentation_commit_key_for_renderable_surface(surface)
+    }
+
     pub fn client_cursor_surface_active(&self) -> bool {
         self.state.client_cursor_surface_active()
     }
@@ -2210,6 +2241,32 @@ impl OwnCompositorServer {
     ) -> Vec<u32> {
         self.state
             .test_frame_batch_presentation_surface_ids(batch_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_take_native_frame_batch_for_render(
+        &mut self,
+        frame_id: u64,
+    ) -> CompositorFrameBatchId {
+        let (surfaces, _, _, _) = self
+            .state
+            .native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
+        let mut presentation_samples = surfaces
+            .iter()
+            .filter_map(|surface| {
+                self.state
+                    .presentation_commit_key_for_renderable_surface(surface)
+            })
+            .collect::<Vec<_>>();
+        if let Some(cursor) = self.state.client_cursor_render_state()
+            && let Some(key) = self
+                .state
+                .presentation_commit_key_for_renderable_surface(cursor.surface)
+        {
+            presentation_samples.push(key);
+        }
+        self.state
+            .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples)
     }
 
     pub fn mark_prepared_frame_submitted(&mut self) {

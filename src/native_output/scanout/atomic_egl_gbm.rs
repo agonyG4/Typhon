@@ -902,7 +902,44 @@ impl AtomicEglGbmScanout {
                 return Err(error);
             }
         };
-        let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
+        let mut presentation_samples = resolved_scene
+            .surfaces
+            .iter()
+            .filter_map(|surface| server.presentation_commit_key_for_renderable_surface(surface))
+            .collect::<Vec<_>>();
+        let exact_cursor_commit = match frozen_cursor_plan.delivery {
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Software => server
+                .client_cursor_render_state()
+                .map(|cursor| (cursor.surface.surface_id, cursor.surface.commit_sequence)),
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
+                frozen_cursor_plane_owner
+                    .as_ref()
+                    .and_then(|owner| owner.client_source_key)
+                    .and_then(|source_key| {
+                        server.presentation_commit_key_for_surface_commit(
+                            source_key.surface_id,
+                            oblivion_one::compositor::SurfaceCommitSequence(
+                                source_key.commit_sequence,
+                            ),
+                        )
+                    })
+                    .map(|key| {
+                        presentation_samples.push(key);
+                        (key.surface_id, key.commit_sequence)
+                    })
+            }
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
+        };
+        if frozen_cursor_plan.delivery
+            == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+            && let Some((surface_id, commit_sequence)) = exact_cursor_commit
+            && let Some(key) =
+                server.presentation_commit_key_for_surface_commit(surface_id, commit_sequence)
+        {
+            presentation_samples.push(key);
+        }
+        let protocol_batch_id = server
+            .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples);
         let transaction_id = match output_transactions.allocate_id() {
             Ok(transaction_id) => transaction_id,
             Err(error) => {
@@ -1016,16 +1053,6 @@ impl AtomicEglGbmScanout {
             let resolved_snapshot = resolved_scene.snapshot_owned();
             let resolved_scene_signature = resolved_scene.scene_identity_signature();
             let mut sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
-            let exact_cursor_commit = cursor_mode
-                .is_software()
-                .then(|| server.client_cursor_render_state())
-                .flatten()
-                .map(|client_cursor| {
-                    (
-                        client_cursor.surface.surface_id,
-                        client_cursor.surface.commit_sequence,
-                    )
-                });
             if frozen_cursor_plan.delivery
                 == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
                 && let Some(source_key) = frozen_cursor_plane_owner

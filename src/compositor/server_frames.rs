@@ -339,6 +339,14 @@ impl OwnCompositorServer {
         self.state.capture_frame_callbacks_for_render();
     }
 
+    pub fn capture_frame_callbacks_for_render_with_presentation_samples(
+        &mut self,
+        presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,
+    ) {
+        self.state
+            .capture_frame_callbacks_for_render_with_presentation_samples(presentation_samples);
+    }
+
     #[doc(hidden)]
     pub fn mark_frame_callbacks_rendered(&mut self, batch_id: CompositorFrameBatchId) {
         self.state.mark_frame_callbacks_rendered(batch_id);
@@ -437,6 +445,15 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
         self.state.take_frame_batch_for_render(frame_id)
+    }
+
+    pub fn take_frame_batch_for_render_with_presentation_samples(
+        &mut self,
+        frame_id: u64,
+        presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,
+    ) -> CompositorFrameBatchId {
+        self.state
+            .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples)
     }
 
     #[doc(hidden)]

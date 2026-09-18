@@ -225,6 +225,51 @@ impl CompositorState {
             .and(publication.latest_published)
     }
 
+    pub(in crate::compositor) fn presentation_commit_key_for_surface_commit(
+        &self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> Option<SurfacePresentationCommitKey> {
+        let presentation_generation = self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()?;
+        self.presentation_commit_key_for_surface_commit_with_generation(
+            surface_id,
+            presentation_generation,
+            commit_sequence,
+        )
+    }
+
+    pub(in crate::compositor) fn presentation_commit_key_for_surface_commit_with_generation(
+        &self,
+        surface_id: u32,
+        presentation_generation: u64,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> Option<SurfacePresentationCommitKey> {
+        if self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+            != Some(presentation_generation)
+        {
+            return None;
+        }
+        let active = self.active_surface_presentation_commits.get(&surface_id)?;
+        (active.commit_sequence == commit_sequence).then_some(SurfacePresentationCommitKey {
+            surface_id,
+            presentation_generation,
+            commit_sequence,
+        })
+    }
+
+    pub(in crate::compositor) fn presentation_commit_key_for_renderable_surface(
+        &self,
+        surface: &RenderableSurface,
+    ) -> Option<SurfacePresentationCommitKey> {
+        self.presentation_commit_key_for_surface_commit(surface.surface_id, surface.commit_sequence)
+    }
+
     pub(in crate::compositor) fn allocate_surface_commit_sequence(
         &mut self,
     ) -> SurfaceCommitSequence {

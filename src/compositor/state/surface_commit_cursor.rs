@@ -113,6 +113,7 @@ impl CompositorState {
         } else {
             self.complete_frame_callbacks(frame_callbacks);
         }
+        self.refresh_presentation_feedback_eligibility();
         true
     }
 

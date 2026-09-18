@@ -41,6 +41,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn sync_cursor_visibility_request(&mut self) {
+        self.refresh_presentation_feedback_eligibility();
         let desired_visible = self.interaction_cursor_override.is_some()
             || self.cursor_visibility.theme_fallback_visible();
         if self.cursor_visibility.visible == desired_visible {

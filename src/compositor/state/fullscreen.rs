@@ -116,6 +116,7 @@ impl CompositorState {
             output_width: self.output_size.width,
             output_height: self.output_size.height,
         });
+        self.refresh_presentation_feedback_eligibility();
         if crate::compositor::fullscreen::fullscreen_trace_enabled() {
             eprintln!(
                 "oblivion-one fullscreen: event={event} root_surface_id={surface_id} reason=authoritative_mode_state"
@@ -129,6 +130,7 @@ impl CompositorState {
             .is_some_and(|owner| owner.owner_root_surface_id == surface_id)
         {
             self.fullscreen_presentation = None;
+            self.refresh_presentation_feedback_eligibility();
             if crate::compositor::fullscreen::fullscreen_trace_enabled() {
                 eprintln!(
                     "oblivion-one fullscreen: event=fullscreen_owner_cleared root_surface_id={surface_id} reason=authoritative_mode_or_lifecycle_transition"

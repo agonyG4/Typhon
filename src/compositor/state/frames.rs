@@ -187,7 +187,7 @@ impl CompositorState {
             || self.presentation_animation_has_pending_visible()
             || self.lifecycle_animation_has_pending_visible()
             || self.has_unowned_frame_callbacks()
-            || self.has_visible_pending_presentation_feedbacks()
+            || self.has_frame_eligible_pending_presentation_feedbacks()
             // Deferred DMA-BUF releases are runtime retry debt.  They must
             // not manufacture a visual frame when no scene work exists.
             || !self.pending_dmabuf_buffer_releases.is_empty()
@@ -201,7 +201,9 @@ impl CompositorState {
         let completed_work = owns_frame_batch || surface_damage.is_some();
         if owns_frame_batch {
             if self.legacy_prepared_frame_batch.is_none() {
-                self.capture_frame_callbacks_for_render();
+                self.capture_frame_callbacks_for_render_with_presentation_samples(
+                    std::iter::empty(),
+                );
             }
             if let Some(surface_damage) = surface_damage {
                 let batch_id = self
@@ -241,7 +243,7 @@ impl CompositorState {
         self.complete_presented_frame_batch(frame_id, batch_id, presentation);
     }
 
-    fn complete_presentation_feedbacks(
+    pub(in crate::compositor) fn complete_presentation_feedbacks(
         &mut self,
         feedbacks: Vec<PendingPresentationFeedback>,
         presentation: FramePresentation,
@@ -338,6 +340,23 @@ impl CompositorState {
         &mut self,
         frame_id: u64,
     ) -> CompositorFrameBatchId {
+        self.take_frame_batch_for_render_inner(frame_id, None)
+    }
+
+    pub(in crate::compositor) fn take_frame_batch_for_render_with_presentation_samples(
+        &mut self,
+        frame_id: u64,
+        presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,
+    ) -> CompositorFrameBatchId {
+        let presentation_samples = presentation_samples.into_iter().collect::<HashSet<_>>();
+        self.take_frame_batch_for_render_inner(frame_id, Some(&presentation_samples))
+    }
+
+    fn take_frame_batch_for_render_inner(
+        &mut self,
+        frame_id: u64,
+        presentation_samples: Option<&HashSet<SurfacePresentationCommitKey>>,
+    ) -> CompositorFrameBatchId {
         assert!(
             self.frame_batches.len() < 2,
             "compositor frame batch registry exceeds pending plus ready capacity"
@@ -409,7 +428,10 @@ impl CompositorState {
             self.fifo_claims_for_frame(active_scene_surface_ids.iter().copied());
         let commit_timing_target_claims =
             self.commit_timing_claims_for_frame(active_scene_surface_ids.iter().copied());
-        let presentation_feedbacks = self.take_visible_pending_presentation_feedbacks();
+        let presentation_feedbacks = match presentation_samples {
+            Some(samples) => self.take_presentation_feedbacks_for_samples(samples),
+            None => self.take_frame_eligible_pending_presentation_feedbacks(),
+        };
         self.buffer_release_metrics.buffer_releases_captured = self
             .buffer_release_metrics
             .buffer_releases_captured
@@ -438,6 +460,7 @@ impl CompositorState {
                 callback_pacing_state: FrameCallbackPacingState::Captured,
                 callback_settlement: FrameCallbackSettlement::new(callback_count),
                 callback_terminal_ownership_checked: false,
+                presentation_samples_bound: presentation_samples.is_some(),
                 presentation_feedbacks,
                 dmabuf_releases_to_complete_on_present,
                 fifo_barrier_claims,
@@ -882,13 +905,16 @@ impl CompositorState {
                 }
             });
         }
-        let before = self.visible_pending_presentation_feedbacks.len();
-        discard_surface(&mut self.visible_pending_presentation_feedbacks, surface_id);
+        let before = self.frame_eligible_pending_presentation_feedbacks.len();
+        discard_surface(
+            &mut self.frame_eligible_pending_presentation_feedbacks,
+            surface_id,
+        );
         discard_surface(&mut self.pending_presentation_feedbacks, surface_id);
-        self.visible_pending_presentation_feedback_count = self
-            .visible_pending_presentation_feedback_count
+        self.frame_eligible_pending_presentation_feedback_count = self
+            .frame_eligible_pending_presentation_feedback_count
             .saturating_sub(
-                before.saturating_sub(self.visible_pending_presentation_feedbacks.len()),
+                before.saturating_sub(self.frame_eligible_pending_presentation_feedbacks.len()),
             );
         for batch in self.frame_batches.values_mut() {
             discard_surface(&mut batch.presentation_feedbacks, surface_id);
@@ -896,13 +922,13 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn discard_all_pending_presentation_feedbacks(&mut self) {
-        for pending in std::mem::take(&mut self.visible_pending_presentation_feedbacks)
+        for pending in std::mem::take(&mut self.frame_eligible_pending_presentation_feedbacks)
             .into_iter()
             .chain(std::mem::take(&mut self.pending_presentation_feedbacks))
         {
             pending.feedback.discarded();
         }
-        self.visible_pending_presentation_feedback_count = 0;
+        self.frame_eligible_pending_presentation_feedback_count = 0;
         for batch in self.frame_batches.values_mut() {
             for pending in std::mem::take(&mut batch.presentation_feedbacks) {
                 pending.feedback.discarded();

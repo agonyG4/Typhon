@@ -140,6 +140,7 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) callback_pacing_state: FrameCallbackPacingState,
     pub(super) callback_settlement: FrameCallbackSettlement,
     pub(super) callback_terminal_ownership_checked: bool,
+    pub(super) presentation_samples_bound: bool,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) dmabuf_releases_to_complete_on_present: Vec<DmabufReleaseObligation>,
     pub(super) fifo_barrier_claims: Vec<FifoBarrierClaim>,

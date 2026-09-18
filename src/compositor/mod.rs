@@ -864,8 +864,8 @@ pub struct CompositorState {
     surface_frame_clock: HashMap<u32, SurfaceFrameClockState>,
     visible_pending_frame_callback_count: usize,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    visible_pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    visible_pending_presentation_feedback_count: usize,
+    frame_eligible_pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
+    frame_eligible_pending_presentation_feedback_count: usize,
     frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     retired_frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     next_frame_batch_id: u64,
@@ -968,6 +968,15 @@ pub enum FrameBatchDiscardReason {
 pub(crate) struct SurfacePresentationKey {
     surface_id: u32,
     generation: u64,
+}
+
+/// Immutable identity of one client Content Update that can be sampled by a
+/// physically submitted frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfacePresentationCommitKey {
+    pub surface_id: u32,
+    pub presentation_generation: u64,
+    pub commit_sequence: SurfaceCommitSequence,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfacePresentationChange {

@@ -1798,7 +1798,24 @@ impl NativeRuntime {
                         {
                             server.note_client_cursor_surface_sample(false);
                         }
-                        server.capture_frame_callbacks_for_render();
+                        let mut presentation_samples = resolved_scene
+                            .surfaces
+                            .iter()
+                            .filter_map(|surface| {
+                                server.presentation_commit_key_for_renderable_surface(surface)
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some((surface_id, commit_sequence)) = exact_cursor_commit
+                            && let Some(key) = server.presentation_commit_key_for_surface_commit(
+                                surface_id,
+                                commit_sequence,
+                            )
+                        {
+                            presentation_samples.push(key);
+                        }
+                        server.capture_frame_callbacks_for_render_with_presentation_samples(
+                            presentation_samples,
+                        );
                         server.set_prepared_frame_surface_damage(surface_damage);
                         let paint_outcome = match scanout.paint_server_frame(
                             frame_renderer,

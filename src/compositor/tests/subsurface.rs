@@ -361,6 +361,81 @@ fn preactivation_subsurface_feedback_is_not_presented() {
 }
 
 #[test]
+fn mapped_subsurface_feedback_is_bound_to_the_rendered_child_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (parent, _, _) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 40, 30).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_position(3, 4);
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let feedback = presentation.feedback(&child, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 11).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 1,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureNativeFrameBatch {
+            frame_id: 2,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 2,
+            batch_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(state.presentation_presented_count, 1);
+    assert_eq!(state.presentation_discarded_count, 0);
+    assert_eq!(
+        state.presentation_feedback_event_log,
+        vec![(feedback.id().protocol_id(), "presented")]
+    );
+}
+
+#[test]
 fn destroyed_latched_subsurface_is_not_resurrected_by_delayed_parent_commit() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();

@@ -147,30 +147,37 @@ impl CompositorState {
         }
         self.visible_pending_frame_callback_count = self.visible_pending_frame_callbacks.len();
 
+        self.refresh_presentation_feedback_eligibility();
+    }
+
+    pub(in crate::compositor) fn refresh_presentation_feedback_eligibility(&mut self) {
         let feedbacks = std::mem::take(&mut self.pending_presentation_feedbacks);
-        let visible_feedbacks = std::mem::take(&mut self.visible_pending_presentation_feedbacks);
-        self.pending_presentation_feedbacks.clear();
-        self.visible_pending_presentation_feedbacks.clear();
-        for feedback in visible_feedbacks.into_iter().chain(feedbacks) {
-            if self.pending_presentation_feedback_is_visible(&feedback) {
-                self.visible_pending_presentation_feedbacks.push(feedback);
+        let frame_eligible_feedbacks =
+            std::mem::take(&mut self.frame_eligible_pending_presentation_feedbacks);
+        let fullscreen_plan = self.fullscreen_composition_plan();
+        for feedback in frame_eligible_feedbacks.into_iter().chain(feedbacks) {
+            if self.pending_presentation_feedback_is_frame_eligible(&feedback, &fullscreen_plan) {
+                self.frame_eligible_pending_presentation_feedbacks
+                    .push(feedback);
             } else {
                 self.pending_presentation_feedbacks.push(feedback);
             }
         }
-        self.visible_pending_presentation_feedback_count =
-            self.visible_pending_presentation_feedbacks.len();
+        self.frame_eligible_pending_presentation_feedback_count =
+            self.frame_eligible_pending_presentation_feedbacks.len();
     }
 
     pub(in crate::compositor) fn queue_pending_presentation_feedbacks(
         &mut self,
         feedbacks: Vec<PendingPresentationFeedback>,
     ) {
+        let fullscreen_plan = self.fullscreen_composition_plan();
         for feedback in feedbacks {
-            if self.pending_presentation_feedback_is_visible(&feedback) {
-                self.visible_pending_presentation_feedbacks.push(feedback);
-                self.visible_pending_presentation_feedback_count = self
-                    .visible_pending_presentation_feedback_count
+            if self.pending_presentation_feedback_is_frame_eligible(&feedback, &fullscreen_plan) {
+                self.frame_eligible_pending_presentation_feedbacks
+                    .push(feedback);
+                self.frame_eligible_pending_presentation_feedback_count = self
+                    .frame_eligible_pending_presentation_feedback_count
                     .saturating_add(1);
             } else {
                 self.pending_presentation_feedbacks.push(feedback);
@@ -263,8 +270,9 @@ impl CompositorState {
             })
             .collect();
 
-        let visible = std::mem::take(&mut self.visible_pending_presentation_feedbacks);
-        self.visible_pending_presentation_feedbacks = visible
+        let frame_eligible =
+            std::mem::take(&mut self.frame_eligible_pending_presentation_feedbacks);
+        self.frame_eligible_pending_presentation_feedbacks = frame_eligible
             .into_iter()
             .filter_map(|feedback| {
                 let superseded = feedback.surface_id == surface_id
@@ -278,11 +286,25 @@ impl CompositorState {
                 }
             })
             .collect();
-        self.visible_pending_presentation_feedback_count =
-            self.visible_pending_presentation_feedbacks.len();
+        self.frame_eligible_pending_presentation_feedback_count =
+            self.frame_eligible_pending_presentation_feedbacks.len();
     }
 
     pub(in crate::compositor) fn capture_frame_callbacks_for_render(&mut self) {
+        if self.legacy_prepared_frame_batch.is_some() {
+            return;
+        }
+        // The compatibility presenter has no native output scene to resolve. Its
+        // established render contract admits the frame-eligible feedback set;
+        // native submission paths pass their post-culling samples explicitly.
+        let presentation_samples = self.compatibility_frame_presentation_samples();
+        self.capture_frame_callbacks_for_render_with_presentation_samples(presentation_samples);
+    }
+
+    pub(in crate::compositor) fn capture_frame_callbacks_for_render_with_presentation_samples(
+        &mut self,
+        presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,
+    ) {
         if self.legacy_prepared_frame_batch.is_some() {
             return;
         }
@@ -291,7 +313,22 @@ impl CompositorState {
             .checked_add(1)
             .expect("legacy output frame ID overflow");
         let frame_id = self.next_legacy_output_frame_id;
-        self.legacy_prepared_frame_batch = Some(self.take_frame_batch_for_render(frame_id));
+        self.legacy_prepared_frame_batch =
+            Some(self.take_frame_batch_for_render_with_presentation_samples(
+                frame_id,
+                presentation_samples,
+            ));
+    }
+
+    fn compatibility_frame_presentation_samples(&self) -> Vec<SurfacePresentationCommitKey> {
+        self.frame_eligible_pending_presentation_feedbacks
+            .iter()
+            .map(|feedback| SurfacePresentationCommitKey {
+                surface_id: feedback.surface_id,
+                presentation_generation: feedback.surface_presentation_generation,
+                commit_sequence: feedback.commit_sequence,
+            })
+            .collect::<Vec<_>>()
     }
 
     pub(in crate::compositor) fn has_pending_frame_callbacks(&self) -> bool {
@@ -312,25 +349,64 @@ impl CompositorState {
         !self.pending_resize_configure_is_flushable()
             && !self.has_pending_frame_prepare_work()
             && self.pending_color_info.is_empty()
-            && !self.has_visible_pending_presentation_feedbacks()
+            && !self.has_frame_eligible_pending_presentation_feedbacks()
     }
 
-    fn pending_presentation_feedback_is_visible(
+    fn pending_presentation_feedback_is_frame_eligible(
         &self,
         feedback: &PendingPresentationFeedback,
+        fullscreen_plan: &FullscreenCompositionPlan,
     ) -> bool {
-        self.surface_is_visible_in_active_scene(feedback.surface_id)
+        if self.is_cursor_surface(feedback.surface_id) {
+            return self
+                .client_cursor_render_state()
+                .is_some_and(|cursor| cursor.surface.surface_id == feedback.surface_id);
+        }
+        let visible = self.surface_is_visible_in_active_scene(feedback.surface_id);
+        let root = self.presentation_owner_root_for_surface(feedback.surface_id);
+        let allowed = fullscreen_plan.allows_presentation_root(root);
+        visible && allowed
     }
 
-    pub(in crate::compositor) fn take_visible_pending_presentation_feedbacks(
+    pub(in crate::compositor) fn take_frame_eligible_pending_presentation_feedbacks(
         &mut self,
     ) -> Vec<PendingPresentationFeedback> {
-        self.visible_pending_presentation_feedback_count = 0;
-        std::mem::take(&mut self.visible_pending_presentation_feedbacks)
+        self.frame_eligible_pending_presentation_feedback_count = 0;
+        std::mem::take(&mut self.frame_eligible_pending_presentation_feedbacks)
     }
 
-    pub(in crate::compositor) fn has_visible_pending_presentation_feedbacks(&self) -> bool {
-        self.visible_pending_presentation_feedback_count > 0
+    pub(in crate::compositor) fn has_frame_eligible_pending_presentation_feedbacks(&self) -> bool {
+        self.frame_eligible_pending_presentation_feedback_count > 0
+    }
+
+    pub(in crate::compositor) fn take_presentation_feedbacks_for_samples(
+        &mut self,
+        presentation_samples: &HashSet<SurfacePresentationCommitKey>,
+    ) -> Vec<PendingPresentationFeedback> {
+        let frame_eligible =
+            std::mem::take(&mut self.frame_eligible_pending_presentation_feedbacks);
+        let pending = std::mem::take(&mut self.pending_presentation_feedbacks);
+        let fullscreen_plan = self.fullscreen_composition_plan();
+        let mut captured = Vec::new();
+        for feedback in frame_eligible.into_iter().chain(pending) {
+            if presentation_samples.contains(&SurfacePresentationCommitKey {
+                surface_id: feedback.surface_id,
+                presentation_generation: feedback.surface_presentation_generation,
+                commit_sequence: feedback.commit_sequence,
+            }) {
+                captured.push(feedback);
+            } else if self
+                .pending_presentation_feedback_is_frame_eligible(&feedback, &fullscreen_plan)
+            {
+                self.frame_eligible_pending_presentation_feedbacks
+                    .push(feedback);
+            } else {
+                self.pending_presentation_feedbacks.push(feedback);
+            }
+        }
+        self.frame_eligible_pending_presentation_feedback_count =
+            self.frame_eligible_pending_presentation_feedbacks.len();
+        captured
     }
 
     pub(in crate::compositor) fn has_unowned_frame_callbacks(&self) -> bool {
@@ -364,15 +440,17 @@ impl CompositorState {
         &mut self,
         feedbacks: Vec<PendingPresentationFeedback>,
     ) {
+        let fullscreen_plan = self.fullscreen_composition_plan();
         for feedback in feedbacks {
             if !self.pending_presentation_feedback_matches_active_commit(&feedback) {
                 feedback.feedback.discarded();
                 continue;
             }
-            if self.pending_presentation_feedback_is_visible(&feedback) {
-                self.visible_pending_presentation_feedbacks.push(feedback);
-                self.visible_pending_presentation_feedback_count = self
-                    .visible_pending_presentation_feedback_count
+            if self.pending_presentation_feedback_is_frame_eligible(&feedback, &fullscreen_plan) {
+                self.frame_eligible_pending_presentation_feedbacks
+                    .push(feedback);
+                self.frame_eligible_pending_presentation_feedback_count = self
+                    .frame_eligible_pending_presentation_feedback_count
                     .saturating_add(1);
             } else {
                 self.pending_presentation_feedbacks.push(feedback);
@@ -824,6 +902,7 @@ impl CompositorState {
         self.note_frame_callbacks_at_pageflip(batch_id, render_completed_ns, callbacks_remaining);
         self.complete_frame_callbacks_at_presentation_fallback(batch_id);
         let mut batch = self.take_presented_frame_batch(frame_id, batch_id);
+        let presentation_samples_bound = batch.presentation_samples_bound;
         if !matches!(presentation.kind, PresentationKind::Tearing) {
             for claim in &batch.fifo_barrier_claims {
                 if claim.surface_id == direct_surface_id {
@@ -840,12 +919,16 @@ impl CompositorState {
         }
         let feedbacks = std::mem::take(&mut batch.presentation_feedbacks);
         self.clear_legacy_batch_reference(batch_id);
-        self.complete_direct_presentation_feedbacks(
-            feedbacks,
-            direct_surface_id,
-            direct_lineage,
-            presentation,
-        );
+        if presentation_samples_bound {
+            self.complete_presentation_feedbacks(feedbacks, presentation);
+        } else {
+            self.complete_direct_presentation_feedbacks(
+                feedbacks,
+                direct_surface_id,
+                direct_lineage,
+                presentation,
+            );
+        }
         let _ = self.complete_frame_batch_releases(batch_id, batch);
     }
 
