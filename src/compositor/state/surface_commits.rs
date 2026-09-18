@@ -1854,7 +1854,7 @@ impl CompositorState {
                                 window_geometry,
                                 source,
                             );
-                            self.note_layer_surface_buffer_published(surface_id);
+                            self.note_layer_surface_mapped(surface_id);
                             self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
                             (true, activated)
                         }

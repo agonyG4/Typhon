@@ -1996,3 +1996,563 @@ fn arrangement_change_advances_render_generation_without_buffer_special_case() {
     commands.send(ServerCommand::Stop).unwrap();
     let _server = server_thread.join().unwrap();
 }
+
+fn map_exclusive_overlay_pair(
+    connection: &Connection,
+    queue: &mut EventQueue<RegistryTestState>,
+    state: &mut RegistryTestState,
+    compositor: &client_wl_compositor::WlCompositor,
+    shm: &client_wl_shm::WlShm,
+    layer_shell: &client_zwlr_layer_shell_v1::ZwlrLayerShellV1,
+    qh: &QueueHandle<RegistryTestState>,
+) -> (client_wl_surface::WlSurface, client_wl_surface::WlSurface) {
+    let mut map = |namespace: &str| {
+        let (surface, layer_surface) = create_layer_surface(
+            compositor,
+            layer_shell,
+            qh,
+            client_zwlr_layer_shell_v1::Layer::Overlay,
+            namespace,
+        );
+        layer_surface.set_size(64, 64);
+        layer_surface.set_keyboard_interactivity(
+            client_zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+        );
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(state).unwrap();
+        commit_test_buffered_surface(&surface, shm, qh, 64, 64).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(state).unwrap();
+        surface
+    };
+    (map("f10-exclusive-a"), map("f10-exclusive-b"))
+}
+
+#[test]
+fn repainting_older_exclusive_overlay_does_not_steal_focus() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (older, _newer) = map_exclusive_overlay_pair(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+    );
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let older_id = snapshots[0].surface_id;
+    let newer_id = snapshots[1].surface_id;
+    assert_eq!(capture_focused_surface_id(&commands), Some(newer_id));
+
+    commit_test_buffered_surface(&older, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(capture_focused_surface_id(&commands), Some(newer_id));
+    assert_eq!(
+        capture_renderable_surface_snapshot(&commands)
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        vec![older_id, newer_id]
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn repainting_older_overlay_does_not_change_same_layer_render_order() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (older, _newer) = map_exclusive_overlay_pair(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+    );
+    let before = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+
+    commit_test_buffered_surface(&older, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let after = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn geometry_only_layer_commit_preserves_lifecycle_order() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "f10-geometry-order",
+    );
+    layer_surface.set_anchor(client_zwlr_layer_surface_v1::Anchor::Top);
+    layer_surface.set_size(1280, 32);
+    layer_surface.set_exclusive_zone(32);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 1280, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let surface_id = surface.id().protocol_id();
+    let before = capture_layer_surface_lifecycle_state(&commands, surface_id).unwrap();
+    layer_surface.set_exclusive_zone(48);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after = capture_layer_surface_lifecycle_state(&commands, surface_id).unwrap();
+
+    assert_eq!(after.order, before.order);
+    assert_eq!(capture_usable_output_geometry(&commands).y, 48.0);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn content_only_layer_repaints_do_not_run_layer_maintenance() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (surface, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "f10-maintenance-counter",
+        64,
+        64,
+    );
+    let before = capture_core_compliance_metrics(&commands);
+
+    for _ in 0..1_000 {
+        commit_test_buffered_surface(&surface, &shm, &qh, 64, 64).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+    }
+
+    let after = capture_core_compliance_metrics(&commands);
+    assert_eq!(
+        after.layer_surface_arrangement_passes - before.layer_surface_arrangement_passes,
+        0
+    );
+    assert_eq!(
+        after.layer_surface_stack_reorder_passes - before.layer_surface_stack_reorder_passes,
+        0
+    );
+    assert_eq!(
+        after.layer_surface_keyboard_focus_recomputations
+            - before.layer_surface_keyboard_focus_recomputations,
+        0
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn first_map_and_remap_receive_fresh_lifecycle_orders() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+
+    let (first_surface, first_layer) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "f10-first-map",
+    );
+    first_layer.set_size(64, 64);
+    first_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&first_surface, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let first_id = first_surface.id().protocol_id();
+    let first_order = capture_layer_surface_lifecycle_state(&commands, first_id)
+        .unwrap()
+        .order;
+
+    let (second_surface, second_layer) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "f10-second-map",
+    );
+    second_layer.set_size(64, 64);
+    second_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&second_surface, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let second_id = second_surface.id().protocol_id();
+    let second_order = capture_layer_surface_lifecycle_state(&commands, second_id)
+        .unwrap()
+        .order;
+    assert!(second_order > first_order);
+
+    first_surface.attach(None, 0, 0);
+    first_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(
+        !capture_layer_surface_lifecycle_state(&commands, first_id)
+            .unwrap()
+            .mapped
+    );
+
+    first_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&first_surface, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let remapped_order = capture_layer_surface_lifecycle_state(&commands, first_id)
+        .unwrap()
+        .order;
+    assert!(remapped_order > second_order);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn repaint_preserves_same_layer_exclusive_reservation_order() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+
+    let mut map_reserved = |namespace: &str, zone: i32| {
+        let (surface, layer_surface) = create_layer_surface(
+            &compositor,
+            &layer_shell,
+            &qh,
+            client_zwlr_layer_shell_v1::Layer::Top,
+            namespace,
+        );
+        layer_surface.set_anchor(
+            client_zwlr_layer_surface_v1::Anchor::Top
+                | client_zwlr_layer_surface_v1::Anchor::Left
+                | client_zwlr_layer_surface_v1::Anchor::Right,
+        );
+        layer_surface.set_size(0, 24);
+        layer_surface.set_exclusive_zone(zone);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        commit_test_buffered_surface(&surface, &shm, &qh, 1280, 24).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        surface
+    };
+    let older = map_reserved("f10-reservation-older", 32);
+    let newer = map_reserved("f10-reservation-newer", 48);
+    let older_id = older.id().protocol_id();
+    let newer_id = newer.id().protocol_id();
+    let before_orders = (
+        capture_layer_surface_lifecycle_state(&commands, older_id)
+            .unwrap()
+            .order,
+        capture_layer_surface_lifecycle_state(&commands, newer_id)
+            .unwrap()
+            .order,
+    );
+    let before_geometry = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .map(|surface| {
+            (
+                surface.surface_id,
+                surface.local_y,
+                surface.width,
+                surface.height,
+            )
+        })
+        .collect::<Vec<_>>();
+    let before_usable = capture_usable_output_geometry(&commands);
+
+    for _ in 0..3 {
+        commit_test_buffered_surface(&older, &shm, &qh, 1280, 24).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+    }
+
+    let after_orders = (
+        capture_layer_surface_lifecycle_state(&commands, older_id)
+            .unwrap()
+            .order,
+        capture_layer_surface_lifecycle_state(&commands, newer_id)
+            .unwrap()
+            .order,
+    );
+    let after_geometry = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .map(|surface| {
+            (
+                surface.surface_id,
+                surface.local_y,
+                surface.width,
+                surface.height,
+            )
+        })
+        .collect::<Vec<_>>();
+    let after_usable = capture_usable_output_geometry(&commands);
+    assert_eq!(after_orders, before_orders);
+    assert_eq!(after_geometry, before_geometry);
+    assert_eq!(
+        (
+            after_usable.x,
+            after_usable.y,
+            after_usable.width,
+            after_usable.height
+        ),
+        (
+            before_usable.x,
+            before_usable.y,
+            before_usable.width,
+            before_usable.height
+        )
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn set_layer_changes_band_without_refreshing_lifecycle_order() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (older, older_layer) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "f10-set-layer-older",
+    );
+    older_layer.set_size(64, 64);
+    older.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&older, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let (newer, newer_layer) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "f10-set-layer-newer",
+    );
+    newer_layer.set_size(64, 64);
+    newer.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&newer, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let older_id = older.id().protocol_id();
+    let before_stack = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let before_order = capture_layer_surface_lifecycle_state(&commands, older_id)
+        .unwrap()
+        .order;
+    let before_metrics = capture_core_compliance_metrics(&commands);
+    older_layer.set_layer(client_zwlr_layer_shell_v1::Layer::Overlay);
+    older.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after = capture_layer_surface_lifecycle_state(&commands, older_id).unwrap();
+    let after_metrics = capture_core_compliance_metrics(&commands);
+    assert_eq!(after.order, before_order);
+    assert_eq!(after.layer_rank, 4);
+    assert_eq!(
+        capture_renderable_surface_snapshot(&commands)
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        vec![before_stack[1], before_stack[0]]
+    );
+    assert_eq!(
+        after_metrics.layer_surface_arrangement_passes
+            - before_metrics.layer_surface_arrangement_passes,
+        1
+    );
+    assert_eq!(
+        after_metrics.layer_surface_stack_reorder_passes
+            - before_metrics.layer_surface_stack_reorder_passes,
+        1
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn keyboard_policy_rearbitrates_without_restaking() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let mut map = |namespace: &str, interactivity| {
+        let (surface, layer_surface) = create_layer_surface(
+            &compositor,
+            &layer_shell,
+            &qh,
+            client_zwlr_layer_shell_v1::Layer::Overlay,
+            namespace,
+        );
+        layer_surface.set_size(64, 64);
+        layer_surface.set_keyboard_interactivity(interactivity);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        commit_test_buffered_surface(&surface, &shm, &qh, 64, 64).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        (surface, layer_surface)
+    };
+    let (older, older_layer) = map(
+        "f10-keyboard-older",
+        client_zwlr_layer_surface_v1::KeyboardInteractivity::None,
+    );
+    let (newer, newer_layer) = map(
+        "f10-keyboard-newer",
+        client_zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+    );
+    let older_id = older.id().protocol_id();
+    let newer_id = newer.id().protocol_id();
+    let before_stack = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let older_scene_id = before_stack[0];
+    let newer_scene_id = before_stack[1];
+    let before_orders = (
+        capture_layer_surface_lifecycle_state(&commands, older_id)
+            .unwrap()
+            .order,
+        capture_layer_surface_lifecycle_state(&commands, newer_id)
+            .unwrap()
+            .order,
+    );
+    assert_eq!(capture_focused_surface_id(&commands), Some(newer_scene_id));
+
+    let before_metrics = capture_core_compliance_metrics(&commands);
+    older_layer
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
+    older.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_metrics = capture_core_compliance_metrics(&commands);
+    assert_eq!(capture_focused_surface_id(&commands), Some(newer_scene_id));
+    assert_eq!(
+        capture_renderable_surface_snapshot(&commands)
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        before_stack
+    );
+    assert_eq!(
+        (
+            capture_layer_surface_lifecycle_state(&commands, older_id)
+                .unwrap()
+                .order,
+            capture_layer_surface_lifecycle_state(&commands, newer_id)
+                .unwrap()
+                .order,
+        ),
+        before_orders
+    );
+    assert_eq!(
+        after_metrics.layer_surface_arrangement_passes
+            - before_metrics.layer_surface_arrangement_passes,
+        0
+    );
+    assert_eq!(
+        after_metrics.layer_surface_stack_reorder_passes
+            - before_metrics.layer_surface_stack_reorder_passes,
+        0
+    );
+    assert_eq!(
+        after_metrics.layer_surface_keyboard_focus_recomputations
+            - before_metrics.layer_surface_keyboard_focus_recomputations,
+        1
+    );
+
+    newer_layer
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    newer.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_focused_surface_id(&commands), Some(older_scene_id));
+    assert_eq!(
+        capture_renderable_surface_snapshot(&commands)
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        before_stack
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}

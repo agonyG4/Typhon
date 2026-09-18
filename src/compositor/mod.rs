@@ -808,6 +808,7 @@ pub struct CompositorState {
     decoration_theme_error: Option<String>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
     layer_surfaces: HashMap<u32, LayerSurfaceRole>,
+    // Monotonic allocator for provisional registration order and map/remap lifecycle order.
     layer_surface_order: u64,
     exclusive_keyboard_layer_surface: Option<u32>,
     last_application_keyboard_focus: Option<wl_surface::WlSurface>,

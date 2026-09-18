@@ -333,6 +333,14 @@ pub(in crate::compositor::tests) struct SurfaceBufferOwnershipSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct LayerSurfaceLifecycleSnapshot {
+    pub(in crate::compositor::tests) mapped: bool,
+    pub(in crate::compositor::tests) order: u64,
+    pub(in crate::compositor::tests) layer_rank: u8,
+    pub(in crate::compositor::tests) geometry: Option<(i32, i32, u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct DmabufSubsurfaceOwnershipSnapshots {
     pub(in crate::compositor::tests) before_parent_null: SurfaceBufferOwnershipSnapshot,
     pub(in crate::compositor::tests) before_parent_null_child: SurfaceBufferOwnershipSnapshot,

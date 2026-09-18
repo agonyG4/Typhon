@@ -147,6 +147,30 @@ impl Default for LayerSurfaceCommitState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LayerSurfaceCommitEffects {
+    // These effects describe role policy only; content publication is not an effect here.
+    layout_changed: bool,
+    stack_changed: bool,
+    focus_policy_changed: bool,
+}
+
+impl LayerSurfaceCommitEffects {
+    fn between(previous: LayerSurfaceCommitState, next: LayerSurfaceCommitState) -> Self {
+        let stack_changed = previous.layer != next.layer;
+        Self {
+            layout_changed: stack_changed
+                || previous.anchors != next.anchors
+                || previous.size != next.size
+                || previous.margins != next.margins
+                || previous.exclusive_zone != next.exclusive_zone,
+            stack_changed,
+            focus_policy_changed: stack_changed
+                || previous.keyboard_interactivity != next.keyboard_interactivity,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LayerGeometry {
     pub(super) x: i32,
@@ -281,6 +305,7 @@ pub(super) struct LayerSurfaceRole {
     pub(super) mapped: bool,
     pub(super) geometry: Option<LayerGeometry>,
     pub(super) version: u32,
+    // Stable within a mapped lifecycle; content and mapped role-state commits do not refresh it.
     pub(super) order: u64,
 }
 
@@ -468,18 +493,22 @@ impl CompositorState {
             return true;
         }
         let previous_usable = self.reserved_usable_geometry();
-        let committed_change = match self.apply_captured_layer_surface_state(surface_id, captured) {
-            Some(committed_change) => committed_change,
+        let effects = match self.apply_captured_layer_surface_state(surface_id, captured) {
+            Some(effects) => effects,
             None => {
                 return false;
             }
         };
-        if committed_change {
-            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+        if self
+            .layer_surfaces
+            .get(&surface_id)
+            .is_some_and(|role| role.mapped)
+        {
+            self.apply_layer_surface_commit_effects(
+                effects,
                 previous_usable,
                 LayerArrangeCause::ClientSurfaceCommit { surface_id },
             );
-            self.reorder_renderable_surfaces_by_committed_stack();
         }
         if self
             .layer_surfaces
@@ -501,22 +530,19 @@ impl CompositorState {
             return true;
         }
         let previous_usable = self.reserved_usable_geometry();
-        if self
-            .apply_captured_layer_surface_state(surface_id, captured)
-            .is_none()
-        {
+        let Some(effects) = self.apply_captured_layer_surface_state(surface_id, captured) else {
             return false;
-        }
+        };
         if self
             .layer_surfaces
             .get(&surface_id)
             .is_some_and(|role| role.mapped)
         {
-            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+            self.apply_layer_surface_commit_effects(
+                effects,
                 previous_usable,
                 LayerArrangeCause::ClientSurfaceCommit { surface_id },
             );
-            self.reorder_renderable_surfaces_by_committed_stack();
         }
         let Some(role) = self.layer_surfaces.get(&surface_id) else {
             return false;
@@ -545,14 +571,14 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn note_layer_surface_buffer_published(&mut self, surface_id: u32) {
-        if !self.layer_surfaces.contains_key(&surface_id) {
+    pub(in crate::compositor) fn note_layer_surface_mapped(&mut self, surface_id: u32) {
+        let Some(role) = self.layer_surfaces.get(&surface_id) else {
+            return;
+        };
+        if role.mapped {
             return;
         }
         let previous_usable = self.reserved_usable_geometry();
-        let should_focus = self.layer_surfaces.get(&surface_id).is_some_and(|role| {
-            role.committed.keyboard_interactivity == KeyboardInteractivity::Exclusive
-        });
         self.layer_surface_order = self.layer_surface_order.saturating_add(1);
         let activation_order = self.layer_surface_order;
         if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
@@ -563,10 +589,12 @@ impl CompositorState {
             previous_usable,
             LayerArrangeCause::CompositorLayout,
         );
-        if should_focus {
+        if self.layer_surfaces.get(&surface_id).is_some_and(|role| {
+            role.committed.keyboard_interactivity == KeyboardInteractivity::Exclusive
+        }) {
             self.recompute_layer_keyboard_focus();
         }
-        self.reorder_renderable_surfaces_by_committed_stack();
+        self.reorder_layer_surfaces_by_committed_stack();
         self.reconcile_idle_inhibition();
         layer_shell_debug_log(|| format!("map surface={surface_id}"));
     }
@@ -590,7 +618,7 @@ impl CompositorState {
                 previous_usable,
                 LayerArrangeCause::CompositorLayout,
             );
-            self.reorder_renderable_surfaces_by_committed_stack();
+            self.reorder_layer_surfaces_by_committed_stack();
         }
         self.recompute_layer_keyboard_focus();
         self.reconcile_idle_inhibition();
@@ -625,7 +653,7 @@ impl CompositorState {
             popup_surface_id,
             SurfacePlacement::subsurface(surface_id, 0, 0),
         );
-        self.reorder_renderable_surfaces_by_committed_stack();
+        self.reorder_layer_surfaces_by_committed_stack();
         Ok(())
     }
 
@@ -660,7 +688,7 @@ impl CompositorState {
             previous_usable,
             LayerArrangeCause::CompositorLayout,
         );
-        self.reorder_renderable_surfaces_by_committed_stack();
+        self.reorder_layer_surfaces_by_committed_stack();
         self.recompute_layer_keyboard_focus();
     }
 
@@ -762,13 +790,13 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         captured: CapturedLayerSurfaceCommitState,
-    ) -> Option<bool> {
+    ) -> Option<LayerSurfaceCommitEffects> {
         let Some(previous) = self
             .layer_surfaces
             .get(&surface_id)
             .map(|role| role.committed)
         else {
-            return Some(false);
+            return Some(LayerSurfaceCommitEffects::default());
         };
         if let Err(message) = validate_layer_surface_size(captured.state) {
             let resource = self.layer_surfaces[&surface_id].resource.clone();
@@ -786,27 +814,33 @@ impl CompositorState {
             }
             return None;
         }
-        let mut rerun_focus = false;
-        let mapped_changed = previous != captured.state;
-        if mapped_changed {
-            self.layer_surface_order = self.layer_surface_order.saturating_add(1);
-        }
-        let order = self.layer_surface_order;
+        let effects = LayerSurfaceCommitEffects::between(previous, captured.state);
         let Some(role) = self.layer_surfaces.get_mut(&surface_id) else {
-            return Some(false);
+            return Some(LayerSurfaceCommitEffects::default());
         };
         role.committed = captured.state;
-        if role.mapped && mapped_changed {
-            role.order = order;
-            rerun_focus = previous.layer != captured.state.layer
-                || previous.keyboard_interactivity != captured.state.keyboard_interactivity;
-        }
-        let committed_change = role.mapped && mapped_changed;
         self.sync_scene_surface_metadata(surface_id);
-        if rerun_focus {
+        Some(effects)
+    }
+
+    fn apply_layer_surface_commit_effects(
+        &mut self,
+        effects: LayerSurfaceCommitEffects,
+        previous_usable: LayerLayoutRect,
+        cause: LayerArrangeCause,
+    ) {
+        if effects.layout_changed {
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+                previous_usable,
+                cause,
+            );
+        }
+        if effects.stack_changed {
+            self.reorder_layer_surfaces_by_committed_stack();
+        }
+        if effects.focus_policy_changed {
             self.recompute_layer_keyboard_focus();
         }
-        Some(committed_change)
     }
 
     fn configure_layer_surface(&mut self, surface_id: u32) {
@@ -1019,6 +1053,8 @@ impl CompositorState {
     }
 
     fn arrange_layer_surfaces(&mut self, cause: LayerArrangeCause) {
+        self.compliance_metrics
+            .note_layer_surface_arrangement_pass();
         let mut geometries = self
             .arranged_layer_geometries(None)
             .into_iter()
@@ -1146,6 +1182,8 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn recompute_layer_keyboard_focus(&mut self) {
+        self.compliance_metrics
+            .note_layer_surface_keyboard_focus_recomputation();
         let winner = self.active_exclusive_layer_surface_id();
         if let Some(winner) = winner {
             let Some(surface) = self.surface_resource_by_id(winner) else {
@@ -1200,6 +1238,12 @@ impl CompositorState {
             })
             .max_by_key(|(_, role)| (role.committed.layer.scene_rank(), role.order))
             .map(|(surface_id, _)| *surface_id)
+    }
+
+    fn reorder_layer_surfaces_by_committed_stack(&mut self) {
+        self.compliance_metrics
+            .note_layer_surface_stack_reorder_pass();
+        self.reorder_renderable_surfaces_by_committed_stack();
     }
 
     fn focused_surface_is_layer_surface(&self) -> bool {

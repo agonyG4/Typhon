@@ -1481,6 +1481,9 @@ fn delayed_layer_commit_uses_role_state_captured_before_later_mutation() {
     );
     let surface_id = surface.id().protocol_id();
     assert!(capture_layer_surface_commit_state(&commands, surface_id).is_some());
+    let mapped_order = capture_layer_surface_lifecycle_state(&commands, surface_id)
+        .unwrap()
+        .order;
 
     layer_surface.set_exclusive_zone(12);
     layer_surface
@@ -1492,6 +1495,12 @@ fn delayed_layer_commit_uses_role_state_captured_before_later_mutation() {
     commit_test_buffered_surface(&surface, &shm, &qh, 1280, 32).unwrap();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_layer_surface_lifecycle_state(&commands, surface_id)
+            .unwrap()
+            .order,
+        mapped_order
+    );
 
     layer_surface.set_exclusive_zone(34);
     layer_surface
@@ -1511,6 +1520,12 @@ fn delayed_layer_commit_uses_role_state_captured_before_later_mutation() {
     assert_eq!(
         capture_layer_surface_commit_state(&commands, surface_id),
         Some((34, 2))
+    );
+    assert_eq!(
+        capture_layer_surface_lifecycle_state(&commands, surface_id)
+            .unwrap()
+            .order,
+        mapped_order
     );
 
     commands.send(ServerCommand::Stop).unwrap();

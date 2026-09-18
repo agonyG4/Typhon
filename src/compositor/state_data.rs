@@ -62,6 +62,9 @@ pub struct CoreComplianceMetrics {
     pub surface_commit_geometry_noops: u64,
     pub surface_commit_popup_topology_updates: u64,
     pub surface_commit_popup_pointer_refreshes: u64,
+    pub layer_surface_arrangement_passes: u64,
+    pub layer_surface_stack_reorder_passes: u64,
+    pub layer_surface_keyboard_focus_recomputations: u64,
 }
 
 #[allow(dead_code)]
@@ -141,6 +144,22 @@ impl CoreComplianceMetrics {
     pub(in crate::compositor) fn note_surface_commit_popup_pointer_refresh(&mut self) {
         self.surface_commit_popup_pointer_refreshes = self
             .surface_commit_popup_pointer_refreshes
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_layer_surface_arrangement_pass(&mut self) {
+        self.layer_surface_arrangement_passes =
+            self.layer_surface_arrangement_passes.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_layer_surface_stack_reorder_pass(&mut self) {
+        self.layer_surface_stack_reorder_passes =
+            self.layer_surface_stack_reorder_passes.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_layer_surface_keyboard_focus_recomputation(&mut self) {
+        self.layer_surface_keyboard_focus_recomputations = self
+            .layer_surface_keyboard_focus_recomputations
             .saturating_add(1);
     }
 

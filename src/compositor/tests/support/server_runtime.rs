@@ -215,6 +215,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         surface_id: u32,
         reply: Sender<Option<(i32, u8)>>,
     },
+    CaptureLayerSurfaceLifecycleState {
+        surface_id: u32,
+        reply: Sender<Option<LayerSurfaceLifecycleSnapshot>>,
+    },
     CaptureLayerSurfacePendingAck {
         surface_id: u32,
         reply: Sender<Option<u32>>,
@@ -914,6 +918,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         KeyboardInteractivity::OnDemand => 2,
                                     },
                                 )
+                            });
+                        let _ = reply.send(state);
+                    }
+                    ServerCommand::CaptureLayerSurfaceLifecycleState { surface_id, reply } => {
+                        let state = server
+                            .state
+                            .layer_surfaces
+                            .values()
+                            .find(|role| role.surface.id().protocol_id() == surface_id)
+                            .map(|role| LayerSurfaceLifecycleSnapshot {
+                                mapped: role.mapped,
+                                order: role.order,
+                                layer_rank: role.committed.layer.scene_rank(),
+                                geometry: role.geometry.map(|geometry| {
+                                    (geometry.x, geometry.y, geometry.width, geometry.height)
+                                }),
                             });
                         let _ = reply.send(state);
                     }
@@ -1994,6 +2014,20 @@ pub(in crate::compositor::tests) fn capture_layer_surface_commit_state(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should return layer surface state")
+}
+
+pub(in crate::compositor::tests) fn capture_layer_surface_lifecycle_state(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<LayerSurfaceLifecycleSnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureLayerSurfaceLifecycleState { surface_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should return layer surface lifecycle state")
 }
 
 pub(in crate::compositor::tests) fn capture_layer_surface_pending_ack(
