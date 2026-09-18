@@ -678,7 +678,7 @@ pub struct CompositorState {
     lifecycle_decorations: HashMap<u32, crate::compositor::DecorationRenderInstance>,
     presented_lifecycle: crate::window_lifecycle_animation::LifecycleFrameSnapshot,
     presented_lifecycle_frame_id: u64,
-    presented_presentation: PresentationFrameSnapshot,
+    presented_presentation: Option<PresentationFrameSnapshot>,
     presented_window_geometries: Vec<PresentedWindowGeometry>,
     presented_presentation_frame_id: u64,
     scene_work_index: SceneWorkIndex,

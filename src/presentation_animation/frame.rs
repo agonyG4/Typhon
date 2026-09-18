@@ -441,6 +441,7 @@ impl PresentationFrameSnapshot {
     }
 }
 
+#[cfg(test)]
 impl Default for PresentationFrameSnapshot {
     fn default() -> Self {
         Self::empty()

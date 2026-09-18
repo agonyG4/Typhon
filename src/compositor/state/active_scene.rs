@@ -365,6 +365,7 @@ impl CompositorState {
         root_surface_id: u32,
     ) -> Option<PresentationGroupTransform> {
         self.presented_presentation
+            .as_ref()?
             .transform_for_root(root_surface_id)
     }
 
@@ -508,7 +509,7 @@ impl CompositorState {
             return;
         }
         self.presented_presentation_frame_id = frame_id;
-        self.presented_presentation = presentation.clone();
+        self.presented_presentation = Some(presentation.clone());
         self.presented_window_geometries = presentation.presented_windows.clone();
         for transform in &presentation.transforms {
             if transform.mathematically_settled {
@@ -537,12 +538,14 @@ impl CompositorState {
         {
             self.presentation_animator.cancel(scene_node_id);
         }
-        self.presented_presentation
-            .transforms
-            .retain(|transform| transform.root_surface_id != root_surface_id);
+        if let Some(presentation) = self.presented_presentation.as_mut() {
+            presentation
+                .transforms
+                .retain(|transform| transform.root_surface_id != root_surface_id);
+            presentation.refresh_signature();
+        }
         self.presented_window_geometries
             .retain(|window| window.root_surface_id() != root_surface_id);
-        self.presented_presentation.refresh_signature();
     }
 
     pub(in crate::compositor) fn cancel_presentation_geometry_for_root(
