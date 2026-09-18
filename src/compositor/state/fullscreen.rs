@@ -234,7 +234,7 @@ impl CompositorState {
         let fully_opaque = root
             .and_then(RenderableSurface::dmabuf_handle)
             .is_some_and(|buffer| {
-                buffer.format() == DrmFormat::Xrgb8888
+                buffer.format().is_opaque_rgb8888()
                     && buffer.size().width == self.output_size.width
                     && buffer.size().height == self.output_size.height
             })

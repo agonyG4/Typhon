@@ -19,10 +19,10 @@ use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
     AnimationTime, DirectScanoutSceneAnalysis, EffectFrameDemandSnapshot,
     FullscreenCompositionPlan, NativeFramePresentationTargets, PresentationAnimationMetrics,
-    PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
-    PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene, SceneNodeId,
-    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
-    SurfaceResourceSyncState, compositor_surface_id,
+    PresentationCoverageContent, PresentationCoverageContentKind, PresentationFrameSnapshot,
+    PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentedWindowGeometry,
+    ResolvedEffectScene, SceneNodeId, ShmBufferLifetimeMetrics, SurfaceCommitSequence,
+    SurfaceLocalityMetrics, SurfaceResourceSyncState, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -1658,6 +1658,45 @@ impl OwnCompositorServer {
 
     pub fn direct_scanout_scene_analysis(&self) -> DirectScanoutSceneAnalysis {
         self.state.direct_scanout_scene_analysis()
+    }
+
+    pub fn direct_scanout_layer_shell_doctor_details(
+        &self,
+        visible_content: &[PresentationCoverageContent],
+    ) -> (Vec<String>, bool) {
+        const MAX_VISIBLE_CONTENT: usize = 32;
+        let details = visible_content
+            .iter()
+            .take(MAX_VISIBLE_CONTENT)
+            .map(|content| match content.kind {
+                PresentationCoverageContentKind::LayerShell => self
+                    .state
+                    .direct_scanout_layer_shell_doctor_detail(content.root_surface_id)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{{root:{} kind:layer_shell state:unavailable}}",
+                            content.root_surface_id
+                        )
+                    }),
+                PresentationCoverageContentKind::Application => {
+                    format!("{{root:{} kind:application}}", content.root_surface_id)
+                }
+                PresentationCoverageContentKind::Popup => {
+                    format!("{{root:{} kind:popup}}", content.root_surface_id)
+                }
+                PresentationCoverageContentKind::ServerSideDecoration => {
+                    format!(
+                        "{{root:{} kind:server_side_decoration}}",
+                        content.root_surface_id
+                    )
+                }
+            })
+            .collect();
+        (details, visible_content.len() > MAX_VISIBLE_CONTENT)
+    }
+
+    pub fn direct_scanout_effect_doctor_details(&self) -> (u32, Vec<String>, bool) {
+        self.state.direct_scanout_effect_doctor_details()
     }
 
     pub fn fullscreen_tree_presentation_metadata(&self) -> Option<SurfacePresentationMetadata> {

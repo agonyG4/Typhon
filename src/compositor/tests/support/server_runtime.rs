@@ -5,6 +5,7 @@ use super::{
     locked_relative::*, output_bindings::*, registry_state::*, subsurface_client::*, window_ops::*,
 };
 use crate::compositor::layer_shell::KeyboardInteractivity;
+use crate::render_backend::buffer::DrmFormat;
 use crate::wm::{LayoutMembership, WorkspaceId, WorkspaceLocation};
 
 type PendingSurfaceTreeTransactionsSnapshot = Vec<(u64, Vec<(u32, u64)>)>;
@@ -447,6 +448,7 @@ pub(in crate::compositor::tests) struct DirectScanoutCandidateSnapshot {
     pub(in crate::compositor::tests) commit_sequence: SurfaceCommitSequence,
     pub(in crate::compositor::tests) buffer_size: BufferSize,
     pub(in crate::compositor::tests) output_size: BufferSize,
+    pub(in crate::compositor::tests) format: DrmFormat,
     pub(in crate::compositor::tests) viewport_identity_metadata_present: bool,
 }
 
@@ -1113,6 +1115,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 commit_sequence: candidate.commit_sequence,
                                 buffer_size: candidate.buffer_size,
                                 output_size: candidate.output_size,
+                                format: candidate.buffer.format(),
                                 viewport_identity_metadata_present: candidate
                                     .viewport_identity_metadata_present,
                             }

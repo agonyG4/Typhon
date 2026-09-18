@@ -78,6 +78,7 @@ mod commit_debug;
 mod decoration;
 mod desktop_window;
 mod direct_scanout;
+mod direct_scanout_doctor;
 mod dmabuf;
 mod effects;
 mod explicit_sync;

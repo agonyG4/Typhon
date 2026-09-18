@@ -259,6 +259,39 @@ fn xwayland_borderless_xrgb_window_is_a_direct_scanout_candidate_without_fullscr
 }
 
 #[test]
+fn xwayland_xbgr_window_is_an_opaque_direct_scanout_candidate() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(4).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            302,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xbgr8888,
+        ),
+        x11_output_snapshot(generation, 302, 302),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(analysis.blockers.is_empty(), "{:#?}", analysis.blockers);
+    assert_eq!(
+        analysis.coverage.opacity,
+        crate::compositor::PresentationCoverageOpacity::OpaqueRgb8888
+    );
+    assert_eq!(
+        analysis
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.buffer.format()),
+        Some(DrmFormat::Xbgr8888)
+    );
+}
+
+#[test]
 fn xwayland_shm_root_with_xrgb_child_uses_child_as_scanout_source() {
     let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
@@ -548,7 +581,7 @@ fn xwayland_non_xrgb_dmabuf_does_not_qualify_for_direct_scanout() {
         analysis
             .blockers
             .reasons()
-            .contains(&DirectScanoutSceneRejection::FormatNotOpaqueXrgb8888)
+            .contains(&DirectScanoutSceneRejection::FormatNotProvenOpaque)
     );
     assert!(analysis.candidate.is_none());
 }

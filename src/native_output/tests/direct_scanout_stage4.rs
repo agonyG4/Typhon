@@ -8,11 +8,11 @@ use super::{
 };
 use oblivion_one::compositor::{CompositorFrameBatchId, DrmContentType, OutputPresentationMode};
 use oblivion_one::native::kms::PageFlipToken;
-use oblivion_one::render_backend::buffer::DrmFormat;
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
+use oblivion_one::render_backend::buffer::DrmFormat;
 use std::num::NonZeroU64;
 use std::time::Duration;
 

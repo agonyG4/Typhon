@@ -8,8 +8,8 @@ use crate::effects::{
 };
 
 use super::{
-    BackgroundEffectRegion, InputRegionOp, SurfaceData, VisualGroupId, VisualStackGroup,
-    visual_stack_groups,
+    BackgroundEffectRegion, FullscreenCompositionPlan, InputRegionOp, SurfaceData, VisualGroupId,
+    VisualStackGroup, visual_stack_groups,
 };
 use wayland_server::Resource;
 
@@ -354,6 +354,15 @@ impl super::CompositorState {
         ResolvedEffectScene::new(self.scene_render_generation, instances)
     }
 
+    pub(in crate::compositor) fn direct_scanout_effect_doctor_details(
+        &self,
+    ) -> (u32, Vec<String>, bool) {
+        super::direct_scanout_doctor::effect_details(
+            &self.resolved_effect_scene(),
+            &self.trusted_effect_registry.current(),
+        )
+    }
+
     fn scene_order_for_instance(&self, instance: &ResolvedEffectInstance) -> EffectSceneOrder {
         let phase = match instance.anchor {
             EffectAnchor::BeforeSurface(_) => 0,
@@ -395,6 +404,7 @@ impl super::CompositorState {
     pub(in crate::compositor) fn resolved_effect_scene_with_presentation(
         &self,
         presentation: &PresentationSceneSample,
+        fullscreen_plan: &FullscreenCompositionPlan,
     ) -> ResolvedEffectScene {
         let scene = self.resolved_effect_scene();
         let instances = scene
@@ -409,7 +419,10 @@ impl super::CompositorState {
                     }
                     EffectAnchor::OutputPostProcess => None,
                 };
-                root_surface_id.is_none_or(|root| !self.lifecycle_surface_is_suppressed(root))
+                root_surface_id.is_none_or(|root| {
+                    !self.lifecycle_surface_is_suppressed(root)
+                        && fullscreen_plan.allows_presentation_root(root)
+                })
             })
             .map(|mut instance| {
                 let surface_id = match instance.anchor {

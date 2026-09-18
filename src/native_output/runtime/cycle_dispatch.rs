@@ -1,7 +1,9 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::*;
 
-use oblivion_one::compositor::{DirectScanoutSceneAnalysis, SurfaceRenderBackend};
+use oblivion_one::compositor::{
+    DirectScanoutFeedbackCapabilities, DirectScanoutSceneAnalysis, SurfaceRenderBackend,
+};
 use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
 };
@@ -15,7 +17,7 @@ use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
 };
 use oblivion_one::native::event_loop::NativeWakeup;
-use oblivion_one::render_backend::buffer::SurfaceBufferSource;
+use oblivion_one::render_backend::buffer::{DrmFormat, SurfaceBufferSource};
 use serde::{Deserialize, Deserializer};
 
 #[inline]
@@ -927,9 +929,17 @@ impl NativeRuntime {
                         self.server
                             .direct_scanout_solitary_fullscreen(candidate.root_surface_id)
                     });
+                let visible_above = self.server.direct_scanout_layer_shell_doctor_details(
+                    &direct_scene_analysis.coverage.visible_content_above,
+                );
+                let effects = self.server.direct_scanout_effect_doctor_details();
+                let scanout_capabilities = self.scanout.dmabuf_scanout_capabilities();
                 let direct_scene = DirectScanoutDoctorScene::from_analysis(
                     &direct_scene_analysis,
                     semantic_solitary_fullscreen,
+                    scanout_capabilities.as_ref(),
+                    visible_above,
+                    effects,
                 );
                 let direct_runtime = DirectScanoutDoctorRuntime {
                     direct_pending: self.scanout.direct_scanout_pending(),
@@ -2080,11 +2090,12 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectScanoutCounters, DirectScanoutDoctorRuntime, DirectScanoutDoctorScene,
-        EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs, KeyboardLayoutSetArgs,
-        NativePreReadInputDecision, decide_native_pre_read_input, dispatch_keyboard_layout_command,
-        format_direct_scanout_doctor_detail, input_requires_full_server_progression,
-        keyboard_layout_failure, promote_native_input_before_wayland_read,
+        DirectScanoutCounters, DirectScanoutDoctorFormat, DirectScanoutDoctorRuntime,
+        DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs,
+        KeyboardLayoutSetArgs, NativePreReadInputDecision, decide_native_pre_read_input,
+        dispatch_keyboard_layout_command, format_direct_scanout_doctor_detail,
+        input_requires_full_server_progression, keyboard_layout_failure,
+        promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -2119,8 +2130,13 @@ mod tests {
             group_surfaces: Vec::new(),
             group_surfaces_truncated: false,
             visible_above: Vec::new(),
+            visible_above_truncated: false,
+            scanout_format: None,
             opacity: "unknown",
             scene_blockers: vec!["application_content_above", "popup_visible"],
+            effects_visible_instance_count: 0,
+            effects: Vec::new(),
+            effects_truncated: false,
             semantic_solitary_fullscreen: false,
         };
         let counters = DirectScanoutCounters::default();
@@ -2148,13 +2164,27 @@ mod tests {
             group_surfaces: vec![
                 "{id:42 order:0 backend:xwayland buffer_source:shm format:unknown target:0,0,1920,1080 relation:below_source}"
                     .to_string(),
-                "{id:43 order:1 backend:xwayland buffer_source:dmabuf format:0x34325258 target:0,0,1920,1080 relation:source}"
+                "{id:43 order:1 backend:xwayland buffer_source:dmabuf format:0x34324258 target:0,0,1920,1080 relation:source}"
                     .to_string(),
             ],
             group_surfaces_truncated: false,
-            visible_above: Vec::new(),
-            opacity: "opaque_xrgb8888",
+            visible_above_truncated: false,
+            scanout_format: Some(DirectScanoutDoctorFormat {
+                fourcc: 0x3432_4258,
+                name: "XBGR8888",
+                proven_opaque: true,
+                primary_plane_supported: Some(true),
+            }),
+            visible_above: vec![
+                "{root:7 kind:layer_shell namespace:astrea-dock layer:top mapped:true geometry:0,0,1920,64 surface_count:1 intersects_output:true}".to_string(),
+            ],
+            opacity: "opaque_rgb8888",
             scene_blockers: Vec::new(),
+            effects_visible_instance_count: 1,
+            effects: vec![
+                "{id:123 program:background_blur anchor:before_surface:7 region:0,0,1920,64 target_surface:7 requires_composition:true}".to_string(),
+            ],
+            effects_truncated: false,
             semantic_solitary_fullscreen: false,
         };
         let counters = DirectScanoutCounters {
@@ -2182,6 +2212,13 @@ mod tests {
 
         assert!(detail.contains("scene_candidate=true scene_root=42"));
         assert!(detail.contains("scanout_source=43"));
+        assert!(detail.contains(
+            "scanout_format={fourcc:0x34324258 name:XBGR8888 proven_opaque:true primary_plane_supported:true}"
+        ));
+        assert!(detail.contains("namespace:astrea-dock"));
+        assert!(detail.contains("effects_visible_instance_count=1"));
+        assert!(detail.contains("program:background_blur"));
+        assert!(detail.contains("effects_truncated=false"));
         assert!(detail.contains("group_surfaces_truncated=false"));
         assert!(detail.contains("semantic_solitary_fullscreen=false"));
         assert!(detail.contains("candidate_checks:3"));
@@ -2939,6 +2976,14 @@ fn doctor_check_with_detail(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectScanoutDoctorFormat {
+    fourcc: u32,
+    name: &'static str,
+    proven_opaque: bool,
+    primary_plane_supported: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectScanoutDoctorScene {
     scene_candidate: bool,
     scene_root: Option<u32>,
@@ -2946,8 +2991,13 @@ struct DirectScanoutDoctorScene {
     group_surfaces: Vec<String>,
     group_surfaces_truncated: bool,
     visible_above: Vec<String>,
+    visible_above_truncated: bool,
+    scanout_format: Option<DirectScanoutDoctorFormat>,
     opacity: &'static str,
     scene_blockers: Vec<&'static str>,
+    effects_visible_instance_count: u32,
+    effects: Vec<String>,
+    effects_truncated: bool,
     semantic_solitary_fullscreen: bool,
 }
 
@@ -2955,6 +3005,9 @@ impl DirectScanoutDoctorScene {
     fn from_analysis(
         analysis: &DirectScanoutSceneAnalysis,
         semantic_solitary_fullscreen: bool,
+        scanout_capabilities: Option<&DirectScanoutFeedbackCapabilities>,
+        (visible_above, visible_above_truncated): (Vec<String>, bool),
+        (effects_visible_instance_count, effects, effects_truncated): (u32, Vec<String>, bool),
     ) -> Self {
         const MAX_GROUP_SURFACES: usize = 32;
         let group = analysis.coverage.covering_application_group.as_ref();
@@ -3005,29 +3058,21 @@ impl DirectScanoutDoctorScene {
             .unwrap_or_default();
         let group_surfaces_truncated =
             group.is_some_and(|group| group.surface_details.len() > MAX_GROUP_SURFACES);
-        let visible_above = analysis
-            .coverage
-            .visible_content_above
-            .iter()
-            .map(|content| {
-                format!(
-                    "{{root:{} kind:{}}}",
-                    content.root_surface_id,
-                    match content.kind {
-                        oblivion_one::compositor::PresentationCoverageContentKind::Application => {
-                            "application"
-                        }
-                        oblivion_one::compositor::PresentationCoverageContentKind::Popup => "popup",
-                        oblivion_one::compositor::PresentationCoverageContentKind::LayerShell => {
-                            "layer_shell"
-                        }
-                        oblivion_one::compositor::PresentationCoverageContentKind::ServerSideDecoration => {
-                            "server_side_decoration"
-                        }
-                    }
-                )
-            })
-            .collect();
+        let scanout_format = group
+            .and_then(|group| group.covering_surface.as_ref())
+            .and_then(|surface| {
+                let format = surface.format?;
+                let primary_plane_supported = surface.modifier.and_then(|modifier| {
+                    scanout_capabilities
+                        .map(|capabilities| capabilities.supports(format.as_fourcc(), modifier.0))
+                });
+                Some(DirectScanoutDoctorFormat {
+                    fourcc: format.as_fourcc(),
+                    name: direct_scanout_doctor_format_name(format),
+                    proven_opaque: analysis.coverage.opacity.is_proven_opaque(),
+                    primary_plane_supported,
+                })
+            });
         Self {
             scene_candidate: analysis.candidate.is_some(),
             scene_root,
@@ -3035,6 +3080,8 @@ impl DirectScanoutDoctorScene {
             group_surfaces,
             group_surfaces_truncated,
             visible_above,
+            visible_above_truncated,
+            scanout_format,
             opacity: analysis.coverage.opacity.as_str(),
             scene_blockers: analysis
                 .blockers
@@ -3042,6 +3089,9 @@ impl DirectScanoutDoctorScene {
                 .iter()
                 .map(|reason| reason.as_str())
                 .collect(),
+            effects_visible_instance_count,
+            effects,
+            effects_truncated,
             semantic_solitary_fullscreen,
         }
     }
@@ -3067,6 +3117,32 @@ fn direct_scanout_doctor_format(
     format.map_or_else(
         || "unknown".to_string(),
         |format| format!("0x{:08x}", format.as_fourcc()),
+    )
+}
+
+fn direct_scanout_doctor_format_name(format: DrmFormat) -> &'static str {
+    match format {
+        DrmFormat::Argb8888 => "ARGB8888",
+        DrmFormat::Xrgb8888 => "XRGB8888",
+        DrmFormat::Xbgr8888 => "XBGR8888",
+        DrmFormat::Other(_) => "OTHER",
+    }
+}
+
+fn direct_scanout_doctor_scanout_format(format: Option<&DirectScanoutDoctorFormat>) -> String {
+    format.map_or_else(
+        || "none".to_string(),
+        |format| {
+            format!(
+                "{{fourcc:0x{:08x} name:{} proven_opaque:{} primary_plane_supported:{}}}",
+                format.fourcc,
+                format.name,
+                format.proven_opaque,
+                format
+                    .primary_plane_supported
+                    .map_or_else(|| "unknown".to_string(), |supported| supported.to_string()),
+            )
+        },
     )
 }
 
@@ -3101,14 +3177,19 @@ fn format_direct_scanout_doctor_detail(
         scene.scene_blockers.join(",")
     };
     format!(
-        "scene_candidate={} scene_root={} scanout_source={} group_surfaces=[{}] group_surfaces_truncated={} visible_above=[{}] opacity={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
+        "scene_candidate={} scene_root={} scanout_source={} scanout_format={} group_surfaces=[{}] group_surfaces_truncated={} visible_above=[{}] visible_above_truncated={} opacity={} effects_visible_instance_count={} effects=[{}] effects_truncated={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
         scene.scene_candidate,
         scene_root,
         scanout_source,
+        direct_scanout_doctor_scanout_format(scene.scanout_format.as_ref()),
         scene.group_surfaces.join(","),
         scene.group_surfaces_truncated,
         scene.visible_above.join(","),
+        scene.visible_above_truncated,
         scene.opacity,
+        scene.effects_visible_instance_count,
+        scene.effects.join(","),
+        scene.effects_truncated,
         scene_blockers,
         scene.semantic_solitary_fullscreen,
         feature_state.as_str(),
