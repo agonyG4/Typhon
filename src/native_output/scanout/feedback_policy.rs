@@ -309,7 +309,7 @@ mod tests {
             same_physical_gpu,
             dmabuf_version: 4,
             default_feedback_tranche_count: 2,
-            surface_feedback_policy: "default-and-surface-same",
+            surface_feedback_policy: "dynamic-per-surface-scanout",
         }
     }
 
@@ -509,7 +509,7 @@ mod tests {
             same_physical_gpu: Some(drm_nodes_share_physical_device(&primary, &render)),
             dmabuf_version: 4,
             default_feedback_tranche_count: 2,
-            surface_feedback_policy: "default-and-surface-same",
+            surface_feedback_policy: "dynamic-per-surface-scanout",
         });
 
         assert_eq!(compatibility.target_device_override(), Some(render.device));

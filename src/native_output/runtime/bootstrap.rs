@@ -1580,7 +1580,7 @@ fn native_dmabuf_feedback_compatibility(
             capabilities.dmabuf_version().wayland_version()
         }),
         default_feedback_tranche_count,
-        surface_feedback_policy: "default-and-surface-same",
+        surface_feedback_policy: "dynamic-per-surface-scanout",
     })
 }
 

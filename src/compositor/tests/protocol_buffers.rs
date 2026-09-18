@@ -338,9 +338,10 @@ fn configured_stage4_feedback_server(
         Some("/dev/dri/renderD128".to_string()),
         capabilities,
     );
+    server.activate_surface_scanout_hint(1);
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
-    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
     stop_test_server(running, server_thread);
     (
         socket_name,
@@ -360,6 +361,70 @@ fn scanout_tranche_precedes_renderer_tranche() {
     let (_socket, tranche_count, _device) = configured_stage4_feedback_server(Some(capabilities));
 
     assert_eq!(tranche_count, 2);
+}
+
+#[test]
+fn default_feedback_stays_renderer_only_when_scanout_capabilities_exist() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_dmabuf_feedback_with_scanout_capabilities(
+        EglGlesDmabufFeedback::with_scanout_tranche(
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Xrgb8888,
+                DrmModifier(0),
+            )],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        ),
+        Some(0x1122),
+        Some("/dev/dri/renderD128".to_string()),
+        Some(stage4_feedback_capabilities(
+            0x8877_6655_4433_2211,
+            1,
+            42,
+            [(DrmFormat::Xrgb8888.as_fourcc(), 0)],
+        )),
+    );
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert_eq!(state.dmabuf_feedback_tranche_scanout, vec![false]);
+}
+
+#[test]
+fn surface_feedback_without_hint_stays_renderer_only() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_dmabuf_feedback_with_scanout_capabilities(
+        EglGlesDmabufFeedback::with_scanout_tranche(
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Xrgb8888,
+                DrmModifier(0),
+            )],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        ),
+        Some(0x1122),
+        Some("/dev/dri/renderD128".to_string()),
+        Some(stage4_feedback_capabilities(
+            0x8877_6655_4433_2211,
+            1,
+            42,
+            [(DrmFormat::Xrgb8888.as_fourcc(), 0)],
+        )),
+    );
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert_eq!(state.dmabuf_feedback_tranche_scanout, vec![false]);
 }
 
 #[test]
@@ -389,9 +454,10 @@ fn scanout_tranche_uses_selected_drm_device() {
         Some("/dev/dri/renderD128".to_string()),
         Some(capabilities),
     );
+    server.activate_surface_scanout_hint(1);
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
-    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
     stop_test_server(running, server_thread);
 
     assert_eq!(
@@ -431,9 +497,10 @@ fn forced_compat_feedback_has_no_target_device_mismatch() {
         Some(capabilities),
         Some(main_device),
     );
+    server.activate_surface_scanout_hint(1);
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
-    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
     stop_test_server(running, server_thread);
 
     assert_eq!(state.dmabuf_feedback_tranche_targets.len(), 2);
@@ -470,13 +537,14 @@ fn scanout_tranche_excludes_renderer_only_formats() {
         Some("/dev/dri/renderD128".to_string()),
         Some(capabilities),
     );
+    server.activate_surface_scanout_hint(1);
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
-    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
     stop_test_server(running, server_thread);
 
-    assert_eq!(state.dmabuf_feedback_tranche_indices[0], vec![0, 0]);
-    assert_eq!(state.dmabuf_feedback_tranche_indices[1], vec![1, 0]);
+    assert_eq!(state.dmabuf_feedback_tranche_indices[0], vec![1, 0]);
+    assert_eq!(state.dmabuf_feedback_tranche_indices[1], vec![0, 0]);
 }
 
 #[test]
@@ -504,9 +572,10 @@ fn scanout_tranche_excludes_unsupported_modifiers() {
         Some("/dev/dri/renderD128".to_string()),
         Some(capabilities),
     );
+    server.activate_surface_scanout_hint(1);
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
-    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
     stop_test_server(running, server_thread);
 
     assert!(!state.dmabuf_feedback_tranche_scanout[0]);

@@ -550,6 +550,7 @@ impl NativeRuntime {
             direct_scanout_preference: *direct_scanout_preference,
             plane_decision: runtime_plane_plan.as_ref().map(|plan| &plan.decision),
         });
+        server.reconcile_surface_scanout_candidate(direct_inspection.candidate_surface_id);
         let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
         let atomic_primary_commit_pending = direct_inspection.atomic_primary_commit_pending;
         let direct_candidate_changed = direct_inspection.direct_candidate_changed;

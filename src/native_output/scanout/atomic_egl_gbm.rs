@@ -149,7 +149,6 @@ struct DeviceAllocationProbe<'a> {
 fn discover_direct_scanout_capabilities(
     plane_formats: &[DrmFormatModifierPair],
     renderer_dmabuf_feedback: &EglGlesDmabufFeedback,
-    probe: &mut impl GbmAllocationProbe,
 ) -> Vec<DirectScanoutFormatCapability> {
     plane_formats
         .iter()
@@ -160,7 +159,7 @@ fn discover_direct_scanout_capabilities(
                 return None;
             }
             let modifier = DrmModifier(format.modifier);
-            if !renderer_dmabuf_feedback.supports(drm_format, modifier) || !probe.supports(format) {
+            if !renderer_dmabuf_feedback.supports(drm_format, modifier) {
                 return None;
             }
             Some(DirectScanoutFormatCapability {
@@ -482,7 +481,6 @@ impl AtomicEglGbmScanout {
             let scanout_capabilities = discover_direct_scanout_capabilities(
                 &discovery.plane_scanout_formats,
                 &renderer_dmabuf_feedback,
-                &mut probe,
             );
             let scanout_capabilities = DirectScanoutFeedbackCapabilities::new(
                 kms.metadata()?.rdev(),
@@ -1866,17 +1864,6 @@ impl Drop for AtomicEglGbmScanout {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct TestProbe {
-        rejected: Vec<DrmFormatModifierPair>,
-    }
-
-    impl GbmAllocationProbe for TestProbe {
-        fn supports(&mut self, candidate: DrmFormatModifierPair) -> bool {
-            !self.rejected.contains(&candidate)
-        }
-    }
-
     #[test]
     fn direct_scanout_capability_filter_keeps_exact_opaque_rgb_pairs() {
         let xrgb = DrmFormatModifierPair {
@@ -1903,13 +1890,8 @@ mod tests {
                 EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier(11)),
             ],
         );
-        let mut probe = TestProbe::default();
-
-        let capabilities = discover_direct_scanout_capabilities(
-            &[xrgb, xbgr, argb, invalid],
-            &feedback,
-            &mut probe,
-        );
+        let capabilities =
+            discover_direct_scanout_capabilities(&[xrgb, xbgr, argb, invalid], &feedback);
 
         assert_eq!(
             capabilities,
@@ -1927,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_scanout_capability_filter_requires_feedback_and_gbm_support() {
+    fn direct_scanout_capability_filter_uses_plane_and_renderer_intersection_only() {
         let xrgb = DrmFormatModifierPair {
             fourcc: DrmFormat::XRGB8888_FOURCC,
             modifier: 7,
@@ -1943,13 +1925,14 @@ mod tests {
                 DrmModifier(7),
             )],
         );
-        let mut probe = TestProbe {
-            rejected: vec![xrgb],
-        };
+        let capabilities = discover_direct_scanout_capabilities(&[xrgb, xbgr], &feedback);
 
-        let capabilities =
-            discover_direct_scanout_capabilities(&[xrgb, xbgr], &feedback, &mut probe);
-
-        assert!(capabilities.is_empty());
+        assert_eq!(
+            capabilities,
+            vec![DirectScanoutFormatCapability {
+                format: xrgb.fourcc,
+                modifier: xrgb.modifier,
+            }]
+        );
     }
 }

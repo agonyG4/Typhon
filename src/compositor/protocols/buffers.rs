@@ -391,25 +391,15 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
                 data_init.init(params_id, DmabufParamsData::default());
             }
             zwp_linux_dmabuf_v1::Request::Destroy => {}
-            zwp_linux_dmabuf_v1::Request::GetDefaultFeedback { id }
-            | zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, .. } => {
-                match DmabufFeedbackData::new(
-                    &state.dmabuf_feedback,
-                    state.dmabuf_main_device,
-                    state.gpu_protocol_capabilities.dmabuf_formats(),
-                    state.dmabuf_scanout_capabilities.as_ref(),
-                    state.dmabuf_scanout_target_device_override,
-                ) {
-                    Ok(data) => {
-                        let feedback = data_init.init(id, data);
-                        send_dmabuf_feedback(&feedback);
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "oblivion-one compositor: failed to build dmabuf feedback: {error}"
-                        );
-                    }
-                }
+            zwp_linux_dmabuf_v1::Request::GetDefaultFeedback { id } => {
+                create_dmabuf_feedback_resource(state, id, DmabufFeedbackScope::Default, data_init);
+            }
+            zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, surface } => {
+                let scope = surface
+                    .data::<SurfaceData>()
+                    .map(|data| DmabufFeedbackScope::Surface(data.surface_id()))
+                    .unwrap_or(DmabufFeedbackScope::InertSurface);
+                create_dmabuf_feedback_resource(state, id, scope, data_init);
             }
             other => {
                 let _ = other;
@@ -423,7 +413,38 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
     }
 }
 
-impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DmabufFeedbackData>
+fn create_dmabuf_feedback_resource(
+    state: &mut CompositorState,
+    id: New<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1>,
+    scope: DmabufFeedbackScope,
+    data_init: &mut DataInit<'_, CompositorState>,
+) {
+    let snapshot = state
+        .dmabuf_feedback_snapshot_for_scope(scope)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            state
+                .dmabuf_feedback_snapshot_for_scope(DmabufFeedbackScope::Default)
+                .ok()
+                .flatten()
+        });
+    let Some(snapshot) = snapshot else {
+        eprintln!("oblivion-one compositor: failed to build dmabuf feedback for scope {scope:?}");
+        return;
+    };
+    let Ok(binding) =
+        DmabufFeedbackBinding::new(scope, snapshot).map(|binding| Arc::new(Mutex::new(binding)))
+    else {
+        eprintln!("oblivion-one compositor: failed to materialize dmabuf feedback");
+        return;
+    };
+    let feedback = data_init.init(id, DmabufFeedbackResourceData { binding });
+    state.register_dmabuf_feedback_resource(&feedback);
+    send_dmabuf_feedback_resource(&feedback);
+}
+
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DmabufFeedbackResourceData>
     for CompositorState
 {
     fn request(
@@ -431,10 +452,19 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DmabufFeed
         _client: &Client,
         _resource: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
         _request: zwp_linux_dmabuf_feedback_v1::Request,
-        _data: &DmabufFeedbackData,
+        _data: &DmabufFeedbackResourceData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+    }
+
+    fn destroyed(
+        state: &mut CompositorState,
+        _client: ClientId,
+        resource: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        _data: &DmabufFeedbackResourceData,
+    ) {
+        state.unregister_dmabuf_feedback_resource(resource);
     }
 }
 

@@ -141,8 +141,10 @@ pub(crate) use desktop_window::{
 };
 pub use dmabuf::{DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability};
 use dmabuf::{
-    DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
-    send_dmabuf_feedback, send_dmabuf_format_modifiers, send_wl_drm_capabilities,
+    DmabufBufferData, DmabufFeedbackBinding, DmabufFeedbackData, DmabufFeedbackResourceData,
+    DmabufFeedbackScope, DmabufFeedbackSnapshot, DmabufParamsData, LiveDmabufFeedbackResource,
+    PendingDmabufPlane, send_dmabuf_feedback_resource, send_dmabuf_format_modifiers,
+    send_wl_drm_capabilities,
 };
 #[doc(hidden)]
 pub use explicit_sync::{
@@ -905,6 +907,11 @@ pub struct CompositorState {
     dmabuf_main_device_path: Option<String>,
     dmabuf_scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
     dmabuf_scanout_target_device_override: Option<u64>,
+    dmabuf_feedback_resources: HashMap<ObjectId, LiveDmabufFeedbackResource>,
+    dmabuf_surface_scanout_hints: HashSet<u32>,
+    dmabuf_scanout_candidate_surface: Option<u32>,
+    dmabuf_feedback_updates: u64,
+    dmabuf_feedback_duplicate_suppressed: u64,
     syncobj_device: Option<DrmSyncobjDevice>,
     clipboard_bridge: Option<Box<dyn ClipboardBridge>>,
     selection_state: SelectionState,

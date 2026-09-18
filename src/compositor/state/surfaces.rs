@@ -1295,6 +1295,7 @@ impl CompositorState {
         surface_id: u32,
         reason: SurfaceTeardownReason,
     ) {
+        self.detach_dmabuf_surface(surface_id);
         let commit_sequence = self
             .active_surface_presentation_commits
             .get(&surface_id)
@@ -1440,6 +1441,7 @@ impl CompositorState {
         );
 
         for removed_surface_id in &removed_surface_ids {
+            self.detach_dmabuf_surface(*removed_surface_id);
             self.unregister_popup_surface(*removed_surface_id);
             if let Some(buffer) = self.active_dmabuf_buffers.remove(removed_surface_id) {
                 self.queue_dmabuf_buffer_release(buffer);

@@ -1668,6 +1668,25 @@ impl OwnCompositorServer {
         self.state.direct_scanout_scene_candidate()
     }
 
+    pub fn activate_surface_scanout_hint(&mut self, surface_id: u32) {
+        self.state.activate_surface_scanout_hint(surface_id);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn clear_surface_scanout_hint(&mut self, surface_id: u32) {
+        self.state.clear_surface_scanout_hint(surface_id);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn reconcile_surface_scanout_candidate(&mut self, surface_id: Option<u32>) {
+        self.state.reconcile_surface_scanout_candidate(surface_id);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn dmabuf_feedback_doctor_state(&self) -> (bool, Option<u32>, u64, u64) {
+        self.state.dmabuf_feedback_doctor_state()
+    }
+
     pub fn direct_scanout_scene_blockers(&self) -> DirectScanoutSceneBlockers {
         self.state.direct_scanout_scene_blockers()
     }

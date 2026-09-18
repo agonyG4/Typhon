@@ -287,6 +287,7 @@ impl AtomicEglGbmScanout {
             .dmabuf_scanout_capabilities
             .supports(candidate_format, candidate_modifier)
         {
+            server.activate_surface_scanout_hint(candidate.surface_id);
             direct_scanout_debug(format_args!(
                 "candidate rejected before import: primary plane {} does not support format={:#x} modifier={:#x}",
                 self.dmabuf_scanout_capabilities.primary_plane_id,

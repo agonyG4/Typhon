@@ -964,6 +964,15 @@ impl NativeRuntime {
                     direct_runtime,
                     direct_counters.as_ref(),
                 );
+                let (hint_active, hint_surface, feedback_updates, duplicate_suppressed) =
+                    self.server.dmabuf_feedback_doctor_state();
+                let direct_detail = format!(
+                    "{direct_detail} surface_feedback_hint_active={} surface_feedback_hint_surface={} surface_feedback_updates={} surface_feedback_duplicate_suppressed={}",
+                    hint_active,
+                    hint_surface.map_or_else(|| "none".to_string(), |surface| surface.to_string()),
+                    feedback_updates,
+                    duplicate_suppressed,
+                );
                 let dmem_snapshot = self.dmem_foreground.snapshot();
                 let app_scope_snapshot = oblivion_one::application_scope::snapshot();
                 let checks = vec![

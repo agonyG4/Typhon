@@ -20,6 +20,7 @@ pub(super) struct DirectPresentationInspection {
     pub(super) primary_visual_work_pending: bool,
     pub(super) composition_required: bool,
     pub(super) candidate_key: Option<DirectScanoutCandidateKey>,
+    pub(super) candidate_surface_id: Option<u32>,
 }
 
 pub(super) struct DirectPresentationInputs<'a> {
@@ -123,6 +124,9 @@ pub(super) fn inspect_direct_presentation(
             })
         })
         .flatten();
+    let candidate_surface_id = direct_candidate
+        .as_ref()
+        .map(|candidate| candidate.surface_id);
     let direct_candidate_changed = inspect_candidate
         && direct_candidate_changed(
             direct_candidate_key,
@@ -160,6 +164,7 @@ pub(super) fn inspect_direct_presentation(
         primary_visual_work_pending,
         composition_required,
         candidate_key: direct_candidate_key,
+        candidate_surface_id,
     }
 }
 
