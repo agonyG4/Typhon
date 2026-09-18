@@ -114,6 +114,9 @@ fn nested_dwindle_reflow_installs_one_atomic_three_window_transaction() {
         WindowGeometry::new(SurfacePlacement::absolute_root_at(760, 80), 700, 500),
         WindowGeometry::new(SurfacePlacement::absolute_root_at(80, 600), 700, 500),
     ];
+    for index in 0..roots.len() {
+        state.install_toplevel_visual_geometry(roots[index], previous[index]);
+    }
 
     state.begin_layout_reflow_batch();
     state.begin_layout_reflow_batch();
@@ -176,6 +179,27 @@ fn nested_dwindle_reflow_installs_one_atomic_three_window_transaction() {
         state
             .presentation_animator
             .track_started_at_for_scene_node(nodes[2])
+    );
+
+    let layout_generation = state.layout_generation;
+    let configure_serial = state.next_configure_serial;
+    let canonical_placements = state
+        .renderable_surfaces
+        .iter()
+        .map(|surface| (surface.surface_id, surface.placement))
+        .collect::<Vec<_>>();
+    for nanos in [0, 8_000_000, 32_000_000, 96_000_000] {
+        let _ = state.presentation_scene_sample_at(AnimationTime::from_nanos(nanos));
+    }
+    assert_eq!(state.layout_generation, layout_generation);
+    assert_eq!(state.next_configure_serial, configure_serial);
+    assert_eq!(
+        state
+            .renderable_surfaces
+            .iter()
+            .map(|surface| (surface.surface_id, surface.placement))
+            .collect::<Vec<_>>(),
+        canonical_placements
     );
 }
 
