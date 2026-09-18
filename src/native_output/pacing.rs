@@ -663,6 +663,7 @@ mod tests {
             "reactive_double_frames=0",
             "reactive_double_immediate_submits=0",
             "reactive_double_actual_misses=0",
+            "advisory_dispatch_slips=0",
             "predictive_render_ahead_attempts=0",
             "predictive_render_ahead_ready=0",
             "predictive_ready_submits=0",
@@ -698,6 +699,21 @@ mod tests {
         ] {
             assert!(summary.contains(field), "missing summary field {field}");
         }
+    }
+
+    #[test]
+    fn advisory_dispatch_slips_are_bounded_in_the_pacing_summary() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.note_advisory_dispatch_slip();
+        pacing.note_advisory_dispatch_slip();
+
+        assert_eq!(pacing.advisory_dispatch_slips, 2);
+        assert!(
+            pacing
+                .summary_line(0, 0)
+                .contains("advisory_dispatch_slips=2")
+        );
     }
 
     #[test]
@@ -2421,6 +2437,7 @@ pub(crate) struct NativeFramePacing {
     pub(crate) reactive_double_frames: u64,
     pub(crate) reactive_double_immediate_submits: u64,
     pub(crate) reactive_double_actual_misses: u64,
+    pub(crate) advisory_dispatch_slips: u64,
     pub(crate) predictive_triple_frames: u64,
     pub(crate) predictive_render_ahead_attempts: u64,
     pub(crate) predictive_render_ahead_ready: u64,
@@ -2652,6 +2669,7 @@ impl NativeFramePacing {
             reactive_double_frames: 0,
             reactive_double_immediate_submits: 0,
             reactive_double_actual_misses: 0,
+            advisory_dispatch_slips: 0,
             predictive_triple_frames: 0,
             predictive_render_ahead_attempts: 0,
             predictive_render_ahead_ready: 0,
@@ -4821,6 +4839,12 @@ impl NativeFramePacing {
             FenceTimestampQuality::ObservedApproximate => self.sync_file_info_approximate += 1,
         }
     }
+
+    pub(crate) fn note_advisory_dispatch_slip(&mut self) {
+        if self.enabled {
+            self.advisory_dispatch_slips = self.advisory_dispatch_slips.saturating_add(1);
+        }
+    }
     pub(crate) fn summary_line(
         &self,
         compositor_trace_dropped_entries: u64,
@@ -4867,6 +4891,7 @@ impl NativeFramePacing {
                     "reactive_double_actual_misses",
                     self.reactive_double_actual_misses,
                 ),
+                PacingField::u64("advisory_dispatch_slips", self.advisory_dispatch_slips),
                 PacingField::u64(
                     "predictive_render_ahead_attempts",
                     self.predictive_render_ahead_attempts,

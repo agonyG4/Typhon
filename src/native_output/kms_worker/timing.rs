@@ -12,6 +12,7 @@ pub(crate) const MAX_DISPATCH_TAIL_GUARD_NS: u64 = 1_000_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KmsWorkerDispatchTailObservation {
     pub(crate) binding_target: bool,
+    pub(crate) dequeued_before_planned_wake: bool,
     pub(crate) fair_dispatch_chance: bool,
     pub(crate) deadline_overrun_ns: u64,
     pub(crate) guard_before_ns: u64,
@@ -19,6 +20,13 @@ pub(crate) struct KmsWorkerDispatchTailObservation {
     pub(crate) increased: bool,
     pub(crate) decayed: bool,
     pub(crate) cap_hit: bool,
+}
+
+pub(crate) const fn dispatch_fairness(
+    binding_target: bool,
+    dequeued_before_planned_wake: bool,
+) -> bool {
+    binding_target && dequeued_before_planned_wake
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +94,10 @@ impl KmsWorkerDispatchModel {
         &mut self,
         commit_complete_deadline_ns: u64,
         submit_returned_at_ns: u64,
-        fair_dispatch_chance: bool,
+        binding_target: bool,
+        dequeued_before_planned_wake: bool,
     ) -> KmsWorkerDispatchTailObservation {
+        let fair_dispatch_chance = dispatch_fairness(binding_target, dequeued_before_planned_wake);
         let deadline_overrun_ns = submit_returned_at_ns.saturating_sub(commit_complete_deadline_ns);
         let guard_before_ns = self.adaptive_tail_guard_ns;
         let mut increased = false;
@@ -114,7 +124,8 @@ impl KmsWorkerDispatchModel {
             }
         }
         KmsWorkerDispatchTailObservation {
-            binding_target: false,
+            binding_target,
+            dequeued_before_planned_wake,
             fair_dispatch_chance,
             deadline_overrun_ns,
             guard_before_ns,
@@ -194,7 +205,7 @@ mod tests {
         model.record(0, 0, 100_000, 100_000);
         let before = model.budget().dispatch_budget_ns;
 
-        model.observe_submission_deadline(1_000_000, 1_012_230, true);
+        model.observe_submission_deadline(1_000_000, 1_012_230, true, true);
 
         assert_eq!(model.adaptive_tail_guard_ns(), 62_230);
         assert_eq!(
@@ -209,11 +220,12 @@ mod tests {
         model.record(0, 0, 100_000, 100_000);
         let before_guard = model.adaptive_tail_guard_ns();
 
-        let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false);
+        let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false, true);
 
         assert_eq!(observation.guard_ns, before_guard);
         assert!(!observation.increased);
         assert_eq!(observation.deadline_overrun_ns, 12_230);
+        assert!(observation.dequeued_before_planned_wake);
     }
 
     #[test]
@@ -221,20 +233,20 @@ mod tests {
         let mut model = KmsWorkerDispatchModel::default();
 
         for _ in 0..64 {
-            model.observe_submission_deadline(1_000_000, 2_000_000, true);
+            model.observe_submission_deadline(1_000_000, 2_000_000, true, true);
         }
         assert_eq!(model.adaptive_tail_guard_ns(), 1_000_000);
 
-        model.observe_submission_deadline(3_000_000, 3_000_000, true);
+        model.observe_submission_deadline(3_000_000, 3_000_000, true, true);
         assert_eq!(model.adaptive_tail_guard_ns(), 1_000_000);
 
         for _ in 0..32 {
-            model.observe_submission_deadline(4_000_000, 4_000_000, true);
+            model.observe_submission_deadline(4_000_000, 4_000_000, true, true);
         }
         assert_eq!(model.adaptive_tail_guard_ns(), 950_000);
 
         for _ in 0..(32 * 19) {
-            model.observe_submission_deadline(5_000_000, 5_000_000, true);
+            model.observe_submission_deadline(5_000_000, 5_000_000, true, true);
         }
         assert_eq!(model.adaptive_tail_guard_ns(), 0);
     }
@@ -242,13 +254,31 @@ mod tests {
     #[test]
     fn dispatch_tail_miss_resets_clean_decay_streak() {
         let mut model = KmsWorkerDispatchModel::default();
-        model.observe_submission_deadline(1_000_000, 1_100_000, true);
+        model.observe_submission_deadline(1_000_000, 1_100_000, true, true);
         for _ in 0..31 {
-            model.observe_submission_deadline(2_000_000, 2_000_000, true);
+            model.observe_submission_deadline(2_000_000, 2_000_000, true, true);
         }
 
-        model.observe_submission_deadline(3_000_000, 3_100_000, true);
+        model.observe_submission_deadline(3_000_000, 3_100_000, true, true);
 
         assert_eq!(model.adaptive_tail_guard_ns(), 300_000);
+    }
+
+    #[test]
+    fn dispatch_fairness_decomposes_binding_from_dequeue_timing() {
+        assert!(!dispatch_fairness(false, true));
+        assert!(!dispatch_fairness(true, false));
+        assert!(dispatch_fairness(true, true));
+    }
+
+    #[test]
+    fn dispatch_observation_reports_dequeue_timing_without_weakening_fairness() {
+        let mut model = KmsWorkerDispatchModel::default();
+        let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false, true);
+
+        assert!(!observation.binding_target);
+        assert!(observation.dequeued_before_planned_wake);
+        assert!(!observation.fair_dispatch_chance);
+        assert!(!observation.increased);
     }
 }

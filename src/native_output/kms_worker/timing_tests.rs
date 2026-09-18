@@ -79,7 +79,7 @@ fn late_payload_dispatch_overrun_does_not_update_tail_metrics() {
     model.record(0, 0, 100_000, 100_000);
     let metrics = WorkerTimingMetrics::default();
 
-    let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false);
+    let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false, true);
     metrics.record_dispatch_tail(observation);
     let snapshot = metrics.snapshot();
 
@@ -91,24 +91,23 @@ fn late_payload_dispatch_overrun_does_not_update_tail_metrics() {
 #[test]
 fn dispatch_tail_observation_carries_exact_recovery_evidence() {
     let mut model = KmsWorkerDispatchModel::default();
-    let mut fair = model.observe_submission_deadline(1_000_000, 1_012_230, true);
-    fair.binding_target = true;
+    let fair = model.observe_submission_deadline(1_000_000, 1_012_230, true, true);
 
     assert!(fair.binding_target);
     assert!(fair.fair_dispatch_chance);
+    assert!(fair.dequeued_before_planned_wake);
     assert_eq!(fair.guard_before_ns, 0);
     assert_eq!(fair.guard_ns, 62_230);
 
-    let mut unfair = model.observe_submission_deadline(2_000_000, 2_012_230, false);
-    unfair.binding_target = true;
+    let unfair = model.observe_submission_deadline(2_000_000, 2_012_230, true, false);
     assert!(!unfair.fair_dispatch_chance);
+    assert!(!unfair.dequeued_before_planned_wake);
 }
 
 #[test]
 fn clipped_dispatch_tail_increase_is_not_recovery_evidence() {
     let mut model = KmsWorkerDispatchModel::default();
-    let mut clipped = model.observe_submission_deadline(1_000_000, 2_000_000, true);
-    clipped.binding_target = true;
+    let clipped = model.observe_submission_deadline(1_000_000, 2_000_000, true, true);
 
     assert!(clipped.increased);
     assert!(clipped.cap_hit);

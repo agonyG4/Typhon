@@ -1025,20 +1025,24 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     // the worker a fair chance to meet the dispatch deadline and may train
                     // the adaptive tail guard.
                     let binding_target = job.target.is_binding();
-                    let fair_dispatch_chance =
-                        binding_target && dequeued_at.get() <= planned_worker_wake_at;
+                    let dequeued_before_planned_wake = dequeued_at.get() <= planned_worker_wake_at;
+                    let fair_dispatch_chance = super::timing::dispatch_fairness(
+                        binding_target,
+                        dequeued_before_planned_wake,
+                    );
                     dispatch_model.record(
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
                         submit_duration_ns,
                         dispatch_duration_ns,
                     );
-                    let mut dispatch_tail = dispatch_model.observe_submission_deadline(
+                    let dispatch_tail = dispatch_model.observe_submission_deadline(
                         job.submit_window.commit_complete_deadline_ns(),
                         submit_returned_at,
-                        fair_dispatch_chance,
+                        binding_target,
+                        dequeued_before_planned_wake,
                     );
-                    dispatch_tail.binding_target = binding_target;
+                    debug_assert_eq!(dispatch_tail.fair_dispatch_chance, fair_dispatch_chance);
                     shared.metrics.timing.record_dispatch_tail(dispatch_tail);
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
                     let submission_budget_ns = dispatch_budget.dispatch_budget_ns;

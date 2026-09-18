@@ -12,9 +12,14 @@ use crate::native_output::kms_worker::{
     KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
     KmsWorkerDispatchTailObservation, KmsWorkerQueuedCancellation,
 };
+use crate::native_output::presentation::kms_timing::KmsPresentationOutcome;
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
 };
+use oblivion_one::native::adaptive_buffering::{
+    AdaptiveRenderJournal, EstimatorRecoveryDisposition, FenceTimestampQuality, ProvenDeadlineMiss,
+};
+use oblivion_one::native::presentation_deadline::PresentationTarget;
 
 fn pageflip_identity(
     output_id: OutputId,
@@ -29,6 +34,101 @@ fn pageflip_identity(
         token,
         output_generation,
         crtc_id,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdvisoryOpportunitySlip {
+    KmsDispatch,
+}
+
+impl AdvisoryOpportunitySlip {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::KmsDispatch => "kms_dispatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationDeadlineAssessment {
+    None,
+    Proven(ProvenDeadlineMiss),
+    Advisory(AdvisoryOpportunitySlip),
+}
+
+fn assess_presentation_deadline(
+    target: PresentationTarget,
+    outcome: KmsPresentationOutcome,
+    fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
+) -> PresentationDeadlineAssessment {
+    match outcome {
+        KmsPresentationOutcome::TargetHit => PresentationDeadlineAssessment::None,
+        KmsPresentationOutcome::RenderReadinessMiss => {
+            PresentationDeadlineAssessment::Proven(match fence_signal.map(|(_, quality)| quality) {
+                Some(FenceTimestampQuality::ObservedApproximate) => {
+                    ProvenDeadlineMiss::GuardedApproximateRender
+                }
+                Some(FenceTimestampQuality::ExactSyncFile) | None => {
+                    ProvenDeadlineMiss::ExactRender
+                }
+            })
+        }
+        KmsPresentationOutcome::KmsDispatchMiss => {
+            if target.is_binding() {
+                PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::KmsDispatch)
+            } else {
+                PresentationDeadlineAssessment::Advisory(AdvisoryOpportunitySlip::KmsDispatch)
+            }
+        }
+        KmsPresentationOutcome::KmsApplyGuardMiss => {
+            PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::KmsApplyGuard)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProvenDeadlineRecovery {
+    miss: ProvenDeadlineMiss,
+    disposition: EstimatorRecoveryDisposition,
+    recovery_remaining_before: usize,
+    recovery_remaining_after: usize,
+}
+
+fn apply_deadline_assessment(
+    assessment: PresentationDeadlineAssessment,
+    render_journal: &mut AdaptiveRenderJournal,
+    refresh_interval: Duration,
+    dispatch_tail: Option<KmsWorkerDispatchTailObservation>,
+    apply_guard: Option<KmsPresentationTimingObservation>,
+) -> Option<ProvenDeadlineRecovery> {
+    let PresentationDeadlineAssessment::Proven(miss) = assessment else {
+        return None;
+    };
+    let disposition = recovery_disposition(miss, dispatch_tail, apply_guard);
+    let recovery_remaining_before = render_journal
+        .prediction(refresh_interval)
+        .miss_recovery_remaining;
+    render_journal.note_proven_deadline_miss(disposition);
+    let recovery_remaining_after = render_journal
+        .prediction(refresh_interval)
+        .miss_recovery_remaining;
+    Some(ProvenDeadlineRecovery {
+        miss,
+        disposition,
+        recovery_remaining_before,
+        recovery_remaining_after,
+    })
+}
+
+fn target_reason_name(reason: PresentationTargetReason) -> &'static str {
+    match reason {
+        PresentationTargetReason::ReactiveDouble => "reactive_double",
+        PresentationTargetReason::Normal => "normal",
+        PresentationTargetReason::PredictedPressure => "predicted_pressure",
+        PresentationTargetReason::ProvenReadinessMiss => "proven_readiness_miss",
+        PresentationTargetReason::ForcedValidation => "forced_validation",
+        PresentationTargetReason::CommitTiming => "commit_timing",
     }
 }
 
@@ -1418,9 +1518,13 @@ impl NativeRuntime {
                             .get()
                             .saturating_sub(frame.submit_started_at.get()),
                     );
-                    let mut proven_miss = pending_proven_deadline_miss
+                    let mut assessment = pending_proven_deadline_miss
                         .take()
-                        .and_then(|(frame_id, miss)| (frame_id == frame.frame_id).then_some(miss));
+                        .and_then(|(frame_id, miss)| {
+                            (frame_id == frame.frame_id)
+                                .then_some(PresentationDeadlineAssessment::Proven(miss))
+                        })
+                        .unwrap_or(PresentationDeadlineAssessment::None);
                     if !frame.fence_timing_accounted
                         && let Some((signaled_at, quality)) = frame.fence_signal
                     {
@@ -1455,30 +1559,12 @@ impl NativeRuntime {
                                     outcome,
                                 ));
                         }
-                        let classified_miss = match (outcome, frame.fence_signal) {
-                            (KmsPresentationOutcome::RenderReadinessMiss, Some((_, quality))) => {
-                                Some(match quality {
-                                    FenceTimestampQuality::ExactSyncFile => {
-                                        ProvenDeadlineMiss::ExactRender
-                                    }
-                                    FenceTimestampQuality::ObservedApproximate => {
-                                        ProvenDeadlineMiss::GuardedApproximateRender
-                                    }
-                                })
-                            }
-                            (KmsPresentationOutcome::RenderReadinessMiss, None) => {
-                                Some(ProvenDeadlineMiss::ExactRender)
-                            }
-                            (KmsPresentationOutcome::KmsDispatchMiss, _) => {
-                                Some(ProvenDeadlineMiss::KmsDispatch)
-                            }
-                            (KmsPresentationOutcome::KmsApplyGuardMiss, _) => {
-                                Some(ProvenDeadlineMiss::KmsApplyGuard)
-                            }
-                            (KmsPresentationOutcome::TargetHit, _) => None,
-                        };
-                        if proven_miss.is_none() {
-                            proven_miss = classified_miss;
+                        if matches!(assessment, PresentationDeadlineAssessment::None) {
+                            assessment = assess_presentation_deadline(
+                                frame.target,
+                                outcome,
+                                frame.fence_signal,
+                            );
                         }
                     }
                     render_journal.record_frame_service_observation(FrameTimingObservation {
@@ -1490,31 +1576,38 @@ impl NativeRuntime {
                         submit_started_at: Some(frame.submit_started_at),
                         submit_returned_at: Some(frame.submit_returned_at),
                     });
-                    if let Some(miss) = proven_miss {
-                        let disposition = recovery_disposition(
-                            miss,
-                            dispatch_tail_observation,
-                            apply_guard_observation,
-                        );
-                        let recovery_remaining_before = render_journal
-                            .prediction(frame.target.refresh_interval)
-                            .miss_recovery_remaining;
-                        render_journal.note_proven_deadline_miss(disposition);
-                        let recovery_remaining_after = render_journal
-                            .prediction(frame.target.refresh_interval)
-                            .miss_recovery_remaining;
+                    let recovery_remaining_before = render_journal
+                        .prediction(frame.target.refresh_interval)
+                        .miss_recovery_remaining;
+                    let recovery = apply_deadline_assessment(
+                        assessment,
+                        render_journal,
+                        frame.target.refresh_interval,
+                        dispatch_tail_observation,
+                        apply_guard_observation,
+                    );
+                    let proven_miss = recovery.as_ref().map(|value| value.miss);
+                    if let Some(recovery) = recovery {
+                        let miss = recovery.miss;
                         let mut recovery_fields = vec![
                             PacingField::u64("frame_id", frame.frame_id),
                             PacingField::u64("pageflip_token", pageflip_token.get()),
                             PacingField::str("miss_cause", miss.as_str()),
-                            PacingField::str("recovery_disposition", disposition.as_str()),
+                            PacingField::str(
+                                "target_reason",
+                                target_reason_name(frame.target.reason),
+                            ),
+                            PacingField::bool("target_binding", frame.target.is_binding()),
+                            PacingField::u64("target_sequence", frame.target.sequence),
+                            PacingField::u64("actual_sequence", actual_logical_sequence),
+                            PacingField::str("recovery_disposition", recovery.disposition.as_str()),
                             PacingField::usize(
                                 "recovery_remaining_before",
-                                recovery_remaining_before,
+                                recovery.recovery_remaining_before,
                             ),
                             PacingField::usize(
                                 "recovery_remaining_after",
-                                recovery_remaining_after,
+                                recovery.recovery_remaining_after,
                             ),
                             PacingField::str(
                                 "recovery_estimator_mode_after",
@@ -1537,6 +1630,10 @@ impl NativeRuntime {
                                 PacingField::bool(
                                     "dispatch_target_binding",
                                     observation.binding_target,
+                                ),
+                                PacingField::bool(
+                                    "dispatch_dequeued_before_planned_wake",
+                                    observation.dequeued_before_planned_wake,
                                 ),
                                 PacingField::bool(
                                     "dispatch_fair_chance",
@@ -1594,7 +1691,136 @@ impl NativeRuntime {
                                 ),
                             ]);
                         }
+                        if matches!(
+                            miss,
+                            ProvenDeadlineMiss::ExactRender
+                                | ProvenDeadlineMiss::GuardedApproximateRender
+                        ) {
+                            let (render_readiness_source, fence_timestamp_quality) =
+                                match frame.fence_signal {
+                                    Some((_, FenceTimestampQuality::ExactSyncFile)) => {
+                                        ("exact_sync_file", "exact_sync_file")
+                                    }
+                                    Some((_, FenceTimestampQuality::ObservedApproximate)) => {
+                                        ("guarded_approximate", "observed_approximate")
+                                    }
+                                    None => ("rendered_at_fallback", "none"),
+                                };
+                            recovery_fields.extend([
+                                PacingField::str(
+                                    "render_readiness_source",
+                                    render_readiness_source,
+                                ),
+                                PacingField::str(
+                                    "fence_timestamp_quality",
+                                    fence_timestamp_quality,
+                                ),
+                                PacingField::option_u64(
+                                    "payload_ready_at_ns",
+                                    frame.fence_signal.map(|(timestamp, _)| timestamp.get()),
+                                ),
+                                PacingField::u64(
+                                    "commit_complete_deadline_ns",
+                                    frame.submit_window.commit_complete_deadline_ns(),
+                                ),
+                                PacingField::option_u64(
+                                    "render_readiness_lateness_ns",
+                                    frame.fence_signal.map(|(timestamp, _)| {
+                                        timestamp.get().saturating_sub(
+                                            frame.submit_window.commit_complete_deadline_ns(),
+                                        )
+                                    }),
+                                ),
+                                PacingField::u64(
+                                    "composite_started_ns",
+                                    frame.composite_started_at.get(),
+                                ),
+                                PacingField::u64("rendered_at_ns", frame.rendered_at.get()),
+                            ]);
+                        }
                         frame_pacing.log("proven_deadline_miss", recovery_fields);
+                    }
+                    if let PresentationDeadlineAssessment::Advisory(slip) = assessment {
+                        frame_pacing.note_advisory_dispatch_slip();
+                        let recovery_remaining_after = render_journal
+                            .prediction(frame.target.refresh_interval)
+                            .miss_recovery_remaining;
+                        let mut advisory_fields = vec![
+                            PacingField::u64("frame_id", frame.frame_id),
+                            PacingField::u64("pageflip_token", pageflip_token.get()),
+                            PacingField::str("slip_cause", slip.as_str()),
+                            PacingField::str(
+                                "target_reason",
+                                target_reason_name(frame.target.reason),
+                            ),
+                            PacingField::str("target_authority", "advisory"),
+                            PacingField::bool("target_binding", frame.target.is_binding()),
+                            PacingField::u64("target_sequence", frame.target.sequence),
+                            PacingField::u64("actual_sequence", actual_logical_sequence),
+                            PacingField::bool(
+                                "dispatch_evidence_available",
+                                dispatch_tail_observation.is_some(),
+                            ),
+                            PacingField::option_bool(
+                                "dispatch_dequeued_before_planned_wake",
+                                dispatch_tail_observation
+                                    .map(|observation| observation.dequeued_before_planned_wake),
+                            ),
+                            PacingField::option_bool(
+                                "dispatch_fair_chance",
+                                dispatch_tail_observation
+                                    .map(|observation| observation.fair_dispatch_chance),
+                            ),
+                            PacingField::option_u64(
+                                "dispatch_deadline_overrun_ns",
+                                dispatch_tail_observation
+                                    .map(|observation| observation.deadline_overrun_ns),
+                            ),
+                            PacingField::usize(
+                                "recovery_remaining_before",
+                                recovery_remaining_before,
+                            ),
+                            PacingField::usize(
+                                "recovery_remaining_after",
+                                recovery_remaining_after,
+                            ),
+                            PacingField::str(
+                                "recovery_estimator_mode_after",
+                                render_journal
+                                    .prediction(frame.target.refresh_interval)
+                                    .estimator_mode
+                                    .as_str(),
+                            ),
+                        ];
+                        advisory_fields.extend(dispatch_budget_diagnostic_fields(
+                            dispatch_budget_used_ns,
+                            dispatch_budget_after_adaptation_ns,
+                        ));
+                        if let Some(observation) = dispatch_tail_observation {
+                            advisory_fields.extend([
+                                PacingField::bool(
+                                    "dispatch_target_binding",
+                                    observation.binding_target,
+                                ),
+                                PacingField::u64(
+                                    "dispatch_tail_guard_before_ns",
+                                    observation.guard_before_ns,
+                                ),
+                                PacingField::u64(
+                                    "dispatch_tail_guard_after_ns",
+                                    observation.guard_ns,
+                                ),
+                                PacingField::bool(
+                                    "dispatch_tail_guard_increased",
+                                    observation.increased,
+                                ),
+                                PacingField::bool(
+                                    "dispatch_tail_guard_cap_hit",
+                                    observation.cap_hit,
+                                ),
+                            ]);
+                        }
+                        frame_pacing.log("advisory_opportunity_slip", advisory_fields);
                     }
                     let desired_credit_before = adaptive_buffering.desired_credit();
                     let buffering_mode_before = adaptive_buffering.mode();
@@ -1607,7 +1833,10 @@ impl NativeRuntime {
                         adaptive_buffering.mode(),
                         proven_miss,
                     );
-                    frame_pacing.note_o1_credit2_outcome(frame.o1_admission, proven_miss.is_none());
+                    frame_pacing.note_o1_credit2_outcome(
+                        frame.o1_admission,
+                        matches!(assessment, PresentationDeadlineAssessment::None),
+                    );
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
                         planned_sequence: frame.target.sequence,
                         actual_sequence: actual_logical_sequence,
