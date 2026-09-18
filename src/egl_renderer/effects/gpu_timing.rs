@@ -103,6 +103,7 @@ struct TimingSpanMetadata {
     is_total: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PollOutcome {
     Empty,
@@ -340,9 +341,7 @@ impl TimingState {
             capture: None,
             is_total: true,
         });
-        let Some(token) = token else {
-            return None;
-        };
+        let token = token?;
         self.aggregates.push(GraphAggregate {
             scope_id,
             frame_id,
@@ -395,10 +394,12 @@ impl TimingState {
         {
             aggregate.dropped_passes = aggregate.dropped_passes.saturating_add(1);
         }
-        token.map(|token| {
+        if let Some(token) = token {
             debug_assert!(!metadata.is_total);
-            token
-        })
+            Some(token)
+        } else {
+            None
+        }
     }
 
     fn allocate_span(&mut self, metadata: TimingSpanMetadata) -> Option<SpanToken> {
@@ -1206,6 +1207,7 @@ impl EffectGpuProfiler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_pass(
         &mut self,
         gl: &glow::Context,
