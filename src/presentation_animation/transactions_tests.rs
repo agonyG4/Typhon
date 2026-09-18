@@ -362,15 +362,24 @@ fn transaction_member_retirement_requires_exact_revision_evidence() {
     let transaction_id = PresentationTransactionId::new(NonZeroU64::new(7).expect("transaction"));
     let current_revision = PresentationRevisionId::from_raw(10).expect("current revision");
     let stale_revision = PresentationRevisionId::from_raw(9).expect("stale revision");
+    let final_revision = PresentationRevisionId::from_raw(11).expect("final revision");
     let mut record = PresentationTransactionRecord::new(
         transaction_id,
         AnimationTime::from_nanos(0),
-        vec![PresentationTransactionMember::new(
-            node(47),
-            PresentationPropertyKind::Geometry,
-            transaction_id,
-            current_revision,
-        )],
+        vec![
+            PresentationTransactionMember::new(
+                node(47),
+                PresentationPropertyKind::Geometry,
+                transaction_id,
+                current_revision,
+            ),
+            PresentationTransactionMember::new(
+                node(48),
+                PresentationPropertyKind::Geometry,
+                transaction_id,
+                final_revision,
+            ),
+        ],
     );
 
     assert!(!record.remove_member_exact(
@@ -378,11 +387,17 @@ fn transaction_member_retirement_requires_exact_revision_evidence() {
         PresentationPropertyKind::Geometry,
         stale_revision,
     ));
-    assert_eq!(record.members().len(), 1);
+    assert_eq!(record.members().len(), 2);
     assert!(record.remove_member_exact(
         node(47),
         PresentationPropertyKind::Geometry,
         current_revision,
+    ));
+    assert_eq!(record.members().len(), 1);
+    assert!(record.remove_member_exact(
+        node(48),
+        PresentationPropertyKind::Geometry,
+        final_revision,
     ));
     assert!(record.members().is_empty());
 }
