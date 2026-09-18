@@ -7436,6 +7436,30 @@ mod tests {
         harness.renderer.establish_ordinary_scene_state();
     }
 
+    fn fill_non_uniform_diagnostic_output(harness: &GlesEffectTestHarness) {
+        let width = harness.renderer.current_size.0;
+        let height = harness.renderer.current_size.1;
+        harness.renderer.bind_active_output_framebuffer();
+        unsafe {
+            harness.gl.disable(glow::BLEND);
+            harness.gl.enable(glow::SCISSOR_TEST);
+            for y in 0..height {
+                for x in 0..width {
+                    harness.gl.scissor(x as i32, y as i32, 1, 1);
+                    harness.gl.clear_color(
+                        f32::from(((x * 31 + y * 17 + 3) % 256) as u8) / 255.0,
+                        f32::from(((x * 13 + y * 29 + 7) % 256) as u8) / 255.0,
+                        f32::from(((x * 47 + y * 11 + 19) % 256) as u8) / 255.0,
+                        1.0,
+                    );
+                    harness.gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+            }
+            harness.gl.disable(glow::SCISSOR_TEST);
+        }
+        harness.renderer.establish_ordinary_scene_state();
+    }
+
     fn diagnostic_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
         let physical_y = height.saturating_sub(y).saturating_sub(1);
         let index = ((physical_y * width + x) * 4) as usize;
@@ -9881,6 +9905,57 @@ mod tests {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    #[test]
+    fn real_gles_scene_work_preservation_restores_only_planned_regions() {
+        let regions = [OutputRect::new(1, 1, 2, 2), OutputRect::new(5, 3, 2, 2)];
+
+        for framebuffer_origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let mut harness = GlesEffectTestHarness::new(8, 6);
+            fill_non_uniform_diagnostic_output(&harness);
+            let original = read_diagnostic_pixels(&harness);
+            let preservation = effects::capture_scene_work_preservation(
+                &mut harness.renderer,
+                (8, 6),
+                framebuffer_origin,
+                &regions,
+            )
+            .expect("scene-work preservation capture succeeds");
+
+            assert_eq!(preservation.transfer_count(), 2);
+            assert_eq!(preservation.preserved_pixels(), 8);
+
+            poison_diagnostic_output(&harness, [0.07, 0.19, 0.31, 1.0]);
+            let overwritten = read_diagnostic_pixels(&harness);
+            let restore_result =
+                effects::restore_scene_work_preservation(&mut harness.renderer, &preservation);
+            let release_result = preservation.release(&mut harness.renderer);
+            restore_result.expect("scene-work preservation restore succeeds");
+            release_result.expect("scene-work preservation texture releases");
+
+            let actual = read_diagnostic_pixels(&harness);
+            for y in 0..6 {
+                for x in 0..8 {
+                    let source = if diagnostic_pixel_is_inside_repairs(&regions, x, y) {
+                        &original
+                    } else {
+                        &overwritten
+                    };
+                    let expected =
+                        diagnostic_pixel_for_origin(source, 8, 6, x, y, framebuffer_origin);
+                    let actual_pixel =
+                        diagnostic_pixel_for_origin(&actual, 8, 6, x, y, framebuffer_origin);
+                    assert_eq!(
+                        actual_pixel, expected,
+                        "pixel ({x}, {y}) for {framebuffer_origin:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

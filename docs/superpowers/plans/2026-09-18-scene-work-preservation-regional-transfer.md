@@ -120,7 +120,7 @@
 
   Run: `rtk cargo test --lib egl_renderer::tests::real_gles_scene_work_preservation_restores_only_planned_regions -- --nocapture`
 
-  Expected: compile failure until the test-visible seam and the new capture signature are available. The test must also assert the returned stored plan has two transfers and `12` pixels before the overwrite, so the old full-output capture cannot pass by relying only on restore's existing regional loop.
+  Expected: compile failure until the test-visible seam and the new capture signature are available. The test must also assert the returned stored plan has two transfers and `8` pixels before the overwrite, so the old full-output capture cannot pass by relying only on restore's existing regional loop.
 - [ ] **Step 3: Add the minimal test-visible seam.** Keep production execution unchanged in ownership and cleanup; expose only crate-test-visible access needed to obtain, restore, and release one preservation resource. Do not duplicate framebuffer mapping or introduce a second implementation.
 - [ ] **Step 4: Run the GLES test and verify GREEN.**
 
