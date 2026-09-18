@@ -910,6 +910,7 @@ fn execute_graph_passes_inner(
                 renderer,
                 output_size,
                 framebuffer_origin,
+                &scene_work.extra_scene_work,
             )?)
         } else {
             None
@@ -1350,12 +1351,7 @@ fn execute_graph_passes_inner(
             );
         }
         if let Some(preservation) = scene_work_preservation.take() {
-            let restore_result = restore_scene_work_preservation(
-                renderer,
-                &preservation,
-                &scene_work.extra_scene_work,
-                framebuffer_origin,
-            );
+            let restore_result = restore_scene_work_preservation(renderer, &preservation);
             let release_result = renderer.effect_resources.release(preservation.texture);
             restore_result?;
             release_result?;
@@ -1379,12 +1375,7 @@ fn execute_graph_passes_inner(
         Ok(stats)
     })();
     let cleanup_result = if let Some(preservation) = scene_work_preservation.take() {
-        let restore_result = restore_scene_work_preservation(
-            renderer,
-            &preservation,
-            &scene_work.extra_scene_work,
-            framebuffer_origin,
-        );
+        let restore_result = restore_scene_work_preservation(renderer, &preservation);
         let release_result = renderer.effect_resources.release(preservation.texture);
         restore_result.and(release_result.map_err(Into::into))
     } else {
@@ -3109,16 +3100,40 @@ fn scene_work_preservation_blit_rects(
     })
 }
 
-struct SceneWorkPreservation {
+pub(crate) struct SceneWorkPreservation {
     texture: PooledEffectTexture,
     plan: SceneWorkPreservationPlan,
 }
 
-fn capture_scene_work_preservation(
+impl SceneWorkPreservation {
+    #[cfg(test)]
+    pub(crate) fn transfer_count(&self) -> usize {
+        self.plan.transfers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preserved_pixels(&self) -> u64 {
+        self.plan.pixels
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release(self, renderer: &mut GlesSceneRenderer) -> RendererResult<()> {
+        renderer.effect_resources.release(self.texture)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn capture_scene_work_preservation(
     renderer: &mut GlesSceneRenderer,
     output_size: (u32, u32),
     framebuffer_origin: OutputFramebufferOrigin,
+    extra_scene_work: &[OutputRect],
 ) -> RendererResult<SceneWorkPreservation> {
+    let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+        extra_scene_work,
+        output_size,
+        framebuffer_origin,
+    );
     let key = EffectTextureKey::new(
         output_size.0,
         output_size.1,
@@ -3127,18 +3142,7 @@ fn capture_scene_work_preservation(
         oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
     );
     let texture = renderer.effect_resources.acquire(&renderer.gl, key)?;
-    let plan = SceneWorkPreservationPlan::from_extra_scene_work(
-        &[full_output_rect(output_size)],
-        output_size,
-        framebuffer_origin,
-    );
     let result = (|| {
-        let transfer = scene_work_preservation_blit_rects(
-            full_output_rect(output_size),
-            output_size,
-            framebuffer_origin,
-        )
-        .ok_or_else(|| io::Error::other("scene-work preservation output is empty"))?;
         let output_framebuffer = renderer.active_output_framebuffer;
         renderer.bind_active_output_framebuffer();
         let draw_framebuffer = renderer
@@ -3152,24 +3156,34 @@ fn capture_scene_work_preservation(
             renderer
                 .gl
                 .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
-            renderer.gl.blit_framebuffer(
-                transfer.source.x0,
-                transfer.source.y0,
-                transfer.source.x1,
-                transfer.source.y1,
-                transfer.destination.x0,
-                transfer.destination.y0,
-                transfer.destination.x1,
-                transfer.destination.y1,
-                glow::COLOR_BUFFER_BIT,
-                glow::NEAREST,
-            );
+            for transfer in &plan.transfers {
+                renderer.gl.blit_framebuffer(
+                    transfer.source.x0,
+                    transfer.source.y0,
+                    transfer.source.x1,
+                    transfer.source.y1,
+                    transfer.destination.x0,
+                    transfer.destination.y0,
+                    transfer.destination.x1,
+                    transfer.destination.y1,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::NEAREST,
+                );
+            }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
     renderer.establish_ordinary_scene_state();
     match result {
-        Ok(()) => Ok(SceneWorkPreservation { texture, plan }),
+        Ok(()) => {
+            renderer.effect_trace.scene_work_preservation(
+                "capture",
+                plan.transfers.len(),
+                plan.pixels,
+                u64::from(output_size.0).saturating_mul(u64::from(output_size.1)),
+            );
+            Ok(SceneWorkPreservation { texture, plan })
+        }
         Err(error) => {
             let _ = renderer.effect_resources.release(texture);
             Err(error)
@@ -3177,11 +3191,9 @@ fn capture_scene_work_preservation(
     }
 }
 
-fn restore_scene_work_preservation(
+pub(crate) fn restore_scene_work_preservation(
     renderer: &mut GlesSceneRenderer,
     preservation: &SceneWorkPreservation,
-    extra_scene_work: &[OutputRect],
-    framebuffer_origin: OutputFramebufferOrigin,
 ) -> RendererResult<()> {
     let output_framebuffer = renderer.active_output_framebuffer;
     let read_framebuffer = renderer
@@ -3195,14 +3207,7 @@ fn restore_scene_work_preservation(
         renderer
             .gl
             .bind_framebuffer(glow::DRAW_FRAMEBUFFER, output_framebuffer);
-        for rect in extra_scene_work {
-            let Some(transfer) = scene_work_preservation_blit_rects(
-                *rect,
-                renderer.current_size,
-                framebuffer_origin,
-            ) else {
-                continue;
-            };
+        for transfer in &preservation.plan.transfers {
             renderer.gl.blit_framebuffer(
                 transfer.source.x0,
                 transfer.source.y0,
@@ -3218,6 +3223,12 @@ fn restore_scene_work_preservation(
         }
     }
     renderer.establish_ordinary_scene_state();
+    renderer.effect_trace.scene_work_preservation(
+        "restore",
+        preservation.plan.transfers.len(),
+        preservation.plan.pixels,
+        u64::from(renderer.current_size.0).saturating_mul(u64::from(renderer.current_size.1)),
+    );
     Ok(())
 }
 
