@@ -701,17 +701,6 @@ impl PresentationEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn sample_at_transition_start(&self, key: u32) -> Option<PresentationWindowSample> {
-        self.geometry_tracks
-            .get(&synthetic_scene_node_id_from_key(key))
-            .map(|track| {
-                let mut sample = track.transition.sample(track.transition.started_at());
-                sample.key = key;
-                sample
-            })
-    }
-
-    #[cfg(test)]
     pub(crate) fn sample_at_transition_start_for_scene_node(
         &self,
         scene_node_id: SceneNodeId,
