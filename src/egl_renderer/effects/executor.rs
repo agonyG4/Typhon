@@ -3046,6 +3046,41 @@ struct GraphTextureCaptureBlit {
     destination: GlBlitRect,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SceneWorkPreservationPlan {
+    transfers: Vec<GraphTextureCaptureBlit>,
+    pixels: u64,
+}
+
+impl GraphTextureCaptureBlit {
+    fn pixels(self) -> u64 {
+        let width =
+            (i64::from(self.destination.x1) - i64::from(self.destination.x0)).unsigned_abs();
+        let height =
+            (i64::from(self.destination.y1) - i64::from(self.destination.y0)).unsigned_abs();
+        width.saturating_mul(height)
+    }
+}
+
+impl SceneWorkPreservationPlan {
+    fn from_extra_scene_work(
+        extra_scene_work: &[OutputRect],
+        output_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
+        let transfers = extra_scene_work
+            .iter()
+            .filter_map(|rect| {
+                scene_work_preservation_blit_rects(*rect, output_size, framebuffer_origin)
+            })
+            .collect::<Vec<_>>();
+        let pixels = transfers.iter().copied().fold(0u64, |total, transfer| {
+            total.saturating_add(transfer.pixels())
+        });
+        Self { transfers, pixels }
+    }
+}
+
 fn scene_work_preservation_blit_rects(
     rect: OutputRect,
     output_size: (u32, u32),
@@ -3076,6 +3111,7 @@ fn scene_work_preservation_blit_rects(
 
 struct SceneWorkPreservation {
     texture: PooledEffectTexture,
+    plan: SceneWorkPreservationPlan,
 }
 
 fn capture_scene_work_preservation(
@@ -3091,6 +3127,11 @@ fn capture_scene_work_preservation(
         oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
     );
     let texture = renderer.effect_resources.acquire(&renderer.gl, key)?;
+    let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+        &[full_output_rect(output_size)],
+        output_size,
+        framebuffer_origin,
+    );
     let result = (|| {
         let transfer = scene_work_preservation_blit_rects(
             full_output_rect(output_size),
@@ -3128,7 +3169,7 @@ fn capture_scene_work_preservation(
     })();
     renderer.establish_ordinary_scene_state();
     match result {
-        Ok(()) => Ok(SceneWorkPreservation { texture }),
+        Ok(()) => Ok(SceneWorkPreservation { texture, plan }),
         Err(error) => {
             let _ = renderer.effect_resources.release(texture);
             Err(error)
@@ -5982,6 +6023,76 @@ mod tests {
 
         assert!(plan.surface_ids().contains(&1));
         assert!(plan.surface_ids().contains(&2));
+    }
+
+    #[test]
+    fn scene_work_preservation_plan_counts_dock_pixels_for_both_origins() {
+        let extra_scene_work = [OutputRect::new(762, 976, 396, 104)];
+
+        for framebuffer_origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+                &extra_scene_work,
+                (1920, 1080),
+                framebuffer_origin,
+            );
+
+            assert_eq!(plan.transfers.len(), 1);
+            assert_eq!(plan.pixels, 41_184);
+        }
+    }
+
+    #[test]
+    fn scene_work_preservation_plan_counts_topbar_pixels() {
+        let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+            &[OutputRect::new(0, 0, 120, 65)],
+            (1920, 1080),
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+
+        assert_eq!(plan.transfers.len(), 1);
+        assert_eq!(plan.pixels, 7_800);
+    }
+
+    #[test]
+    fn scene_work_preservation_plan_keeps_disjoint_rectangles_separate() {
+        let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+            &[
+                OutputRect::new(762, 976, 396, 104),
+                OutputRect::new(0, 0, 120, 65),
+            ],
+            (1920, 1080),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert_eq!(plan.transfers.len(), 2);
+        assert_eq!(plan.pixels, 48_984);
+    }
+
+    #[test]
+    fn scene_work_preservation_plan_counts_only_clipped_pixels() {
+        let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+            &[OutputRect::new(-10, -5, 30, 20)],
+            (100, 80),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert_eq!(plan.transfers.len(), 1);
+        assert_eq!(plan.pixels, 300);
+    }
+
+    #[test]
+    fn scene_work_preservation_plan_represents_empty_work_without_transfers() {
+        let plan = SceneWorkPreservationPlan::from_extra_scene_work(
+            &[],
+            (1920, 1080),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert!(plan.transfers.is_empty());
+        assert_eq!(plan.pixels, 0);
     }
 
     #[test]
