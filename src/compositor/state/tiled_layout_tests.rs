@@ -204,6 +204,205 @@ fn nested_dwindle_reflow_installs_one_atomic_three_window_transaction() {
 }
 
 #[test]
+fn pending_geometry_mutation_preserves_first_start_and_final_target() {
+    let scene_node_id = crate::core::SceneNodeId::from_raw(2_700).expect("scene node");
+    let first = crate::presentation_animation::PresentationGeometryMutation::new(
+        scene_node_id,
+        crate::presentation_animation::PresentationRect::new(0.0, 0.0, 100.0, 100.0)
+            .expect("first start"),
+        crate::presentation_animation::PresentationRect::new(100.0, 0.0, 100.0, 100.0)
+            .expect("first target"),
+        PresentationAnimationPolicy::kde()
+            .curve_for(PresentationAnimationKind::LayoutReflow),
+    );
+    let second = crate::presentation_animation::PresentationGeometryMutation::new(
+        scene_node_id,
+        first.target,
+        crate::presentation_animation::PresentationRect::new(200.0, 0.0, 100.0, 100.0)
+            .expect("second target"),
+        PresentationAnimationPolicy::kde()
+            .curve_for(PresentationAnimationKind::LayoutReflow),
+    );
+    let mut pending = super::active_scene::PendingPresentationGeometryTransaction {
+        started_at: crate::presentation_animation::AnimationTime::from_nanos(10),
+        members: Vec::new(),
+    };
+
+    pending.upsert_geometry_mutation(first);
+    pending.upsert_geometry_mutation(second);
+
+    assert_eq!(pending.members.len(), 1);
+    assert_eq!(pending.members[0].scene_node_id(), Some(scene_node_id));
+    assert_eq!(pending.members[0].start, first.start);
+    assert_eq!(pending.members[0].target, second.target);
+    assert_eq!(pending.started_at, crate::presentation_animation::AnimationTime::from_nanos(10));
+}
+
+#[test]
+fn nested_layout_batch_merges_duplicate_geometry_before_outer_commit() {
+    let mut state = CompositorState::new(None);
+    let root_surface_id = 2_701;
+    let window_id = WindowId::from_raw(2_701).expect("window id");
+    state.install_native_frame_test_scene(
+        vec![test_renderable_surface(root_surface_id, 100, 100)],
+        &[(root_surface_id, window_id)],
+        None,
+    );
+    let start = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 100, 100);
+    let middle = WindowGeometry::new(SurfacePlacement::absolute_root_at(100, 0), 100, 100);
+    let target = WindowGeometry::new(SurfacePlacement::absolute_root_at(200, 0), 100, 100);
+    state.install_toplevel_visual_geometry(root_surface_id, start);
+
+    state.begin_layout_reflow_batch();
+    state.begin_layout_reflow_batch();
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        start,
+        middle,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        middle,
+        target,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    assert_eq!(state.presentation_animator.transaction_count(), 0);
+
+    assert!(!state.finish_layout_reflow_batch());
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    assert_eq!(state.presentation_animator.transaction_count(), 0);
+
+    let _ = state.finish_layout_reflow_batch();
+    let scene_node_id = state
+        .presentation_scene_node_id_for_root(root_surface_id)
+        .expect("window group scene node");
+    assert_eq!(state.presentation_animator.active_count(), 1);
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_eq!(
+        state
+            .presentation_animator
+            .track_revision(scene_node_id)
+            .expect("one geometry revision")
+            .get(),
+        1
+    );
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("track start");
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_at_transition_start_for_scene_node(scene_node_id)
+            .expect("start sample")
+            .rect,
+        crate::presentation_animation::PresentationRect::new(0.0, 0.0, 100.0, 100.0)
+            .expect("start rect")
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(
+                scene_node_id,
+                crate::presentation_animation::AnimationTime::from_nanos(
+                    started_at.as_nanos() + 1_000_000_000,
+                ),
+            )
+            .expect("settled sample")
+            .rect,
+        crate::presentation_animation::PresentationRect::new(200.0, 0.0, 100.0, 100.0)
+            .expect("target rect")
+    );
+}
+
+#[test]
+fn repeated_pending_mutations_retarget_active_track_at_batch_start() {
+    let mut state = CompositorState::new(None);
+    let root_surface_id = 2_702;
+    let window_id = WindowId::from_raw(2_702).expect("window id");
+    state.install_native_frame_test_scene(
+        vec![test_renderable_surface(root_surface_id, 100, 100)],
+        &[(root_surface_id, window_id)],
+        None,
+    );
+    let start = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 100, 100);
+    let active_target = WindowGeometry::new(SurfacePlacement::absolute_root_at(100, 0), 100, 100);
+    let pending_middle =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(150, 0), 100, 100);
+    let pending_target = WindowGeometry::new(SurfacePlacement::absolute_root_at(250, 0), 100, 100);
+    state.install_toplevel_visual_geometry(root_surface_id, start);
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        start,
+        active_target,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    let scene_node_id = state
+        .presentation_scene_node_id_for_root(root_surface_id)
+        .expect("window group scene node");
+    let previous_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("active transaction");
+
+    state.begin_layout_reflow_batch();
+    let batch_started_at = state.layout_animation_epoch.expect("batch start");
+    let expected = state
+        .presentation_animator
+        .sample_for_scene_node(scene_node_id, batch_started_at)
+        .expect("active sample at batch start");
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        active_target,
+        pending_middle,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        pending_middle,
+        pending_target,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    let _ = state.finish_layout_reflow_batch();
+
+    assert_eq!(state.presentation_animator.active_count(), 1);
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_ne!(
+        state
+            .presentation_animator
+            .track_transaction(scene_node_id),
+        Some(previous_transaction)
+    );
+    let retargeted_start = state
+        .presentation_animator
+        .sample_at_transition_start_for_scene_node(scene_node_id)
+        .expect("retargeted start");
+    assert_eq!(retargeted_start.rect, expected.rect);
+    assert_eq!(retargeted_start.velocity, expected.velocity);
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("retargeted timestamp");
+    assert_eq!(started_at, batch_started_at);
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(
+                scene_node_id,
+                crate::presentation_animation::AnimationTime::from_nanos(
+                    started_at.as_nanos() + 1_000_000_000,
+                ),
+            )
+            .expect("retargeted settled sample")
+            .rect,
+        crate::presentation_animation::PresentationRect::new(250.0, 0.0, 100.0, 100.0)
+            .expect("final target rect")
+    );
+}
+
+#[test]
 fn tiled_dwindle_reflow_starts_from_pre_mutation_geometry_without_visual_history() {
     let mut state = CompositorState::new(None);
     assert!(state.set_output_size(1_920, 1_080));

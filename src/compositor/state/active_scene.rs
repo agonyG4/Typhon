@@ -9,6 +9,24 @@ pub(in crate::compositor) struct PendingPresentationGeometryTransaction {
         Vec<crate::presentation_animation::PresentationGeometryMutation>,
 }
 
+impl PendingPresentationGeometryTransaction {
+    pub(in crate::compositor) fn upsert_geometry_mutation(
+        &mut self,
+        mutation: crate::presentation_animation::PresentationGeometryMutation,
+    ) {
+        if let Some(existing) = self
+            .members
+            .iter_mut()
+            .find(|member| member.scene_node_id() == mutation.scene_node_id())
+        {
+            existing.target = mutation.target;
+            existing.curve = mutation.curve;
+        } else {
+            self.members.push(mutation);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct ActiveSceneSelection {
     pub(in crate::compositor) regular: WorkspaceId,
@@ -603,15 +621,7 @@ impl CompositorState {
         );
         if self.layout_batch_depth > 0 {
             if let Some(pending) = self.pending_presentation_geometry_transaction.as_mut() {
-                if let Some(existing) = pending
-                    .members
-                    .iter_mut()
-                    .find(|member| member.scene_node_id() == Some(scene_node_id))
-                {
-                    *existing = mutation;
-                } else {
-                    pending.members.push(mutation);
-                }
+                pending.upsert_geometry_mutation(mutation);
             }
             return;
         }
