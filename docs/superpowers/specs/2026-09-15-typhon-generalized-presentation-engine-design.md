@@ -1,7 +1,7 @@
 # Typhon Generalized Presentation Engine — Gate and Design
 
 Date: 2026-09-15
-Status: approved design; geometry Presentation Engine v2 stage implemented
+Status: approved design; Geometry Presentation Engine v2 hardened and closed
 
 ## Decision
 
@@ -9,7 +9,10 @@ The canonical scene identity, visual topology, immutable frame evidence, and
 physical promotion foundations are implemented. Geometry presentation now uses
 the first production stage of the generalized engine: transactional,
 SceneNode-owned sparse tracks with exact physical revision acknowledgement.
-Lifecycle/Lamp retention and additional generalized properties remain deferred.
+The geometry stage is now hardened for repeated pending mutations, immutable
+output-qualified physical ACK evidence, and exact transaction-member
+retirement. Lifecycle/Lamp retention and additional generalized properties
+remain deferred.
 
 Future implementation stages must preserve the physical frame authority and
 the compatibility boundaries described below.
@@ -96,11 +99,14 @@ prerequisite status is:
 * **Physical SceneNode promotion contract:** implemented. `NativeSceneHistory`
   promotes the exact frozen evidence on immediate/pageflip promotion and does
   not reconstruct identity from current compositor state.
-* **Presentation Engine v2 geometry stage:** implemented. Transaction IDs,
-  SceneNode-owned geometry tracks, exact revision ACK, output-qualified frame
-  samples, scheduled sample-time evidence, and atomic Dwindle geometry
-  transactions are active. Opacity/clip, retained lifecycle/Lamp migration,
-  and new animation effects remain pending.
+* **Presentation Engine v2 geometry stage:** implemented and hardened.
+  Transaction IDs, SceneNode-owned geometry tracks, exact revision ACK,
+  output-qualified frame samples, scheduled sample-time evidence, and atomic
+  Dwindle geometry transactions are active. Pending duplicate mutations keep
+  the first start and final target; physical ACKs use only immutable promoted
+  frame evidence; and transaction members retire by exact
+  node/property/revision identity. Opacity/clip, retained lifecycle/Lamp
+  migration, and new animation effects remain pending.
 
 Typhon remains a single-output product. This internal `OutputId` foundation
 does not add hotplug, multi-output layout, or a multi-output product model.
@@ -306,7 +312,7 @@ pageflip timing, or fullscreen gaming performance.
 
 ## Current result
 
-The first production geometry stage is complete:
+The first production geometry stage is complete and closed:
 
 ```text
 OutputId foundation                         implemented
@@ -319,6 +325,10 @@ Presentation Engine v2 transaction IDs      implemented
 SceneNode geometry ownership                implemented
 exact revision physical ACK                 implemented
 Dwindle atomic geometry transactions        implemented
+repeated batch mutation semantics            hardened
+output-qualified immutable ACK               hardened
+exact transaction-member retirement          hardened
+geometry source-layout closure               complete
 
 opacity/clip generalized properties         pending
 lifecycle retained-source migration         pending
