@@ -103,17 +103,20 @@ impl BufferSize {
 pub enum DrmFormat {
     Argb8888,
     Xrgb8888,
+    Xbgr8888,
     Other(u32),
 }
 
 impl DrmFormat {
     pub const ARGB8888_FOURCC: u32 = fourcc(b'A', b'R', b'2', b'4');
     pub const XRGB8888_FOURCC: u32 = fourcc(b'X', b'R', b'2', b'4');
+    pub const XBGR8888_FOURCC: u32 = fourcc(b'X', b'B', b'2', b'4');
 
     pub const fn from_fourcc(format: u32) -> Self {
         match format {
             Self::ARGB8888_FOURCC => Self::Argb8888,
             Self::XRGB8888_FOURCC => Self::Xrgb8888,
+            Self::XBGR8888_FOURCC => Self::Xbgr8888,
             other => Self::Other(other),
         }
     }
@@ -122,8 +125,13 @@ impl DrmFormat {
         match self {
             Self::Argb8888 => Self::ARGB8888_FOURCC,
             Self::Xrgb8888 => Self::XRGB8888_FOURCC,
+            Self::Xbgr8888 => Self::XBGR8888_FOURCC,
             Self::Other(format) => format,
         }
+    }
+
+    pub const fn is_opaque_rgb8888(self) -> bool {
+        matches!(self, Self::Xrgb8888 | Self::Xbgr8888)
     }
 }
 
@@ -369,10 +377,12 @@ impl CommittedSurfaceBuffer {
             Self::ShmSnapshot { format, .. } => *format,
             Self::DmabufHandle { handle, .. } => handle.format(),
         };
-        match format {
-            DrmFormat::Argb8888 => crate::blur_policy::SurfaceAlphaCapability::AlphaCapable,
-            DrmFormat::Xrgb8888 => crate::blur_policy::SurfaceAlphaCapability::Opaque,
-            DrmFormat::Other(_) => crate::blur_policy::SurfaceAlphaCapability::Unknown,
+        if matches!(format, DrmFormat::Argb8888) {
+            crate::blur_policy::SurfaceAlphaCapability::AlphaCapable
+        } else if format.is_opaque_rgb8888() {
+            crate::blur_policy::SurfaceAlphaCapability::Opaque
+        } else {
+            crate::blur_policy::SurfaceAlphaCapability::Unknown
         }
     }
 

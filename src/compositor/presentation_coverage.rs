@@ -1,10 +1,10 @@
 use super::{DecorationRenderInstance, RenderableSurface, SurfaceTargetRect, WindowVisualGroup};
 use crate::compositor::surface::SurfaceRenderBackend;
-use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
+use crate::render_backend::buffer::{BufferSize, DrmFormat, DrmModifier, SurfaceBufferSource};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PresentationCoverageOpacity {
-    OpaqueXrgb8888,
+    OpaqueRgb8888,
     #[default]
     Unknown,
 }
@@ -12,13 +12,13 @@ pub enum PresentationCoverageOpacity {
 impl PresentationCoverageOpacity {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::OpaqueXrgb8888 => "opaque_xrgb8888",
+            Self::OpaqueRgb8888 => "opaque_rgb8888",
             Self::Unknown => "unknown",
         }
     }
 
     pub const fn is_proven_opaque(self) -> bool {
-        matches!(self, Self::OpaqueXrgb8888)
+        matches!(self, Self::OpaqueRgb8888)
     }
 }
 
@@ -38,6 +38,7 @@ pub struct PresentationCoverageSurface {
     pub backend: SurfaceRenderBackend,
     pub buffer_source: SurfaceBufferSource,
     pub format: Option<DrmFormat>,
+    pub modifier: Option<DrmModifier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +118,10 @@ pub(crate) fn analyze_presentation_coverage(
                 backend: surface.render_backend,
                 buffer_source: surface.buffer_source(),
                 format: surface.dmabuf_handle().map(|buffer| buffer.format()),
+                modifier: surface
+                    .dmabuf_handle()
+                    .and_then(|buffer| buffer.planes().first())
+                    .map(|plane| plane.descriptor().modifier),
             })
         })
         .collect::<Vec<_>>();
@@ -315,7 +320,7 @@ mod tests {
             |root| layers.contains(&root),
             |surface, _target| {
                 if surface.surface_id == 10 {
-            PresentationCoverageOpacity::OpaqueRgb8888
+                    PresentationCoverageOpacity::OpaqueRgb8888
                 } else {
                     PresentationCoverageOpacity::Unknown
                 }
@@ -345,6 +350,7 @@ mod tests {
                     backend: SurfaceRenderBackend::NativeWayland,
                     buffer_source: SurfaceBufferSource::Shm,
                     format: None,
+                    modifier: None,
                 }],
                 covering_surface: Some(PresentationCoverageSurface {
                     surface_id: 10,
@@ -353,6 +359,7 @@ mod tests {
                     backend: SurfaceRenderBackend::NativeWayland,
                     buffer_source: SurfaceBufferSource::Shm,
                     format: None,
+                    modifier: None,
                 }),
                 visible_surface_ids_above_covering: Vec::new(),
             })

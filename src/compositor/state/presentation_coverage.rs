@@ -2,7 +2,7 @@ use super::*;
 use crate::compositor::presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageOpacity, analyze_presentation_coverage,
 };
-use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
+use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 
 impl CompositorState {
     pub(in crate::compositor) fn presentation_coverage_analysis(
@@ -43,7 +43,7 @@ impl CompositorState {
             && surface.buffer_source() == SurfaceBufferSource::Dmabuf
             && surface
                 .dmabuf_handle()
-                .is_some_and(|buffer| buffer.format() == DrmFormat::Xrgb8888)
+                .is_some_and(|buffer| buffer.format().is_opaque_rgb8888())
             && surface
                 .dmabuf_handle()
                 .is_some_and(|buffer| buffer.size() == output_size)
@@ -53,7 +53,7 @@ impl CompositorState {
                 .is_none_or(|placement| placement == surface.placement)
             && surface.render_target_size.is_none();
         if proven {
-            PresentationCoverageOpacity::OpaqueXrgb8888
+            PresentationCoverageOpacity::OpaqueRgb8888
         } else {
             PresentationCoverageOpacity::Unknown
         }

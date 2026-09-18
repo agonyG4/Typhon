@@ -51,7 +51,17 @@ fn fullscreen_identity_viewport_xrgb_dmabuf_is_direct_scanout_candidate() {
 #[test]
 fn fullscreen_identity_viewport_xbgr_dmabuf_is_direct_scanout_candidate() {
     let socket_name = unique_socket_name();
-    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let mut probe = crate::compositor::gpu_protocol_capabilities::GpuProtocolProbe::valid_for_tests();
+    let xbgr = crate::compositor::gpu_protocol_capabilities::GpuFormat::new(
+        DrmFormat::XBGR8888_FOURCC,
+        crate::render_backend::buffer::DrmModifier::LINEAR.0,
+    );
+    probe.importer_formats.push(xbgr);
+    probe.feedback_format_table.push(xbgr);
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.enable_gpu_buffer_protocols_with_capabilities(
+        crate::compositor::gpu_protocol_capabilities::GpuProtocolCapabilities::from_probe(probe),
+    );
     server.set_dmabuf_feedback(
         crate::render_backend::egl_gles::EglGlesDmabufFeedback::from_formats([
             crate::render_backend::egl_gles::EglGlesDmabufFormat::new(

@@ -8,6 +8,7 @@ use super::{
 };
 use oblivion_one::compositor::{CompositorFrameBatchId, DrmContentType, OutputPresentationMode};
 use oblivion_one::native::kms::PageFlipToken;
+use oblivion_one::render_backend::buffer::DrmFormat;
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
 };
@@ -486,6 +487,23 @@ fn feedback_capabilities_require_exact_primary_plane_format_modifier() {
     assert!(capabilities.supports(0x3432_5241, 7));
     assert!(!capabilities.supports(0x3432_5241, 5));
     assert!(!capabilities.supports(0x3432_5258, 3));
+}
+
+#[test]
+fn feedback_capabilities_accept_exact_xbgr_pair_and_reject_xrgb_substitution() {
+    let capabilities = DirectScanoutFeedbackCapabilities::new(
+        7,
+        1,
+        42,
+        vec![DirectScanoutFormatCapability {
+            format: DrmFormat::XBGR8888_FOURCC,
+            modifier: 9,
+        }],
+    );
+
+    assert!(capabilities.supports(DrmFormat::XBGR8888_FOURCC, 9));
+    assert!(!capabilities.supports(DrmFormat::XBGR8888_FOURCC, 7));
+    assert!(!capabilities.supports(DrmFormat::XRGB8888_FOURCC, 9));
 }
 
 #[test]

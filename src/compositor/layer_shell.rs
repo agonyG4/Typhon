@@ -1,4 +1,6 @@
 use super::*;
+use crate::compositor::render::SurfaceTargetRect;
+use crate::render_backend::buffer::SurfaceBufferSource;
 use crate::window_lifecycle_animation::LifecycleSceneSample;
 use std::collections::HashSet;
 
@@ -17,6 +19,15 @@ impl Layer {
             Self::Bottom => 1,
             Self::Top => 3,
             Self::Overlay => 4,
+        }
+    }
+
+    pub(super) const fn doctor_name(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Bottom => "bottom",
+            Self::Top => "top",
+            Self::Overlay => "overlay",
         }
     }
 }
@@ -849,6 +860,85 @@ impl CompositorState {
             width: f64::from(usable.width),
             height: f64::from(usable.height),
         }
+    }
+
+    pub(in crate::compositor) fn direct_scanout_layer_shell_doctor_detail(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<String> {
+        const MAX_SURFACE_DETAILS: usize = 32;
+        let role = self.layer_surfaces.get(&root_surface_id)?;
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        let targets = render::surface_render_space_targets(surfaces, origins, 1.0);
+        let output = SurfaceTargetRect::new(0, 0, self.output_size.width, self.output_size.height);
+        let root_surfaces = surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, surface)| {
+                self.root_surface_id_for_surface(surface.surface_id) == root_surface_id
+            })
+            .collect::<Vec<_>>();
+        let surface_details = root_surfaces
+            .iter()
+            .take(MAX_SURFACE_DETAILS)
+            .map(|(index, surface)| {
+                let target = targets.get(*index).copied();
+                let format = surface
+                    .dmabuf_handle()
+                    .map(|buffer| format!("0x{:08x}", buffer.format().as_fourcc()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!(
+                    "{{id:{} buffer_source:{} format:{} target:{} intersects_output:{}}}",
+                    surface.surface_id,
+                    match surface.buffer_source() {
+                        SurfaceBufferSource::Shm => "shm",
+                        SurfaceBufferSource::Dmabuf => "dmabuf",
+                    },
+                    format,
+                    target.map_or_else(
+                        || "unknown".to_string(),
+                        |target| {
+                            format!(
+                                "{},{},{},{}",
+                                target.x(),
+                                target.y(),
+                                target.width(),
+                                target.height()
+                            )
+                        },
+                    ),
+                    target.is_some_and(|target| target.intersects(output)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let geometry = role.geometry.map_or_else(
+            || "none".to_string(),
+            |geometry| {
+                format!(
+                    "{},{},{},{}",
+                    geometry.x, geometry.y, geometry.width, geometry.height
+                )
+            },
+        );
+        let geometry_intersects_output = role.geometry.is_some_and(|geometry| {
+            i64::from(geometry.x) < i64::from(self.output_size.width)
+                && i64::from(geometry.y) < i64::from(self.output_size.height)
+                && i64::from(geometry.x) + i64::from(geometry.width) > 0
+                && i64::from(geometry.y) + i64::from(geometry.height) > 0
+        });
+        Some(format!(
+            "{{root:{} kind:layer_shell namespace:{} layer:{} mapped:{} geometry:{} surface_count:{} intersects_output:{} surfaces:[{}] surfaces_truncated:{}}}",
+            root_surface_id,
+            role.namespace,
+            role.committed.layer.doctor_name(),
+            role.mapped,
+            geometry,
+            root_surfaces.len(),
+            geometry_intersects_output,
+            surface_details.join(","),
+            root_surfaces.len() > MAX_SURFACE_DETAILS,
+        ))
     }
 
     fn reserved_usable_geometry(&self) -> LayerLayoutRect {

@@ -7,7 +7,7 @@ use crate::compositor::presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageContentKind,
 };
 use crate::compositor::render::SurfaceTargetRect;
-use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
+use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 use crate::wm::WorkspaceLocation;
 use wayland_server::Resource;
 
@@ -125,8 +125,8 @@ impl CompositorState {
             blockers.push(DirectScanoutSceneRejection::OwnerRootBufferMissing);
         }
         if let Some(buffer) = buffer.as_ref() {
-            if buffer.format() != DrmFormat::Xrgb8888 {
-                blockers.push(DirectScanoutSceneRejection::FormatNotOpaqueXrgb8888);
+            if !buffer.format().is_opaque_rgb8888() {
+                blockers.push(DirectScanoutSceneRejection::FormatNotProvenOpaque);
             }
             if buffer.size() != output_size {
                 blockers.push(DirectScanoutSceneRejection::BufferSizeMismatch);

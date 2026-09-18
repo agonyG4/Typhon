@@ -11,10 +11,12 @@ use std::{
 use oblivion_one::{
     native::{drm, kms::FramebufferId},
     render_backend::buffer::{
-        BufferIdentity, DmabufBufferHandle, DmabufImageKey, DrmFormat, DrmModifier,
-        WeakBufferIdentity,
+        BufferIdentity, DmabufBufferHandle, DmabufImageKey, DrmModifier, WeakBufferIdentity,
     },
 };
+
+#[cfg(test)]
+use oblivion_one::render_backend::buffer::DrmFormat;
 
 use super::{ExplicitFramebufferDescriptor, ExplicitFramebufferPlane, add_explicit_framebuffer};
 
@@ -316,28 +318,29 @@ pub(crate) fn validate_direct_dma_buf(buffer: &DmabufBufferHandle) -> io::Result
             ));
         }
     }
-    if buffer.format() != DrmFormat::Xrgb8888 {
+    if !buffer.format().is_opaque_rgb8888() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "direct scanout importer only accepts XRGB8888",
+            "direct scanout importer only accepts explicitly supported opaque RGB8888 formats",
         ));
     }
     if planes.len() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "XRGB8888 direct scanout must have one plane",
+            "opaque RGB8888 direct scanout must have one plane",
         ));
     }
     let descriptor = planes[0].descriptor();
-    let minimum_stride = buffer
-        .size()
-        .width
-        .checked_mul(4)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "XRGB stride overflow"))?;
+    let minimum_stride = buffer.size().width.checked_mul(4).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "opaque RGB8888 stride overflow",
+        )
+    })?;
     if descriptor.offset != 0 || descriptor.stride < minimum_stride {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "impossible XRGB8888 dma-buf layout",
+            "impossible opaque RGB8888 dma-buf layout",
         ));
     }
     Ok(())
@@ -474,7 +477,7 @@ mod tests {
     use std::{os::fd::OwnedFd, sync::Mutex};
 
     use oblivion_one::render_backend::buffer::{
-        BufferSize, DmabufPlane, DmabufPlaneDescriptor,
+        BufferSize, DmabufPlane, DmabufPlaneDescriptor, DrmFormat,
     };
 
     #[derive(Default)]
@@ -580,33 +583,32 @@ mod tests {
     fn xbgr8888_direct_import_rejects_invalid_layout_metadata() {
         let mut too_small_stride = valid_descriptor(0);
         too_small_stride.stride = 15;
-        assert!(validate_direct_dma_buf(&validation_buffer(
-            DrmFormat::Xbgr8888,
-            &[too_small_stride],
-        ))
-        .is_err());
+        assert!(
+            validate_direct_dma_buf(&validation_buffer(DrmFormat::Xbgr8888, &[too_small_stride],))
+                .is_err()
+        );
 
         let mut nonzero_offset = valid_descriptor(0);
         nonzero_offset.offset = 4;
-        assert!(validate_direct_dma_buf(&validation_buffer(
-            DrmFormat::Xbgr8888,
-            &[nonzero_offset],
-        ))
-        .is_err());
+        assert!(
+            validate_direct_dma_buf(&validation_buffer(DrmFormat::Xbgr8888, &[nonzero_offset],))
+                .is_err()
+        );
 
         let mut invalid_modifier = valid_descriptor(0);
         invalid_modifier.modifier = DrmModifier::INVALID;
-        assert!(validate_direct_dma_buf(&validation_buffer(
-            DrmFormat::Xbgr8888,
-            &[invalid_modifier],
-        ))
-        .is_err());
+        assert!(
+            validate_direct_dma_buf(&validation_buffer(DrmFormat::Xbgr8888, &[invalid_modifier],))
+                .is_err()
+        );
 
-        assert!(validate_direct_dma_buf(&validation_buffer(
-            DrmFormat::Xbgr8888,
-            &[valid_descriptor(0), valid_descriptor(1)],
-        ))
-        .is_err());
+        assert!(
+            validate_direct_dma_buf(&validation_buffer(
+                DrmFormat::Xbgr8888,
+                &[valid_descriptor(0), valid_descriptor(1)],
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -625,7 +627,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(imported.format, DrmFormat::XBGR8888_FOURCC);
-        assert_eq!(io.formats.lock().unwrap().as_slice(), &[DrmFormat::XBGR8888_FOURCC]);
+        assert_eq!(
+            io.formats.lock().unwrap().as_slice(),
+            &[DrmFormat::XBGR8888_FOURCC]
+        );
     }
 
     #[test]
