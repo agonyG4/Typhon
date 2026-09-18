@@ -22,7 +22,7 @@ pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
 #[cfg(test)]
 pub(crate) use executor::{
-    SceneWorkPreservation, capture_scene_work_preservation, restore_scene_work_preservation,
+    capture_scene_work_preservation, restore_scene_work_preservation,
     SceneCaptureMaterializationPolicy, execute_effect_graph_with_debug_config,
     execute_effect_graph_with_debug_config_and_materialization_policy,
 };
