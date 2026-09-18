@@ -191,17 +191,70 @@ impl CompositorState {
 
     pub(in crate::compositor) fn dmabuf_feedback_doctor_state(
         &self,
-    ) -> (bool, Option<u32>, u64, u64) {
+        source_surface_id: Option<u32>,
+        source_fourcc: Option<u32>,
+    ) -> DmabufFeedbackDoctorState {
         let hinted_surface = self
             .dmabuf_scanout_candidate_surface
             .filter(|surface_id| self.dmabuf_surface_scanout_hints.contains(surface_id))
             .or_else(|| self.dmabuf_surface_scanout_hints.iter().copied().min());
-        (
-            hinted_surface.is_some(),
-            hinted_surface,
-            self.dmabuf_feedback_updates,
-            self.dmabuf_feedback_duplicate_suppressed,
-        )
+        let (live_resources, snapshots) = source_surface_id
+            .map(|source_surface_id| {
+                let bindings = self
+                    .dmabuf_feedback_resources
+                    .values()
+                    .filter_map(|resource| {
+                        let feedback = resource.resource.upgrade().ok()?;
+                        let data = feedback.data::<DmabufFeedbackResourceData>()?;
+                        let binding = data.binding.lock().ok()?;
+                        Some((binding.scope(), binding.last_snapshot().cloned()))
+                    });
+                collect_surface_feedback_snapshots(source_surface_id, bindings)
+            })
+            .unwrap_or_default();
+        let (
+            snapshot_variants,
+            snapshots_consistent,
+            advertised_scanout_pair_count,
+            advertised_source_modifiers,
+        ) = source_fourcc
+            .map(|source_fourcc| summarize_surface_feedback_snapshots(&snapshots, source_fourcc))
+            .unwrap_or((0, true, None, None));
+        let scanout_capability_pair_count = self
+            .dmabuf_scanout_capabilities
+            .as_ref()
+            .map_or(0, |capabilities| capabilities.formats.len());
+        let scanout_capability_source_modifiers = source_fourcc
+            .and_then(|source_fourcc| {
+                self.dmabuf_scanout_capabilities
+                    .as_ref()
+                    .map(|capabilities| {
+                        let mut modifiers = capabilities
+                            .formats
+                            .iter()
+                            .filter(|capability| capability.format == source_fourcc)
+                            .map(|capability| capability.modifier)
+                            .collect::<Vec<_>>();
+                        modifiers.sort_unstable();
+                        modifiers.dedup();
+                        modifiers
+                    })
+            })
+            .unwrap_or_default();
+
+        DmabufFeedbackDoctorState {
+            hint_active: hinted_surface.is_some(),
+            hint_surface: hinted_surface,
+            updates: self.dmabuf_feedback_updates,
+            duplicate_suppressed: self.dmabuf_feedback_duplicate_suppressed,
+            live_resources,
+            snapshot_variants,
+            snapshots_consistent,
+            scanout_capability_pair_count,
+            scanout_capability_source_modifiers,
+            advertised_scanout_pair_count,
+            advertised_source_modifiers,
+        }
     }
 
     pub(in crate::compositor) fn set_dmabuf_feedback(
@@ -258,5 +311,167 @@ impl CompositorState {
             self.reconcile_all_dmabuf_feedback();
         }
         changed
+    }
+}
+
+fn collect_surface_feedback_snapshots<I>(
+    source_surface_id: u32,
+    bindings: I,
+) -> (usize, Vec<DmabufFeedbackSnapshot>)
+where
+    I: IntoIterator<Item = (DmabufFeedbackScope, Option<DmabufFeedbackSnapshot>)>,
+{
+    let mut live_resources = 0usize;
+    let mut snapshots = Vec::new();
+    for (scope, snapshot) in bindings {
+        if scope != DmabufFeedbackScope::Surface(source_surface_id) {
+            continue;
+        }
+        live_resources = live_resources.saturating_add(1);
+        if let Some(snapshot) = snapshot {
+            snapshots.push(snapshot);
+        }
+    }
+    (live_resources, snapshots)
+}
+
+fn summarize_surface_feedback_snapshots(
+    snapshots: &[DmabufFeedbackSnapshot],
+    source_fourcc: u32,
+) -> (usize, bool, Option<usize>, Option<Vec<u64>>) {
+    let mut variants = Vec::new();
+    for snapshot in snapshots {
+        if !variants.contains(snapshot) {
+            variants.push(snapshot.clone());
+        }
+    }
+    let snapshots_consistent = variants.len() <= 1;
+    let (advertised_scanout_pair_count, advertised_source_modifiers) =
+        if let Some(snapshot) = variants.first().filter(|_| snapshots_consistent) {
+            (
+                Some(snapshot.scanout_pair_count()),
+                Some(snapshot.scanout_modifiers_for_fourcc(source_fourcc)),
+            )
+        } else {
+            (None, None)
+        };
+    (
+        variants.len(),
+        snapshots_consistent,
+        advertised_scanout_pair_count,
+        advertised_source_modifiers,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compositor::gpu_protocol_capabilities::GpuFormat;
+    use crate::render_backend::egl_gles::EglGlesDmabufFormat;
+
+    #[test]
+    fn advertised_snapshot_summary_deduplicates_consistent_live_resources() {
+        let first = snapshot_with_scanout_modifier(7);
+        let summary = summarize_surface_feedback_snapshots(
+            &[first.clone(), first],
+            DrmFormat::Xrgb8888.as_fourcc(),
+        );
+
+        assert_eq!(summary, (1, true, Some(1), Some(vec![7])));
+    }
+
+    #[test]
+    fn advertised_snapshot_summary_withholds_effective_pairs_when_inconsistent() {
+        let summary = summarize_surface_feedback_snapshots(
+            &[
+                snapshot_with_scanout_modifier(7),
+                snapshot_with_scanout_modifier(9),
+            ],
+            DrmFormat::Xrgb8888.as_fourcc(),
+        );
+
+        assert_eq!(summary, (2, false, None, None));
+    }
+
+    #[test]
+    fn actual_snapshot_collection_ignores_other_and_inert_scopes() {
+        let source_snapshot = snapshot_with_scanout_modifier(7);
+        let (live_resources, snapshots) = collect_surface_feedback_snapshots(
+            35,
+            [
+                (
+                    DmabufFeedbackScope::Surface(35),
+                    Some(source_snapshot.clone()),
+                ),
+                (
+                    DmabufFeedbackScope::Surface(36),
+                    Some(snapshot_with_scanout_modifier(9)),
+                ),
+                (DmabufFeedbackScope::InertSurface, Some(source_snapshot)),
+                (DmabufFeedbackScope::Surface(35), None),
+            ],
+        );
+
+        assert_eq!(live_resources, 2);
+        assert_eq!(snapshots, vec![snapshot_with_scanout_modifier(7)]);
+    }
+
+    #[test]
+    fn capability_and_advertised_modifier_views_remain_independent() {
+        let capability_modifier = 0x10;
+        let advertised_modifier = 0x20;
+        let capabilities = DirectScanoutFeedbackCapabilities::new(
+            0x200,
+            1,
+            42,
+            vec![DirectScanoutFormatCapability {
+                format: DrmFormat::Xrgb8888.as_fourcc(),
+                modifier: capability_modifier,
+            }],
+        );
+        let advertised = snapshot_with_scanout_modifier(advertised_modifier);
+
+        assert_eq!(
+            capabilities
+                .formats
+                .iter()
+                .filter(|capability| capability.format == DrmFormat::Xrgb8888.as_fourcc())
+                .map(|capability| capability.modifier)
+                .collect::<Vec<_>>(),
+            vec![capability_modifier]
+        );
+        assert_eq!(
+            advertised.scanout_modifiers_for_fourcc(DrmFormat::Xrgb8888.as_fourcc()),
+            vec![advertised_modifier]
+        );
+    }
+
+    fn snapshot_with_scanout_modifier(modifier: u64) -> DmabufFeedbackSnapshot {
+        let capabilities = DirectScanoutFeedbackCapabilities::new(
+            0x200,
+            1,
+            42,
+            vec![DirectScanoutFormatCapability {
+                format: DrmFormat::Xrgb8888.as_fourcc(),
+                modifier,
+            }],
+        );
+        DmabufFeedbackData::build_snapshot(
+            &EglGlesDmabufFeedback::with_scanout_tranche(
+                [],
+                [EglGlesDmabufFormat::new(
+                    DrmFormat::Argb8888,
+                    DrmModifier::LINEAR,
+                )],
+            ),
+            0x100,
+            &[
+                GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), modifier),
+                GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+            ],
+            Some(&capabilities),
+            None,
+        )
+        .unwrap()
     }
 }

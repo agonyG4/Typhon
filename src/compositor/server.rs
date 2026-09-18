@@ -17,13 +17,13 @@ use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
-    AnimationTime, DirectScanoutSceneAnalysis, EffectFrameDemandSnapshot,
-    FullscreenCompositionPlan, NativeFramePresentationTargets, PresentationAnimationMetrics,
-    PresentationCoverageContent, PresentationCoverageContentKind, PresentationFrameSnapshot,
-    PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentedWindowGeometry,
-    RenderableSurface, ResolvedEffectScene, SceneNodeId, ShmBufferLifetimeMetrics,
-    SurfaceCommitSequence, SurfaceLocalityMetrics, SurfacePresentationCommitKey,
-    SurfaceResourceSyncState, compositor_surface_id,
+    AnimationTime, DirectScanoutSceneAnalysis, DmabufFeedbackDoctorState,
+    EffectFrameDemandSnapshot, FullscreenCompositionPlan, NativeFramePresentationTargets,
+    PresentationAnimationMetrics, PresentationCoverageContent, PresentationCoverageContentKind,
+    PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
+    PresentationSceneSample, PresentedWindowGeometry, RenderableSurface, ResolvedEffectScene,
+    SceneNodeId, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
+    SurfacePresentationCommitKey, SurfaceResourceSyncState, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -1714,8 +1714,13 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
-    pub fn dmabuf_feedback_doctor_state(&self) -> (bool, Option<u32>, u64, u64) {
-        self.state.dmabuf_feedback_doctor_state()
+    pub fn dmabuf_feedback_doctor_state(
+        &self,
+        source_surface_id: Option<u32>,
+        source_fourcc: Option<u32>,
+    ) -> DmabufFeedbackDoctorState {
+        self.state
+            .dmabuf_feedback_doctor_state(source_surface_id, source_fourcc)
     }
 
     pub fn direct_scanout_scene_blockers(&self) -> DirectScanoutSceneBlockers {

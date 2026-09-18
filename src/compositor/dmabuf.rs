@@ -113,6 +113,61 @@ pub(super) struct DmabufFeedbackSnapshot {
     tranches: Vec<DmabufFeedbackSnapshotTranche>,
 }
 
+impl DmabufFeedbackSnapshot {
+    pub(super) fn scanout_pair_count(&self) -> usize {
+        if !self.has_scanout_tranche() {
+            return 0;
+        }
+        let mut pairs = self
+            .tranches
+            .iter()
+            .filter(|tranche| tranche.scanout)
+            .flat_map(|tranche| {
+                tranche
+                    .formats
+                    .iter()
+                    .map(|format| (format.format.as_fourcc(), format.modifier.0))
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs.len()
+    }
+
+    pub(super) fn scanout_modifiers_for_fourcc(&self, fourcc: u32) -> Vec<u64> {
+        let mut modifiers = self
+            .tranches
+            .iter()
+            .filter(|tranche| tranche.scanout)
+            .flat_map(|tranche| tranche.formats.iter())
+            .filter(|format| format.format.as_fourcc() == fourcc)
+            .map(|format| format.modifier.0)
+            .collect::<Vec<_>>();
+        modifiers.sort_unstable();
+        modifiers.dedup();
+        modifiers
+    }
+
+    pub(super) fn has_scanout_tranche(&self) -> bool {
+        self.tranches.iter().any(|tranche| tranche.scanout)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DmabufFeedbackDoctorState {
+    pub hint_active: bool,
+    pub hint_surface: Option<u32>,
+    pub updates: u64,
+    pub duplicate_suppressed: u64,
+    pub live_resources: usize,
+    pub snapshot_variants: usize,
+    pub snapshots_consistent: bool,
+    pub scanout_capability_pair_count: usize,
+    pub scanout_capability_source_modifiers: Vec<u64>,
+    pub advertised_scanout_pair_count: Option<usize>,
+    pub advertised_source_modifiers: Option<Vec<u64>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DmabufFeedbackSnapshotTranche {
     formats: Vec<EglGlesDmabufFormat>,
@@ -147,6 +202,10 @@ impl DmabufFeedbackBinding {
 
     pub(super) fn scope(&self) -> DmabufFeedbackScope {
         self.scope
+    }
+
+    pub(super) fn last_snapshot(&self) -> Option<&DmabufFeedbackSnapshot> {
+        self.last_snapshot.as_ref()
     }
 
     pub(super) fn make_inert(&mut self) {
@@ -865,6 +924,118 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, changed_target);
+    }
+
+    #[test]
+    fn dmabuf_feedback_snapshot_reports_exact_scanout_pairs() {
+        let xbgr_modifier_b = 0x0300_0000_0060_6010_u64;
+        let xbgr_modifier_c = 0x0300_0000_0060_6011_u64;
+        let xrgb_modifier_a = 0x0300_0000_0060_6012_u64;
+        let capabilities = DirectScanoutFeedbackCapabilities::new(
+            0x200,
+            1,
+            42,
+            vec![
+                DirectScanoutFormatCapability {
+                    format: DrmFormat::Xbgr8888.as_fourcc(),
+                    modifier: xbgr_modifier_c,
+                },
+                DirectScanoutFormatCapability {
+                    format: DrmFormat::Xrgb8888.as_fourcc(),
+                    modifier: xrgb_modifier_a,
+                },
+                DirectScanoutFormatCapability {
+                    format: DrmFormat::Xbgr8888.as_fourcc(),
+                    modifier: xbgr_modifier_b,
+                },
+            ],
+        );
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            [],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        );
+        let allowed = [
+            GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), xrgb_modifier_a),
+            GpuFormat::new(DrmFormat::Xbgr8888.as_fourcc(), xbgr_modifier_b),
+            GpuFormat::new(DrmFormat::Xbgr8888.as_fourcc(), xbgr_modifier_c),
+            GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+        ];
+        let snapshot = DmabufFeedbackData::build_snapshot(
+            &feedback,
+            0x100,
+            &allowed,
+            Some(&capabilities),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.scanout_pair_count(), 3);
+        assert_eq!(
+            snapshot.scanout_modifiers_for_fourcc(DrmFormat::Xbgr8888.as_fourcc()),
+            vec![xbgr_modifier_b, xbgr_modifier_c]
+        );
+        assert_eq!(
+            snapshot.scanout_modifiers_for_fourcc(DrmFormat::Xrgb8888.as_fourcc()),
+            vec![xrgb_modifier_a]
+        );
+        assert!(snapshot.has_scanout_tranche());
+        assert_eq!(
+            snapshot.scanout_modifiers_for_fourcc(DrmFormat::Argb8888.as_fourcc()),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn dmabuf_feedback_binding_exposes_last_snapshot_without_reconstructing_it() {
+        let old_snapshot = DmabufFeedbackData::build_snapshot(
+            &EglGlesDmabufFeedback::with_scanout_tranche(
+                [EglGlesDmabufFormat::new(
+                    DrmFormat::Xrgb8888,
+                    DrmModifier(7),
+                )],
+                [EglGlesDmabufFormat::new(
+                    DrmFormat::Argb8888,
+                    DrmModifier::LINEAR,
+                )],
+            ),
+            0x100,
+            &[
+                GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
+                GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        let desired_snapshot = DmabufFeedbackData::build_snapshot(
+            &EglGlesDmabufFeedback::with_scanout_tranche(
+                [EglGlesDmabufFormat::new(
+                    DrmFormat::Xrgb8888,
+                    DrmModifier(9),
+                )],
+                [EglGlesDmabufFormat::new(
+                    DrmFormat::Argb8888,
+                    DrmModifier::LINEAR,
+                )],
+            ),
+            0x100,
+            &[
+                GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 9),
+                GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        let binding =
+            DmabufFeedbackBinding::new(DmabufFeedbackScope::Surface(35), old_snapshot.clone())
+                .unwrap();
+
+        assert_eq!(binding.last_snapshot(), Some(&old_snapshot));
+        assert_ne!(binding.last_snapshot(), Some(&desired_snapshot));
     }
 
     #[test]

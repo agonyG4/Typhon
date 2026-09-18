@@ -964,14 +964,37 @@ impl NativeRuntime {
                     direct_runtime,
                     direct_counters.as_ref(),
                 );
-                let (hint_active, hint_surface, feedback_updates, duplicate_suppressed) =
-                    self.server.dmabuf_feedback_doctor_state();
+                let source_surface_id = direct_scene.scanout_source;
+                let source_fourcc = direct_scene
+                    .scanout_format
+                    .as_ref()
+                    .map(|format| format.fourcc);
+                let feedback_doctor = self
+                    .server
+                    .dmabuf_feedback_doctor_state(source_surface_id, source_fourcc);
                 let direct_detail = format!(
-                    "{direct_detail} surface_feedback_hint_active={} surface_feedback_hint_surface={} surface_feedback_updates={} surface_feedback_duplicate_suppressed={}",
-                    hint_active,
-                    hint_surface.map_or_else(|| "none".to_string(), |surface| surface.to_string()),
-                    feedback_updates,
-                    duplicate_suppressed,
+                    "{direct_detail} surface_feedback_hint_active={} surface_feedback_hint_surface={} surface_feedback_updates={} surface_feedback_duplicate_suppressed={} surface_feedback_live_resources={} surface_feedback_snapshot_variants={} surface_feedback_snapshots_consistent={} scanout_capability_pair_count={} scanout_capability_source_format={} surface_feedback_scanout_pair_count={} surface_feedback_source_format={}",
+                    feedback_doctor.hint_active,
+                    feedback_doctor
+                        .hint_surface
+                        .map_or_else(|| "none".to_string(), |surface| surface.to_string()),
+                    feedback_doctor.updates,
+                    feedback_doctor.duplicate_suppressed,
+                    feedback_doctor.live_resources,
+                    feedback_doctor.snapshot_variants,
+                    feedback_doctor.snapshots_consistent,
+                    feedback_doctor.scanout_capability_pair_count,
+                    format_dmabuf_feedback_source_format(
+                        source_fourcc,
+                        Some(&feedback_doctor.scanout_capability_source_modifiers),
+                    ),
+                    feedback_doctor
+                        .advertised_scanout_pair_count
+                        .map_or_else(|| "none".to_string(), |count| count.to_string()),
+                    format_dmabuf_feedback_source_format(
+                        source_fourcc,
+                        feedback_doctor.advertised_source_modifiers.as_deref(),
+                    ),
                 );
                 let dmem_snapshot = self.dmem_foreground.snapshot();
                 let app_scope_snapshot = oblivion_one::application_scope::snapshot();
@@ -2103,8 +2126,8 @@ mod tests {
         DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs,
         KeyboardLayoutSetArgs, NativePreReadInputDecision, decide_native_pre_read_input,
         dispatch_keyboard_layout_command, format_direct_scanout_doctor_detail,
-        input_requires_full_server_progression, keyboard_layout_failure,
-        promote_native_input_before_wayland_read,
+        format_dmabuf_feedback_source_format, input_requires_full_server_progression,
+        keyboard_layout_failure, promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -2181,6 +2204,7 @@ mod tests {
             scanout_format: Some(DirectScanoutDoctorFormat {
                 fourcc: 0x3432_4258,
                 name: "XBGR8888",
+                modifier: Some(0x0300_0000_00e0_8014),
                 proven_opaque: true,
                 primary_plane_supported: Some(true),
             }),
@@ -2222,7 +2246,7 @@ mod tests {
         assert!(detail.contains("scene_candidate=true scene_root=42"));
         assert!(detail.contains("scanout_source=43"));
         assert!(detail.contains(
-            "scanout_format={fourcc:0x34324258 name:XBGR8888 proven_opaque:true primary_plane_supported:true}"
+            "scanout_format={fourcc:0x34324258 name:XBGR8888 modifier:0x300000000e08014 proven_opaque:true primary_plane_supported:true}"
         ));
         assert!(detail.contains("namespace:astrea-dock"));
         assert!(detail.contains("effects_visible_instance_count=1"));
@@ -2235,6 +2259,51 @@ mod tests {
         assert!(detail.contains("test_only_rejections:1"));
         assert!(detail.contains("first_blocker:import_failed"));
         assert!(detail.contains("last_blocker:test_only_rejected"));
+    }
+
+    #[test]
+    fn direct_scanout_doctor_format_reports_unknown_modifier() {
+        let detail = format_direct_scanout_doctor_detail(
+            &DirectScanoutDoctorScene {
+                scene_candidate: true,
+                scene_root: Some(1),
+                scanout_source: Some(2),
+                group_surfaces: Vec::new(),
+                group_surfaces_truncated: false,
+                visible_above: Vec::new(),
+                visible_above_truncated: false,
+                scanout_format: Some(DirectScanoutDoctorFormat {
+                    fourcc: 0x3432_4258,
+                    name: "XBGR8888",
+                    modifier: None,
+                    proven_opaque: true,
+                    primary_plane_supported: None,
+                }),
+                opacity: "opaque_rgb8888",
+                scene_blockers: Vec::new(),
+                effects_visible_instance_count: 0,
+                effects: Vec::new(),
+                effects_truncated: false,
+                semantic_solitary_fullscreen: true,
+            },
+            FeatureState::Available,
+            direct_doctor_runtime_for_test(),
+            None,
+        );
+
+        assert!(detail.contains("modifier:unknown"));
+    }
+
+    #[test]
+    fn dmabuf_feedback_doctor_modifier_output_is_bounded_and_deterministic() {
+        let modifiers = (0..20).map(|modifier| modifier as u64).collect::<Vec<_>>();
+
+        let output = format_dmabuf_feedback_source_format(Some(0x3432_4258), Some(&modifiers));
+
+        assert!(output.contains("modifiers_truncated:true"));
+        assert!(output.contains("0x0000000000000000"));
+        assert!(output.contains("0x000000000000000f"));
+        assert!(!output.contains("0x0000000000000010"));
     }
 
     #[test]
@@ -2988,6 +3057,7 @@ fn doctor_check_with_detail(
 struct DirectScanoutDoctorFormat {
     fourcc: u32,
     name: &'static str,
+    modifier: Option<u64>,
     proven_opaque: bool,
     primary_plane_supported: Option<bool>,
 }
@@ -3078,6 +3148,7 @@ impl DirectScanoutDoctorScene {
                 Some(DirectScanoutDoctorFormat {
                     fourcc: format.as_fourcc(),
                     name: direct_scanout_doctor_format_name(format),
+                    modifier: surface.modifier.map(|modifier| modifier.0),
                     proven_opaque: analysis.coverage.opacity.is_proven_opaque(),
                     primary_plane_supported,
                 })
@@ -3143,15 +3214,40 @@ fn direct_scanout_doctor_scanout_format(format: Option<&DirectScanoutDoctorForma
         || "none".to_string(),
         |format| {
             format!(
-                "{{fourcc:0x{:08x} name:{} proven_opaque:{} primary_plane_supported:{}}}",
+                "{{fourcc:0x{:08x} name:{} modifier:{} proven_opaque:{} primary_plane_supported:{}}}",
                 format.fourcc,
                 format.name,
+                format
+                    .modifier
+                    .map_or_else(|| "unknown".to_string(), |modifier| format!("0x{modifier:x}")),
                 format.proven_opaque,
                 format
                     .primary_plane_supported
                     .map_or_else(|| "unknown".to_string(), |supported| supported.to_string()),
             )
         },
+    )
+}
+
+const MAX_DOCTOR_MODIFIERS: usize = 16;
+
+fn format_dmabuf_feedback_source_format(fourcc: Option<u32>, modifiers: Option<&[u64]>) -> String {
+    let Some(fourcc) = fourcc else {
+        return "none".to_string();
+    };
+    let name = direct_scanout_doctor_format_name(DrmFormat::from_fourcc(fourcc));
+    let Some(modifiers) = modifiers else {
+        return format!("{{fourcc:0x{fourcc:08x} name:{name} modifiers:unavailable}}");
+    };
+    let displayed = modifiers
+        .iter()
+        .take(MAX_DOCTOR_MODIFIERS)
+        .map(|modifier| format!("0x{modifier:016x}"))
+        .collect::<Vec<_>>();
+    format!(
+        "{{fourcc:0x{fourcc:08x} name:{name} modifiers:[{}] modifiers_truncated:{}}}",
+        displayed.join(","),
+        modifiers.len() > MAX_DOCTOR_MODIFIERS,
     )
 }
 

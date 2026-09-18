@@ -139,7 +139,9 @@ pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
     classify_x11_role, x11_placement_policy,
 };
-pub use dmabuf::{DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability};
+pub use dmabuf::{
+    DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability, DmabufFeedbackDoctorState,
+};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackBinding, DmabufFeedbackData, DmabufFeedbackResourceData,
     DmabufFeedbackScope, DmabufFeedbackSnapshot, DmabufParamsData, LiveDmabufFeedbackResource,
