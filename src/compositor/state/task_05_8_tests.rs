@@ -49,8 +49,16 @@ mod task_05_8_tests {
         state.presentation_animator.set_enabled(true);
     }
 
-    fn prepare_semantic_animation_state() -> (CompositorState, WindowGeometry, u32) {
+    fn presentation_test_state() -> CompositorState {
         let mut state = CompositorState::default();
+        state
+            .ensure_native_output_id()
+            .expect("presentation test output identity");
+        state
+    }
+
+    fn prepare_semantic_animation_state() -> (CompositorState, WindowGeometry, u32) {
+        let mut state = presentation_test_state();
         let root_id = 55;
         state.append_renderable_surface(test_surface(root_id, 640, 480));
         let previous = WindowGeometry::new(SurfacePlacement::root_at(40, 40), 640, 480);
@@ -738,7 +746,7 @@ mod task_05_8_tests {
 
     #[test]
     pub(in crate::compositor) fn task_05_8_csd_window_geometry_aligns_root_and_titlebar() {
-        let mut state = CompositorState::default();
+        let mut state = presentation_test_state();
         let root_id = 42;
         let titlebar_id = 43;
         state.append_renderable_surface(test_surface(root_id, 944, 502));
@@ -853,7 +861,7 @@ mod task_05_8_tests {
 
     #[test]
     fn native_frame_membership_keeps_culled_transition_until_physical_reveal() {
-        let mut state = CompositorState::default();
+        let mut state = presentation_test_state();
         let rear_window = WindowId::from_raw(1).expect("rear window id");
         let fullscreen_window = WindowId::from_raw(2).expect("fullscreen window id");
         let mut rear = test_surface(501, 320, 200);
@@ -951,7 +959,7 @@ mod task_05_8_tests {
 
     #[test]
     fn animated_fullscreen_owner_keeps_background_until_physical_settlement() {
-        let mut state = CompositorState::default();
+        let mut state = presentation_test_state();
         let rear_window = WindowId::from_raw(11).expect("rear window id");
         let fullscreen_window = WindowId::from_raw(12).expect("fullscreen window id");
         let mut rear = test_surface(511, 320, 200);
@@ -1036,7 +1044,7 @@ mod task_05_8_tests {
 
     #[test]
     pub(in crate::compositor) fn task_05_8_presented_window_projection_survives_canonical_race() {
-        let mut state = CompositorState::default();
+        let mut state = presentation_test_state();
         let root_id = 52;
         state.append_renderable_surface(test_surface(root_id, 944, 502));
         let titlebar_id = 53;
