@@ -12,7 +12,7 @@ use crate::native_output::kms_worker::{
     KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
     KmsWorkerDispatchTailObservation, KmsWorkerQueuedCancellation,
 };
-use crate::native_output::presentation::kms_timing::KmsPresentationOutcome;
+use crate::native_output::presentation::kms_timing::{KmsPresentationOutcome, KmsSubmitWindow};
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
 };
@@ -57,19 +57,137 @@ enum PresentationDeadlineAssessment {
     Advisory(AdvisoryOpportunitySlip),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderReadinessSource {
+    ExactSyncFile,
+    ObservedApproximate,
+    RenderedAtFallback,
+}
+
+impl RenderReadinessSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactSyncFile => "exact_sync_file",
+            Self::ObservedApproximate => "guarded_approximate",
+            Self::RenderedAtFallback => "rendered_at_fallback",
+        }
+    }
+
+    const fn fence_timestamp_quality_str(self) -> &'static str {
+        match self {
+            Self::ExactSyncFile => "exact_sync_file",
+            Self::ObservedApproximate => "observed_approximate",
+            Self::RenderedAtFallback => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderReadinessObservation {
+    // For RenderedAtFallback this is a compositor-side lower bound, not GPU
+    // payload-completion proof.
+    observed_at: MonotonicTimestampNs,
+    source: RenderReadinessSource,
+}
+
+impl RenderReadinessObservation {
+    const fn from_frame(
+        fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
+        rendered_at: MonotonicTimestampNs,
+    ) -> Self {
+        match fence_signal {
+            Some((observed_at, FenceTimestampQuality::ExactSyncFile)) => Self {
+                observed_at,
+                source: RenderReadinessSource::ExactSyncFile,
+            },
+            Some((observed_at, FenceTimestampQuality::ObservedApproximate)) => Self {
+                observed_at,
+                source: RenderReadinessSource::ObservedApproximate,
+            },
+            None => Self {
+                observed_at: rendered_at,
+                source: RenderReadinessSource::RenderedAtFallback,
+            },
+        }
+    }
+
+    const fn observed_at(self) -> MonotonicTimestampNs {
+        self.observed_at
+    }
+
+    const fn source(self) -> RenderReadinessSource {
+        self.source
+    }
+
+    fn fence_ready_at_ns(self) -> Option<u64> {
+        match self.source {
+            RenderReadinessSource::ExactSyncFile | RenderReadinessSource::ObservedApproximate => {
+                Some(self.observed_at.get())
+            }
+            RenderReadinessSource::RenderedAtFallback => None,
+        }
+    }
+
+    fn fence_lateness_ns(self, deadline_ns: u64) -> Option<u64> {
+        self.fence_ready_at_ns()
+            .map(|observed_at| observed_at.saturating_sub(deadline_ns))
+    }
+
+    fn observation_lateness_ns(self, deadline_ns: u64) -> u64 {
+        self.observed_at.get().saturating_sub(deadline_ns)
+    }
+}
+
+fn render_readiness_diagnostic_fields(
+    readiness: RenderReadinessObservation,
+    submit_window: &KmsSubmitWindow,
+    composite_started_at: MonotonicTimestampNs,
+    rendered_at: MonotonicTimestampNs,
+) -> Vec<PacingField> {
+    let deadline_ns = submit_window.commit_complete_deadline_ns();
+    vec![
+        PacingField::str("render_readiness_source", readiness.source().as_str()),
+        PacingField::str(
+            "fence_timestamp_quality",
+            readiness.source().fence_timestamp_quality_str(),
+        ),
+        PacingField::option_u64("payload_ready_at_ns", readiness.fence_ready_at_ns()),
+        PacingField::u64("commit_complete_deadline_ns", deadline_ns),
+        PacingField::option_u64(
+            "render_readiness_lateness_ns",
+            readiness.fence_lateness_ns(deadline_ns),
+        ),
+        PacingField::u64(
+            "render_readiness_observed_at_ns",
+            readiness.observed_at().get(),
+        ),
+        PacingField::u64(
+            "render_readiness_observation_lateness_ns",
+            readiness.observation_lateness_ns(deadline_ns),
+        ),
+        PacingField::u64("composite_started_ns", composite_started_at.get()),
+        PacingField::u64("rendered_at_ns", rendered_at.get()),
+    ]
+}
+
 fn assess_presentation_deadline(
     target: PresentationTarget,
     outcome: KmsPresentationOutcome,
-    fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
+    readiness: RenderReadinessObservation,
 ) -> PresentationDeadlineAssessment {
     match outcome {
         KmsPresentationOutcome::TargetHit => PresentationDeadlineAssessment::None,
         KmsPresentationOutcome::RenderReadinessMiss => {
-            PresentationDeadlineAssessment::Proven(match fence_signal.map(|(_, quality)| quality) {
-                Some(FenceTimestampQuality::ObservedApproximate) => {
+            PresentationDeadlineAssessment::Proven(match readiness.source() {
+                RenderReadinessSource::ObservedApproximate => {
                     ProvenDeadlineMiss::GuardedApproximateRender
                 }
-                Some(FenceTimestampQuality::ExactSyncFile) | None => {
+                RenderReadinessSource::ExactSyncFile
+                | RenderReadinessSource::RenderedAtFallback => {
+                    // `rendered_at` is not GPU payload proof, but once the
+                    // physical classifier has established this miss it is an
+                    // exact lower-bound proof that compositor render/fence
+                    // export completion was late.
                     ProvenDeadlineMiss::ExactRender
                 }
             })
@@ -85,6 +203,20 @@ fn assess_presentation_deadline(
             PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::KmsApplyGuard)
         }
     }
+}
+
+fn resolve_presentation_deadline_assessment(
+    pending_miss: Option<ProvenDeadlineMiss>,
+    target: PresentationTarget,
+    outcome: Option<KmsPresentationOutcome>,
+    readiness: RenderReadinessObservation,
+) -> PresentationDeadlineAssessment {
+    if let Some(miss) = pending_miss {
+        return PresentationDeadlineAssessment::Proven(miss);
+    }
+    outcome.map_or(PresentationDeadlineAssessment::None, |outcome| {
+        assess_presentation_deadline(target, outcome, readiness)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1518,13 +1650,13 @@ impl NativeRuntime {
                             .get()
                             .saturating_sub(frame.submit_started_at.get()),
                     );
-                    let mut assessment = pending_proven_deadline_miss
+                    let pending_miss = pending_proven_deadline_miss
                         .take()
-                        .and_then(|(frame_id, miss)| {
-                            (frame_id == frame.frame_id)
-                                .then_some(PresentationDeadlineAssessment::Proven(miss))
-                        })
-                        .unwrap_or(PresentationDeadlineAssessment::None);
+                        .and_then(|(frame_id, miss)| (frame_id == frame.frame_id).then_some(miss));
+                    let readiness = RenderReadinessObservation::from_frame(
+                        frame.fence_signal,
+                        frame.rendered_at,
+                    );
                     if !frame.fence_timing_accounted
                         && let Some((signaled_at, quality)) = frame.fence_signal
                     {
@@ -1537,13 +1669,9 @@ impl NativeRuntime {
                     let outcome = if presentation_mode.is_async() {
                         None
                     } else {
-                        let payload_ready_at_ns = frame
-                            .fence_signal
-                            .map(|(signaled_at, _)| signaled_at.get())
-                            .or(Some(frame.rendered_at.get()));
                         Some(KmsPresentationOutcome::classify(
                             &frame.submit_window,
-                            payload_ready_at_ns,
+                            Some(readiness.observed_at().get()),
                             frame.submit_returned_at.get(),
                             frame.target.sequence,
                             actual_logical_sequence,
@@ -1559,14 +1687,13 @@ impl NativeRuntime {
                                     outcome,
                                 ));
                         }
-                        if matches!(assessment, PresentationDeadlineAssessment::None) {
-                            assessment = assess_presentation_deadline(
-                                frame.target,
-                                outcome,
-                                frame.fence_signal,
-                            );
-                        }
                     }
+                    let assessment = resolve_presentation_deadline_assessment(
+                        pending_miss,
+                        frame.target,
+                        outcome,
+                        readiness,
+                    );
                     render_journal.record_frame_service_observation(FrameTimingObservation {
                         frame_id: frame.frame_id,
                         target: frame.target,
@@ -1696,47 +1823,12 @@ impl NativeRuntime {
                             ProvenDeadlineMiss::ExactRender
                                 | ProvenDeadlineMiss::GuardedApproximateRender
                         ) {
-                            let (render_readiness_source, fence_timestamp_quality) =
-                                match frame.fence_signal {
-                                    Some((_, FenceTimestampQuality::ExactSyncFile)) => {
-                                        ("exact_sync_file", "exact_sync_file")
-                                    }
-                                    Some((_, FenceTimestampQuality::ObservedApproximate)) => {
-                                        ("guarded_approximate", "observed_approximate")
-                                    }
-                                    None => ("rendered_at_fallback", "none"),
-                                };
-                            recovery_fields.extend([
-                                PacingField::str(
-                                    "render_readiness_source",
-                                    render_readiness_source,
-                                ),
-                                PacingField::str(
-                                    "fence_timestamp_quality",
-                                    fence_timestamp_quality,
-                                ),
-                                PacingField::option_u64(
-                                    "payload_ready_at_ns",
-                                    frame.fence_signal.map(|(timestamp, _)| timestamp.get()),
-                                ),
-                                PacingField::u64(
-                                    "commit_complete_deadline_ns",
-                                    frame.submit_window.commit_complete_deadline_ns(),
-                                ),
-                                PacingField::option_u64(
-                                    "render_readiness_lateness_ns",
-                                    frame.fence_signal.map(|(timestamp, _)| {
-                                        timestamp.get().saturating_sub(
-                                            frame.submit_window.commit_complete_deadline_ns(),
-                                        )
-                                    }),
-                                ),
-                                PacingField::u64(
-                                    "composite_started_ns",
-                                    frame.composite_started_at.get(),
-                                ),
-                                PacingField::u64("rendered_at_ns", frame.rendered_at.get()),
-                            ]);
+                            recovery_fields.extend(render_readiness_diagnostic_fields(
+                                readiness,
+                                &frame.submit_window,
+                                frame.composite_started_at,
+                                frame.rendered_at,
+                            ));
                         }
                         frame_pacing.log("proven_deadline_miss", recovery_fields);
                     }

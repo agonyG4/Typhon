@@ -56,6 +56,16 @@ fn reactive_test_target() -> PresentationTarget {
     }
 }
 
+fn render_readiness_test_window() -> crate::native_output::presentation::kms_timing::KmsSubmitWindow
+{
+    crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(100, 40, 20, 20)
+        .unwrap()
+}
+
+fn fallback_render_readiness() -> RenderReadinessObservation {
+    RenderReadinessObservation::from_frame(None, MonotonicTimestampNs::new(81))
+}
+
 fn journal_with_warm_paired_samples() -> AdaptiveRenderJournal {
     let mut journal = AdaptiveRenderJournal::default();
     let target = reactive_test_target();
@@ -83,7 +93,7 @@ fn reactive_dispatch_slip_is_advisory_not_proven_recovery_evidence() {
         assess_presentation_deadline(
             reactive_test_target(),
             KmsPresentationOutcome::KmsDispatchMiss,
-            None,
+            fallback_render_readiness(),
         ),
         PresentationDeadlineAssessment::Advisory(AdvisoryOpportunitySlip::KmsDispatch)
     );
@@ -179,7 +189,10 @@ fn advisory_target_render_readiness_misses_remain_proven() {
         let assessment = assess_presentation_deadline(
             target,
             outcome,
-            Some((MonotonicTimestampNs::new(81), quality)),
+            RenderReadinessObservation::from_frame(
+                Some((MonotonicTimestampNs::new(81), quality)),
+                MonotonicTimestampNs::new(70),
+            ),
         );
         assert_eq!(assessment, PresentationDeadlineAssessment::Proven(expected));
 
@@ -199,16 +212,172 @@ fn advisory_target_render_readiness_misses_remain_proven() {
 fn binding_dispatch_and_apply_guard_assessments_remain_proven() {
     let binding = worker_test_target();
     assert_eq!(
-        assess_presentation_deadline(binding, KmsPresentationOutcome::KmsDispatchMiss, None),
+        assess_presentation_deadline(
+            binding,
+            KmsPresentationOutcome::KmsDispatchMiss,
+            fallback_render_readiness(),
+        ),
         PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::KmsDispatch)
     );
     assert_eq!(
         assess_presentation_deadline(
             reactive_test_target(),
             KmsPresentationOutcome::KmsApplyGuardMiss,
-            None,
+            fallback_render_readiness(),
         ),
         PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::KmsApplyGuard)
+    );
+}
+
+#[test]
+fn exact_fence_readiness_wins_over_rendered_at_for_classification_and_recovery() {
+    let readiness = RenderReadinessObservation::from_frame(
+        Some((
+            MonotonicTimestampNs::new(81),
+            FenceTimestampQuality::ExactSyncFile,
+        )),
+        MonotonicTimestampNs::new(70),
+    );
+    let outcome = KmsPresentationOutcome::classify(
+        &render_readiness_test_window(),
+        Some(readiness.observed_at().get()),
+        79,
+        4,
+        4,
+    );
+
+    assert_eq!(readiness.source(), RenderReadinessSource::ExactSyncFile);
+    assert_eq!(readiness.observed_at().get(), 81);
+    assert_eq!(readiness.fence_ready_at_ns(), Some(81));
+    assert_eq!(outcome, KmsPresentationOutcome::RenderReadinessMiss);
+    assert_eq!(
+        assess_presentation_deadline(worker_test_target(), outcome, readiness),
+        PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::ExactRender)
+    );
+}
+
+#[test]
+fn approximate_fence_readiness_is_guarded_render_recovery_evidence() {
+    let readiness = RenderReadinessObservation::from_frame(
+        Some((
+            MonotonicTimestampNs::new(81),
+            FenceTimestampQuality::ObservedApproximate,
+        )),
+        MonotonicTimestampNs::new(70),
+    );
+    let outcome = KmsPresentationOutcome::classify(
+        &render_readiness_test_window(),
+        Some(readiness.observed_at().get()),
+        79,
+        4,
+        4,
+    );
+
+    assert_eq!(
+        readiness.source(),
+        RenderReadinessSource::ObservedApproximate
+    );
+    assert_eq!(readiness.observed_at().get(), 81);
+    assert_eq!(readiness.fence_ready_at_ns(), Some(81));
+    assert_eq!(outcome, KmsPresentationOutcome::RenderReadinessMiss);
+    assert_eq!(
+        assess_presentation_deadline(worker_test_target(), outcome, readiness),
+        PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::GuardedApproximateRender)
+    );
+}
+
+#[test]
+fn rendered_at_fallback_is_an_observation_without_payload_ready_proof() {
+    let readiness = fallback_render_readiness();
+    let outcome = KmsPresentationOutcome::classify(
+        &render_readiness_test_window(),
+        Some(readiness.observed_at().get()),
+        79,
+        4,
+        4,
+    );
+
+    assert_eq!(
+        readiness.source(),
+        RenderReadinessSource::RenderedAtFallback
+    );
+    assert_eq!(readiness.observed_at().get(), 81);
+    assert_eq!(readiness.fence_ready_at_ns(), None);
+    assert_eq!(
+        outcome,
+        KmsPresentationOutcome::RenderReadinessMiss,
+        "rendered_at still drives the existing physical lower-bound classification"
+    );
+    assert_eq!(
+        assess_presentation_deadline(worker_test_target(), outcome, readiness),
+        PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::ExactRender)
+    );
+}
+
+#[test]
+fn rendered_at_fallback_exposes_observation_lateness_without_fence_lateness() {
+    let window = render_readiness_test_window();
+    let readiness = RenderReadinessObservation::from_frame(
+        None,
+        MonotonicTimestampNs::new(window.commit_complete_deadline_ns() + 250_000),
+    );
+    let fields = render_readiness_diagnostic_fields(
+        readiness,
+        &window,
+        MonotonicTimestampNs::new(10),
+        MonotonicTimestampNs::new(250_080),
+    );
+    let line = pacing_line("proven_deadline_miss", &fields);
+
+    assert_eq!(
+        readiness.observation_lateness_ns(window.commit_complete_deadline_ns()),
+        250_000
+    );
+    assert_eq!(
+        readiness.fence_lateness_ns(window.commit_complete_deadline_ns()),
+        None
+    );
+    assert!(line.contains("render_readiness_source=rendered_at_fallback"));
+    assert!(line.contains("fence_timestamp_quality=none"));
+    assert!(line.contains("payload_ready_at_ns=none"));
+    assert!(line.contains("render_readiness_lateness_ns=none"));
+    assert!(line.contains("render_readiness_observed_at_ns=250080"));
+    assert!(line.contains("render_readiness_observation_lateness_ns=250000"));
+}
+
+#[test]
+fn on_time_rendered_at_fallback_does_not_create_a_render_readiness_miss() {
+    let readiness = RenderReadinessObservation::from_frame(
+        None,
+        MonotonicTimestampNs::new(render_readiness_test_window().commit_complete_deadline_ns()),
+    );
+    let outcome = KmsPresentationOutcome::classify(
+        &render_readiness_test_window(),
+        Some(readiness.observed_at().get()),
+        79,
+        4,
+        4,
+    );
+
+    assert_eq!(outcome, KmsPresentationOutcome::TargetHit);
+    assert_eq!(
+        assess_presentation_deadline(worker_test_target(), outcome, readiness),
+        PresentationDeadlineAssessment::None
+    );
+}
+
+#[test]
+fn pending_proven_render_evidence_wins_over_pageflip_fallback_reconstruction() {
+    let assessment = resolve_presentation_deadline_assessment(
+        Some(ProvenDeadlineMiss::GuardedApproximateRender),
+        worker_test_target(),
+        Some(KmsPresentationOutcome::RenderReadinessMiss),
+        RenderReadinessObservation::from_frame(None, MonotonicTimestampNs::new(81)),
+    );
+
+    assert_eq!(
+        assessment,
+        PresentationDeadlineAssessment::Proven(ProvenDeadlineMiss::GuardedApproximateRender)
     );
 }
 

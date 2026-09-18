@@ -227,13 +227,13 @@ pub(crate) enum KmsPresentationOutcome {
 impl KmsPresentationOutcome {
     pub(crate) const fn classify(
         window: &KmsSubmitWindow,
-        payload_ready_at_ns: Option<u64>,
+        render_readiness_observed_at_ns: Option<u64>,
         submit_returned_at_ns: u64,
         target_sequence: u64,
         presented_sequence: u64,
     ) -> Self {
-        if match payload_ready_at_ns {
-            Some(ready) => ready > window.commit_complete_deadline_ns,
+        if match render_readiness_observed_at_ns {
+            Some(observed_at) => observed_at > window.commit_complete_deadline_ns,
             None => false,
         } {
             Self::RenderReadinessMiss
