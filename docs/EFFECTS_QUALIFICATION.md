@@ -88,6 +88,55 @@ timestamp data. `query_pool_capacity` and `query_pool_high_water` are query
 object counts. `dropped_spans` and `disjoint_invalidated_spans` are bounded
 cumulative diagnostics for the profiler lifetime.
 
+The capture attribution fields append the following integer values to the same
+one-line record:
+
+```text
+scene_capture_ns surface_capture_ns
+replay_capture_ns framebuffer_capture_ns checkpoint_capture_ns
+scene_capture_passes surface_capture_passes replay_capture_passes framebuffer_capture_passes checkpoint_capture_passes
+scene_capture_pixels surface_capture_pixels replay_capture_pixels framebuffer_capture_pixels checkpoint_capture_pixels
+capture_execution_summary_available
+capture_execution_pixels scene_capture_execution_pixels surface_capture_execution_pixels replay_capture_execution_pixels framebuffer_capture_execution_pixels checkpoint_capture_execution_pixels
+replay_capture_execution_passes framebuffer_capture_execution_passes checkpoint_capture_execution_passes
+replay_capture_commands checkpoint_dependency_edges
+max_capture_pass_ns max_capture_pass_id max_capture_instance_id max_capture_kind max_capture_mode max_capture_pixels max_capture_checkpoint_count
+```
+
+`capture_pixels` and its SceneCapture/SurfaceCapture and replay/framebuffer/
+checkpoint splits retain the legacy unit: bounded effect-space demanded-region
+area. `capture_execution_pixels` is a separate physical-work unit: the sum of
+the pixels in the materialized capture rectangles actually executed. Direct
+framebuffer capture uses its full target-texture domain; replay capture uses
+the existing materialization rectangles. The mode-specific execution pixel
+fields use the same physical unit. `capture_execution_summary_available=0`
+means execution metadata was unavailable, such as after an effect execution
+error; the execution fields are then zero.
+
+`replay_capture_ns` and `framebuffer_capture_ns` are the existing capture pass
+timestamp spans classified by the actual executor mode. `checkpoint_capture_ns`
+is the subset whose pass has one or more `checkpoint_dependencies`, regardless
+of capture mode. The corresponding `*_capture_passes` and `*_capture_pixels`
+fields count and sum only valid resolved GPU spans. The
+`*_capture_execution_passes` fields count successful physical capture passes
+in the scope-owned execution summary. `replay_capture_commands` is the number
+of command indices submitted to `draw_capture_commands_for_regions`; direct
+framebuffer captures contribute zero. `checkpoint_dependency_edges` is the
+sum of the dependency-list lengths for physically executed capture passes.
+
+`max_capture_*` describes the single slowest valid timed capture pass in the
+scope. Its stable kind values are `scene` and `surface`, and its mode values
+are `replay` and `framebuffer_blit`; scopes without a valid capture pass emit
+`none` and zero values. All capture mode and checkpoint metadata is derived at
+the executor pass-timing call site from `is_direct_framebuffer_capture` and
+`checkpoint_dependencies`, then carried by the existing timestamp span.
+
+Capture timing includes any GPU idle or ordering dependency that occurs between
+the existing begin-pass and end-pass timestamp commands. In particular,
+`framebuffer_capture_ns` is not a pure memory-copy bandwidth measurement: a
+framebuffer blit may include GL dependency, resolve, and cache-ordering costs
+required by the command stream.
+
 The active profiler preallocates a fixed pool of 4,096 query objects (2,048
 timestamp-pair slots), sized from Typhon's 128-instance bound, the current
 six-pass built-in blur instance shape, and two expected in-flight graph

@@ -15,6 +15,7 @@ use super::super::geometry::{
     add_surface_consumers_for_command_range,
 };
 use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
+use super::gpu_timing::{CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode};
 use super::{
     EffectDebugCaptureMode, EffectDebugConfig, EffectDebugKawaseMode, FrameTraceSummary,
     PassTraceSummary, blur, capture, effect_debug_config,
@@ -397,10 +398,86 @@ pub(crate) struct EffectExecutionStats {
     /// Physical target-texture pixels covered by executed capture regions.
     /// This is execution work, not the allocated texture area.
     pub capture_execution_pixels: u64,
+    pub scene_capture_execution_pixels: u64,
+    pub surface_capture_execution_pixels: u64,
+    pub replay_capture_execution_pixels: u64,
+    pub framebuffer_capture_execution_pixels: u64,
+    pub checkpoint_capture_execution_pixels: u64,
+    pub replay_capture_passes: usize,
+    pub framebuffer_capture_passes: usize,
+    pub checkpoint_capture_passes: usize,
+    pub replay_capture_commands: usize,
+    pub checkpoint_dependency_edges: usize,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
     pub resource_acquisitions: usize,
+}
+
+impl EffectExecutionStats {
+    fn capture_timing_summary(&self) -> CaptureExecutionTimingSummary {
+        CaptureExecutionTimingSummary {
+            capture_execution_pixels: self.capture_execution_pixels,
+            scene_capture_execution_pixels: self.scene_capture_execution_pixels,
+            surface_capture_execution_pixels: self.surface_capture_execution_pixels,
+            replay_capture_execution_pixels: self.replay_capture_execution_pixels,
+            framebuffer_capture_execution_pixels: self.framebuffer_capture_execution_pixels,
+            checkpoint_capture_execution_pixels: self.checkpoint_capture_execution_pixels,
+            replay_capture_passes: self.replay_capture_passes,
+            framebuffer_capture_passes: self.framebuffer_capture_passes,
+            checkpoint_capture_passes: self.checkpoint_capture_passes,
+            replay_capture_commands: self.replay_capture_commands,
+            checkpoint_dependency_edges: self.checkpoint_dependency_edges,
+        }
+    }
+
+    fn record_capture_execution(
+        &mut self,
+        pass: &CompiledRenderPass,
+        direct_capture: bool,
+        physical_pixels: u64,
+        replay_commands: usize,
+    ) {
+        self.capture_execution_pixels = self
+            .capture_execution_pixels
+            .saturating_add(physical_pixels);
+        match pass.kind {
+            RenderPassKind::SceneCapture => {
+                self.scene_capture_execution_pixels = self
+                    .scene_capture_execution_pixels
+                    .saturating_add(physical_pixels);
+            }
+            RenderPassKind::SurfaceCapture => {
+                self.surface_capture_execution_pixels = self
+                    .surface_capture_execution_pixels
+                    .saturating_add(physical_pixels);
+            }
+            _ => return,
+        }
+        if direct_capture {
+            self.framebuffer_capture_execution_pixels = self
+                .framebuffer_capture_execution_pixels
+                .saturating_add(physical_pixels);
+            self.framebuffer_capture_passes = self.framebuffer_capture_passes.saturating_add(1);
+        } else {
+            self.replay_capture_execution_pixels = self
+                .replay_capture_execution_pixels
+                .saturating_add(physical_pixels);
+            self.replay_capture_passes = self.replay_capture_passes.saturating_add(1);
+            self.replay_capture_commands =
+                self.replay_capture_commands.saturating_add(replay_commands);
+        }
+        let checkpoint_count = pass.checkpoint_dependencies.len();
+        if checkpoint_count > 0 {
+            self.checkpoint_capture_execution_pixels = self
+                .checkpoint_capture_execution_pixels
+                .saturating_add(physical_pixels);
+            self.checkpoint_capture_passes = self.checkpoint_capture_passes.saturating_add(1);
+            self.checkpoint_dependency_edges = self
+                .checkpoint_dependency_edges
+                .saturating_add(checkpoint_count);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -660,12 +737,13 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
             scene_work_state.mark_capture_satisfied(pass.id);
         }
     }
+    let trailing_scene_work = finalize_surface_consumer_trailing_work(&mut scene_work_state);
     add_surface_consumers_for_command_range(
         &mut plan,
         commands,
         scene_cursor,
         commands.len(),
-        scene_work_state.active_work(),
+        &trailing_scene_work,
     );
     plan.finish();
     plan
@@ -897,9 +975,13 @@ pub(crate) fn execute_graph_passes(
         scene_replay_work_mode_override,
         graph_scope,
     );
+    let capture_execution = result
+        .as_ref()
+        .ok()
+        .map(EffectExecutionStats::capture_timing_summary);
     renderer
         .effect_gpu_profiler
-        .end_graph(&renderer.gl, graph_scope);
+        .end_graph(&renderer.gl, graph_scope, capture_execution);
     result
 }
 
@@ -1343,6 +1425,7 @@ fn execute_graph_passes_inner(
                     pass.instance.get(),
                     pass.kind,
                     effect_region_pixels(&execution_damage.region),
+                    capture_timing_metadata(pass, lifecycle_backdrop, debug_config),
                 )
             });
             let execute_result = execute_pass(
@@ -1385,7 +1468,22 @@ fn execute_graph_passes_inner(
                 return Err(error);
             }
             if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
-                scene_work_state.mark_capture_satisfied(pass.id);
+                let capture_satisfied = scene_work_state.mark_capture_satisfied(pass.id);
+                if capture_satisfied && renderer.effect_trace.enabled() {
+                    let metrics = scene_work_state.work_trace_metrics();
+                    renderer.effect_trace.scene_replay_boundary(
+                        "capture_satisfied",
+                        pass,
+                        "capture_satisfied",
+                        scene_cursor,
+                        scene_cursor,
+                        metrics.0,
+                        metrics.1,
+                        metrics.2,
+                        metrics.3,
+                        metrics.4,
+                    );
+                }
             }
             if matches!(
                 pass.kind,
@@ -1780,6 +1878,27 @@ fn is_direct_framebuffer_capture(
         RenderPassKind::SurfaceCapture => !pass.checkpoint_dependencies.is_empty(),
         _ => false,
     }
+}
+
+fn capture_timing_metadata(
+    pass: &CompiledRenderPass,
+    lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
+) -> Option<CaptureTimingMetadata> {
+    if !matches!(
+        pass.kind,
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+    ) {
+        return None;
+    }
+    Some(CaptureTimingMetadata {
+        mode: if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+            CaptureTimingMode::FramebufferBlit
+        } else {
+            CaptureTimingMode::Replay
+        },
+        checkpoint_count: pass.checkpoint_dependencies.len(),
+    })
 }
 
 fn capture_execution_damage(
@@ -3048,9 +3167,7 @@ fn execute_capture(
         || capture_rects.clone(),
         |plan| plan.texture_rects(target_plan),
     );
-    stats.capture_execution_pixels = stats
-        .capture_execution_pixels
-        .saturating_add(output_rect_pixels(&capture_rects));
+    let physical_pixels = output_rect_pixels(&capture_rects);
     if let Some(materialization) = materialization.as_ref()
         && renderer.effect_trace.enabled()
     {
@@ -3066,6 +3183,7 @@ fn execute_capture(
         );
     }
     if direct_capture {
+        stats.record_capture_execution(pass, true, physical_pixels, 0);
         capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
         return Ok(());
     }
@@ -3136,6 +3254,7 @@ fn execute_capture(
         pass.visual_group,
         pass.anchor_scope,
     );
+    stats.record_capture_execution(pass, false, physical_pixels, indices.len());
     let scissors = materialization
         .as_ref()
         .expect("replay capture has a materialization plan")
@@ -3926,6 +4045,20 @@ impl<'a> SceneReplayWorkState<'a> {
             self.pending_checkpoint_requirements(),
         )
     }
+}
+
+fn finalize_surface_consumer_trailing_work(
+    scene_work_state: &mut SceneReplayWorkState<'_>,
+) -> Vec<OutputRect> {
+    let pending_checkpoint_requirements = scene_work_state.pending_checkpoint_requirements();
+    if pending_checkpoint_requirements != 0 {
+        debug_assert_eq!(
+            pending_checkpoint_requirements, 0,
+            "pending scene checkpoint requirements remain before trailing consumer planning"
+        );
+        scene_work_state.force_baseline();
+    }
+    scene_work_state.active_work().to_vec()
 }
 
 fn output_size_for_work_plan(plan: &SceneReplayWorkPlan) -> (u32, u32) {
@@ -4865,6 +4998,51 @@ mod tests {
     }
 
     #[test]
+    fn capture_timing_metadata_uses_execution_authority() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let replay_pass = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            Vec::new(),
+        );
+        let replay_metadata = capture_timing_metadata(
+            &replay_pass,
+            false,
+            EffectDebugConfig::new(
+                EffectDebugCaptureMode::Replay,
+                EffectDebugKawaseMode::Partial,
+            ),
+        )
+        .expect("capture metadata");
+        assert_eq!(replay_metadata.mode, CaptureTimingMode::Replay);
+        assert_eq!(replay_metadata.checkpoint_count, 0);
+
+        let checkpoint_pass = test_pass(
+            3,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            vec![GraphPassId::new(2).unwrap()],
+        );
+        let checkpoint_metadata = capture_timing_metadata(
+            &checkpoint_pass,
+            false,
+            EffectDebugConfig::new(
+                EffectDebugCaptureMode::Replay,
+                EffectDebugKawaseMode::Partial,
+            ),
+        )
+        .expect("checkpoint capture metadata");
+        assert_eq!(checkpoint_metadata.mode, CaptureTimingMode::FramebufferBlit);
+        assert_eq!(checkpoint_metadata.checkpoint_count, 1);
+    }
+
+    #[test]
     fn framebuffer_scene_work_includes_selected_backdrop_capture_domains() {
         let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
         let capture_id = GraphTextureId::new(1).unwrap();
@@ -5160,6 +5338,43 @@ mod tests {
             !consumer_plan.surface_ids().contains(&20),
             "surface A must not be planned after its checkpoint has retired"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "pending scene checkpoint requirements")]
+    fn surface_consumer_plan_trailing_pending_requirements_expose_invariant_failure() {
+        let presentation = OutputRect::new(0, 0, 10, 10);
+        let checkpoint_a = OutputRect::new(20, 0, 10, 10);
+        let checkpoint_b = OutputRect::new(40, 0, 10, 10);
+        let requirements = [
+            test_checkpoint_requirement(1, &[checkpoint_a]),
+            test_checkpoint_requirement(2, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[presentation], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+
+        let _ = finalize_surface_consumer_trailing_work(&mut state);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn surface_consumer_plan_trailing_pending_requirements_use_baseline_work() {
+        let presentation = OutputRect::new(0, 0, 10, 10);
+        let checkpoint_a = OutputRect::new(20, 0, 10, 10);
+        let checkpoint_b = OutputRect::new(40, 0, 10, 10);
+        let requirements = [
+            test_checkpoint_requirement(1, &[checkpoint_a]),
+            test_checkpoint_requirement(2, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[presentation], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+
+        let trailing = finalize_surface_consumer_trailing_work(&mut state);
+
+        assert_same_output_region(&trailing, &[presentation, checkpoint_a, checkpoint_b]);
     }
 
     #[test]
@@ -6155,6 +6370,54 @@ mod tests {
 
         assert_eq!(demand.rects().len(), 1);
         assert_eq!(output_rect_pixels(&rects), 1200);
+    }
+
+    #[test]
+    fn capture_execution_summary_uses_materialized_pixels_and_replay_indices() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let output = GraphTextureId::new(1).unwrap();
+        let replay_pass = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            Vec::new(),
+        );
+        let layers = [
+            capture::CaptureLayer::Other,
+            capture::CaptureLayer::Surface(10),
+            capture::CaptureLayer::Surface(20),
+        ];
+        let indices = capture::indices_for_capture(
+            &layers,
+            &[None, None, None],
+            oblivion_one::compositor::EffectAnchor::BeforeSurface(20),
+            false,
+            None,
+            oblivion_one::compositor::EffectAnchorScope::Surface,
+        );
+        let replay_rects = [OutputRect::new(10, 20, 30, 40)];
+        let replay_pixels = output_rect_pixels(&replay_rects);
+        let mut stats = EffectExecutionStats::default();
+        stats.record_capture_execution(&replay_pass, false, replay_pixels, indices.len());
+
+        let direct_pass = test_pass(
+            2,
+            RenderPassKind::SurfaceCapture,
+            instance,
+            Vec::new(),
+            output,
+            vec![GraphPassId::new(1).unwrap()],
+        );
+        let direct_rects = [full_output_rect((100, 80))];
+        stats.record_capture_execution(&direct_pass, true, output_rect_pixels(&direct_rects), 0);
+
+        assert_eq!(stats.replay_capture_execution_pixels, replay_pixels);
+        assert_eq!(stats.replay_capture_commands, indices.len());
+        assert_eq!(stats.framebuffer_capture_execution_pixels, 8_000);
+        assert_eq!(stats.checkpoint_capture_execution_pixels, 8_000);
+        assert_eq!(stats.capture_execution_pixels, replay_pixels + 8_000);
     }
 
     #[test]

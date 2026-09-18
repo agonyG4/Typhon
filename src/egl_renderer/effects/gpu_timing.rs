@@ -56,6 +56,42 @@ pub(crate) struct GraphTimingScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureTimingMode {
+    Replay,
+    FramebufferBlit,
+}
+
+impl CaptureTimingMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replay => "replay",
+            Self::FramebufferBlit => "framebuffer_blit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CaptureTimingMetadata {
+    pub(crate) mode: CaptureTimingMode,
+    pub(crate) checkpoint_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CaptureExecutionTimingSummary {
+    pub(crate) capture_execution_pixels: u64,
+    pub(crate) scene_capture_execution_pixels: u64,
+    pub(crate) surface_capture_execution_pixels: u64,
+    pub(crate) replay_capture_execution_pixels: u64,
+    pub(crate) framebuffer_capture_execution_pixels: u64,
+    pub(crate) checkpoint_capture_execution_pixels: u64,
+    pub(crate) replay_capture_passes: usize,
+    pub(crate) framebuffer_capture_passes: usize,
+    pub(crate) checkpoint_capture_passes: usize,
+    pub(crate) replay_capture_commands: usize,
+    pub(crate) checkpoint_dependency_edges: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TimingSpanMetadata {
     scope_id: u64,
     frame_id: Option<u64>,
@@ -63,6 +99,7 @@ struct TimingSpanMetadata {
     instance_id: Option<u64>,
     kind: Option<oblivion_one::effects::RenderPassKind>,
     pixels: u64,
+    capture: Option<CaptureTimingMetadata>,
     is_total: bool,
 }
 
@@ -124,6 +161,17 @@ impl TimingCategory {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxCapturePassTiming {
+    duration_ns: u64,
+    pass_id: u64,
+    instance_id: u64,
+    kind: RenderPassKind,
+    mode: CaptureTimingMode,
+    effect_pixels: u64,
+    checkpoint_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GpuTimingRecord {
     frame_id: Option<u64>,
     scope_id: u64,
@@ -136,6 +184,41 @@ struct GpuTimingRecord {
     query_pool_high_water: usize,
     dropped_spans: usize,
     disjoint_invalidated_spans: usize,
+    scene_capture_ns: u64,
+    surface_capture_ns: u64,
+    replay_capture_ns: u64,
+    framebuffer_capture_ns: u64,
+    checkpoint_capture_ns: u64,
+    scene_capture_passes: usize,
+    surface_capture_passes: usize,
+    replay_capture_passes: usize,
+    framebuffer_capture_passes: usize,
+    checkpoint_capture_passes: usize,
+    scene_capture_pixels: u64,
+    surface_capture_pixels: u64,
+    replay_capture_pixels: u64,
+    framebuffer_capture_pixels: u64,
+    checkpoint_capture_pixels: u64,
+    capture_execution_pixels: u64,
+    scene_capture_execution_pixels: u64,
+    surface_capture_execution_pixels: u64,
+    replay_capture_execution_pixels: u64,
+    framebuffer_capture_execution_pixels: u64,
+    checkpoint_capture_execution_pixels: u64,
+    replay_capture_execution_passes: usize,
+    framebuffer_capture_execution_passes: usize,
+    checkpoint_capture_execution_passes: usize,
+    replay_capture_commands: usize,
+    checkpoint_dependency_edges: usize,
+    capture_execution_summary_available: bool,
+    max_capture_pass: Option<MaxCapturePassTiming>,
+}
+
+impl GpuTimingRecord {
+    fn capture_ns(&self) -> u64 {
+        self.durations_ns[TimingCategory::SceneCapture.index()]
+            .saturating_add(self.durations_ns[TimingCategory::SurfaceCapture.index()])
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +242,23 @@ struct GraphAggregate {
     pixels: [u64; 10],
     timed_passes: usize,
     dropped_passes: usize,
+    scene_capture_ns: u64,
+    surface_capture_ns: u64,
+    replay_capture_ns: u64,
+    framebuffer_capture_ns: u64,
+    checkpoint_capture_ns: u64,
+    scene_capture_passes: usize,
+    surface_capture_passes: usize,
+    replay_capture_passes: usize,
+    framebuffer_capture_passes: usize,
+    checkpoint_capture_passes: usize,
+    scene_capture_pixels: u64,
+    surface_capture_pixels: u64,
+    replay_capture_pixels: u64,
+    framebuffer_capture_pixels: u64,
+    checkpoint_capture_pixels: u64,
+    capture_execution: Option<CaptureExecutionTimingSummary>,
+    max_capture_pass: Option<MaxCapturePassTiming>,
 }
 
 #[derive(Debug)]
@@ -237,6 +337,7 @@ impl TimingState {
             instance_id: None,
             kind: None,
             pixels: 0,
+            capture: None,
             is_total: true,
         });
         let Some(token) = token else {
@@ -249,6 +350,23 @@ impl TimingState {
             pixels: [0; 10],
             timed_passes: 0,
             dropped_passes: 0,
+            scene_capture_ns: 0,
+            surface_capture_ns: 0,
+            replay_capture_ns: 0,
+            framebuffer_capture_ns: 0,
+            checkpoint_capture_ns: 0,
+            scene_capture_passes: 0,
+            surface_capture_passes: 0,
+            replay_capture_passes: 0,
+            framebuffer_capture_passes: 0,
+            checkpoint_capture_passes: 0,
+            scene_capture_pixels: 0,
+            surface_capture_pixels: 0,
+            replay_capture_pixels: 0,
+            framebuffer_capture_pixels: 0,
+            checkpoint_capture_pixels: 0,
+            capture_execution: None,
+            max_capture_pass: None,
         });
         Some(GraphTimingScope {
             scope_id,
@@ -319,6 +437,20 @@ impl TimingState {
         self.aggregates
             .iter()
             .any(|aggregate| aggregate.scope_id == scope_id)
+    }
+
+    fn attach_capture_execution_summary(
+        &mut self,
+        scope_id: u64,
+        summary: CaptureExecutionTimingSummary,
+    ) {
+        if let Some(aggregate) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope_id)
+        {
+            aggregate.capture_execution = Some(summary);
+        }
     }
 
     #[cfg(test)]
@@ -441,6 +573,78 @@ impl TimingState {
         aggregate.durations_ns[index] = aggregate.durations_ns[index].saturating_add(duration_ns);
         aggregate.pixels[index] = aggregate.pixels[index].saturating_add(metadata.pixels);
         aggregate.timed_passes = aggregate.timed_passes.saturating_add(1);
+
+        let is_capture = matches!(
+            kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        );
+        let Some(capture) = metadata.capture.filter(|_| is_capture) else {
+            return;
+        };
+        match kind {
+            RenderPassKind::SceneCapture => {
+                aggregate.scene_capture_ns = aggregate.scene_capture_ns.saturating_add(duration_ns);
+                aggregate.scene_capture_passes = aggregate.scene_capture_passes.saturating_add(1);
+                aggregate.scene_capture_pixels = aggregate
+                    .scene_capture_pixels
+                    .saturating_add(metadata.pixels);
+            }
+            RenderPassKind::SurfaceCapture => {
+                aggregate.surface_capture_ns =
+                    aggregate.surface_capture_ns.saturating_add(duration_ns);
+                aggregate.surface_capture_passes =
+                    aggregate.surface_capture_passes.saturating_add(1);
+                aggregate.surface_capture_pixels = aggregate
+                    .surface_capture_pixels
+                    .saturating_add(metadata.pixels);
+            }
+            _ => unreachable!("capture metadata filtered to capture pass kinds"),
+        }
+        match capture.mode {
+            CaptureTimingMode::Replay => {
+                aggregate.replay_capture_ns =
+                    aggregate.replay_capture_ns.saturating_add(duration_ns);
+                aggregate.replay_capture_passes = aggregate.replay_capture_passes.saturating_add(1);
+                aggregate.replay_capture_pixels = aggregate
+                    .replay_capture_pixels
+                    .saturating_add(metadata.pixels);
+            }
+            CaptureTimingMode::FramebufferBlit => {
+                aggregate.framebuffer_capture_ns =
+                    aggregate.framebuffer_capture_ns.saturating_add(duration_ns);
+                aggregate.framebuffer_capture_passes =
+                    aggregate.framebuffer_capture_passes.saturating_add(1);
+                aggregate.framebuffer_capture_pixels = aggregate
+                    .framebuffer_capture_pixels
+                    .saturating_add(metadata.pixels);
+            }
+        }
+        if capture.checkpoint_count > 0 {
+            aggregate.checkpoint_capture_ns =
+                aggregate.checkpoint_capture_ns.saturating_add(duration_ns);
+            aggregate.checkpoint_capture_passes =
+                aggregate.checkpoint_capture_passes.saturating_add(1);
+            aggregate.checkpoint_capture_pixels = aggregate
+                .checkpoint_capture_pixels
+                .saturating_add(metadata.pixels);
+        }
+        if let (Some(pass_id), Some(instance_id)) = (metadata.pass_id, metadata.instance_id) {
+            let candidate = MaxCapturePassTiming {
+                duration_ns,
+                pass_id,
+                instance_id,
+                kind,
+                mode: capture.mode,
+                effect_pixels: metadata.pixels,
+                checkpoint_count: capture.checkpoint_count,
+            };
+            if aggregate
+                .max_capture_pass
+                .is_none_or(|current| candidate.duration_ns > current.duration_ns)
+            {
+                aggregate.max_capture_pass = Some(candidate);
+            }
+        }
     }
 
     fn finish_total(
@@ -465,6 +669,56 @@ impl TimingState {
             query_pool_high_water: self.high_water.saturating_mul(2),
             dropped_spans: self.dropped_spans,
             disjoint_invalidated_spans: self.disjoint_invalidated_spans,
+            scene_capture_ns: aggregate.scene_capture_ns,
+            surface_capture_ns: aggregate.surface_capture_ns,
+            replay_capture_ns: aggregate.replay_capture_ns,
+            framebuffer_capture_ns: aggregate.framebuffer_capture_ns,
+            checkpoint_capture_ns: aggregate.checkpoint_capture_ns,
+            scene_capture_passes: aggregate.scene_capture_passes,
+            surface_capture_passes: aggregate.surface_capture_passes,
+            replay_capture_passes: aggregate.replay_capture_passes,
+            framebuffer_capture_passes: aggregate.framebuffer_capture_passes,
+            checkpoint_capture_passes: aggregate.checkpoint_capture_passes,
+            scene_capture_pixels: aggregate.scene_capture_pixels,
+            surface_capture_pixels: aggregate.surface_capture_pixels,
+            replay_capture_pixels: aggregate.replay_capture_pixels,
+            framebuffer_capture_pixels: aggregate.framebuffer_capture_pixels,
+            checkpoint_capture_pixels: aggregate.checkpoint_capture_pixels,
+            capture_execution_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.capture_execution_pixels),
+            scene_capture_execution_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.scene_capture_execution_pixels),
+            surface_capture_execution_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.surface_capture_execution_pixels),
+            replay_capture_execution_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_execution_pixels),
+            framebuffer_capture_execution_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.framebuffer_capture_execution_pixels),
+            checkpoint_capture_execution_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.checkpoint_capture_execution_pixels),
+            replay_capture_execution_passes: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_passes),
+            framebuffer_capture_execution_passes: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.framebuffer_capture_passes),
+            checkpoint_capture_execution_passes: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.checkpoint_capture_passes),
+            replay_capture_commands: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_commands),
+            checkpoint_dependency_edges: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.checkpoint_dependency_edges),
+            capture_execution_summary_available: aggregate.capture_execution.is_some(),
+            max_capture_pass: aggregate.max_capture_pass,
         })
     }
 
@@ -748,13 +1002,29 @@ enum ProfilerState {
 }
 
 fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
-    let capture_ns = record.durations_ns[TimingCategory::SceneCapture.index()]
-        .saturating_add(record.durations_ns[TimingCategory::SurfaceCapture.index()]);
+    let capture_ns = record.capture_ns();
     let capture_pixels = record.pixels[TimingCategory::SceneCapture.index()]
         .saturating_add(record.pixels[TimingCategory::SurfaceCapture.index()]);
     let field = |values: &[u64; 10], category: TimingCategory| values[category.index()];
+    let max_capture_pass_id = record.max_capture_pass.map_or(0, |pass| pass.pass_id);
+    let max_capture_instance_id = record.max_capture_pass.map_or(0, |pass| pass.instance_id);
+    let max_capture_kind = record
+        .max_capture_pass
+        .map_or("none", |pass| match pass.kind {
+            RenderPassKind::SceneCapture => "scene",
+            RenderPassKind::SurfaceCapture => "surface",
+            _ => "none",
+        });
+    let max_capture_mode = record
+        .max_capture_pass
+        .map_or("none", |pass| pass.mode.as_str());
+    let max_capture_pass_ns = record.max_capture_pass.map_or(0, |pass| pass.duration_ns);
+    let max_capture_pixels = record.max_capture_pass.map_or(0, |pass| pass.effect_pixels);
+    let max_capture_checkpoint_count = record
+        .max_capture_pass
+        .map_or(0, |pass| pass.checkpoint_count);
     format!(
-        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={}",
+        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={}",
         record
             .frame_id
             .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
@@ -784,6 +1054,40 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         record.query_pool_high_water,
         record.dropped_spans,
         record.disjoint_invalidated_spans,
+        record.scene_capture_ns,
+        record.surface_capture_ns,
+        record.replay_capture_ns,
+        record.framebuffer_capture_ns,
+        record.checkpoint_capture_ns,
+        record.scene_capture_passes,
+        record.surface_capture_passes,
+        record.replay_capture_passes,
+        record.framebuffer_capture_passes,
+        record.checkpoint_capture_passes,
+        record.scene_capture_pixels,
+        record.surface_capture_pixels,
+        record.replay_capture_pixels,
+        record.framebuffer_capture_pixels,
+        record.checkpoint_capture_pixels,
+        usize::from(record.capture_execution_summary_available),
+        record.capture_execution_pixels,
+        record.scene_capture_execution_pixels,
+        record.surface_capture_execution_pixels,
+        record.replay_capture_execution_pixels,
+        record.framebuffer_capture_execution_pixels,
+        record.checkpoint_capture_execution_pixels,
+        record.replay_capture_execution_passes,
+        record.framebuffer_capture_execution_passes,
+        record.checkpoint_capture_execution_passes,
+        record.replay_capture_commands,
+        record.checkpoint_dependency_edges,
+        max_capture_pass_ns,
+        max_capture_pass_id,
+        max_capture_instance_id,
+        max_capture_kind,
+        max_capture_mode,
+        max_capture_pixels,
+        max_capture_checkpoint_count,
     )
 }
 
@@ -879,13 +1183,23 @@ impl EffectGpuProfiler {
         Some(scope)
     }
 
-    pub(crate) fn end_graph(&mut self, gl: &glow::Context, scope: Option<GraphTimingScope>) {
+    pub(crate) fn end_graph(
+        &mut self,
+        gl: &glow::Context,
+        scope: Option<GraphTimingScope>,
+        capture_execution: Option<CaptureExecutionTimingSummary>,
+    ) {
         let Some(scope) = scope else {
             return;
         };
         let ProfilerState::Active(active) = &mut self.state else {
             return;
         };
+        if let Some(summary) = capture_execution {
+            active
+                .timing
+                .attach_capture_execution_summary(scope.scope_id, summary);
+        }
         if active.timing.finish(scope.total) {
             let query = active.queries[scope.total.slot].end;
             unsafe { gl.query_counter(query, glow::TIMESTAMP) };
@@ -900,6 +1214,7 @@ impl EffectGpuProfiler {
         instance_id: u64,
         kind: RenderPassKind,
         pixels: u64,
+        capture: Option<CaptureTimingMetadata>,
     ) -> Option<PassTimingSpan> {
         let ProfilerState::Active(active) = &mut self.state else {
             return None;
@@ -911,6 +1226,7 @@ impl EffectGpuProfiler {
             instance_id: Some(instance_id),
             kind: Some(kind),
             pixels,
+            capture,
             is_total: false,
         };
         let token = active.timing.begin_pass(scope, metadata)?;
@@ -1034,7 +1350,19 @@ mod tests {
         EXT_QUERYIV_PNAME.store(0, Ordering::Relaxed);
     }
 
-    fn pass_metadata(pass_id: u64, kind: RenderPassKind, pixels: u64) -> TimingSpanMetadata {
+    fn capture_metadata(mode: CaptureTimingMode, checkpoint_count: usize) -> CaptureTimingMetadata {
+        CaptureTimingMetadata {
+            mode,
+            checkpoint_count,
+        }
+    }
+
+    fn pass_metadata(
+        pass_id: u64,
+        kind: RenderPassKind,
+        pixels: u64,
+        capture: Option<CaptureTimingMetadata>,
+    ) -> TimingSpanMetadata {
         TimingSpanMetadata {
             scope_id: 1,
             frame_id: Some(120),
@@ -1042,6 +1370,7 @@ mod tests {
             instance_id: Some(1),
             kind: Some(kind),
             pixels,
+            capture,
             is_total: false,
         }
     }
@@ -1064,7 +1393,7 @@ mod tests {
     fn unavailable_end_query_is_not_read() {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
-        let pass = state.begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64));
+        let pass = state.begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None));
         state.finish(pass.expect("pass slot"));
         assert_eq!(
             state.poll_front(false, Some((100, 140))),
@@ -1079,7 +1408,7 @@ mod tests {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         let pass = state
-            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
         let free_before = state.free_slot_count();
         assert!(state.finish(pass));
@@ -1098,7 +1427,7 @@ mod tests {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         let pass = state
-            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
         assert!(state.finish(pass));
         assert_eq!(
@@ -1114,7 +1443,7 @@ mod tests {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         let pass = state
-            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
         assert!(state.finish(pass));
         assert!(!state.finish(pass));
@@ -1136,7 +1465,7 @@ mod tests {
         let scope = state.begin_scope(Some(120)).expect("total slot");
         assert!(
             state
-                .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+                .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None),)
                 .is_none()
         );
         assert_eq!(state.dropped_spans(), 1);
@@ -1212,7 +1541,7 @@ mod tests {
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         for (index, kind) in kinds.into_iter().enumerate() {
             let pass = state
-                .begin_pass(scope, pass_metadata(index as u64, kind, 64))
+                .begin_pass(scope, pass_metadata(index as u64, kind, 64, None))
                 .expect("pass slot");
             assert!(state.finish(pass));
         }
@@ -1239,11 +1568,329 @@ mod tests {
     }
 
     #[test]
+    fn capture_kind_aggregation_preserves_legacy_capture_totals() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let scene = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    7,
+                    RenderPassKind::SceneCapture,
+                    100,
+                    Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                ),
+            )
+            .expect("scene capture slot");
+        assert!(state.finish(scene));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 112))),
+            PollOutcome::Ready {
+                duration_ns: Some(12),
+                record: None
+            }
+        ));
+        let surface = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    8,
+                    RenderPassKind::SurfaceCapture,
+                    200,
+                    Some(capture_metadata(CaptureTimingMode::FramebufferBlit, 0)),
+                ),
+            )
+            .expect("surface capture slot");
+        assert!(state.finish(surface));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 130))),
+            PollOutcome::Ready {
+                duration_ns: Some(30),
+                record: None
+            }
+        ));
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 260))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert_eq!(record.capture_ns(), 42);
+        assert_eq!(
+            record.capture_ns(),
+            record.scene_capture_ns + record.surface_capture_ns
+        );
+        assert_eq!(
+            record.capture_ns(),
+            record.replay_capture_ns + record.framebuffer_capture_ns
+        );
+        assert!(record.checkpoint_capture_ns <= record.framebuffer_capture_ns);
+        assert_eq!(record.scene_capture_ns, 12);
+        assert_eq!(record.surface_capture_ns, 30);
+        assert_eq!(record.scene_capture_passes, 1);
+        assert_eq!(record.surface_capture_passes, 1);
+        assert_eq!(record.scene_capture_pixels, 100);
+        assert_eq!(record.surface_capture_pixels, 200);
+    }
+
+    #[test]
+    fn capture_execution_mode_aggregation_routes_distinct_samples() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        for (pass_id, mode, duration, pixels) in [
+            (7, CaptureTimingMode::Replay, 11, 70),
+            (8, CaptureTimingMode::FramebufferBlit, 23, 90),
+        ] {
+            let pass = state
+                .begin_pass(
+                    scope,
+                    pass_metadata(
+                        pass_id,
+                        RenderPassKind::SceneCapture,
+                        pixels,
+                        Some(capture_metadata(mode, 0)),
+                    ),
+                )
+                .expect("capture slot");
+            assert!(state.finish(pass));
+            assert!(matches!(
+                state.poll_front(true, Some((100, 100 + duration))),
+                PollOutcome::Ready {
+                    duration_ns: Some(_),
+                    record: None
+                }
+            ));
+        }
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert_eq!(record.replay_capture_ns, 11);
+        assert_eq!(record.framebuffer_capture_ns, 23);
+        assert_eq!(record.replay_capture_passes, 1);
+        assert_eq!(record.framebuffer_capture_passes, 1);
+        assert_eq!(record.replay_capture_pixels, 70);
+        assert_eq!(record.framebuffer_capture_pixels, 90);
+    }
+
+    #[test]
+    fn checkpoint_capture_aggregation_uses_dependency_count() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        for (pass_id, checkpoint_count, duration, pixels) in [(7, 2, 17, 700), (8, 0, 19, 900)] {
+            let pass = state
+                .begin_pass(
+                    scope,
+                    pass_metadata(
+                        pass_id,
+                        RenderPassKind::SceneCapture,
+                        pixels,
+                        Some(capture_metadata(
+                            CaptureTimingMode::FramebufferBlit,
+                            checkpoint_count,
+                        )),
+                    ),
+                )
+                .expect("capture slot");
+            assert!(state.finish(pass));
+            assert!(matches!(
+                state.poll_front(true, Some((100, 100 + duration))),
+                PollOutcome::Ready {
+                    duration_ns: Some(_),
+                    record: None
+                }
+            ));
+        }
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert_eq!(record.checkpoint_capture_ns, 17);
+        assert_eq!(record.checkpoint_capture_passes, 1);
+        assert_eq!(record.checkpoint_capture_pixels, 700);
+        assert_eq!(record.framebuffer_capture_ns, 36);
+    }
+
+    #[test]
+    fn max_capture_pass_keeps_the_longest_valid_capture_identity() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        for (pass_id, instance_id, kind, mode, duration, pixels, checkpoint_count) in [
+            (
+                7,
+                11,
+                RenderPassKind::SceneCapture,
+                CaptureTimingMode::Replay,
+                9,
+                70,
+                0,
+            ),
+            (
+                8,
+                12,
+                RenderPassKind::SurfaceCapture,
+                CaptureTimingMode::FramebufferBlit,
+                31,
+                90,
+                3,
+            ),
+        ] {
+            let mut metadata = pass_metadata(
+                pass_id,
+                kind,
+                pixels,
+                Some(capture_metadata(mode, checkpoint_count)),
+            );
+            metadata.instance_id = Some(instance_id);
+            let pass = state.begin_pass(scope, metadata).expect("capture slot");
+            assert!(state.finish(pass));
+            assert!(matches!(
+                state.poll_front(true, Some((100, 100 + duration))),
+                PollOutcome::Ready {
+                    duration_ns: Some(_),
+                    record: None
+                }
+            ));
+        }
+        let non_capture = state
+            .begin_pass(
+                scope,
+                pass_metadata(9, RenderPassKind::Composite, 900, None),
+            )
+            .expect("non-capture slot");
+        assert!(state.finish(non_capture));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 1_000))),
+            PollOutcome::Ready {
+                duration_ns: Some(900),
+                record: None
+            }
+        ));
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+        let max = record.max_capture_pass.expect("max capture pass");
+
+        assert_eq!(max.duration_ns, 31);
+        assert_eq!(max.pass_id, 8);
+        assert_eq!(max.instance_id, 12);
+        assert_eq!(max.kind, RenderPassKind::SurfaceCapture);
+        assert_eq!(max.mode, CaptureTimingMode::FramebufferBlit);
+        assert_eq!(max.effect_pixels, 90);
+        assert_eq!(max.checkpoint_count, 3);
+    }
+
+    #[test]
+    fn invalid_capture_span_does_not_contribute_to_attribution() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let pass = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    7,
+                    RenderPassKind::SceneCapture,
+                    700,
+                    Some(capture_metadata(CaptureTimingMode::FramebufferBlit, 2)),
+                ),
+            )
+            .expect("capture slot");
+        assert!(state.finish(pass));
+        assert_eq!(
+            state.poll_front(true, Some((200, 100))),
+            PollOutcome::Invalid
+        );
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert_eq!(record.capture_ns(), 0);
+        assert_eq!(record.framebuffer_capture_passes, 0);
+        assert_eq!(record.checkpoint_capture_ns, 0);
+        assert!(record.max_capture_pass.is_none());
+        assert_eq!(record.dropped_passes, 1);
+    }
+
+    #[test]
+    fn execution_summaries_follow_scope_id_not_frame_id() {
+        let mut state = TimingState::active_for_test(4);
+        let first = state.begin_scope(Some(120)).expect("first scope");
+        let second = state.begin_scope(Some(120)).expect("second scope");
+        state.attach_capture_execution_summary(
+            first.scope_id,
+            CaptureExecutionTimingSummary {
+                capture_execution_pixels: 111,
+                ..Default::default()
+            },
+        );
+        state.attach_capture_execution_summary(
+            second.scope_id,
+            CaptureExecutionTimingSummary {
+                capture_execution_pixels: 222,
+                ..Default::default()
+            },
+        );
+        assert!(state.finish(first.total));
+        assert!(state.finish(second.total));
+
+        let first_record = match state.poll_front(true, Some((100, 140))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected first outcome: {outcome:?}"),
+        };
+        let second_record = match state.poll_front(true, Some((200, 240))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected second outcome: {outcome:?}"),
+        };
+
+        assert_eq!(first_record.capture_execution_pixels, 111);
+        assert_eq!(second_record.capture_execution_pixels, 222);
+    }
+
+    #[test]
+    fn attribution_does_not_change_query_pool_capacity() {
+        assert_eq!(TIMING_QUERY_OBJECT_CAPACITY, TIMING_SPAN_POOL_CAPACITY * 2);
+        let profiler = EffectGpuProfiler::active_for_test(TIMING_SPAN_POOL_CAPACITY);
+        assert_eq!(
+            profiler.allocated_query_count_for_test(),
+            TIMING_QUERY_OBJECT_CAPACITY
+        );
+    }
+
+    #[test]
     fn total_completion_returns_one_graph_record() {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         let pass = state
-            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
         assert!(state.finish(pass));
         assert!(matches!(
@@ -1265,7 +1912,7 @@ mod tests {
         let mut state = TimingState::active_for_test(3);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         let pass = state
-            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
         assert!(state.finish(pass));
         assert!(state.finish(scope.total));
@@ -1289,10 +1936,38 @@ mod tests {
             query_pool_high_water: 14,
             dropped_spans: 0,
             disjoint_invalidated_spans: 0,
+            scene_capture_ns: 0,
+            surface_capture_ns: 0,
+            replay_capture_ns: 0,
+            framebuffer_capture_ns: 0,
+            checkpoint_capture_ns: 0,
+            scene_capture_passes: 0,
+            surface_capture_passes: 0,
+            replay_capture_passes: 0,
+            framebuffer_capture_passes: 0,
+            checkpoint_capture_passes: 0,
+            scene_capture_pixels: 0,
+            surface_capture_pixels: 0,
+            replay_capture_pixels: 0,
+            framebuffer_capture_pixels: 0,
+            checkpoint_capture_pixels: 0,
+            capture_execution_pixels: 0,
+            scene_capture_execution_pixels: 0,
+            surface_capture_execution_pixels: 0,
+            replay_capture_execution_pixels: 0,
+            framebuffer_capture_execution_pixels: 0,
+            checkpoint_capture_execution_pixels: 0,
+            replay_capture_execution_passes: 0,
+            framebuffer_capture_execution_passes: 0,
+            checkpoint_capture_execution_passes: 0,
+            replay_capture_commands: 0,
+            checkpoint_dependency_edges: 0,
+            capture_execution_summary_available: false,
+            max_capture_pass: None,
         };
         assert_eq!(
             format_gpu_timing_line(&record),
-            "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0"
+            "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 checkpoint_capture_passes=0 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=0 replay_capture_commands=0 checkpoint_dependency_edges=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0"
         );
     }
 
@@ -1301,7 +1976,7 @@ mod tests {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
         let pass = state
-            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64))
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
         let free_before = state.free_slot_count();
         let simulated_error = true;
