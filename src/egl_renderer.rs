@@ -7734,6 +7734,29 @@ mod tests {
         config: effects::EffectDebugConfig,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
+        execute_diagnostic_frame_with_origin_and_scene_replay_mode(
+            harness,
+            graph,
+            plan,
+            region,
+            conservative_full,
+            config,
+            framebuffer_origin,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_diagnostic_frame_with_origin_and_scene_replay_mode(
+        harness: &mut GlesEffectTestHarness,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        plan: &RepaintPlan,
+        region: EffectRegion,
+        conservative_full: bool,
+        config: effects::EffectDebugConfig,
+        framebuffer_origin: OutputFramebufferOrigin,
+        scene_replay_work_mode: Option<effects::SceneReplayWorkMode>,
+    ) {
         let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
             graph,
             &region,
@@ -7741,15 +7764,27 @@ mod tests {
             config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
         );
         let selection = effects::select_effect_execution(graph, &demand);
-        effects::execute_effect_graph_with_debug_config(
-            &mut harness.renderer,
-            graph,
-            framebuffer_origin,
-            plan,
-            &demand,
-            &selection,
-            config,
-        )
+        match scene_replay_work_mode {
+            Some(mode) => effects::execute_effect_graph_with_debug_config_and_scene_replay_mode(
+                &mut harness.renderer,
+                graph,
+                framebuffer_origin,
+                plan,
+                &demand,
+                &selection,
+                config,
+                mode,
+            ),
+            None => effects::execute_effect_graph_with_debug_config(
+                &mut harness.renderer,
+                graph,
+                framebuffer_origin,
+                plan,
+                &demand,
+                &selection,
+                config,
+            ),
+        }
         .expect("diagnostic frame renders");
     }
 
@@ -7757,6 +7792,20 @@ mod tests {
         fixture: NativeStackedDiagnosticFixture,
         config: effects::EffectDebugConfig,
         poison: Option<[f32; 4]>,
+    ) -> (
+        oblivion_one::effects::CompiledFrameGraph,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<String>,
+    ) {
+        render_native_stacked_candidate_with_mode(fixture, config, poison, None)
+    }
+
+    fn render_native_stacked_candidate_with_mode(
+        fixture: NativeStackedDiagnosticFixture,
+        config: effects::EffectDebugConfig,
+        poison: Option<[f32; 4]>,
+        scene_replay_work_mode: Option<effects::SceneReplayWorkMode>,
     ) -> (
         oblivion_one::effects::CompiledFrameGraph,
         Vec<u8>,
@@ -7839,7 +7888,7 @@ mod tests {
             "native B required region intersects A influence"
         );
 
-        execute_diagnostic_frame_with_origin(
+        execute_diagnostic_frame_with_origin_and_scene_replay_mode(
             &mut harness,
             &graph,
             &diagnostic_repaint_plan_for_repairs_in_size(
@@ -7851,6 +7900,7 @@ mod tests {
             true,
             config,
             OutputFramebufferOrigin::TopLeftScanout,
+            scene_replay_work_mode,
         );
         let previous = read_diagnostic_pixels(&harness);
 
@@ -7911,7 +7961,7 @@ mod tests {
                 "native expanded scene work consumes Surface({surface_id})"
             );
         }
-        execute_diagnostic_frame_with_origin(
+        execute_diagnostic_frame_with_origin_and_scene_replay_mode(
             &mut harness,
             &graph,
             &diagnostic_repaint_plan_for_repairs_in_size(
@@ -7923,6 +7973,7 @@ mod tests {
             false,
             config,
             OutputFramebufferOrigin::TopLeftScanout,
+            scene_replay_work_mode,
         );
         let candidate = read_diagnostic_pixels(&harness);
         let events = effects::take_effect_trace_test_events();
@@ -8645,6 +8696,63 @@ mod tests {
             &full_current_reference,
             "Full Kawase Dock",
         );
+    }
+
+    #[test]
+    fn native_faithful_stacked_replay_baseline_matches_suffix_demand() {
+        let fixture = native_dock_fixture();
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let (_, _, baseline, baseline_events) = render_native_stacked_candidate_with_mode(
+            fixture,
+            config,
+            None,
+            Some(effects::SceneReplayWorkMode::GlobalBaseline),
+        );
+        let (_, _, optimized, optimized_events) = render_native_stacked_candidate_with_mode(
+            fixture,
+            config,
+            None,
+            Some(effects::SceneReplayWorkMode::SuffixDemand),
+        );
+        let mismatches = baseline
+            .iter()
+            .zip(&optimized)
+            .filter(|(expected, actual)| expected.abs_diff(**actual) > 2)
+            .count();
+        assert_eq!(mismatches, 0, "baseline and suffix replay pixels differ");
+        for events in [&baseline_events, &optimized_events] {
+            let validity_events = events
+                .iter()
+                .filter(|line| line.contains("event=effect_checkpoint_source_validity"))
+                .collect::<Vec<_>>();
+            assert!(!validity_events.is_empty());
+            assert!(
+                validity_events
+                    .iter()
+                    .all(|line| line.contains("missing_pixels=0")),
+                "checkpoint validity event reported missing pixels: {validity_events:?}"
+            );
+        }
+        let baseline_replays = baseline_events
+            .iter()
+            .filter(|line| line.contains("event=effect_scene_replay_"))
+            .collect::<Vec<_>>();
+        assert!(!baseline_replays.is_empty());
+        assert!(
+            baseline_replays
+                .iter()
+                .all(|line| line.contains("saved_pixels=0"))
+        );
+        let optimized_replays = optimized_events
+            .iter()
+            .filter(|line| line.contains("event=effect_scene_replay_"))
+            .collect::<Vec<_>>();
+        assert!(optimized_replays.iter().any(|line| {
+            line.contains("pending_checkpoint_requirements=0") && !line.contains("saved_pixels=0")
+        }));
     }
 
     #[test]

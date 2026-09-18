@@ -482,6 +482,7 @@ pub(crate) enum EffectExecutionInvariantError {
     InvalidScissor(GraphPassId),
     InvalidDomainMapping(GraphTextureId),
     InvalidFramebufferBlitTargets,
+    PendingSceneCheckpointRequirements(Vec<GraphPassId>),
 }
 
 impl std::fmt::Display for EffectExecutionInvariantError {
@@ -698,6 +699,53 @@ pub(crate) fn execute_effect_graph_with_debug_config(
     selection: &EffectExecutionSelection,
     debug_config: EffectDebugConfig,
 ) -> RendererResult<EffectExecutionStats> {
+    execute_effect_graph_with_debug_config_internal(
+        renderer,
+        graph,
+        framebuffer_origin,
+        repaint_plan,
+        demand,
+        selection,
+        debug_config,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_effect_graph_with_debug_config_and_scene_replay_mode(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_plan: &super::super::damage::RepaintPlan,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
+    scene_replay_work_mode: SceneReplayWorkMode,
+) -> RendererResult<EffectExecutionStats> {
+    execute_effect_graph_with_debug_config_internal(
+        renderer,
+        graph,
+        framebuffer_origin,
+        repaint_plan,
+        demand,
+        selection,
+        debug_config,
+        Some(scene_replay_work_mode),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_effect_graph_with_debug_config_internal(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_plan: &super::super::damage::RepaintPlan,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
+    scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
+) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
     let trace_summary = effect_trace_summary(renderer, graph, Some(repaint_plan), selection);
     renderer
@@ -718,6 +766,7 @@ pub(crate) fn execute_effect_graph_with_debug_config(
         debug_config,
         false,
         true,
+        scene_replay_work_mode_override,
     );
     renderer.effect_trace.frame_boundary(
         "effect_graph_execute",
@@ -785,6 +834,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         *effect_debug_config(),
         true,
         false,
+        None,
     );
     renderer
         .effect_trace
@@ -823,6 +873,7 @@ pub(crate) fn execute_graph_passes(
     debug_config: EffectDebugConfig,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
+    scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
 ) -> RendererResult<EffectExecutionStats> {
     let graph_scope = (!renderer.capture_in_progress)
         .then(|| {
@@ -843,6 +894,7 @@ pub(crate) fn execute_graph_passes(
         debug_config,
         lifecycle_backdrop,
         draw_overlays,
+        scene_replay_work_mode_override,
         graph_scope,
     );
     renderer
@@ -891,6 +943,7 @@ fn execute_graph_passes_inner(
     debug_config: EffectDebugConfig,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
+    scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
@@ -916,6 +969,11 @@ fn execute_graph_passes_inner(
         renderer.current_size,
         lifecycle_backdrop,
         debug_config,
+    );
+    let mut scene_work_state = SceneReplayWorkState::new(
+        &scene_work,
+        scene_replay_work_mode_override
+            .unwrap_or_else(|| scene_replay_work_mode(lifecycle_backdrop, framebuffer_capture)),
     );
     let scene_work_rects = &scene_work.baseline_work;
     let output_size = renderer.current_size;
@@ -1047,29 +1105,41 @@ fn execute_graph_passes_inner(
                 );
                 if draw_end > scene_cursor {
                     if renderer.effect_trace.enabled() {
+                        let metrics = scene_work_state.work_trace_metrics();
                         renderer.effect_trace.scene_replay_boundary(
                             "begin",
                             pass,
                             scene_advance_reason,
                             scene_cursor,
                             draw_end,
+                            metrics.0,
+                            metrics.1,
+                            metrics.2,
+                            metrics.3,
+                            metrics.4,
                         );
                     }
                     renderer.draw_effect_scene_range(
-                        scene_work_rects,
+                        scene_work_state.active_work(),
                         scene_cursor,
                         draw_end,
                         framebuffer_origin,
                     )?;
                     scene_valid_region =
-                        scene_valid_region.union(&output_rects_to_effect_region(scene_work_rects));
+                        scene_valid_region_after_scene_advance(scene_work_state.active_work());
                     if renderer.effect_trace.enabled() {
+                        let metrics = scene_work_state.work_trace_metrics();
                         renderer.effect_trace.scene_replay_boundary(
                             "end",
                             pass,
                             scene_advance_reason,
                             scene_cursor,
                             draw_end,
+                            metrics.0,
+                            metrics.1,
+                            metrics.2,
+                            metrics.3,
+                            metrics.4,
                         );
                     }
                     scene_cursor = draw_end;
@@ -1086,31 +1156,43 @@ fn execute_graph_passes_inner(
                     pass.anchor_scope,
                 );
                 if renderer.effect_trace.enabled() {
+                    let metrics = scene_work_state.work_trace_metrics();
                     renderer.effect_trace.scene_replay_boundary(
                         "begin",
                         pass,
                         "composite_advance",
                         scene_cursor,
                         draw_end,
+                        metrics.0,
+                        metrics.1,
+                        metrics.2,
+                        metrics.3,
+                        metrics.4,
                     );
                 }
                 renderer.draw_effect_scene_range(
-                    scene_work_rects,
+                    scene_work_state.active_work(),
                     scene_cursor,
                     draw_end,
                     framebuffer_origin,
                 )?;
                 if draw_end > scene_cursor {
                     scene_valid_region =
-                        scene_valid_region.union(&output_rects_to_effect_region(scene_work_rects));
+                        scene_valid_region_after_scene_advance(scene_work_state.active_work());
                 }
                 if renderer.effect_trace.enabled() {
+                    let metrics = scene_work_state.work_trace_metrics();
                     renderer.effect_trace.scene_replay_boundary(
                         "end",
                         pass,
                         "composite_advance",
                         scene_cursor,
                         draw_end,
+                        metrics.0,
+                        metrics.1,
+                        metrics.2,
+                        metrics.3,
+                        metrics.4,
                     );
                 }
                 scene_cursor = next_cursor.max(scene_cursor);
@@ -1302,6 +1384,9 @@ fn execute_graph_passes_inner(
                 }
                 return Err(error);
             }
+            if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+                scene_work_state.mark_capture_satisfied(pass.id);
+            }
             if matches!(
                 pass.kind,
                 RenderPassKind::Composite | RenderPassKind::OutputPostProcess
@@ -1349,25 +1434,47 @@ fn execute_graph_passes_inner(
             release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
             stats.passes = stats.passes.saturating_add(1);
         }
+        if scene_work_state.pending_checkpoint_requirements() != 0 {
+            let error = EffectExecutionInvariantError::PendingSceneCheckpointRequirements(
+                scene_work_state.pending_capture_passes.clone(),
+            );
+            renderer.effect_trace.invariant_failure(&error);
+            #[cfg(any(debug_assertions, test))]
+            return Err(Box::new(error));
+            #[cfg(not(any(debug_assertions, test)))]
+            scene_work_state.force_baseline();
+        }
         let final_scene_cursor_end = renderer.commands.len();
         if renderer.effect_trace.enabled() {
+            let metrics = scene_work_state.work_trace_metrics();
             renderer.effect_trace.final_scene_replay_boundary(
                 "begin",
                 scene_cursor,
                 final_scene_cursor_end,
+                metrics.0,
+                metrics.1,
+                metrics.2,
+                metrics.3,
+                metrics.4,
             );
         }
         renderer.draw_effect_scene_range(
-            scene_work_rects,
+            scene_work_state.active_work(),
             scene_cursor,
             final_scene_cursor_end,
             framebuffer_origin,
         )?;
         if renderer.effect_trace.enabled() {
+            let metrics = scene_work_state.work_trace_metrics();
             renderer.effect_trace.final_scene_replay_boundary(
                 "end",
                 scene_cursor,
                 final_scene_cursor_end,
+                metrics.0,
+                metrics.1,
+                metrics.2,
+                metrics.3,
+                metrics.4,
             );
         }
         if let Some(preservation) = scene_work_preservation.take() {
@@ -1410,6 +1517,12 @@ fn execute_graph_passes_inner(
 
 fn effect_region_pixels(region: &EffectRegion) -> u64 {
     region.rects().iter().fold(0u64, |total, rect| {
+        total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+    })
+}
+
+fn output_rects_pixels(rects: &[OutputRect]) -> u64 {
+    rects.iter().fold(0u64, |total, rect| {
         total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
     })
 }
@@ -1467,6 +1580,10 @@ fn output_rects_to_effect_region(rects: &[OutputRect]) -> EffectRegion {
         }
     }
     region
+}
+
+fn scene_valid_region_after_scene_advance(active_work: &[OutputRect]) -> EffectRegion {
+    output_rects_to_effect_region(active_work)
 }
 
 fn prepare_effect_execution_region(
@@ -3685,7 +3802,7 @@ struct SceneCheckpointRequirement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SceneReplayWorkMode {
+pub(crate) enum SceneReplayWorkMode {
     GlobalBaseline,
     SuffixDemand,
 }
@@ -3708,11 +3825,8 @@ impl SceneReplayWorkPlan {
         let checkpoint_work = checkpoint_requirements
             .iter()
             .flat_map(|requirement| requirement.region.iter().copied());
-        let baseline_work = normalize_scene_replay_work(
-            &presentation_work,
-            checkpoint_work,
-            output_size,
-        );
+        let baseline_work =
+            normalize_scene_replay_work(&presentation_work, checkpoint_work, output_size);
         let extra_scene_work = extra_scene_work(&baseline_work, &presentation_work);
         Self {
             presentation_work,
@@ -3797,9 +3911,20 @@ impl<'a> SceneReplayWorkState<'a> {
         true
     }
 
+    #[allow(dead_code)]
     fn force_baseline(&mut self) {
         self.mode = SceneReplayWorkMode::GlobalBaseline;
         self.active_work = self.plan.baseline_work.clone();
+    }
+
+    fn work_trace_metrics(&self) -> (usize, u64, usize, u64, usize) {
+        (
+            self.active_work.len(),
+            output_rects_pixels(&self.active_work),
+            self.plan.baseline_work.len(),
+            output_rects_pixels(&self.plan.baseline_work),
+            self.pending_checkpoint_requirements(),
+        )
     }
 }
 
@@ -5007,7 +5132,8 @@ mod tests {
                 EffectDebugKawaseMode::Partial,
             ),
         );
-        let mut expected_state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+        let mut expected_state =
+            SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
         expected_state.mark_capture_satisfied(capture_a.id);
         assert_same_output_region(
             expected_state.active_work(),
@@ -6539,11 +6665,7 @@ mod tests {
         presentation: &[OutputRect],
         requirements: &[SceneCheckpointRequirement],
     ) -> SceneReplayWorkPlan {
-        SceneReplayWorkPlan::new(
-            presentation.to_vec(),
-            requirements.to_vec(),
-            (100, 100),
-        )
+        SceneReplayWorkPlan::new(presentation.to_vec(), requirements.to_vec(), (100, 100))
     }
 
     fn assert_same_output_region(actual: &[OutputRect], expected: &[OutputRect]) {
@@ -6700,5 +6822,22 @@ mod tests {
 
         assert!(output_work_pixels(state.active_work()) < initial_pixels);
         assert_same_output_region(state.active_work(), &[presentation, checkpoint_b]);
+    }
+
+    #[test]
+    fn scene_valid_region_replaces_expired_work_after_scene_advance() {
+        let presentation = OutputRect::new(0, 0, 10, 10);
+        let expired = OutputRect::new(20, 0, 10, 10);
+        let pending = OutputRect::new(40, 0, 10, 10);
+        let valid = scene_valid_region_after_scene_advance(&[presentation, pending]);
+
+        assert!(valid.contains_point(5, 5));
+        assert!(valid.contains_point(45, 5));
+        assert!(!valid.contains_point(25, 5));
+        assert!(
+            valid
+                .subtract(&output_rects_to_effect_region(&[presentation, expired]))
+                .contains_point(45, 5)
+        );
     }
 }

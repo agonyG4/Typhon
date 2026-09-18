@@ -318,6 +318,7 @@ impl EffectExecutionTrace {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scene_replay_boundary(
         &self,
         boundary: &'static str,
@@ -325,29 +326,42 @@ impl EffectExecutionTrace {
         reason: &'static str,
         scene_cursor_start: usize,
         scene_cursor_end: usize,
+        active_work_rects: usize,
+        active_work_pixels: u64,
+        baseline_work_rects: usize,
+        baseline_work_pixels: u64,
+        pending_checkpoint_requirements: usize,
     ) {
         self.event(|| {
             format!(
-                "event=effect_scene_replay_{boundary} frame_id={} pass={} kind={} reason={reason} scene_cursor_start={scene_cursor_start} scene_cursor_end={scene_cursor_end} command_count={}",
+                "event=effect_scene_replay_{boundary} frame_id={} pass={} kind={} reason={reason} scene_cursor_start={scene_cursor_start} scene_cursor_end={scene_cursor_end} command_count={} active_work_rects={active_work_rects} active_work_pixels={active_work_pixels} baseline_work_rects={baseline_work_rects} baseline_work_pixels={baseline_work_pixels} saved_pixels={} pending_checkpoint_requirements={pending_checkpoint_requirements}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 render_pass_kind_name(pass.kind),
                 scene_cursor_end.saturating_sub(scene_cursor_start),
+                baseline_work_pixels.saturating_sub(active_work_pixels),
             )
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn final_scene_replay_boundary(
         &self,
         boundary: &'static str,
         scene_cursor_start: usize,
         scene_cursor_end: usize,
+        active_work_rects: usize,
+        active_work_pixels: u64,
+        baseline_work_rects: usize,
+        baseline_work_pixels: u64,
+        pending_checkpoint_requirements: usize,
     ) {
         self.event(|| {
             format!(
-                "event=effect_final_scene_replay_{boundary} frame_id={} scene_cursor_start={scene_cursor_start} scene_cursor_end={scene_cursor_end} command_count={}",
+                "event=effect_final_scene_replay_{boundary} frame_id={} scene_cursor_start={scene_cursor_start} scene_cursor_end={scene_cursor_end} command_count={} active_work_rects={active_work_rects} active_work_pixels={active_work_pixels} baseline_work_rects={baseline_work_rects} baseline_work_pixels={baseline_work_pixels} saved_pixels={} pending_checkpoint_requirements={pending_checkpoint_requirements}",
                 optional_u64(self.frame_id),
                 scene_cursor_end.saturating_sub(scene_cursor_start),
+                baseline_work_pixels.saturating_sub(active_work_pixels),
             )
         });
     }
@@ -999,5 +1013,54 @@ mod tests {
         assert!(line.contains("pixels=48984"));
         assert!(line.contains("output_pixels=2073600"));
         assert!(!line.contains("rects="));
+    }
+
+    #[test]
+    fn scene_replay_trace_reports_bounded_work_metrics() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let pass = CompiledRenderPass {
+            id: oblivion_one::effects::GraphPassId::new(13).unwrap(),
+            kind: RenderPassKind::SceneCapture,
+            inputs: Vec::new(),
+            output: None,
+            damage: EffectRegion::empty(),
+            instance: EffectInstanceId::new(7).unwrap(),
+            anchor: EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
+        };
+
+        clear_test_events();
+        trace.scene_replay_boundary(
+            "begin",
+            &pass,
+            "checkpoint_dependency",
+            2,
+            5,
+            2,
+            400,
+            4,
+            1_000,
+            1,
+        );
+        let line = take_test_events().pop().expect("scene replay trace event");
+
+        assert!(line.contains("active_work_rects=2"));
+        assert!(line.contains("active_work_pixels=400"));
+        assert!(line.contains("baseline_work_rects=4"));
+        assert!(line.contains("baseline_work_pixels=1000"));
+        assert!(line.contains("saved_pixels=600"));
+        assert!(line.contains("pending_checkpoint_requirements=1"));
+        assert!(!line.contains("active_work="));
+        assert!(!line.contains("baseline_work="));
     }
 }
