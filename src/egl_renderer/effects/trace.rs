@@ -304,6 +304,20 @@ impl EffectExecutionTrace {
         }
     }
 
+    pub(crate) fn scene_work_preservation(
+        &self,
+        phase: &'static str,
+        rect_count: usize,
+        pixels: u64,
+        output_pixels: u64,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_scene_work_preservation phase={phase} rect_count={rect_count} pixels={pixels} output_pixels={output_pixels}"
+            )
+        });
+    }
+
     pub(crate) fn scene_replay_boundary(
         &self,
         boundary: &'static str,
@@ -967,5 +981,23 @@ mod tests {
         assert!(line.contains("logical_bbox=10,20,40,30"));
         assert!(line.contains("physical_rects=2"));
         assert!(line.contains("physical_pixels=1200"));
+    }
+
+    #[test]
+    fn scene_work_preservation_trace_reports_bounded_transfer_metrics() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+
+        clear_test_events();
+        trace.scene_work_preservation("capture", 2, 48_984, 2_073_600);
+        let line = take_test_events()
+            .pop()
+            .expect("scene-work preservation trace event");
+
+        assert!(line.contains("event=effect_scene_work_preservation"));
+        assert!(line.contains("phase=capture"));
+        assert!(line.contains("rect_count=2"));
+        assert!(line.contains("pixels=48984"));
+        assert!(line.contains("output_pixels=2073600"));
+        assert!(!line.contains("rects="));
     }
 }
