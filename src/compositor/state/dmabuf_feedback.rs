@@ -217,9 +217,11 @@ impl CompositorState {
             snapshots_consistent,
             advertised_scanout_pair_count,
             advertised_source_modifiers,
+            advertised_fallback_pair_count,
+            advertised_fallback_source_modifiers,
         ) = source_fourcc
             .map(|source_fourcc| summarize_surface_feedback_snapshots(&snapshots, source_fourcc))
-            .unwrap_or((0, true, None, None));
+            .unwrap_or((0, true, None, None, None, None));
         let scanout_capability_pair_count = self
             .dmabuf_scanout_capabilities
             .as_ref()
@@ -254,6 +256,16 @@ impl CompositorState {
             scanout_capability_source_modifiers,
             advertised_scanout_pair_count,
             advertised_source_modifiers,
+            advertised_fallback_pair_count,
+            advertised_fallback_source_modifiers,
+            dmabuf_kms_preferred_requested: self.dmabuf_kms_preferred_state.requested,
+            dmabuf_kms_preferred_effective: self.dmabuf_kms_preferred_state.effective,
+            dmabuf_renderer_pairs_raw: self.dmabuf_kms_preferred_state.renderer_pairs_raw,
+            dmabuf_kms_presentable_pairs: self.dmabuf_kms_preferred_state.kms_presentable_pairs,
+            dmabuf_renderer_pairs_advertised: self
+                .dmabuf_kms_preferred_state
+                .renderer_pairs_advertised,
+            dmabuf_renderer_pairs_removed: self.dmabuf_kms_preferred_state.renderer_pairs_removed,
         }
     }
 
@@ -295,18 +307,39 @@ impl CompositorState {
         scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
         scanout_target_device_override: Option<u64>,
     ) -> bool {
+        self.set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+            feedback,
+            main_device,
+            main_device_path,
+            scanout_capabilities,
+            scanout_target_device_override,
+            DmabufKmsPreferredState::default(),
+        )
+    }
+
+    pub(in crate::compositor) fn set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+        &mut self,
+        feedback: EglGlesDmabufFeedback,
+        main_device: Option<u64>,
+        main_device_path: Option<String>,
+        scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
+        scanout_target_device_override: Option<u64>,
+        dmabuf_kms_preferred_state: DmabufKmsPreferredState,
+    ) -> bool {
         let main_device = main_device.filter(|device| *device != 0).unwrap_or(0);
         let main_device_path = main_device_path.filter(|path| !path.is_empty());
         let changed = self.dmabuf_feedback != feedback
             || self.dmabuf_main_device != main_device
             || self.dmabuf_main_device_path != main_device_path
             || self.dmabuf_scanout_capabilities != scanout_capabilities
-            || self.dmabuf_scanout_target_device_override != scanout_target_device_override;
+            || self.dmabuf_scanout_target_device_override != scanout_target_device_override
+            || self.dmabuf_kms_preferred_state != dmabuf_kms_preferred_state;
         self.dmabuf_feedback = feedback;
         self.dmabuf_main_device = main_device;
         self.dmabuf_main_device_path = main_device_path;
         self.dmabuf_scanout_capabilities = scanout_capabilities;
         self.dmabuf_scanout_target_device_override = scanout_target_device_override;
+        self.dmabuf_kms_preferred_state = dmabuf_kms_preferred_state;
         if changed {
             self.reconcile_all_dmabuf_feedback();
         }
@@ -335,10 +368,19 @@ where
     (live_resources, snapshots)
 }
 
+type DmabufFeedbackSnapshotSummary = (
+    usize,
+    bool,
+    Option<usize>,
+    Option<Vec<u64>>,
+    Option<usize>,
+    Option<Vec<u64>>,
+);
+
 fn summarize_surface_feedback_snapshots(
     snapshots: &[DmabufFeedbackSnapshot],
     source_fourcc: u32,
-) -> (usize, bool, Option<usize>, Option<Vec<u64>>) {
+) -> DmabufFeedbackSnapshotSummary {
     let mut variants = Vec::new();
     for snapshot in snapshots {
         if !variants.contains(snapshot) {
@@ -346,20 +388,28 @@ fn summarize_surface_feedback_snapshots(
         }
     }
     let snapshots_consistent = variants.len() <= 1;
-    let (advertised_scanout_pair_count, advertised_source_modifiers) =
-        if let Some(snapshot) = variants.first().filter(|_| snapshots_consistent) {
-            (
-                Some(snapshot.scanout_pair_count()),
-                Some(snapshot.scanout_modifiers_for_fourcc(source_fourcc)),
-            )
-        } else {
-            (None, None)
-        };
+    let (
+        advertised_scanout_pair_count,
+        advertised_source_modifiers,
+        advertised_fallback_pair_count,
+        advertised_fallback_source_modifiers,
+    ) = if let Some(snapshot) = variants.first().filter(|_| snapshots_consistent) {
+        (
+            Some(snapshot.scanout_pair_count()),
+            Some(snapshot.scanout_modifiers_for_fourcc(source_fourcc)),
+            Some(snapshot.fallback_pair_count()),
+            Some(snapshot.fallback_modifiers_for_fourcc(source_fourcc)),
+        )
+    } else {
+        (None, None, None, None)
+    };
     (
         variants.len(),
         snapshots_consistent,
         advertised_scanout_pair_count,
         advertised_source_modifiers,
+        advertised_fallback_pair_count,
+        advertised_fallback_source_modifiers,
     )
 }
 
@@ -377,7 +427,10 @@ mod tests {
             DrmFormat::Xrgb8888.as_fourcc(),
         );
 
-        assert_eq!(summary, (1, true, Some(1), Some(vec![7])));
+        assert_eq!(
+            summary,
+            (1, true, Some(1), Some(vec![7]), Some(1), Some(Vec::new()))
+        );
     }
 
     #[test]
@@ -390,7 +443,20 @@ mod tests {
             DrmFormat::Xrgb8888.as_fourcc(),
         );
 
-        assert_eq!(summary, (2, false, None, None));
+        assert_eq!(summary, (2, false, None, None, None, None));
+    }
+
+    #[test]
+    fn advertised_snapshot_summary_reports_actual_fallback_pairs() {
+        let snapshot = snapshot_with_scanout_and_fallback(7, [9, 10]);
+
+        assert_eq!(
+            summarize_surface_feedback_snapshots(
+                std::slice::from_ref(&snapshot),
+                DrmFormat::Xrgb8888.as_fourcc(),
+            ),
+            (1, true, Some(1), Some(vec![7]), Some(2), Some(vec![9, 10]))
+        );
     }
 
     #[test]
@@ -469,6 +535,49 @@ mod tests {
                 GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), modifier),
                 GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
             ],
+            Some(&capabilities),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn snapshot_with_scanout_and_fallback(
+        scanout_modifier: u64,
+        fallback_modifiers: impl IntoIterator<Item = u64>,
+    ) -> DmabufFeedbackSnapshot {
+        let capabilities = DirectScanoutFeedbackCapabilities::new(
+            0x200,
+            1,
+            42,
+            vec![DirectScanoutFormatCapability {
+                format: DrmFormat::Xrgb8888.as_fourcc(),
+                modifier: scanout_modifier,
+            }],
+        );
+        let fallback_formats = fallback_modifiers
+            .into_iter()
+            .map(|modifier| EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(modifier)))
+            .collect::<Vec<_>>();
+        let allowed_formats = std::iter::once(GpuFormat::new(
+            DrmFormat::Xrgb8888.as_fourcc(),
+            scanout_modifier,
+        ))
+        .chain(
+            fallback_formats
+                .iter()
+                .map(|format| GpuFormat::new(format.format.as_fourcc(), format.modifier.0)),
+        )
+        .collect::<Vec<_>>();
+        DmabufFeedbackData::build_snapshot(
+            &EglGlesDmabufFeedback::with_scanout_tranche(
+                [EglGlesDmabufFormat::new(
+                    DrmFormat::Xrgb8888,
+                    DrmModifier(scanout_modifier),
+                )],
+                fallback_formats,
+            ),
+            0x100,
+            &allowed_formats,
             Some(&capabilities),
             None,
         )

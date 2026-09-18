@@ -973,7 +973,13 @@ impl NativeRuntime {
                     .server
                     .dmabuf_feedback_doctor_state(source_surface_id, source_fourcc);
                 let direct_detail = format!(
-                    "{direct_detail} surface_feedback_hint_active={} surface_feedback_hint_surface={} surface_feedback_updates={} surface_feedback_duplicate_suppressed={} surface_feedback_live_resources={} surface_feedback_snapshot_variants={} surface_feedback_snapshots_consistent={} scanout_capability_pair_count={} scanout_capability_source_format={} surface_feedback_scanout_pair_count={} surface_feedback_source_format={}",
+                    "{direct_detail} dmabuf_kms_preferred_requested={} dmabuf_kms_preferred_effective={} dmabuf_renderer_pairs_raw={} dmabuf_kms_presentable_pairs={} dmabuf_renderer_pairs_advertised={} dmabuf_renderer_pairs_removed={} surface_feedback_hint_active={} surface_feedback_hint_surface={} surface_feedback_updates={} surface_feedback_duplicate_suppressed={} surface_feedback_live_resources={} surface_feedback_snapshot_variants={} surface_feedback_snapshots_consistent={} scanout_capability_pair_count={} scanout_capability_source_format={} surface_feedback_scanout_pair_count={} surface_feedback_source_format={} surface_feedback_fallback_pair_count={} surface_feedback_fallback_source_format={}",
+                    feedback_doctor.dmabuf_kms_preferred_requested,
+                    feedback_doctor.dmabuf_kms_preferred_effective,
+                    feedback_doctor.dmabuf_renderer_pairs_raw,
+                    feedback_doctor.dmabuf_kms_presentable_pairs,
+                    feedback_doctor.dmabuf_renderer_pairs_advertised,
+                    feedback_doctor.dmabuf_renderer_pairs_removed,
                     feedback_doctor.hint_active,
                     feedback_doctor
                         .hint_surface
@@ -994,6 +1000,15 @@ impl NativeRuntime {
                     format_dmabuf_feedback_source_format(
                         source_fourcc,
                         feedback_doctor.advertised_source_modifiers.as_deref(),
+                    ),
+                    feedback_doctor
+                        .advertised_fallback_pair_count
+                        .map_or_else(|| "none".to_string(), |count| count.to_string()),
+                    format_dmabuf_feedback_source_format(
+                        source_fourcc,
+                        feedback_doctor
+                            .advertised_fallback_source_modifiers
+                            .as_deref(),
                     ),
                 );
                 let dmem_snapshot = self.dmem_foreground.snapshot();

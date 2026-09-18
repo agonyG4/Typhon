@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::DmabufKmsPreferredState;
 
 struct RawSurfaceFocusSnapshot {
     state: RegistryTestState,
@@ -393,6 +394,83 @@ fn default_feedback_stays_renderer_only_when_scanout_capabilities_exist() {
     stop_test_server(running, server_thread);
 
     assert_eq!(state.dmabuf_feedback_tranche_scanout, vec![false]);
+}
+
+#[test]
+fn kms_preferred_feedback_filters_renderer_pair_from_table_and_hint_fallback() {
+    let safe = EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(0));
+    let selected_renderer_formats = [safe];
+    let policy_state = DmabufKmsPreferredState {
+        requested: "force",
+        effective: true,
+        renderer_pairs_raw: 2,
+        kms_presentable_pairs: 1,
+        renderer_pairs_advertised: 1,
+        renderer_pairs_removed: 1,
+        reason: "same-FOURCC KMS-compatible modifiers selected",
+    };
+    let capabilities = stage4_feedback_capabilities(
+        0x8877_6655_4433_2211,
+        1,
+        42,
+        [(DrmFormat::Xrgb8888.as_fourcc(), 0)],
+    );
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+        EglGlesDmabufFeedback::with_scanout_tranche([safe], selected_renderer_formats),
+        Some(0x1122),
+        Some("/dev/dri/renderD128".to_string()),
+        Some(capabilities),
+        None,
+        policy_state,
+    );
+    assert!(
+        server
+            .state
+            .dmabuf_feedback
+            .advertises(DrmFormat::Xrgb8888, DrmModifier(0))
+    );
+    assert!(
+        !server
+            .state
+            .dmabuf_feedback
+            .advertises(DrmFormat::Xrgb8888, DrmModifier(1))
+    );
+    assert_eq!(server.state.dmabuf_feedback.format_table_formats().len(), 1);
+
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let default_state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    stop_test_server(running, server_thread);
+    assert_eq!(default_state.dmabuf_feedback_tranche_scanout, vec![false]);
+
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let capabilities = stage4_feedback_capabilities(
+        0x8877_6655_4433_2211,
+        1,
+        42,
+        [(DrmFormat::Xrgb8888.as_fourcc(), 0)],
+    );
+    server.set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+        EglGlesDmabufFeedback::with_scanout_tranche([safe], [safe]),
+        Some(0x1122),
+        Some("/dev/dri/renderD128".to_string()),
+        Some(capabilities),
+        None,
+        policy_state,
+    );
+    server.activate_surface_scanout_hint(1);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let hinted_state = request_dmabuf_surface_feedback(&socket_path).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert_eq!(
+        hinted_state.dmabuf_feedback_tranche_scanout,
+        vec![true, false]
+    );
 }
 
 #[test]

@@ -569,6 +569,18 @@ mod tests {
         assert!(feedback.advertises(DrmFormat::Xrgb8888, DrmModifier(7)));
     }
 
+    #[test]
+    fn filtered_renderer_feedback_is_the_only_fallback_and_table_source() {
+        let safe = EglGlesDmabufFormat::new(DrmFormat::Xbgr8888, DrmModifier(2));
+        let unsafe_modifier = EglGlesDmabufFormat::new(DrmFormat::Xbgr8888, DrmModifier(3));
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche([], [safe]);
+
+        assert_eq!(feedback.formats(), &[safe]);
+        assert_eq!(feedback.format_table_formats(), &[safe]);
+        assert!(feedback.advertises(safe.format, safe.modifier));
+        assert!(!feedback.advertises(unsafe_modifier.format, unsafe_modifier.modifier));
+    }
+
     fn dmabuf_handle(format: DrmFormat, modifier: DrmModifier) -> DmabufBufferHandle {
         dmabuf_handle_with_modifiers(format, &[modifier])
     }

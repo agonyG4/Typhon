@@ -141,6 +141,7 @@ pub(crate) use desktop_window::{
 };
 pub use dmabuf::{
     DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability, DmabufFeedbackDoctorState,
+    DmabufKmsPreferredState,
 };
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackBinding, DmabufFeedbackData, DmabufFeedbackResourceData,
@@ -909,6 +910,7 @@ pub struct CompositorState {
     dmabuf_main_device_path: Option<String>,
     dmabuf_scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
     dmabuf_scanout_target_device_override: Option<u64>,
+    dmabuf_kms_preferred_state: DmabufKmsPreferredState,
     dmabuf_feedback_resources: HashMap<ObjectId, LiveDmabufFeedbackResource>,
     dmabuf_surface_scanout_hints: HashSet<u32>,
     dmabuf_scanout_candidate_surface: Option<u32>,

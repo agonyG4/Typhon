@@ -17,7 +17,7 @@ use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
-    AnimationTime, DirectScanoutSceneAnalysis, DmabufFeedbackDoctorState,
+    AnimationTime, DirectScanoutSceneAnalysis, DmabufFeedbackDoctorState, DmabufKmsPreferredState,
     EffectFrameDemandSnapshot, FullscreenCompositionPlan, NativeFramePresentationTargets,
     PresentationAnimationMetrics, PresentationCoverageContent, PresentationCoverageContentKind,
     PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
@@ -1873,6 +1873,29 @@ impl OwnCompositorServer {
                 main_device_path,
                 scanout_capabilities,
                 scanout_target_device_override,
+            );
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+        &mut self,
+        feedback: EglGlesDmabufFeedback,
+        main_device: Option<u64>,
+        main_device_path: Option<String>,
+        scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
+        scanout_target_device_override: Option<u64>,
+        dmabuf_kms_preferred_state: DmabufKmsPreferredState,
+    ) -> bool {
+        let changed = self
+            .state
+            .set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+                feedback,
+                main_device,
+                main_device_path,
+                scanout_capabilities,
+                scanout_target_device_override,
+                dmabuf_kms_preferred_state,
             );
         let _ = self.display.flush_clients();
         changed

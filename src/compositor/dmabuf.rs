@@ -151,6 +151,77 @@ impl DmabufFeedbackSnapshot {
     pub(super) fn has_scanout_tranche(&self) -> bool {
         self.tranches.iter().any(|tranche| tranche.scanout)
     }
+
+    pub(super) fn fallback_pair_count(&self) -> usize {
+        let mut pairs = self
+            .tranches
+            .iter()
+            .filter(|tranche| !tranche.scanout)
+            .flat_map(|tranche| {
+                tranche
+                    .formats
+                    .iter()
+                    .map(|format| (format.format.as_fourcc(), format.modifier.0))
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs.len()
+    }
+
+    pub(super) fn fallback_modifiers_for_fourcc(&self, fourcc: u32) -> Vec<u64> {
+        let mut modifiers = self
+            .tranches
+            .iter()
+            .filter(|tranche| !tranche.scanout)
+            .flat_map(|tranche| tranche.formats.iter())
+            .filter(|format| format.format.as_fourcc() == fourcc)
+            .map(|format| format.modifier.0)
+            .collect::<Vec<_>>();
+        modifiers.sort_unstable();
+        modifiers.dedup();
+        modifiers
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmabufKmsPreferredState {
+    pub requested: &'static str,
+    pub effective: bool,
+    pub renderer_pairs_raw: usize,
+    pub kms_presentable_pairs: usize,
+    pub renderer_pairs_advertised: usize,
+    pub renderer_pairs_removed: usize,
+    pub reason: &'static str,
+}
+
+impl Default for DmabufKmsPreferredState {
+    fn default() -> Self {
+        Self {
+            requested: "off",
+            effective: false,
+            renderer_pairs_raw: 0,
+            kms_presentable_pairs: 0,
+            renderer_pairs_advertised: 0,
+            renderer_pairs_removed: 0,
+            reason: "policy unavailable for this scanout backend",
+        }
+    }
+}
+
+impl DmabufKmsPreferredState {
+    pub fn startup_diagnostic(&self) -> String {
+        format!(
+            "native GPU protocol: dmabuf_kms_preferred_requested={} dmabuf_kms_preferred_effective={} dmabuf_renderer_pairs_raw={} dmabuf_kms_presentable_pairs={} dmabuf_renderer_pairs_advertised={} dmabuf_renderer_pairs_removed={} dmabuf_kms_preferred_reason={}",
+            self.requested,
+            self.effective,
+            self.renderer_pairs_raw,
+            self.kms_presentable_pairs,
+            self.renderer_pairs_advertised,
+            self.renderer_pairs_removed,
+            self.reason,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,6 +237,14 @@ pub struct DmabufFeedbackDoctorState {
     pub scanout_capability_source_modifiers: Vec<u64>,
     pub advertised_scanout_pair_count: Option<usize>,
     pub advertised_source_modifiers: Option<Vec<u64>>,
+    pub advertised_fallback_pair_count: Option<usize>,
+    pub advertised_fallback_source_modifiers: Option<Vec<u64>>,
+    pub dmabuf_kms_preferred_requested: &'static str,
+    pub dmabuf_kms_preferred_effective: bool,
+    pub dmabuf_renderer_pairs_raw: usize,
+    pub dmabuf_kms_presentable_pairs: usize,
+    pub dmabuf_renderer_pairs_advertised: usize,
+    pub dmabuf_renderer_pairs_removed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1350,6 +1350,10 @@ impl NativeRuntime {
             native_gpu_capabilities.as_ref(),
         );
         println!("{}", dmabuf_feedback_compatibility.startup_diagnostic());
+        println!(
+            "{}",
+            scanout.dmabuf_kms_preferred_state().startup_diagnostic()
+        );
         let mut dmabuf_feedback_compat_metrics = DmabufFeedbackCompatibilityMetrics::default();
         dmabuf_feedback_compat_metrics.observe(&dmabuf_feedback_compatibility);
         apply_native_scanout_feedback(

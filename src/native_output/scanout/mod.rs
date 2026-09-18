@@ -18,6 +18,7 @@ mod feedback_policy;
 #[allow(dead_code)] // Negotiation is wired into explicit slot allocation in Task 4.
 mod format_negotiation;
 mod gbm_cpu;
+mod kms_preferred;
 #[allow(dead_code)] // Concrete slots are attached to runtime ownership after initial modeset.
 mod output_slot;
 #[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
@@ -39,6 +40,7 @@ pub(crate) use feedback_policy::*;
 #[allow(unused_imports)]
 pub(crate) use format_negotiation::*;
 pub(crate) use gbm_cpu::*;
+pub(crate) use kms_preferred::*;
 #[allow(unused_imports)]
 pub(crate) use output_slot::*;
 #[allow(unused_imports)]
@@ -838,6 +840,15 @@ impl NativeScanoutBackend {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.dmabuf_scanout_capabilities(),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn dmabuf_kms_preferred_state(
+        &self,
+    ) -> oblivion_one::compositor::DmabufKmsPreferredState {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.dmabuf_kms_preferred_state(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Default::default(),
         }
     }
 }

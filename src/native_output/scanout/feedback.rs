@@ -20,12 +20,15 @@ pub(crate) fn apply_native_scanout_feedback(
     scanout: &NativeScanoutBackend,
     scanout_target_device_override: Option<u64>,
 ) -> bool {
-    server.set_dmabuf_feedback_with_scanout_capabilities_and_target(
+    server.set_dmabuf_feedback_with_scanout_capabilities_and_target_and_kms_preferred(
+        // The policy summary is stored separately from Direct Scanout capabilities;
+        // it only describes the renderer tranche selected for client allocation.
         scanout.dmabuf_feedback(),
         scanout.dmabuf_main_device(),
         scanout.dmabuf_main_device_path(),
         scanout.dmabuf_scanout_capabilities(),
         scanout_target_device_override,
+        scanout.dmabuf_kms_preferred_state(),
     )
 }
 

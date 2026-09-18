@@ -55,6 +55,27 @@ fn start_launcher_documents_safe_nvidia_egl_wayland2_default() {
 }
 
 #[test]
+fn start_launcher_documents_kms_preferred_dmabuf_escape_hatch() {
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("start launcher help should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let policy_line = stdout
+        .lines()
+        .find(|line| line.contains("OBLIVION_ONE_DMABUF_KMS_PREFERRED"))
+        .expect("launcher help should document KMS-preferred DMA-BUF policy");
+    assert!(policy_line.contains("auto (default)"));
+    assert!(policy_line.contains("off"));
+    assert!(policy_line.contains("force"));
+}
+
+#[test]
 fn nvidia_egl_wayland2_qualifier_accepts_external_kitty_toplevel() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let qualifier = fs::read_to_string(repo_dir.join("bin/qualify-nvidia-egl-wayland2"))

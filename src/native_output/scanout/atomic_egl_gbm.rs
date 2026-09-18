@@ -12,8 +12,8 @@ use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
-    DrmContentType, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
-    SurfacePipelineEvent,
+    DmabufKmsPreferredState, DrmContentType, FrameBatchDiscardReason, OwnCompositorServer,
+    SurfaceDamagePresentation, SurfacePipelineEvent,
 };
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
@@ -70,6 +70,7 @@ pub(crate) struct AtomicEglGbmScanout {
     dmabuf_main_device_path: Option<String>,
     dmabuf_egl_vendor: String,
     dmabuf_scanout_capabilities: DirectScanoutFeedbackCapabilities,
+    dmabuf_kms_preferred_state: DmabufKmsPreferredState,
     pub(crate) format_modifier: DrmFormatModifierPair,
     drm_cleanup_armed: bool,
     deadline_hints_enabled: bool,
@@ -488,6 +489,17 @@ impl AtomicEglGbmScanout {
                 discovery.pipeline.plane.get(),
                 scanout_capabilities,
             );
+            let kms_presentable_client_formats = discover_kms_presentable_client_formats(
+                &discovery.plane_scanout_formats,
+                renderer_dmabuf_feedback.formats(),
+            );
+            let kms_preferred_selection = resolve_kms_preferred_dmabuf_policy(
+                KmsPreferredDmabufPolicy::from_env(),
+                &dmabuf_egl_vendor,
+                renderer_dmabuf_feedback.formats(),
+                &kms_presentable_client_formats,
+            );
+            let dmabuf_kms_preferred_state = kms_preferred_selection.summary();
             let dmabuf_feedback = EglGlesDmabufFeedback::with_scanout_tranche(
                 scanout_capabilities.formats.iter().map(|format| {
                     EglGlesDmabufFormat::new(
@@ -495,7 +507,7 @@ impl AtomicEglGbmScanout {
                         DrmModifier(format.modifier),
                     )
                 }),
-                renderer_dmabuf_feedback.formats().iter().copied(),
+                kms_preferred_selection.advertised_renderer_formats,
             );
             let (dmabuf_main_device_path, dmabuf_main_device) =
                 query_egl_main_device(&egl, egl_display)
@@ -565,6 +577,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_main_device_path,
                 dmabuf_egl_vendor,
                 scanout_capabilities,
+                dmabuf_kms_preferred_state,
             ))
         })();
 
@@ -581,6 +594,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_main_device_path,
                 dmabuf_egl_vendor,
                 scanout_capabilities,
+                dmabuf_kms_preferred_state,
             )) => Ok(Self {
                 _device: device,
                 egl,
@@ -599,6 +613,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_main_device_path,
                 dmabuf_egl_vendor,
                 dmabuf_scanout_capabilities: scanout_capabilities,
+                dmabuf_kms_preferred_state,
                 format_modifier,
                 drm_cleanup_armed: true,
                 deadline_hints_enabled: true,
@@ -1668,6 +1683,10 @@ impl AtomicEglGbmScanout {
         Some(self.dmabuf_scanout_capabilities.clone())
     }
 
+    pub(crate) fn dmabuf_kms_preferred_state(&self) -> DmabufKmsPreferredState {
+        self.dmabuf_kms_preferred_state
+    }
+
     pub(crate) fn disarm_drm_cleanup(&mut self) {
         self.drm_cleanup_armed = false;
         self.direct.disarm_drm_cleanup();
@@ -1961,5 +1980,49 @@ mod tests {
                 modifier: xrgb.modifier,
             }]
         );
+    }
+
+    #[test]
+    fn kms_presentable_client_formats_are_broader_than_direct_scanout_capabilities() {
+        let argb = DrmFormatModifierPair {
+            fourcc: DrmFormat::ARGB8888_FOURCC,
+            modifier: 11,
+        };
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            [],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier(11),
+            )],
+        );
+
+        let kms_presentable = discover_kms_presentable_client_formats(&[argb], feedback.formats());
+        let direct = discover_direct_scanout_capabilities(&[argb], &feedback);
+
+        assert_eq!(kms_presentable, vec![argb]);
+        assert!(direct.is_empty());
+    }
+
+    #[test]
+    fn kms_preferred_feedback_uses_selected_renderer_set() {
+        let safe = EglGlesDmabufFormat::new(DrmFormat::Xbgr8888, DrmModifier(2));
+        let unsafe_modifier = EglGlesDmabufFormat::new(DrmFormat::Xbgr8888, DrmModifier(3));
+        let selection = resolve_kms_preferred_dmabuf_policy(
+            KmsPreferredDmabufPolicy::Force,
+            "test vendor",
+            &[safe, unsafe_modifier],
+            &[DrmFormatModifierPair {
+                fourcc: DrmFormat::XBGR8888_FOURCC,
+                modifier: 2,
+            }],
+        );
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            [],
+            selection.advertised_renderer_formats.clone(),
+        );
+
+        assert_eq!(feedback.formats(), &[safe]);
+        assert_eq!(feedback.format_table_formats(), &[safe]);
+        assert!(!feedback.advertises(DrmFormat::Xbgr8888, DrmModifier(3)));
     }
 }
