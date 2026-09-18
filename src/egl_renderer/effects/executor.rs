@@ -562,7 +562,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
     debug_config: EffectDebugConfig,
 ) -> SurfaceConsumerPlan {
     let mut plan = SurfaceConsumerPlan::default();
-    let scene_work = scene_work_regions(
+    let scene_work = scene_replay_work_plan(
         repaint_rects,
         graph,
         selection,
@@ -599,7 +599,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
                 commands,
                 scene_cursor,
                 draw_end,
-                &scene_work.scene_work_rects,
+                &scene_work.baseline_work,
             );
             scene_cursor = scene_cursor.max(draw_end.min(commands.len()));
         }
@@ -614,7 +614,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
                 commands,
                 scene_cursor,
                 draw_end,
-                &scene_work.scene_work_rects,
+                &scene_work.baseline_work,
             );
             scene_cursor = scene_cursor.max(next_cursor.min(commands.len()));
         }
@@ -655,7 +655,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         commands,
         scene_cursor,
         commands.len(),
-        &scene_work.scene_work_rects,
+        &scene_work.baseline_work,
     );
     plan.finish();
     plan
@@ -889,7 +889,7 @@ fn execute_graph_passes_inner(
             framebuffer_origin,
         )?
     };
-    let scene_work = scene_work_regions(
+    let scene_work = scene_replay_work_plan(
         &repaint_rects,
         graph,
         selection,
@@ -897,7 +897,7 @@ fn execute_graph_passes_inner(
         lifecycle_backdrop,
         debug_config,
     );
-    let scene_work_rects = &scene_work.scene_work_rects;
+    let scene_work_rects = &scene_work.baseline_work;
     let output_size = renderer.current_size;
     let reconstruct_internal_scene_work =
         framebuffer_capture || !scene_work.extra_scene_work.is_empty();
@@ -3658,22 +3658,183 @@ fn full_output_rect(size: (u32, u32)) -> OutputRect {
     OutputRect::new(0, 0, size.0, size.1)
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SceneWorkRegions {
-    scene_work_rects: Vec<OutputRect>,
-    extra_scene_work: Vec<OutputRect>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SceneCheckpointRequirement {
+    capture_pass: GraphPassId,
+    region: Vec<OutputRect>,
 }
 
-fn scene_work_regions(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SceneReplayWorkMode {
+    GlobalBaseline,
+    SuffixDemand,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SceneReplayWorkPlan {
+    presentation_work: Vec<OutputRect>,
+    baseline_work: Vec<OutputRect>,
+    extra_scene_work: Vec<OutputRect>,
+    checkpoint_requirements: Vec<SceneCheckpointRequirement>,
+    output_size: (u32, u32),
+}
+
+impl SceneReplayWorkPlan {
+    fn new(
+        presentation_work: Vec<OutputRect>,
+        checkpoint_requirements: Vec<SceneCheckpointRequirement>,
+        output_size: (u32, u32),
+    ) -> Self {
+        let checkpoint_work = checkpoint_requirements
+            .iter()
+            .flat_map(|requirement| requirement.region.iter().copied());
+        let baseline_work = normalize_scene_replay_work(
+            &presentation_work,
+            checkpoint_work,
+            output_size,
+        );
+        let extra_scene_work = extra_scene_work(&baseline_work, &presentation_work);
+        Self {
+            presentation_work,
+            baseline_work,
+            extra_scene_work,
+            checkpoint_requirements,
+            output_size,
+        }
+    }
+}
+
+struct SceneReplayWorkState<'a> {
+    plan: &'a SceneReplayWorkPlan,
+    mode: SceneReplayWorkMode,
+    pending_capture_passes: Vec<GraphPassId>,
+    active_work: Vec<OutputRect>,
+}
+
+impl<'a> SceneReplayWorkState<'a> {
+    fn new(plan: &'a SceneReplayWorkPlan, mode: SceneReplayWorkMode) -> Self {
+        let pending_capture_passes = plan
+            .checkpoint_requirements
+            .iter()
+            .map(|requirement| requirement.capture_pass)
+            .collect::<Vec<_>>();
+        let active_work = match mode {
+            SceneReplayWorkMode::GlobalBaseline => plan.baseline_work.clone(),
+            SceneReplayWorkMode::SuffixDemand => normalize_scene_replay_work(
+                &plan.presentation_work,
+                plan.checkpoint_requirements
+                    .iter()
+                    .flat_map(|requirement| requirement.region.iter().copied()),
+                output_size_for_work_plan(plan),
+            ),
+        };
+        Self {
+            plan,
+            mode,
+            pending_capture_passes,
+            active_work,
+        }
+    }
+
+    fn active_work(&self) -> &[OutputRect] {
+        &self.active_work
+    }
+
+    fn pending_checkpoint_requirements(&self) -> usize {
+        self.pending_capture_passes.len()
+    }
+
+    fn mark_capture_satisfied(&mut self, capture_pass: GraphPassId) -> bool {
+        let Some(index) = self
+            .pending_capture_passes
+            .iter()
+            .position(|pending| *pending == capture_pass)
+        else {
+            return false;
+        };
+        let previous = self.active_work.clone();
+        self.pending_capture_passes.remove(index);
+        if self.mode == SceneReplayWorkMode::SuffixDemand {
+            self.active_work = normalize_scene_replay_work(
+                &self.plan.presentation_work,
+                self.plan
+                    .checkpoint_requirements
+                    .iter()
+                    .filter(|requirement| {
+                        self.pending_capture_passes
+                            .contains(&requirement.capture_pass)
+                    })
+                    .flat_map(|requirement| requirement.region.iter().copied()),
+                output_size_for_work_plan(self.plan),
+            );
+            debug_assert!(
+                output_rects_to_effect_region(&self.active_work)
+                    .subtract(&output_rects_to_effect_region(&previous))
+                    .is_empty(),
+                "scene replay work must only shrink after a capture succeeds"
+            );
+        }
+        true
+    }
+
+    fn force_baseline(&mut self) {
+        self.mode = SceneReplayWorkMode::GlobalBaseline;
+        self.active_work = self.plan.baseline_work.clone();
+    }
+}
+
+fn output_size_for_work_plan(plan: &SceneReplayWorkPlan) -> (u32, u32) {
+    plan.output_size
+}
+
+fn normalize_scene_replay_work(
+    presentation_work: &[OutputRect],
+    checkpoint_work: impl IntoIterator<Item = OutputRect>,
+    output_size: (u32, u32),
+) -> Vec<OutputRect> {
+    let mut rects = presentation_work.to_vec();
+    rects.extend(checkpoint_work);
+    let coalesced = OutputDamage::rects(output_size.0, output_size.1, rects);
+    let rects = match coalesced {
+        OutputDamage::Empty => Vec::new(),
+        OutputDamage::Full => vec![full_output_rect(output_size)],
+        OutputDamage::Rects(rects) => rects,
+    };
+    disjoint_output_rects(rects, output_size)
+}
+
+fn extra_scene_work(
+    scene_work_rects: &[OutputRect],
+    repaint_rects: &[OutputRect],
+) -> Vec<OutputRect> {
+    let mut extra_scene_work = Vec::new();
+    for scene_rect in scene_work_rects {
+        let mut fragments = vec![*scene_rect];
+        for repaint_rect in repaint_rects {
+            let mut next = Vec::new();
+            for fragment in fragments {
+                next.extend(subtract_output_rect(fragment, *repaint_rect));
+            }
+            fragments = next;
+            if fragments.is_empty() {
+                break;
+            }
+        }
+        extra_scene_work.extend(fragments);
+    }
+    extra_scene_work
+}
+
+fn scene_replay_work_plan(
     repaint_rects: &[OutputRect],
     graph: &CompiledFrameGraph,
     selection: &EffectExecutionSelection,
     output_size: (u32, u32),
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
-) -> SceneWorkRegions {
+) -> SceneReplayWorkPlan {
     let presentation_work = repaint_rects.to_vec();
-    let mut checkpoint_work = Vec::new();
+    let mut checkpoint_requirements = Vec::new();
     for pass in &graph.passes {
         if !selection.executed_passes.contains(&pass.id)
             || !is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config)
@@ -3693,37 +3854,12 @@ fn scene_work_regions(
         let Some(rect) = clipped_output_rect(texture.domain, output_size) else {
             continue;
         };
-        checkpoint_work.push(rect);
+        checkpoint_requirements.push(SceneCheckpointRequirement {
+            capture_pass: pass.id,
+            region: vec![rect],
+        });
     }
-
-    let mut rects = presentation_work.clone();
-    rects.extend(checkpoint_work.iter().copied());
-    let coalesced = OutputDamage::rects(output_size.0, output_size.1, rects);
-    let scene_work_rects = match coalesced {
-        OutputDamage::Empty => Vec::new(),
-        OutputDamage::Full => vec![full_output_rect(output_size)],
-        OutputDamage::Rects(rects) => rects,
-    };
-    let scene_work_rects = disjoint_output_rects(scene_work_rects, output_size);
-    let mut extra_scene_work = Vec::new();
-    for scene_rect in &scene_work_rects {
-        let mut fragments = vec![*scene_rect];
-        for repaint_rect in repaint_rects {
-            let mut next = Vec::new();
-            for fragment in fragments {
-                next.extend(subtract_output_rect(fragment, *repaint_rect));
-            }
-            fragments = next;
-            if fragments.is_empty() {
-                break;
-            }
-        }
-        extra_scene_work.extend(fragments);
-    }
-    SceneWorkRegions {
-        scene_work_rects,
-        extra_scene_work,
-    }
+    SceneReplayWorkPlan::new(presentation_work, checkpoint_requirements, output_size)
 }
 
 fn disjoint_output_rects(rects: Vec<OutputRect>, output_size: (u32, u32)) -> Vec<OutputRect> {
@@ -4615,7 +4751,7 @@ mod tests {
             EffectDebugCaptureMode::Framebuffer,
             EffectDebugKawaseMode::Partial,
         );
-        let regions = scene_work_regions(
+        let regions = scene_replay_work_plan(
             &[OutputRect::new(5, 6, 7, 8)],
             &graph,
             &selection,
@@ -4623,7 +4759,7 @@ mod tests {
             false,
             config,
         );
-        let work = &regions.scene_work_rects;
+        let work = &regions.baseline_work;
 
         assert!(work.contains(&OutputRect::new(5, 6, 7, 8)));
         assert!(work.contains(&OutputRect::new(40, 30, 60, 50)));
@@ -4635,7 +4771,7 @@ mod tests {
         );
         assert!(work.len() <= MAX_EFFECT_REGION_RECTS);
 
-        let coalesced = scene_work_regions(
+        let coalesced = scene_replay_work_plan(
             &[OutputRect::new(5, 6, 50, 40)],
             &graph,
             &selection,
@@ -4643,7 +4779,7 @@ mod tests {
             false,
             config,
         )
-        .scene_work_rects;
+        .baseline_work;
         assert_eq!(coalesced.len(), 3);
         for (index, first) in coalesced.iter().enumerate() {
             for second in coalesced.iter().skip(index + 1) {
@@ -4689,7 +4825,7 @@ mod tests {
             EffectDebugKawaseMode::Partial,
         );
 
-        let regions = scene_work_regions(
+        let regions = scene_replay_work_plan(
             &[OutputRect::new(24, 20, 8, 8)],
             &graph,
             &selection,
@@ -4700,14 +4836,14 @@ mod tests {
 
         assert!(
             regions
-                .scene_work_rects
+                .baseline_work
                 .iter()
                 .any(|rect| rect.x <= capture_domain.x
                     && rect.y <= capture_domain.y
                     && rect.x + rect.width as i32 >= capture_domain.right()
                     && rect.y + rect.height as i32 >= capture_domain.bottom()),
             "replay checkpoint capture must expand internal scene work to its exact source domain: {:?}",
-            regions.scene_work_rects
+            regions.baseline_work
         );
         assert!(!regions.extra_scene_work.is_empty());
     }
@@ -4741,7 +4877,7 @@ mod tests {
             executed_passes: vec![pass.id],
             ..EffectExecutionSelection::default()
         };
-        let regions = scene_work_regions(
+        let regions = scene_replay_work_plan(
             &[OutputRect::new(10, 10, 4, 4)],
             &graph,
             &selection,
@@ -4753,7 +4889,7 @@ mod tests {
             ),
         );
 
-        assert!(regions.scene_work_rects.iter().any(|rect| {
+        assert!(regions.baseline_work.iter().any(|rect| {
             rect.x <= capture_domain.x
                 && rect.y <= capture_domain.y
                 && rect.x + rect.width as i32 >= capture_domain.right()
@@ -6252,5 +6388,179 @@ mod tests {
         );
         assert!(!selection.executed_instances.contains(&unrelated));
         assert_eq!(repaint_plan.mode, RepaintMode::Partial);
+    }
+
+    fn test_checkpoint_requirement(pass: u16, rects: &[OutputRect]) -> SceneCheckpointRequirement {
+        SceneCheckpointRequirement {
+            capture_pass: GraphPassId::new(pass).expect("test checkpoint pass id"),
+            region: rects.to_vec(),
+        }
+    }
+
+    fn test_scene_replay_plan(
+        presentation: &[OutputRect],
+        requirements: &[SceneCheckpointRequirement],
+    ) -> SceneReplayWorkPlan {
+        SceneReplayWorkPlan::new(
+            presentation.to_vec(),
+            requirements.to_vec(),
+            (100, 100),
+        )
+    }
+
+    fn assert_same_output_region(actual: &[OutputRect], expected: &[OutputRect]) {
+        let actual = output_rects_to_effect_region(actual);
+        let expected = output_rects_to_effect_region(expected);
+        assert!(
+            actual.subtract(&expected).is_empty(),
+            "actual work contains pixels outside expected work: {actual:?} vs {expected:?}"
+        );
+        assert!(
+            expected.subtract(&actual).is_empty(),
+            "expected work contains pixels outside actual work: {expected:?} vs {actual:?}"
+        );
+    }
+
+    fn output_work_pixels(rects: &[OutputRect]) -> u64 {
+        rects.iter().fold(0, |pixels, rect| {
+            pixels.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+        })
+    }
+
+    #[test]
+    fn scene_replay_work_one_checkpoint_expires_after_capture() {
+        let presentation = OutputRect::new(0, 0, 10, 10);
+        let checkpoint = OutputRect::new(20, 0, 10, 10);
+        let requirement = test_checkpoint_requirement(1, &[checkpoint]);
+        let plan = test_scene_replay_plan(&[presentation], &[requirement]);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+
+        assert_same_output_region(state.active_work(), &[presentation, checkpoint]);
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+        assert_same_output_region(state.active_work(), &[presentation]);
+        assert_eq!(state.pending_checkpoint_requirements(), 0);
+    }
+
+    #[test]
+    fn scene_replay_work_two_checkpoints_expires_as_a_suffix() {
+        let presentation = OutputRect::new(0, 0, 10, 10);
+        let checkpoint_a = OutputRect::new(20, 0, 10, 10);
+        let checkpoint_b = OutputRect::new(40, 0, 10, 10);
+        let requirements = [
+            test_checkpoint_requirement(1, &[checkpoint_a]),
+            test_checkpoint_requirement(2, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[presentation], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+
+        assert_eq!(output_work_pixels(state.active_work()), 300);
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+        assert_same_output_region(state.active_work(), &[presentation, checkpoint_b]);
+        assert_eq!(output_work_pixels(state.active_work()), 200);
+        state.mark_capture_satisfied(GraphPassId::new(2).unwrap());
+        assert_same_output_region(state.active_work(), &[presentation]);
+        assert_eq!(output_work_pixels(state.active_work()), 100);
+    }
+
+    #[test]
+    fn scene_replay_work_overlapping_checkpoints_keep_pending_overlap() {
+        let checkpoint_a = OutputRect::new(0, 0, 20, 20);
+        let checkpoint_b = OutputRect::new(10, 0, 20, 20);
+        let requirements = [
+            test_checkpoint_requirement(1, &[checkpoint_a]),
+            test_checkpoint_requirement(2, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+        assert_same_output_region(state.active_work(), &[checkpoint_b]);
+        assert!(state.active_work().iter().any(|rect| {
+            rect.x <= 10
+                && rect.y <= 0
+                && rect.x + rect.width as i32 >= 30
+                && rect.y + rect.height as i32 >= 20
+        }));
+    }
+
+    #[test]
+    fn scene_replay_work_same_anchor_uses_pass_lifetime_not_cursor_position() {
+        let checkpoint_a = OutputRect::new(0, 0, 10, 10);
+        let checkpoint_b = OutputRect::new(20, 0, 10, 10);
+        let requirements = [
+            test_checkpoint_requirement(10, &[checkpoint_a]),
+            test_checkpoint_requirement(11, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+
+        let scene_cursor = 10;
+        state.mark_capture_satisfied(GraphPassId::new(10).unwrap());
+        assert_eq!(scene_cursor, 10);
+        assert_eq!(state.pending_checkpoint_requirements(), 1);
+        assert_same_output_region(state.active_work(), &[checkpoint_b]);
+
+        state.mark_capture_satisfied(GraphPassId::new(11).unwrap());
+        assert_eq!(state.pending_checkpoint_requirements(), 0);
+        assert!(state.active_work().is_empty());
+    }
+
+    #[test]
+    fn scene_replay_work_presentation_overlap_creates_no_duplicate_fragment() {
+        let presentation = OutputRect::new(0, 0, 20, 20);
+        let requirement = test_checkpoint_requirement(1, &[OutputRect::new(5, 5, 5, 5)]);
+        let plan = test_scene_replay_plan(&[presentation], &[requirement]);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+
+        assert_eq!(state.active_work(), &[presentation]);
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+        assert_eq!(state.active_work(), &[presentation]);
+    }
+
+    #[test]
+    fn scene_replay_work_without_checkpoints_is_presentation_only() {
+        let presentation = OutputRect::new(12, 14, 18, 16);
+        let plan = test_scene_replay_plan(&[presentation], &[]);
+        let state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+
+        assert_eq!(state.active_work(), &[presentation]);
+        assert_eq!(state.pending_checkpoint_requirements(), 0);
+    }
+
+    #[test]
+    fn scene_replay_work_global_baseline_is_stable_after_capture() {
+        let presentation = OutputRect::new(0, 0, 10, 10);
+        let checkpoint_a = OutputRect::new(20, 0, 10, 10);
+        let checkpoint_b = OutputRect::new(40, 0, 10, 10);
+        let requirements = [
+            test_checkpoint_requirement(1, &[checkpoint_a]),
+            test_checkpoint_requirement(2, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[presentation], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::GlobalBaseline);
+
+        let baseline = state.active_work().to_vec();
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+        state.mark_capture_satisfied(GraphPassId::new(2).unwrap());
+        assert_eq!(state.active_work(), baseline.as_slice());
+    }
+
+    #[test]
+    fn scene_replay_work_has_strict_reduction_after_an_earlier_capture() {
+        let presentation = OutputRect::new(0, 0, 20, 20);
+        let checkpoint_a = OutputRect::new(30, 0, 20, 20);
+        let checkpoint_b = OutputRect::new(60, 0, 20, 20);
+        let requirements = [
+            test_checkpoint_requirement(1, &[checkpoint_a]),
+            test_checkpoint_requirement(2, &[checkpoint_b]),
+        ];
+        let plan = test_scene_replay_plan(&[presentation], &requirements);
+        let mut state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+        let initial_pixels = output_work_pixels(state.active_work());
+
+        state.mark_capture_satisfied(GraphPassId::new(1).unwrap());
+
+        assert!(output_work_pixels(state.active_work()) < initial_pixels);
+        assert_same_output_region(state.active_work(), &[presentation, checkpoint_b]);
     }
 }
