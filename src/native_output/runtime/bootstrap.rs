@@ -548,7 +548,7 @@ impl NativeRuntime {
         let pageflip_timeout_owner: NativePageflipTimeoutOwner = kms_commit_worker_transport.into();
         let initial_wake_plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns: scheduler_anchor_ns,
-            scheduler_deadline: scheduler_deadline_for_timeout_owner(
+            scheduler_wake_requirement: scheduler_deadline_for_timeout_owner(
                 frame_scheduler
                     .page_flip_watchdog_deadline_ns()
                     .map(|at_ns| oblivion_one::native::scheduler::SchedulerWakeDeadline {
@@ -556,7 +556,9 @@ impl NativeRuntime {
                         at_ns,
                     }),
                 pageflip_timeout_owner,
-            ),
+            )
+            .map(NativeSchedulerWakeRequirement::Deadline)
+            .unwrap_or_default(),
             explicit_sync_fallback_deadline_ns: acquire_watches.next_fallback_deadline_ns(),
             xwayland_timeout_deadline_ns: xwayland.next_deadline_ns(),
             control_timeout_deadline_ns: initial_control_timeout_deadline

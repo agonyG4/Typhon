@@ -3,7 +3,9 @@ use oblivion_one::native::event_loop::NativeEventLoop;
 pub(crate) use oblivion_one::native::event_loop::{
     NativeContinuationReason, NativeContinuationReasons,
 };
-use oblivion_one::native::scheduler::{SchedulerWakeDeadline, SchedulerWakeDeadlineKind};
+use oblivion_one::native::scheduler::{
+    SchedulerDecision, SchedulerWakeDeadline, SchedulerWakeDeadlineKind,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum NativePageflipTimeoutOwner {
@@ -57,6 +59,29 @@ pub(crate) struct NativeDeadline {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum NativeSchedulerWakeRequirement {
+    #[default]
+    None,
+    Deadline(NativeDeadline),
+    ImmediatePresentation {
+        action: SchedulerDecision,
+    },
+}
+
+impl NativeSchedulerWakeRequirement {
+    pub(crate) const fn deadline(self) -> Option<NativeDeadline> {
+        match self {
+            Self::Deadline(deadline) => Some(deadline),
+            Self::None | Self::ImmediatePresentation { .. } => None,
+        }
+    }
+
+    pub(crate) const fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeWakePlan {
     pub(crate) continuation: NativeContinuationReasons,
     pub(crate) deadline: Option<NativeDeadline>,
@@ -65,7 +90,8 @@ pub(crate) struct NativeWakePlan {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeWakePlanInputs {
     pub(crate) now_ns: u64,
-    pub(crate) scheduler_deadline: Option<NativeDeadline>,
+    pub(crate) scheduler_wake_requirement: NativeSchedulerWakeRequirement,
+    pub(crate) primary_deadline: Option<NativeDeadline>,
     pub(crate) atomic_commit_watchdog_deadline_ns: Option<u64>,
     pub(crate) explicit_sync_fallback_deadline_ns: Option<u64>,
     pub(crate) xwayland_timeout_deadline_ns: Option<u64>,
@@ -95,6 +121,7 @@ pub(crate) struct NativeWakeAuthorityMetrics {
     pub(crate) xwayland_continuations: u64,
     pub(crate) control_timeout_continuations: u64,
     pub(crate) scene_visual_debt_continuations: u64,
+    pub(crate) frame_scheduler_continuations: u64,
     pub(crate) scene_visual_debt_without_wake_owner: u64,
     pub(crate) deadline_owner_frame_scheduler: u64,
     pub(crate) deadline_owner_presentation_target: u64,
@@ -132,6 +159,10 @@ impl NativeWakeAuthorityMetrics {
             NativeContinuationReason::SceneVisualDebt => {
                 self.scene_visual_debt_continuations =
                     self.scene_visual_debt_continuations.saturating_add(1)
+            }
+            NativeContinuationReason::FrameScheduler => {
+                self.frame_scheduler_continuations =
+                    self.frame_scheduler_continuations.saturating_add(1)
             }
         }
     }
@@ -227,7 +258,7 @@ impl NativeWakeAuthorityMetrics {
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
         format!(
-            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={}",
+            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={}",
             self.runtime_timer_arms,
             self.runtime_timer_disarms,
             event_loop.continuation_requests(),
@@ -239,6 +270,7 @@ impl NativeWakeAuthorityMetrics {
             self.xwayland_continuations,
             self.control_timeout_continuations,
             self.scene_visual_debt_continuations,
+            self.frame_scheduler_continuations,
             self.scene_visual_debt_without_wake_owner,
             self.stale_deadline_rearms,
             self.past_deadline_arms,
@@ -293,6 +325,13 @@ impl NativeWakeAuthorityMetrics {
 
 pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWakePlan {
     let mut continuation = NativeContinuationReasons::default();
+    let mut deadline = inputs.scheduler_wake_requirement.deadline();
+    if matches!(
+        inputs.scheduler_wake_requirement,
+        NativeSchedulerWakeRequirement::ImmediatePresentation { .. }
+    ) {
+        continuation = continuation.insert(NativeContinuationReason::FrameScheduler);
+    }
     if inputs.input_backlog {
         continuation = continuation.insert(NativeContinuationReason::InputBacklog);
     }
@@ -312,7 +351,7 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
         continuation = continuation.insert(NativeContinuationReason::SceneVisualDebt);
     }
 
-    let mut deadline = inputs.scheduler_deadline;
+    deadline = earliest_deadline(deadline, inputs.primary_deadline);
     deadline = earliest_deadline(
         deadline,
         inputs
@@ -408,6 +447,44 @@ pub(crate) fn scheduler_deadline_for_timeout_owner(
         .map(native_deadline_from_scheduler)
 }
 
+pub(crate) fn scheduler_wake_requirement_for_action(
+    action: SchedulerDecision,
+    deadline: Option<SchedulerWakeDeadline>,
+    owner: NativePageflipTimeoutOwner,
+) -> NativeSchedulerWakeRequirement {
+    match action {
+        SchedulerDecision::WaitForRefresh => scheduler_deadline_for_timeout_owner(deadline, owner)
+            .map_or(
+                NativeSchedulerWakeRequirement::None,
+                NativeSchedulerWakeRequirement::Deadline,
+            ),
+        SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => {
+            scheduler_deadline_for_timeout_owner(
+                deadline.filter(|deadline| {
+                    deadline.kind == SchedulerWakeDeadlineKind::PageFlipWatchdog
+                }),
+                owner,
+            )
+            .map_or(
+                NativeSchedulerWakeRequirement::None,
+                NativeSchedulerWakeRequirement::Deadline,
+            )
+        }
+        SchedulerDecision::WaitForWorkerQueue | SchedulerDecision::Idle => {
+            NativeSchedulerWakeRequirement::None
+        }
+        SchedulerDecision::Render
+        | SchedulerDecision::RenderAhead
+        | SchedulerDecision::SubmitReady
+        | SchedulerDecision::SubmitReadyLate
+        | SchedulerDecision::ReadyTargetInvalidated
+        | SchedulerDecision::CompleteProtocolOnly
+        | SchedulerDecision::PageFlipWatchdogExpired => {
+            NativeSchedulerWakeRequirement::ImmediatePresentation { action }
+        }
+    }
+}
+
 pub(crate) fn atomic_commit_watchdog_deadline_for_timeout_owner(
     deadline_ns: Option<u64>,
     owner: NativePageflipTimeoutOwner,
@@ -433,6 +510,59 @@ const fn earliest_deadline(
 mod tests {
     use super::*;
     use crate::native_output::runtime::NativeCursorOutputArbitration;
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
+    };
+    use oblivion_one::native::scheduler::{
+        NativeFrameScheduler, NativeOutputPacingMode, SchedulerCapabilities, SchedulerDecision,
+        SchedulerFrameContext, apply_atomic_commit_lane_guard,
+    };
+    use std::time::Duration;
+
+    fn ready_target(submit_not_before: u64) -> PresentationTarget {
+        let presentation_time = submit_not_before.saturating_add(1_000_000);
+        PresentationTarget {
+            sequence: 1,
+            presentation_time: MonotonicTimestampNs::new(presentation_time),
+            submit_not_before: MonotonicTimestampNs::new(submit_not_before),
+            render_start_deadline: MonotonicTimestampNs::new(submit_not_before),
+            refresh_interval: Duration::from_nanos(6_060_606),
+            reason: PresentationTargetReason::PredictedPressure,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: MonotonicTimestampNs::new(presentation_time),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
+        }
+    }
+
+    fn ready_frame_observation(now_ns: u64) -> (SchedulerDecision, Option<SchedulerWakeDeadline>) {
+        let target = ready_target(5_000_000);
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.note_ready_frame(Some(target));
+        let action = scheduler.decision_with_context(SchedulerFrameContext {
+            pacing_mode: NativeOutputPacingMode::PredictiveTriple,
+            capabilities: SchedulerCapabilities::legacy(),
+            presentation_target: Some(target),
+            predicted_total_cost: Duration::ZERO,
+            now: MonotonicTimestampNs::new(now_ns),
+            render_target_available: true,
+            render_ahead_allowed: false,
+            ready_frame_present: true,
+            ready_target_current: true,
+            worker_queue_available: false,
+        });
+        let wake_deadline =
+            matches!(action, SchedulerDecision::WaitForRefresh).then_some(SchedulerWakeDeadline {
+                kind: SchedulerWakeDeadlineKind::SubmitNotBefore,
+                at_ns: target.submit_not_before().get(),
+            });
+        (action, wake_deadline)
+    }
 
     fn cursor_wake_plan(
         arbitration: &NativeCursorOutputArbitration,
@@ -449,7 +579,6 @@ mod tests {
     fn expired_visual_deadline_is_not_selected_for_worker_blocker() {
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns: 5_000_000,
-            scheduler_deadline: None,
             input_backlog: false,
             astrea_publication: false,
             commit_timing_planning: false,
@@ -462,10 +591,129 @@ mod tests {
     }
 
     #[test]
+    fn future_ready_frame_owns_submit_boundary_deadline() {
+        let (action, scheduler_deadline) = ready_frame_observation(4_999_999);
+        assert_eq!(action, SchedulerDecision::WaitForRefresh);
+        let requirement = scheduler_wake_requirement_for_action(
+            action,
+            scheduler_deadline,
+            NativePageflipTimeoutOwner::MainThread,
+        );
+
+        assert_eq!(
+            requirement,
+            NativeSchedulerWakeRequirement::Deadline(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 5_000_000,
+            })
+        );
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: requirement,
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            plan.deadline.map(|deadline| deadline.at_ns),
+            Some(5_000_000)
+        );
+        assert!(
+            !plan
+                .continuation
+                .contains(NativeContinuationReason::FrameScheduler)
+        );
+    }
+
+    #[test]
+    fn actionable_ready_frame_owns_immediate_presentation_continuation() {
+        let (action, scheduler_deadline) = ready_frame_observation(5_000_001);
+        assert_eq!(action, SchedulerDecision::SubmitReady);
+        assert_eq!(scheduler_deadline, None);
+        let requirement = scheduler_wake_requirement_for_action(
+            action,
+            scheduler_deadline,
+            NativePageflipTimeoutOwner::MainThread,
+        );
+
+        assert_eq!(
+            requirement,
+            NativeSchedulerWakeRequirement::ImmediatePresentation { action }
+        );
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: requirement,
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(plan.deadline, None);
+        assert!(
+            plan.continuation
+                .contains(NativeContinuationReason::FrameScheduler)
+        );
+    }
+
+    #[test]
+    fn ready_frame_boundary_transition_retains_a_runtime_wake_owner() {
+        let (first_action, first_deadline) = ready_frame_observation(4_999_999);
+        let first_requirement = scheduler_wake_requirement_for_action(
+            first_action,
+            first_deadline,
+            NativePageflipTimeoutOwner::MainThread,
+        );
+        let (second_action, second_deadline) = ready_frame_observation(5_000_001);
+        let second_requirement = scheduler_wake_requirement_for_action(
+            second_action,
+            second_deadline,
+            NativePageflipTimeoutOwner::MainThread,
+        );
+        let first = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: first_requirement,
+            ..NativeWakePlanInputs::default()
+        });
+        let second = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: second_requirement,
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert_eq!(
+            first.deadline.map(|deadline| deadline.at_ns),
+            Some(5_000_000)
+        );
+        assert_eq!(second.deadline, None);
+        assert!(
+            second
+                .continuation
+                .contains(NativeContinuationReason::FrameScheduler)
+        );
+    }
+
+    #[test]
+    fn lane_blocked_ready_frame_does_not_request_scheduler_continuation() {
+        let guarded = apply_atomic_commit_lane_guard(SchedulerDecision::SubmitReady, true, false);
+        assert_eq!(guarded, SchedulerDecision::WaitForPageFlip);
+        assert_eq!(
+            scheduler_wake_requirement_for_action(
+                guarded,
+                None,
+                NativePageflipTimeoutOwner::MainThread,
+            ),
+            NativeSchedulerWakeRequirement::None
+        );
+    }
+
+    #[test]
+    fn worker_queue_wait_does_not_request_scheduler_continuation() {
+        assert_eq!(
+            scheduler_wake_requirement_for_action(
+                SchedulerDecision::WaitForWorkerQueue,
+                None,
+                NativePageflipTimeoutOwner::KmsWorker,
+            ),
+            NativeSchedulerWakeRequirement::None
+        );
+    }
+
+    #[test]
     fn future_refresh_deadline_is_selected_with_owner() {
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns: 4_000_000,
-            scheduler_deadline: Some(NativeDeadline {
+            primary_deadline: Some(NativeDeadline {
                 owner: NativeDeadlineOwner::FrameScheduler,
                 at_ns: 5_000_000,
             }),
@@ -538,6 +786,20 @@ mod tests {
     }
 
     #[test]
+    fn frame_scheduler_continuation_is_counted_in_wake_authority_summary() {
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        metrics.note_continuation(NativeContinuationReason::FrameScheduler);
+        let event_loop = NativeEventLoop::new().unwrap();
+
+        assert_eq!(metrics.frame_scheduler_continuations, 1);
+        assert!(
+            metrics
+                .summary_line(&event_loop)
+                .contains("frame_scheduler_continuations=1")
+        );
+    }
+
+    #[test]
     fn all_immediate_reasons_are_coalesced_without_a_timer() {
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             input_backlog: true,
@@ -587,7 +849,7 @@ mod tests {
     #[test]
     fn scheduler_wake_is_sufficient_owner_for_future_visual_debt() {
         let plan = build_native_wake_plan(NativeWakePlanInputs {
-            scheduler_deadline: Some(NativeDeadline {
+            primary_deadline: Some(NativeDeadline {
                 owner: NativeDeadlineOwner::PresentationTarget,
                 at_ns: 20_000,
             }),
@@ -740,7 +1002,12 @@ mod tests {
 
         let plan =
             build_native_wake_plan(NativeWakePlanInputs {
-                scheduler_deadline: scheduler_deadline_for_timeout_owner(scheduler_watchdog, owner),
+                scheduler_wake_requirement: scheduler_deadline_for_timeout_owner(
+                    scheduler_watchdog,
+                    owner,
+                )
+                .map(NativeSchedulerWakeRequirement::Deadline)
+                .unwrap_or_default(),
                 atomic_commit_watchdog_deadline_ns:
                     atomic_commit_watchdog_deadline_for_timeout_owner(Some(1_000), owner),
                 explicit_sync_fallback_deadline_ns: Some(3_000),
@@ -779,7 +1046,9 @@ mod tests {
         );
 
         let plan = build_native_wake_plan(NativeWakePlanInputs {
-            scheduler_deadline: scheduler_watchdog,
+            scheduler_wake_requirement: scheduler_watchdog
+                .map(NativeSchedulerWakeRequirement::Deadline)
+                .unwrap_or_default(),
             atomic_commit_watchdog_deadline_ns: Some(1_000),
             ..NativeWakePlanInputs::default()
         });

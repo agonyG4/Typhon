@@ -216,6 +216,9 @@ impl NativeWorkDomains {
         let presentation = reasons.drm()
             || reasons.kms_commit_worker()
             || reasons.output_render_fence()
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::FrameScheduler)
             || state.visual_work_deadline_due
             || state.visual_scene_debt
             || state.cursor_only_due
@@ -343,6 +346,22 @@ mod tests {
         assert!(!domains.wayland_dispatch);
         assert!(!domains.presentation);
         assert!(!domains.cursor);
+    }
+
+    #[test]
+    fn frame_scheduler_continuation_is_presentation_only() {
+        let mut wake = wakeup(0);
+        wake.continuation =
+            NativeContinuationReasons::default().insert(NativeContinuationReason::FrameScheduler);
+
+        let domains = NativeWorkDomains::classify(&wake, &state());
+        let plan = domains.operation_plan();
+
+        assert!(domains.presentation);
+        assert!(!domains.scene);
+        assert!(plan.presentation_due);
+        assert!(!plan.visual_scene_debt);
+        assert!(!plan.service_acquire_and_prepare);
     }
 
     #[test]

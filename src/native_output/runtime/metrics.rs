@@ -12,7 +12,8 @@ use oblivion_one::control_snapshots::{
     SignedTimingSummarySnapshot, TimingSummarySnapshot, WorkerTimingPerformanceSnapshot,
 };
 use oblivion_one::native::scheduler::{
-    SchedulerWakeDeadline, SchedulerWakeDeadlineKind, apply_atomic_commit_lane_guard,
+    SchedulerDecision, SchedulerWakeDeadline, SchedulerWakeDeadlineKind,
+    apply_atomic_commit_lane_guard,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -388,10 +389,10 @@ fn xwayland_scene_metric_fields(
 }
 
 impl NativeRuntime {
-    pub(super) fn current_scheduler_wake_deadline(
+    pub(super) fn current_scheduler_wake_requirement(
         &mut self,
         now_ns: u64,
-    ) -> NativeResult<Option<NativeDeadline>> {
+    ) -> NativeResult<NativeSchedulerWakeRequirement> {
         let predicted_total_cost = Duration::from_nanos(
             self.render_journal
                 .prediction_with_kms_guard(
@@ -440,12 +441,14 @@ impl NativeRuntime {
                 self.atomic_commit_arbiter.atomic_commit_pending(),
                 can_queue_worker_next,
             );
-            return Ok((action == decision.action)
+            let scheduler_deadline = (action == decision.action)
                 .then_some(decision.wake_deadline)
-                .flatten()
-                .and_then(|deadline| {
-                    scheduler_deadline_for_timeout_owner(Some(deadline), pageflip_timeout_owner)
-                }));
+                .flatten();
+            return Ok(scheduler_wake_requirement_for_action(
+                action,
+                scheduler_deadline,
+                pageflip_timeout_owner,
+            ));
         }
 
         let decision = self
@@ -465,22 +468,22 @@ impl NativeRuntime {
         let deadline = match decision {
             SchedulerDecision::WaitForRefresh => {
                 if let Some(target) = self.frame_scheduler.ready_target() {
-                    (now_ns < target.submit_not_before().get()).then_some(NativeDeadline {
-                        owner: NativeDeadlineOwner::PresentationTarget,
+                    (now_ns < target.submit_not_before().get()).then_some(SchedulerWakeDeadline {
+                        kind: SchedulerWakeDeadlineKind::SubmitNotBefore,
                         at_ns: target.submit_not_before().get(),
                     })
                 } else if self.frame_scheduler.visual_work_queued() {
                     self.scheduled_presentation_target
                         .filter(|target| now_ns < target.render_start_deadline.get())
-                        .map(|target| NativeDeadline {
-                            owner: NativeDeadlineOwner::PresentationTarget,
+                        .map(|target| SchedulerWakeDeadline {
+                            kind: SchedulerWakeDeadlineKind::RenderStart,
                             at_ns: target.render_start_deadline.get(),
                         })
                 } else {
                     self.frame_scheduler
                         .next_deadline_ns()
-                        .map(|at_ns| NativeDeadline {
-                            owner: NativeDeadlineOwner::FrameScheduler,
+                        .map(|at_ns| SchedulerWakeDeadline {
+                            kind: SchedulerWakeDeadlineKind::ProtocolRefresh,
                             at_ns,
                         })
                 }
@@ -488,17 +491,13 @@ impl NativeRuntime {
             // Buffer and page-flip ownership is external readiness.  Preserve
             // only the genuine page-flip watchdog; never reuse a visual
             // target deadline as a poll for either owner.
-            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => {
-                scheduler_deadline_for_timeout_owner(
-                    self.frame_scheduler
-                        .page_flip_watchdog_deadline_ns()
-                        .map(|at_ns| SchedulerWakeDeadline {
-                            kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
-                            at_ns,
-                        }),
-                    pageflip_timeout_owner,
-                )
-            }
+            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
+                .frame_scheduler
+                .page_flip_watchdog_deadline_ns()
+                .map(|at_ns| SchedulerWakeDeadline {
+                    kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
+                    at_ns,
+                }),
             SchedulerDecision::Idle
             | SchedulerDecision::Render
             | SchedulerDecision::RenderAhead
@@ -509,7 +508,11 @@ impl NativeRuntime {
             | SchedulerDecision::WaitForWorkerQueue
             | SchedulerDecision::PageFlipWatchdogExpired => None,
         };
-        Ok(deadline)
+        Ok(scheduler_wake_requirement_for_action(
+            decision,
+            deadline,
+            pageflip_timeout_owner,
+        ))
     }
 
     pub(super) fn install_native_wake_plan(
@@ -526,6 +529,7 @@ impl NativeRuntime {
             NativeContinuationReason::XwaylandContinuation,
             NativeContinuationReason::ControlTimeout,
             NativeContinuationReason::SceneVisualDebt,
+            NativeContinuationReason::FrameScheduler,
         ] {
             if plan.continuation.contains(reason) {
                 self.wake_authority.note_continuation(reason);
@@ -1354,7 +1358,8 @@ impl NativeRuntime {
         });
         let now_ns = monotonic_now_ns()?;
         let scheduler_deadline = self
-            .current_scheduler_wake_deadline(now_ns)?
+            .current_scheduler_wake_requirement(now_ns)?
+            .deadline()
             .map(|deadline| deadline.at_ns);
         self.frame_pacing.note_deadline_state(
             scheduler_decision,

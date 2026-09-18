@@ -94,9 +94,11 @@ pub(crate) use resource_efficiency::{
 };
 pub(crate) use scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
 pub(super) use wake_plan::{
-    NativeDeadline, NativeDeadlineOwner, NativePageflipTimeoutOwner, NativeWakeAuthorityMetrics,
-    NativeWakePlan, NativeWakePlanInputs, atomic_commit_watchdog_deadline_for_timeout_owner,
+    NativeDeadline, NativeDeadlineOwner, NativePageflipTimeoutOwner,
+    NativeSchedulerWakeRequirement, NativeWakeAuthorityMetrics, NativeWakePlan,
+    NativeWakePlanInputs, atomic_commit_watchdog_deadline_for_timeout_owner,
     build_native_wake_plan, scheduler_deadline_for_timeout_owner,
+    scheduler_wake_requirement_for_action,
 };
 pub(super) use work_domains::{NativeRuntimeState, NativeWorkDomains};
 

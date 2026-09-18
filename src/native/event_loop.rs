@@ -247,6 +247,7 @@ pub enum NativeContinuationReason {
     XwaylandContinuation,
     ControlTimeout,
     SceneVisualDebt,
+    FrameScheduler,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -259,6 +260,7 @@ impl NativeContinuationReasons {
     const XWAYLAND_CONTINUATION: u32 = 1 << 3;
     const CONTROL_TIMEOUT: u32 = 1 << 4;
     const SCENE_VISUAL_DEBT: u32 = 1 << 5;
+    const FRAME_SCHEDULER: u32 = 1 << 6;
 
     pub const fn contains(self, reason: NativeContinuationReason) -> bool {
         self.0 & reason.bit() != 0
@@ -295,6 +297,7 @@ impl NativeContinuationReason {
             Self::XwaylandContinuation => NativeContinuationReasons::XWAYLAND_CONTINUATION,
             Self::ControlTimeout => NativeContinuationReasons::CONTROL_TIMEOUT,
             Self::SceneVisualDebt => NativeContinuationReasons::SCENE_VISUAL_DEBT,
+            Self::FrameScheduler => NativeContinuationReasons::FRAME_SCHEDULER,
         }
     }
 }
@@ -1634,6 +1637,12 @@ mod tests {
         event_loop
             .request_continuation(NativeContinuationReason::XwaylandContinuation)
             .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::FrameScheduler)
+            .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::FrameScheduler)
+            .unwrap();
 
         let wakeup = event_loop.wait().unwrap();
         assert!(wakeup.reasons.runtime_continuation());
@@ -1657,8 +1666,13 @@ mod tests {
                 .continuation
                 .contains(NativeContinuationReason::XwaylandContinuation)
         );
-        assert_eq!(event_loop.continuation_requests(), 4);
-        assert_eq!(event_loop.continuation_coalesced(), 3);
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::FrameScheduler)
+        );
+        assert_eq!(event_loop.continuation_requests(), 6);
+        assert_eq!(event_loop.continuation_coalesced(), 5);
         assert_eq!(event_loop.continuation_wakes(), 1);
     }
 

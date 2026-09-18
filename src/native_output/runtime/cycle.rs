@@ -825,7 +825,7 @@ impl NativeRuntime {
                     let control_timeout_deadline = self.control_server.next_deadline_ns();
                     let plan = build_native_wake_plan(NativeWakePlanInputs {
                         now_ns,
-                        scheduler_deadline: Some(NativeDeadline {
+                        primary_deadline: Some(NativeDeadline {
                             owner: NativeDeadlineOwner::ControlTimeout,
                             at_ns: now_ns.saturating_add(50_000_000),
                         }),
@@ -854,7 +854,7 @@ impl NativeRuntime {
         let control_timeout_deadline = self.control_server.next_deadline_ns();
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
-            scheduler_deadline: self
+            primary_deadline: self
                 .shutdown
                 .pageflip_deadline_ns()
                 .map(|at_ns| NativeDeadline {
@@ -878,7 +878,7 @@ impl NativeRuntime {
         let control_timeout_deadline = self.control_server.next_deadline_ns();
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
-            scheduler_deadline: self.shutdown.suspended_reactor_deadline_ns().map(|at_ns| {
+            primary_deadline: self.shutdown.suspended_reactor_deadline_ns().map(|at_ns| {
                 NativeDeadline {
                     owner: NativeDeadlineOwner::ControlTimeout,
                     at_ns,

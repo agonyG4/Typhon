@@ -17,7 +17,7 @@ impl NativeRuntime {
             .then(|| self.server.next_surface_pacing_deadline_ns())
             .flatten();
         let control_timeout_deadline = self.control_server.next_deadline_ns();
-        let scheduler_deadline = self.current_scheduler_wake_deadline(now_ns)?;
+        let scheduler_wake_requirement = self.current_scheduler_wake_requirement(now_ns)?;
         let visual_scene_debt = super::commit_timing::logical_scene_changed(
             self.last_rendered_scene_generation,
             self.server.scene_render_generation(),
@@ -26,11 +26,12 @@ impl NativeRuntime {
             || self.atomic_commit_arbiter.atomic_commit_pending()
             || self.output_render_fence_token.is_some();
         let scene_visual_debt_continuation = visual_scene_debt
-            && scheduler_deadline.is_none()
+            && scheduler_wake_requirement.is_none()
             && !scene_visual_debt_has_external_wake_owner;
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
-            scheduler_deadline,
+            primary_deadline: None,
+            scheduler_wake_requirement,
             atomic_commit_watchdog_deadline_ns: atomic_commit_watchdog_deadline_for_timeout_owner(
                 self.atomic_commit_arbiter.watchdog_deadline_ns(),
                 pageflip_timeout_owner,
@@ -74,6 +75,11 @@ impl NativeRuntime {
                     NativeDeadlineOwner::SurfacePacing => "deadline:surface_pacing",
                     NativeDeadlineOwner::DmabufRetry => "deadline:dmabuf_retry",
                 }
+            } else if plan
+                .continuation
+                .contains(NativeContinuationReason::FrameScheduler)
+            {
+                "continuation:frame_scheduler"
             } else if plan
                 .continuation
                 .contains(NativeContinuationReason::SceneVisualDebt)
