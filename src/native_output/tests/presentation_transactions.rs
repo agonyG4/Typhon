@@ -13,9 +13,10 @@ use crate::native_output::runtime::{
 };
 use crate::native_output::{ExplicitOutputCounters, OutputPresentationMode};
 use oblivion_one::compositor::{
-    CompositorFrameBatchId, SurfaceDamagePresentation as CompositorSurfaceDamagePresentation,
+    CompositorFrameBatchId, PresentationFeedbackBatchId,
+    SurfaceDamagePresentation as CompositorSurfaceDamagePresentation,
 };
-use oblivion_one::native::kms::AtomicCursorVisualState;
+use oblivion_one::native::kms::{AtomicCursorVisualState, PageFlipToken};
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::num::NonZeroU64;
@@ -1553,6 +1554,76 @@ fn cursor_only_plane_delta_owns_its_exact_surface_damage_token() {
             .frame_batch_id(),
         None
     );
+}
+
+#[test]
+fn cursor_only_plane_delta_owns_only_a_presentation_feedback_batch() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let presentation_batch_id = PresentationFeedbackBatchId::new(
+        NonZeroU64::new(7).expect("presentation feedback batch id is non-zero"),
+    );
+    let transaction = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        115,
+        Some(cursor_state(93)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_presentation_feedback_batch(presentation_batch_id)
+    .expect("plane delta accepts presentation-only ownership");
+    ledger.insert(transaction).unwrap();
+
+    let descriptor = ledger.transaction(id).unwrap().descriptor();
+    assert_eq!(descriptor.obligations().frame_batch_id(), None);
+    assert_eq!(
+        descriptor.obligations().presentation_feedback_batch_id(),
+        Some(presentation_batch_id)
+    );
+    ledger
+        .validate_terminal_ownership()
+        .expect("presentation-only owner is tracked exactly once");
+}
+
+#[test]
+fn cursor_only_plane_delta_releases_presentation_only_owner_at_pageflip() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let token = PageFlipToken::new(11).unwrap();
+    let presentation_batch_id = PresentationFeedbackBatchId::new(NonZeroU64::new(8).unwrap());
+    let transaction = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        115,
+        Some(cursor_state(93)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_presentation_feedback_batch(presentation_batch_id)
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+    ledger
+        .mark_presented(id, token, 1, MonotonicTimestampNs::new(30), Some(2))
+        .unwrap();
+
+    assert!(ledger.transaction_including_terminal(id).is_some());
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id),
+        None
+    );
+    assert_eq!(ledger.counters().presented_plane_delta, 1);
 }
 
 #[test]

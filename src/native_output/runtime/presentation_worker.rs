@@ -7,7 +7,8 @@ use super::presentation_cursor::{
 };
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    present_compatibility_frame, settle_failed_output_transaction, submit_plane_delta,
+    effective_output_presentation, present_compatibility_frame, settle_failed_output_transaction,
+    submit_plane_delta,
 };
 use super::*;
 use crate::native_output::kms_worker::{
@@ -671,6 +672,7 @@ fn settle_failed_direct_worker_transaction(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn queue_plane_delta_for_presentation(
     worker: &KmsCommitWorkerHandle,
+    server: &mut OwnCompositorServer,
     cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
@@ -686,12 +688,15 @@ pub(super) fn queue_plane_delta_for_presentation(
     attachable_primary: Option<crate::native_output::kms_worker::AttachablePrimary>,
     cursor_action: crate::native_output::presentation::plane_policy::CursorPlaneAction,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
     cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
     cursor_reveal: Option<(u64, u64)>,
     cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<SchedulerDecision> {
     match queue_plane_delta(
         worker,
+        server,
         cursor,
         desired,
         atomic_commit_arbiter,
@@ -708,6 +713,8 @@ pub(super) fn queue_plane_delta_for_presentation(
         attachable_primary,
         cursor_action,
         cursor_delivery,
+        presentation_mode,
+        content_type,
         cursor_surface_damage,
         cursor_reveal,
         cursor_reveal_trace,
@@ -746,7 +753,7 @@ pub(super) fn present_cursor_for_presentation(
     perf: NativePerfLogger,
     client_cursor_active: bool,
     cursor_render_mode: &mut NativeCursorRenderMode,
-    server: &OwnCompositorServer,
+    server: &mut OwnCompositorServer,
     effective_cursor: &mut Option<AtomicCursorVisualState>,
     queued_redraw_requested: &mut bool,
     last_client_cursor_damage: &mut Option<NativeClientCursorDamageState>,
@@ -774,6 +781,13 @@ pub(super) fn present_cursor_for_presentation(
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let cursor_delivery = presented_delivery_for_plan(plane_plan, &desired);
+        let (presentation_mode, content_type) = effective_output_presentation(
+            server,
+            desired.as_ref().is_some_and(|state| state.visible),
+            Some(kms_backend),
+            output_generation,
+            pacing_mode,
+        );
         let trace_snapshot = if crate::pointer_debug::cursor_presentation_trace_enabled() {
             let trace_state = desired.clone().unwrap_or_else(|| {
                 let mut hidden = cursor.desired().clone();
@@ -794,6 +808,7 @@ pub(super) fn present_cursor_for_presentation(
         };
         let decision = queue_plane_delta_for_presentation(
             worker,
+            server,
             cursor,
             desired,
             atomic_commit_arbiter,
@@ -812,6 +827,8 @@ pub(super) fn present_cursor_for_presentation(
                 |plan| plan.decision.cursor_action,
             ),
             cursor_delivery,
+            presentation_mode,
+            content_type,
             cursor_surface_damage,
             server.cursor_reveal_authority().map(|reveal| {
                 (

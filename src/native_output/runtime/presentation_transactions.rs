@@ -22,7 +22,7 @@ pub(crate) struct DirectCallbackLeakMetrics {
     pub(crate) leaked_callbacks: u64,
 }
 
-fn effective_output_presentation(
+pub(crate) fn effective_output_presentation(
     server: &OwnCompositorServer,
     cursor_visible: bool,
     kms_backend: Option<&KmsBackendSelection>,
@@ -65,6 +65,66 @@ fn effective_output_presentation(
             |kms| kms.resolved_content_type(effective.content_type.drm_value()),
         ),
     )
+}
+
+pub(crate) fn take_client_cursor_presentation_feedback_batch(
+    server: &mut OwnCompositorServer,
+    presentation_key: Option<oblivion_one::compositor::SurfacePresentationCommitKey>,
+    cursor_delivery: PresentedCursorDelivery,
+    cursor_visible: bool,
+) -> Option<oblivion_one::compositor::PresentationFeedbackBatchId> {
+    if cursor_delivery != PresentedCursorDelivery::Hardware || !cursor_visible {
+        return None;
+    }
+    let presentation_key = presentation_key?;
+    server.take_presentation_feedback_batch_for_samples([presentation_key])
+}
+
+pub(crate) fn take_plane_delta_presentation_feedback_batch(
+    server: &mut OwnCompositorServer,
+    output_transactions: &OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    cursor_delivery: PresentedCursorDelivery,
+    cursor_visible: bool,
+) -> Option<oblivion_one::compositor::PresentationFeedbackBatchId> {
+    let source_key = output_transactions
+        .transaction(transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    take_client_cursor_presentation_feedback_batch(
+        server,
+        source_key,
+        cursor_delivery,
+        cursor_visible,
+    )
+}
+
+pub(crate) fn restore_presentation_feedback_obligation(
+    server: &mut OwnCompositorServer,
+    obligations: OutputProtocolObligations,
+) {
+    if let Some(batch_id) = obligations.presentation_feedback_batch_id() {
+        server.restore_presentation_feedback_batch_after_failure(batch_id);
+    }
+}
+
+pub(crate) fn discard_presentation_feedback_obligation(
+    server: &mut OwnCompositorServer,
+    obligations: OutputProtocolObligations,
+) {
+    if let Some(batch_id) = obligations.presentation_feedback_batch_id() {
+        server.discard_presentation_feedback_batch(batch_id);
+    }
+}
+
+pub(crate) fn complete_presentation_feedback_obligation(
+    server: &mut OwnCompositorServer,
+    obligations: OutputProtocolObligations,
+    presentation: FramePresentation,
+) -> NativeResult<()> {
+    if let Some(batch_id) = obligations.presentation_feedback_batch_id() {
+        server.complete_presentation_feedback_batch(batch_id, presentation);
+    }
+    Ok(())
 }
 
 pub(crate) fn direct_terminal_callback_owner_leaks(
@@ -772,6 +832,10 @@ pub(super) fn build_cursor_transaction(
     cursor_epoch: u64,
     desired: Option<&AtomicCursorVisualState>,
     surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
+    client_cursor_presentation_key: Option<oblivion_one::compositor::SurfacePresentationCommitKey>,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
+    presentation_feedback_batch_id: Option<oblivion_one::compositor::PresentationFeedbackBatchId>,
 ) -> NativeResult<OutputTransactionId> {
     let transaction_id = output_transactions
         .allocate_id()
@@ -787,7 +851,15 @@ pub(super) fn build_cursor_transaction(
         desired.cloned(),
         OutputReleasePlan::Pageflip,
     )
-    .map_err(io::Error::other)?;
+    .map_err(io::Error::other)?
+    .with_presentation_state(presentation_mode, content_type)
+    .with_client_cursor_presentation_key(client_cursor_presentation_key);
+    let transaction = match presentation_feedback_batch_id {
+        Some(batch_id) => transaction
+            .with_presentation_feedback_batch(batch_id)
+            .map_err(io::Error::other)?,
+        None => transaction,
+    };
     let transaction = if let Some(surface_damage) = surface_damage {
         transaction.with_surface_damage(surface_damage)
     } else {
@@ -829,7 +901,7 @@ pub(super) fn submit_plane_delta(
     current_client_cursor_damage: Option<NativeClientCursorDamageState>,
     current_software_cursor_damage: Option<NativeDamageRect>,
     cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
-    server: &OwnCompositorServer,
+    server: &mut OwnCompositorServer,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
 ) -> NativeResult<SchedulerDecision> {
     let cursor_capability_key = desired
@@ -837,7 +909,32 @@ pub(super) fn submit_plane_delta(
         .and_then(|state| cursor.capability_key_for(state));
     match kms_backend.test_atomic_cursor_flip(desired.as_ref()) {
         Ok(()) => {
-            let transaction_id = build_cursor_transaction(
+            let submitted_delivery = if desired.as_ref().is_some_and(|state| state.visible) {
+                PresentedCursorDelivery::Hardware
+            } else {
+                PresentedCursorDelivery::Hidden
+            };
+            let client_cursor_presentation_key =
+                cursor.client_source_key().and_then(|source_key| {
+                    server.presentation_commit_key_for_surface_commit(
+                        source_key.surface_id,
+                        oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
+                    )
+                });
+            let (presentation_mode, content_type) = effective_output_presentation(
+                server,
+                desired.as_ref().is_some_and(|state| state.visible),
+                Some(kms_backend),
+                output_generation,
+                pacing_mode,
+            );
+            let presentation_feedback_batch_id = take_client_cursor_presentation_feedback_batch(
+                server,
+                client_cursor_presentation_key,
+                submitted_delivery,
+                desired.as_ref().is_some_and(|state| state.visible),
+            );
+            let transaction_id = match build_cursor_transaction(
                 output_transactions,
                 presentation_trace,
                 output_generation,
@@ -846,7 +943,19 @@ pub(super) fn submit_plane_delta(
                 cursor_epoch,
                 desired.as_ref(),
                 cursor_surface_damage,
-            )?;
+                client_cursor_presentation_key,
+                presentation_mode,
+                content_type,
+                presentation_feedback_batch_id,
+            ) {
+                Ok(transaction_id) => transaction_id,
+                Err(error) => {
+                    if let Some(batch_id) = presentation_feedback_batch_id {
+                        server.restore_presentation_feedback_batch_after_failure(batch_id);
+                    }
+                    return Err(error);
+                }
+            };
             let token = PageFlipToken::new(allocate_native_page_flip_token())
                 .expect("allocated native pageflip token is nonzero");
             if let Err(error) = atomic_commit_arbiter.reserve(
@@ -865,7 +974,10 @@ pub(super) fn submit_plane_delta(
                     transaction_id,
                     OutputTransactionFailureStage::KmsSubmit,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    |_| Ok(()),
+                    |obligations| {
+                        restore_presentation_feedback_obligation(server, obligations);
+                        Ok(())
+                    },
                 )?;
                 return Err(Box::new(io::Error::other(error)));
             }
@@ -876,11 +988,6 @@ pub(super) fn submit_plane_delta(
                 hidden
             });
             let submitted_revision = cursor.revision_for_legacy_epoch(cursor_epoch);
-            let submitted_delivery = if submitted_state.visible {
-                PresentedCursorDelivery::Hardware
-            } else {
-                PresentedCursorDelivery::Hidden
-            };
             let trace_snapshot = cursor_reveal_trace_snapshot(
                 server,
                 &submitted_state,
@@ -969,7 +1076,10 @@ pub(super) fn submit_plane_delta(
                         transaction_id,
                         OutputTransactionFailureStage::KmsSubmit,
                         MonotonicTimestampNs::new(monotonic_now_ns()?),
-                        |_| Ok(()),
+                        |obligations| {
+                            restore_presentation_feedback_obligation(server, obligations);
+                            Ok(())
+                        },
                     )?;
                     defer_cursor_after_busy(
                         cursor_output_arbitration,
@@ -987,7 +1097,10 @@ pub(super) fn submit_plane_delta(
                         transaction_id,
                         OutputTransactionFailureStage::KmsSubmit,
                         MonotonicTimestampNs::new(monotonic_now_ns()?),
-                        |_| Ok(()),
+                        |obligations| {
+                            restore_presentation_feedback_obligation(server, obligations);
+                            Ok(())
+                        },
                     )?;
                     cursor.note_submit_failure_for(cursor_capability_key);
                     cursor.note_software_fallback();

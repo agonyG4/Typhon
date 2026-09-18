@@ -313,6 +313,18 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn complete_presentation_feedback_batch(
+        &mut self,
+        batch_id: PresentationFeedbackBatchId,
+        presentation: FramePresentation,
+    ) {
+        let batch = self
+            .presentation_feedback_batches
+            .remove(&batch_id)
+            .expect("missing presentation feedback batch at presentation");
+        self.complete_presentation_feedbacks(batch.feedbacks, presentation);
+    }
+
     pub(in crate::compositor) fn complete_direct_presentation_feedbacks(
         &mut self,
         feedbacks: Vec<PendingPresentationFeedback>,
@@ -919,6 +931,9 @@ impl CompositorState {
         for batch in self.frame_batches.values_mut() {
             discard_surface(&mut batch.presentation_feedbacks, surface_id);
         }
+        for batch in self.presentation_feedback_batches.values_mut() {
+            discard_surface(&mut batch.feedbacks, surface_id);
+        }
     }
 
     pub(in crate::compositor) fn discard_all_pending_presentation_feedbacks(&mut self) {
@@ -931,6 +946,11 @@ impl CompositorState {
         self.frame_eligible_pending_presentation_feedback_count = 0;
         for batch in self.frame_batches.values_mut() {
             for pending in std::mem::take(&mut batch.presentation_feedbacks) {
+                pending.feedback.discarded();
+            }
+        }
+        for batch in std::mem::take(&mut self.presentation_feedback_batches).into_values() {
+            for pending in batch.feedbacks {
                 pending.feedback.discarded();
             }
         }

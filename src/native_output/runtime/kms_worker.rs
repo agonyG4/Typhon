@@ -17,8 +17,8 @@ pub(super) use super::kms_worker_teardown::{
 };
 pub(super) use super::plane_cycle::{WorkerQueueOutcome, queue_plane_delta};
 use super::presentation_transactions::{
-    build_compatibility_transaction, settle_failed_output_transaction,
-    settle_forced_shutdown_transaction_if_safe,
+    build_compatibility_transaction, discard_presentation_feedback_obligation,
+    settle_failed_output_transaction, settle_forced_shutdown_transaction_if_safe,
 };
 use super::*;
 use crate::native_output::presentation::plane::CursorRevision;
@@ -651,6 +651,7 @@ impl NativeRuntime {
             token,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
+                discard_presentation_feedback_obligation(&mut self.server, obligations);
                 if let Some(batch_id) = obligations.frame_batch_id() {
                     self.server.complete_frame_batch_after_safe_abandonment(
                         batch_id,

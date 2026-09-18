@@ -1,4 +1,6 @@
-use super::presentation_transactions::complete_dropped_output_transaction;
+use super::presentation_transactions::{
+    complete_dropped_output_transaction, discard_presentation_feedback_obligation,
+};
 use super::*;
 use oblivion_one::compositor::FrameBatchDiscardReason;
 use oblivion_one::native::kms::KmsBackendKind;
@@ -457,6 +459,7 @@ impl NativeSessionIo for NativeRuntime {
                 OutputTransactionDropReason::SessionSuspended,
                 abandoned_at,
                 |obligations| {
+                    discard_presentation_feedback_obligation(server, obligations);
                     if let Some(batch_id) = obligations.frame_batch_id() {
                         server.complete_frame_batch_after_safe_abandonment(
                             batch_id,

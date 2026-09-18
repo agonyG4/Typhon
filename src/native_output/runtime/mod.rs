@@ -150,8 +150,8 @@ pub(crate) use planner::{
 pub(super) use presentation_pipeline::initial_presented;
 pub(crate) use presentation_transactions::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
-    direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
-    settle_no_visual_change_output_transaction,
+    direct_terminal_callback_owner_leaks, discard_presentation_feedback_obligation,
+    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
 };
 pub(crate) use session::{
     NativeSeatSwitch, NativeSessionLifecycle, NativeSessionTransition, NativeVtSwitchRequestStatus,
@@ -925,6 +925,7 @@ impl Drop for NativeRuntime {
                 OutputTransactionDropReason::OutputDestroyed,
                 abandoned_at,
                 |obligations| {
+                    discard_presentation_feedback_obligation(&mut self.server, obligations);
                     if let Some(batch_id) = obligations.frame_batch_id() {
                         self.server.complete_frame_batch_after_safe_abandonment(
                             batch_id,

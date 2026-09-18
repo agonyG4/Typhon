@@ -4,7 +4,7 @@ use std::{collections::HashMap, fmt, num::NonZeroU64};
 
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DrmContentType, OutputPresentationMode,
-    SurfaceDamagePresentation,
+    SurfaceDamagePresentation, SurfacePresentationCommitKey,
 };
 use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::AtomicCursorVisualState;
@@ -111,6 +111,7 @@ pub(crate) enum OutputTransactionBuildError {
     FrameBatchForPlaneDelta,
     DirectSurfaceForCompositedContent,
     DirectSurfaceForPlaneDelta,
+    PresentationFeedbackBatchForNonPlaneDelta,
     OverlayAssignmentsUnsupported,
 }
 
@@ -345,6 +346,7 @@ impl OutputSynchronizationPlan {
 pub(crate) struct OutputProtocolObligations {
     frame_batch_id: Option<CompositorFrameBatchId>,
     direct_surface_id: Option<u32>,
+    presentation_feedback_batch_id: Option<oblivion_one::compositor::PresentationFeedbackBatchId>,
 }
 
 impl OutputProtocolObligations {
@@ -352,6 +354,7 @@ impl OutputProtocolObligations {
         Self {
             frame_batch_id: Some(frame_batch_id),
             direct_surface_id: None,
+            presentation_feedback_batch_id: None,
         }
     }
 
@@ -362,6 +365,7 @@ impl OutputProtocolObligations {
         Self {
             frame_batch_id: Some(frame_batch_id),
             direct_surface_id: Some(direct_surface_id),
+            presentation_feedback_batch_id: None,
         }
     }
 
@@ -369,6 +373,7 @@ impl OutputProtocolObligations {
         Self {
             frame_batch_id: None,
             direct_surface_id: None,
+            presentation_feedback_batch_id: None,
         }
     }
 
@@ -378,6 +383,12 @@ impl OutputProtocolObligations {
 
     pub(crate) const fn direct_surface_id(self) -> Option<u32> {
         self.direct_surface_id
+    }
+
+    pub(crate) const fn presentation_feedback_batch_id(
+        self,
+    ) -> Option<oblivion_one::compositor::PresentationFeedbackBatchId> {
+        self.presentation_feedback_batch_id
     }
 }
 
@@ -397,6 +408,7 @@ pub(crate) struct OutputTransaction {
     synchronization: OutputSynchronizationPlan,
     obligations: OutputProtocolObligations,
     surface_damage: Option<SurfaceDamagePresentation>,
+    client_cursor_presentation_key: Option<SurfacePresentationCommitKey>,
 }
 
 impl OutputTransaction {
@@ -781,6 +793,7 @@ impl OutputTransaction {
             synchronization,
             obligations,
             surface_damage: None,
+            client_cursor_presentation_key: None,
         })
     }
 
@@ -869,6 +882,33 @@ impl OutputTransaction {
     ) -> Self {
         self.async_validation_key = key;
         self
+    }
+
+    pub(crate) fn with_presentation_feedback_batch(
+        mut self,
+        batch_id: oblivion_one::compositor::PresentationFeedbackBatchId,
+    ) -> Result<Self, OutputTransactionBuildError> {
+        if !matches!(self.content, OutputTransactionContent::PlaneDelta { .. }) {
+            return Err(OutputTransactionBuildError::PresentationFeedbackBatchForNonPlaneDelta);
+        }
+        debug_assert!(self.obligations.presentation_feedback_batch_id.is_none());
+        self.obligations.presentation_feedback_batch_id = Some(batch_id);
+        Ok(self)
+    }
+
+    pub(crate) fn with_client_cursor_presentation_key(
+        mut self,
+        presentation_key: Option<SurfacePresentationCommitKey>,
+    ) -> Self {
+        debug_assert!(self.client_cursor_presentation_key.is_none());
+        self.client_cursor_presentation_key = presentation_key;
+        self
+    }
+
+    pub(crate) const fn client_cursor_presentation_key(
+        &self,
+    ) -> Option<SurfacePresentationCommitKey> {
+        self.client_cursor_presentation_key
     }
 
     pub(crate) fn with_surface_damage(mut self, surface_damage: SurfaceDamagePresentation) -> Self {

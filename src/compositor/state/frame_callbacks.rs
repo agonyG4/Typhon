@@ -1,6 +1,7 @@
 use super::surface_transactions::ActiveSurfacePresentationCommit;
 use super::*;
 use crate::compositor::frame_batch::FrameCallbackPacingState;
+use std::num::NonZeroU64;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SurfaceFrameClockState {
@@ -456,6 +457,57 @@ impl CompositorState {
                 self.pending_presentation_feedbacks.push(feedback);
             }
         }
+    }
+
+    pub(in crate::compositor) fn take_presentation_feedback_batch_for_samples(
+        &mut self,
+        presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,
+    ) -> Option<PresentationFeedbackBatchId> {
+        let feedbacks = self.take_presentation_feedbacks_for_samples(
+            &presentation_samples.into_iter().collect::<HashSet<_>>(),
+        );
+        if feedbacks.is_empty() {
+            return None;
+        }
+        self.next_presentation_feedback_batch_id = self
+            .next_presentation_feedback_batch_id
+            .checked_add(1)
+            .expect("presentation feedback batch ID overflow");
+        let batch_id = PresentationFeedbackBatchId::new(
+            NonZeroU64::new(self.next_presentation_feedback_batch_id)
+                .expect("presentation feedback batch IDs start at one"),
+        );
+        let previous = self
+            .presentation_feedback_batches
+            .insert(batch_id, PresentationFeedbackBatch { feedbacks });
+        assert!(
+            previous.is_none(),
+            "presentation feedback batch ID was reused"
+        );
+        Some(batch_id)
+    }
+
+    pub(in crate::compositor) fn restore_presentation_feedback_batch_after_failure(
+        &mut self,
+        batch_id: PresentationFeedbackBatchId,
+    ) {
+        let batch = self
+            .presentation_feedback_batches
+            .remove(&batch_id)
+            .expect("missing presentation feedback batch on restore");
+        self.requeue_presentation_feedbacks_after_restore(batch.feedbacks);
+        self.rebuild_scene_work_index();
+    }
+
+    pub(in crate::compositor) fn discard_presentation_feedback_batch(
+        &mut self,
+        batch_id: PresentationFeedbackBatchId,
+    ) {
+        let batch = self
+            .presentation_feedback_batches
+            .remove(&batch_id)
+            .expect("missing presentation feedback batch on discard");
+        self.discard_presentation_feedbacks(batch.feedbacks);
     }
 
     fn pending_presentation_feedback_matches_active_commit(

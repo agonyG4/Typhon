@@ -26,6 +26,25 @@ impl CompositorFrameBatchId {
     }
 }
 
+/// Identifies a compositor-owned batch containing only presentation feedback.
+///
+/// Unlike [`CompositorFrameBatchId`], this never owns callbacks, pacing claims,
+/// buffer releases, surface damage, or render generations.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PresentationFeedbackBatchId(NonZeroU64);
+
+impl PresentationFeedbackBatchId {
+    #[doc(hidden)]
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DmabufGpuReleaseLeaseId(NonZeroU64);
@@ -146,6 +165,11 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) fifo_barrier_claims: Vec<FifoBarrierClaim>,
     pub(super) commit_timing_target_claims: Vec<CommitTimingTargetClaim>,
     pub(super) surface_damage: Option<SurfaceDamagePresentation>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PresentationFeedbackBatch {
+    pub(super) feedbacks: Vec<PendingPresentationFeedback>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

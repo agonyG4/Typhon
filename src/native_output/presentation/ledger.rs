@@ -3,9 +3,9 @@
 use super::transaction::{
     FramePresentationBindingError, OutputTransaction, OutputTransactionContent, OutputTransactionId,
 };
-use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::OutputPresentationMode;
 use oblivion_one::compositor::SurfaceDamagePresentation;
+use oblivion_one::compositor::{CompositorFrameBatchId, PresentationFeedbackBatchId};
 use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
@@ -162,6 +162,7 @@ pub(crate) enum OutputTransactionError {
     DuplicateId,
     UnknownTransaction,
     DuplicateObligationOwner,
+    PresentationFeedbackBatchForNonPlaneDelta,
     InvalidTransition {
         from: OutputTransactionStateKind,
         requested: OutputTransactionTransitionKind,
@@ -188,6 +189,18 @@ pub(crate) enum OutputTransactionOwnershipError {
     },
     OrphanedObligationOwner {
         batch_id: CompositorFrameBatchId,
+        transaction_id: OutputTransactionId,
+    },
+    MissingPresentationFeedbackOwner {
+        batch_id: PresentationFeedbackBatchId,
+    },
+    WrongPresentationFeedbackOwner {
+        batch_id: PresentationFeedbackBatchId,
+        expected: OutputTransactionId,
+        actual: OutputTransactionId,
+    },
+    OrphanedPresentationFeedbackOwner {
+        batch_id: PresentationFeedbackBatchId,
         transaction_id: OutputTransactionId,
     },
     SettlingCountMismatch {
@@ -298,6 +311,7 @@ pub(crate) struct OutputTransactionLedger {
     history_capacity: usize,
     active: HashMap<OutputTransactionId, OutputTransactionRecord>,
     obligation_owner: HashMap<CompositorFrameBatchId, OutputTransactionId>,
+    presentation_feedback_owner: HashMap<PresentationFeedbackBatchId, OutputTransactionId>,
     recent_terminal: VecDeque<OutputTransactionRecord>,
     settled_output_terminals: VecDeque<SettledOutputTerminal>,
     counters: OutputTransactionCounters,
@@ -348,6 +362,7 @@ impl OutputTransactionLedger {
             history_capacity: history_capacity.max(1),
             active: HashMap::new(),
             obligation_owner: HashMap::new(),
+            presentation_feedback_owner: HashMap::new(),
             recent_terminal: VecDeque::new(),
             settled_output_terminals: VecDeque::new(),
             counters: OutputTransactionCounters::default(),
@@ -398,6 +413,18 @@ impl OutputTransactionLedger {
         if let Some(batch_id) = descriptor.obligations().frame_batch_id() {
             self.obligation_owner.insert(batch_id, id);
         }
+        if let Some(batch_id) = descriptor.obligations().presentation_feedback_batch_id()
+            && self.presentation_feedback_owner.contains_key(&batch_id)
+        {
+            self.counters.duplicate_obligation_attempts = self
+                .counters
+                .duplicate_obligation_attempts
+                .saturating_add(1);
+            return Err(OutputTransactionError::DuplicateObligationOwner);
+        }
+        if let Some(batch_id) = descriptor.obligations().presentation_feedback_batch_id() {
+            self.presentation_feedback_owner.insert(batch_id, id);
+        }
         let content = descriptor.content();
         self.active.insert(
             id,
@@ -420,6 +447,38 @@ impl OutputTransactionLedger {
             }
         }
         self.counters.active_peak = self.counters.active_peak.max(self.active.len() as u64);
+        Ok(())
+    }
+
+    pub(crate) fn attach_presentation_feedback_batch(
+        &mut self,
+        id: OutputTransactionId,
+        batch_id: PresentationFeedbackBatchId,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(
+            state,
+            OutputTransactionState::Built | OutputTransactionState::Ready { .. }
+        ) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Ready));
+        }
+        if self.presentation_feedback_owner.contains_key(&batch_id) {
+            self.counters.duplicate_obligation_attempts = self
+                .counters
+                .duplicate_obligation_attempts
+                .saturating_add(1);
+            return Err(OutputTransactionError::DuplicateObligationOwner);
+        }
+        let record = self
+            .active
+            .get_mut(&id)
+            .expect("active transaction was observed above");
+        record.descriptor = record
+            .descriptor
+            .clone()
+            .with_presentation_feedback_batch(batch_id)
+            .map_err(|_| OutputTransactionError::PresentationFeedbackBatchForNonPlaneDelta)?;
+        self.presentation_feedback_owner.insert(batch_id, id);
         Ok(())
     }
     pub(crate) fn mark_ready(
@@ -860,6 +919,16 @@ impl OutputTransactionLedger {
                 Some(&accepted.transaction_id)
             );
         }
+        if let Some(batch_id) = record
+            .descriptor
+            .obligations()
+            .presentation_feedback_batch_id()
+        {
+            debug_assert_eq!(
+                self.presentation_feedback_owner.get(&batch_id),
+                Some(&accepted.transaction_id)
+            );
+        }
         self.finish_settling_committed(
             accepted.transaction_id,
             Some(accepted.prior_state),
@@ -1008,6 +1077,13 @@ impl OutputTransactionLedger {
         self.obligation_owner.get(&batch_id).copied()
     }
 
+    pub(crate) fn presentation_feedback_owner(
+        &self,
+        batch_id: PresentationFeedbackBatchId,
+    ) -> Option<OutputTransactionId> {
+        self.presentation_feedback_owner.get(&batch_id).copied()
+    }
+
     pub(crate) fn validate_terminal_ownership(
         &self,
     ) -> Result<(), OutputTransactionOwnershipError> {
@@ -1043,6 +1119,57 @@ impl OutputTransactionLedger {
                     batch_id,
                     transaction_id,
                 });
+            }
+        }
+        for record in self.active.values() {
+            let Some(batch_id) = record
+                .descriptor
+                .obligations()
+                .presentation_feedback_batch_id()
+            else {
+                continue;
+            };
+            match self.presentation_feedback_owner.get(&batch_id).copied() {
+                Some(owner) if owner == record.descriptor.id() => {}
+                Some(actual) => {
+                    return Err(
+                        OutputTransactionOwnershipError::WrongPresentationFeedbackOwner {
+                            batch_id,
+                            expected: record.descriptor.id(),
+                            actual,
+                        },
+                    );
+                }
+                None => {
+                    return Err(
+                        OutputTransactionOwnershipError::MissingPresentationFeedbackOwner {
+                            batch_id,
+                        },
+                    );
+                }
+            }
+        }
+        for (&batch_id, &transaction_id) in &self.presentation_feedback_owner {
+            let Some(record) = self.active.get(&transaction_id) else {
+                return Err(
+                    OutputTransactionOwnershipError::OrphanedPresentationFeedbackOwner {
+                        batch_id,
+                        transaction_id,
+                    },
+                );
+            };
+            if record
+                .descriptor
+                .obligations()
+                .presentation_feedback_batch_id()
+                != Some(batch_id)
+            {
+                return Err(
+                    OutputTransactionOwnershipError::OrphanedPresentationFeedbackOwner {
+                        batch_id,
+                        transaction_id,
+                    },
+                );
             }
         }
         let settling_records = self
@@ -1240,6 +1367,15 @@ impl OutputTransactionLedger {
         {
             return Err(self.reject_terminal(OutputTransactionError::DuplicateObligationOwner));
         }
+        if validate_obligation_owner
+            && let Some(batch_id) = record
+                .descriptor
+                .obligations()
+                .presentation_feedback_batch_id()
+            && self.presentation_feedback_owner.get(&batch_id).copied() != Some(id)
+        {
+            return Err(self.reject_terminal(OutputTransactionError::DuplicateObligationOwner));
+        }
         self.finish_settling_committed(id, prior_state, terminal);
         Ok(())
     }
@@ -1268,6 +1404,14 @@ impl OutputTransactionLedger {
             && self.obligation_owner.get(&batch_id).copied() == Some(id)
         {
             self.obligation_owner.remove(&batch_id);
+        }
+        if let Some(batch_id) = record
+            .descriptor
+            .obligations()
+            .presentation_feedback_batch_id()
+            && self.presentation_feedback_owner.get(&batch_id).copied() == Some(id)
+        {
+            self.presentation_feedback_owner.remove(&batch_id);
         }
         record.state = OutputTransactionState::Terminal(terminal);
         if self.recent_terminal.len() == self.history_capacity {

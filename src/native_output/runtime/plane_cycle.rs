@@ -13,7 +13,10 @@ use crate::native_output::presentation::{
     plane::{CursorRevision, PresentedCursorDelivery},
     plane_policy::CursorPlaneAction,
 };
-use crate::native_output::runtime::presentation_transactions::settle_failed_output_transaction;
+use crate::native_output::runtime::presentation_transactions::{
+    restore_presentation_feedback_obligation, settle_failed_output_transaction,
+    settle_superseded_output_transaction, take_plane_delta_presentation_feedback_batch,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkerQueueOutcome {
@@ -67,6 +70,7 @@ pub(super) fn plane_delta_reservation_outcome(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn queue_plane_delta(
     worker: &KmsCommitWorkerHandle,
+    server: &mut OwnCompositorServer,
     cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
@@ -82,12 +86,15 @@ pub(super) fn queue_plane_delta(
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
     cursor_surface_damage: Option<SurfaceDamagePresentation>,
     cursor_reveal: Option<(u64, u64)>,
     cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<WorkerQueueOutcome> {
-    let preparation = prepare_plane_delta(
+    let preparation = prepare_plane_delta_with_presentation(
         worker,
+        Some(server),
         cursor,
         desired,
         output_transactions,
@@ -101,6 +108,8 @@ pub(super) fn queue_plane_delta(
         attachable_primary,
         cursor_action,
         cursor_delivery,
+        presentation_mode,
+        content_type,
         cursor_surface_damage,
         cursor_reveal_trace,
     )?;
@@ -144,17 +153,41 @@ pub(super) fn queue_plane_delta(
     let permit = match worker.try_reserve_admission_slot() {
         Ok(permit) => permit,
         Err(error) => {
-            output_transactions
-                .mark_superseded(
-                    transaction_id,
-                    None,
-                    OutputTransactionSupersedeReason::SameContentSuppressed,
-                    MonotonicTimestampNs::new(monotonic_now_ns()?),
-                )
-                .map_err(io::Error::other)?;
+            settle_superseded_output_transaction(
+                output_transactions,
+                transaction_id,
+                None,
+                OutputTransactionSupersedeReason::SameContentSuppressed,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |obligations| {
+                    restore_presentation_feedback_obligation(server, obligations);
+                    Ok(())
+                },
+            )?;
             return Ok(WorkerQueueOutcome::Unavailable(error));
         }
     };
+    if let Some(batch_id) = take_plane_delta_presentation_feedback_batch(
+        server,
+        output_transactions,
+        transaction_id,
+        cursor_delivery,
+        desired.as_ref().is_some_and(|state| state.visible),
+    ) {
+        if let Err(error) =
+            output_transactions.attach_presentation_feedback_batch(transaction_id, batch_id)
+        {
+            server.restore_presentation_feedback_batch_after_failure(batch_id);
+            settle_failed_output_transaction(
+                output_transactions,
+                transaction_id,
+                OutputTransactionFailureStage::BackendOwnershipTransfer,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |_| Ok(()),
+            )?;
+            return Err(io::Error::other(error).into());
+        }
+    }
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
     let queued_at_ns = monotonic_now_ns()?;
@@ -173,7 +206,10 @@ pub(super) fn queue_plane_delta(
             transaction_id,
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(queued_at_ns),
-            |_| Ok(()),
+            |obligations| {
+                restore_presentation_feedback_obligation(server, obligations);
+                Ok(())
+            },
         )?;
         return Err(io::Error::other(error).into());
     }
@@ -191,7 +227,10 @@ pub(super) fn queue_plane_delta(
             transaction_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(queued_at_ns),
-            |_| Ok(()),
+            |obligations| {
+                restore_presentation_feedback_obligation(server, obligations);
+                Ok(())
+            },
         )?;
         return Ok(WorkerQueueOutcome::Unavailable(reason));
     }
@@ -274,7 +313,10 @@ pub(super) fn queue_plane_delta(
             transaction_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(queued_at_ns),
-            |_| Ok(()),
+            |obligations| {
+                restore_presentation_feedback_obligation(server, obligations);
+                Ok(())
+            },
         )?;
         return Err(io::Error::other(format!("invalid cursor worker payload: {error:?}")).into());
     }
@@ -312,7 +354,10 @@ pub(super) fn queue_plane_delta(
             transaction_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(queued_at_ns),
-            |_| Ok(()),
+            |obligations| {
+                restore_presentation_feedback_obligation(server, obligations);
+                Ok(())
+            },
         )?;
         return Err(error.into());
     }
@@ -325,7 +370,10 @@ pub(super) fn queue_plane_delta(
             transaction_id,
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
-            |_| Ok(()),
+            |obligations| {
+                restore_presentation_feedback_obligation(server, obligations);
+                Ok(())
+            },
         )?;
         return Err(io::Error::other(format!(
             "cursor Atomic worker enqueue failed: {:?}",
@@ -345,6 +393,7 @@ pub(super) fn queue_plane_delta(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn prepare_plane_delta(
     worker: &KmsCommitWorkerHandle,
     cursor: &mut NativeAtomicCursor,
@@ -360,6 +409,51 @@ pub(super) fn prepare_plane_delta(
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
+    cursor_surface_damage: Option<SurfaceDamagePresentation>,
+    cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
+) -> NativeResult<PlaneDeltaPreparation> {
+    prepare_plane_delta_with_presentation(
+        worker,
+        None,
+        cursor,
+        desired,
+        output_transactions,
+        presentation_trace,
+        target,
+        crtc_id,
+        output_generation,
+        pacing_mode,
+        cursor_epoch,
+        validation_base,
+        attachable_primary,
+        cursor_action,
+        cursor_delivery,
+        OutputPresentationMode::Vsync,
+        DrmContentType::Graphics,
+        cursor_surface_damage,
+        cursor_reveal_trace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_plane_delta_with_presentation(
+    worker: &KmsCommitWorkerHandle,
+    server: Option<&OwnCompositorServer>,
+    cursor: &mut NativeAtomicCursor,
+    desired: Option<AtomicCursorVisualState>,
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    target: PresentationTarget,
+    crtc_id: u32,
+    output_generation: u64,
+    pacing_mode: NativeOutputPacingMode,
+    cursor_epoch: u64,
+    validation_base: KmsValidationBase,
+    attachable_primary: Option<AttachablePrimary>,
+    cursor_action: CursorPlaneAction,
+    cursor_delivery: PresentedCursorDelivery,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
     cursor_surface_damage: Option<SurfaceDamagePresentation>,
     cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<PlaneDeltaPreparation> {
@@ -421,7 +515,16 @@ pub(super) fn prepare_plane_delta(
         desired.clone(),
         OutputReleasePlan::Pageflip,
     )
-    .map_err(io::Error::other)?;
+    .map_err(io::Error::other)?
+    .with_presentation_state(presentation_mode, content_type)
+    .with_client_cursor_presentation_key(server.and_then(|server| {
+        cursor.client_source_key().and_then(|source_key| {
+            server.presentation_commit_key_for_surface_commit(
+                source_key.surface_id,
+                oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
+            )
+        })
+    }));
     let transaction = if let Some(surface_damage) = cursor_surface_damage {
         transaction.with_surface_damage(surface_damage)
     } else {

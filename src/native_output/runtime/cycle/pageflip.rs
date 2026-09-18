@@ -2,7 +2,8 @@ use super::super::cursor_cycle::{complete_plane_delta_pageflip, complete_primary
 use super::super::kms_worker::drop_queued_worker_job_with_reason_parts;
 use super::super::presentation_cursor::trace_presented_cursor;
 use super::super::presentation_transactions::{
-    commit_prepared_presented_output_transaction, complete_presented_output_transaction,
+    commit_prepared_presented_output_transaction, complete_presentation_feedback_obligation,
+    complete_presented_output_transaction, discard_presentation_feedback_obligation,
     prepare_presented_output_transaction, settle_dropped_output_transaction,
 };
 use super::super::presentation_worker::promote_pageflip_and_publish;
@@ -458,6 +459,7 @@ pub(crate) fn abandon_overtaken_ready(
         OutputTransactionDropReason::SafeAbandonment,
         presented_at,
         |obligations| {
+            discard_presentation_feedback_obligation(server, obligations);
             if obligations.frame_batch_id() != Some(owner.protocol_batch_id) {
                 return Err(io::Error::other(
                     "overtaken READY transaction owns a different frame batch",
@@ -989,6 +991,27 @@ impl NativeRuntime {
                 // producer can be observed and scheduled immediately.
                 if let Some(transaction_id) = cursor_transaction_id {
                     let cursor_surface_damage = output_transactions.surface_damage(transaction_id);
+                    let cursor_presentation = output_transactions
+                        .transaction(transaction_id)
+                        .map(|record| record.descriptor().presentation_mode())
+                        .map(|presentation_mode| {
+                            if presentation_mode.is_async() {
+                                FramePresentation::tearing(
+                                    *presentation_clock,
+                                    pageflip.timestamp.seconds,
+                                    pageflip.timestamp.microseconds,
+                                    pageflip.sequence,
+                                )
+                            } else {
+                                FramePresentation::synchronized(
+                                    *presentation_clock,
+                                    pageflip.timestamp.seconds,
+                                    pageflip.timestamp.microseconds,
+                                    pageflip.sequence,
+                                )
+                            }
+                        })
+                        .transpose()?;
                     complete_presented_output_transaction(
                         output_transactions,
                         &mut self.presentation_trace,
@@ -997,9 +1020,16 @@ impl NativeRuntime {
                             .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
                         *drm_file_generation,
                         MonotonicTimestampNs::new(compositor_receive_ns),
-                        None,
+                        Some(u64::from(pageflip.sequence)),
                         |obligations| {
                             debug_assert!(obligations.frame_batch_id().is_none());
+                            if let Some(presentation) = cursor_presentation {
+                                complete_presentation_feedback_obligation(
+                                    server,
+                                    obligations,
+                                    presentation,
+                                )?;
+                            }
                             if let Some(surface_damage) = cursor_surface_damage {
                                 server.commit_surface_damage_presented(surface_damage);
                             }

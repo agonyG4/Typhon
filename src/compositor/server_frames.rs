@@ -456,6 +456,36 @@ impl OwnCompositorServer {
             .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples)
     }
 
+    pub fn take_presentation_feedback_batch_for_samples(
+        &mut self,
+        presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,
+    ) -> Option<PresentationFeedbackBatchId> {
+        self.state
+            .take_presentation_feedback_batch_for_samples(presentation_samples)
+    }
+
+    pub fn restore_presentation_feedback_batch_after_failure(
+        &mut self,
+        batch_id: PresentationFeedbackBatchId,
+    ) {
+        self.state
+            .restore_presentation_feedback_batch_after_failure(batch_id);
+    }
+
+    pub fn discard_presentation_feedback_batch(&mut self, batch_id: PresentationFeedbackBatchId) {
+        self.state.discard_presentation_feedback_batch(batch_id);
+    }
+
+    pub fn complete_presentation_feedback_batch(
+        &mut self,
+        batch_id: PresentationFeedbackBatchId,
+        presentation: FramePresentation,
+    ) {
+        self.state
+            .complete_presentation_feedback_batch(batch_id, presentation);
+        let _ = self.display.flush_clients();
+    }
+
     #[doc(hidden)]
     pub fn frame_batch_dmabuf_release_count(&self, batch_id: CompositorFrameBatchId) -> usize {
         self.state.frame_batch_dmabuf_release_count(batch_id)

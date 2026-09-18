@@ -167,9 +167,11 @@ pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{
     BufferReleaseMetrics, CompositorFrameBatchId, DmabufGpuReleaseLeaseId,
     ExplicitReleaseSignalRetryResult, FrameCallbackAdmission, FrameCallbackMetrics,
-    FrameCallbackTimingEvidence,
+    FrameCallbackTimingEvidence, PresentationFeedbackBatchId,
 };
-pub(crate) use frame_batch::{CompositorFrameBatch, DmabufGpuReleaseLease};
+pub(crate) use frame_batch::{
+    CompositorFrameBatch, DmabufGpuReleaseLease, PresentationFeedbackBatch,
+};
 pub use geometry::{
     SurfaceBufferMapping, SurfaceGeometryRect, SurfaceMappingError, SurfaceUvQuad,
     transform_buffer_pixel, transformed_buffer_size,
@@ -871,7 +873,9 @@ pub struct CompositorState {
     frame_eligible_pending_presentation_feedback_count: usize,
     frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     retired_frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
+    presentation_feedback_batches: HashMap<PresentationFeedbackBatchId, PresentationFeedbackBatch>,
     next_frame_batch_id: u64,
+    next_presentation_feedback_batch_id: u64,
     next_legacy_output_frame_id: u64,
     legacy_prepared_frame_batch: Option<CompositorFrameBatchId>,
     legacy_submitted_frame_batch: Option<CompositorFrameBatchId>,

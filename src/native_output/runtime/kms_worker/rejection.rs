@@ -4,6 +4,7 @@ use oblivion_one::native::kms::AtomicKmsError;
 
 use super::super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
+    discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
     settle_dropped_output_transaction, settle_failed_output_transaction,
 };
 use super::direct_rejection::WorkerRejectionKind;
@@ -139,6 +140,7 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
         drop_reason,
         MonotonicTimestampNs::new(monotonic_now_ns()?),
         |obligations| {
+            discard_presentation_feedback_obligation(server, obligations);
             if let Some(batch_id) = obligations.frame_batch_id() {
                 server.complete_frame_batch_after_safe_abandonment(
                     batch_id,
@@ -155,6 +157,7 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
             drop_reason,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
+                discard_presentation_feedback_obligation(server, obligations);
                 debug_assert!(obligations.frame_batch_id().is_none());
                 debug_assert!(obligations.direct_surface_id().is_none());
                 Ok(())
@@ -532,7 +535,9 @@ impl NativeRuntime {
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
-                if direct_job {
+                if matches!(job.kind, AtomicCommitKind::PlaneDelta { .. }) {
+                    restore_presentation_feedback_obligation(&mut self.server, obligations);
+                } else if direct_job {
                     let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                         io::Error::other("rejected direct transaction has no frame batch")
                     })?;
@@ -552,6 +557,7 @@ impl NativeRuntime {
                 OutputTransactionFailureStage::KmsSubmit,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
                 |obligations| {
+                    restore_presentation_feedback_obligation(&mut self.server, obligations);
                     debug_assert!(obligations.frame_batch_id().is_none());
                     debug_assert!(obligations.direct_surface_id().is_none());
                     Ok(())
@@ -682,6 +688,7 @@ impl NativeRuntime {
             drop_reason,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
+                discard_presentation_feedback_obligation(&mut self.server, obligations);
                 if let Some(batch_id) = obligations.frame_batch_id() {
                     self.server.complete_frame_batch_after_safe_abandonment(
                         batch_id,
@@ -698,6 +705,7 @@ impl NativeRuntime {
                 drop_reason,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
                 |obligations| {
+                    discard_presentation_feedback_obligation(&mut self.server, obligations);
                     debug_assert!(obligations.frame_batch_id().is_none());
                     debug_assert!(obligations.direct_surface_id().is_none());
                     Ok(())
