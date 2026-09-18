@@ -301,7 +301,9 @@ impl X11WindowRegistry {
         record.map_requested = true;
         record.map_authorized = false;
         record.mapped_notified = false;
-        record.inflight_wm_unmaps = 0;
+        if !remapping_iconic {
+            record.inflight_wm_unmaps = 0;
+        }
         if !remapping_iconic {
             record.snapshot = None;
             record.properties_ready = false;

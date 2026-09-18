@@ -2511,6 +2511,119 @@ fn iconic_client_map_request_starts_a_new_map_epoch() {
 }
 
 #[test]
+fn wm_unmap_command_then_map_command_consumes_late_confirmation() {
+    let generation = generation(32);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 132, true, true, true);
+    xwm.windows
+        .confirm_map_notify(handle)
+        .expect("initial MapNotify");
+    xwm.windows
+        .try_ready(handle)
+        .expect("known window")
+        .expect("ready window");
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Unmap(handle)).expect("WM unmap command");
+    let record = xwm.windows.get(handle).expect("window after WM unmap");
+    assert_eq!(record.lifecycle, X11WindowLifecycle::Iconic);
+    assert_eq!(record.inflight_wm_unmaps, 1);
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Map(handle))
+        .expect("restore map command");
+    assert_eq!(
+        xwm.windows
+            .get(handle)
+            .expect("restoring window")
+            .inflight_wm_unmaps,
+        1
+    );
+    normalize(&mut xwm, unmap_event(handle.xid())).expect("late WM UnmapNotify");
+
+    let events = ready_events(&mut xwm);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, XwmEvent::WindowWithdrawn(window) if *window == handle))
+    );
+    let record = xwm.windows.get(handle).expect("restoring window survives");
+    assert!(record.snapshot.is_some());
+    assert_eq!(record.inflight_wm_unmaps, 0);
+    assert_eq!(record.lifecycle, X11WindowLifecycle::MapCommanded);
+}
+
+#[test]
+fn client_map_request_then_late_wm_unmap_preserves_identity() {
+    let generation = generation(33);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 133, true, true, true);
+    xwm.windows
+        .confirm_map_notify(handle)
+        .expect("initial MapNotify");
+    xwm.windows
+        .try_ready(handle)
+        .expect("known window")
+        .expect("ready window");
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Unmap(handle)).expect("WM unmap command");
+    assert_eq!(
+        xwm.windows
+            .get(handle)
+            .expect("iconic window")
+            .inflight_wm_unmaps,
+        1
+    );
+
+    normalize(&mut xwm, map_request_event(handle.xid())).expect("client MapRequest");
+    assert_eq!(
+        xwm.windows
+            .get(handle)
+            .expect("client remap")
+            .inflight_wm_unmaps,
+        1
+    );
+    normalize(&mut xwm, unmap_event(handle.xid())).expect("late WM UnmapNotify");
+
+    let events = ready_events(&mut xwm);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, XwmEvent::WindowWithdrawn(window) if *window == handle))
+    );
+    let record = xwm.windows.get(handle).expect("client remap survives");
+    assert!(record.snapshot.is_some());
+    assert_eq!(record.inflight_wm_unmaps, 0);
+    assert_ne!(record.lifecycle, X11WindowLifecycle::Withdrawn);
+    assert_ne!(record.lifecycle, X11WindowLifecycle::Destroyed);
+}
+
+#[test]
+fn confirmed_wm_unmap_remains_iconic_before_restore() {
+    let generation = generation(34);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 134, true, true, true);
+    xwm.windows
+        .confirm_map_notify(handle)
+        .expect("initial MapNotify");
+    xwm.windows
+        .try_ready(handle)
+        .expect("known window")
+        .expect("ready window");
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Unmap(handle)).expect("WM unmap command");
+    normalize(&mut xwm, unmap_event(handle.xid())).expect("confirmed WM UnmapNotify");
+
+    let events = ready_events(&mut xwm);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, XwmEvent::WindowWithdrawn(window) if *window == handle))
+    );
+    let record = xwm.windows.get(handle).expect("iconic window survives");
+    assert_eq!(record.lifecycle, X11WindowLifecycle::Iconic);
+    assert_eq!(record.inflight_wm_unmaps, 0);
+}
+
+#[test]
 fn create_override_redirect_then_map_request_authorizes_managed_mapping() {
     let generation = generation(33);
     let (mut xwm, mut peer) = test_fixture(generation);
