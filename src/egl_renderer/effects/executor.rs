@@ -570,6 +570,13 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         false,
         debug_config,
     );
+    let mut scene_work_state = SceneReplayWorkState::new(
+        &scene_work,
+        scene_replay_work_mode(
+            false,
+            debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer,
+        ),
+    );
     let mut scene_cursor = 0;
     let layers = commands
         .iter()
@@ -587,10 +594,11 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         if !selection.executed_passes.contains(&pass.id) {
             continue;
         }
-        if matches!(
-            pass.kind,
-            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
-        ) && !pass.checkpoint_dependencies.is_empty()
+        if scene_advance_reason(
+            pass,
+            debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer,
+        )
+        .is_some()
         {
             let (draw_end, _) =
                 composition_range(commands, pass.anchor, pass.visual_group, pass.anchor_scope);
@@ -599,7 +607,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
                 commands,
                 scene_cursor,
                 draw_end,
-                &scene_work.baseline_work,
+                scene_work_state.active_work(),
             );
             scene_cursor = scene_cursor.max(draw_end.min(commands.len()));
         }
@@ -614,7 +622,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
                 commands,
                 scene_cursor,
                 draw_end,
-                &scene_work.baseline_work,
+                scene_work_state.active_work(),
             );
             scene_cursor = scene_cursor.max(next_cursor.min(commands.len()));
         }
@@ -648,6 +656,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
                 &indices,
                 &capture_rects,
             );
+            scene_work_state.mark_capture_satisfied(pass.id);
         }
     }
     add_surface_consumers_for_command_range(
@@ -655,7 +664,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         commands,
         scene_cursor,
         commands.len(),
-        &scene_work.baseline_work,
+        scene_work_state.active_work(),
     );
     plan.finish();
     plan
@@ -856,6 +865,17 @@ fn scene_advance_reason(
     }
     (pass.kind == RenderPassKind::SceneCapture && framebuffer_capture)
         .then_some("framebuffer_capture")
+}
+
+fn scene_replay_work_mode(
+    lifecycle_backdrop: bool,
+    framebuffer_capture: bool,
+) -> SceneReplayWorkMode {
+    if lifecycle_backdrop || framebuffer_capture {
+        SceneReplayWorkMode::GlobalBaseline
+    } else {
+        SceneReplayWorkMode::SuffixDemand
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4896,6 +4916,124 @@ mod tests {
                 && rect.y + rect.height as i32 >= capture_domain.bottom()
         }));
         assert!(!regions.extra_scene_work.is_empty());
+    }
+
+    #[test]
+    fn surface_consumer_plan_matches_scene_replay_work_state() {
+        let instance_a = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let instance_b = oblivion_one::effects::EffectInstanceId::new(2).unwrap();
+        let output_a = GraphTextureId::new(1).unwrap();
+        let output_b = GraphTextureId::new(2).unwrap();
+        let mut capture_a = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance_a,
+            Vec::new(),
+            output_a,
+            vec![GraphPassId::new(90).unwrap()],
+        );
+        capture_a.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(20);
+        capture_a.anchor_scope = oblivion_one::compositor::EffectAnchorScope::Surface;
+        let mut capture_b = test_pass(
+            2,
+            RenderPassKind::SurfaceCapture,
+            instance_b,
+            Vec::new(),
+            output_b,
+            vec![GraphPassId::new(91).unwrap()],
+        );
+        capture_b.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(30);
+        capture_b.anchor_scope = oblivion_one::compositor::EffectAnchorScope::Surface;
+        let graph = CompiledFrameGraph {
+            passes: vec![capture_a.clone(), capture_b.clone()],
+            textures: vec![
+                test_texture(
+                    1,
+                    GraphTextureSource::CapturedScene,
+                    oblivion_one::effects::EffectRect::new(20, 0, 10, 10).unwrap(),
+                ),
+                test_texture(
+                    2,
+                    GraphTextureSource::CapturedTarget,
+                    oblivion_one::effects::EffectRect::new(40, 0, 10, 10).unwrap(),
+                ),
+            ],
+            instances: Vec::new(),
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let selection = EffectExecutionSelection {
+            executed_passes: vec![capture_a.id, capture_b.id],
+            ..EffectExecutionSelection::default()
+        };
+        let commands = vec![
+            EglDrawCommand {
+                layer: EglDrawLayer::SolidRgba(0xff10_2030),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 10.0, 10.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ExactNearest,
+            },
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(20),
+                visual_group: None,
+                bounds: EglRect::new(20.0, 0.0, 10.0, 10.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ExactNearest,
+            },
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(30),
+                visual_group: None,
+                bounds: EglRect::new(40.0, 0.0, 10.0, 10.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ExactNearest,
+            },
+        ];
+        let demand = EffectExecutionDemand::new(Vec::new(), EffectRegion::empty());
+        let plan = scene_replay_work_plan(
+            &[OutputRect::new(0, 0, 10, 10)],
+            &graph,
+            &selection,
+            (100, 100),
+            false,
+            EffectDebugConfig::new(
+                EffectDebugCaptureMode::Replay,
+                EffectDebugKawaseMode::Partial,
+            ),
+        );
+        let mut expected_state = SceneReplayWorkState::new(&plan, SceneReplayWorkMode::SuffixDemand);
+        expected_state.mark_capture_satisfied(capture_a.id);
+        assert_same_output_region(
+            expected_state.active_work(),
+            &[
+                OutputRect::new(0, 0, 10, 10),
+                OutputRect::new(40, 0, 10, 10),
+            ],
+        );
+
+        let consumer_plan = plan_effect_surface_consumers_with_debug_config(
+            &graph,
+            &demand,
+            &selection,
+            &commands,
+            &[OutputRect::new(0, 0, 10, 10)],
+            (100, 100),
+            EffectDebugConfig::new(
+                EffectDebugCaptureMode::Replay,
+                EffectDebugKawaseMode::Partial,
+            ),
+        );
+        assert!(consumer_plan.surface_ids().contains(&30));
+        assert!(
+            !consumer_plan.surface_ids().contains(&20),
+            "surface A must not be planned after its checkpoint has retired"
+        );
     }
 
     #[test]
