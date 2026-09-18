@@ -988,10 +988,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             if server.state.toplevel_surfaces.len() == 1 {
                                 server.state.toplevel_surfaces.keys().next().and_then(
                                     |surface_id| {
+                                        let scene_node_id = server
+                                            .state
+                                            .presentation_scene_node_id_for_root(*surface_id)?;
                                         server
                                             .state
                                             .presentation_animator
-                                            .transition_curve(*surface_id)
+                                            .track_curve(scene_node_id)
                                     },
                                 )
                             } else {
@@ -1003,12 +1006,16 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         root_surface_id,
                         reply,
                     } => {
-                        let _ = reply.send(
-                            server
-                                .state
-                                .presentation_animator
-                                .transition_curve(root_surface_id),
-                        );
+                        let curve = server
+                            .state
+                            .presentation_scene_node_id_for_root(root_surface_id)
+                            .and_then(|scene_node_id| {
+                                server
+                                    .state
+                                    .presentation_animator
+                                    .track_curve(scene_node_id)
+                            });
+                        let _ = reply.send(curve);
                     }
                     ServerCommand::CapturePresentationTransitionStart {
                         root_surface_id,
@@ -1016,8 +1023,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     } => {
                         let sample = server
                             .state
-                            .presentation_animator
-                            .sample_at_transition_start(root_surface_id);
+                            .presentation_scene_node_id_for_root(root_surface_id)
+                            .and_then(|scene_node_id| {
+                                server
+                                    .state
+                                    .presentation_animator
+                                    .sample_at_transition_start_for_scene_node(scene_node_id)
+                            });
                         let _ = reply.send(sample);
                     }
                     ServerCommand::CaptureFocusedPresentationAfter {
@@ -1029,19 +1041,25 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .state
                                 .focused_root_surface_id()
                                 .and_then(|root_surface_id| {
+                                    let scene_node_id = server
+                                        .state
+                                        .presentation_scene_node_id_for_root(root_surface_id)?;
                                     server
                                         .state
                                         .presentation_animator
-                                        .transition_started_at(root_surface_id)
+                                        .transition_started_at_for_scene_node(scene_node_id)
                                         .and_then(|started_at| {
-                                            server.state.presentation_animator.sample(
-                                                root_surface_id,
-                                                AnimationTime::from_nanos(
-                                                    started_at
-                                                        .as_nanos()
-                                                        .saturating_add(elapsed_nanos),
-                                                ),
-                                            )
+                                            server
+                                                .state
+                                                .presentation_animator
+                                                .sample_for_scene_node(
+                                                    scene_node_id,
+                                                    AnimationTime::from_nanos(
+                                                        started_at
+                                                            .as_nanos()
+                                                            .saturating_add(elapsed_nanos),
+                                                    ),
+                                                )
                                         })
                                 });
                         let _ = reply.send(sample);
@@ -1065,7 +1083,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CancelFocusedPresentationTransition => {
                         if let Some(surface_id) = server.state.focused_root_surface_id() {
-                            server.state.presentation_animator.cancel(surface_id);
+                            server
+                                .state
+                                .cancel_presentation_geometry_for_root(surface_id);
                         }
                     }
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
@@ -1573,10 +1593,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         elapsed_nanos,
                     } => {
                         if let Some(root_surface_id) = server.state.focused_root_surface_id()
+                            && let Some(scene_node_id) = server
+                                .state
+                                .presentation_scene_node_id_for_root(root_surface_id)
                             && let Some(started_at) = server
                                 .state
                                 .presentation_animator
-                                .transition_started_at(root_surface_id)
+                                .transition_started_at_for_scene_node(scene_node_id)
                         {
                             server.publish_test_presentation_at(
                                 frame_id,

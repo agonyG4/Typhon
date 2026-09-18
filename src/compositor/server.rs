@@ -1276,6 +1276,21 @@ impl OwnCompositorServer {
             .presentation_scene_sample_for_targets_at(at, targets)
     }
 
+    pub fn presentation_scene_sample_for_targets_at_with_source(
+        &self,
+        at: AnimationTime,
+        source: crate::presentation_animation::PresentationSampleTimeSource,
+        targets: &NativeFramePresentationTargets,
+    ) -> PresentationSceneSample {
+        self.state
+            .presentation_scene_sample_for_targets_at_with_source(at, source, targets)
+    }
+
+    pub fn presentation_scene_node_id_for_root(&self, root_surface_id: u32) -> Option<SceneNodeId> {
+        self.state
+            .presentation_scene_node_id_for_root(root_surface_id)
+    }
+
     pub fn apply_presentation_to_native_frame_surfaces<'a>(
         &self,
         surfaces: Cow<'a, [RenderableSurface]>,
@@ -1606,9 +1621,10 @@ impl OwnCompositorServer {
     pub fn resolved_effect_scene_for_presentation(
         &self,
         presentation: &PresentationSceneSample,
+        fullscreen_plan: &FullscreenCompositionPlan,
     ) -> ResolvedEffectScene {
         self.state
-            .resolved_effect_scene_with_presentation(presentation)
+            .resolved_effect_scene_with_presentation(presentation, fullscreen_plan)
     }
 
     pub fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {

@@ -234,6 +234,7 @@ impl CompositorState {
         self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window = self.desktop_windows.remove(&id)?;
+        self.cancel_presentation_geometry_for_root(window.root_surface_id);
         self.remove_window_scene_nodes(id);
         for child in self.desktop_windows.values_mut() {
             if child.relationships.parent == Some(id) {

@@ -910,7 +910,7 @@ mod task_05_8_tests {
                 .reasons()
                 .contains(&DirectScanoutSceneRejection::AnimationTransform)
         );
-        state.presentation_animator.cancel(502);
+        state.cancel_presentation_geometry_for_root(502);
         let fullscreen_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &hidden_sample,
             state.presented_window_geometries_for_targets(&hidden_sample, &hidden_targets),
@@ -1149,7 +1149,7 @@ mod task_05_8_tests {
         let retarget_at = AnimationTime::from_nanos(10_000_000);
         let before = state
             .presentation_animator
-            .sample(root_id, retarget_at)
+            .sample_compat(root_id, retarget_at)
             .expect("active KDE transition");
         assert_eq!(
             state.presentation_animator.transition_curve(root_id),
@@ -1184,7 +1184,7 @@ mod task_05_8_tests {
         );
         let after = state
             .presentation_animator
-            .sample(root_id, retarget_at)
+            .sample_compat(root_id, retarget_at)
             .expect("retargeted macOS transition");
         assert_eq!(
             state.presentation_animator.transition_curve(root_id),
@@ -1219,7 +1219,7 @@ mod task_05_8_tests {
         let retarget_at = AnimationTime::from_nanos(10_000_000);
         let before = state
             .presentation_animator
-            .sample(root_id, retarget_at)
+            .sample_compat(root_id, retarget_at)
             .expect("active macOS transition");
         configure_test_animation(
             &mut state,
@@ -1234,7 +1234,7 @@ mod task_05_8_tests {
         );
         let after = state
             .presentation_animator
-            .sample(root_id, retarget_at)
+            .sample_compat(root_id, retarget_at)
             .expect("retargeted KDE transition");
         assert_eq!(
             state.presentation_animator.transition_curve(root_id),

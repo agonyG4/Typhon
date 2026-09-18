@@ -2,6 +2,13 @@ use super::*;
 use crate::wm::{SpecialWorkspaceId, WorkspaceId};
 use std::time::Duration;
 
+#[derive(Debug)]
+pub(in crate::compositor) struct PendingPresentationGeometryTransaction {
+    pub(in crate::compositor) started_at: AnimationTime,
+    pub(in crate::compositor) members:
+        Vec<crate::presentation_animation::PresentationGeometryMutation>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct ActiveSceneSelection {
     pub(in crate::compositor) regular: WorkspaceId,
@@ -98,6 +105,12 @@ fn materialize_presented_window_geometry(
 }
 
 impl CompositorState {
+    fn presentation_output_id(&self) -> crate::core::OutputId {
+        self.native_output_id().unwrap_or_else(|| {
+            crate::core::OutputId::from_raw(1).expect("single native output identity is nonzero")
+        })
+    }
+
     pub(in crate::compositor) fn presentation_rect_for_geometry(
         &self,
         root_surface_id: u32,
@@ -131,14 +144,13 @@ impl CompositorState {
         &self,
         surfaces: &[RenderableSurface],
     ) -> NativeFramePresentationTargets {
-        let mut seen_roots = std::collections::HashSet::new();
+        let mut seen_window_groups = std::collections::HashSet::new();
         let windows = surfaces
             .iter()
             .filter_map(|surface| {
                 let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
-                if !seen_roots.insert(root_surface_id)
-                    || self.window_id_for_surface(root_surface_id).is_none()
-                {
+                let scene_node_id = self.presentation_scene_node_id_for_root(root_surface_id)?;
+                if !seen_window_groups.insert(scene_node_id) {
                     return None;
                 }
                 let geometry = self
@@ -146,7 +158,8 @@ impl CompositorState {
                     .or_else(|| self.current_root_window_geometry(root_surface_id))?;
                 let canonical_rect =
                     self.presentation_rect_for_geometry(root_surface_id, geometry)?;
-                Some(PresentationWindowTarget::new(
+                Some(PresentationWindowTarget::with_scene_node(
+                    scene_node_id,
                     root_surface_id,
                     canonical_rect,
                 ))
@@ -224,12 +237,21 @@ impl CompositorState {
         target: PresentationRect,
         at: AnimationTime,
     ) {
-        let _ = self.presentation_animator.start(
-            root_surface_id,
-            start,
-            target,
-            at,
-            AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+        let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) else {
+            return;
+        };
+        let _ = self.presentation_animator.commit(
+            crate::presentation_animation::PresentationTransactionRequest::geometry(
+                at,
+                vec![
+                    crate::presentation_animation::PresentationGeometryMutation::new(
+                        scene_node_id,
+                        start,
+                        target,
+                        AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+                    ),
+                ],
+            ),
         );
     }
 
@@ -238,8 +260,12 @@ impl CompositorState {
         at: AnimationTime,
     ) -> PresentationSceneSample {
         let targets = self.presentation_targets_for_surfaces(self.active_scene_surfaces());
-        self.presentation_animator
-            .sample_scene(at, targets.windows())
+        self.presentation_animator.sample(
+            self.presentation_output_id(),
+            at,
+            crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+            targets.windows(),
+        )
     }
 
     pub(in crate::compositor) fn presentation_scene_sample_for_targets_at(
@@ -247,8 +273,25 @@ impl CompositorState {
         at: AnimationTime,
         targets: &NativeFramePresentationTargets,
     ) -> PresentationSceneSample {
-        self.presentation_animator
-            .sample_scene(at, targets.windows())
+        self.presentation_scene_sample_for_targets_at_with_source(
+            at,
+            crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+            targets,
+        )
+    }
+
+    pub(in crate::compositor) fn presentation_scene_sample_for_targets_at_with_source(
+        &self,
+        at: AnimationTime,
+        source: crate::presentation_animation::PresentationSampleTimeSource,
+        targets: &NativeFramePresentationTargets,
+    ) -> PresentationSceneSample {
+        self.presentation_animator.sample(
+            self.presentation_output_id(),
+            at,
+            source,
+            targets.windows(),
+        )
     }
 
     pub(in crate::compositor) fn presentation_animation_has_unsettled_visible_at(
@@ -261,7 +304,7 @@ impl CompositorState {
     pub(in crate::compositor) fn presentation_animation_has_pending_visible(&self) -> bool {
         let surfaces = self.native_frame_renderable_surfaces();
         let targets = self.native_frame_presentation_targets(surfaces.as_ref());
-        let visible_keys = targets.root_surface_ids().collect::<Vec<_>>();
+        let visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
         self.presentation_animator
             .has_pending_visible(&visible_keys)
     }
@@ -270,8 +313,28 @@ impl CompositorState {
         &self,
         root_surface_id: u32,
     ) -> bool {
+        let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) else {
+            return false;
+        };
         self.presentation_animator
-            .has_pending_visible(&[root_surface_id])
+            .has_pending_visible(&[scene_node_id])
+    }
+
+    pub(in crate::compositor) fn presentation_scene_node_id_for_root(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<SceneNodeId> {
+        let group = self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.scene_node_id_for_window_group(window_id));
+        #[cfg(test)]
+        {
+            group.or_else(|| SceneNodeId::from_raw(u64::from(root_surface_id)))
+        }
+        #[cfg(not(test))]
+        {
+            group
+        }
     }
 
     pub(in crate::compositor) fn presentation_animation_metrics(
@@ -323,7 +386,11 @@ impl CompositorState {
                     .map_or(target.canonical_rect(), |transform| {
                         transform.presented_rect
                     });
-                PresentedWindowGeometry::new(root_surface_id, presented_rect)
+                PresentedWindowGeometry::with_scene_node(
+                    target.window_group_scene_node_id(),
+                    root_surface_id,
+                    presented_rect,
+                )
             })
             .collect::<Vec<_>>();
         windows.sort_unstable_by_key(PresentedWindowGeometry::root_surface_id);
@@ -362,7 +429,7 @@ impl CompositorState {
         // Keep the last physically presented transform until the next frame
         // publishes its replacement. This preserves the direct-scanout
         // blocker while input and canonical layout take over immediately.
-        self.presentation_animator.cancel(root_surface_id);
+        self.cancel_presentation_geometry_for_root(root_surface_id);
         let placement_changed =
             self.set_surface_placement_with_cause(root_surface_id, presented_origin, cause);
         if let Some(window_id) = self.window_id_for_surface(root_surface_id)
@@ -419,15 +486,20 @@ impl CompositorState {
         frame_id: u64,
         presentation: &PresentationFrameSnapshot,
     ) {
+        if presentation.output_id != self.presentation_output_id() {
+            return;
+        }
         self.presented_presentation_frame_id = frame_id;
         self.presented_presentation = presentation.clone();
         self.presented_window_geometries = presentation.presented_windows.clone();
         for transform in &presentation.transforms {
             if transform.mathematically_settled {
-                self.presentation_animator.acknowledge_presented_transition(
-                    transform.root_surface_id,
-                    transform.transition_id,
+                self.presentation_animator.acknowledge_presented_geometry(
+                    presentation.output_id,
+                    transform.scene_node_id,
+                    transform.revision_id,
                     transform.presented_rect,
+                    Some(transform.transaction_id),
                 );
             }
         }
@@ -442,13 +514,26 @@ impl CompositorState {
         // Destructive physical-identity removal is for root teardown. An
         // interaction handoff cancels the animator through its immediate
         // visual installer and keeps the last pageflip ledger intact.
-        self.presentation_animator.cancel(root_surface_id);
+        if let Some(window_id) = self.window_id_for_surface(root_surface_id)
+            && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
+        {
+            self.presentation_animator.cancel(scene_node_id);
+        }
         self.presented_presentation
             .transforms
             .retain(|transform| transform.root_surface_id != root_surface_id);
         self.presented_window_geometries
             .retain(|window| window.root_surface_id() != root_surface_id);
         self.presented_presentation.refresh_signature();
+    }
+
+    pub(in crate::compositor) fn cancel_presentation_geometry_for_root(
+        &mut self,
+        root_surface_id: u32,
+    ) {
+        if let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) {
+            self.presentation_animator.cancel(scene_node_id);
+        }
     }
 
     pub(in crate::compositor) fn publish_presented_window_geometry(
@@ -480,42 +565,62 @@ impl CompositorState {
             .layout_animation_epoch
             .or_else(AnimationTime::monotonic_now)
         else {
-            self.presentation_animator.cancel(root_surface_id);
+            if let Some(window_id) = self.window_id_for_surface(root_surface_id)
+                && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
+            {
+                self.presentation_animator.cancel(scene_node_id);
+            }
+            return;
+        };
+        let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) else {
             return;
         };
         if interaction_active {
-            self.presentation_animator.cancel(root_surface_id);
+            self.presentation_animator.cancel(scene_node_id);
             return;
         }
         let Some(previous) =
             self.presentation_rect_for_geometry(root_surface_id, previous_geometry)
         else {
-            self.presentation_animator.cancel(root_surface_id);
+            self.presentation_animator.cancel(scene_node_id);
             return;
         };
         let Some(target) = self.presentation_rect_for_geometry(root_surface_id, target_geometry)
         else {
-            self.presentation_animator.cancel(root_surface_id);
+            self.presentation_animator.cancel(scene_node_id);
             return;
         };
         let current_curve = self.animation_control.curve_for(kind);
-        if self
-            .presentation_animator
-            .sample(root_surface_id, now)
-            .is_some()
-        {
-            if let Some(curve) = current_curve {
-                self.presentation_animator
-                    .retarget(root_surface_id, target, now, curve);
-            } else {
-                self.presentation_animator.cancel(root_surface_id);
+        let Some(curve) = current_curve else {
+            self.presentation_animator.cancel(scene_node_id);
+            return;
+        };
+        let mutation = crate::presentation_animation::PresentationGeometryMutation::new(
+            scene_node_id,
+            previous,
+            target,
+            curve,
+        );
+        if self.layout_batch_depth > 0 {
+            if let Some(pending) = self.pending_presentation_geometry_transaction.as_mut() {
+                if let Some(existing) = pending
+                    .members
+                    .iter_mut()
+                    .find(|member| member.scene_node_id() == Some(scene_node_id))
+                {
+                    *existing = mutation;
+                } else {
+                    pending.members.push(mutation);
+                }
             }
-        } else if let Some(curve) = current_curve {
-            self.presentation_animator
-                .start(root_surface_id, previous, target, now, curve);
-        } else {
-            self.presentation_animator.cancel(root_surface_id);
+            return;
         }
+        let _ = self.presentation_animator.commit(
+            crate::presentation_animation::PresentationTransactionRequest::geometry(
+                now,
+                vec![mutation],
+            ),
+        );
     }
 
     fn active_scene_renderable_surfaces(&self) -> Vec<RenderableSurface> {
@@ -559,9 +664,7 @@ impl CompositorState {
             .iter()
             .copied()
             .enumerate()
-            .map(|(index, node)| {
-                (node, index)
-            })
+            .map(|(index, node)| (node, index))
             .collect();
         let popup_surface_ids = self.active_popup_surface_ids_from_state();
         let surface_origins = render::surface_origins(&surfaces);

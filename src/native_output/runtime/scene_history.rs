@@ -389,11 +389,14 @@ mod tests {
         );
         let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &sample,
-            vec![oblivion_one::compositor::PresentedWindowGeometry::new(
-                7,
-                oblivion_one::compositor::PresentationRect::new(x, 0.0, 100.0, 80.0)
-                    .expect("valid window rect"),
-            )],
+            vec![
+                oblivion_one::compositor::PresentedWindowGeometry::with_scene_node(
+                    oblivion_one::core::SceneNodeId::from_raw(7).expect("scene node"),
+                    7,
+                    oblivion_one::compositor::PresentationRect::new(x, 0.0, 100.0, 80.0)
+                        .expect("valid window rect"),
+                ),
+            ],
         );
         NativeFrameSceneSnapshot {
             output_id: OutputId::from_raw(1).expect("nonzero output id"),

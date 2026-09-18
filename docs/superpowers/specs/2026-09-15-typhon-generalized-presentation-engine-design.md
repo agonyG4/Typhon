@@ -1,18 +1,18 @@
 # Typhon Generalized Presentation Engine — Gate and Design
 
 Date: 2026-09-15
-Status: approved design; production implementation blocked by the prerequisite gate
+Status: approved design; geometry Presentation Engine v2 stage implemented
 
 ## Decision
 
-Do not implement the generalized Presentation Engine in the current checkout.
-The canonical scene identity and visual-topology foundations are now present,
-but frame-level SceneNode evidence and the physical presentation contract are
-not. Adding presentation primitives now would require inventing an interim
-frame contract, which is explicitly prohibited.
+The canonical scene identity, visual topology, immutable frame evidence, and
+physical promotion foundations are implemented. Geometry presentation now uses
+the first production stage of the generalized engine: transactional,
+SceneNode-owned sparse tracks with exact physical revision acknowledgement.
+Lifecycle/Lamp retention and additional generalized properties remain deferred.
 
-The implementation may begin only after the remaining frame and physical
-foundation work described below has landed and is present at the new baseline.
+Future implementation stages must preserve the physical frame authority and
+the compatibility boundaries described below.
 
 ## Repository baseline and evidence
 
@@ -43,9 +43,10 @@ still apply.
 * The typed logical `OutputId` foundation is implemented. It is distinct from
   `OutputTransactionId`, output/backend generation, and physical DRM IDs.
 * `SceneNodeId` is now a stable, stale-safe typed identity. It is monotonically
-  allocated and never reused during the compositor session. Presentation
-  geometry remains keyed by `root_surface_id: u32` and lifecycle presentation
-  remains keyed by `WindowId` until the later Presentation Engine migration.
+  allocated and never reused during the compositor session. Geometry
+  presentation is keyed by WindowGroup `SceneNodeId`; `root_surface_id` remains
+  only a frame/render/input compatibility adapter. Lifecycle presentation
+  remains keyed by `WindowId` until the later retained-visual migration.
 * `ActiveSceneView` remains an ordered `Vec<RenderableSurface>` with its
   existing `HashMap<u32, usize>` indexing, and now carries derived
   `surface_id -> SceneNodeId` and reverse active-index mappings. It is still a
@@ -55,7 +56,7 @@ still apply.
   `visual_parent`, and reverse visual-child indexing. Existing protocol,
   window, stacking, geometry, and render authorities remain unchanged.
 * `CompositorState` currently owns separate
-  `PresentationAnimator`, `WindowLifecycleAnimator`,
+  SceneNode-owned geometry `PresentationEngine`, `WindowLifecycleAnimator`,
   `presented_presentation`, `presented_lifecycle`, and
   `layout_animation_epoch` state. This is useful behavior to migrate, but it
   is not the required generalized ownership model.
@@ -95,8 +96,11 @@ prerequisite status is:
 * **Physical SceneNode promotion contract:** implemented. `NativeSceneHistory`
   promotes the exact frozen evidence on immediate/pageflip promotion and does
   not reconstruct identity from current compositor state.
-* **Presentation Engine v2:** still gated; it must wait for the scene-node
-  transaction/revision and sample foundations.
+* **Presentation Engine v2 geometry stage:** implemented. Transaction IDs,
+  SceneNode-owned geometry tracks, exact revision ACK, output-qualified frame
+  samples, scheduled sample-time evidence, and atomic Dwindle geometry
+  transactions are active. Opacity/clip, retained lifecycle/Lamp migration,
+  and new animation effects remain pending.
 
 Typhon remains a single-output product. This internal `OutputId` foundation
 does not add hotplug, multi-output layout, or a multi-output product model.
@@ -302,7 +306,27 @@ pageflip timing, or fullscreen gaming performance.
 
 ## Current result
 
-This design records the migration target and the exact reason implementation
-must stop at the current HEAD. No production source, animation behavior,
-renderer path, scheduler, input path, damage path, or KMS ownership was changed
-by this task.
+The first production geometry stage is complete:
+
+```text
+OutputId foundation                         implemented
+SceneNodeId foundation                      implemented
+canonical visual topology                   implemented
+immutable frame SceneNode evidence          implemented
+physical SceneNode promotion contract       implemented
+
+Presentation Engine v2 transaction IDs      implemented
+SceneNode geometry ownership                implemented
+exact revision physical ACK                 implemented
+Dwindle atomic geometry transactions        implemented
+
+opacity/clip generalized properties         pending
+lifecycle retained-source migration         pending
+Lamp migration                              pending
+new animation effects                       pending
+```
+
+The implementation preserves the existing geometry curves, analytical spring
+sampling, input handoff, effects/SSD adapters, Direct Scanout conservatism,
+and `NativeSceneHistory` physical authority. It does not claim completion of
+the generalized animation roadmap or lifecycle/Lamp migration.

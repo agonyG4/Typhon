@@ -136,10 +136,30 @@ pub(super) fn resolve_scene_and_damage<'a>(
         Option<NativeDamageRect>,
     ),
 ) -> (ResolvedNativeFrameScene<'a>, NativeOutputDamage) {
-    let at = presentation_time
-        .or_else(AnimationTime::monotonic_now)
-        .unwrap_or(AnimationTime::from_nanos(0));
-    let resolved_scene = ResolvedNativeFrameScene::from_server_at(server, at);
+    let (at, sample_time_source) = presentation_time.map_or_else(
+        || {
+            AnimationTime::monotonic_now().map_or(
+                (
+                    AnimationTime::from_nanos(0),
+                    oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+                ),
+                |at| {
+                    (
+                        at,
+                        oblivion_one::compositor::PresentationSampleTimeSource::MonotonicFallback,
+                    )
+                },
+            )
+        },
+        |at| {
+            (
+                at,
+                oblivion_one::compositor::PresentationSampleTimeSource::ScheduledTarget,
+            )
+        },
+    );
+    let resolved_scene =
+        ResolvedNativeFrameScene::from_server_at_with_source(server, at, sample_time_source);
     let output_damage = native_output_damage_for_presented_scene(
         direct,
         width,

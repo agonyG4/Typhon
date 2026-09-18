@@ -43,12 +43,36 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
 
 impl<'a> ResolvedNativeFrameScene<'a> {
     pub(crate) fn from_server(server: &'a OwnCompositorServer) -> Self {
-        let at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-        Self::from_server_at(server, at)
+        let (at, source) = AnimationTime::monotonic_now().map_or(
+            (
+                AnimationTime::from_nanos(0),
+                oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+            ),
+            |at| {
+                (
+                    at,
+                    oblivion_one::compositor::PresentationSampleTimeSource::MonotonicFallback,
+                )
+            },
+        );
+        Self::from_server_at_with_source(server, at, source)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_server_at(server: &'a OwnCompositorServer, at: AnimationTime) -> Self {
-        let (canonical_surfaces, canonical_scene_nodes, _fullscreen_plan, visibility) =
+        Self::from_server_at_with_source(
+            server,
+            at,
+            oblivion_one::compositor::PresentationSampleTimeSource::MonotonicFallback,
+        )
+    }
+
+    pub(crate) fn from_server_at_with_source(
+        server: &'a OwnCompositorServer,
+        at: AnimationTime,
+        sample_time_source: oblivion_one::compositor::PresentationSampleTimeSource,
+    ) -> Self {
+        let (canonical_surfaces, canonical_scene_nodes, fullscreen_plan, visibility) =
             server.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
         let lifecycle = server.lifecycle_scene_sample_at(at);
         let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
@@ -67,7 +91,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_nodes.as_ref(),
         );
         let targets = server.native_frame_presentation_targets(canonical_surfaces.as_ref());
-        let presentation = server.presentation_scene_sample_for_targets_at(at, &targets);
+        let presentation = server.presentation_scene_sample_for_targets_at_with_source(
+            at,
+            sample_time_source,
+            &targets,
+        );
         let decorations = server
             .native_decoration_render_instances_for_scale(canonical_surfaces.as_ref(), 1.0)
             .into_iter()
@@ -88,7 +116,8 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
-        let effects = server.resolved_effect_scene_for_presentation(&presentation);
+        let effects =
+            server.resolved_effect_scene_for_presentation(&presentation, &fullscreen_plan);
         let snapshot = NativeSceneSnapshot::from_surfaces_with_scene_nodes(
             surfaces.as_ref(),
             canonical_scene_nodes.as_ref(),
@@ -128,7 +157,6 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             lifecycle_snapshot,
         }
     }
-
     pub(crate) fn into_owned(self) -> ResolvedNativeFrameScene<'static> {
         ResolvedNativeFrameScene {
             surfaces: Cow::Owned(self.surfaces.into_owned()),

@@ -675,12 +675,16 @@ fn xwayland_mode_transition_uses_the_fullscreen_policy_curve() {
             },
         });
 
+    let scene_node_id = fixture
+        .server
+        .presentation_scene_node_id_for_root(fixture.surface_id)
+        .expect("XWayland WindowGroup scene node");
     assert_eq!(
         fixture
             .server
             .state
             .presentation_animator
-            .transition_curve(fixture.surface_id),
+            .track_curve(scene_node_id),
         Some(
             fixture
                 .server
@@ -818,11 +822,15 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
             },
         });
 
+    let scene_node_id = fixture
+        .server
+        .presentation_scene_node_id_for_root(fixture.surface_id)
+        .expect("XWayland WindowGroup scene node");
     let start = fixture
         .server
         .state
         .presentation_animator
-        .sample_at_transition_start(fixture.surface_id)
+        .sample_at_transition_start_for_scene_node(scene_node_id)
         .expect("XWayland fullscreen transition should be active");
     assert_eq!(
         start.rect,
@@ -834,7 +842,7 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
             .server
             .state
             .presentation_animator
-            .transition_curve(fixture.surface_id),
+            .track_curve(scene_node_id),
         Some(
             fixture
                 .server

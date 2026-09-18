@@ -37,8 +37,10 @@ impl CompositorState {
         canonical_rect: PresentationRect,
         presented_rect: PresentationRect,
     ) -> ResolvedEffectScene {
-        let transform = PresentationGroupTransform::new(
+        let transform = PresentationGroupTransform::with_scene_node(
+            crate::core::SceneNodeId::from_raw(1).expect("effect scene node"),
             0,
+            crate::presentation_animation::PresentationTransactionId::new(NonZeroU64::MIN),
             TransitionId::new(NonZeroU64::MIN),
             canonical_rect,
             presented_rect,
@@ -1002,7 +1004,7 @@ impl CompositorState {
         // Lamp takes over the root's presentation pixels, but the last
         // pageflip-confirmed geometry remains authoritative for source
         // continuity and direct-scanout safety.
-        self.presentation_animator.cancel(root_surface_id);
+        self.cancel_presentation_geometry_for_root(root_surface_id);
         self.lifecycle_render_suppressed_roots
             .remove(&root_surface_id);
         let started = self.window_lifecycle_animator.start_or_reverse(

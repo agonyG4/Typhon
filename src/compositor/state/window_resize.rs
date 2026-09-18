@@ -504,7 +504,7 @@ impl CompositorState {
             self.advance_pointer_hit_generation();
             match transition {
                 VisualGeometryTransition::Immediate => {
-                    self.presentation_animator.cancel(root_surface_id);
+                    self.cancel_presentation_geometry_for_root(root_surface_id);
                 }
                 VisualGeometryTransition::Animated { source, kind } => {
                     self.animate_toplevel_visual_geometry(root_surface_id, source, geometry, kind);

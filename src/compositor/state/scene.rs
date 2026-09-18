@@ -1,6 +1,14 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn scene_node_id_for_window_group(
+        &self,
+        window_id: WindowId,
+    ) -> Option<SceneNodeId> {
+        self.scene_registry
+            .node_for_source(SceneSource::WindowGroup(window_id))
+    }
+
     pub(in crate::compositor) fn scene_node_id_for_surface(
         &self,
         surface_id: u32,

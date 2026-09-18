@@ -984,7 +984,14 @@ impl CompositorState {
         self.layout_batch_depth = self.layout_batch_depth.saturating_add(1);
         if self.layout_batch_depth == 1 {
             self.layout_batch_scene_effect = false;
-            self.layout_animation_epoch = AnimationTime::monotonic_now();
+            let started_at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+            self.layout_animation_epoch = Some(started_at);
+            self.pending_presentation_geometry_transaction = Some(
+                super::active_scene::PendingPresentationGeometryTransaction {
+                    started_at,
+                    members: Vec::new(),
+                },
+            );
         }
     }
 
@@ -996,6 +1003,20 @@ impl CompositorState {
         }
         let scene_effect = self.layout_batch_scene_effect;
         self.layout_batch_scene_effect = false;
+        if let Some(pending) = self.pending_presentation_geometry_transaction.take()
+            && !pending.members.is_empty()
+        {
+            let result = self.presentation_animator.commit(
+                crate::presentation_animation::PresentationTransactionRequest::geometry(
+                    pending.started_at,
+                    pending.members,
+                ),
+            );
+            debug_assert!(
+                result.is_ok(),
+                "layout presentation transaction must validate"
+            );
+        }
         self.layout_animation_epoch = None;
         if scene_effect {
             self.advance_render_generation_with_scene_effect(
@@ -1300,10 +1321,9 @@ impl CompositorState {
             None,
             None,
         );
-        let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        if root_surface_id == surface_id {
-            self.cancel_presentation_for_root(root_surface_id);
-        }
+        // A root surface is only the current frame adapter. XWayland may
+        // replace it while the logical WindowGroup and its geometry track
+        // remain alive; logical window teardown cancels the track instead.
         self.remove_keyboard_shortcut_inhibitors_for_surface(surface_id);
         self.surface_frame_clock.remove(&surface_id);
         if reason != SurfaceTeardownReason::ClientDisconnected {

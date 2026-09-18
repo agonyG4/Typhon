@@ -807,8 +807,12 @@ fn tiled_resize_interruption_cancels_presentation_without_baking_visual_size() {
     );
     assert!(
         state
-            .presentation_animator
-            .sample(root_surface_id, AnimationTime::from_nanos(1))
+            .presentation_scene_node_id_for_root(root_surface_id)
+            .and_then(|scene_node_id| {
+                state
+                    .presentation_animator
+                    .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(1))
+            })
             .is_none()
     );
     assert_eq!(

@@ -627,7 +627,7 @@ impl CompositorState {
                 // The Dwindle solution and the rebased split handle own tiled
                 // resize geometry. Cancelling the effect is sufficient; do
                 // not turn a presentation sample into canonical placement.
-                self.presentation_animator.cancel(root_surface_id);
+                self.cancel_presentation_geometry_for_root(root_surface_id);
             } else if maximized_restore {
                 // The synchronous maximize handoff already installed the
                 // pointer-anchored target. Keep it as the Move origin while

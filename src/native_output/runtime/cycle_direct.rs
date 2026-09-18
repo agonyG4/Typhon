@@ -141,9 +141,15 @@ pub(super) fn settle_direct_pageflip(
         timestamp_ns: presented_at.get(),
     });
     server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
+    let Some(scene_node_id) =
+        server.presentation_scene_node_id_for_root(direct_info.root_surface_id)
+    else {
+        return Err(io::Error::other("direct frame has no WindowGroup SceneNode").into());
+    };
     server.publish_presented_window_geometry(
         direct_info.frame_id,
-        PresentedWindowGeometry::new(
+        PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
             direct_info.root_surface_id,
             direct_info.presented_window_rect,
         ),

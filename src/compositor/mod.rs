@@ -300,9 +300,10 @@ pub use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, NativeFramePresentationTargets,
     PresentationAnimationMetrics, PresentationAnimator, PresentationDamageRect,
     PresentationFrameSnapshot, PresentationGeometryTransform, PresentationGroupTransform,
-    PresentationRect, PresentationSceneSample, PresentationTransition, PresentationVelocity,
-    PresentationWindowSample, PresentationWindowTarget, PresentedWindowGeometry, SpringSpec,
-    TransitionId, presentation_damage,
+    PresentationRect, PresentationSampleTimeSource, PresentationSceneSample,
+    PresentationTransition, PresentationVelocity, PresentationWindowSample,
+    PresentationWindowTarget, PresentedWindowGeometry, SpringSpec, TransitionId,
+    presentation_damage,
 };
 pub use crate::presentation_animation_policy::{
     PresentationAnimationKind, PresentationAnimationPolicy, PresentationAnimationStyle,
@@ -688,6 +689,8 @@ pub struct CompositorState {
     layout_batch_depth: u8,
     layout_batch_scene_effect: bool,
     pub(in crate::compositor) layout_animation_epoch: Option<AnimationTime>,
+    pub(in crate::compositor) pending_presentation_geometry_transaction:
+        Option<state::PendingPresentationGeometryTransaction>,
     tiled_layout_dirty: HashSet<WorkspaceLocation>,
     tiled_floating_restores: HashMap<WindowId, WindowGeometry>,
     next_surface_id: u32,

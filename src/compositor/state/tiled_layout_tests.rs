@@ -56,7 +56,7 @@ fn tiled_dwindle_reflow_uses_the_kde_layout_policy_curve() {
         WindowGeometry::new(SurfacePlacement::absolute_root_at(37, 49), 640, 480),
     );
     assert!(state.reflow_tiled_location(location));
-    state.presentation_animator.cancel(250);
+    state.cancel_presentation_geometry_for_root(250);
 
     state
         .insert_desktop_window(DesktopWindow::new_xdg(second, 251))
@@ -70,10 +70,112 @@ fn tiled_dwindle_reflow_uses_the_kde_layout_policy_curve() {
 
     assert!(state.reflow_tiled_location(location));
     assert_eq!(
-        state.presentation_animator.transition_curve(250),
+        state.presentation_animator.track_curve(
+            state
+                .presentation_scene_node_id_for_root(250)
+                .expect("group node")
+        ),
         Some(
             PresentationAnimationPolicy::kde().curve_for(PresentationAnimationKind::LayoutReflow,)
         )
+    );
+}
+
+#[test]
+fn nested_dwindle_reflow_installs_one_atomic_three_window_transaction() {
+    let mut state = CompositorState::new(None);
+    assert!(state.set_output_size(1_920, 1_080));
+    let roots = [270, 271, 272];
+    let windows = [
+        WindowId::from_raw(70).expect("first window id"),
+        WindowId::from_raw(71).expect("second window id"),
+        WindowId::from_raw(72).expect("third window id"),
+    ];
+    state.install_native_frame_test_scene(
+        roots
+            .into_iter()
+            .map(|root| test_renderable_surface(root, 640, 480))
+            .collect(),
+        &[
+            (roots[0], windows[0]),
+            (roots[1], windows[1]),
+            (roots[2], windows[2]),
+        ],
+        None,
+    );
+
+    let previous = [
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(40, 40), 640, 480),
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(700, 40), 640, 480),
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(40, 540), 640, 480),
+    ];
+    let targets = [
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(80, 80), 700, 500),
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(760, 80), 700, 500),
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(80, 600), 700, 500),
+    ];
+
+    state.begin_layout_reflow_batch();
+    state.begin_layout_reflow_batch();
+    for index in 0..roots.len() {
+        state.animate_toplevel_visual_geometry(
+            roots[index],
+            previous[index],
+            targets[index],
+            PresentationAnimationKind::LayoutReflow,
+        );
+    }
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    assert!(!state.finish_layout_reflow_batch());
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    let _ = state.finish_layout_reflow_batch();
+    assert_eq!(state.presentation_animator.active_count(), roots.len());
+
+    let nodes = roots
+        .into_iter()
+        .map(|root| {
+            state
+                .presentation_scene_node_id_for_root(root)
+                .expect("group node")
+        })
+        .collect::<Vec<_>>();
+    let transactions = nodes
+        .iter()
+        .map(|node| {
+            state
+                .presentation_animator
+                .track_transaction(*node)
+                .expect("transaction")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(transactions[0], transactions[1]);
+    assert_eq!(transactions[1], transactions[2]);
+    let revisions = nodes
+        .iter()
+        .map(|node| {
+            state
+                .presentation_animator
+                .track_revision(*node)
+                .expect("revision")
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(revisions[0], revisions[1]);
+    assert_ne!(revisions[1], revisions[2]);
+    assert_eq!(
+        state
+            .presentation_animator
+            .track_started_at_for_scene_node(nodes[0]),
+        state
+            .presentation_animator
+            .track_started_at_for_scene_node(nodes[1])
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .track_started_at_for_scene_node(nodes[1]),
+        state
+            .presentation_animator
+            .track_started_at_for_scene_node(nodes[2])
     );
 }
 
@@ -106,7 +208,11 @@ fn tiled_dwindle_reflow_starts_from_pre_mutation_geometry_without_visual_history
     assert!(state.reflow_tiled_location(location));
     let start = state
         .presentation_animator
-        .sample_at_transition_start(260)
+        .sample_at_transition_start_for_scene_node(
+            state
+                .presentation_scene_node_id_for_root(260)
+                .expect("group node"),
+        )
         .expect("layout transition should be active");
     let expected = state
         .presentation_rect_for_geometry(260, source)
