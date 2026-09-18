@@ -287,14 +287,6 @@ pub struct PresentationSceneSample {
 pub type FramePresentationSample = PresentationSceneSample;
 
 impl PresentationSceneSample {
-    pub fn empty(sampled_at: AnimationTime) -> Self {
-        Self::empty_for_output(
-            OutputId::from_raw(1).expect("single native output identity is nonzero"),
-            sampled_at,
-            PresentationSampleTimeSource::ZeroFallback,
-        )
-    }
-
     pub fn empty_for_output(
         output_id: OutputId,
         sampled_at: AnimationTime,
@@ -348,10 +340,12 @@ pub struct PresentationFrameSnapshot {
 }
 
 impl PresentationFrameSnapshot {
-    pub fn empty() -> Self {
-        Self::from_sample(&PresentationSceneSample::empty(AnimationTime::from_nanos(
-            0,
-        )))
+    pub fn empty_for_output(output_id: OutputId) -> Self {
+        Self::from_sample(&PresentationSceneSample::empty_for_output(
+            output_id,
+            AnimationTime::from_nanos(0),
+            PresentationSampleTimeSource::ZeroFallback,
+        ))
     }
 
     pub fn from_sample(sample: &PresentationSceneSample) -> Self {
@@ -438,13 +432,6 @@ impl PresentationFrameSnapshot {
             }
         }
         self.signature = signature;
-    }
-}
-
-#[cfg(test)]
-impl Default for PresentationFrameSnapshot {
-    fn default() -> Self {
-        Self::empty()
     }
 }
 

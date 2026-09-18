@@ -372,20 +372,24 @@ mod tests {
     };
 
     fn snapshot(frame_id: u64) -> NativeFrameSceneSnapshot {
+        let output_id = OutputId::from_raw(1).expect("nonzero output id");
         NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id,
             render_generation: frame_id,
             scene: NativeSceneSnapshot::default(),
             cursor_damage: NativeCursorDamageBounds::default(),
-            presentation: PresentationFrameSnapshot::empty(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
         }
     }
 
     fn snapshot_with_root(frame_id: u64, x: f64) -> NativeFrameSceneSnapshot {
-        let sample = oblivion_one::compositor::PresentationSceneSample::empty(
+        let output_id = OutputId::from_raw(1).expect("nonzero output id");
+        let sample = oblivion_one::compositor::PresentationSceneSample::empty_for_output(
+            output_id,
             oblivion_one::compositor::AnimationTime::from_nanos(frame_id),
+            oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
         );
         let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &sample,
@@ -399,7 +403,7 @@ mod tests {
             ],
         );
         NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id,
             render_generation: frame_id,
             scene: NativeSceneSnapshot::default(),

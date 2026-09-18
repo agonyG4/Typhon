@@ -322,18 +322,22 @@ immutable frame SceneNode evidence          implemented
 physical SceneNode promotion contract       implemented
 
 Presentation Engine v2 transaction IDs      implemented
-SceneNode geometry ownership                implemented
+Geometry SceneNode ownership                implemented
+Geometry transactions                        implemented
 exact revision physical ACK                 implemented
 Dwindle atomic geometry transactions        implemented
-repeated batch mutation semantics            hardened
+duplicate batch semantics                   hardened
 output-qualified immutable ACK               hardened
 exact transaction-member retirement          hardened
 geometry source-layout closure               complete
+synthetic presentation OutputId defaults     removed
+effective geometry no-op elision             implemented
+Geometry v2                                  closed
 
-opacity/clip generalized properties         pending
-lifecycle retained-source migration         pending
-Lamp migration                              pending
-new animation effects                       pending
+Opacity                                      pending
+Clip                                         pending
+retained lifecycle/Lamp migration            pending
+new animation effects                        pending
 ```
 
 The implementation preserves the existing geometry curves, analytical spring

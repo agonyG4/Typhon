@@ -239,6 +239,7 @@ fn scene_identity_and_damage_reuse_finalized_snapshot() {
 #[test]
 fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
     fn assert_popup_ids(popup_surface_ids: &[u32]) {
+        let output_id = oblivion_one::core::OutputId::from_raw(1).expect("test output id");
         let surfaces: &[RenderableSurface] = &[];
         let resolved = ResolvedNativeFrameScene {
             surfaces: Cow::Borrowed(surfaces),
@@ -255,8 +256,12 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             ),
             scene_identity_signature: 0,
             effects: ResolvedEffectScene::default(),
-            presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(0)),
-            presentation_snapshot: PresentationFrameSnapshot::empty(),
+            presentation: PresentationSceneSample::empty_for_output(
+                output_id,
+                AnimationTime::from_nanos(0),
+                oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+            ),
+            presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleSceneSample {
                 sampled_at: AnimationTime::from_nanos(0),
                 lamps: Vec::new(),

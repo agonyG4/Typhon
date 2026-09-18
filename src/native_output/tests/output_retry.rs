@@ -12,6 +12,7 @@ fn contains(rect: NativeDamageRect, x: i32, y: i32) -> bool {
 
 #[test]
 fn rejected_same_generation_retry_repairs_from_presented_scene() {
+    let output_id = OutputId::from_raw(1).expect("nonzero output id");
     let mut presented =
         test_renderable_surface(91, -200, 160, 2200, 420, RenderableSurfaceDamage::Full);
     presented.generation = 10;
@@ -21,21 +22,21 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
     let presented_scene = NativeSceneSnapshot::from_surfaces(&[presented], Vec::new());
     let retry_scene = NativeSceneSnapshot::from_surfaces(&[retry], Vec::new());
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 1,
         render_generation: 1,
         scene: presented_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 2,
         render_generation: 7,
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(200));

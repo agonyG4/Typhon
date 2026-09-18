@@ -265,14 +265,20 @@ impl PresentationEngine {
             if !valid_rect(mutation.start) || !valid_rect(mutation.target) {
                 return Err(PresentationTransactionError::InvalidGeometry);
             }
-            let (start, start_velocity, preserve_start_velocity) = self
-                .geometry_tracks
-                .get(&scene_node_id)
-                .map(|track| {
-                    let sample = track.transition.sample(request.started_at);
-                    (sample.rect, sample.velocity, true)
-                })
-                .unwrap_or((mutation.start, PresentationVelocity::default(), false));
+            let (start, start_velocity, preserve_start_velocity) = if let Some(track) =
+                self.geometry_tracks.get(&scene_node_id)
+            {
+                let sample = track.transition.sample(request.started_at);
+                if sample.mathematically_settled && sample.rect.is_identity_with(mutation.target) {
+                    continue;
+                }
+                (sample.rect, sample.velocity, true)
+            } else {
+                if mutation.start.is_identity_with(mutation.target) {
+                    continue;
+                }
+                (mutation.start, PresentationVelocity::default(), false)
+            };
             prepared.push(super::PreparedGeometryMutation {
                 scene_node_id,
                 start,
@@ -281,6 +287,10 @@ impl PresentationEngine {
                 curve: mutation.curve,
                 preserve_start_velocity,
             });
+        }
+
+        if prepared.is_empty() {
+            return Err(PresentationTransactionError::Empty);
         }
 
         let transaction_id = self.peek_transaction_id()?;

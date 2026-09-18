@@ -1013,8 +1013,11 @@ impl CompositorState {
                 ),
             );
             debug_assert!(
-                result.is_ok(),
-                "layout presentation transaction must validate"
+                matches!(
+                    result,
+                    Ok(_) | Err(crate::presentation_animation::PresentationTransactionError::Empty)
+                ),
+                "layout presentation transaction must validate or be an effective no-op"
             );
         }
         self.layout_animation_epoch = None;

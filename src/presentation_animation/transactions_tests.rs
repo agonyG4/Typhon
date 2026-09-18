@@ -560,3 +560,233 @@ fn revision_id_exhaustion_is_checked_before_commit_mutation() {
         Some(first.members()[0].revision_id())
     );
 }
+
+#[test]
+fn empty_presentation_samples_and_snapshots_preserve_explicit_output_identity() {
+    let output_a = OutputId::from_raw(1).expect("output A");
+    let output_b = OutputId::from_raw(2).expect("output B");
+    let sampled_at = AnimationTime::from_nanos(17);
+
+    let sample_a = PresentationSceneSample::empty_for_output(
+        output_a,
+        sampled_at,
+        PresentationSampleTimeSource::ZeroFallback,
+    );
+    let sample_b = PresentationSceneSample::empty_for_output(
+        output_b,
+        sampled_at,
+        PresentationSampleTimeSource::ZeroFallback,
+    );
+
+    assert_eq!(sample_a.output_id, output_a);
+    assert_eq!(sample_b.output_id, output_b);
+    assert_eq!(
+        PresentationFrameSnapshot::empty_for_output(output_a).output_id,
+        output_a
+    );
+    assert_eq!(
+        PresentationFrameSnapshot::empty_for_output(output_b).output_id,
+        output_b
+    );
+}
+
+#[test]
+fn inactive_identity_geometry_is_empty_without_allocating_presentation_work() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(101);
+    let identity = rect(10.0, 20.0, 30.0, 40.0);
+    let request = || {
+        PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                identity,
+                identity,
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        )
+    };
+    let before = engine.metrics();
+
+    assert_eq!(
+        engine.commit(request()),
+        Err(PresentationTransactionError::Empty)
+    );
+    assert_eq!(engine.metrics(), before);
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+    assert!(!engine.has_pending_visible(&[scene_node_id]));
+
+    engine.set_next_ids_for_test(NonZeroU64::MAX, NonZeroU64::MAX);
+    assert_eq!(
+        engine.commit(request()),
+        Err(PresentationTransactionError::Empty)
+    );
+    assert_eq!(engine.metrics(), before);
+    engine.set_next_ids_for_test(
+        NonZeroU64::new(41).expect("transaction id"),
+        NonZeroU64::new(51).expect("revision id"),
+    );
+    let effective = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                identity,
+                rect(11.0, 20.0, 30.0, 40.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("effective transaction");
+    assert_eq!(effective.id().get(), 41);
+    assert_eq!(effective.members()[0].revision_id().get(), 51);
+}
+
+#[test]
+fn mixed_geometry_transaction_contains_only_effective_members() {
+    let mut engine = PresentationEngine::enabled();
+    let identity_a = rect(0.0, 0.0, 10.0, 10.0);
+    let identity_c = rect(20.0, 20.0, 10.0, 10.0);
+    let record = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![
+                PresentationGeometryMutation::new(
+                    node(111),
+                    identity_a,
+                    identity_a,
+                    AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+                ),
+                PresentationGeometryMutation::new(
+                    node(112),
+                    rect(0.0, 20.0, 10.0, 10.0),
+                    rect(20.0, 20.0, 10.0, 10.0),
+                    AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+                ),
+                PresentationGeometryMutation::new(
+                    node(113),
+                    identity_c,
+                    identity_c,
+                    AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+                ),
+            ],
+        ))
+        .expect("one effective member commits");
+
+    assert_eq!(record.members().len(), 1);
+    assert_eq!(record.members()[0].scene_node_id(), node(112));
+    assert!(!engine.has_track(node(111)));
+    assert!(engine.has_track(node(112)));
+    assert!(!engine.has_track(node(113)));
+}
+
+#[test]
+fn moving_active_track_retargets_when_canonical_start_equals_target() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(121);
+    let start = rect(0.0, 0.0, 10.0, 10.0);
+    let target_rect = rect(100.0, 0.0, 10.0, 10.0);
+    let spring = AnimationCurve::spring(SpringSpec::new(100.0, 16.0));
+    let initial = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                start,
+                target_rect,
+                spring,
+            )],
+        ))
+        .expect("initial track");
+    let retarget_at = AnimationTime::from_nanos(50_000_000);
+    let sampled = engine
+        .sample_for_scene_node(scene_node_id, retarget_at)
+        .expect("active sample");
+    assert!(!sampled.mathematically_settled);
+
+    let retargeted = engine
+        .commit(PresentationTransactionRequest::geometry(
+            retarget_at,
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                target_rect,
+                target_rect,
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::EaseOut),
+            )],
+        ))
+        .expect("moving active track remains effective");
+    assert_ne!(
+        retargeted.members()[0].revision_id(),
+        initial.members()[0].revision_id()
+    );
+    let retargeted_sample = engine
+        .sample_for_scene_node(scene_node_id, retarget_at)
+        .expect("retargeted sample");
+    assert_eq!(retargeted_sample.rect, sampled.rect);
+    assert_eq!(retargeted_sample.velocity, sampled.velocity);
+    assert_eq!(retargeted_sample.rect, sampled.rect);
+    assert_eq!(
+        engine.track_curve(scene_node_id),
+        Some(AnimationCurve::easing(
+            Duration::from_millis(100),
+            EasingCurve::EaseOut,
+        ))
+    );
+}
+
+#[test]
+fn settled_unacknowledged_same_target_keeps_existing_revision_until_ack() {
+    let mut engine = PresentationEngine::enabled();
+    let output_id = OutputId::from_raw(1).expect("output");
+    let scene_node_id = node(131);
+    let target_rect = rect(20.0, 0.0, 10.0, 10.0);
+    let initial = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                target_rect,
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("initial track");
+    let settled_at = AnimationTime::from_nanos(20_000_000);
+    let sampled = engine
+        .sample_for_scene_node(scene_node_id, settled_at)
+        .expect("settled sample");
+    assert!(sampled.mathematically_settled);
+    let before = engine.metrics();
+
+    assert_eq!(
+        engine.commit(PresentationTransactionRequest::geometry(
+            settled_at,
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                target_rect,
+                target_rect,
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::EaseOut),
+            )],
+        )),
+        Err(PresentationTransactionError::Empty)
+    );
+    assert_eq!(engine.metrics(), before);
+    assert_eq!(engine.track_transaction(scene_node_id), Some(initial.id()));
+    assert_eq!(
+        engine.track_revision(scene_node_id),
+        Some(initial.members()[0].revision_id())
+    );
+    assert_eq!(engine.transaction_count(), 1);
+    assert!(engine.acknowledge_presented_geometry(
+        output_id,
+        geometry_ack(
+            output_id,
+            scene_node_id,
+            initial.id(),
+            initial.members()[0].revision_id(),
+            target_rect,
+        ),
+    ));
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+}

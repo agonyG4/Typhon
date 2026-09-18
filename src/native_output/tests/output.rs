@@ -864,6 +864,7 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
     const HEIGHT: u32 = 1080;
     const TITLEBAR_HEIGHT: i32 = 26;
     const FRAME_BORDER: i32 = 1;
+    let output_id = OutputId::from_raw(1).expect("test output id");
     const ROOT_X: i32 = -200;
     const ROOT_Y: i32 = 120;
     const PRESENTED_A_WIDTH: u32 = 2100;
@@ -922,21 +923,21 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         vec![decoration(RENDERED_B_WIDTH)],
     );
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 1,
         render_generation: 1,
         scene: presented_a_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 2,
         render_generation: 2,
         scene: rendered_b_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(2));
@@ -1049,6 +1050,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
     const ROOT_Y: i32 = 160;
     const TITLEBAR_HEIGHT: i32 = 26;
     const FRAME_BORDER: i32 = 1;
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let window_id = WindowId::from_raw(92).expect("non-zero test window id");
     let decoration = |width: u32| {
         DecorationSceneSnapshot::from_bounds(
@@ -1084,32 +1086,32 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         vec![decoration(1400)],
     );
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 1,
         render_generation: 1,
         scene: presented_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 2,
         render_generation: 44,
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(220));
     assert!(history.discard_submission(220));
     history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 3,
         render_generation: 44,
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
 
@@ -1176,6 +1178,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
     const HEIGHT: u32 = 1080;
     const ROOT_X: i32 = -200;
     const ROOT_Y: i32 = 160;
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let surface = |width: u32, generation: u64| {
         let mut surface = test_renderable_surface(
             93,
@@ -1195,32 +1198,32 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
     let retry_scene =
         NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&retry_surface), Vec::new());
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 1,
         render_generation: 1,
         scene: presented_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 2,
         render_generation: 45,
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(230));
     assert!(history.discard_submission(230));
     history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 3,
         render_generation: 45,
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
 
@@ -1318,6 +1321,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
     const CLIENT_HEIGHT: u32 = 220;
     const TITLEBAR_HEIGHT: i32 = 26;
     const FRAME_BORDER: i32 = 1;
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let window_id = WindowId::from_raw(96).expect("non-zero test window id");
     let scene = |width: u32, generation: u64| {
         let mut surface = test_renderable_surface(
@@ -1345,12 +1349,12 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
 
     for age in 1..=3_u32 {
         let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id: 1,
             render_generation: 1,
             scene: scene(2200, 100),
             cursor_damage: NativeCursorDamageBounds::default(),
-            presentation: PresentationFrameSnapshot::empty(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
         });
         let mut planner = PartialRepaintPlanner::new(
@@ -1389,12 +1393,12 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             planner.commit_presented_transition(plan.render_damage.clone());
             let frame_id = 2 + index as u64;
             history.replace_ready(NativeFrameSceneSnapshot {
-                output_id: OutputId::from_raw(1).expect("nonzero output id"),
+                output_id,
                 frame_id,
                 render_generation: frame_id,
                 scene: current_scene,
                 cursor_damage: NativeCursorDamageBounds::default(),
-                presentation: PresentationFrameSnapshot::empty(),
+                presentation: PresentationFrameSnapshot::empty_for_output(output_id),
                 lifecycle: LifecycleFrameSnapshot::default(),
             });
             let token = 960 + frame_id;
@@ -1405,24 +1409,24 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
         let retry_scene = scene(1400, 110);
         let rejected_frame_id = 10 + age as u64;
         history.replace_ready(NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id: rejected_frame_id,
             render_generation: 900,
             scene: retry_scene.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
-            presentation: PresentationFrameSnapshot::empty(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
         });
         let rejected_token = 1000 + age as u64;
         assert!(history.queue_submission(rejected_token));
         assert!(history.discard_submission(rejected_token));
         history.replace_ready(NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id: rejected_frame_id + 1,
             render_generation: 900,
             scene: retry_scene.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
-            presentation: PresentationFrameSnapshot::empty(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
         });
 
@@ -1516,6 +1520,7 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
     const FRAME_BORDER: i32 = 1;
     const ROOT_X: i32 = -200;
     const ROOT_Y: i32 = 120;
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let widths: Vec<u32> = (0..=30).map(|step| 2200 - (step * 1400 / 30)).collect();
     let window_id = WindowId::from_raw(89).expect("non-zero test window id");
     let decoration = |width: u32| {
@@ -1547,12 +1552,12 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
     assert_eq!(widths.last(), Some(&800));
     let first_surface = surface(widths[0]);
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         frame_id: 0,
         render_generation: 0,
         scene: scene(&first_surface, widths[0]),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
@@ -1609,12 +1614,12 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
         assert_eq!(mismatches, 0, "shrink step {step} at width {width}");
 
         history.replace_ready(NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id: step as u64,
             render_generation: step as u64,
             scene: current_scene,
             cursor_damage: NativeCursorDamageBounds::default(),
-            presentation: PresentationFrameSnapshot::empty(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
         });
         let token = 100 + step as u64;

@@ -53,8 +53,9 @@ fn frame_snapshot(
     scene_node_id: SceneNodeId,
 ) -> NativeFrameSceneSnapshot {
     let surface = surface(surface_id, 32, 32);
+    let output_id = OutputId::from_raw(1).expect("test output id");
     NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("test output id"),
+        output_id,
         frame_id,
         render_generation: frame_id,
         scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(
@@ -64,7 +65,7 @@ fn frame_snapshot(
             &[],
         ),
         cursor_damage: NativeCursorDamageBounds::default(),
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     }
 }
@@ -288,8 +289,9 @@ fn physical_helpers_expose_decoration_and_cursor_scene_nodes() {
         hotspot_y: 0,
         rect: None,
     };
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let snapshot = NativeFrameSceneSnapshot {
-        output_id: OutputId::from_raw(1).expect("test output id"),
+        output_id,
         frame_id: 1,
         render_generation: 1,
         scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(
@@ -302,7 +304,7 @@ fn physical_helpers_expose_decoration_and_cursor_scene_nodes() {
             client: Some(cursor),
             ..NativeCursorDamageBounds::default()
         },
-        presentation: PresentationFrameSnapshot::empty(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     };
     let history = NativeSceneHistory::new(snapshot);

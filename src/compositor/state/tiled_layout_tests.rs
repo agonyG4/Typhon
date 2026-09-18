@@ -342,6 +342,65 @@ fn nested_layout_batch_merges_duplicate_geometry_before_outer_commit() {
 }
 
 #[test]
+fn net_zero_layout_batch_elides_presentation_work_and_scanout_blocker() {
+    let mut state = CompositorState::new(None);
+    assert!(state.set_output_size(1_920, 1_080));
+    let root_surface_id = 2_703;
+    let window_id = WindowId::from_raw(2_703).expect("window id");
+    state.install_native_frame_test_scene(
+        vec![test_renderable_surface(root_surface_id, 1_920, 1_080)],
+        &[(root_surface_id, window_id)],
+        None,
+    );
+    let start = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 1_920, 1_080);
+    let middle = WindowGeometry::new(SurfacePlacement::absolute_root_at(80, 60), 1_760, 960);
+    state.install_toplevel_visual_geometry(root_surface_id, start);
+    let scene_node_id = state
+        .presentation_scene_node_id_for_root(root_surface_id)
+        .expect("window group scene node");
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    assert!(!state.presentation_animation_has_pending_visible());
+    assert!(
+        !state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
+    );
+
+    state.begin_layout_reflow_batch();
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        start,
+        middle,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    state.animate_toplevel_visual_geometry(
+        root_surface_id,
+        middle,
+        start,
+        PresentationAnimationKind::LayoutReflow,
+    );
+    assert_eq!(state.presentation_animator.active_count(), 0);
+
+    let _ = state.finish_layout_reflow_batch();
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    assert_eq!(state.presentation_animator.transaction_count(), 0);
+    assert!(!state.presentation_animator.has_track(scene_node_id));
+    assert!(
+        !state
+            .presentation_animator
+            .has_pending_visible(&[scene_node_id])
+    );
+    assert!(!state.presentation_animation_has_pending_visible());
+    assert!(
+        !state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
+    );
+}
+
+#[test]
 fn repeated_pending_mutations_retarget_active_track_at_batch_start() {
     let mut state = CompositorState::new(None);
     let root_surface_id = 2_702;
