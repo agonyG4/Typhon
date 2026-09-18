@@ -124,9 +124,8 @@ fn materialize_presented_window_geometry(
 
 impl CompositorState {
     fn presentation_output_id(&self) -> crate::core::OutputId {
-        self.native_output_id().unwrap_or_else(|| {
-            crate::core::OutputId::from_raw(1).expect("single native output identity is nonzero")
-        })
+        self.native_output_id()
+            .expect("native presentation requires allocated logical OutputId")
     }
 
     pub(in crate::compositor) fn presentation_rect_for_geometry(
@@ -504,7 +503,8 @@ impl CompositorState {
         frame_id: u64,
         presentation: &PresentationFrameSnapshot,
     ) {
-        if presentation.output_id != self.presentation_output_id() {
+        let expected_output_id = self.presentation_output_id();
+        if presentation.output_id != expected_output_id {
             return;
         }
         self.presented_presentation_frame_id = frame_id;
@@ -513,11 +513,11 @@ impl CompositorState {
         for transform in &presentation.transforms {
             if transform.mathematically_settled {
                 self.presentation_animator.acknowledge_presented_geometry(
-                    presentation.output_id,
-                    transform.scene_node_id,
-                    transform.revision_id,
-                    transform.presented_rect,
-                    Some(transform.transaction_id),
+                    expected_output_id,
+                    crate::presentation_animation::PresentedGeometryAck::from_transform(
+                        presentation.output_id,
+                        *transform,
+                    ),
                 );
             }
         }

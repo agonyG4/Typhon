@@ -13,7 +13,7 @@ use super::{
     PresentationRect, PresentationRevisionId, PresentationSampleTimeSource,
     PresentationSceneSample, PresentationTransactionError, PresentationTransactionId,
     PresentationTransactionMember, PresentationTransactionRecord, PresentationTransactionRequest,
-    PresentationVelocity, PresentationWindowSample, PresentationWindowTarget,
+    PresentationVelocity, PresentationWindowSample, PresentationWindowTarget, PresentedGeometryAck,
 };
 
 #[cfg(test)]
@@ -176,7 +176,6 @@ pub struct PresentationEngine {
     revision_ids_exhausted: bool,
     metrics: PresentationAnimationMetrics,
     sampled_windows: Cell<u64>,
-    sampled_output: Cell<Option<OutputId>>,
     sample_metrics: Cell<PresentationAnimationMetrics>,
 }
 
@@ -223,7 +222,6 @@ impl PresentationEngine {
             revision_ids_exhausted: false,
             metrics: PresentationAnimationMetrics::default(),
             sampled_windows: Cell::new(0),
-            sampled_output: Cell::new(None),
             sample_metrics: Cell::new(PresentationAnimationMetrics::default()),
         }
     }
@@ -324,6 +322,8 @@ impl PresentationEngine {
                 self.remove_transaction_member(
                     old.transition.transaction_id,
                     mutation.scene_node_id,
+                    PresentationPropertyKind::Geometry,
+                    old.transition.revision_id,
                 );
             }
             let transition = PresentationTransition {
@@ -365,7 +365,12 @@ impl PresentationEngine {
         let Some(track) = self.geometry_tracks.remove(&scene_node_id) else {
             return;
         };
-        self.remove_transaction_member(track.transition.transaction_id, scene_node_id);
+        self.remove_transaction_member(
+            track.transition.transaction_id,
+            scene_node_id,
+            PresentationPropertyKind::Geometry,
+            track.transition.revision_id,
+        );
         self.metrics.transitions_cancelled = self.metrics.transitions_cancelled.saturating_add(1);
         self.metrics.geometry_cancels = self.metrics.geometry_cancels.saturating_add(1);
         self.metrics.active_tracks = self.geometry_tracks.len() as u64;
@@ -392,7 +397,6 @@ impl PresentationEngine {
         time_source: PresentationSampleTimeSource,
         targets: &[PresentationWindowTarget],
     ) -> PresentationSceneSample {
-        self.sampled_output.set(Some(output_id));
         let mut sampled = Vec::new();
         let mut transforms = Vec::new();
         let mut sample_metrics = self.sample_metrics.get();
@@ -454,30 +458,25 @@ impl PresentationEngine {
 
     pub fn acknowledge_presented_geometry(
         &mut self,
-        output_id: OutputId,
-        scene_node_id: SceneNodeId,
-        revision_id: PresentationRevisionId,
-        presented_rect: PresentationRect,
-        transaction_id: Option<PresentationTransactionId>,
+        expected_output_id: OutputId,
+        ack: PresentedGeometryAck,
     ) -> bool {
-        if self
-            .sampled_output
-            .get()
-            .is_some_and(|sampled| sampled != output_id)
-        {
+        if ack.output_id != expected_output_id {
             self.metrics.wrong_output_acks = self.metrics.wrong_output_acks.saturating_add(1);
             return false;
         }
+        let scene_node_id = ack.scene_node_id;
         let Some(current) = self.geometry_tracks.get(&scene_node_id) else {
             return false;
         };
         let sample = current
             .transition
             .sample(AnimationTime::from_nanos(u64::MAX));
-        if current.transition.revision_id != revision_id
-            || transaction_id.is_some_and(|id| id != current.transition.transaction_id)
+        if ack.property != PresentationPropertyKind::Geometry
+            || current.transition.revision_id != ack.revision_id
+            || current.transition.transaction_id != ack.transaction_id
             || !sample.mathematically_settled
-            || sample.rect != presented_rect
+            || sample.rect != ack.presented_rect
         {
             self.metrics.stale_acknowledgements =
                 self.metrics.stale_acknowledgements.saturating_add(1);
@@ -485,8 +484,14 @@ impl PresentationEngine {
             return false;
         }
         let transaction = current.transition.transaction_id;
+        let revision = current.transition.revision_id;
         self.geometry_tracks.remove(&scene_node_id);
-        self.remove_transaction_member(transaction, scene_node_id);
+        self.remove_transaction_member(
+            transaction,
+            scene_node_id,
+            PresentationPropertyKind::Geometry,
+            revision,
+        );
         self.metrics.transitions_acknowledged =
             self.metrics.transitions_acknowledged.saturating_add(1);
         self.metrics.physical_revision_acks = self.metrics.physical_revision_acks.saturating_add(1);
@@ -617,9 +622,11 @@ impl PresentationEngine {
         &mut self,
         transaction_id: PresentationTransactionId,
         scene_node_id: SceneNodeId,
+        property: PresentationPropertyKind,
+        revision_id: PresentationRevisionId,
     ) {
         if let Some(record) = self.transactions.get_mut(&transaction_id) {
-            record.remove_member(scene_node_id);
+            record.remove_member_exact(scene_node_id, property, revision_id);
             if record.members().is_empty() {
                 self.transactions.remove(&transaction_id);
             }

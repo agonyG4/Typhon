@@ -147,9 +147,19 @@ impl PresentationTransactionRecord {
         &self.members
     }
 
-    pub(crate) fn remove_member(&mut self, scene_node_id: SceneNodeId) {
-        self.members
-            .retain(|member| member.scene_node_id != scene_node_id);
+    pub(crate) fn remove_member_exact(
+        &mut self,
+        scene_node_id: SceneNodeId,
+        property: PresentationPropertyKind,
+        revision_id: PresentationRevisionId,
+    ) -> bool {
+        let original_len = self.members.len();
+        self.members.retain(|member| {
+            !(member.scene_node_id == scene_node_id
+                && member.property == property
+                && member.revision_id == revision_id)
+        });
+        self.members.len() != original_len
     }
 }
 

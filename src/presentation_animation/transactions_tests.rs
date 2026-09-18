@@ -19,6 +19,23 @@ fn target(
     PresentationWindowTarget::with_scene_node(scene_node_id, root_surface_id, rect)
 }
 
+fn geometry_ack(
+    output_id: OutputId,
+    scene_node_id: SceneNodeId,
+    transaction_id: PresentationTransactionId,
+    revision_id: PresentationRevisionId,
+    presented_rect: PresentationRect,
+) -> PresentedGeometryAck {
+    PresentedGeometryAck {
+        output_id,
+        scene_node_id,
+        property: PresentationPropertyKind::Geometry,
+        transaction_id,
+        revision_id,
+        presented_rect,
+    }
+}
+
 #[test]
 fn geometry_transaction_assigns_one_transaction_and_distinct_revisions() {
     let mut engine = PresentationEngine::enabled();
@@ -208,30 +225,166 @@ fn settled_track_requires_matching_physical_revision_ack() {
     assert!(frame.transforms[0].mathematically_settled);
     assert_eq!(engine.active_count(), 1);
     assert!(!engine.acknowledge_presented_geometry(
-        OutputId::from_raw(2).expect("wrong output"),
-        node(41),
-        revision,
-        rect(20.0, 0.0, 10.0, 10.0),
-        Some(transaction.id()),
+        output,
+        geometry_ack(
+            OutputId::from_raw(2).expect("wrong output"),
+            node(41),
+            transaction.id(),
+            revision,
+            rect(20.0, 0.0, 10.0, 10.0),
+        ),
     ));
     assert_eq!(engine.active_count(), 1);
     assert!(!engine.acknowledge_presented_geometry(
         output,
-        node(42),
-        revision,
-        rect(20.0, 0.0, 10.0, 10.0),
-        Some(transaction.id()),
+        geometry_ack(
+            output,
+            node(42),
+            transaction.id(),
+            revision,
+            rect(20.0, 0.0, 10.0, 10.0),
+        ),
     ));
     assert_eq!(engine.active_count(), 1);
     assert!(engine.acknowledge_presented_geometry(
         output,
-        node(41),
-        revision,
-        rect(20.0, 0.0, 10.0, 10.0),
-        Some(transaction.id()),
+        geometry_ack(
+            output,
+            node(41),
+            transaction.id(),
+            revision,
+            rect(20.0, 0.0, 10.0, 10.0),
+        ),
     ));
     assert_eq!(engine.active_count(), 0);
     assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn frozen_output_a_ack_survives_sampling_output_b() {
+    let mut engine = PresentationEngine::enabled();
+    let transaction = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                node(45),
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(20.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("transaction");
+    let output_a = OutputId::from_raw(1).expect("output A");
+    let output_b = OutputId::from_raw(2).expect("output B");
+    let frame_a = engine.sample(
+        output_a,
+        AnimationTime::from_nanos(20_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(45), 45, rect(20.0, 0.0, 10.0, 10.0))],
+    );
+    let _frame_b = engine.sample(
+        output_b,
+        AnimationTime::from_nanos(20_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(45), 45, rect(20.0, 0.0, 10.0, 10.0))],
+    );
+    let transform = frame_a.transforms[0];
+    let ack = PresentedGeometryAck {
+        output_id: frame_a.output_id,
+        scene_node_id: transform.scene_node_id,
+        property: PresentationPropertyKind::Geometry,
+        transaction_id: transform.transaction_id,
+        revision_id: transform.revision_id,
+        presented_rect: transform.presented_rect,
+    };
+
+    assert_eq!(ack.transaction_id, transaction.id());
+    assert!(engine.acknowledge_presented_geometry(output_a, ack));
+    assert_eq!(engine.active_count(), 0);
+}
+
+#[test]
+fn wrong_output_ack_is_rejected_without_mutating_the_active_track() {
+    let mut engine = PresentationEngine::enabled();
+    let transaction = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                node(46),
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(20.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("transaction");
+    let output_a = OutputId::from_raw(1).expect("output A");
+    let output_b = OutputId::from_raw(2).expect("output B");
+    let frame_a = engine.sample(
+        output_a,
+        AnimationTime::from_nanos(20_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(46), 46, rect(20.0, 0.0, 10.0, 10.0))],
+    );
+    let _frame_b = engine.sample(
+        output_b,
+        AnimationTime::from_nanos(20_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(46), 46, rect(20.0, 0.0, 10.0, 10.0))],
+    );
+    let transform = frame_a.transforms[0];
+    let mut wrong_output_ack = PresentedGeometryAck {
+        output_id: output_b,
+        scene_node_id: transform.scene_node_id,
+        property: PresentationPropertyKind::Geometry,
+        transaction_id: transform.transaction_id,
+        revision_id: transform.revision_id,
+        presented_rect: transform.presented_rect,
+    };
+    let before = engine.metrics();
+
+    assert!(!engine.acknowledge_presented_geometry(output_a, wrong_output_ack));
+    assert_eq!(engine.active_count(), 1);
+    assert_eq!(engine.transaction_count(), 1);
+    assert_eq!(engine.track_transaction(node(46)), Some(transaction.id()));
+    assert_eq!(engine.track_revision(node(46)), Some(transform.revision_id));
+    assert_eq!(
+        engine.metrics().wrong_output_acks,
+        before.wrong_output_acks + 1
+    );
+
+    wrong_output_ack.output_id = output_a;
+    assert!(engine.acknowledge_presented_geometry(output_a, wrong_output_ack));
+    assert_eq!(engine.active_count(), 0);
+}
+
+#[test]
+fn transaction_member_retirement_requires_exact_revision_evidence() {
+    let transaction_id = PresentationTransactionId::new(NonZeroU64::new(7).expect("transaction"));
+    let current_revision = PresentationRevisionId::from_raw(10).expect("current revision");
+    let stale_revision = PresentationRevisionId::from_raw(9).expect("stale revision");
+    let mut record = PresentationTransactionRecord::new(
+        transaction_id,
+        AnimationTime::from_nanos(0),
+        vec![PresentationTransactionMember::new(
+            node(47),
+            PresentationPropertyKind::Geometry,
+            transaction_id,
+            current_revision,
+        )],
+    );
+
+    assert!(!record.remove_member_exact(
+        node(47),
+        PresentationPropertyKind::Geometry,
+        stale_revision,
+    ));
+    assert_eq!(record.members().len(), 1);
+    assert!(record.remove_member_exact(
+        node(47),
+        PresentationPropertyKind::Geometry,
+        current_revision,
+    ));
+    assert!(record.members().is_empty());
 }
 
 #[test]
@@ -263,10 +416,13 @@ fn stale_revision_ack_cannot_retire_newer_track() {
     let output = OutputId::from_raw(1).expect("output");
     assert!(!engine.acknowledge_presented_geometry(
         output,
-        node(51),
-        old_revision,
-        rect(20.0, 0.0, 10.0, 10.0),
-        Some(initial.id()),
+        geometry_ack(
+            output,
+            node(51),
+            initial.id(),
+            old_revision,
+            rect(20.0, 0.0, 10.0, 10.0),
+        ),
     ));
     assert_eq!(
         engine.track_revision(node(51)),

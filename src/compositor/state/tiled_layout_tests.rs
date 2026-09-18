@@ -212,16 +212,14 @@ fn pending_geometry_mutation_preserves_first_start_and_final_target() {
             .expect("first start"),
         crate::presentation_animation::PresentationRect::new(100.0, 0.0, 100.0, 100.0)
             .expect("first target"),
-        PresentationAnimationPolicy::kde()
-            .curve_for(PresentationAnimationKind::LayoutReflow),
+        PresentationAnimationPolicy::kde().curve_for(PresentationAnimationKind::LayoutReflow),
     );
     let second = crate::presentation_animation::PresentationGeometryMutation::new(
         scene_node_id,
         first.target,
         crate::presentation_animation::PresentationRect::new(200.0, 0.0, 100.0, 100.0)
             .expect("second target"),
-        PresentationAnimationPolicy::kde()
-            .curve_for(PresentationAnimationKind::LayoutReflow),
+        PresentationAnimationPolicy::kde().curve_for(PresentationAnimationKind::LayoutReflow),
     );
     let mut pending = super::active_scene::PendingPresentationGeometryTransaction {
         started_at: crate::presentation_animation::AnimationTime::from_nanos(10),
@@ -235,7 +233,33 @@ fn pending_geometry_mutation_preserves_first_start_and_final_target() {
     assert_eq!(pending.members[0].scene_node_id(), Some(scene_node_id));
     assert_eq!(pending.members[0].start, first.start);
     assert_eq!(pending.members[0].target, second.target);
-    assert_eq!(pending.started_at, crate::presentation_animation::AnimationTime::from_nanos(10));
+    assert_eq!(
+        pending.started_at,
+        crate::presentation_animation::AnimationTime::from_nanos(10)
+    );
+}
+
+#[test]
+fn presentation_sampling_requires_allocated_output_identity() {
+    let state = CompositorState::default();
+    assert!(state.native_output_id().is_none());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.presentation_scene_sample_at(
+            crate::presentation_animation::AnimationTime::from_nanos(0),
+        );
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn presentation_sampling_uses_the_explicitly_allocated_output_identity() {
+    let mut state = CompositorState::default();
+    let output_id = state
+        .ensure_native_output_id()
+        .expect("test output identity");
+    let sample = state
+        .presentation_scene_sample_at(crate::presentation_animation::AnimationTime::from_nanos(0));
+    assert_eq!(sample.output_id, output_id);
 }
 
 #[test]
@@ -329,8 +353,7 @@ fn repeated_pending_mutations_retarget_active_track_at_batch_start() {
     );
     let start = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 100, 100);
     let active_target = WindowGeometry::new(SurfacePlacement::absolute_root_at(100, 0), 100, 100);
-    let pending_middle =
-        WindowGeometry::new(SurfacePlacement::absolute_root_at(150, 0), 100, 100);
+    let pending_middle = WindowGeometry::new(SurfacePlacement::absolute_root_at(150, 0), 100, 100);
     let pending_target = WindowGeometry::new(SurfacePlacement::absolute_root_at(250, 0), 100, 100);
     state.install_toplevel_visual_geometry(root_surface_id, start);
     state.animate_toplevel_visual_geometry(
@@ -370,9 +393,7 @@ fn repeated_pending_mutations_retarget_active_track_at_batch_start() {
     assert_eq!(state.presentation_animator.active_count(), 1);
     assert_eq!(state.presentation_animator.transaction_count(), 1);
     assert_ne!(
-        state
-            .presentation_animator
-            .track_transaction(scene_node_id),
+        state.presentation_animator.track_transaction(scene_node_id),
         Some(previous_transaction)
     );
     let retargeted_start = state

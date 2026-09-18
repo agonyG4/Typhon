@@ -1,8 +1,8 @@
 use crate::core::{OutputId, SceneNodeId};
 
 use super::{
-    AnimationTime, PresentationGeometryTransform, PresentationRect, PresentationRevisionId,
-    PresentationTransactionId, PresentationWindowSample, TransitionId,
+    AnimationTime, PresentationGeometryTransform, PresentationPropertyKind, PresentationRect,
+    PresentationRevisionId, PresentationTransactionId, PresentationWindowSample, TransitionId,
 };
 
 /// The source used to choose the immutable timestamp attached to a frame.
@@ -199,6 +199,33 @@ impl PresentationGroupTransform {
             signature = signature.wrapping_mul(0x1000_0000_01b3);
         }
         signature
+    }
+}
+
+/// Immutable physical evidence used to acknowledge one settled geometry track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentedGeometryAck {
+    pub output_id: OutputId,
+    pub scene_node_id: SceneNodeId,
+    pub property: PresentationPropertyKind,
+    pub transaction_id: PresentationTransactionId,
+    pub revision_id: PresentationRevisionId,
+    pub presented_rect: PresentationRect,
+}
+
+impl PresentedGeometryAck {
+    pub const fn from_transform(
+        output_id: OutputId,
+        transform: PresentationGroupTransform,
+    ) -> Self {
+        Self {
+            output_id,
+            scene_node_id: transform.scene_node_id,
+            property: PresentationPropertyKind::Geometry,
+            transaction_id: transform.transaction_id,
+            revision_id: transform.revision_id,
+            presented_rect: transform.presented_rect,
+        }
     }
 }
 

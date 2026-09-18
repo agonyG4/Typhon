@@ -20,7 +20,7 @@ pub use engine::{
 pub use frame::{
     FramePresentationSample, NativeFramePresentationTargets, PresentationFrameSnapshot,
     PresentationGroupTransform, PresentationSampleTimeSource, PresentationSceneSample,
-    PresentationWindowTarget, PresentedWindowGeometry,
+    PresentationWindowTarget, PresentedGeometryAck, PresentedWindowGeometry,
 };
 pub use geometry::{
     PresentationDamageRect, PresentationGeometryTransform, PresentationRect, PresentationVelocity,
