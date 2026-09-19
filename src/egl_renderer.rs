@@ -8230,8 +8230,10 @@ mod tests {
             for y in 0..height {
                 for x in 0..width {
                     harness.gl.scissor(x as i32, y as i32, 1, 1);
+                    let checker = ((x / 3 + y / 3) % 2) as u8;
                     harness.gl.clear_color(
-                        f32::from(((x * 31 + y * 17 + 3) % 256) as u8) / 255.0,
+                        f32::from((((x * 31 + y * 17 + 3) % 256) as u8) ^ (checker * 0x3f))
+                            / 255.0,
                         f32::from(((x * 13 + y * 29 + 7) % 256) as u8) / 255.0,
                         f32::from(((x * 47 + y * 11 + 19) % 256) as u8) / 255.0,
                         f32::from(((x * 19 + y * 23 + 61) % 256) as u8) / 255.0,
@@ -8288,7 +8290,7 @@ mod tests {
             OutputFramebufferOrigin::TopLeftScanout,
         ] {
             for domain in domains {
-                let target_plan = GraphTexturePlan {
+                let blit_target_plan = GraphTexturePlan {
                     id: GraphTextureId::new(1).expect("capture target id"),
                     source: GraphTextureSource::CapturedScene,
                     width: domain.width,
@@ -8299,29 +8301,51 @@ mod tests {
                     first_use: None,
                     last_use: None,
                 };
-                let target = harness
+                let shader_target_plan = GraphTexturePlan {
+                    id: GraphTextureId::new(2).expect("shader-copy target id"),
+                    ..blit_target_plan.clone()
+                };
+                let blit_target = harness
                     .renderer
                     .effect_resources
-                    .acquire_plan(&harness.gl, &target_plan)
-                    .expect("capture target acquires");
+                    .acquire_plan(&harness.gl, &blit_target_plan)
+                    .expect("blit capture target acquires");
+                let shader_target = harness
+                    .renderer
+                    .effect_resources
+                    .acquire_plan(&harness.gl, &shader_target_plan)
+                    .expect("shader-copy capture target acquires");
                 effects::capture_output_region_to_graph_texture(
                     &mut harness.renderer,
-                    &target,
-                    &target_plan,
+                    &blit_target,
+                    &blit_target_plan,
                     origin,
                 )
                 .expect("framebuffer blit capture succeeds");
-                let blit_pixels =
-                    read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+                let blit_pixels = read_effect_texture_pixels(
+                    &mut harness,
+                    &blit_target,
+                    domain.width,
+                    domain.height,
+                );
+                let output_texture = harness
+                    .renderer
+                    .active_output_texture
+                    .expect("shader-copy test output texture");
                 effects::capture_output_region_to_graph_texture_shader_copy(
                     &mut harness.renderer,
-                    &target,
-                    &target_plan,
+                    &shader_target,
+                    &shader_target_plan,
                     origin,
+                    output_texture,
                 )
                 .expect("shader copy capture succeeds");
-                let shader_pixels =
-                    read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+                let shader_pixels = read_effect_texture_pixels(
+                    &mut harness,
+                    &shader_target,
+                    domain.width,
+                    domain.height,
+                );
                 assert_eq!(
                     blit_pixels, shader_pixels,
                     "capture pixels differ for {origin:?} domain {domain:?}"
@@ -8329,8 +8353,13 @@ mod tests {
                 harness
                     .renderer
                     .effect_resources
-                    .release(target)
-                    .expect("capture target releases");
+                    .release(blit_target)
+                    .expect("blit capture target releases");
+                harness
+                    .renderer
+                    .effect_resources
+                    .release(shader_target)
+                    .expect("shader-copy capture target releases");
             }
         }
     }
