@@ -2,7 +2,7 @@
 
 Date: 2026-09-15
 Status: approved design; Geometry Presentation Engine v2 hardened and closed;
-Opacity implemented as the second production property
+Opacity closed as the second production property
 
 ## Decision
 
@@ -339,7 +339,7 @@ synthetic presentation OutputId defaults     removed
 effective geometry no-op elision             implemented
 Geometry v2                                  closed
 
-Opacity                                      implemented
+Opacity                                      closed
 Clip                                         pending
 retained lifecycle/Lamp migration            pending
 new animation effects                        pending
