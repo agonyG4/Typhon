@@ -167,6 +167,10 @@ pub(super) fn queue_plane_delta(
             return Ok(WorkerQueueOutcome::Unavailable(error));
         }
     };
+    // Capture a stable timestamp before taking the presentation-only batch.
+    // Every path below can then retire the batch without introducing another
+    // fallible clock read after ownership has moved out of the compositor.
+    let queued_at_ns = monotonic_now_ns()?;
     if let Some(batch_id) = take_plane_delta_presentation_feedback_batch(
         server,
         output_transactions,
@@ -182,7 +186,7 @@ pub(super) fn queue_plane_delta(
                 output_transactions,
                 transaction_id,
                 OutputTransactionFailureStage::BackendOwnershipTransfer,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                MonotonicTimestampNs::new(queued_at_ns),
                 |_| Ok(()),
             )?;
             return Err(io::Error::other(error).into());
@@ -190,7 +194,6 @@ pub(super) fn queue_plane_delta(
     }
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
-    let queued_at_ns = monotonic_now_ns()?;
     let kind = AtomicCommitKind::PlaneDelta {
         transaction_id,
         cursor_epoch,
@@ -234,22 +237,91 @@ pub(super) fn queue_plane_delta(
         )?;
         return Ok(WorkerQueueOutcome::Unavailable(reason));
     }
-    let mut owners = KmsBundleOwners::for_transaction(
+    let descriptor = match output_transactions.transaction(transaction_id) {
+        Some(record) => record.descriptor().clone(),
+        None => {
+            let arbiter_rejected = atomic_commit_arbiter.reject_worker_queued(token).is_some();
+            settle_failed_output_transaction(
+                output_transactions,
+                transaction_id,
+                OutputTransactionFailureStage::BackendOwnershipTransfer,
+                MonotonicTimestampNs::new(queued_at_ns),
+                |obligations| {
+                    restore_presentation_feedback_obligation(server, obligations);
+                    Ok(())
+                },
+            )?;
+            if !arbiter_rejected {
+                return Err(io::Error::other(
+                    "queued cursor transaction disappeared and arbiter rollback did not match",
+                )
+                .into());
+            }
+            return Err(io::Error::other("queued cursor transaction disappeared").into());
+        }
+    };
+    let mut owners = match KmsBundleOwners::for_transaction(
         kind,
-        Arc::new(
-            output_transactions
-                .transaction(transaction_id)
-                .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?
-                .descriptor()
-                .clone(),
-        ),
+        Arc::new(descriptor),
         Some(owned_revision.unwrap_or_else(|| cursor.desired_revision())),
         desired
             .as_ref()
             .and_then(|state| cursor.capability_key_for(state)),
-    )
-    .map_err(|error| io::Error::other(format!("invalid cursor owner: {error:?}")))?;
+    ) {
+        Ok(owners) => owners,
+        Err(error) => {
+            let arbiter_rejected = atomic_commit_arbiter.reject_worker_queued(token).is_some();
+            settle_failed_output_transaction(
+                output_transactions,
+                transaction_id,
+                OutputTransactionFailureStage::BackendOwnershipTransfer,
+                MonotonicTimestampNs::new(queued_at_ns),
+                |obligations| {
+                    restore_presentation_feedback_obligation(server, obligations);
+                    Ok(())
+                },
+            )?;
+            if !arbiter_rejected {
+                return Err(io::Error::other(format!(
+                    "invalid cursor owner: {error:?}; arbiter rollback did not match"
+                ))
+                .into());
+            }
+            return Err(io::Error::other(format!("invalid cursor owner: {error:?}")).into());
+        }
+    };
     owners.set_cursor_trace_reveal(cursor_reveal_trace);
+    let cursor_pin_result = match promoted_pin {
+        Some(pin) => Ok(Some(pin)),
+        None => desired
+            .as_ref()
+            .filter(|state| state.framebuffer_id.is_some())
+            .map(|state| cursor.pin_framebuffer_for(state))
+            .transpose(),
+    };
+    let cursor_pin = match cursor_pin_result {
+        Ok(cursor_pin) => cursor_pin,
+        Err(error) => {
+            let arbiter_rejected = atomic_commit_arbiter.reject_worker_queued(token).is_some();
+            settle_failed_output_transaction(
+                output_transactions,
+                transaction_id,
+                OutputTransactionFailureStage::BackendOwnershipTransfer,
+                MonotonicTimestampNs::new(queued_at_ns),
+                |obligations| {
+                    restore_presentation_feedback_obligation(server, obligations);
+                    Ok(())
+                },
+            )?;
+            if !arbiter_rejected {
+                return Err(io::Error::other(format!(
+                    "cursor framebuffer pin failed: {error}; arbiter rollback did not match"
+                ))
+                .into());
+            }
+            return Err(error.into());
+        }
+    };
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
@@ -270,14 +342,7 @@ pub(super) fn queue_plane_delta(
             .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
         cursor_delivery,
         primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
-        cursor_pin: match promoted_pin {
-            Some(pin) => Some(pin),
-            None => desired
-                .as_ref()
-                .filter(|state| state.framebuffer_id.is_some())
-                .map(|state| cursor.pin_framebuffer_for(state))
-                .transpose()?,
-        },
+        cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_ticket: None,
@@ -369,7 +434,7 @@ pub(super) fn queue_plane_delta(
             output_transactions,
             transaction_id,
             OutputTransactionFailureStage::KmsSubmit,
-            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            MonotonicTimestampNs::new(queued_at_ns),
             |obligations| {
                 restore_presentation_feedback_obligation(server, obligations);
                 Ok(())
@@ -383,7 +448,7 @@ pub(super) fn queue_plane_delta(
     }
     presentation_trace.push(PresentationTransactionEvent::WorkerQueued {
         transaction_id,
-        timestamp_ns: monotonic_now_ns()?,
+        timestamp_ns: queued_at_ns,
     });
     worker.record_cursor_worker_queued();
     Ok(WorkerQueueOutcome::CursorQueued {

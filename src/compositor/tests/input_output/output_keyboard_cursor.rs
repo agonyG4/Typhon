@@ -1171,6 +1171,99 @@ fn software_client_cursor_feedback_is_presented_for_the_exact_cursor_commit() {
 }
 
 #[test]
+fn presentation_only_feedback_teardown_is_safe_before_late_pageflip_completion() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let cursor_surface = compositor.create_surface(&qh, ());
+    let feedback = presentation.feedback(&cursor_surface, &qh, ());
+    pointer.set_cursor(
+        state
+            .pointer_enter_serial
+            .expect("expected pointer enter serial before set_cursor"),
+        Some(&cursor_surface),
+        1,
+        1,
+    );
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let cursor = capture_client_cursor_snapshot(&commands).expect("client cursor is active");
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePresentationFeedbackBatch {
+            surface_id: cursor.surface_id,
+            commit_sequence: SurfaceCommitSequence(cursor.commit_sequence),
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap()
+        .expect("cursor feedback should be captured by the presentation-only owner");
+    wait_for_server_commands(&commands);
+    assert!(!capture_frame_eligible_presentation_feedback_work(
+        &commands
+    ));
+
+    commands
+        .send(ServerCommand::DiscardAllPresentationFeedbacks)
+        .unwrap();
+    commands
+        .send(ServerCommand::CompletePresentationFeedbackBatch {
+            batch_id,
+            presentation: FramePresentation::synchronized(PresentationClock::Monotonic, 7, 11, 19)
+                .unwrap(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!capture_frame_eligible_presentation_feedback_work(
+        &commands
+    ));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 0);
+    assert_eq!(state.presentation_discarded_count, 1);
+    assert_eq!(
+        state.presentation_feedback_event_log,
+        vec![(feedback.id().protocol_id(), "discarded")]
+    );
+}
+
+#[test]
 fn same_buffer_cursor_damage_commit_preserves_owned_content_identity() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

@@ -388,6 +388,16 @@ pub(in crate::compositor::tests) enum ServerCommand {
         batch_id: CompositorFrameBatchId,
         reply: Sender<Vec<u32>>,
     },
+    CapturePresentationFeedbackBatch {
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+        reply: Sender<Option<PresentationFeedbackBatchId>>,
+    },
+    DiscardAllPresentationFeedbacks,
+    CompletePresentationFeedbackBatch {
+        batch_id: PresentationFeedbackBatchId,
+        presentation: FramePresentation,
+    },
     CaptureFrameCallbackPacingCompleted {
         batch_id: CompositorFrameBatchId,
         reply: Sender<bool>,
@@ -1667,6 +1677,27 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureFrameBatchSurfaceIds { batch_id, reply } => {
                         let _ =
                             reply.send(server.test_frame_batch_presentation_surface_ids(batch_id));
+                    }
+                    ServerCommand::CapturePresentationFeedbackBatch {
+                        surface_id,
+                        commit_sequence,
+                        reply,
+                    } => {
+                        let batch_id = server
+                            .presentation_commit_key_for_surface_commit(surface_id, commit_sequence)
+                            .and_then(|key| {
+                                server.take_presentation_feedback_batch_for_samples([key])
+                            });
+                        let _ = reply.send(batch_id);
+                    }
+                    ServerCommand::DiscardAllPresentationFeedbacks => {
+                        server.state.discard_all_pending_presentation_feedbacks();
+                    }
+                    ServerCommand::CompletePresentationFeedbackBatch {
+                        batch_id,
+                        presentation,
+                    } => {
+                        server.complete_presentation_feedback_batch(batch_id, presentation);
                     }
                     ServerCommand::CaptureFrameCallbackPacingCompleted { batch_id, reply } => {
                         let _ =

@@ -914,6 +914,11 @@ pub(super) fn submit_plane_delta(
             } else {
                 PresentedCursorDelivery::Hidden
             };
+            // Read the timestamp before taking presentation-only ownership so
+            // every pre-pageflip failure can settle without another fallible
+            // operation after the exact cursor feedback leaves the pending
+            // registry.
+            let submission_at_ns = monotonic_now_ns()?;
             let client_cursor_presentation_key =
                 cursor.client_source_key().and_then(|source_key| {
                     server.presentation_commit_key_for_surface_commit(
@@ -967,13 +972,13 @@ pub(super) fn submit_plane_delta(
                     cursor_epoch,
                     framebuffer_id: desired.as_ref().and_then(|state| state.framebuffer_id),
                 },
-                monotonic_now_ns()?,
+                submission_at_ns,
             ) {
                 settle_failed_output_transaction(
                     output_transactions,
                     transaction_id,
                     OutputTransactionFailureStage::KmsSubmit,
-                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    MonotonicTimestampNs::new(submission_at_ns),
                     |obligations| {
                         restore_presentation_feedback_obligation(server, obligations);
                         Ok(())
@@ -1037,12 +1042,12 @@ pub(super) fn submit_plane_delta(
                         .mark_submitted(
                             transaction_id,
                             token,
-                            MonotonicTimestampNs::new(monotonic_now_ns()?),
+                            MonotonicTimestampNs::new(submission_at_ns),
                         )
                         .map_err(io::Error::other)?;
                     presentation_trace.push(PresentationTransactionEvent::KmsSubmitReturned {
                         transaction_id,
-                        timestamp_ns: monotonic_now_ns()?,
+                        timestamp_ns: submission_at_ns,
                     });
                     let submitted_state = cursor.begin_submission_at_revision_with_capability_key(
                         token,
@@ -1075,7 +1080,7 @@ pub(super) fn submit_plane_delta(
                         output_transactions,
                         transaction_id,
                         OutputTransactionFailureStage::KmsSubmit,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        MonotonicTimestampNs::new(submission_at_ns),
                         |obligations| {
                             restore_presentation_feedback_obligation(server, obligations);
                             Ok(())
@@ -1096,7 +1101,7 @@ pub(super) fn submit_plane_delta(
                         output_transactions,
                         transaction_id,
                         OutputTransactionFailureStage::KmsSubmit,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        MonotonicTimestampNs::new(submission_at_ns),
                         |obligations| {
                             restore_presentation_feedback_obligation(server, obligations);
                             Ok(())

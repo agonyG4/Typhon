@@ -491,10 +491,13 @@ impl CompositorState {
         &mut self,
         batch_id: PresentationFeedbackBatchId,
     ) {
-        let batch = self
-            .presentation_feedback_batches
-            .remove(&batch_id)
-            .expect("missing presentation feedback batch on restore");
+        let Some(batch) = self.presentation_feedback_batches.remove(&batch_id) else {
+            // A global compositor teardown may have already terminalized the
+            // feedback objects while the output transaction was being
+            // abandoned.  The physical transaction still owns the ID, but
+            // there is no feedback left to restore.
+            return;
+        };
         self.requeue_presentation_feedbacks_after_restore(batch.feedbacks);
         self.rebuild_scene_work_index();
     }
@@ -503,10 +506,12 @@ impl CompositorState {
         &mut self,
         batch_id: PresentationFeedbackBatchId,
     ) {
-        let batch = self
-            .presentation_feedback_batches
-            .remove(&batch_id)
-            .expect("missing presentation feedback batch on discard");
+        let Some(batch) = self.presentation_feedback_batches.remove(&batch_id) else {
+            // The batch may have been terminalized by global feedback
+            // teardown before the output transaction reached its terminal
+            // failure path.
+            return;
+        };
         self.discard_presentation_feedbacks(batch.feedbacks);
     }
 

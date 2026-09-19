@@ -318,10 +318,13 @@ impl CompositorState {
         batch_id: PresentationFeedbackBatchId,
         presentation: FramePresentation,
     ) {
-        let batch = self
-            .presentation_feedback_batches
-            .remove(&batch_id)
-            .expect("missing presentation feedback batch at presentation");
+        let Some(batch) = self.presentation_feedback_batches.remove(&batch_id) else {
+            // Shutdown can discard feedback globally before a late physical
+            // completion is observed.  That feedback already has its
+            // terminal Discarded result; never manufacture Presented or
+            // panic while retiring the transaction owner.
+            return;
+        };
         self.complete_presentation_feedbacks(batch.feedbacks, presentation);
     }
 
