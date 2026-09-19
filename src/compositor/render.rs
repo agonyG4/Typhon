@@ -3384,6 +3384,32 @@ mod tests {
     };
     use std::sync::{Arc, Mutex, OnceLock};
 
+    #[test]
+    fn presentation_opacity_scales_all_premultiplied_rgba_channels() {
+        let pixel = [200, 100, 50, 128];
+        assert_eq!(scale_premultiplied_rgba(pixel, 1.0), pixel);
+        assert_eq!(scale_premultiplied_rgba(pixel, 0.5), [100, 50, 25, 64]);
+        assert_eq!(scale_premultiplied_rgba(pixel, 0.0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn presentation_opacity_scales_all_premultiplied_argb_channels() {
+        let pixel = 0x80_64_32_10;
+        assert_eq!(scale_premultiplied_argb(pixel, 1.0), pixel);
+        assert_eq!(scale_premultiplied_argb(pixel, 0.5), 0x40_32_19_08);
+        assert_eq!(scale_premultiplied_argb(pixel, 0.0), 0);
+    }
+
+    #[test]
+    fn zero_presentation_opacity_is_a_source_over_no_op() {
+        let destination = 0xff_20_40_60;
+        let source = scale_premultiplied_argb(0x80_64_32_10, 0.0);
+        assert_eq!(
+            blend_premultiplied_argb_over_opaque(source, destination),
+            destination
+        );
+    }
+
     fn test_buffer_identity() -> BufferIdentity {
         static IDS: OnceLock<Mutex<BufferIdAllocator>> = OnceLock::new();
         IDS.get_or_init(|| Mutex::new(BufferIdAllocator::default()))
