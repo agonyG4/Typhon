@@ -7,6 +7,8 @@ mod cursor;
 mod data_device;
 mod desktop_windows;
 mod direct_scanout;
+#[cfg(test)]
+mod direct_scanout_tests;
 mod dmabuf_feedback;
 mod frame_callbacks;
 mod frames;
