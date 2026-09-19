@@ -18,6 +18,10 @@ pub(super) fn create_capture_program(gl: &glow::Context) -> RendererResult<GlPro
     create_program_from_sources(gl, CAPTURE_VERTEX_SHADER, EGL_FRAGMENT_SHADER)
 }
 
+pub(super) fn create_capture_copy_program(gl: &glow::Context) -> RendererResult<GlProgram> {
+    create_program_from_sources(gl, EGL_VERTEX_SHADER, CAPTURE_COPY_FRAGMENT_SHADER)
+}
+
 pub(super) fn create_program_from_sources(
     gl: &glow::Context,
     vertex_source: &str,
@@ -81,6 +85,29 @@ out vec4 out_color;
 
 void main() {
     out_color = texture(u_texture, v_uv) * clamp(u_opacity, 0.0, 1.0);
+}
+"#;
+
+const CAPTURE_COPY_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D u_output_texture;
+uniform vec2 u_capture_output_size;
+uniform vec4 u_capture_domain;
+uniform vec2 u_capture_target_size;
+uniform int u_capture_origin_bottom_left;
+
+out vec4 out_color;
+
+void main() {
+    ivec2 destination = ivec2(gl_FragCoord.xy);
+    int logical_y = int(u_capture_target_size.y) - 1 - destination.y;
+    int source_x = int(u_capture_domain.x) + destination.x;
+    int source_y = u_capture_origin_bottom_left != 0
+        ? int(u_capture_output_size.y) - 1 - int(u_capture_domain.y) - logical_y
+        : int(u_capture_domain.y) + logical_y;
+    out_color = texelFetch(u_output_texture, ivec2(source_x, source_y), 0);
 }
 "#;
 

@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Instant};
 
 use glow::HasContext;
 use oblivion_one::effects::{
@@ -15,10 +15,13 @@ use super::super::geometry::{
     add_surface_consumers_for_command_range,
 };
 use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
-use super::gpu_timing::{CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode};
+use super::gpu_timing::{
+    CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
+    ReplayCaptureExecutionDetail,
+};
 use super::{
-    EffectDebugCaptureMode, EffectDebugConfig, EffectDebugKawaseMode, FrameTraceSummary,
-    PassTraceSummary, blur, capture, effect_debug_config,
+    CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
+    EffectDebugKawaseMode, FrameTraceSummary, PassTraceSummary, blur, capture, effect_debug_config,
     resources::{
         EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture,
         release_dead_graph_textures,
@@ -160,9 +163,9 @@ void main() {
         discard;
     }
     vec4 result = texture(u_effect_input, typhon_effect_sample_uv(logical_input_uv));
-    result *= clamp(u_presentation_opacity, 0.0, 1.0);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     if (u_effect_force_opaque != 0) result.a = 1.0;
+    result *= clamp(u_presentation_opacity, 0.0, 1.0);
     out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
@@ -404,12 +407,26 @@ pub(crate) struct EffectExecutionStats {
     pub surface_capture_execution_pixels: u64,
     pub replay_capture_execution_pixels: u64,
     pub framebuffer_capture_execution_pixels: u64,
+    pub framebuffer_shader_copy_capture_execution_pixels: u64,
     pub checkpoint_capture_execution_pixels: u64,
     pub replay_capture_passes: usize,
     pub framebuffer_capture_passes: usize,
     pub checkpoint_capture_passes: usize,
     pub replay_capture_commands: usize,
     pub checkpoint_dependency_edges: usize,
+    pub replay_capture_materialization_rects: usize,
+    pub replay_capture_execution_regions: usize,
+    pub replay_capture_disjoint_overflows: usize,
+    pub replay_capture_command_region_pairs: usize,
+    pub replay_capture_scene_scan_pairs: usize,
+    pub replay_capture_planner_commands_visited: usize,
+    pub replay_capture_planner_commands_drawable: usize,
+    pub replay_capture_commands_executed: usize,
+    pub replay_capture_draw_calls: usize,
+    pub replay_capture_host_cpu_ns: u64,
+    pub replay_capture_selection_cpu_ns: u64,
+    pub replay_capture_visibility_cpu_ns: u64,
+    pub replay_capture_draw_submit_cpu_ns: u64,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
@@ -424,19 +441,95 @@ impl EffectExecutionStats {
             surface_capture_execution_pixels: self.surface_capture_execution_pixels,
             replay_capture_execution_pixels: self.replay_capture_execution_pixels,
             framebuffer_capture_execution_pixels: self.framebuffer_capture_execution_pixels,
+            framebuffer_shader_copy_capture_execution_pixels: self
+                .framebuffer_shader_copy_capture_execution_pixels,
             checkpoint_capture_execution_pixels: self.checkpoint_capture_execution_pixels,
             replay_capture_passes: self.replay_capture_passes,
             framebuffer_capture_passes: self.framebuffer_capture_passes,
             checkpoint_capture_passes: self.checkpoint_capture_passes,
             replay_capture_commands: self.replay_capture_commands,
             checkpoint_dependency_edges: self.checkpoint_dependency_edges,
+            replay_capture_materialization_rects: self.replay_capture_materialization_rects,
+            replay_capture_execution_regions: self.replay_capture_execution_regions,
+            replay_capture_disjoint_overflows: self.replay_capture_disjoint_overflows,
+            replay_capture_command_region_pairs: self.replay_capture_command_region_pairs,
+            replay_capture_scene_scan_pairs: self.replay_capture_scene_scan_pairs,
+            replay_capture_planner_commands_visited: self.replay_capture_planner_commands_visited,
+            replay_capture_planner_commands_drawable: self.replay_capture_planner_commands_drawable,
+            replay_capture_commands_executed: self.replay_capture_commands_executed,
+            replay_capture_draw_calls: self.replay_capture_draw_calls,
+            replay_capture_host_cpu_ns: self.replay_capture_host_cpu_ns,
+            replay_capture_selection_cpu_ns: self.replay_capture_selection_cpu_ns,
+            replay_capture_visibility_cpu_ns: self.replay_capture_visibility_cpu_ns,
+            replay_capture_draw_submit_cpu_ns: self.replay_capture_draw_submit_cpu_ns,
         }
+    }
+
+    fn record_replay_capture_detail(&mut self, detail: ReplayCaptureExecutionDetail) {
+        self.replay_capture_materialization_rects = self
+            .replay_capture_materialization_rects
+            .saturating_add(detail.materialization_rects);
+        self.replay_capture_execution_regions = self
+            .replay_capture_execution_regions
+            .saturating_add(detail.execution_regions);
+        self.replay_capture_disjoint_overflows = self
+            .replay_capture_disjoint_overflows
+            .saturating_add(usize::from(detail.disjoint_overflowed));
+        self.replay_capture_command_region_pairs = self
+            .replay_capture_command_region_pairs
+            .saturating_add(detail.command_region_pairs);
+        self.replay_capture_scene_scan_pairs = self
+            .replay_capture_scene_scan_pairs
+            .saturating_add(detail.scene_scan_pairs);
+        self.replay_capture_planner_commands_visited = self
+            .replay_capture_planner_commands_visited
+            .saturating_add(detail.planner_commands_visited);
+        self.replay_capture_planner_commands_drawable = self
+            .replay_capture_planner_commands_drawable
+            .saturating_add(detail.planner_commands_drawable);
+        self.replay_capture_commands_executed = self
+            .replay_capture_commands_executed
+            .saturating_add(detail.commands_executed);
+        self.replay_capture_draw_calls = self
+            .replay_capture_draw_calls
+            .saturating_add(detail.draw_calls);
+        self.replay_capture_host_cpu_ns = self
+            .replay_capture_host_cpu_ns
+            .saturating_add(detail.host_cpu_ns);
+        self.replay_capture_selection_cpu_ns = self
+            .replay_capture_selection_cpu_ns
+            .saturating_add(detail.selection_cpu_ns);
+        self.replay_capture_visibility_cpu_ns = self
+            .replay_capture_visibility_cpu_ns
+            .saturating_add(detail.visibility_cpu_ns);
+        self.replay_capture_draw_submit_cpu_ns = self
+            .replay_capture_draw_submit_cpu_ns
+            .saturating_add(detail.draw_submit_cpu_ns);
     }
 
     fn record_capture_execution(
         &mut self,
         pass: &CompiledRenderPass,
         direct_capture: bool,
+        physical_pixels: u64,
+        replay_commands: usize,
+    ) {
+        self.record_capture_execution_with_mode(
+            pass,
+            if direct_capture {
+                CaptureTimingMode::FramebufferBlit
+            } else {
+                CaptureTimingMode::Replay
+            },
+            physical_pixels,
+            replay_commands,
+        );
+    }
+
+    fn record_capture_execution_with_mode(
+        &mut self,
+        pass: &CompiledRenderPass,
+        mode: CaptureTimingMode,
         physical_pixels: u64,
         replay_commands: usize,
     ) {
@@ -456,18 +549,30 @@ impl EffectExecutionStats {
             }
             _ => return,
         }
-        if direct_capture {
-            self.framebuffer_capture_execution_pixels = self
-                .framebuffer_capture_execution_pixels
-                .saturating_add(physical_pixels);
-            self.framebuffer_capture_passes = self.framebuffer_capture_passes.saturating_add(1);
-        } else {
-            self.replay_capture_execution_pixels = self
-                .replay_capture_execution_pixels
-                .saturating_add(physical_pixels);
-            self.replay_capture_passes = self.replay_capture_passes.saturating_add(1);
-            self.replay_capture_commands =
-                self.replay_capture_commands.saturating_add(replay_commands);
+        match mode {
+            CaptureTimingMode::Replay => {
+                self.replay_capture_execution_pixels = self
+                    .replay_capture_execution_pixels
+                    .saturating_add(physical_pixels);
+                self.replay_capture_passes = self.replay_capture_passes.saturating_add(1);
+                self.replay_capture_commands =
+                    self.replay_capture_commands.saturating_add(replay_commands);
+            }
+            CaptureTimingMode::FramebufferBlit => {
+                self.framebuffer_capture_execution_pixels = self
+                    .framebuffer_capture_execution_pixels
+                    .saturating_add(physical_pixels);
+                self.framebuffer_capture_passes = self.framebuffer_capture_passes.saturating_add(1);
+            }
+            CaptureTimingMode::FramebufferShaderCopy => {
+                self.framebuffer_capture_execution_pixels = self
+                    .framebuffer_capture_execution_pixels
+                    .saturating_add(physical_pixels);
+                self.framebuffer_shader_copy_capture_execution_pixels = self
+                    .framebuffer_shader_copy_capture_execution_pixels
+                    .saturating_add(physical_pixels);
+                self.framebuffer_capture_passes = self.framebuffer_capture_passes.saturating_add(1);
+            }
         }
         let checkpoint_count = pass.checkpoint_dependencies.len();
         if checkpoint_count > 0 {
@@ -492,13 +597,14 @@ fn effect_pass_blend_mode(
     kind: RenderPassKind,
     output_is_framebuffer: bool,
     alpha_mode: EffectAlphaMode,
+    presentation_opacity: f32,
 ) -> EffectPassBlendMode {
     if output_is_framebuffer
         && matches!(
             kind,
             RenderPassKind::Composite | RenderPassKind::OutputPostProcess
         )
-        && alpha_mode == EffectAlphaMode::Preserve
+        && (alpha_mode == EffectAlphaMode::Preserve || presentation_opacity < 1.0)
     {
         EffectPassBlendMode::PremultipliedSourceOver
     } else {
@@ -1420,6 +1526,12 @@ fn execute_graph_passes_inner(
                 if renderer.capture_in_progress {
                     return None;
                 }
+                let capture_metadata = capture_timing_metadata_for_renderer(
+                    renderer,
+                    pass,
+                    lifecycle_backdrop,
+                    debug_config,
+                );
                 renderer.effect_gpu_profiler.begin_pass(
                     &renderer.gl,
                     scope,
@@ -1427,7 +1539,7 @@ fn execute_graph_passes_inner(
                     pass.instance.get(),
                     pass.kind,
                     effect_region_pixels(&execution_damage.region),
-                    capture_timing_metadata(pass, lifecycle_backdrop, debug_config),
+                    capture_metadata,
                 )
             });
             let execute_result = execute_pass(
@@ -1439,11 +1551,16 @@ fn execute_graph_passes_inner(
                 &execution_damage.region,
                 lifecycle_backdrop,
                 debug_config,
+                graph_scope.is_some(),
                 &mut stats,
             );
+            let replay_execution = execute_result.as_ref().ok().copied().flatten();
             renderer
                 .effect_gpu_profiler
-                .end_pass(&renderer.gl, pass_timing);
+                .end_pass(&renderer.gl, pass_timing, replay_execution);
+            if let Some(detail) = replay_execution {
+                stats.record_replay_capture_detail(detail);
+            }
             if renderer.effect_trace.enabled() {
                 renderer.effect_trace.pass_boundary(
                     "execute_end",
@@ -1625,6 +1742,16 @@ fn output_rects_pixels(rects: &[OutputRect]) -> u64 {
     rects.iter().fold(0u64, |total, rect| {
         total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
     })
+}
+
+fn monotonic_elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| {
+        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    })
+}
+
+fn replay_capture_host_timing_enabled(host_timing_enabled: bool, direct_capture: bool) -> bool {
+    host_timing_enabled && !direct_capture
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1882,6 +2009,62 @@ fn is_direct_framebuffer_capture(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CapturePathDecision {
+    requested: Option<CheckpointCapturePath>,
+    mode: CaptureTimingMode,
+    fallback_reason: Option<CapturePathFallbackReason>,
+}
+
+fn capture_path_decision(
+    renderer: &GlesSceneRenderer,
+    pass: &CompiledRenderPass,
+    lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
+) -> CapturePathDecision {
+    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
+    let checkpoint_direct_capture = pass.kind == RenderPassKind::SceneCapture
+        && !pass.checkpoint_dependencies.is_empty()
+        && !lifecycle_backdrop
+        && debug_config.capture_mode() == EffectDebugCaptureMode::Replay
+        && direct_capture;
+    if checkpoint_direct_capture {
+        let requested = Some(debug_config.checkpoint_capture_path());
+        return match debug_config.checkpoint_capture_path() {
+            CheckpointCapturePath::FramebufferBlit => CapturePathDecision {
+                requested,
+                mode: CaptureTimingMode::FramebufferBlit,
+                fallback_reason: None,
+            },
+            CheckpointCapturePath::FramebufferShaderCopy
+                if renderer.active_output_texture.is_some() =>
+            {
+                CapturePathDecision {
+                    requested,
+                    mode: CaptureTimingMode::FramebufferShaderCopy,
+                    fallback_reason: None,
+                }
+            }
+            CheckpointCapturePath::FramebufferShaderCopy => CapturePathDecision {
+                requested,
+                mode: CaptureTimingMode::FramebufferBlit,
+                fallback_reason: Some(CapturePathFallbackReason::NoSampleableOutputTexture),
+            },
+        };
+    }
+
+    CapturePathDecision {
+        requested: None,
+        mode: if direct_capture {
+            CaptureTimingMode::FramebufferBlit
+        } else {
+            CaptureTimingMode::Replay
+        },
+        fallback_reason: None,
+    }
+}
+
+#[cfg(test)]
 fn capture_timing_metadata(
     pass: &CompiledRenderPass,
     lifecycle_backdrop: bool,
@@ -1899,6 +2082,22 @@ fn capture_timing_metadata(
         } else {
             CaptureTimingMode::Replay
         },
+        checkpoint_count: pass.checkpoint_dependencies.len(),
+    })
+}
+
+fn capture_timing_metadata_for_renderer(
+    renderer: &GlesSceneRenderer,
+    pass: &CompiledRenderPass,
+    lifecycle_backdrop: bool,
+    debug_config: EffectDebugConfig,
+) -> Option<CaptureTimingMetadata> {
+    matches!(
+        pass.kind,
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+    )
+    .then_some(CaptureTimingMetadata {
+        mode: capture_path_decision(renderer, pass, lifecycle_backdrop, debug_config).mode,
         checkpoint_count: pass.checkpoint_dependencies.len(),
     })
 }
@@ -2268,15 +2467,12 @@ fn pass_trace_summary(
     } else {
         "precise"
     };
+    let capture_decision = capture_path_decision(renderer, pass, lifecycle_backdrop, debug_config);
     let capture_mode = matches!(
         pass.kind,
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
     )
-    .then_some(if direct_capture {
-        "framebuffer_blit"
-    } else {
-        "replay"
-    });
+    .then_some(capture_decision.mode.as_str());
     let capture_command_count = if capture_mode == Some("replay") {
         let layers = renderer
             .commands
@@ -2318,6 +2514,17 @@ fn pass_trace_summary(
         damage_rect_count: execution_damage.rects().len(),
         damage_bounding_box,
         capture_mode,
+        requested_capture_path: capture_decision
+            .requested
+            .map(CheckpointCapturePath::as_str),
+        executed_capture_path: matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        )
+        .then_some(capture_decision.mode.as_str()),
+        capture_fallback_reason: capture_decision
+            .fallback_reason
+            .map(CapturePathFallbackReason::as_str),
         capture_command_count,
         read_framebuffer: direct_capture.then(|| {
             renderer.active_output_framebuffer.map_or_else(
@@ -2441,11 +2648,12 @@ fn execute_pass(
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    host_timing_enabled: bool,
     stats: &mut EffectExecutionStats,
-) -> RendererResult<()> {
+) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
     match pass.kind {
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture => {
-            execute_capture(
+            let replay_execution = execute_capture(
                 renderer,
                 graph,
                 textures,
@@ -2454,9 +2662,11 @@ fn execute_pass(
                 execution_damage,
                 lifecycle_backdrop,
                 debug_config,
+                host_timing_enabled,
                 stats,
             )?;
             stats.scene_captures = stats.scene_captures.saturating_add(1);
+            return Ok(replay_execution);
         }
         RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample => {
             let first_downsample = pass.kind == RenderPassKind::DualKawaseDownsample
@@ -2565,7 +2775,7 @@ fn execute_pass(
             stats.composites = stats.composites.saturating_add(1);
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3137,8 +3347,9 @@ fn execute_capture(
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    host_timing_enabled: bool,
     stats: &mut EffectExecutionStats,
-) -> RendererResult<()> {
+) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
     let output = pass
         .output
         .ok_or_else(|| io::Error::other("capture pass has no output texture"))?;
@@ -3147,6 +3358,9 @@ fn execute_capture(
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
     let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
+    let replay_host_timing_enabled =
+        replay_capture_host_timing_enabled(host_timing_enabled, direct_capture);
+    let host_start = replay_host_timing_enabled.then(Instant::now);
     let materialization = if direct_capture {
         None
     } else {
@@ -3184,10 +3398,29 @@ fn execute_capture(
             output_rect_pixels(&capture_rects),
         );
     }
+    let capture_decision = capture_path_decision(renderer, pass, lifecycle_backdrop, debug_config);
     if direct_capture {
-        stats.record_capture_execution(pass, true, physical_pixels, 0);
-        capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
-        return Ok(());
+        stats.record_capture_execution_with_mode(pass, capture_decision.mode, physical_pixels, 0);
+        match capture_decision.mode {
+            CaptureTimingMode::FramebufferBlit => {
+                capture_output_region_to_graph_texture(
+                    renderer,
+                    target,
+                    target_plan,
+                    framebuffer_origin,
+                )?;
+            }
+            CaptureTimingMode::FramebufferShaderCopy => {
+                capture_output_region_to_graph_texture_shader_copy(
+                    renderer,
+                    target,
+                    target_plan,
+                    framebuffer_origin,
+                )?;
+            }
+            CaptureTimingMode::Replay => unreachable!("direct capture selected replay timing"),
+        }
+        return Ok(None);
     }
     renderer
         .effect_resources
@@ -3235,6 +3468,7 @@ fn execute_capture(
             );
         }
     }
+    let selection_start = replay_host_timing_enabled.then(Instant::now);
     let layers = renderer
         .commands
         .iter()
@@ -3256,6 +3490,7 @@ fn execute_capture(
         pass.visual_group,
         pass.anchor_scope,
     );
+    let selection_cpu_ns = monotonic_elapsed_ns(selection_start);
     stats.record_capture_execution(pass, false, physical_pixels, indices.len());
     let scissors = materialization
         .as_ref()
@@ -3268,14 +3503,18 @@ fn execute_capture(
         &scissors,
         target_plan.domain,
         (target_plan.width, target_plan.height),
+        replay_host_timing_enabled,
     );
     renderer.capture_unattenuated_visual_group = None;
-    draw_result?;
+    let mut detail = draw_result?;
     renderer.effect_resources.unbind_render_target(&renderer.gl);
     renderer.bind_active_output_framebuffer();
     restore_output_viewport(renderer);
     establish_effect_pass_blend_state(&renderer.gl, EffectPassBlendMode::Replace);
-    Ok(())
+    detail.execution_pixels = physical_pixels;
+    detail.selection_cpu_ns = selection_cpu_ns;
+    detail.host_cpu_ns = monotonic_elapsed_ns(host_start);
+    Ok(Some(detail))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3574,9 +3813,42 @@ fn plan_graph_texture_capture(
     })
 }
 
+#[cfg(test)]
+fn shader_copy_source_texel(
+    output_size: (u32, u32),
+    domain: oblivion_one::effects::EffectRect,
+    target_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+    destination: (u32, u32),
+) -> Option<(i32, i32)> {
+    let transfer =
+        plan_graph_texture_capture(output_size, domain, target_size, framebuffer_origin)?;
+    if destination.0 >= target_size.0 || destination.1 >= target_size.1 {
+        return None;
+    }
+    let logical_y = target_size.1.checked_sub(destination.1)?.checked_sub(1)?;
+    let source_x = domain.x.checked_add(i32::try_from(destination.0).ok()?)?;
+    let source_y = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => i32::try_from(output_size.1)
+            .ok()?
+            .checked_sub(1)?
+            .checked_sub(domain.y)?
+            .checked_sub(i32::try_from(logical_y).ok()?)?,
+        OutputFramebufferOrigin::TopLeftScanout => {
+            domain.y.checked_add(i32::try_from(logical_y).ok()?)?
+        }
+    };
+    let source = (source_x, source_y);
+    (source.0 >= transfer.source.x0
+        && source.0 < transfer.source.x1
+        && source.1 >= transfer.source.y0
+        && source.1 < transfer.source.y1)
+        .then_some(source)
+}
+
 /// Capture a logical output domain into a graph texture with the canonical
 /// `GraphTextureOrigin::BottomLeft` orientation.
-fn capture_output_region_to_graph_texture(
+pub(crate) fn capture_output_region_to_graph_texture(
     renderer: &mut GlesSceneRenderer,
     target: &PooledEffectTexture,
     target_plan: &oblivion_one::effects::GraphTexturePlan,
@@ -3632,6 +3904,107 @@ fn capture_output_region_to_graph_texture(
     result
 }
 
+/// Copy the active output image into the same pooled graph texture used by the
+/// framebuffer-blit path. The output image is sampled as an integer texel
+/// source, while the graph target remains bottom-left oriented and local to
+/// the capture domain.
+pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    target_plan: &oblivion_one::effects::GraphTexturePlan,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    if target_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft {
+        return Err(io::Error::other("direct capture target is not bottom-left oriented").into());
+    }
+    plan_graph_texture_capture(
+        renderer.current_size,
+        target_plan.domain,
+        (target_plan.width, target_plan.height),
+        framebuffer_origin,
+    )
+    .ok_or_else(|| io::Error::other("direct capture domain is outside the output"))?;
+    let output_texture = renderer
+        .active_output_texture
+        .ok_or_else(|| io::Error::other("shader-copy capture has no sampleable output texture"))?;
+    let result = (|| {
+        let draw_framebuffer = renderer
+            .effect_resources
+            .bind_draw_target(&renderer.gl, target)?;
+        // This is a hard guard against sampling from the image attached to the
+        // current draw framebuffer. The output framebuffer is never bound as
+        // DRAW for this path; only the pooled graph target is.
+        if renderer.active_output_framebuffer == Some(draw_framebuffer)
+            || target_plan.source == GraphTextureSource::Output
+        {
+            return Err(
+                Box::new(EffectExecutionInvariantError::InvalidFramebufferBlitTargets)
+                    as Box<dyn std::error::Error>,
+            );
+        }
+        let (vertex_array, _) = renderer.ensure_effect_quad()?;
+        unsafe {
+            renderer
+                .gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
+            renderer
+                .gl
+                .viewport(0, 0, target_plan.width as i32, target_plan.height as i32);
+            renderer.gl.disable(glow::SCISSOR_TEST);
+            renderer.gl.disable(glow::BLEND);
+            renderer.gl.use_program(Some(renderer.capture_copy_program));
+            renderer.gl.active_texture(glow::TEXTURE0);
+            renderer
+                .gl
+                .bind_texture(glow::TEXTURE_2D, Some(output_texture));
+            if let Some(location) = renderer.capture_copy_uniform_location("u_output_texture") {
+                renderer.gl.uniform_1_i32(Some(&location), 0);
+            }
+            if let Some(location) = renderer.capture_copy_uniform_location("u_capture_output_size")
+            {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    renderer.current_size.0 as f32,
+                    renderer.current_size.1 as f32,
+                );
+            }
+            if let Some(location) = renderer.capture_copy_uniform_location("u_capture_domain") {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    target_plan.domain.x as f32,
+                    target_plan.domain.y as f32,
+                    target_plan.domain.width as f32,
+                    target_plan.domain.height as f32,
+                );
+            }
+            if let Some(location) = renderer.capture_copy_uniform_location("u_capture_target_size")
+            {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    target_plan.width as f32,
+                    target_plan.height as f32,
+                );
+            }
+            if let Some(location) =
+                renderer.capture_copy_uniform_location("u_capture_origin_bottom_left")
+            {
+                renderer.gl.uniform_1_i32(
+                    Some(&location),
+                    i32::from(matches!(
+                        framebuffer_origin,
+                        OutputFramebufferOrigin::BottomLeft
+                    )),
+                );
+            }
+            renderer.gl.bind_vertex_array(Some(vertex_array));
+            renderer.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        }
+        Ok(())
+    })();
+    renderer.establish_ordinary_scene_state();
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_fullscreen_pass(
     renderer: &mut GlesSceneRenderer,
@@ -3672,7 +4045,21 @@ fn execute_fullscreen_pass(
             .effect_resources
             .bind_render_target(&renderer.gl, texture)?;
     }
-    let blend_mode = effect_pass_blend_mode(pass.kind, output_is_framebuffer, pass.alpha_mode);
+    let presentation_opacity = if output_is_framebuffer
+        && matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        ) {
+        renderer.presentation_opacity_for_visual_group(pass.visual_group)
+    } else {
+        1.0
+    };
+    let blend_mode = effect_pass_blend_mode(
+        pass.kind,
+        output_is_framebuffer,
+        pass.alpha_mode,
+        presentation_opacity,
+    );
     establish_effect_pass_blend_state(&renderer.gl, blend_mode);
     unsafe {
         renderer
@@ -3723,12 +4110,9 @@ fn execute_fullscreen_pass(
             program,
             "u_presentation_opacity",
         ) {
-            let opacity = if output_is_framebuffer {
-                renderer.presentation_opacity_for_visual_group(pass.visual_group)
-            } else {
-                1.0
-            };
-            renderer.gl.uniform_1_f32(Some(&location), opacity);
+            renderer
+                .gl
+                .uniform_1_f32(Some(&location), presentation_opacity);
         }
         if let Some(location) = uniform_location(
             &mut renderer.effect_shaders,
@@ -4411,6 +4795,7 @@ fn trusted_effect_output_size(
 
 #[cfg(test)]
 mod coordinate_tests {
+    use super::shader_copy_source_texel;
     use super::*;
     use crate::egl_renderer::{EglRect, SurfaceSampling};
 
@@ -4576,6 +4961,24 @@ mod coordinate_tests {
     }
 
     #[test]
+    fn composite_shader_applies_presentation_opacity_after_effect_alpha_mode() {
+        let force_opaque = COMPOSITE_FRAGMENT_SHADER
+            .find("if (u_effect_force_opaque != 0)")
+            .expect("composite shader must preserve opaque effect semantics");
+        let presentation_opacity = COMPOSITE_FRAGMENT_SHADER
+            .find("result *= clamp(u_presentation_opacity, 0.0, 1.0)")
+            .expect("composite shader must apply presentation opacity");
+        assert!(
+            force_opaque < presentation_opacity,
+            "PresentationOpacity must be the outermost effect alpha operation"
+        );
+        assert!(
+            COMPOSITE_FRAGMENT_SHADER
+                .contains("out_color = typhon_sanitize_premultiplied(result);")
+        );
+    }
+
+    #[test]
     fn every_fullscreen_pass_family_uses_the_shared_sample_orientation_contract() {
         for shader in [
             blur::DUAL_KAWASE_DOWNSAMPLE_SHADER,
@@ -4663,6 +5066,52 @@ mod coordinate_tests {
                 y1: 0,
             }
         );
+    }
+
+    #[test]
+    fn shader_copy_maps_each_capture_pixel_like_framebuffer_blit() {
+        let output_size = (1920, 1080);
+        let domains = [
+            oblivion_one::effects::EffectRect::new(762, 976, 396, 104).unwrap(),
+            oblivion_one::effects::EffectRect::new(0, 0, 120, 65).unwrap(),
+            oblivion_one::effects::EffectRect::new(1610, 0, 310, 65).unwrap(),
+            oblivion_one::effects::EffectRect::new(700, 400, 320, 180).unwrap(),
+            oblivion_one::effects::EffectRect::new(0, 0, 1920, 1).unwrap(),
+            oblivion_one::effects::EffectRect::new(0, 1079, 1920, 1).unwrap(),
+            oblivion_one::effects::EffectRect::new(0, 0, 1, 1080).unwrap(),
+            oblivion_one::effects::EffectRect::new(1919, 0, 1, 1080).unwrap(),
+        ];
+
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            for domain in domains {
+                let target_size = (domain.width, domain.height);
+                let transfer = plan_graph_texture_capture(output_size, domain, target_size, origin)
+                    .expect("edge capture domain is valid");
+                for destination_y in 0..target_size.1 {
+                    for destination_x in 0..target_size.0 {
+                        let expected_y = if transfer.destination.y0 < transfer.destination.y1 {
+                            transfer.source.y0 + destination_y as i32
+                        } else {
+                            transfer.source.y1 - 1 - destination_y as i32
+                        };
+                        assert_eq!(
+                            shader_copy_source_texel(
+                                output_size,
+                                domain,
+                                target_size,
+                                origin,
+                                (destination_x, destination_y),
+                            ),
+                            Some((transfer.source.x0 + destination_x as i32, expected_y,)),
+                            "shader mapping mismatch for {origin:?}, domain {domain:?}, destination ({destination_x}, {destination_y})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4903,7 +5352,7 @@ mod coordinate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egl_renderer::{EglRect, SurfaceSampling};
+    use crate::egl_renderer::{EglRect, SurfaceSampling, replay_capture_region_layout};
 
     fn test_texture(
         id: u16,
@@ -5632,6 +6081,7 @@ mod tests {
                     kind,
                     false,
                     oblivion_one::effects::EffectAlphaMode::Preserve,
+                    1.0,
                 ),
                 EffectPassBlendMode::Replace,
                 "internal pass {kind:?} must replace its target"
@@ -5646,6 +6096,7 @@ mod tests {
                 RenderPassKind::Composite,
                 true,
                 oblivion_one::effects::EffectAlphaMode::Opaque,
+                1.0,
             ),
             EffectPassBlendMode::Replace
         );
@@ -5654,9 +6105,22 @@ mod tests {
                 RenderPassKind::OutputPostProcess,
                 true,
                 oblivion_one::effects::EffectAlphaMode::Preserve,
+                1.0,
             ),
             EffectPassBlendMode::PremultipliedSourceOver
         );
+        for opacity in [0.5, 0.0] {
+            assert_eq!(
+                effect_pass_blend_mode(
+                    RenderPassKind::Composite,
+                    true,
+                    oblivion_one::effects::EffectAlphaMode::Opaque,
+                    opacity,
+                ),
+                EffectPassBlendMode::PremultipliedSourceOver,
+                "opaque final output with opacity {opacity} must source-over"
+            );
+        }
     }
 
     #[test]
@@ -5677,6 +6141,58 @@ mod tests {
                 OutputRect::new(8, 72, 12, 10),
                 OutputRect::new(80, 31, 8, 7)
             ]
+        );
+    }
+
+    #[test]
+    fn replay_capture_region_layout_reports_materialization_and_execution_regions() {
+        let output_rects = [
+            OutputRect::new(10, 20, 30, 40),
+            OutputRect::new(80, 90, 12, 14),
+        ];
+
+        let layout = replay_capture_region_layout(&output_rects);
+
+        assert_eq!(layout.materialization_rects, 2);
+        assert_eq!(layout.execution_regions, 2);
+        assert!(!layout.disjoint_overflowed);
+        assert_eq!(layout.execution_region.rects().len(), 2);
+    }
+
+    #[test]
+    fn replay_capture_region_layout_reports_bounded_overflow_and_bbox_fallback() {
+        let mut output_rects = Vec::new();
+        for index in 0..oblivion_one::effects::MAX_EFFECT_REGION_RECTS.saturating_sub(1) {
+            output_rects.push(OutputRect::new(0, index as i32 * 2, 1_000, 1));
+        }
+        output_rects.push(OutputRect::new(
+            0,
+            0,
+            1_000,
+            (oblivion_one::effects::MAX_EFFECT_REGION_RECTS as u32)
+                .saturating_mul(2)
+                .saturating_sub(1),
+        ));
+
+        let layout = replay_capture_region_layout(&output_rects);
+
+        assert_eq!(layout.materialization_rects, output_rects.len());
+        assert!(layout.disjoint_overflowed);
+        assert_eq!(layout.execution_regions, 1);
+        assert_eq!(layout.execution_region.rects().len(), 1);
+        assert_eq!(
+            layout.execution_region.bounding_rect(),
+            Some(
+                oblivion_one::effects::EffectRect::new(
+                    0,
+                    0,
+                    1_000,
+                    (oblivion_one::effects::MAX_EFFECT_REGION_RECTS as u32)
+                        .saturating_mul(2)
+                        .saturating_sub(1),
+                )
+                .unwrap(),
+            )
         );
     }
 
@@ -5814,6 +6330,7 @@ mod tests {
                 RenderPassKind::Composite,
                 true,
                 oblivion_one::effects::EffectAlphaMode::Preserve,
+                0.5,
             ),
             EffectPassBlendMode::PremultipliedSourceOver
         );
@@ -6474,6 +6991,66 @@ mod tests {
         assert_eq!(stats.framebuffer_capture_execution_pixels, 8_000);
         assert_eq!(stats.checkpoint_capture_execution_pixels, 8_000);
         assert_eq!(stats.capture_execution_pixels, replay_pixels + 8_000);
+    }
+
+    #[test]
+    fn replay_capture_detail_distinguishes_candidate_planning_from_scene_scans() {
+        let mut stats = EffectExecutionStats::default();
+        stats.record_replay_capture_detail(ReplayCaptureExecutionDetail {
+            materialization_rects: 2,
+            execution_regions: 2,
+            candidate_commands: 3,
+            command_region_pairs: 5,
+            scene_commands_total: 10,
+            scene_scan_pairs: 20,
+            planner_commands_visited: 5,
+            planner_commands_drawable: 4,
+            commands_considered: 20,
+            commands_executed: 3,
+            draw_calls: 3,
+            ..Default::default()
+        });
+
+        let summary = stats.capture_timing_summary();
+
+        assert_eq!(summary.replay_capture_materialization_rects, 2);
+        assert_eq!(summary.replay_capture_execution_regions, 2);
+        assert_eq!(summary.replay_capture_command_region_pairs, 5);
+        assert_eq!(summary.replay_capture_scene_scan_pairs, 20);
+        assert_eq!(summary.replay_capture_planner_commands_visited, 5);
+        assert_eq!(summary.replay_capture_planner_commands_drawable, 4);
+        assert_eq!(summary.replay_capture_commands_executed, 3);
+        assert_eq!(summary.replay_capture_draw_calls, 3);
+        assert_ne!(summary.replay_capture_command_region_pairs, 3 * 2);
+        assert_eq!(stats.replay_capture_commands, 0);
+    }
+
+    #[test]
+    fn replay_capture_detail_keeps_host_phases_synthetic_and_fixed_size() {
+        let mut stats = EffectExecutionStats::default();
+        stats.record_replay_capture_detail(ReplayCaptureExecutionDetail {
+            host_cpu_ns: 101,
+            selection_cpu_ns: 11,
+            visibility_cpu_ns: 22,
+            draw_submit_cpu_ns: 33,
+            commands_executed: 1,
+            draw_calls: 1,
+            ..Default::default()
+        });
+
+        let summary = stats.capture_timing_summary();
+
+        assert_eq!(summary.replay_capture_host_cpu_ns, 101);
+        assert_eq!(summary.replay_capture_selection_cpu_ns, 11);
+        assert_eq!(summary.replay_capture_visibility_cpu_ns, 22);
+        assert_eq!(summary.replay_capture_draw_submit_cpu_ns, 33);
+    }
+
+    #[test]
+    fn replay_host_timing_gate_is_disabled_without_active_gpu_profiling() {
+        assert!(!replay_capture_host_timing_enabled(false, false));
+        assert!(!replay_capture_host_timing_enabled(true, true));
+        assert!(replay_capture_host_timing_enabled(true, false));
     }
 
     #[test]

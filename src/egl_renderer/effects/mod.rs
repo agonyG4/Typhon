@@ -19,16 +19,19 @@ pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;
 #[cfg(test)]
 pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_SHADER;
 #[cfg(test)]
+pub(crate) use executor::execute_effect_graph_with_debug_config;
+#[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
 #[cfg(test)]
 pub(crate) use executor::{
     SceneReplayWorkMode, execute_effect_graph_with_debug_config_and_scene_replay_mode,
 };
+#[cfg(test)]
 pub(crate) use executor::{
-    capture_scene_work_preservation, restore_scene_work_preservation,
-    SceneCaptureMaterializationPolicy, execute_effect_graph_with_debug_config,
-    execute_effect_graph_with_debug_config_and_materialization_policy,
+    capture_output_region_to_graph_texture, capture_output_region_to_graph_texture_shader_copy,
 };
+#[cfg(test)]
+pub(crate) use executor::{capture_scene_work_preservation, restore_scene_work_preservation};
 pub(crate) use executor::{
     execute_effect_graph, execute_effect_graph_for_lifecycle, plan_effect_surface_consumers,
     select_effect_execution,
@@ -47,8 +50,9 @@ pub(crate) use shader_cache::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
 };
 pub(crate) use trace::{
-    EffectDebugCaptureMode, EffectDebugConfig, EffectDebugKawaseMode, EffectExecutionTrace,
-    FrameTraceSummary, PassTraceSummary, effect_debug_config,
+    CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
+    EffectDebugKawaseMode, EffectExecutionTrace, FrameTraceSummary, PassTraceSummary,
+    effect_debug_config,
 };
 #[cfg(test)]
 pub(crate) use trace::{

@@ -13,6 +13,7 @@ use super::resources::PooledEffectTexture;
 const TRACE_ENV: &str = "TYPHON_EFFECT_EXEC_TRACE";
 const DEBUG_CAPTURE_MODE_ENV: &str = "TYPHON_EFFECT_DEBUG_CAPTURE_MODE";
 const DEBUG_KAWASE_MODE_ENV: &str = "TYPHON_EFFECT_DEBUG_KAWASE_MODE";
+const DEBUG_CHECKPOINT_CAPTURE_PATH_ENV: &str = "TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH";
 const MAX_TRACE_INPUTS: usize = 8;
 
 #[cfg(test)]
@@ -52,6 +53,34 @@ pub(crate) enum EffectDebugCaptureMode {
     Framebuffer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointCapturePath {
+    FramebufferBlit,
+    FramebufferShaderCopy,
+}
+
+impl CheckpointCapturePath {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::FramebufferBlit => "blit",
+            Self::FramebufferShaderCopy => "shader-copy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapturePathFallbackReason {
+    NoSampleableOutputTexture,
+}
+
+impl CapturePathFallbackReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSampleableOutputTexture => "no-sampleable-output-texture",
+        }
+    }
+}
+
 impl EffectDebugCaptureMode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -80,6 +109,7 @@ impl EffectDebugKawaseMode {
 pub(crate) struct EffectDebugConfig {
     capture_mode: EffectDebugCaptureMode,
     kawase_mode: EffectDebugKawaseMode,
+    checkpoint_capture_path: CheckpointCapturePath,
 }
 
 impl EffectDebugConfig {
@@ -91,6 +121,20 @@ impl EffectDebugConfig {
         Self {
             capture_mode,
             kawase_mode,
+            checkpoint_capture_path: CheckpointCapturePath::FramebufferBlit,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_with_checkpoint_capture_path(
+        capture_mode: EffectDebugCaptureMode,
+        kawase_mode: EffectDebugKawaseMode,
+        checkpoint_capture_path: CheckpointCapturePath,
+    ) -> Self {
+        Self {
+            capture_mode,
+            kawase_mode,
+            checkpoint_capture_path,
         }
     }
 
@@ -98,9 +142,18 @@ impl EffectDebugConfig {
         capture_mode: Option<&OsStr>,
         kawase_mode: Option<&OsStr>,
     ) -> Self {
+        Self::from_env_values_with_checkpoint_capture_path(capture_mode, kawase_mode, None)
+    }
+
+    pub(crate) fn from_env_values_with_checkpoint_capture_path(
+        capture_mode: Option<&OsStr>,
+        kawase_mode: Option<&OsStr>,
+        checkpoint_capture_path: Option<&OsStr>,
+    ) -> Self {
         Self {
             capture_mode: parse_debug_capture_mode(capture_mode),
             kawase_mode: parse_debug_kawase_mode(kawase_mode),
+            checkpoint_capture_path: parse_checkpoint_capture_path(checkpoint_capture_path),
         }
     }
 
@@ -110,6 +163,26 @@ impl EffectDebugConfig {
 
     pub(crate) const fn kawase_mode(self) -> EffectDebugKawaseMode {
         self.kawase_mode
+    }
+
+    pub(crate) const fn checkpoint_capture_path(self) -> CheckpointCapturePath {
+        self.checkpoint_capture_path
+    }
+}
+
+fn parse_checkpoint_capture_path(value: Option<&OsStr>) -> CheckpointCapturePath {
+    match value.and_then(OsStr::to_str) {
+        None | Some("blit") => CheckpointCapturePath::FramebufferBlit,
+        Some("shader-copy") => CheckpointCapturePath::FramebufferShaderCopy,
+        Some(value) => {
+            static WARNED: OnceLock<()> = OnceLock::new();
+            if WARNED.set(()).is_ok() {
+                eprintln!(
+                    "warning: invalid {DEBUG_CHECKPOINT_CAPTURE_PATH_ENV}={value:?}; using blit"
+                );
+            }
+            CheckpointCapturePath::FramebufferBlit
+        }
     }
 }
 
@@ -144,7 +217,17 @@ pub(crate) fn effect_debug_config() -> &'static EffectDebugConfig {
             std::env::var_os(DEBUG_CAPTURE_MODE_ENV).as_deref(),
             std::env::var_os(DEBUG_KAWASE_MODE_ENV).as_deref(),
         )
+        .with_checkpoint_capture_path_from_env(
+            std::env::var_os(DEBUG_CHECKPOINT_CAPTURE_PATH_ENV).as_deref(),
+        )
     })
+}
+
+impl EffectDebugConfig {
+    fn with_checkpoint_capture_path_from_env(mut self, value: Option<&OsStr>) -> Self {
+        self.checkpoint_capture_path = parse_checkpoint_capture_path(value);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -188,6 +271,9 @@ pub(crate) struct PassTraceSummary {
     pub(crate) damage_rect_count: usize,
     pub(crate) damage_bounding_box: Option<(i32, i32, u32, u32)>,
     pub(crate) capture_mode: Option<&'static str>,
+    pub(crate) requested_capture_path: Option<&'static str>,
+    pub(crate) executed_capture_path: Option<&'static str>,
+    pub(crate) capture_fallback_reason: Option<&'static str>,
     pub(crate) capture_command_count: Option<usize>,
     pub(crate) read_framebuffer: Option<String>,
     pub(crate) draw_framebuffer: Option<String>,
@@ -290,6 +376,34 @@ impl EffectExecutionTrace {
 
     pub(crate) const fn frame_id(self) -> Option<u64> {
         self.frame_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_gpu_timing(
+        &self,
+        frame_id: Option<u64>,
+        pass_id: Option<u64>,
+        instance_id: Option<u64>,
+        kind: RenderPassKind,
+        capture_path: &'static str,
+        checkpoint_count: usize,
+        pixels: u64,
+        duration_ns: u64,
+    ) {
+        let line = format!(
+            "event=effect_capture_gpu_timing frame_id={} pass={} instance={} kind={} capture_path={} checkpoint_count={} pixels={} duration_ns={}",
+            optional_u64(frame_id),
+            optional_u64(pass_id),
+            optional_u64(instance_id),
+            render_pass_kind_name(kind),
+            capture_path,
+            checkpoint_count,
+            pixels,
+            duration_ns,
+        );
+        #[cfg(test)]
+        TEST_EVENTS.with(|events| events.borrow_mut().push(line.clone()));
+        eprintln!("typhon effect: {line}");
     }
 
     pub(crate) fn event<F>(&self, make_line: F)
@@ -590,7 +704,7 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} backdrop_capture_policy={} kawase_execution_policy={} scene_work_damage_rects={} scene_work_damage_bbox={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} requested_capture_path={} executed_capture_path={} fallback_reason={} backdrop_capture_policy={} kawase_execution_policy={} scene_work_damage_rects={} scene_work_damage_bbox={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
@@ -608,6 +722,9 @@ impl EffectExecutionTrace {
                 bbox,
                 pass.checkpoint_dependencies.len(),
                 summary.capture_mode.unwrap_or("none"),
+                summary.requested_capture_path.unwrap_or("none"),
+                summary.executed_capture_path.unwrap_or("none"),
+                summary.capture_fallback_reason.unwrap_or("none"),
                 summary.backdrop_capture_policy.unwrap_or("replay"),
                 summary.kawase_execution_policy.unwrap_or("partial"),
                 summary.scene_work_damage_rects,
@@ -732,6 +849,10 @@ mod tests {
         let defaults = EffectDebugConfig::from_env_values(None, None);
         assert_eq!(defaults.capture_mode(), EffectDebugCaptureMode::Replay);
         assert_eq!(defaults.kawase_mode(), EffectDebugKawaseMode::Partial);
+        assert_eq!(
+            defaults.checkpoint_capture_path(),
+            CheckpointCapturePath::FramebufferBlit
+        );
 
         let framebuffer_full = EffectDebugConfig::from_env_values(
             Some(OsStr::new("framebuffer")),
@@ -747,6 +868,26 @@ mod tests {
             EffectDebugConfig::from_env_values(Some(OsStr::new("blit")), Some(OsStr::new("all")));
         assert_eq!(invalid.capture_mode(), EffectDebugCaptureMode::Replay);
         assert_eq!(invalid.kawase_mode(), EffectDebugKawaseMode::Partial);
+
+        let shader_copy = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            None,
+            None,
+            Some(OsStr::new("shader-copy")),
+        );
+        assert_eq!(
+            shader_copy.checkpoint_capture_path(),
+            CheckpointCapturePath::FramebufferShaderCopy
+        );
+
+        let invalid_checkpoint = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            None,
+            None,
+            Some(OsStr::new("auto")),
+        );
+        assert_eq!(
+            invalid_checkpoint.checkpoint_capture_path(),
+            CheckpointCapturePath::FramebufferBlit
+        );
     }
 
     #[test]
@@ -760,6 +901,33 @@ mod tests {
         });
 
         assert!(!formatted.get());
+    }
+
+    #[test]
+    fn capture_gpu_timing_event_is_bounded_and_path_specific() {
+        clear_test_events();
+        let trace = EffectExecutionTrace::enabled_for_test();
+        trace.capture_gpu_timing(
+            Some(9),
+            Some(7),
+            Some(11),
+            RenderPassKind::SceneCapture,
+            "framebuffer_shader_copy",
+            2,
+            41_184,
+            1_234,
+        );
+        let line = take_test_events().pop().expect("capture timing event");
+        assert!(line.contains("event=effect_capture_gpu_timing"));
+        assert!(line.contains("frame_id=9"));
+        assert!(line.contains("pass=7"));
+        assert!(line.contains("instance=11"));
+        assert!(line.contains("kind=SceneCapture"));
+        assert!(line.contains("capture_path=framebuffer_shader_copy"));
+        assert!(line.contains("checkpoint_count=2"));
+        assert!(line.contains("pixels=41184"));
+        assert!(line.contains("duration_ns=1234"));
+        assert!(!line.contains("region"));
     }
 
     #[test]

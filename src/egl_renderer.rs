@@ -52,8 +52,8 @@ use damage::{
 };
 use effects::{
     EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache, EffectGpuProfiler,
-    EffectGraphMetrics, FrameTraceSummary, ShaderProgramCache, builtin_shader_program_count,
-    graph_metrics, shader_cache_capacity_for_custom_shaders,
+    EffectGraphMetrics, FrameTraceSummary, ReplayCaptureExecutionDetail, ShaderProgramCache,
+    builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
@@ -63,7 +63,7 @@ use geometry::{
     plan_capture_visibility, plan_surface_consumers, plan_visibility, push_draw_command,
     push_draw_command_with_uv, surface_sampling_for_plan,
 };
-use program::create_texture_program;
+use program::{create_capture_copy_program, create_texture_program};
 
 pub(crate) type RendererResult<T> = Result<T, Box<dyn Error>>;
 pub(crate) type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
@@ -466,6 +466,7 @@ pub(crate) enum EglFrameOutcome {
 #[allow(dead_code)] // The explicit Atomic runtime consumes this after bootstrap reordering.
 pub(crate) struct EglOutputRenderTarget {
     pub(crate) framebuffer: glow::Framebuffer,
+    pub(crate) sampleable_texture: Option<glow::Texture>,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) buffer_age: BufferAge,
@@ -574,7 +575,9 @@ pub(crate) struct GlesSceneRenderer {
     gl: glow::Context,
     program: GlProgram,
     capture_program: GlProgram,
+    capture_copy_program: GlProgram,
     capture_uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
+    capture_copy_uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
     presentation_opacity_location: Option<glow::UniformLocation>,
     scene_vertex_array: GlVertexArray,
     scene_vertex_buffer: GlBuffer,
@@ -635,6 +638,7 @@ pub(crate) struct GlesSceneRenderer {
     effect_trace: EffectExecutionTrace,
     effect_gpu_profiler: EffectGpuProfiler,
     active_output_framebuffer: Option<glow::Framebuffer>,
+    active_output_texture: Option<glow::Texture>,
     frame_stats: GlesSceneFrameStats,
     effect_clock_start: Instant,
     effect_time_seconds: f32,
@@ -662,6 +666,7 @@ struct CaptureRendererState {
     lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
     failed_surface_generations: HashMap<u32, u64>,
     active_output_framebuffer: Option<glow::Framebuffer>,
+    active_output_texture: Option<glow::Texture>,
     capture_in_progress: bool,
     capture_unattenuated_visual_group: Option<VisualGroupId>,
 }
@@ -686,6 +691,7 @@ impl CaptureRendererState {
             lifecycle_visual_sources: renderer.lifecycle_visual_sources.clone(),
             failed_surface_generations: renderer.failed_surface_generations.clone(),
             active_output_framebuffer: renderer.active_output_framebuffer,
+            active_output_texture: renderer.active_output_texture,
             capture_in_progress: renderer.capture_in_progress,
             capture_unattenuated_visual_group: renderer.capture_unattenuated_visual_group,
         }
@@ -709,6 +715,7 @@ impl CaptureRendererState {
         renderer.lifecycle_visual_sources = self.lifecycle_visual_sources;
         renderer.failed_surface_generations = self.failed_surface_generations;
         renderer.active_output_framebuffer = self.active_output_framebuffer;
+        renderer.active_output_texture = self.active_output_texture;
         renderer.capture_in_progress = self.capture_in_progress;
         renderer.capture_unattenuated_visual_group = self.capture_unattenuated_visual_group;
     }
@@ -1074,6 +1081,51 @@ fn set_lamp_uniform_rect(
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplayCaptureRegionLayout {
+    pub(crate) materialization_rects: usize,
+    pub(crate) execution_region: EffectRegion,
+    pub(crate) execution_regions: usize,
+    pub(crate) disjoint_overflowed: bool,
+}
+
+pub(crate) fn replay_capture_region_layout(
+    output_rects: &[OutputRect],
+) -> ReplayCaptureRegionLayout {
+    let mut requested = EffectRegion::empty();
+    for output_rect in output_rects {
+        if let Some(rect) = EffectRect::new(
+            output_rect.x,
+            output_rect.y,
+            output_rect.width,
+            output_rect.height,
+        ) {
+            requested.push(rect);
+        }
+    }
+    let disjoint = requested.disjoint_bounded();
+    let execution_region = if disjoint.overflowed {
+        requested
+            .bounding_rect()
+            .map(EffectRegion::from_rect)
+            .unwrap_or_else(EffectRegion::empty)
+    } else {
+        disjoint.region
+    };
+    ReplayCaptureRegionLayout {
+        materialization_rects: output_rects.len(),
+        execution_regions: execution_region.rects().len(),
+        disjoint_overflowed: disjoint.overflowed,
+        execution_region,
+    }
+}
+
+fn monotonic_elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| {
+        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    })
+}
+
 impl GlesSceneRenderer {
     pub(crate) const fn lifecycle_animation_available(&self) -> bool {
         self.lamp_program.is_some()
@@ -1101,6 +1153,7 @@ impl GlesSceneRenderer {
         };
         let program = create_texture_program(&gl)?;
         let capture_program = program::create_capture_program(&gl)?;
+        let capture_copy_program = create_capture_copy_program(&gl)?;
         let lamp_program = program::create_lamp_program(&gl).ok();
         let scene_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let scene_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
@@ -1151,6 +1204,12 @@ impl GlesSceneRenderer {
             }
             if let Some(location) = gl.get_uniform_location(capture_program, "u_opacity") {
                 gl.uniform_1_f32(Some(&location), 1.0);
+            }
+            gl.use_program(Some(capture_copy_program));
+            if let Some(location) =
+                gl.get_uniform_location(capture_copy_program, "u_output_texture")
+            {
+                gl.uniform_1_i32(Some(&location), 0);
             }
             if let Some(lamp_program) = lamp_program {
                 gl.use_program(Some(lamp_program));
@@ -1203,7 +1262,9 @@ impl GlesSceneRenderer {
             gl,
             program,
             capture_program,
+            capture_copy_program,
             capture_uniform_locations: HashMap::new(),
+            capture_copy_uniform_locations: HashMap::new(),
             presentation_opacity_location,
             scene_vertex_array,
             scene_vertex_buffer,
@@ -1268,6 +1329,7 @@ impl GlesSceneRenderer {
             effect_trace: EffectExecutionTrace::new(None, None, None, None),
             effect_gpu_profiler,
             active_output_framebuffer: None,
+            active_output_texture: None,
             frame_stats: GlesSceneFrameStats::default(),
             effect_clock_start: Instant::now(),
             effect_time_seconds: 0.0,
@@ -1347,12 +1409,39 @@ impl GlesSceneRenderer {
             .clamp(0.0, 1.0)
     }
 
+    fn presentation_opacity_for_root(
+        presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
+        owner_root: u32,
+    ) -> f32 {
+        presentation_opacities
+            .iter()
+            .find(|entry| entry.root_surface_id == owner_root)
+            .map_or(1.0, |entry| entry.opacity.get() as f32)
+            .clamp(0.0, 1.0)
+    }
+
     pub(crate) fn capture_uniform_location(&mut self, name: &str) -> Option<glow::UniformLocation> {
         if let Some(location) = self.capture_uniform_locations.get(name) {
             return *location;
         }
         let location = unsafe { self.gl.get_uniform_location(self.capture_program, name) };
         self.capture_uniform_locations
+            .insert(name.to_owned(), location);
+        location
+    }
+
+    pub(crate) fn capture_copy_uniform_location(
+        &mut self,
+        name: &str,
+    ) -> Option<glow::UniformLocation> {
+        if let Some(location) = self.capture_copy_uniform_locations.get(name) {
+            return *location;
+        }
+        let location = unsafe {
+            self.gl
+                .get_uniform_location(self.capture_copy_program, name)
+        };
+        self.capture_copy_uniform_locations
             .insert(name.to_owned(), location);
         location
     }
@@ -1547,6 +1636,7 @@ impl GlesSceneRenderer {
                     egl_display,
                     EglOutputRenderTarget {
                         framebuffer,
+                        sampleable_texture: None,
                         width: dimensions.width,
                         height: dimensions.height,
                         buffer_age: BufferAge::Value(0),
@@ -1647,7 +1737,10 @@ impl GlesSceneRenderer {
     ) -> RendererResult<EglFrameOutcome> {
         request.width = target.width;
         request.height = target.height;
+        let previous_output_framebuffer = self.active_output_framebuffer;
+        let previous_output_texture = self.active_output_texture;
         self.active_output_framebuffer = Some(target.framebuffer);
+        self.active_output_texture = target.sampleable_texture;
         unsafe {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
@@ -1662,9 +1755,11 @@ impl GlesSceneRenderer {
             target.framebuffer_origin,
         );
         unsafe {
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl
+                .bind_framebuffer(glow::FRAMEBUFFER, previous_output_framebuffer);
         }
-        self.active_output_framebuffer = None;
+        self.active_output_framebuffer = previous_output_framebuffer;
+        self.active_output_texture = previous_output_texture;
         result
     }
 
@@ -1708,7 +1803,8 @@ impl GlesSceneRenderer {
             Some(scene_signature),
         );
         if !self.capture_in_progress {
-            self.effect_gpu_profiler.collect(&self.gl);
+            self.effect_gpu_profiler
+                .collect(&self.gl, &self.effect_trace);
         }
         self.effect_trace.frame_boundary(
             "effect_scene_resolve",
@@ -3028,11 +3124,7 @@ impl GlesSceneRenderer {
                         .map(DecorationRenderInstance::root_surface_id)
                 })
                 .unwrap_or_else(|| group.root_surface_id());
-            let opacity = presentation_opacities
-                .iter()
-                .find(|entry| entry.root_surface_id == owner_root)
-                .map_or(1.0, |entry| entry.opacity.get() as f32)
-                .clamp(0.0, 1.0);
+            let opacity = Self::presentation_opacity_for_root(presentation_opacities, owner_root);
             if let Some(visual_group) = visual_group {
                 self.presentation_visual_group_opacities
                     .insert(visual_group, opacity);
@@ -4362,7 +4454,8 @@ impl GlesSceneRenderer {
         output_rect: OutputRect,
         target_domain: EffectRect,
         target_size: (u32, u32),
-    ) -> RendererResult<()> {
+        host_timing_enabled: bool,
+    ) -> RendererResult<ReplayCaptureExecutionDetail> {
         let requested = EffectRect::new(
             output_rect.x,
             output_rect.y,
@@ -4371,7 +4464,7 @@ impl GlesSceneRenderer {
         )
         .and_then(|rect| rect.intersect(target_domain));
         let Some(requested) = requested else {
-            return Ok(());
+            return Ok(ReplayCaptureExecutionDetail::default());
         };
         let local_x = requested.x.saturating_sub(target_domain.x);
         let local_y = requested.y.saturating_sub(target_domain.y);
@@ -4394,20 +4487,46 @@ impl GlesSceneRenderer {
             output_rect.width as f32,
             output_rect.height as f32,
         );
+        let visibility_start = host_timing_enabled.then(Instant::now);
         let capture_stats = plan_capture_visibility(
             &self.commands,
             command_indices,
             repair,
             &mut self.scene_visibility_plan,
         );
+        let visibility_cpu_ns = monotonic_elapsed_ns(visibility_start);
+        let commands_considered_before = self.frame_stats.commands_considered;
+        let commands_executed_before = self.frame_stats.commands_executed;
+        let draw_calls_before = self.frame_stats.draw_calls;
+        let draw_submit_start = host_timing_enabled.then(Instant::now);
         let result = self.draw_command_batch_with_visibility(true, Some(output_rect), false);
+        let draw_submit_cpu_ns = monotonic_elapsed_ns(draw_submit_start);
         unsafe { self.gl.disable(glow::SCISSOR_TEST) };
         self.frame_stats.planner_commands_visited = self
             .frame_stats
             .planner_commands_visited
             .saturating_add(capture_stats.commands_visited);
         self.scene_visibility_plan = saved_visibility;
-        result
+        let detail = ReplayCaptureExecutionDetail {
+            planner_commands_visited: capture_stats.commands_visited,
+            planner_commands_drawable: capture_stats.commands_drawable,
+            commands_considered: self
+                .frame_stats
+                .commands_considered
+                .saturating_sub(commands_considered_before),
+            commands_executed: self
+                .frame_stats
+                .commands_executed
+                .saturating_sub(commands_executed_before),
+            draw_calls: self
+                .frame_stats
+                .draw_calls
+                .saturating_sub(draw_calls_before),
+            visibility_cpu_ns,
+            draw_submit_cpu_ns,
+            ..Default::default()
+        };
+        result.map(|()| detail)
     }
 
     fn draw_capture_commands_for_regions(
@@ -4416,36 +4535,55 @@ impl GlesSceneRenderer {
         output_rects: &[OutputRect],
         target_domain: EffectRect,
         target_size: (u32, u32),
-    ) -> RendererResult<()> {
-        let mut requested = EffectRegion::empty();
-        for output_rect in output_rects {
-            if let Some(rect) = EffectRect::new(
-                output_rect.x,
-                output_rect.y,
-                output_rect.width,
-                output_rect.height,
-            ) {
-                requested.push(rect);
-            }
-        }
-        let disjoint = requested.disjoint_bounded();
-        let execution_region = if disjoint.overflowed {
-            requested
-                .bounding_rect()
-                .map(EffectRegion::from_rect)
-                .unwrap_or_else(EffectRegion::empty)
-        } else {
-            disjoint.region
+        host_timing_enabled: bool,
+    ) -> RendererResult<ReplayCaptureExecutionDetail> {
+        let layout = replay_capture_region_layout(output_rects);
+        let mut detail = ReplayCaptureExecutionDetail {
+            execution_pixels: 0,
+            materialization_rects: layout.materialization_rects,
+            execution_regions: layout.execution_regions,
+            disjoint_overflowed: layout.disjoint_overflowed,
+            candidate_commands: command_indices.len(),
+            scene_commands_total: self.commands.len(),
+            ..Default::default()
         };
-        for output_rect in execution_region
+        for output_rect in layout
+            .execution_region
             .rects()
             .iter()
             .copied()
             .map(|rect| OutputRect::new(rect.x, rect.y, rect.width, rect.height))
         {
-            self.draw_capture_commands(command_indices, output_rect, target_domain, target_size)?;
+            let region_detail = self.draw_capture_commands(
+                command_indices,
+                output_rect,
+                target_domain,
+                target_size,
+                host_timing_enabled,
+            )?;
+            detail.planner_commands_visited = detail
+                .planner_commands_visited
+                .saturating_add(region_detail.planner_commands_visited);
+            detail.planner_commands_drawable = detail
+                .planner_commands_drawable
+                .saturating_add(region_detail.planner_commands_drawable);
+            detail.commands_considered = detail
+                .commands_considered
+                .saturating_add(region_detail.commands_considered);
+            detail.commands_executed = detail
+                .commands_executed
+                .saturating_add(region_detail.commands_executed);
+            detail.draw_calls = detail.draw_calls.saturating_add(region_detail.draw_calls);
+            detail.visibility_cpu_ns = detail
+                .visibility_cpu_ns
+                .saturating_add(region_detail.visibility_cpu_ns);
+            detail.draw_submit_cpu_ns = detail
+                .draw_submit_cpu_ns
+                .saturating_add(region_detail.draw_submit_cpu_ns);
         }
-        Ok(())
+        detail.command_region_pairs = detail.planner_commands_visited;
+        detail.scene_scan_pairs = detail.commands_considered;
+        Ok(detail)
     }
 
     fn plan_scene_visibility(&mut self, scissor: Option<OutputRect>) {
@@ -4587,6 +4725,7 @@ impl GlesSceneRenderer {
             self.gl.delete_vertex_array(self.overlay_vertex_array);
             self.gl.delete_program(self.program);
             self.gl.delete_program(self.capture_program);
+            self.gl.delete_program(self.capture_copy_program);
         }
     }
 }
@@ -6668,11 +6807,13 @@ mod tests {
         EffectAlphaMode, EffectColorConversion, EffectFailurePolicy, EffectFootprint,
         EffectFrameDemand, EffectInstanceExecutionDemand, EffectNode, EffectNodeId,
         EffectParameterBlock, EffectPassExecutionDemand, EffectProgram, EffectProgramId,
-        EffectSource, EffectWorkingSpace, GraphTextureId, GraphTexturePhysicalRect,
+        EffectRect, EffectSource, EffectWorkingSpace, GraphTextureId, GraphTexturePhysicalRect,
         GraphTexturePlan, GraphTextureSource, RenderPassKind, ShaderModuleId,
         validate_effect_program,
     };
-    use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
+    use oblivion_one::presentation_animation::{
+        AnimationTime, PresentationGroupOpacity, PresentationOpacity, PresentationRect,
+    };
     use oblivion_one::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
         DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
@@ -6699,6 +6840,8 @@ mod tests {
         surface: egl::Surface,
         gl: glow::Context,
         renderer: GlesSceneRenderer,
+        test_output_texture: Option<glow::Texture>,
+        test_output_framebuffer: Option<glow::Framebuffer>,
         _egl_test_lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -6795,13 +6938,88 @@ mod tests {
                 surface,
                 gl,
                 renderer,
+                test_output_texture: None,
+                test_output_framebuffer: None,
             }
+        }
+
+        fn install_texture_backed_output(&mut self) {
+            assert!(self.test_output_texture.is_none());
+            let width = self.renderer.current_size.0;
+            let height = self.renderer.current_size.1;
+            let texture = unsafe { self.gl.create_texture().expect("output texture creates") };
+            let framebuffer = unsafe {
+                self.gl
+                    .create_framebuffer()
+                    .expect("output framebuffer creates")
+            };
+            unsafe {
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                self.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::NEAREST as i32,
+                );
+                self.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::NEAREST as i32,
+                );
+                self.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_S,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                self.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                self.gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                self.gl
+                    .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                self.gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(texture),
+                    0,
+                );
+                assert_eq!(
+                    self.gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                    glow::FRAMEBUFFER_COMPLETE,
+                    "test output framebuffer is complete"
+                );
+            }
+            self.renderer.active_output_framebuffer = Some(framebuffer);
+            self.renderer.active_output_texture = Some(texture);
+            self.test_output_texture = Some(texture);
+            self.test_output_framebuffer = Some(framebuffer);
+            self.renderer.establish_ordinary_scene_state();
         }
     }
 
     impl Drop for GlesEffectTestHarness {
         fn drop(&mut self) {
             self.renderer.destroy(&self.egl, self.display);
+            unsafe {
+                if let Some(framebuffer) = self.test_output_framebuffer.take() {
+                    self.gl.delete_framebuffer(framebuffer);
+                }
+                if let Some(texture) = self.test_output_texture.take() {
+                    self.gl.delete_texture(texture);
+                }
+            }
             let _ = self.egl.make_current(self.display, None, None, None);
             let _ = self.egl.destroy_surface(self.display, self.surface);
             let _ = self.egl.destroy_context(self.display, self.context);
@@ -6823,6 +7041,63 @@ mod tests {
         assert!(uniforms.contraction_progress.is_some());
         assert!(uniforms.translation_progress.is_some());
         assert!(uniforms.retreat_progress.is_some());
+    }
+
+    #[test]
+    fn ordinary_egl_presentation_opacity_resolves_owner_values() {
+        let scene_node_id =
+            oblivion_one::core::SceneNodeId::from_raw(1).expect("presentation scene node");
+        for value in [1.0, 0.5, 0.0] {
+            let entry = PresentationGroupOpacity::with_scene_node(
+                scene_node_id,
+                701,
+                PresentationOpacity::new(value).expect("presentation opacity"),
+                None,
+            );
+            assert_eq!(
+                GlesSceneRenderer::presentation_opacity_for_root(&[entry], 701),
+                value as f32
+            );
+            assert_eq!(
+                GlesSceneRenderer::presentation_opacity_for_root(&[entry], 999),
+                1.0
+            );
+        }
+    }
+
+    #[test]
+    fn capture_renderer_state_restores_active_output_texture() {
+        let mut harness = GlesEffectTestHarness::new(8, 8);
+        let framebuffer = unsafe {
+            harness
+                .gl
+                .create_framebuffer()
+                .expect("state test framebuffer creates")
+        };
+        let texture = unsafe {
+            harness
+                .gl
+                .create_texture()
+                .expect("state test texture creates")
+        };
+        harness.renderer.active_output_framebuffer = Some(framebuffer);
+        harness.renderer.active_output_texture = Some(texture);
+
+        let snapshot = CaptureRendererState::take(&harness.renderer);
+        harness.renderer.active_output_framebuffer = None;
+        harness.renderer.active_output_texture = None;
+        snapshot.restore(&mut harness.renderer);
+
+        assert_eq!(
+            harness.renderer.active_output_framebuffer,
+            Some(framebuffer)
+        );
+        assert_eq!(harness.renderer.active_output_texture, Some(texture));
+
+        unsafe {
+            harness.gl.delete_framebuffer(framebuffer);
+            harness.gl.delete_texture(texture);
+        }
     }
 
     fn moving_blur_scene(rect: EffectRect) -> (ResolvedEffectScene, EffectRegistry) {
@@ -7840,6 +8115,121 @@ mod tests {
         harness.renderer.establish_ordinary_scene_state();
     }
 
+    fn fill_shader_copy_test_pattern(harness: &GlesEffectTestHarness) {
+        let width = harness.renderer.current_size.0;
+        let height = harness.renderer.current_size.1;
+        harness.renderer.bind_active_output_framebuffer();
+        unsafe {
+            harness.gl.disable(glow::BLEND);
+            harness.gl.enable(glow::SCISSOR_TEST);
+            for y in 0..height {
+                for x in 0..width {
+                    harness.gl.scissor(x as i32, y as i32, 1, 1);
+                    harness.gl.clear_color(
+                        f32::from(((x * 31 + y * 17 + 3) % 256) as u8) / 255.0,
+                        f32::from(((x * 13 + y * 29 + 7) % 256) as u8) / 255.0,
+                        f32::from(((x * 47 + y * 11 + 19) % 256) as u8) / 255.0,
+                        f32::from(((x * 19 + y * 23 + 61) % 256) as u8) / 255.0,
+                    );
+                    harness.gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+            }
+            harness.gl.disable(glow::SCISSOR_TEST);
+        }
+        harness.renderer.establish_ordinary_scene_state();
+    }
+
+    fn read_effect_texture_pixels(
+        harness: &mut GlesEffectTestHarness,
+        target: &PooledEffectTexture,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        harness
+            .renderer
+            .effect_resources
+            .bind_read_target(&harness.gl, target)
+            .expect("capture target binds for readback");
+        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+        unsafe {
+            harness.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            harness.gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        harness.renderer.establish_ordinary_scene_state();
+        pixels
+    }
+
+    #[test]
+    fn gles_framebuffer_blit_and_shader_copy_capture_pixels_match_at_edges() {
+        let mut harness = GlesEffectTestHarness::new(64, 48);
+        harness.install_texture_backed_output();
+        fill_shader_copy_test_pattern(&harness);
+        let domains = [
+            EffectRect::new(0, 0, 16, 12).expect("top-left edge domain"),
+            EffectRect::new(0, 36, 16, 12).expect("bottom-left edge domain"),
+            EffectRect::new(48, 8, 16, 12).expect("right edge domain"),
+            EffectRect::new(20, 8, 16, 12).expect("interior domain"),
+        ];
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            for domain in domains {
+                let target_plan = GraphTexturePlan {
+                    id: GraphTextureId::new(1).expect("capture target id"),
+                    source: GraphTextureSource::CapturedScene,
+                    width: domain.width,
+                    height: domain.height,
+                    domain,
+                    working_space: EffectWorkingSpace::OutputEncodedSrgb,
+                    origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+                    first_use: None,
+                    last_use: None,
+                };
+                let target = harness
+                    .renderer
+                    .effect_resources
+                    .acquire_plan(&harness.gl, &target_plan)
+                    .expect("capture target acquires");
+                effects::capture_output_region_to_graph_texture(
+                    &mut harness.renderer,
+                    &target,
+                    &target_plan,
+                    origin,
+                )
+                .expect("framebuffer blit capture succeeds");
+                let blit_pixels =
+                    read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+                effects::capture_output_region_to_graph_texture_shader_copy(
+                    &mut harness.renderer,
+                    &target,
+                    &target_plan,
+                    origin,
+                )
+                .expect("shader copy capture succeeds");
+                let shader_pixels =
+                    read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+                assert_eq!(
+                    blit_pixels, shader_pixels,
+                    "capture pixels differ for {origin:?} domain {domain:?}"
+                );
+                harness
+                    .renderer
+                    .effect_resources
+                    .release(target)
+                    .expect("capture target releases");
+            }
+        }
+    }
+
     fn diagnostic_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
         let physical_y = height.saturating_sub(y).saturating_sub(1);
         let index = ((physical_y * width + x) * 4) as usize;
@@ -8194,6 +8584,10 @@ mod tests {
         Vec<String>,
     ) {
         let mut harness = GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+        if config.checkpoint_capture_path() == effects::CheckpointCapturePath::FramebufferShaderCopy
+        {
+            harness.install_texture_backed_output();
+        }
         install_native_stacked_diagnostic_scene(&mut harness, fixture.scene);
         let graph = compile_native_stacked_graph(fixture, &EffectRegion::empty());
         let a_id = oblivion_one::effects::EffectInstanceId::new(fixture.effect_a.id)
@@ -8380,7 +8774,17 @@ mod tests {
             })
             .expect("native B execute trace event");
         assert!(capture_event.contains("checkpoints=1"));
-        assert!(capture_event.contains("capture_mode=framebuffer_blit"));
+        let expected_capture_mode = match config.checkpoint_capture_path() {
+            effects::CheckpointCapturePath::FramebufferBlit => "framebuffer_blit",
+            effects::CheckpointCapturePath::FramebufferShaderCopy => "framebuffer_shader_copy",
+        };
+        let expected_requested_path = config.checkpoint_capture_path().as_str();
+        assert!(capture_event.contains(&format!("capture_mode={expected_capture_mode}")));
+        assert!(
+            capture_event.contains(&format!("requested_capture_path={expected_requested_path}"))
+        );
+        assert!(capture_event.contains(&format!("executed_capture_path={expected_capture_mode}")));
+        assert!(capture_event.contains("fallback_reason=none"));
         assert!(capture_event.contains("backdrop_capture_policy=replay"));
         let expected_kawase_policy = match config.kawase_mode() {
             effects::EffectDebugKawaseMode::Full => "full",
@@ -8439,6 +8843,10 @@ mod tests {
         Vec<String>,
     ) {
         let mut harness = GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+        if config.checkpoint_capture_path() == effects::CheckpointCapturePath::FramebufferShaderCopy
+        {
+            harness.install_texture_backed_output();
+        }
         install_native_three_checkpoint_diagnostic_scene(&mut harness, fixture.scene);
         let graph = compile_native_three_checkpoint_graph(fixture, &EffectRegion::empty());
         let a_id = oblivion_one::effects::EffectInstanceId::new(fixture.effect_a.id)
@@ -8591,7 +8999,17 @@ mod tests {
                         && line.contains(&format!("pass={pass}"))
                 })
                 .expect("three-checkpoint framebuffer capture trace event");
-            assert!(event.contains("capture_mode=framebuffer_blit"));
+            let expected_capture_mode = match config.checkpoint_capture_path() {
+                effects::CheckpointCapturePath::FramebufferBlit => "framebuffer_blit",
+                effects::CheckpointCapturePath::FramebufferShaderCopy => "framebuffer_shader_copy",
+            };
+            assert!(event.contains(&format!("capture_mode={expected_capture_mode}")));
+            assert!(event.contains(&format!(
+                "requested_capture_path={}",
+                config.checkpoint_capture_path().as_str()
+            )));
+            assert!(event.contains(&format!("executed_capture_path={expected_capture_mode}")));
+            assert!(event.contains("fallback_reason=none"));
             assert!(event.contains("backdrop_capture_policy=replay"));
             assert!(event.contains("kawase_execution_policy=partial"));
         }
@@ -9422,6 +9840,33 @@ mod tests {
     }
 
     #[test]
+    fn native_faithful_topbar_blit_and_shader_copy_are_pixel_equivalent() {
+        let fixture = native_topbar_fixture();
+        let blit_config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let shader_config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+            effects::CheckpointCapturePath::FramebufferShaderCopy,
+        );
+        let (_, _, blit_pixels, _) = render_native_stacked_candidate(fixture, blit_config, None);
+        let (_, _, shader_pixels, shader_events) =
+            render_native_stacked_candidate(fixture, shader_config, None);
+        assert_eq!(blit_pixels, shader_pixels, "TopBar A/B pixels differ");
+        assert!(shader_events.iter().any(|line| {
+            line.contains("kind=SceneCapture")
+                && line.contains("checkpoints=1")
+                && line.contains("executed_capture_path=framebuffer_shader_copy")
+        }));
+        assert!(shader_events.iter().any(|line| {
+            line.contains("event=effect_checkpoint_source_validity")
+                && line.contains("missing_pixels=0")
+        }));
+    }
+
+    #[test]
     fn native_three_checkpoint_suffix_demand_replays_pending_suffix() {
         let fixture = native_three_checkpoint_fixture();
         let config = effects::EffectDebugConfig::new(
@@ -9505,6 +9950,69 @@ mod tests {
             &full_current_reference,
             "native Dock",
         );
+    }
+
+    #[test]
+    fn native_faithful_stacked_dock_blit_and_shader_copy_are_pixel_equivalent() {
+        let fixture = native_dock_fixture();
+        let blit_config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let shader_config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+            effects::CheckpointCapturePath::FramebufferShaderCopy,
+        );
+        let (_, _, blit_pixels, _) = render_native_stacked_candidate(fixture, blit_config, None);
+        let (_, _, shader_pixels, shader_events) =
+            render_native_stacked_candidate(fixture, shader_config, None);
+        assert_eq!(blit_pixels, shader_pixels, "Dock A/B pixels differ");
+        assert!(shader_events.iter().any(|line| {
+            line.contains("kind=SceneCapture")
+                && line.contains("checkpoints=1")
+                && line.contains("executed_capture_path=framebuffer_shader_copy")
+        }));
+        assert!(shader_events.iter().any(|line| {
+            line.contains("event=effect_checkpoint_source_validity")
+                && line.contains("missing_pixels=0")
+        }));
+    }
+
+    #[test]
+    fn native_three_checkpoint_blit_and_shader_copy_preserve_dependencies() {
+        let fixture = native_three_checkpoint_fixture();
+        let blit_config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let shader_config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+            effects::CheckpointCapturePath::FramebufferShaderCopy,
+        );
+        let (_, _, blit_pixels, _) =
+            render_native_three_checkpoint_candidate_with_mode(fixture, blit_config, None);
+        let (_, _, shader_pixels, shader_events) =
+            render_native_three_checkpoint_candidate_with_mode(fixture, shader_config, None);
+        assert_eq!(
+            blit_pixels, shader_pixels,
+            "multi-dependency A/B pixels differ"
+        );
+        let validity_events = shader_events
+            .iter()
+            .filter(|line| line.contains("event=effect_checkpoint_source_validity"))
+            .collect::<Vec<_>>();
+        assert!(!validity_events.is_empty());
+        assert!(
+            validity_events
+                .iter()
+                .all(|line| line.contains("missing_pixels=0"))
+        );
+        assert!(shader_events.iter().any(|line| {
+            line.contains("executed_capture_path=framebuffer_shader_copy")
+                && line.contains("checkpoints=2")
+        }));
     }
 
     #[test]
@@ -11284,6 +11792,86 @@ mod tests {
         assert_effect_test_pixel(&top_left_scanout_pixels, 4, 1, 2, [0, 0, 255, 255]);
         assert_effect_test_pixel(&top_left_scanout_pixels, 4, 2, 2, [0, 0, 255, 255]);
         assert_effect_test_pixel(&top_left_scanout_pixels, 4, 1, 4, [0, 0, 0, 0]);
+
+        unsafe {
+            harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn real_gles_opaque_effect_with_translucent_presentation_uses_source_over() {
+        let mut harness = GlesEffectTestHarness::new(1, 1);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            effects::DUAL_KAWASE_VERTEX_SHADER,
+            effects::COMPOSITE_FRAGMENT_SHADER,
+        )
+        .expect("opaque-effect presentation regression program compiles");
+        let input_texture = create_effect_test_texture(&harness.gl, 1, 1, &[102, 51, 26, 255]);
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("opaque-effect presentation regression quad creates")
+            .0;
+        let source = oblivion_one::effects::PremultipliedRgba::new(0.4, 0.2, 0.1, 1.0);
+        let destination = oblivion_one::effects::PremultipliedRgba::new(0.1, 0.05, 0.02, 0.25);
+        let expected = destination.blend(source, oblivion_one::effects::BlendMode::SourceOver, 0.5);
+
+        unsafe {
+            harness.gl.viewport(0, 0, 1, 1);
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness
+                .gl
+                .clear_color(destination.r, destination.g, destination.b, destination.a);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+            effects::establish_effect_pass_blend_state(
+                &harness.gl,
+                effects::EffectPassBlendMode::PremultipliedSourceOver,
+            );
+            harness.gl.use_program(Some(program));
+            set_effect_test_uniform_i32(&harness.gl, program, "u_effect_input", 0);
+            set_effect_test_uniform_i32(&harness.gl, program, "u_effect_target_flip_y", 0);
+            set_effect_test_uniform_i32(&harness.gl, program, "u_effect_input_flip_y", 0);
+            set_effect_test_uniform_i32(&harness.gl, program, "u_effect_encode_srgb", 0);
+            set_effect_test_uniform_i32(&harness.gl, program, "u_effect_force_opaque", 1);
+            set_effect_test_uniform_4_f32(
+                &harness.gl,
+                program,
+                "u_effect_input_domain",
+                [0.0, 0.0, 1.0, 1.0],
+            );
+            set_effect_test_uniform_2_f32(&harness.gl, program, "u_effect_output_size", 1.0, 1.0);
+            let opacity = harness
+                .gl
+                .get_uniform_location(program, "u_presentation_opacity")
+                .expect("presentation opacity uniform is active");
+            harness.gl.uniform_1_f32(Some(&opacity), 0.5);
+            harness.gl.active_texture(glow::TEXTURE0);
+            harness
+                .gl
+                .bind_texture(glow::TEXTURE_2D, Some(input_texture));
+            harness.gl.bind_vertex_array(Some(quad));
+            harness.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            harness.gl.bind_vertex_array(None);
+            harness.gl.bind_texture(glow::TEXTURE_2D, None);
+            harness.gl.use_program(None);
+        }
+
+        let pixels = read_effect_test_pixels(&harness.gl, 1, 1);
+        let expected = [
+            (expected.r * 255.0).round() as u8,
+            (expected.g * 255.0).round() as u8,
+            (expected.b * 255.0).round() as u8,
+            (expected.a * 255.0).round() as u8,
+        ];
+        let actual = &pixels[..4];
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (*actual as i16 - expected as i16).abs() <= 3,
+                "opaque effect source-over mismatch: actual={actual}, expected={expected}, pixel={pixels:?}"
+            );
+        }
 
         unsafe {
             harness.gl.delete_texture(input_texture);
