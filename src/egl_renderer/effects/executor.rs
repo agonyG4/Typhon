@@ -5375,6 +5375,40 @@ mod tests {
         let trailing = finalize_surface_consumer_trailing_work(&mut state);
 
         assert_same_output_region(&trailing, &[presentation, checkpoint_a, checkpoint_b]);
+
+        let command = |surface_id, rect: OutputRect| EglDrawCommand {
+            layer: EglDrawLayer::Surface(surface_id),
+            visual_group: None,
+            bounds: EglRect::new(
+                rect.x as f32,
+                rect.y as f32,
+                rect.width as f32,
+                rect.height as f32,
+            ),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(10, presentation),
+            command(20, checkpoint_a),
+            command(30, checkpoint_b),
+        ];
+        let mut trailing_plan = SurfaceConsumerPlan::default();
+        add_surface_consumers_for_command_range(
+            &mut trailing_plan,
+            &commands,
+            0,
+            commands.len(),
+            &trailing,
+        );
+        trailing_plan.finish();
+        assert_eq!(
+            trailing_plan.surface_ids(),
+            &[10, 20, 30],
+            "pending checkpoint requirements must keep every baseline surface in the trailing plan"
+        );
     }
 
     #[test]
