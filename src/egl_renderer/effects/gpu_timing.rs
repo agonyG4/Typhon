@@ -753,9 +753,8 @@ impl TimingState {
                 aggregate.framebuffer_blit_capture_ns = aggregate
                     .framebuffer_blit_capture_ns
                     .saturating_add(duration_ns);
-                aggregate.framebuffer_blit_capture_passes = aggregate
-                    .framebuffer_blit_capture_passes
-                    .saturating_add(1);
+                aggregate.framebuffer_blit_capture_passes =
+                    aggregate.framebuffer_blit_capture_passes.saturating_add(1);
                 aggregate.framebuffer_blit_capture_pixels = aggregate
                     .framebuffer_blit_capture_pixels
                     .saturating_add(metadata.pixels);
@@ -2452,7 +2451,10 @@ mod tests {
         assert!(state.finish(stale.total));
         assert!(matches!(
             state.poll_front(true, Some((100, 140))),
-            PollOutcome::Ready { record: Some(_), .. }
+            PollOutcome::Ready {
+                record: Some(_),
+                ..
+            }
         ));
 
         let current = state.begin_scope(Some(120)).expect("current scope");
@@ -2690,6 +2692,10 @@ mod tests {
             .replace(
                 "framebuffer_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0",
                 "framebuffer_capture_execution_pixels=0 framebuffer_shader_copy_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0",
+            )
+            .replace(
+                "checkpoint_capture_execution_passes=0",
+                "checkpoint_capture_passes=0",
             ),
         );
         assert!(format_gpu_timing_line(&record).ends_with("max_capture_replay_detail_available=0"));
