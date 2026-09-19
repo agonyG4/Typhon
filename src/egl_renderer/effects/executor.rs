@@ -2529,9 +2529,7 @@ fn pass_trace_summary(
         damage_rect_count: execution_damage.rects().len(),
         damage_bounding_box,
         capture_mode,
-        requested_capture_path: capture_plan
-            .requested
-            .map(CheckpointCapturePath::as_str),
+        requested_capture_path: capture_plan.requested.map(CheckpointCapturePath::as_str),
         executed_capture_path: matches!(
             pass.kind,
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
@@ -5559,8 +5557,8 @@ mod tests {
             CheckpointCapturePath::FramebufferBlit,
             false,
         );
-        let replay_metadata = capture_timing_metadata(&replay_pass, replay_plan)
-        .expect("capture metadata");
+        let replay_metadata =
+            capture_timing_metadata(&replay_pass, replay_plan).expect("capture metadata");
         assert_eq!(replay_metadata.mode, CaptureTimingMode::Replay);
         assert_eq!(replay_metadata.checkpoint_count, 0);
 
@@ -5581,7 +5579,7 @@ mod tests {
             false,
         );
         let checkpoint_metadata = capture_timing_metadata(&checkpoint_pass, checkpoint_plan)
-        .expect("checkpoint capture metadata");
+            .expect("checkpoint capture metadata");
         assert_eq!(checkpoint_metadata.mode, CaptureTimingMode::FramebufferBlit);
         assert_eq!(checkpoint_metadata.checkpoint_count, 1);
     }

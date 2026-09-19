@@ -8232,8 +8232,7 @@ mod tests {
                     harness.gl.scissor(x as i32, y as i32, 1, 1);
                     let checker = ((x / 3 + y / 3) % 2) as u8;
                     harness.gl.clear_color(
-                        f32::from((((x * 31 + y * 17 + 3) % 256) as u8) ^ (checker * 0x3f))
-                            / 255.0,
+                        f32::from((((x * 31 + y * 17 + 3) % 256) as u8) ^ (checker * 0x3f)) / 255.0,
                         f32::from(((x * 13 + y * 29 + 7) % 256) as u8) / 255.0,
                         f32::from(((x * 47 + y * 11 + 19) % 256) as u8) / 255.0,
                         f32::from(((x * 19 + y * 23 + 61) % 256) as u8) / 255.0,
