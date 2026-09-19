@@ -8,13 +8,13 @@ use oblivion_one::compositor::{
     SurfaceRenderBackend,
 };
 use oblivion_one::core::OutputId;
-use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
-use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 use oblivion_one::presentation_animation::{
     PresentationGroupOpacity, PresentationOpacity, PresentationOpacityTransitionEvidence,
     PresentationRevisionId, PresentationSampleTimeSource, PresentationSceneSample,
     PresentationTransactionId,
 };
+use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
+use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 use std::num::NonZeroU64;
 use wayland_server::protocol::wl_output;
 
@@ -90,16 +90,18 @@ fn frame_snapshot_with_opacity(
         AnimationTime::from_nanos(frame_id),
         PresentationSampleTimeSource::ZeroFallback,
     );
-    sample.opacities.push(PresentationGroupOpacity::with_scene_node(
-        scene_node_id,
-        root_surface_id,
-        opacity,
-        Some(PresentationOpacityTransitionEvidence {
-            transaction_id,
-            revision_id,
-            mathematically_settled: false,
-        }),
-    ));
+    sample
+        .opacities
+        .push(PresentationGroupOpacity::with_scene_node(
+            scene_node_id,
+            root_surface_id,
+            opacity,
+            Some(PresentationOpacityTransitionEvidence {
+                transaction_id,
+                revision_id,
+                mathematically_settled: false,
+            }),
+        ));
     snapshot.presentation = PresentationFrameSnapshot::from_sample(&sample);
     snapshot
 }
@@ -278,9 +280,8 @@ fn submitted_opacity_history_preserves_old_backing_evidence() {
     let transaction_id = PresentationTransactionId::new(
         NonZeroU64::new(17).expect("nonzero presentation transaction"),
     );
-    let revision_id = PresentationRevisionId::new(
-        NonZeroU64::new(29).expect("nonzero presentation revision"),
-    );
+    let revision_id =
+        PresentationRevisionId::new(NonZeroU64::new(29).expect("nonzero presentation revision"));
     let frame_a = frame_snapshot_with_opacity(
         1,
         1001,
