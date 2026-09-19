@@ -628,14 +628,6 @@ impl CompositorState {
         sample.geometry_signature()
     }
 
-    pub(in crate::compositor) fn presented_presentation_is_non_identity(
-        &self,
-        root_surface_id: u32,
-    ) -> bool {
-        self.presented_presentation_transform(root_surface_id)
-            .is_some_and(|transform| !transform.is_identity())
-    }
-
     pub(in crate::compositor) fn presented_presentation_geometry_is_non_identity_for_scene_node(
         &self,
         scene_node_id: SceneNodeId,

@@ -463,15 +463,6 @@ impl CompositorState {
             })
     }
 
-    pub(in crate::compositor) fn presented_presentation_opacity_is_non_identity(
-        &self,
-        root_surface_id: u32,
-    ) -> bool {
-        !self
-            .presented_presentation_opacity(root_surface_id)
-            .is_opaque()
-    }
-
     pub(in crate::compositor) fn presented_presentation_opacity_is_non_identity_for_scene_node(
         &self,
         scene_node_id: SceneNodeId,
