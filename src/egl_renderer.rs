@@ -7066,6 +7066,78 @@ mod tests {
     }
 
     #[test]
+    fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
+        let mut harness = GlesEffectTestHarness::new(320, 200);
+        let mut surface = test_shm_surface(RenderableSurfaceDamage::full());
+        surface.opaque_region = SurfaceOpaqueRegion::Full;
+        let surfaces = vec![surface];
+        let signatures = egl_scene_surface_signatures(&surfaces);
+        let owner_root = 701;
+        let scene_node_id =
+            oblivion_one::core::SceneNodeId::from_raw(1).expect("presentation scene node");
+        let opacity = PresentationGroupOpacity::with_scene_node(
+            scene_node_id,
+            owner_root,
+            PresentationOpacity::new(0.5).expect("presentation opacity"),
+            None,
+        );
+
+        harness.renderer.rebuild_scene_commands(
+            320,
+            200,
+            &surfaces,
+            &[],
+            &[],
+            1,
+            1.0,
+            1,
+            &signatures,
+            &[],
+            0,
+            &[opacity],
+            &HashMap::from([(7, owner_root)]),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        let translucent_command = harness
+            .renderer
+            .commands
+            .last()
+            .expect("surface command is emitted");
+        assert!(translucent_command.opaque_regions.is_empty());
+
+        let opaque = PresentationGroupOpacity::with_scene_node(
+            scene_node_id,
+            owner_root,
+            PresentationOpacity::new(1.0).expect("presentation opacity"),
+            None,
+        );
+        harness.renderer.rebuild_scene_commands(
+            320,
+            200,
+            &surfaces,
+            &[],
+            &[],
+            2,
+            1.0,
+            1,
+            &signatures,
+            &[],
+            0,
+            &[opaque],
+            &HashMap::from([(7, owner_root)]),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        let opaque_command = harness
+            .renderer
+            .commands
+            .last()
+            .expect("surface command is emitted");
+        assert!(!opaque_command.opaque_regions.is_empty());
+    }
+
+    #[test]
     fn capture_renderer_state_restores_active_output_texture() {
         let mut harness = GlesEffectTestHarness::new(8, 8);
         let framebuffer = unsafe {
