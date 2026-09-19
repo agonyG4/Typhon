@@ -5,6 +5,13 @@ Typhon keeps direct scanout disabled by default. Set
 qualification run; `auto` is retained as a compatibility alias and is not a
 production default.
 
+Direct Scanout presentation-property qualification uses the stable WindowGroup
+`SceneNodeId` for active, canonical, and physically presented Geometry/Opacity
+state. `root_surface_id` remains the current render/input/frame adapter and is
+preserved in immutable physical evidence, so an XWayland backing replacement
+does not make previously presented nonidentity state disappear before the new
+identity frame is physically shown.
+
 The reproducible matrix tool is:
 
 ```bash
