@@ -93,11 +93,11 @@ one-line record:
 
 ```text
 scene_capture_ns surface_capture_ns
-replay_capture_ns framebuffer_capture_ns checkpoint_capture_ns
-scene_capture_passes surface_capture_passes replay_capture_passes framebuffer_capture_passes checkpoint_capture_passes
-scene_capture_pixels surface_capture_pixels replay_capture_pixels framebuffer_capture_pixels checkpoint_capture_pixels
+replay_capture_ns framebuffer_capture_ns framebuffer_blit_capture_ns framebuffer_shader_copy_capture_ns checkpoint_capture_ns
+scene_capture_passes surface_capture_passes replay_capture_passes framebuffer_capture_passes framebuffer_blit_capture_passes framebuffer_shader_copy_capture_passes checkpoint_capture_passes
+scene_capture_pixels surface_capture_pixels replay_capture_pixels framebuffer_capture_pixels framebuffer_blit_capture_pixels framebuffer_shader_copy_capture_pixels checkpoint_capture_pixels
 capture_execution_summary_available
-capture_execution_pixels scene_capture_execution_pixels surface_capture_execution_pixels replay_capture_execution_pixels framebuffer_capture_execution_pixels checkpoint_capture_execution_pixels
+capture_execution_pixels scene_capture_execution_pixels surface_capture_execution_pixels replay_capture_execution_pixels framebuffer_capture_execution_pixels framebuffer_shader_copy_capture_execution_pixels checkpoint_capture_execution_pixels
 replay_capture_execution_passes framebuffer_capture_execution_passes checkpoint_capture_execution_passes
 replay_capture_commands checkpoint_dependency_edges
 max_capture_pass_ns max_capture_pass_id max_capture_instance_id max_capture_kind max_capture_mode max_capture_pixels max_capture_checkpoint_count
@@ -114,7 +114,13 @@ means execution metadata was unavailable, such as after an effect execution
 error; the execution fields are then zero.
 
 `replay_capture_ns` and `framebuffer_capture_ns` are the existing capture pass
-timestamp spans classified by the actual executor mode. `checkpoint_capture_ns`
+timestamp spans classified by the actual executor mode. `framebuffer_capture_ns`
+is the aggregate framebuffer-backed capture category; its
+`framebuffer_blit_capture_*` and `framebuffer_shader_copy_capture_*` fields are
+the path-specific duration, pass-count, and pixel splits. The
+`framebuffer_shader_copy_capture_execution_pixels` field is the corresponding
+physical execution-pixel split already carried by the execution summary.
+`checkpoint_capture_ns`
 is the subset whose pass has one or more `checkpoint_dependencies`, regardless
 of capture mode. The corresponding `*_capture_passes` and `*_capture_pixels`
 fields count and sum only valid resolved GPU spans. The
@@ -126,7 +132,7 @@ sum of the dependency-list lengths for physically executed capture passes.
 
 `max_capture_*` describes the single slowest valid timed capture pass in the
 scope. Its stable kind values are `scene` and `surface`, and its mode values
-are `replay` and `framebuffer_blit`; scopes without a valid capture pass emit
+are `replay`, `framebuffer_blit`, and `framebuffer_shader_copy`; scopes without a valid capture pass emit
 `none` and zero values. All capture mode and checkpoint metadata is derived at
 the executor pass-timing call site from `is_direct_framebuffer_capture` and
 `checkpoint_dependencies`, then carried by the existing timestamp span.
