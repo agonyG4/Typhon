@@ -5469,6 +5469,47 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_capture_execution_plan_selects_shader_copy_for_eligible_scene_capture() {
+        let plan = checkpoint_capture_execution_plan(
+            RenderPassKind::SceneCapture,
+            1,
+            false,
+            EffectDebugCaptureMode::Replay,
+            CheckpointCapturePath::FramebufferShaderCopy,
+            true,
+        );
+
+        assert_eq!(
+            plan.requested,
+            Some(CheckpointCapturePath::FramebufferShaderCopy)
+        );
+        assert_eq!(plan.executed, CaptureTimingMode::FramebufferShaderCopy);
+        assert_eq!(plan.fallback_reason, None);
+    }
+
+    #[test]
+    fn checkpoint_capture_execution_plan_falls_back_without_output_texture() {
+        let plan = checkpoint_capture_execution_plan(
+            RenderPassKind::SceneCapture,
+            1,
+            false,
+            EffectDebugCaptureMode::Replay,
+            CheckpointCapturePath::FramebufferShaderCopy,
+            false,
+        );
+
+        assert_eq!(
+            plan.executed,
+            CaptureTimingMode::FramebufferBlit,
+            "shader-copy must fall back to framebuffer blit when the output is not sampleable"
+        );
+        assert_eq!(
+            plan.fallback_reason,
+            Some(CapturePathFallbackReason::NoSampleableOutputTexture)
+        );
+    }
+
+    #[test]
     fn capture_timing_metadata_uses_execution_authority() {
         let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
         let output = GraphTextureId::new(2).unwrap();
