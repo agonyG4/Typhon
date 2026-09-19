@@ -1,7 +1,7 @@
 use super::kms_worker::{
     FatalWorkerJobDisposition, FatalWorkerJobHandler, UncertainJobRetention,
-    handle_fatal_worker_jobs, retain_complete_submitted_ownership,
-    retain_uncertain_job_with_suspension,
+    handle_fatal_worker_jobs, prepare_frozen_cursor_presentation_for_submission,
+    retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
 };
 use super::kms_worker_teardown::SubmittedWorkerPacingState;
 use super::plane_cycle::plane_delta_reservation_outcome;
@@ -16,13 +16,19 @@ use crate::native_output::scanout::{
     DirectPrimaryLease, OutputFrameIdentitySnapshot, OutputFrameKey, OutputSlotId,
 };
 use crate::native_output::{
-    ContentEpochId, DirectScanoutCandidateKey, NativeResult, OutputContentKey, OutputTransactionId,
+    ContentEpochId, DirectScanoutCandidateKey, NativeResult, OutputContentKey, OutputReleasePlan,
+    OutputTransaction, OutputTransactionId, OutputTransactionLedger, OutputTransactionState,
+};
+use oblivion_one::compositor::{
+    CompositorFrameBatchId, PresentationFeedbackBatchId, SurfaceCommitSequence,
+    SurfacePresentationCommitKey,
 };
 use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
+use std::num::NonZeroU64;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -169,6 +175,313 @@ fn test_eventfd() -> OwnedFd {
     assert!(fd >= 0, "test eventfd should be created");
     // SAFETY: eventfd returned a new owned descriptor for this test.
     unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn worker_freeze_test_target() -> PresentationTarget {
+    let now = MonotonicTimestampNs::new(10);
+    PresentationTarget {
+        sequence: 2,
+        presentation_time: now,
+        submit_not_before: now,
+        render_start_deadline: now,
+        refresh_interval: Duration::from_millis(10),
+        reason: PresentationTargetReason::ReactiveDouble,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: now,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
+    }
+}
+
+fn worker_freeze_cursor_key() -> SurfacePresentationCommitKey {
+    SurfacePresentationCommitKey {
+        surface_id: 77,
+        presentation_generation: 3,
+        commit_sequence: SurfaceCommitSequence(1),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkerFreezePrimaryKind {
+    Composited,
+    Direct,
+}
+
+fn worker_freeze_fixture(
+    primary_key: Option<SurfacePresentationCommitKey>,
+    sidecar_key: Option<SurfacePresentationCommitKey>,
+    with_feedback: bool,
+    primary_kind: WorkerFreezePrimaryKind,
+) -> (
+    OutputTransactionLedger,
+    OutputTransactionId,
+    OutputTransactionId,
+    Option<PresentationFeedbackBatchId>,
+) {
+    let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
+    let primary_id = ledger.allocate_id().expect("primary transaction ID");
+    let presentation_batch_id = with_feedback.then(|| {
+        PresentationFeedbackBatchId::new(
+            NonZeroU64::new(700).expect("presentation batch ID is nonzero"),
+        )
+    });
+    let mut primary = match primary_kind {
+        WorkerFreezePrimaryKind::Composited => OutputTransaction::composited(
+            ledger.output_id(),
+            primary_id,
+            1,
+            MonotonicTimestampNs::new(1),
+            worker_freeze_test_target(),
+            NativeOutputPacingMode::ReactiveDouble,
+            11,
+            12,
+            13,
+            OutputSlotId::new(0).expect("slot ID"),
+            91,
+            None,
+            CompositorFrameBatchId::new(NonZeroU64::new(701).expect("frame batch ID")),
+        )
+        .expect("composited primary transaction"),
+        WorkerFreezePrimaryKind::Direct => OutputTransaction::direct(
+            ledger.output_id(),
+            primary_id,
+            1,
+            MonotonicTimestampNs::new(1),
+            worker_freeze_test_target(),
+            NativeOutputPacingMode::ReactiveDouble,
+            11,
+            test_direct_key(),
+            91,
+            None,
+            CompositorFrameBatchId::new(NonZeroU64::new(701).expect("frame batch ID")),
+            77,
+            OutputReleasePlan::Pageflip,
+        )
+        .expect("direct primary transaction"),
+    }
+    .with_client_cursor_presentation_key(primary_key);
+    if let Some(batch_id) = presentation_batch_id {
+        primary = primary
+            .with_presentation_feedback_batch(batch_id)
+            .expect("cursor presentation feedback batch");
+    }
+    ledger.insert(primary).expect("insert primary");
+    ledger
+        .mark_queued(primary_id, 1, MonotonicTimestampNs::new(2))
+        .expect("primary queued");
+
+    let sidecar_id = ledger.allocate_id().expect("sidecar transaction ID");
+    let sidecar = OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(2),
+        worker_freeze_test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        3,
+        Some(oblivion_one::native::kms::AtomicCursorVisualState {
+            visible: true,
+            x: 0,
+            y: 0,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 64,
+            height: 64,
+            framebuffer_id: Some(92),
+            image_generation: 1,
+        }),
+        OutputReleasePlan::Pageflip,
+    )
+    .expect("sidecar transaction")
+    .with_client_cursor_presentation_key(sidecar_key);
+    ledger.insert(sidecar).expect("insert sidecar");
+    (ledger, primary_id, sidecar_id, presentation_batch_id)
+}
+
+#[test]
+fn real_worker_success_rebinds_before_submit_transition() {
+    let (mut ledger, primary_id, sidecar_id, presentation_batch_id) = worker_freeze_fixture(
+        Some(worker_freeze_cursor_key()),
+        Some(worker_freeze_cursor_key()),
+        true,
+        WorkerFreezePrimaryKind::Composited,
+    );
+
+    let socket_name = format!("typhon-kms-worker-freeze-red-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind worker-freeze test compositor");
+    let result = prepare_frozen_cursor_presentation_for_submission(
+        &mut server,
+        &mut ledger,
+        primary_id,
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(2),
+    );
+
+    result.expect("pre-submit worker rebind");
+    assert!(matches!(
+        ledger
+            .transaction(primary_id)
+            .expect("primary transaction")
+            .state(),
+        OutputTransactionState::Queued { .. }
+    ));
+    assert!(matches!(
+        ledger
+            .transaction(sidecar_id)
+            .expect("sidecar transaction")
+            .state(),
+        OutputTransactionState::Queued { .. }
+    ));
+    ledger
+        .mark_submitted(
+            primary_id,
+            PageFlipToken::new(702).expect("submit token"),
+            MonotonicTimestampNs::new(3),
+        )
+        .expect("primary submitted");
+    ledger
+        .mark_submitted(
+            sidecar_id,
+            PageFlipToken::new(702).expect("submit token"),
+            MonotonicTimestampNs::new(3),
+        )
+        .expect("sidecar submitted");
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id.expect("feedback batch")),
+        Some(sidecar_id)
+    );
+    assert!(matches!(
+        ledger
+            .transaction(primary_id)
+            .expect("submitted primary")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
+    assert!(matches!(
+        ledger
+            .transaction(sidecar_id)
+            .expect("submitted sidecar")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
+}
+
+#[test]
+fn real_worker_success_rebind_without_feedback_is_legal() {
+    let (mut ledger, primary_id, sidecar_id, presentation_batch_id) = worker_freeze_fixture(
+        Some(worker_freeze_cursor_key()),
+        Some(worker_freeze_cursor_key()),
+        false,
+        WorkerFreezePrimaryKind::Composited,
+    );
+    let socket_name = format!(
+        "typhon-kms-worker-freeze-no-feedback-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind worker-freeze no-feedback test compositor");
+    prepare_frozen_cursor_presentation_for_submission(
+        &mut server,
+        &mut ledger,
+        primary_id,
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(2),
+    )
+    .expect("no-feedback worker rebind");
+    assert!(presentation_batch_id.is_none());
+}
+
+#[test]
+fn real_worker_success_content_change_detaches_old_feedback() {
+    let key_c1 = worker_freeze_cursor_key();
+    let key_c2 = SurfacePresentationCommitKey {
+        commit_sequence: SurfaceCommitSequence(2),
+        ..key_c1
+    };
+    let (mut ledger, primary_id, sidecar_id, presentation_batch_id) = worker_freeze_fixture(
+        Some(key_c1),
+        Some(key_c2),
+        true,
+        WorkerFreezePrimaryKind::Composited,
+    );
+    let presentation_batch_id = presentation_batch_id.expect("feedback batch");
+    let sidecar_presentation_batch_id = PresentationFeedbackBatchId::new(
+        NonZeroU64::new(704).expect("sidecar presentation batch ID is nonzero"),
+    );
+    ledger
+        .attach_presentation_feedback_batch(sidecar_id, sidecar_presentation_batch_id)
+        .expect("sidecar presentation feedback batch");
+    let socket_name = format!(
+        "typhon-kms-worker-freeze-content-change-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind worker-freeze content-change test compositor");
+    prepare_frozen_cursor_presentation_for_submission(
+        &mut server,
+        &mut ledger,
+        primary_id,
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(2),
+    )
+    .expect("content-changing worker rebind");
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id),
+        None
+    );
+    assert_eq!(
+        ledger.presentation_feedback_owner(sidecar_presentation_batch_id),
+        Some(sidecar_id)
+    );
+    assert_eq!(
+        ledger
+            .transaction(primary_id)
+            .expect("primary transaction")
+            .descriptor()
+            .obligations()
+            .presentation_feedback_batch_id(),
+        None
+    );
+}
+
+#[test]
+fn direct_worker_success_rebinds_before_submit_transition() {
+    let (mut ledger, primary_id, sidecar_id, presentation_batch_id) = worker_freeze_fixture(
+        Some(worker_freeze_cursor_key()),
+        Some(worker_freeze_cursor_key()),
+        true,
+        WorkerFreezePrimaryKind::Direct,
+    );
+    let presentation_batch_id = presentation_batch_id.expect("feedback batch");
+    let socket_name = format!("typhon-kms-worker-direct-freeze-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind direct worker-freeze test compositor");
+    prepare_frozen_cursor_presentation_for_submission(
+        &mut server,
+        &mut ledger,
+        primary_id,
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(2),
+    )
+    .expect("direct pre-submit worker rebind");
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id),
+        Some(sidecar_id)
+    );
 }
 
 #[test]

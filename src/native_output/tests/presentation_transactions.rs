@@ -1821,64 +1821,6 @@ fn submitted_cursor_presentation_owner_cannot_be_rebound() {
 }
 
 #[test]
-fn submitted_frozen_bundle_rebind_moves_same_cursor_feedback_to_sidecar() {
-    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
-    let primary = test_composited_transaction(&mut ledger, test_batch(87), 1)
-        .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
-        .with_presentation_feedback_batch(PresentationFeedbackBatchId::new(
-            NonZeroU64::new(88).unwrap(),
-        ))
-        .unwrap();
-    let primary_id = primary.id();
-    let batch_id = primary
-        .obligations()
-        .presentation_feedback_batch_id()
-        .unwrap();
-    ledger.insert(primary).unwrap();
-    ledger
-        .mark_submitted(
-            primary_id,
-            PageFlipToken::new(89).unwrap(),
-            MonotonicTimestampNs::new(30),
-        )
-        .unwrap();
-
-    let sidecar_id = ledger.allocate_id().unwrap();
-    let sidecar = super::OutputTransaction::cursor_plane_delta(
-        ledger.output_id(),
-        sidecar_id,
-        1,
-        MonotonicTimestampNs::new(31),
-        test_target(),
-        NativeOutputPacingMode::ReactiveDouble,
-        90,
-        Some(cursor_state(99)),
-        super::OutputReleasePlan::Pageflip,
-    )
-    .unwrap()
-    .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)));
-    ledger.insert(sidecar).unwrap();
-    ledger
-        .mark_submitted(
-            sidecar_id,
-            PageFlipToken::new(89).unwrap(),
-            MonotonicTimestampNs::new(30),
-        )
-        .unwrap();
-
-    assert_eq!(
-        ledger
-            .transfer_submitted_cursor_presentation_feedback_batch(primary_id, sidecar_id)
-            .unwrap(),
-        Some(batch_id)
-    );
-    assert_eq!(
-        ledger.presentation_feedback_owner(batch_id),
-        Some(sidecar_id)
-    );
-}
-
-#[test]
 fn cursor_only_plane_delta_releases_presentation_only_owner_at_pageflip() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();

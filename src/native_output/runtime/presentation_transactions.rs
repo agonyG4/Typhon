@@ -159,15 +159,12 @@ pub(crate) fn rebind_cursor_presentation_feedback_to_frozen_sidecar(
         .and_then(|record| record.descriptor().client_cursor_presentation_key());
     if primary_key == sidecar_key {
         output_transactions
-            .transfer_submitted_cursor_presentation_feedback_batch(
-                primary_transaction_id,
-                sidecar_transaction_id,
-            )
+            .transfer_presentation_feedback_batch(primary_transaction_id, sidecar_transaction_id)
             .map_err(io::Error::other)?;
         return Ok(());
     }
     if let Some(batch_id) = output_transactions
-        .detach_submitted_cursor_presentation_feedback_batch(primary_transaction_id)
+        .detach_presentation_feedback_batch(primary_transaction_id)
         .map_err(io::Error::other)?
     {
         server.restore_presentation_feedback_batch_after_failure(batch_id);

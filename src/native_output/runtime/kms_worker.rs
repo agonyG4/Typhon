@@ -79,6 +79,42 @@ pub(super) trait FatalWorkerJobHandler {
     fn drop_known_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()>;
 }
 
+/// Bind a worker-frozen cursor sidecar while both transactions are still
+/// eligible for ordinary pre-submit ownership changes.
+///
+/// The worker result is the first point at which the physical cursor owner is
+/// final.  Keep this operation immediately before the Submitted transitions;
+/// once those transitions are accepted, cursor presentation ownership is
+/// immutable.
+pub(crate) fn prepare_frozen_cursor_presentation_for_submission(
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    primary_transaction_id: OutputTransactionId,
+    sidecar_transaction_id: OutputTransactionId,
+    output_generation: u64,
+    queued_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    output_transactions
+        .mark_queued(sidecar_transaction_id, output_generation, queued_at)
+        .map_err(io::Error::other)?;
+    debug_assert!(
+        output_transactions
+            .transaction(primary_transaction_id)
+            .is_some_and(|record| matches!(record.state(), OutputTransactionState::Queued { .. }))
+    );
+    debug_assert!(
+        output_transactions
+            .transaction(sidecar_transaction_id)
+            .is_some_and(|record| matches!(record.state(), OutputTransactionState::Queued { .. }))
+    );
+    rebind_cursor_presentation_feedback_to_frozen_sidecar(
+        server,
+        output_transactions,
+        primary_transaction_id,
+        sidecar_transaction_id,
+    )
+}
+
 pub(super) fn handle_fatal_worker_jobs(
     fatal_jobs: impl IntoIterator<Item = KmsWorkerFatalJob>,
     handler: &mut impl FatalWorkerJobHandler,
@@ -1097,18 +1133,13 @@ impl NativeRuntime {
                     .into());
                 }
                 if let Some(sidecar) = sidecar_owner.as_ref() {
-                    self.output_transactions
-                        .mark_queued(
-                            sidecar.transaction.id(),
-                            ownership.job.output_generation,
-                            MonotonicTimestampNs::new(queued_at),
-                        )
-                        .map_err(io::Error::other)?;
-                    rebind_cursor_presentation_feedback_to_frozen_sidecar(
+                    prepare_frozen_cursor_presentation_for_submission(
                         &mut self.server,
                         &mut self.output_transactions,
                         transaction_id,
                         sidecar.transaction.id(),
+                        ownership.job.output_generation,
+                        MonotonicTimestampNs::new(queued_at),
                     )?;
                 }
                 let cursor_epoch = if let Some(sidecar) = sidecar_owner.as_ref() {
