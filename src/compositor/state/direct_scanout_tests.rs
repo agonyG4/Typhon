@@ -497,6 +497,15 @@ fn physical_presentation_owner_survives_xwayland_backing_replacement() {
         Some(scene_node_id)
     );
 
+    let analysis = state.direct_scanout_scene_analysis();
+    assert_eq!(
+        analysis
+            .coverage
+            .covering_application_group
+            .as_ref()
+            .map(|group| group.root_surface_id),
+        Some(root_b)
+    );
     let blockers = state.direct_scanout_scene_blockers();
     assert!(
         blockers
@@ -520,6 +529,13 @@ fn physical_presentation_owner_survives_xwayland_backing_replacement() {
         !recovered
             .reasons()
             .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
+    assert_eq!(
+        state
+            .direct_scanout_scene_candidate()
+            .expect("identity physical frame restores scanout")
+            .root_surface_id,
+        root_b
     );
 }
 
