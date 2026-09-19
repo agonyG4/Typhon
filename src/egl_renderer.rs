@@ -7104,6 +7104,7 @@ mod tests {
             .commands
             .last()
             .expect("surface command is emitted");
+        assert_eq!(harness.renderer.presentation_opacities, vec![0.5]);
         assert!(translucent_command.opaque_regions.is_empty());
 
         let opaque = PresentationGroupOpacity::with_scene_node(
@@ -7134,7 +7135,39 @@ mod tests {
             .commands
             .last()
             .expect("surface command is emitted");
+        assert_eq!(harness.renderer.presentation_opacities, vec![1.0]);
         assert!(!opaque_command.opaque_regions.is_empty());
+
+        let zero = PresentationGroupOpacity::with_scene_node(
+            scene_node_id,
+            owner_root,
+            PresentationOpacity::new(0.0).expect("presentation opacity"),
+            None,
+        );
+        harness.renderer.rebuild_scene_commands(
+            320,
+            200,
+            &surfaces,
+            &[],
+            &[],
+            3,
+            1.0,
+            1,
+            &signatures,
+            &[],
+            0,
+            &[zero],
+            &HashMap::from([(7, owner_root)]),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        let zero_command = harness
+            .renderer
+            .commands
+            .last()
+            .expect("surface command is emitted");
+        assert_eq!(harness.renderer.presentation_opacities, vec![0.0]);
+        assert!(zero_command.opaque_regions.is_empty());
     }
 
     #[test]
