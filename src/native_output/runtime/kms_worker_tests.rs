@@ -303,6 +303,22 @@ fn worker_freeze_fixture(
     (ledger, primary_id, sidecar_id, presentation_batch_id)
 }
 
+fn submit_worker_freeze_bundle(
+    ledger: &mut OutputTransactionLedger,
+    primary_id: OutputTransactionId,
+    sidecar_id: Option<OutputTransactionId>,
+) {
+    let token = PageFlipToken::new(702).expect("submit token");
+    ledger
+        .mark_submitted(primary_id, token, MonotonicTimestampNs::new(3))
+        .expect("primary submitted");
+    if let Some(sidecar_id) = sidecar_id {
+        ledger
+            .mark_submitted(sidecar_id, token, MonotonicTimestampNs::new(3))
+            .expect("sidecar submitted");
+    }
+}
+
 #[test]
 fn real_worker_success_rebinds_before_submit_transition() {
     let (mut ledger, primary_id, sidecar_id, presentation_batch_id) = worker_freeze_fixture(
@@ -340,20 +356,7 @@ fn real_worker_success_rebinds_before_submit_transition() {
             .state(),
         OutputTransactionState::Queued { .. }
     ));
-    ledger
-        .mark_submitted(
-            primary_id,
-            PageFlipToken::new(702).expect("submit token"),
-            MonotonicTimestampNs::new(3),
-        )
-        .expect("primary submitted");
-    ledger
-        .mark_submitted(
-            sidecar_id,
-            PageFlipToken::new(702).expect("submit token"),
-            MonotonicTimestampNs::new(3),
-        )
-        .expect("sidecar submitted");
+    submit_worker_freeze_bundle(&mut ledger, primary_id, Some(sidecar_id));
     assert_eq!(
         ledger.presentation_feedback_owner(presentation_batch_id.expect("feedback batch")),
         Some(sidecar_id)
@@ -399,6 +402,21 @@ fn real_worker_success_rebind_without_feedback_is_legal() {
     )
     .expect("no-feedback worker rebind");
     assert!(presentation_batch_id.is_none());
+    submit_worker_freeze_bundle(&mut ledger, primary_id, Some(sidecar_id));
+    assert!(matches!(
+        ledger
+            .transaction(primary_id)
+            .expect("submitted primary")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
+    assert!(matches!(
+        ledger
+            .transaction(sidecar_id)
+            .expect("submitted sidecar")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
 }
 
 #[test]
@@ -454,6 +472,11 @@ fn real_worker_success_content_change_detaches_old_feedback() {
             .presentation_feedback_batch_id(),
         None
     );
+    submit_worker_freeze_bundle(&mut ledger, primary_id, Some(sidecar_id));
+    assert_eq!(
+        ledger.presentation_feedback_owner(sidecar_presentation_batch_id),
+        Some(sidecar_id)
+    );
 }
 
 #[test]
@@ -482,6 +505,46 @@ fn direct_worker_success_rebinds_before_submit_transition() {
         ledger.presentation_feedback_owner(presentation_batch_id),
         Some(sidecar_id)
     );
+    submit_worker_freeze_bundle(&mut ledger, primary_id, Some(sidecar_id));
+    assert!(matches!(
+        ledger
+            .transaction(primary_id)
+            .expect("submitted primary")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
+    assert!(matches!(
+        ledger
+            .transaction(sidecar_id)
+            .expect("submitted sidecar")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
+}
+
+#[test]
+fn primary_only_worker_success_preserves_primary_presentation_owner() {
+    let (mut ledger, primary_id, _sidecar_id, presentation_batch_id) = worker_freeze_fixture(
+        Some(worker_freeze_cursor_key()),
+        None,
+        true,
+        WorkerFreezePrimaryKind::Composited,
+    );
+    let presentation_batch_id = presentation_batch_id.expect("feedback batch");
+
+    submit_worker_freeze_bundle(&mut ledger, primary_id, None);
+
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id),
+        Some(primary_id)
+    );
+    assert!(matches!(
+        ledger
+            .transaction(primary_id)
+            .expect("submitted primary")
+            .state(),
+        OutputTransactionState::Submitted { .. }
+    ));
 }
 
 #[test]

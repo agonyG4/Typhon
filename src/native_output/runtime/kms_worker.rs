@@ -94,6 +94,11 @@ pub(crate) fn prepare_frozen_cursor_presentation_for_submission(
     output_generation: u64,
     queued_at: MonotonicTimestampNs,
 ) -> NativeResult<()> {
+    debug_assert!(
+        output_transactions
+            .transaction(primary_transaction_id)
+            .is_some_and(|record| matches!(record.state(), OutputTransactionState::Queued { .. }))
+    );
     output_transactions
         .mark_queued(sidecar_transaction_id, output_generation, queued_at)
         .map_err(io::Error::other)?;
@@ -107,12 +112,78 @@ pub(crate) fn prepare_frozen_cursor_presentation_for_submission(
             .transaction(sidecar_transaction_id)
             .is_some_and(|record| matches!(record.state(), OutputTransactionState::Queued { .. }))
     );
+    let primary_key = output_transactions
+        .transaction(primary_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    let sidecar_key = output_transactions
+        .transaction(sidecar_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    let primary_batch_id = output_transactions
+        .transaction(primary_transaction_id)
+        .and_then(|record| {
+            record
+                .descriptor()
+                .obligations()
+                .presentation_feedback_batch_id()
+        });
+    let sidecar_batch_id = output_transactions
+        .transaction(sidecar_transaction_id)
+        .and_then(|record| {
+            record
+                .descriptor()
+                .obligations()
+                .presentation_feedback_batch_id()
+        });
     rebind_cursor_presentation_feedback_to_frozen_sidecar(
         server,
         output_transactions,
         primary_transaction_id,
         sidecar_transaction_id,
-    )
+    )?;
+    debug_assert!(
+        output_transactions
+            .transaction(primary_transaction_id)
+            .is_some_and(|record| matches!(record.state(), OutputTransactionState::Queued { .. }))
+    );
+    debug_assert!(
+        output_transactions
+            .transaction(sidecar_transaction_id)
+            .is_some_and(|record| matches!(record.state(), OutputTransactionState::Queued { .. }))
+    );
+    debug_assert!(
+        output_transactions
+            .transaction(primary_transaction_id)
+            .is_some_and(|record| {
+                record
+                    .descriptor()
+                    .obligations()
+                    .presentation_feedback_batch_id()
+                    .is_none()
+            })
+    );
+    if primary_key == sidecar_key {
+        debug_assert!(sidecar_batch_id.is_none());
+        if let Some(batch_id) = primary_batch_id {
+            debug_assert_eq!(
+                output_transactions.presentation_feedback_owner(batch_id),
+                Some(sidecar_transaction_id)
+            );
+        }
+    } else {
+        if let Some(batch_id) = primary_batch_id {
+            debug_assert_eq!(
+                output_transactions.presentation_feedback_owner(batch_id),
+                None
+            );
+        }
+        if let Some(batch_id) = sidecar_batch_id {
+            debug_assert_eq!(
+                output_transactions.presentation_feedback_owner(batch_id),
+                Some(sidecar_transaction_id)
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn handle_fatal_worker_jobs(
@@ -1314,13 +1385,79 @@ impl NativeRuntime {
                     )
                     .map_err(io::Error::other)?;
                 if let Some(sidecar) = sidecar_owner {
+                    let sidecar_transaction_id = sidecar.transaction.id();
                     self.output_transactions
                         .mark_submitted(
-                            sidecar.transaction.id(),
+                            sidecar_transaction_id,
                             token,
                             MonotonicTimestampNs::new(submit_returned_at),
                         )
                         .map_err(io::Error::other)?;
+                    debug_assert!(
+                        self.output_transactions
+                            .transaction(transaction_id)
+                            .is_some_and(|record| {
+                                matches!(record.state(), OutputTransactionState::Submitted { .. })
+                            })
+                    );
+                    debug_assert!(
+                        self.output_transactions
+                            .transaction(sidecar_transaction_id)
+                            .is_some_and(|record| {
+                                matches!(record.state(), OutputTransactionState::Submitted { .. })
+                            })
+                    );
+                    debug_assert!(
+                        self.output_transactions
+                            .transaction(transaction_id)
+                            .is_some_and(|record| {
+                                record
+                                    .descriptor()
+                                    .obligations()
+                                    .presentation_feedback_batch_id()
+                                    .is_none()
+                            })
+                    );
+                    if let Some(batch_id) = self
+                        .output_transactions
+                        .transaction(sidecar_transaction_id)
+                        .and_then(|record| {
+                            record
+                                .descriptor()
+                                .obligations()
+                                .presentation_feedback_batch_id()
+                        })
+                    {
+                        debug_assert_eq!(
+                            self.output_transactions
+                                .presentation_feedback_owner(batch_id),
+                            Some(sidecar_transaction_id)
+                        );
+                    }
+                } else {
+                    debug_assert!(
+                        self.output_transactions
+                            .transaction(transaction_id)
+                            .is_some_and(|record| {
+                                matches!(record.state(), OutputTransactionState::Submitted { .. })
+                            })
+                    );
+                    if let Some(batch_id) = self
+                        .output_transactions
+                        .transaction(transaction_id)
+                        .and_then(|record| {
+                            record
+                                .descriptor()
+                                .obligations()
+                                .presentation_feedback_batch_id()
+                        })
+                    {
+                        debug_assert_eq!(
+                            self.output_transactions
+                                .presentation_feedback_owner(batch_id),
+                            Some(transaction_id)
+                        );
+                    }
                 }
                 self.atomic_commit_arbiter
                     .mark_kernel_submitted(token, submit_started_at, submit_returned_at)
