@@ -2,6 +2,62 @@ use super::*;
 use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
 use oblivion_one::core::OutputId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeVisualWorkQueueReason {
+    SceneRepaint,
+    QueuedRedrawRetry,
+    WorkerRequeue,
+    CursorSoftwareFallback,
+}
+
+impl NativeVisualWorkQueueReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SceneRepaint => "scene_repaint",
+            Self::QueuedRedrawRetry => "queued_redraw_retry",
+            Self::WorkerRequeue => "worker_requeue",
+            Self::CursorSoftwareFallback => "cursor_software_fallback",
+        }
+    }
+}
+
+pub(crate) fn queue_visual_work(
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    now_ns: u64,
+    render_generation: u64,
+    reason: NativeVisualWorkQueueReason,
+) -> NativeResult<()> {
+    let scheduler_visual_before = frame_scheduler.visual_work_queued();
+    let pacing_active_before = frame_pacing.active;
+    let worker_reservation_present = frame_pacing.worker_reservation_present();
+
+    frame_pacing.queue_visual(now_ns, render_generation);
+    frame_scheduler.queue_visual_work();
+
+    let scheduler_visual_after = frame_scheduler.visual_work_queued();
+    let pacing_active_after = frame_pacing.active;
+    frame_pacing.log_visual_work_ownership(
+        reason.as_str(),
+        scheduler_visual_before,
+        scheduler_visual_after,
+        pacing_active_before,
+        pacing_active_after,
+        worker_reservation_present,
+        frame_pacing.active_worker_owned(),
+        render_generation,
+    );
+
+    if scheduler_visual_after && pacing_active_after.is_none() {
+        return Err(io::Error::other(format!(
+            "visual work ownership pairing failed: reason={} scheduler_visual=true pacing_active=none render_generation={render_generation}",
+            reason.as_str(),
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 macro_rules! require_validation_base {
     ($context:expr, $redraw:ident) => {
         match $context {
@@ -46,6 +102,8 @@ mod pointer_timing;
 mod presentation;
 mod presentation_cursor;
 mod presentation_cycle;
+#[cfg(test)]
+pub(crate) use presentation_cycle::{admit_repaint_visual_work, primary_redraw_requested};
 #[cfg(test)]
 mod presentation_cycle_tests;
 mod presentation_direct;

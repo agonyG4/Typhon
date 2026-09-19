@@ -364,6 +364,46 @@ mod tests {
     }
 
     #[test]
+    fn queued_successor_before_old_worker_cancel_preserves_render_identity() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let predecessor = pacing.active.expect("predecessor visual");
+        let predecessor_ticket = pacing
+            .reserve_worker_submission(false)
+            .expect("predecessor worker reservation")
+            .expect("predecessor worker ticket");
+
+        // New visual work arrives while the immutable predecessor ticket is
+        // still queued, before a successor render starts.
+        pacing.queue_visual(2, 2);
+        assert_eq!(pacing.active, Some(predecessor));
+        assert!(!pacing.active_worker_owned());
+        assert!(pacing.worker_reservation_present());
+
+        assert!(pacing.cancel_worker_submission(Some(predecessor_ticket)));
+        assert_eq!(pacing.active, Some(predecessor));
+        assert!(!pacing.worker_reservation_present());
+        pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing
+            .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("queued successor can begin RenderAhead");
+    }
+
+    #[test]
+    fn strict_predictive_attempt_rejects_deliberately_broken_ownership() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing.cancel_unsubmitted_render();
+        pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+        assert_eq!(
+            pacing.begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true),
+            Err("Predictive O1 render started without an active frame")
+        );
+    }
+
+    #[test]
     fn worker_cancel_settles_reserved_frame_after_active_becomes_ready() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -2838,6 +2878,27 @@ impl NativeFramePacing {
             return;
         }
         if self.active.is_some() {
+            // An active worker reservation may describe the predecessor
+            // visual while the scheduler has already accepted newer visual
+            // work.  Keep the logical ID for the supported same-ID
+            // successor semantics, but detach the predecessor ticket's
+            // ownership before it can be returned or cancelled.
+            if self.active_worker_reservation_id.take().is_some() {
+                let id = self.active;
+                self.active_predictive_attempt = None;
+                self.active_physical_identity = None;
+                self.active_physical_key = None;
+                self.active_origin = PreparedFrameOrigin::Normal;
+                self.active_queued_ns = Some(now_ns);
+                self.active_queued_frame_id = id;
+                self.log(
+                    "visual_successor_queued",
+                    vec![
+                        frame_id_field(id),
+                        PacingField::u64("render_generation", render_generation),
+                    ],
+                );
+            }
             return;
         }
         let id = self.ids.next();
@@ -2861,6 +2922,47 @@ impl NativeFramePacing {
         if let Some(trace) = &self.trace {
             trace.send(pacing_line(event, &fields));
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn log_visual_work_ownership(
+        &self,
+        reason: &str,
+        scheduler_visual_before: bool,
+        scheduler_visual_after: bool,
+        pacing_active_before: Option<NativeOutputFrameId>,
+        pacing_active_after: Option<NativeOutputFrameId>,
+        worker_reservation_present: bool,
+        active_worker_owned: bool,
+        render_generation: u64,
+    ) {
+        self.log(
+            "visual_work_ownership",
+            vec![
+                PacingField::str("reason", reason),
+                PacingField::bool("scheduler_visual_before", scheduler_visual_before),
+                PacingField::bool("scheduler_visual_after", scheduler_visual_after),
+                PacingField::option_u64(
+                    "pacing_active_before",
+                    pacing_active_before.map(NativeOutputFrameId::get),
+                ),
+                PacingField::option_u64(
+                    "pacing_active_after",
+                    pacing_active_after.map(NativeOutputFrameId::get),
+                ),
+                PacingField::bool("worker_reservation_present", worker_reservation_present),
+                PacingField::bool("active_worker_owned", active_worker_owned),
+                PacingField::u64("render_generation", render_generation),
+            ],
+        );
+    }
+
+    pub(crate) const fn worker_reservation_present(&self) -> bool {
+        self.worker_reservation.is_some()
+    }
+
+    pub(crate) const fn active_worker_owned(&self) -> bool {
+        self.active_worker_reservation_id.is_some()
     }
 
     pub(crate) fn note_prediction(&mut self, prediction: RenderPrediction) {

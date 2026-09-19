@@ -70,6 +70,51 @@ pub(super) fn complete_compatibility_no_visual_change(
     true
 }
 
+pub(crate) const fn primary_redraw_requested(
+    redraw_requested: bool,
+    queued_redraw_requested: bool,
+    cursor_deadline_due: bool,
+    client_cursor_software_work: bool,
+) -> bool {
+    redraw_requested
+        || queued_redraw_requested
+        || (cursor_deadline_due && client_cursor_software_work)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_repaint_visual_work(
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    now_ns: u64,
+    render_generation: u64,
+    primary_redraw: bool,
+    repaint: bool,
+    queued_redraw_requested: &mut bool,
+    cursor_deadline_due: bool,
+    client_cursor_software_work: bool,
+) -> NativeResult<()> {
+    if !repaint {
+        return Ok(());
+    }
+
+    let reason = if *queued_redraw_requested {
+        NativeVisualWorkQueueReason::QueuedRedrawRetry
+    } else if cursor_deadline_due && client_cursor_software_work {
+        NativeVisualWorkQueueReason::CursorSoftwareFallback
+    } else {
+        NativeVisualWorkQueueReason::SceneRepaint
+    };
+    queue_visual_work(
+        frame_pacing,
+        frame_scheduler,
+        now_ns,
+        render_generation,
+        reason,
+    )?;
+    *queued_redraw_requested |= primary_redraw;
+    Ok(())
+}
+
 impl NativeRuntime {
     pub(super) fn render_present_and_update_metrics(
         &mut self,
@@ -301,8 +346,12 @@ impl NativeRuntime {
                 client_cursor_software_work,
                 hardware_cursor_work_pending,
             );
-        let primary_redraw_requested =
-            redraw_requested || (cursor_deadline_due && client_cursor_software_work);
+        let primary_redraw_requested = primary_redraw_requested(
+            redraw_requested,
+            *queued_redraw_requested,
+            cursor_deadline_due,
+            client_cursor_software_work,
+        );
         let repaint_decision = native_repaint_decision(NativeRepaintInputs {
             accepted_clients: accepted > 0,
             render_generation_changed: scene_changed,
@@ -322,9 +371,17 @@ impl NativeRuntime {
             );
         }
         if repaint_decision.repaint {
-            frame_pacing.queue_visual(pacing_now_ns, render_generation);
-            frame_scheduler.queue_visual_work();
-            *queued_redraw_requested |= primary_redraw_requested;
+            admit_repaint_visual_work(
+                frame_pacing,
+                frame_scheduler,
+                pacing_now_ns,
+                render_generation,
+                primary_redraw_requested,
+                true,
+                queued_redraw_requested,
+                cursor_deadline_due,
+                client_cursor_software_work,
+            )?;
         } else if repaint_decision.protocol_only_present {
             frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
         }
@@ -707,6 +764,39 @@ impl NativeRuntime {
         );
         if pending_interactive_visual_work {
             server.record_interactive_scheduler_decision();
+        }
+        if scheduler_decision == SchedulerDecision::RenderAhead {
+            let scheduler_visual_work = frame_scheduler.visual_work_queued();
+            let pacing_active = frame_pacing.active.is_some();
+            if !scheduler_visual_work || !pacing_active {
+                frame_pacing.log(
+                    "render_admission_ownership_violation",
+                    vec![
+                        PacingField::bool("scheduler_visual_work", scheduler_visual_work),
+                        PacingField::option_u64(
+                            "pacing_active",
+                            frame_pacing.active.map(NativeOutputFrameId::get),
+                        ),
+                        PacingField::bool(
+                            "worker_reservation_present",
+                            frame_pacing.worker_reservation_present(),
+                        ),
+                        PacingField::bool(
+                            "active_worker_owned",
+                            frame_pacing.active_worker_owned(),
+                        ),
+                        PacingField::bool("queued_redraw_requested", *queued_redraw_requested),
+                        PacingField::u64("render_generation", render_generation),
+                    ],
+                );
+                return Err(io::Error::other(format!(
+                    "RenderAhead visual ownership invariant violated: scheduler_visual_work={scheduler_visual_work} pacing_active={pacing_active} worker_reservation_present={} active_worker_owned={} queued_redraw_requested={} render_generation={render_generation}",
+                    frame_pacing.worker_reservation_present(),
+                    frame_pacing.active_worker_owned(),
+                    *queued_redraw_requested,
+                ))
+                .into());
+            }
         }
         if matches!(
             scheduler_decision,

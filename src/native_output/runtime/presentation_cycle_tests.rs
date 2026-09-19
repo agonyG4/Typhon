@@ -129,3 +129,40 @@ fn compatibility_renderer_skip_retires_logical_generation_and_terminally_owns_ba
     assert_eq!(last_software_cursor_damage, current_software_cursor_damage);
     assert_ne!(server.prepared_frame_batch_id(), Some(prepared_batch));
 }
+
+#[test]
+fn queued_redraw_retry_is_admitted_before_predictive_render_ahead() {
+    let mut pacing = NativeFramePacing::from_env();
+    let mut frame_scheduler = NativeFrameScheduler::new(165, 0);
+    queue_visual_work(
+        &mut pacing,
+        &mut frame_scheduler,
+        1,
+        1,
+        NativeVisualWorkQueueReason::SceneRepaint,
+    )
+    .expect("initial visual work pairing");
+    pacing.cancel_unsubmitted_render();
+    let mut queued_redraw_requested = true;
+    let primary_redraw = primary_redraw_requested(false, queued_redraw_requested, false, false);
+
+    assert!(primary_redraw);
+    admit_repaint_visual_work(
+        &mut pacing,
+        &mut frame_scheduler,
+        2,
+        1,
+        primary_redraw,
+        true,
+        &mut queued_redraw_requested,
+        false,
+        false,
+    )
+    .expect("queued retry admission pairs visual ownership");
+
+    assert!(frame_scheduler.visual_work_queued());
+    pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+    pacing
+        .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
+        .expect("RenderAhead must have a pacing identity");
+}

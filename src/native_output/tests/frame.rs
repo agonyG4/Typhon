@@ -1,9 +1,11 @@
 use super::output::test_renderable_surface;
 use super::*;
 use crate::native_output::runtime::{
-    NativeCursorOutputArbitration, NativeCursorOutputDisposition, earliest_native_deadline,
-    update_cursor_output_arbitration,
+    NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeVisualWorkQueueReason,
+    admit_repaint_visual_work, earliest_native_deadline, primary_redraw_requested,
+    queue_visual_work, update_cursor_output_arbitration,
 };
+use oblivion_one::native::presentation_deadline::{PresentationTargetReason, PrimaryRefreshClaim};
 use oblivion_one::native::scheduler::SchedulerCapabilities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +89,39 @@ fn reactive_context(now_ns: u64) -> SchedulerFrameContext {
         now: MonotonicTimestampNs::new(now_ns),
         render_target_available: true,
         render_ahead_allowed: false,
+        ready_frame_present: false,
+        ready_target_current: true,
+        worker_queue_available: false,
+    }
+}
+
+fn predictive_render_ahead_context(now_ns: u64) -> SchedulerFrameContext {
+    let presentation_time = MonotonicTimestampNs::new(now_ns.saturating_add(1_000_000));
+    let target = PresentationTarget {
+        sequence: 2,
+        presentation_time,
+        submit_not_before: MonotonicTimestampNs::new(now_ns),
+        render_start_deadline: MonotonicTimestampNs::new(now_ns),
+        refresh_interval: Duration::from_millis(10),
+        reason: PresentationTargetReason::PredictedPressure,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
+    };
+    SchedulerFrameContext {
+        pacing_mode: NativeOutputPacingMode::PredictiveTriple,
+        capabilities: SchedulerCapabilities::explicit_atomic(true, true),
+        presentation_target: Some(target),
+        predicted_total_cost: Duration::from_millis(10),
+        now: MonotonicTimestampNs::new(now_ns),
+        render_target_available: true,
+        render_ahead_allowed: true,
         ready_frame_present: false,
         ready_target_current: true,
         worker_queue_available: false,
@@ -922,6 +957,257 @@ fn native_repaint_decision_waits_for_pending_pageflip_before_repaint() {
             protocol_only_present: false,
         }
     );
+}
+
+#[test]
+fn predictive_o1_retry_never_renders_without_active_frame() {
+    let mut pacing = NativeFramePacing::from_env();
+    let mut scheduler = NativeFrameScheduler::new(165, 0);
+    pacing.queue_visual(1, 1);
+    scheduler.queue_visual_work();
+
+    // This is the recoverable, pre-backend exit from an unreachable submit
+    // window.  It clears pacing ownership while the scheduler still owns the
+    // visual retry.
+    pacing.cancel_unsubmitted_render();
+    let mut queued_redraw_requested = true;
+
+    let primary_redraw = primary_redraw_requested(false, queued_redraw_requested, false, false);
+    let repaint = native_repaint_decision(NativeRepaintInputs {
+        accepted_clients: false,
+        render_generation_changed: false,
+        pending_frame_work: false,
+        only_pending_surface_frame_callbacks: false,
+        redraw_requested: primary_redraw,
+        cursor_work_pending: false,
+        effect_work_pending: false,
+        effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
+        page_flip_pending: false,
+    });
+    assert!(
+        queued_redraw_requested && repaint.repaint,
+        "queued redraw retry must be admitted as visual work"
+    );
+
+    if repaint.repaint {
+        admit_repaint_visual_work(
+            &mut pacing,
+            &mut scheduler,
+            2,
+            1,
+            primary_redraw,
+            repaint.repaint,
+            &mut queued_redraw_requested,
+            false,
+            false,
+        )
+        .expect("retry admission pairs scheduler and pacing ownership");
+    }
+    assert!(scheduler.visual_work_queued());
+    pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+    pacing
+        .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
+        .expect("RenderAhead must have a pacing identity");
+}
+
+#[test]
+fn worker_requeue_without_successor_restores_pacing_identity() {
+    let mut pacing = NativeFramePacing::from_env();
+    let mut scheduler = NativeFrameScheduler::new(165, 0);
+    pacing.queue_visual(1, 1);
+    scheduler.queue_visual_work();
+    let ticket = pacing
+        .reserve_worker_submission(false)
+        .expect("pacing worker reservation")
+        .expect("pacing worker ticket");
+    scheduler
+        .reserve_worker_submission(41, 1001)
+        .expect("scheduler worker reservation");
+
+    assert!(pacing.cancel_worker_submission(Some(ticket)));
+    scheduler
+        .cancel_worker_submission(41, 1001)
+        .expect("scheduler cancellation requeues visual work");
+    assert!(scheduler.visual_work_queued());
+    assert!(pacing.active.is_none());
+
+    queue_visual_work(
+        &mut pacing,
+        &mut scheduler,
+        2,
+        1,
+        NativeVisualWorkQueueReason::WorkerRequeue,
+    )
+    .expect("worker retry pairs visual ownership");
+    assert!(scheduler.visual_work_queued());
+    assert!(pacing.active.is_some());
+}
+
+#[test]
+fn safe_worker_abandonment_does_not_create_a_successor_identity() {
+    let mut pacing = NativeFramePacing::from_env();
+    let mut scheduler = NativeFrameScheduler::new(165, 0);
+    pacing.queue_visual(1, 1);
+    scheduler.queue_visual_work();
+    let ticket = pacing
+        .reserve_worker_submission(false)
+        .expect("pacing worker reservation")
+        .expect("pacing worker ticket");
+    scheduler
+        .reserve_worker_submission(41, 1001)
+        .expect("scheduler worker reservation");
+
+    assert!(pacing.abandon_worker_submission(Some(ticket)));
+    scheduler
+        .abandon_worker_submission(41, 1001)
+        .expect("safe scheduler abandonment");
+    assert!(!scheduler.visual_work_queued());
+    assert!(pacing.active.is_none());
+}
+
+#[test]
+fn predictive_o1_queue_ownership_seeded_stress() {
+    let mut pacing = NativeFramePacing::from_env();
+    let mut scheduler = NativeFrameScheduler::new(165, 0);
+    let mut worker_ticket = None;
+    let mut worker_identity = None;
+    let mut pending_token = None;
+    let mut queued_retry = false;
+    let mut seed = 0x9e37_79b9_u64;
+
+    for step in 0..5_000_u64 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let now_ns = step.saturating_add(1);
+
+        // A recoverable render exit returns to the cycle boundary.  The next
+        // admission must repair the pair before asking the scheduler for an
+        // actionable decision.
+        if queued_retry {
+            queue_visual_work(
+                &mut pacing,
+                &mut scheduler,
+                now_ns,
+                step,
+                NativeVisualWorkQueueReason::QueuedRedrawRetry,
+            )
+            .expect("retry admission preserves the visual ownership pair");
+            queued_retry = false;
+        }
+
+        match seed % 7 {
+            0 | 1 => {
+                queue_visual_work(
+                    &mut pacing,
+                    &mut scheduler,
+                    now_ns,
+                    step,
+                    NativeVisualWorkQueueReason::SceneRepaint,
+                )
+                .expect("scene repaint admission preserves the visual ownership pair");
+            }
+            2 if worker_ticket.is_none()
+                && pending_token.is_none()
+                && pacing.active.is_some()
+                && scheduler.visual_work_queued() =>
+            {
+                let token = 10_000 + step;
+                let transaction_id = 20_000 + step;
+                let ticket = pacing
+                    .reserve_worker_submission(false)
+                    .expect("pacing worker reservation")
+                    .expect("active visual has a worker ticket");
+                scheduler
+                    .reserve_worker_submission(token, transaction_id)
+                    .expect("scheduler worker reservation");
+                worker_ticket = Some(ticket);
+                worker_identity = Some((token, transaction_id));
+            }
+            3 => {
+                if let (Some(ticket), Some((token, transaction_id))) =
+                    (worker_ticket.take(), worker_identity.take())
+                {
+                    if seed & 1 == 0 {
+                        pacing
+                            .note_worker_submit_exact(
+                                Some(ticket),
+                                token,
+                                now_ns,
+                                NativeOutputPacingMode::PredictiveTriple,
+                            )
+                            .expect("worker success settles the exact pacing ticket");
+                        scheduler
+                            .confirm_kernel_submission(token, now_ns)
+                            .expect("worker success settles the exact scheduler ticket");
+                        pending_token = Some(token);
+                    } else if seed & 2 == 0 && !scheduler.visual_work_queued() {
+                        assert!(pacing.abandon_worker_submission(Some(ticket)));
+                        scheduler
+                            .abandon_worker_submission(token, transaction_id)
+                            .expect("safe worker abandonment does not requeue");
+                    } else {
+                        assert!(pacing.cancel_worker_submission(Some(ticket)));
+                        scheduler
+                            .cancel_worker_submission(token, transaction_id)
+                            .expect("worker cancellation requeues visual work");
+                        queue_visual_work(
+                            &mut pacing,
+                            &mut scheduler,
+                            now_ns,
+                            step,
+                            NativeVisualWorkQueueReason::WorkerRequeue,
+                        )
+                        .expect("worker requeue restores pacing ownership");
+                    }
+                }
+            }
+            4 if pending_token.is_some() => {
+                let token = pending_token.take().expect("pending token");
+                assert!(matches!(
+                    scheduler.complete_kernel_pageflip(token, now_ns),
+                    PageFlipCompletionResult::Completed { .. }
+                ));
+            }
+            5 if scheduler.visual_work_queued() && pending_token.is_some() => {
+                let decision =
+                    scheduler.decision_with_context(predictive_render_ahead_context(now_ns));
+                if decision == SchedulerDecision::RenderAhead {
+                    assert!(
+                        pacing.active.is_some(),
+                        "RenderAhead at step {step} lost its pacing identity"
+                    );
+                    pacing.cancel_unsubmitted_render();
+                    queued_retry = true;
+                }
+            }
+            6 if scheduler.visual_work_queued()
+                && pending_token.is_some()
+                && pacing.active.is_some() =>
+            {
+                pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+                pacing
+                    .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
+                    .expect("ready transition starts from the paired active identity");
+                scheduler.note_render_ahead_ready();
+                pacing.note_ready_frame(now_ns, true);
+                assert!(pacing.ready.is_some());
+                assert!(pacing.abandon_ready_frame());
+                scheduler.discard_ready_frame();
+            }
+            _ => {}
+        }
+
+        if !queued_retry && scheduler.visual_work_queued() && pending_token.is_some() {
+            let decision = scheduler.decision_with_context(predictive_render_ahead_context(now_ns));
+            if decision == SchedulerDecision::RenderAhead {
+                assert!(
+                    pacing.active.is_some(),
+                    "RenderAhead at step {step} lost its pacing identity"
+                );
+            }
+        }
+    }
 }
 
 #[test]

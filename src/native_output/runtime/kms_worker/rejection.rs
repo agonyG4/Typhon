@@ -88,6 +88,15 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
             if let Some(worker) = kms_commit_worker {
                 worker.record_scheduler_queued_cancellation();
             }
+            if drop_reason != OutputTransactionDropReason::SafeAbandonment {
+                queue_visual_work(
+                    frame_pacing,
+                    frame_scheduler,
+                    monotonic_now_ns()?,
+                    server.scene_render_generation(),
+                    NativeVisualWorkQueueReason::WorkerRequeue,
+                )?;
+            }
         }
     }
     atomic_commit_arbiter.reject_worker_queued(job.token);
@@ -328,16 +337,23 @@ impl NativeRuntime {
             return Err(io::Error::other("invalidated worker pacing identity mismatch").into());
         }
 
-        if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
-            && compatibility_primary
-            && let Err(error) = self
+        if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) && compatibility_primary {
+            if let Err(error) = self
                 .frame_scheduler
                 .cancel_worker_submission(job.token.get(), job.transaction_id.get())
-        {
-            if let Some(worker) = self.kms_commit_worker.as_ref() {
-                worker.record_scheduler_cancel_mismatch();
+            {
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_scheduler_cancel_mismatch();
+                }
+                return Err(io::Error::other(error).into());
             }
-            return Err(io::Error::other(error).into());
+            queue_visual_work(
+                &mut self.frame_pacing,
+                &mut self.frame_scheduler,
+                monotonic_now_ns()?,
+                self.server.scene_render_generation(),
+                NativeVisualWorkQueueReason::WorkerRequeue,
+            )?;
         }
         let mut cursor_owner = if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
             && !compatibility_primary
@@ -522,6 +538,13 @@ impl NativeRuntime {
             if let Some(worker) = self.kms_commit_worker.as_ref() {
                 worker.record_scheduler_queued_cancellation();
             }
+            queue_visual_work(
+                &mut self.frame_pacing,
+                &mut self.frame_scheduler,
+                monotonic_now_ns()?,
+                self.server.scene_render_generation(),
+                NativeVisualWorkQueueReason::WorkerRequeue,
+            )?;
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
@@ -640,6 +663,15 @@ impl NativeRuntime {
                 }
                 if let Some(worker) = self.kms_commit_worker.as_ref() {
                     worker.record_scheduler_queued_cancellation();
+                }
+                if drop_reason != OutputTransactionDropReason::SafeAbandonment {
+                    queue_visual_work(
+                        &mut self.frame_pacing,
+                        &mut self.frame_scheduler,
+                        monotonic_now_ns()?,
+                        self.server.scene_render_generation(),
+                        NativeVisualWorkQueueReason::WorkerRequeue,
+                    )?;
                 }
             }
         }
