@@ -636,6 +636,14 @@ impl CompositorState {
             .is_some_and(|transform| !transform.is_identity())
     }
 
+    pub(in crate::compositor) fn presented_presentation_geometry_is_non_identity_for_scene_node(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> bool {
+        self.presented_presentation_transform_for_scene_node(scene_node_id)
+            .is_some_and(|transform| !transform.is_identity())
+    }
+
     fn visible_fullscreen_overlay_count(&self) -> usize {
         self.layer_surfaces
             .values()

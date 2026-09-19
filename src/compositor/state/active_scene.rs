@@ -432,6 +432,15 @@ impl CompositorState {
             .transform_for_root(root_surface_id)
     }
 
+    pub(in crate::compositor) fn presented_presentation_transform_for_scene_node(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> Option<PresentationGroupTransform> {
+        self.presented_presentation
+            .as_ref()?
+            .transform_for_scene_node(scene_node_id)
+    }
+
     pub(in crate::compositor) fn presented_presentation_opacity(
         &self,
         root_surface_id: u32,
@@ -443,12 +452,32 @@ impl CompositorState {
             })
     }
 
+    pub(in crate::compositor) fn presented_presentation_opacity_for_scene_node(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> PresentationOpacity {
+        self.presented_presentation
+            .as_ref()
+            .map_or(PresentationOpacity::OPAQUE, |presentation| {
+                presentation.opacity_for_scene_node(scene_node_id)
+            })
+    }
+
     pub(in crate::compositor) fn presented_presentation_opacity_is_non_identity(
         &self,
         root_surface_id: u32,
     ) -> bool {
         !self
             .presented_presentation_opacity(root_surface_id)
+            .is_opaque()
+    }
+
+    pub(in crate::compositor) fn presented_presentation_opacity_is_non_identity_for_scene_node(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> bool {
+        !self
+            .presented_presentation_opacity_for_scene_node(scene_node_id)
             .is_opaque()
     }
 
