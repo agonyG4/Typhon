@@ -13,8 +13,8 @@ use crate::native_output::runtime::{
 };
 use crate::native_output::{ExplicitOutputCounters, OutputPresentationMode};
 use oblivion_one::compositor::{
-    CompositorFrameBatchId, PresentationFeedbackBatchId,
-    SurfaceDamagePresentation as CompositorSurfaceDamagePresentation,
+    CompositorFrameBatchId, PresentationFeedbackBatchId, SurfaceCommitSequence,
+    SurfaceDamagePresentation as CompositorSurfaceDamagePresentation, SurfacePresentationCommitKey,
 };
 use oblivion_one::native::kms::{AtomicCursorVisualState, PageFlipToken};
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
@@ -381,6 +381,14 @@ fn test_target() -> oblivion_one::native::presentation_deadline::PresentationTar
 
 fn test_batch(value: u64) -> CompositorFrameBatchId {
     CompositorFrameBatchId::new(NonZeroU64::new(value).expect("frame batch is nonzero"))
+}
+
+fn cursor_presentation_key(commit_sequence: u64) -> SurfacePresentationCommitKey {
+    SurfacePresentationCommitKey {
+        surface_id: 77,
+        presentation_generation: 3,
+        commit_sequence: SurfaceCommitSequence(commit_sequence),
+    }
 }
 
 fn test_composited_transaction(
@@ -1588,6 +1596,286 @@ fn cursor_only_plane_delta_owns_only_a_presentation_feedback_batch() {
     ledger
         .validate_terminal_ownership()
         .expect("presentation-only owner is tracked exactly once");
+}
+
+#[test]
+fn composited_primary_can_own_a_hardware_cursor_presentation_batch() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let presentation_batch_id = PresentationFeedbackBatchId::new(NonZeroU64::new(70).unwrap());
+    let transaction = test_composited_transaction(&mut ledger, test_batch(71), 1)
+        .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
+        .with_presentation_feedback_batch(presentation_batch_id)
+        .expect("primary transaction accepts cursor presentation ownership");
+    let id = transaction.id();
+
+    assert_eq!(transaction.id(), id);
+    ledger
+        .insert(transaction)
+        .expect("insert primary transaction");
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id),
+        Some(id)
+    );
+}
+
+#[test]
+fn direct_primary_can_own_a_hardware_cursor_presentation_batch() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let presentation_batch_id = PresentationFeedbackBatchId::new(NonZeroU64::new(72).unwrap());
+    let transaction = super::OutputTransaction::direct(
+        ledger.output_id(),
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        72,
+        test_direct_key(),
+        92,
+        None,
+        test_batch(73),
+        7,
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
+    .with_presentation_feedback_batch(presentation_batch_id)
+    .expect("direct transaction accepts cursor presentation ownership");
+
+    ledger
+        .insert(transaction)
+        .expect("insert direct transaction");
+    assert_eq!(
+        ledger.presentation_feedback_owner(presentation_batch_id),
+        Some(id)
+    );
+}
+
+#[test]
+fn compatibility_immediate_cannot_own_cursor_presentation_feedback() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let result = super::OutputTransaction::compatibility_immediate(
+        ledger.output_id(),
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        84,
+        test_batch(85),
+    )
+    .unwrap()
+    .with_presentation_feedback_batch(PresentationFeedbackBatchId::new(
+        NonZeroU64::new(86).unwrap(),
+    ));
+
+    assert_eq!(
+        result,
+        Err(super::OutputTransactionBuildError::PresentationFeedbackBatchForCompatibilityImmediate)
+    );
+}
+
+#[test]
+fn cursor_presentation_batch_transfers_for_motion_only_sidecar_replacement() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let primary = test_composited_transaction(&mut ledger, test_batch(74), 1)
+        .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
+        .with_presentation_feedback_batch(PresentationFeedbackBatchId::new(
+            NonZeroU64::new(75).unwrap(),
+        ))
+        .unwrap();
+    let primary_id = primary.id();
+    let batch_id = primary
+        .obligations()
+        .presentation_feedback_batch_id()
+        .unwrap();
+    ledger.insert(primary).unwrap();
+
+    let sidecar_id = ledger.allocate_id().unwrap();
+    let sidecar = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(20),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        76,
+        Some(cursor_state(96)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)));
+    ledger.insert(sidecar).unwrap();
+
+    assert_eq!(
+        ledger
+            .transfer_presentation_feedback_batch(primary_id, sidecar_id)
+            .unwrap(),
+        Some(batch_id)
+    );
+    assert_eq!(
+        ledger.presentation_feedback_owner(batch_id),
+        Some(sidecar_id)
+    );
+    assert_eq!(
+        ledger
+            .transaction(primary_id)
+            .unwrap()
+            .descriptor()
+            .obligations()
+            .presentation_feedback_batch_id(),
+        None
+    );
+    ledger.validate_terminal_ownership().unwrap();
+}
+
+#[test]
+fn cursor_presentation_batch_does_not_transfer_across_content_updates() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let primary = test_composited_transaction(&mut ledger, test_batch(77), 1)
+        .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
+        .with_presentation_feedback_batch(PresentationFeedbackBatchId::new(
+            NonZeroU64::new(78).unwrap(),
+        ))
+        .unwrap();
+    let primary_id = primary.id();
+    let batch_id = primary
+        .obligations()
+        .presentation_feedback_batch_id()
+        .unwrap();
+    ledger.insert(primary).unwrap();
+
+    let sidecar_id = ledger.allocate_id().unwrap();
+    let sidecar = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(20),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        79,
+        Some(cursor_state(97)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_client_cursor_presentation_key(Some(cursor_presentation_key(2)));
+    ledger.insert(sidecar).unwrap();
+
+    assert_eq!(
+        ledger.transfer_presentation_feedback_batch(primary_id, sidecar_id),
+        Err(super::OutputTransactionError::PresentationFeedbackKeyMismatch)
+    );
+    assert_eq!(
+        ledger.presentation_feedback_owner(batch_id),
+        Some(primary_id)
+    );
+    ledger.validate_terminal_ownership().unwrap();
+}
+
+#[test]
+fn submitted_cursor_presentation_owner_cannot_be_rebound() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(80), 1)
+        .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
+        .with_presentation_feedback_batch(PresentationFeedbackBatchId::new(
+            NonZeroU64::new(81).unwrap(),
+        ))
+        .unwrap();
+    let id = transaction.id();
+    let batch_id = transaction
+        .obligations()
+        .presentation_feedback_batch_id()
+        .unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(
+            id,
+            PageFlipToken::new(82).unwrap(),
+            MonotonicTimestampNs::new(30),
+        )
+        .unwrap();
+
+    let sidecar_id = ledger.allocate_id().unwrap();
+    let sidecar = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(31),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        83,
+        Some(cursor_state(98)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)));
+    ledger.insert(sidecar).unwrap();
+
+    assert!(matches!(
+        ledger.transfer_presentation_feedback_batch(id, sidecar_id),
+        Err(super::OutputTransactionError::InvalidTransition { .. })
+    ));
+    assert_eq!(ledger.presentation_feedback_owner(batch_id), Some(id));
+}
+
+#[test]
+fn submitted_frozen_bundle_rebind_moves_same_cursor_feedback_to_sidecar() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let primary = test_composited_transaction(&mut ledger, test_batch(87), 1)
+        .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)))
+        .with_presentation_feedback_batch(PresentationFeedbackBatchId::new(
+            NonZeroU64::new(88).unwrap(),
+        ))
+        .unwrap();
+    let primary_id = primary.id();
+    let batch_id = primary
+        .obligations()
+        .presentation_feedback_batch_id()
+        .unwrap();
+    ledger.insert(primary).unwrap();
+    ledger
+        .mark_submitted(
+            primary_id,
+            PageFlipToken::new(89).unwrap(),
+            MonotonicTimestampNs::new(30),
+        )
+        .unwrap();
+
+    let sidecar_id = ledger.allocate_id().unwrap();
+    let sidecar = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
+        sidecar_id,
+        1,
+        MonotonicTimestampNs::new(31),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        90,
+        Some(cursor_state(99)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_client_cursor_presentation_key(Some(cursor_presentation_key(1)));
+    ledger.insert(sidecar).unwrap();
+    ledger
+        .mark_submitted(
+            sidecar_id,
+            PageFlipToken::new(89).unwrap(),
+            MonotonicTimestampNs::new(30),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ledger
+            .transfer_submitted_cursor_presentation_feedback_batch(primary_id, sidecar_id)
+            .unwrap(),
+        Some(batch_id)
+    );
+    assert_eq!(
+        ledger.presentation_feedback_owner(batch_id),
+        Some(sidecar_id)
+    );
 }
 
 #[test]

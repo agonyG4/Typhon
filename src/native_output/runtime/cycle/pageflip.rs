@@ -962,6 +962,7 @@ impl NativeRuntime {
         let mut frame_completed = false;
         let frame_rendered = false;
         let frame_submitted = false;
+        let mut pageflip_presentation: Option<FramePresentation> = None;
         if let Some(pageflip) = pageflip_event {
             *last_refresh_sequence = u64::from(pageflip.sequence);
             if let Some(tracker) = direct_fallback_tracker.as_mut() {
@@ -1189,6 +1190,7 @@ impl NativeRuntime {
                         pageflip.sequence,
                     )?
                 };
+                pageflip_presentation = Some(presentation);
                 let compositor_receive_us = sample_clock_microseconds(*drm_timestamp_clock)?;
                 let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)
                     .saturating_mul(1_000_000)
@@ -1580,6 +1582,11 @@ impl NativeRuntime {
                         |obligations| {
                             debug_assert!(obligations.direct_surface_id().is_none());
                             server.commit_surface_damage_presented(surface_damage);
+                            complete_presentation_feedback_obligation(
+                                server,
+                                obligations,
+                                presentation,
+                            )?;
                             server.complete_presented_frame_batch(
                                 completed_frame_id,
                                 protocol_batch_id,
@@ -2173,6 +2180,11 @@ impl NativeRuntime {
                             io::Error::other(format!("worker pageflip ack: {error:?}"))
                         })?;
                     if let Some(sidecar_transaction_id) = sidecar_transaction_id {
+                        let pageflip_presentation = pageflip_presentation.ok_or_else(|| {
+                            io::Error::other(
+                                "worker sidecar pageflip has no physical presentation evidence",
+                            )
+                        })?;
                         complete_presented_output_transaction(
                             output_transactions,
                             &mut self.presentation_trace,
@@ -2184,6 +2196,11 @@ impl NativeRuntime {
                             |obligations| {
                                 debug_assert!(obligations.frame_batch_id().is_none());
                                 debug_assert!(obligations.direct_surface_id().is_none());
+                                complete_presentation_feedback_obligation(
+                                    server,
+                                    obligations,
+                                    pageflip_presentation,
+                                )?;
                                 if let Some(surface_damage) = sidecar_surface_damage {
                                     server.commit_surface_damage_presented(surface_damage);
                                 }

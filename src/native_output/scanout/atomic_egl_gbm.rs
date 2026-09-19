@@ -32,9 +32,11 @@ use crate::egl_renderer::{
     GlesSceneRenderer, OutputDamage, OutputFramebufferOrigin, choose_surfaceless_egl_config,
     create_gles_context, detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
+use crate::native_output::runtime::take_client_cursor_presentation_feedback_batch;
 use crate::native_output::runtime::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition, DmabufGpuReleaseSafety,
-    direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
+    direct_terminal_callback_owner_leaks, discard_presentation_feedback_obligation,
+    restore_presentation_feedback_obligation, settle_failed_output_transaction,
     settle_no_visual_change_output_transaction,
 };
 use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
@@ -743,6 +745,7 @@ impl AtomicEglGbmScanout {
                 self.egl_display,
                 EglOutputRenderTarget {
                     framebuffer,
+                    sampleable_texture: Some(self.slot(slot)?.texture),
                     width: self.width,
                     height: self.height,
                     buffer_age,
@@ -922,10 +925,7 @@ impl AtomicEglGbmScanout {
             .iter()
             .filter_map(|surface| server.presentation_commit_key_for_renderable_surface(surface))
             .collect::<Vec<_>>();
-        let exact_cursor_commit = match frozen_cursor_plan.delivery {
-            crate::native_output::presentation::plane::PresentedCursorDelivery::Software => server
-                .client_cursor_render_state()
-                .map(|cursor| (cursor.surface.surface_id, cursor.surface.commit_sequence)),
+        let hardware_cursor_presentation_key = match frozen_cursor_plan.delivery {
             crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
                 frozen_cursor_plane_owner
                     .as_ref()
@@ -938,10 +938,16 @@ impl AtomicEglGbmScanout {
                             ),
                         )
                     })
-                    .map(|key| {
-                        presentation_samples.push(key);
-                        (key.surface_id, key.commit_sequence)
-                    })
+            }
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+            | crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
+        };
+        let exact_cursor_commit = match frozen_cursor_plan.delivery {
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Software => server
+                .client_cursor_render_state()
+                .map(|cursor| (cursor.surface.surface_id, cursor.surface.commit_sequence)),
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
+                hardware_cursor_presentation_key.map(|key| (key.surface_id, key.commit_sequence))
             }
             crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
         };
@@ -989,12 +995,13 @@ impl AtomicEglGbmScanout {
         } else {
             None
         };
+        let transaction_created_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let transaction_result = if let Some(intent) = prepare_intent {
             OutputTransaction::composited_deferred_o1(
                 self.direct.output_id,
                 transaction_id,
                 output_generation,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                transaction_created_at,
                 intent,
                 pacing_mode,
                 frame_id,
@@ -1010,7 +1017,7 @@ impl AtomicEglGbmScanout {
                 self.direct.output_id,
                 transaction_id,
                 output_generation,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                transaction_created_at,
                 target,
                 pacing_mode,
                 frame_id,
@@ -1026,17 +1033,49 @@ impl AtomicEglGbmScanout {
         let transaction = match transaction_result {
             Ok(transaction) => transaction
                 .with_presentation_state(presentation_mode, content_type)
-                .with_async_validation_key(async_validation_key),
+                .with_async_validation_key(async_validation_key)
+                .with_client_cursor_presentation_key(hardware_cursor_presentation_key),
+
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
                 return Err(io::Error::other(error));
             }
         };
+        let composite_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         if let Err(error) = output_transactions.insert(transaction) {
             server.restore_frame_batch_after_render_failure(protocol_batch_id);
             self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
             return Err(io::Error::other(error));
+        }
+        if let Some(batch_id) = take_client_cursor_presentation_feedback_batch(
+            server,
+            hardware_cursor_presentation_key,
+            frozen_cursor_plan.delivery,
+            cursor_visible,
+        ) {
+            if let Err(error) =
+                output_transactions.attach_presentation_feedback_batch(transaction_id, batch_id)
+            {
+                server.restore_presentation_feedback_batch_after_failure(batch_id);
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::RenderPreparation,
+                    transaction_created_at,
+                    |obligations| {
+                        server.restore_frame_batch_after_render_failure(
+                            obligations
+                                .frame_batch_id()
+                                .expect("composited transaction frame"),
+                        );
+                        self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                return Err(io::Error::other(error));
+            }
         }
         server.trace_surface_pipeline_surfaces(
             SurfacePipelineEvent::SceneResolved,
@@ -1054,7 +1093,6 @@ impl AtomicEglGbmScanout {
         // This is the estimator's production render boundary. Everything before it may
         // include protocol bookkeeping or diagnostics; everything after it is explicit
         // scene encoding, fence export, and GPU work owned by this output frame.
-        let composite_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let callback_timing = server.frame_callback_timing_for_batch(protocol_batch_id);
         let mut gpu_sampling_started = false;
         let (
@@ -1163,6 +1201,7 @@ impl AtomicEglGbmScanout {
                             io::Error::other("skipped render transaction has no frame batch")
                         })?;
                         self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                        restore_presentation_feedback_obligation(server, obligations);
                         server.set_frame_batch_surface_damage(batch_id, surface_damage);
                         if let (Some(lease_id), Some(_)) =
                             (dmabuf_gpu_release_lease_id, release_fence.as_ref())
@@ -1204,6 +1243,7 @@ impl AtomicEglGbmScanout {
                     OutputTransactionFailureStage::RenderExecution,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                     |obligations| {
+                        restore_presentation_feedback_obligation(server, obligations);
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("lifecycle fallback transaction has no frame batch")
                         })?;
@@ -1230,6 +1270,11 @@ impl AtomicEglGbmScanout {
                     failure_stage,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                     |obligations| {
+                        if gpu_sampling_started {
+                            discard_presentation_feedback_obligation(server, obligations);
+                        } else {
+                            restore_presentation_feedback_obligation(server, obligations);
+                        }
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("render failure transaction has no frame batch")
                         })?;
@@ -1384,6 +1429,7 @@ impl AtomicEglGbmScanout {
                     OutputTransactionFailureStage::RenderExecution,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                     |obligations| {
+                        discard_presentation_feedback_obligation(server, obligations);
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("ready ownership failure has no frame batch")
                         })?;

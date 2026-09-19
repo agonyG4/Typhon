@@ -18,7 +18,8 @@ pub(super) use super::kms_worker_teardown::{
 pub(super) use super::plane_cycle::{WorkerQueueOutcome, queue_plane_delta};
 use super::presentation_transactions::{
     build_compatibility_transaction, discard_presentation_feedback_obligation,
-    settle_failed_output_transaction, settle_forced_shutdown_transaction_if_safe,
+    rebind_cursor_presentation_feedback_to_frozen_sidecar, settle_failed_output_transaction,
+    settle_forced_shutdown_transaction_if_safe, settle_returned_cursor_sidecar,
 };
 use super::*;
 use crate::native_output::presentation::plane::CursorRevision;
@@ -1103,6 +1104,12 @@ impl NativeRuntime {
                             MonotonicTimestampNs::new(queued_at),
                         )
                         .map_err(io::Error::other)?;
+                    rebind_cursor_presentation_feedback_to_frozen_sidecar(
+                        &mut self.server,
+                        &mut self.output_transactions,
+                        transaction_id,
+                        sidecar.transaction.id(),
+                    )?;
                 }
                 let cursor_epoch = if let Some(sidecar) = sidecar_owner.as_ref() {
                     match sidecar.transaction.planes().cursor() {
@@ -1425,14 +1432,25 @@ impl NativeRuntime {
                             | OutputTransactionState::Queued { .. }
                     )
                 {
-                    self.output_transactions
-                        .mark_superseded(
-                            transaction_id,
-                            None,
-                            OutputTransactionSupersedeReason::NewerTransaction,
-                            MonotonicTimestampNs::new(monotonic_now_ns()?),
-                        )
-                        .map_err(io::Error::other)?;
+                    let transfer_to_primary = match sidecar.coupling {
+                        crate::native_output::kms_worker::CursorSidecarCoupling::MustBundleWith(
+                            primary_transaction_id,
+                        ) if reason == CursorSidecarReturnReason::RequiredPrimaryPassedFreeze => {
+                            Some(primary_transaction_id)
+                        }
+                        crate::native_output::kms_worker::CursorSidecarCoupling::Independent
+                        | crate::native_output::kms_worker::CursorSidecarCoupling::MustBundleWith(
+                            _,
+                        ) => None,
+                    };
+                    settle_returned_cursor_sidecar(
+                        &mut self.server,
+                        &mut self.output_transactions,
+                        transaction_id,
+                        transfer_to_primary,
+                        reason == CursorSidecarReturnReason::RequiredPrimaryPassedFreeze,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    )?;
                 }
                 self.perf.log("native.kms_commit_worker", || {
                     vec![

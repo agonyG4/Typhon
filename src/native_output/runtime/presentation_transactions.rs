@@ -80,24 +80,6 @@ pub(crate) fn take_client_cursor_presentation_feedback_batch(
     server.take_presentation_feedback_batch_for_samples([presentation_key])
 }
 
-pub(crate) fn take_plane_delta_presentation_feedback_batch(
-    server: &mut OwnCompositorServer,
-    output_transactions: &OutputTransactionLedger,
-    transaction_id: OutputTransactionId,
-    cursor_delivery: PresentedCursorDelivery,
-    cursor_visible: bool,
-) -> Option<oblivion_one::compositor::PresentationFeedbackBatchId> {
-    let source_key = output_transactions
-        .transaction(transaction_id)
-        .and_then(|record| record.descriptor().client_cursor_presentation_key());
-    take_client_cursor_presentation_feedback_batch(
-        server,
-        source_key,
-        cursor_delivery,
-        cursor_visible,
-    )
-}
-
 pub(crate) fn restore_presentation_feedback_obligation(
     server: &mut OwnCompositorServer,
     obligations: OutputProtocolObligations,
@@ -125,6 +107,138 @@ pub(crate) fn complete_presentation_feedback_obligation(
         server.complete_presentation_feedback_batch(batch_id, presentation);
     }
     Ok(())
+}
+
+pub(crate) fn settle_replaced_cursor_sidecar(
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    replaced_transaction_id: OutputTransactionId,
+    replacement_transaction_id: OutputTransactionId,
+    settled_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    let replaced_key = output_transactions
+        .transaction(replaced_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    let replacement_key = output_transactions
+        .transaction(replacement_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    if replaced_key == replacement_key {
+        output_transactions
+            .transfer_presentation_feedback_batch(
+                replaced_transaction_id,
+                replacement_transaction_id,
+            )
+            .map_err(io::Error::other)?;
+    }
+    settle_superseded_output_transaction(
+        output_transactions,
+        replaced_transaction_id,
+        Some(replacement_transaction_id),
+        OutputTransactionSupersedeReason::NewerTransaction,
+        settled_at,
+        |obligations| {
+            if replaced_key != replacement_key {
+                restore_presentation_feedback_obligation(server, obligations);
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn rebind_cursor_presentation_feedback_to_frozen_sidecar(
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    primary_transaction_id: OutputTransactionId,
+    sidecar_transaction_id: OutputTransactionId,
+) -> NativeResult<()> {
+    let primary_key = output_transactions
+        .transaction(primary_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    let sidecar_key = output_transactions
+        .transaction(sidecar_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    if primary_key == sidecar_key {
+        output_transactions
+            .transfer_submitted_cursor_presentation_feedback_batch(
+                primary_transaction_id,
+                sidecar_transaction_id,
+            )
+            .map_err(io::Error::other)?;
+        return Ok(());
+    }
+    if let Some(batch_id) = output_transactions
+        .detach_submitted_cursor_presentation_feedback_batch(primary_transaction_id)
+        .map_err(io::Error::other)?
+    {
+        server.restore_presentation_feedback_batch_after_failure(batch_id);
+    }
+    Ok(())
+}
+
+pub(crate) fn settle_returned_cursor_sidecar(
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    sidecar_transaction_id: OutputTransactionId,
+    transfer_to_primary: Option<OutputTransactionId>,
+    restore_if_not_transferable: bool,
+    settled_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    let sidecar_key = output_transactions
+        .transaction(sidecar_transaction_id)
+        .and_then(|record| record.descriptor().client_cursor_presentation_key());
+    if let Some(primary_transaction_id) = transfer_to_primary
+        && output_transactions
+            .transaction(primary_transaction_id)
+            .is_some_and(|record| {
+                matches!(
+                    record.state(),
+                    OutputTransactionState::Built
+                        | OutputTransactionState::Ready { .. }
+                        | OutputTransactionState::Queued { .. }
+                )
+            })
+        && output_transactions
+            .transaction(sidecar_transaction_id)
+            .is_some_and(|record| {
+                matches!(
+                    record.state(),
+                    OutputTransactionState::Built
+                        | OutputTransactionState::Ready { .. }
+                        | OutputTransactionState::Queued { .. }
+                )
+            })
+        && sidecar_key
+            == output_transactions
+                .transaction(primary_transaction_id)
+                .and_then(|record| record.descriptor().client_cursor_presentation_key())
+    {
+        output_transactions
+            .transfer_presentation_feedback_batch(sidecar_transaction_id, primary_transaction_id)
+            .map_err(io::Error::other)?;
+        return settle_superseded_output_transaction(
+            output_transactions,
+            sidecar_transaction_id,
+            Some(primary_transaction_id),
+            OutputTransactionSupersedeReason::NewerTransaction,
+            settled_at,
+            |_| Ok(()),
+        );
+    }
+    settle_superseded_output_transaction(
+        output_transactions,
+        sidecar_transaction_id,
+        None,
+        OutputTransactionSupersedeReason::NewerTransaction,
+        settled_at,
+        |obligations| {
+            if restore_if_not_transferable {
+                restore_presentation_feedback_obligation(server, obligations);
+            } else {
+                discard_presentation_feedback_obligation(server, obligations);
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn direct_terminal_callback_owner_leaks(
@@ -826,6 +940,7 @@ pub(super) fn register_primary_transaction(
 pub(super) fn build_cursor_transaction(
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
+    created_at: MonotonicTimestampNs,
     output_generation: u64,
     target: PresentationTarget,
     pacing_mode: NativeOutputPacingMode,
@@ -844,7 +959,7 @@ pub(super) fn build_cursor_transaction(
         output_transactions.output_id(),
         transaction_id,
         output_generation,
-        MonotonicTimestampNs::new(monotonic_now_ns()?),
+        created_at,
         target,
         pacing_mode,
         cursor_epoch,
@@ -870,7 +985,7 @@ pub(super) fn build_cursor_transaction(
         .map_err(io::Error::other)?;
     presentation_trace.push(PresentationTransactionEvent::TransactionBuilt {
         transaction_id,
-        timestamp_ns: monotonic_now_ns()?,
+        timestamp_ns: created_at.get(),
     });
     Ok(transaction_id)
 }
@@ -942,6 +1057,7 @@ pub(super) fn submit_plane_delta(
             let transaction_id = match build_cursor_transaction(
                 output_transactions,
                 presentation_trace,
+                MonotonicTimestampNs::new(submission_at_ns),
                 output_generation,
                 target,
                 pacing_mode,

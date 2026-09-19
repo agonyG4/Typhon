@@ -162,7 +162,8 @@ pub(crate) enum OutputTransactionError {
     DuplicateId,
     UnknownTransaction,
     DuplicateObligationOwner,
-    PresentationFeedbackBatchForNonPlaneDelta,
+    PresentationFeedbackBatchForCompatibilityImmediate,
+    PresentationFeedbackKeyMismatch,
     InvalidTransition {
         from: OutputTransactionStateKind,
         requested: OutputTransactionTransitionKind,
@@ -477,9 +478,210 @@ impl OutputTransactionLedger {
             .descriptor
             .clone()
             .with_presentation_feedback_batch(batch_id)
-            .map_err(|_| OutputTransactionError::PresentationFeedbackBatchForNonPlaneDelta)?;
+            .map_err(|_| {
+                OutputTransactionError::PresentationFeedbackBatchForCompatibilityImmediate
+            })?;
         self.presentation_feedback_owner.insert(batch_id, id);
         Ok(())
+    }
+
+    pub(crate) fn transfer_presentation_feedback_batch(
+        &mut self,
+        from: OutputTransactionId,
+        to: OutputTransactionId,
+    ) -> Result<Option<PresentationFeedbackBatchId>, OutputTransactionError> {
+        let from_state = self.state(from)?;
+        let to_state = self.state(to)?;
+        if !matches!(
+            from_state,
+            OutputTransactionState::Built
+                | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::Queued { .. }
+        ) {
+            return Err(self.invalid_transition(from_state, OutputTransactionTransitionKind::Ready));
+        }
+        if !matches!(
+            to_state,
+            OutputTransactionState::Built
+                | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::Queued { .. }
+        ) {
+            return Err(self.invalid_transition(to_state, OutputTransactionTransitionKind::Ready));
+        }
+        let from_descriptor = self
+            .active
+            .get(&from)
+            .expect("source transaction was observed above")
+            .descriptor
+            .clone();
+        let to_descriptor = self
+            .active
+            .get(&to)
+            .expect("target transaction was observed above")
+            .descriptor
+            .clone();
+        if from_descriptor.client_cursor_presentation_key()
+            != to_descriptor.client_cursor_presentation_key()
+        {
+            return Err(OutputTransactionError::PresentationFeedbackKeyMismatch);
+        }
+        let Some(batch_id) = from_descriptor
+            .obligations()
+            .presentation_feedback_batch_id()
+        else {
+            return Ok(None);
+        };
+        if to_descriptor
+            .obligations()
+            .presentation_feedback_batch_id()
+            .is_some()
+        {
+            self.counters.duplicate_obligation_attempts = self
+                .counters
+                .duplicate_obligation_attempts
+                .saturating_add(1);
+            return Err(OutputTransactionError::DuplicateObligationOwner);
+        }
+        let updated_from = from_descriptor.without_presentation_feedback_batch();
+        let updated_to = to_descriptor
+            .with_presentation_feedback_batch(batch_id)
+            .map_err(|_| {
+                OutputTransactionError::PresentationFeedbackBatchForCompatibilityImmediate
+            })?;
+        self.active
+            .get_mut(&from)
+            .expect("source transaction was observed above")
+            .descriptor = updated_from;
+        self.active
+            .get_mut(&to)
+            .expect("target transaction was observed above")
+            .descriptor = updated_to;
+        debug_assert_eq!(self.presentation_feedback_owner.get(&batch_id), Some(&from));
+        self.presentation_feedback_owner.insert(batch_id, to);
+        Ok(Some(batch_id))
+    }
+
+    pub(crate) fn transfer_submitted_cursor_presentation_feedback_batch(
+        &mut self,
+        from: OutputTransactionId,
+        to: OutputTransactionId,
+    ) -> Result<Option<PresentationFeedbackBatchId>, OutputTransactionError> {
+        let from_state = self.state(from)?;
+        let to_state = self.state(to)?;
+        if !matches!(from_state, OutputTransactionState::Submitted { .. }) {
+            return Err(self.invalid_transition(from_state, OutputTransactionTransitionKind::Ready));
+        }
+        if !matches!(to_state, OutputTransactionState::Submitted { .. }) {
+            return Err(self.invalid_transition(to_state, OutputTransactionTransitionKind::Ready));
+        }
+        let from_descriptor = self
+            .active
+            .get(&from)
+            .expect("source transaction was observed above")
+            .descriptor
+            .clone();
+        let to_descriptor = self
+            .active
+            .get(&to)
+            .expect("target transaction was observed above")
+            .descriptor
+            .clone();
+        if from_descriptor.client_cursor_presentation_key()
+            != to_descriptor.client_cursor_presentation_key()
+        {
+            return Err(OutputTransactionError::PresentationFeedbackKeyMismatch);
+        }
+        let Some(batch_id) = from_descriptor
+            .obligations()
+            .presentation_feedback_batch_id()
+        else {
+            return Ok(None);
+        };
+        if to_descriptor
+            .obligations()
+            .presentation_feedback_batch_id()
+            .is_some()
+        {
+            self.counters.duplicate_obligation_attempts = self
+                .counters
+                .duplicate_obligation_attempts
+                .saturating_add(1);
+            return Err(OutputTransactionError::DuplicateObligationOwner);
+        }
+        let updated_from = from_descriptor.without_presentation_feedback_batch();
+        let updated_to = to_descriptor
+            .with_presentation_feedback_batch(batch_id)
+            .map_err(|_| {
+                OutputTransactionError::PresentationFeedbackBatchForCompatibilityImmediate
+            })?;
+        self.active
+            .get_mut(&from)
+            .expect("source transaction was observed above")
+            .descriptor = updated_from;
+        self.active
+            .get_mut(&to)
+            .expect("target transaction was observed above")
+            .descriptor = updated_to;
+        debug_assert_eq!(self.presentation_feedback_owner.get(&batch_id), Some(&from));
+        self.presentation_feedback_owner.insert(batch_id, to);
+        Ok(Some(batch_id))
+    }
+
+    pub(crate) fn detach_submitted_cursor_presentation_feedback_batch(
+        &mut self,
+        id: OutputTransactionId,
+    ) -> Result<Option<PresentationFeedbackBatchId>, OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(state, OutputTransactionState::Submitted { .. }) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Ready));
+        }
+        let descriptor = self
+            .active
+            .get(&id)
+            .expect("transaction was observed above")
+            .descriptor
+            .clone();
+        let Some(batch_id) = descriptor.obligations().presentation_feedback_batch_id() else {
+            return Ok(None);
+        };
+        self.active
+            .get_mut(&id)
+            .expect("transaction was observed above")
+            .descriptor = descriptor.without_presentation_feedback_batch();
+        debug_assert_eq!(self.presentation_feedback_owner.get(&batch_id), Some(&id));
+        self.presentation_feedback_owner.remove(&batch_id);
+        Ok(Some(batch_id))
+    }
+
+    pub(crate) fn detach_presentation_feedback_batch(
+        &mut self,
+        id: OutputTransactionId,
+    ) -> Result<Option<PresentationFeedbackBatchId>, OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(
+            state,
+            OutputTransactionState::Built
+                | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::Queued { .. }
+        ) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Ready));
+        }
+        let descriptor = self
+            .active
+            .get(&id)
+            .expect("transaction was observed above")
+            .descriptor
+            .clone();
+        let Some(batch_id) = descriptor.obligations().presentation_feedback_batch_id() else {
+            return Ok(None);
+        };
+        self.active
+            .get_mut(&id)
+            .expect("transaction was observed above")
+            .descriptor = descriptor.without_presentation_feedback_batch();
+        debug_assert_eq!(self.presentation_feedback_owner.get(&batch_id), Some(&id));
+        self.presentation_feedback_owner.remove(&batch_id);
+        Ok(Some(batch_id))
     }
     pub(crate) fn mark_ready(
         &mut self,

@@ -111,7 +111,7 @@ pub(crate) enum OutputTransactionBuildError {
     FrameBatchForPlaneDelta,
     DirectSurfaceForCompositedContent,
     DirectSurfaceForPlaneDelta,
-    PresentationFeedbackBatchForNonPlaneDelta,
+    PresentationFeedbackBatchForCompatibilityImmediate,
     OverlayAssignmentsUnsupported,
 }
 
@@ -888,12 +888,22 @@ impl OutputTransaction {
         mut self,
         batch_id: oblivion_one::compositor::PresentationFeedbackBatchId,
     ) -> Result<Self, OutputTransactionBuildError> {
-        if !matches!(self.content, OutputTransactionContent::PlaneDelta { .. }) {
-            return Err(OutputTransactionBuildError::PresentationFeedbackBatchForNonPlaneDelta);
+        if matches!(
+            self.content,
+            OutputTransactionContent::CompatibilityImmediate { .. }
+        ) {
+            return Err(
+                OutputTransactionBuildError::PresentationFeedbackBatchForCompatibilityImmediate,
+            );
         }
         debug_assert!(self.obligations.presentation_feedback_batch_id.is_none());
         self.obligations.presentation_feedback_batch_id = Some(batch_id);
         Ok(self)
+    }
+
+    pub(crate) fn without_presentation_feedback_batch(mut self) -> Self {
+        self.obligations.presentation_feedback_batch_id = None;
+        self
     }
 
     pub(crate) fn with_client_cursor_presentation_key(

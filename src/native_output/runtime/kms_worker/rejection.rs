@@ -6,6 +6,7 @@ use super::super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
     discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
     settle_dropped_output_transaction, settle_failed_output_transaction,
+    settle_superseded_output_transaction,
 };
 use super::direct_rejection::WorkerRejectionKind;
 use crate::native_output::scanout::{AtomicEglGbmScanout, FrozenCursorPlaneOwner};
@@ -403,14 +404,17 @@ impl NativeRuntime {
                     | OutputTransactionState::Queued { .. }
             )
         {
-            self.output_transactions
-                .mark_superseded(
-                    sidecar_transaction_id,
-                    None,
-                    OutputTransactionSupersedeReason::NewerTransaction,
-                    MonotonicTimestampNs::new(monotonic_now_ns()?),
-                )
-                .map_err(io::Error::other)?;
+            settle_superseded_output_transaction(
+                &mut self.output_transactions,
+                sidecar_transaction_id,
+                None,
+                OutputTransactionSupersedeReason::NewerTransaction,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |obligations| {
+                    restore_presentation_feedback_obligation(&mut self.server, obligations);
+                    Ok(())
+                },
+            )?;
         }
         self.perf.log("native.kms_commit_worker", || {
             vec![
@@ -541,9 +545,11 @@ impl NativeRuntime {
                     let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                         io::Error::other("rejected direct transaction has no frame batch")
                     })?;
+                    discard_presentation_feedback_obligation(&mut self.server, obligations);
                     self.server
                         .restore_frame_batch_after_render_failure(batch_id);
                 } else if let Some(batch_id) = obligations.frame_batch_id() {
+                    discard_presentation_feedback_obligation(&mut self.server, obligations);
                     self.server
                         .discard_frame_batch(batch_id, FrameBatchDiscardReason::FatalOutputFailure);
                 }

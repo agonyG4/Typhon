@@ -151,7 +151,8 @@ pub(super) use presentation_pipeline::initial_presented;
 pub(crate) use presentation_transactions::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
     direct_terminal_callback_owner_leaks, discard_presentation_feedback_obligation,
-    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+    restore_presentation_feedback_obligation, settle_failed_output_transaction,
+    settle_no_visual_change_output_transaction, take_client_cursor_presentation_feedback_batch,
 };
 pub(crate) use session::{
     NativeSeatSwitch, NativeSessionLifecycle, NativeSessionTransition, NativeVtSwitchRequestStatus,

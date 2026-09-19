@@ -15,7 +15,8 @@ use crate::native_output::presentation::{
 };
 use crate::native_output::runtime::presentation_transactions::{
     restore_presentation_feedback_obligation, settle_failed_output_transaction,
-    settle_superseded_output_transaction, take_plane_delta_presentation_feedback_batch,
+    settle_replaced_cursor_sidecar, settle_superseded_output_transaction,
+    take_client_cursor_presentation_feedback_batch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,27 +172,6 @@ pub(super) fn queue_plane_delta(
     // Every path below can then retire the batch without introducing another
     // fallible clock read after ownership has moved out of the compositor.
     let queued_at_ns = monotonic_now_ns()?;
-    if let Some(batch_id) = take_plane_delta_presentation_feedback_batch(
-        server,
-        output_transactions,
-        transaction_id,
-        cursor_delivery,
-        desired.as_ref().is_some_and(|state| state.visible),
-    ) {
-        if let Err(error) =
-            output_transactions.attach_presentation_feedback_batch(transaction_id, batch_id)
-        {
-            server.restore_presentation_feedback_batch_after_failure(batch_id);
-            settle_failed_output_transaction(
-                output_transactions,
-                transaction_id,
-                OutputTransactionFailureStage::BackendOwnershipTransfer,
-                MonotonicTimestampNs::new(queued_at_ns),
-                |_| Ok(()),
-            )?;
-            return Err(io::Error::other(error).into());
-        }
-    }
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
     let kind = AtomicCommitKind::PlaneDelta {
@@ -503,7 +483,7 @@ pub(super) fn prepare_plane_delta(
 #[allow(clippy::too_many_arguments)]
 fn prepare_plane_delta_with_presentation(
     worker: &KmsCommitWorkerHandle,
-    server: Option<&OwnCompositorServer>,
+    mut server: Option<&mut OwnCompositorServer>,
     cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
     output_transactions: &mut OutputTransactionLedger,
@@ -569,11 +549,25 @@ fn prepare_plane_delta_with_presentation(
     let transaction_id = output_transactions
         .allocate_id()
         .map_err(io::Error::other)?;
+    let client_cursor_presentation_key = server.as_deref().and_then(|server| {
+        cursor.client_source_key().and_then(|source_key| {
+            server.presentation_commit_key_for_surface_commit(
+                source_key.surface_id,
+                oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
+            )
+        })
+    });
+    let transaction_created_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+    let sidecar_offer_timestamp = if attachable_primary.is_some() {
+        Some(MonotonicTimestampNs::new(monotonic_now_ns()?))
+    } else {
+        None
+    };
     let transaction = OutputTransaction::cursor_plane_delta(
         output_transactions.output_id(),
         transaction_id,
         output_generation,
-        MonotonicTimestampNs::new(monotonic_now_ns()?),
+        transaction_created_at,
         target,
         pacing_mode,
         cursor_epoch,
@@ -582,24 +576,37 @@ fn prepare_plane_delta_with_presentation(
     )
     .map_err(io::Error::other)?
     .with_presentation_state(presentation_mode, content_type)
-    .with_client_cursor_presentation_key(server.and_then(|server| {
-        cursor.client_source_key().and_then(|source_key| {
-            server.presentation_commit_key_for_surface_commit(
-                source_key.surface_id,
-                oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
-            )
-        })
-    }));
+    .with_client_cursor_presentation_key(client_cursor_presentation_key);
+    let presentation_feedback_batch_id = server.as_deref_mut().and_then(|server| {
+        take_client_cursor_presentation_feedback_batch(
+            server,
+            client_cursor_presentation_key,
+            cursor_delivery,
+            desired.as_ref().is_some_and(|state| state.visible),
+        )
+    });
+    let transaction = match presentation_feedback_batch_id {
+        Some(batch_id) => transaction
+            .with_presentation_feedback_batch(batch_id)
+            .map_err(io::Error::other)?,
+        None => transaction,
+    };
     let transaction = if let Some(surface_damage) = cursor_surface_damage {
         transaction.with_surface_damage(surface_damage)
     } else {
         transaction
     };
-    output_transactions
-        .insert(transaction)
-        .map_err(io::Error::other)?;
+    if let Err(error) = output_transactions.insert(transaction) {
+        if let Some(server) = server {
+            if let Some(batch_id) = presentation_feedback_batch_id {
+                server.restore_presentation_feedback_batch_after_failure(batch_id);
+            }
+        }
+        return Err(io::Error::other(error).into());
+    }
     if let Some(outcome) = try_offer_cursor_sidecar(
         worker,
+        server,
         cursor,
         desired.as_ref(),
         output_transactions,
@@ -613,6 +620,7 @@ fn prepare_plane_delta_with_presentation(
         cursor_action,
         cursor_delivery,
         cursor_reveal_trace,
+        sidecar_offer_timestamp,
     )? {
         return Ok(PlaneDeltaPreparation::Return(outcome));
     }
@@ -634,6 +642,7 @@ fn prepare_plane_delta_with_presentation(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_offer_cursor_sidecar(
     worker: &KmsCommitWorkerHandle,
+    mut server: Option<&mut OwnCompositorServer>,
     cursor: &mut NativeAtomicCursor,
     desired: Option<&AtomicCursorVisualState>,
     output_transactions: &mut OutputTransactionLedger,
@@ -647,14 +656,31 @@ pub(super) fn try_offer_cursor_sidecar(
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
     cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
+    sidecar_offer_timestamp: Option<MonotonicTimestampNs>,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
     let Some(attachable_primary) = attachable_primary else {
         return Ok(None);
     };
-    let descriptor = output_transactions
-        .transaction(transaction_id)
-        .ok_or_else(|| io::Error::other("sidecar transaction disappeared"))?
-        .descriptor();
+    let descriptor = match output_transactions.transaction(transaction_id) {
+        Some(record) => record.descriptor(),
+        None => {
+            settle_superseded_output_transaction(
+                output_transactions,
+                transaction_id,
+                None,
+                OutputTransactionSupersedeReason::SameContentSuppressed,
+                sidecar_offer_timestamp.unwrap_or(MonotonicTimestampNs::new(monotonic_now_ns()?)),
+                |obligations| {
+                    if let Some(server) = server.as_deref_mut() {
+                        restore_presentation_feedback_obligation(server, obligations);
+                    }
+                    Ok(())
+                },
+            )?;
+            return Err(io::Error::other("sidecar transaction disappeared").into());
+        }
+    };
+    let settled_at = sidecar_offer_timestamp.unwrap_or(descriptor.created_at());
     let OutputTransactionContent::PlaneDelta {
         cursor_sidecar_id, ..
     } = descriptor.content()
@@ -679,52 +705,96 @@ pub(super) fn try_offer_cursor_sidecar(
     // standalone retry receives a fresh Predecessor(P) base only after this
     // attachment attempt has been returned to runtime.
     let sidecar_validation_base = attachable_primary.validation_base;
-    let sidecar = CursorSidecar {
-        id: cursor_sidecar_id,
-        transaction: Arc::new(descriptor.clone()),
-        revision: cursor.desired_revision(),
-        assignment: descriptor.planes().cursor().clone(),
-        lease: desired
-            .filter(|state| state.framebuffer_id.is_some())
-            .map(|state| cursor.pin_framebuffer_for(state))
-            .transpose()?,
-        coupling,
-        created_at: descriptor.created_at(),
-        deadline: target,
-        crtc_id,
-        test_policy: scheduled_kms_test_policy(cursor),
-        cursor_delivery,
-        capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
-        trace_reveal: cursor_reveal_trace,
-        validation_base: sidecar_validation_base,
+    let sidecar = match (|| -> NativeResult<CursorSidecar> {
+        Ok(CursorSidecar {
+            id: cursor_sidecar_id,
+            transaction: Arc::new(descriptor.clone()),
+            revision: cursor.desired_revision(),
+            assignment: descriptor.planes().cursor().clone(),
+            lease: desired
+                .filter(|state| state.framebuffer_id.is_some())
+                .map(|state| cursor.pin_framebuffer_for(state))
+                .transpose()?,
+            coupling,
+            created_at: descriptor.created_at(),
+            deadline: target,
+            crtc_id,
+            test_policy: scheduled_kms_test_policy(cursor),
+            cursor_delivery,
+            capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
+            trace_reveal: cursor_reveal_trace,
+            validation_base: sidecar_validation_base,
+        })
+    })() {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            settle_superseded_output_transaction(
+                output_transactions,
+                transaction_id,
+                None,
+                OutputTransactionSupersedeReason::SameContentSuppressed,
+                settled_at,
+                |obligations| {
+                    if let Some(server) = server.as_deref_mut() {
+                        restore_presentation_feedback_obligation(server, obligations);
+                    }
+                    Ok(())
+                },
+            )?;
+            return Err(error);
+        }
     };
     match worker.offer_cursor_sidecar(sidecar) {
         Ok(replaced) => {
             if let Some(replaced) = replaced {
-                output_transactions
-                    .mark_superseded(
+                if let Some(server) = server.as_deref_mut() {
+                    settle_replaced_cursor_sidecar(
+                        server,
+                        output_transactions,
+                        replaced.transaction.id(),
+                        transaction_id,
+                        settled_at,
+                    )?;
+                } else {
+                    settle_superseded_output_transaction(
+                        output_transactions,
                         replaced.transaction.id(),
                         Some(transaction_id),
                         OutputTransactionSupersedeReason::NewerTransaction,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
+                        settled_at,
+                        |_| Ok(()),
+                    )?;
+                }
             }
             presentation_trace.push(PresentationTransactionEvent::WorkerQueued {
                 transaction_id,
-                timestamp_ns: monotonic_now_ns()?,
+                timestamp_ns: settled_at.get(),
             });
             Ok(Some(WorkerQueueOutcome::SidecarQueued { transaction_id }))
         }
         Err(error) => {
-            output_transactions
-                .mark_superseded(
+            if let Some(server) = server.as_deref_mut() {
+                settle_superseded_output_transaction(
+                    output_transactions,
                     transaction_id,
                     None,
                     OutputTransactionSupersedeReason::SameContentSuppressed,
-                    MonotonicTimestampNs::new(monotonic_now_ns()?),
-                )
-                .map_err(io::Error::other)?;
+                    settled_at,
+                    |obligations| {
+                        restore_presentation_feedback_obligation(server, obligations);
+                        Ok(())
+                    },
+                )?;
+            } else {
+                settle_superseded_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    None,
+                    OutputTransactionSupersedeReason::SameContentSuppressed,
+                    settled_at,
+                    |_| Ok(()),
+                )?;
+            }
             Ok(Some(WorkerQueueOutcome::Unavailable(error.reason)))
         }
     }

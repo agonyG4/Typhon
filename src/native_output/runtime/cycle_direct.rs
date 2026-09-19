@@ -1,7 +1,7 @@
 use super::super::cursor_cycle::{commit_primary_cursor_pageflip, prepare_primary_cursor_pageflip};
 use super::super::presentation_transactions::{
-    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    prepare_presented_output_transaction,
+    DirectTerminalCallbackDisposition, complete_presentation_feedback_obligation,
+    direct_terminal_callback_owner_leaks, prepare_presented_output_transaction,
 };
 use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::*;
@@ -107,6 +107,7 @@ pub(super) fn settle_direct_pageflip(
         commit_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, drm_file_generation);
     }
     server.commit_surface_damage_presented(completion.surface_damage);
+    complete_presentation_feedback_obligation(server, logical_obligations, presentation)?;
     scanout.note_direct_presentation();
     debug_assert_eq!(completion.transaction_id, transaction_id);
     debug_assert_eq!(completion.token, pageflip_token);

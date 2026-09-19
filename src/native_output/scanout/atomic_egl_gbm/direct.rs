@@ -1,6 +1,10 @@
 use super::*;
 use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::runtime::{
+    discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
+    take_client_cursor_presentation_feedback_batch,
+};
 
 #[allow(clippy::too_many_arguments)]
 fn settle_no_visual_change_transaction(
@@ -396,7 +400,7 @@ impl AtomicEglGbmScanout {
         });
 
         let frame_id = self.swapchain()?.next_frame_id();
-        let mut presentation_samples = server
+        let presentation_samples = server
             .presentation_commit_key_for_surface_commit_with_generation(
                 candidate.surface_id,
                 candidate.surface_presentation_generation,
@@ -404,14 +408,12 @@ impl AtomicEglGbmScanout {
             )
             .into_iter()
             .collect::<Vec<_>>();
-        if let Some(cursor_source_key) = cursor_source_key
-            && let Some(key) = server.presentation_commit_key_for_surface_commit(
+        let client_cursor_presentation_key = cursor_source_key.and_then(|cursor_source_key| {
+            server.presentation_commit_key_for_surface_commit(
                 cursor_source_key.surface_id,
                 oblivion_one::compositor::SurfaceCommitSequence(cursor_source_key.commit_sequence),
             )
-        {
-            presentation_samples.push(key);
-        }
+        });
         let protocol_batch_id = server
             .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples);
         let mut sampled_surface_ids = vec![candidate.surface_id];
@@ -441,6 +443,7 @@ impl AtomicEglGbmScanout {
             drop(surface_damage);
             return Ok(DirectScanoutAttempt::TimingDeferred);
         }
+        let transaction_created_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let transaction_id = match output_transactions.allocate_id() {
             Ok(transaction_id) => transaction_id,
             Err(error) => {
@@ -453,7 +456,7 @@ impl AtomicEglGbmScanout {
             self.direct.output_id,
             transaction_id,
             self.direct.drm_generation,
-            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            transaction_created_at,
             target,
             pacing_mode,
             frame_id,
@@ -467,15 +470,38 @@ impl AtomicEglGbmScanout {
             candidate.surface_id,
             release,
         ) {
-            Ok(transaction) => transaction.with_presentation_state(presentation_mode, content_type),
+            Ok(transaction) => transaction
+                .with_presentation_state(presentation_mode, content_type)
+                .with_client_cursor_presentation_key(client_cursor_presentation_key),
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 drop(surface_damage);
                 return Err(io::Error::other(error));
             }
         };
+        let cursor_presentation_batch_id = take_client_cursor_presentation_feedback_batch(
+            server,
+            client_cursor_presentation_key,
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+            cursor.is_some_and(|state| state.visible),
+        );
+        let transaction = match cursor_presentation_batch_id {
+            Some(batch_id) => match transaction.with_presentation_feedback_batch(batch_id) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                    server.restore_presentation_feedback_batch_after_failure(batch_id);
+                    drop(surface_damage);
+                    return Err(io::Error::other(error));
+                }
+            },
+            None => transaction,
+        };
         if let Err(error) = output_transactions.insert(transaction) {
             server.restore_frame_batch_after_render_failure(protocol_batch_id);
+            if let Some(batch_id) = cursor_presentation_batch_id {
+                server.restore_presentation_feedback_batch_after_failure(batch_id);
+            }
             drop(surface_damage);
             return Err(io::Error::other(error));
         }
@@ -500,6 +526,7 @@ impl AtomicEglGbmScanout {
                     transaction_id,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                     |obligations| {
+                        restore_presentation_feedback_obligation(server, obligations);
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("duplicate direct transaction has no frame batch")
                         })?;
@@ -528,6 +555,7 @@ impl AtomicEglGbmScanout {
                     OutputTransactionFailureStage::KmsSubmit,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                     |obligations| {
+                        discard_presentation_feedback_obligation(server, obligations);
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("rejected direct transaction has no frame batch")
                         })?;

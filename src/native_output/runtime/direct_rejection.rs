@@ -1,6 +1,7 @@
 use super::cycle::direct_fallback::DirectFallbackReason;
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
+    discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
 };
 use super::*;
 
@@ -85,6 +86,7 @@ impl NativeRuntime {
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
+                discard_presentation_feedback_obligation(&mut self.server, obligations);
                 let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                     io::Error::other("rejected direct transaction has no frame batch")
                 })?;
@@ -104,6 +106,7 @@ impl NativeRuntime {
                 OutputTransactionFailureStage::KmsSubmit,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
                 |obligations| {
+                    restore_presentation_feedback_obligation(&mut self.server, obligations);
                     debug_assert!(obligations.frame_batch_id().is_none());
                     debug_assert!(obligations.direct_surface_id().is_none());
                     Ok(())
