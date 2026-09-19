@@ -3757,7 +3757,21 @@ mod tests {
             client_cursor: None,
         });
 
-        assert_eq!(frame[0], frame[1], "SSD and client use the same owner opacity");
+        let expected_client = blend_premultiplied_argb_over_opaque(
+            scale_premultiplied_argb(0xffff_6432, 0.5),
+            OUTPUT_BACKGROUND,
+        );
+        let expected_ssd = rgba_to_pixel(scale_premultiplied_rgba(
+            [0xff, 0x64, 0x32, 0xff],
+            0.5,
+        ));
+        assert_eq!(frame[0], expected_client, "client uses owner opacity");
+        assert_eq!(frame[1], expected_ssd, "SSD uses owner opacity");
+        assert_eq!(
+            frame[1] >> 24,
+            scale_premultiplied_argb(0xffff_6432, 0.5) >> 24,
+            "client and SSD contributions carry the same opacity"
+        );
     }
 
     #[test]
