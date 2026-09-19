@@ -1180,6 +1180,7 @@ pub(crate) struct EffectGpuProfiler {
     state: ProfilerState,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ProfilerState {
     Disabled,
     Unsupported,
