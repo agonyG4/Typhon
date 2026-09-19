@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     num::NonZeroU64,
+    os::unix::net::UnixStream,
 };
 
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
@@ -117,6 +118,29 @@ fn aggregate_deadline_handler_services_focus_and_adoption_due_together() {
     assert!(outcome.error.is_none());
     assert_ne!(xwm.next_deadline_ns(), Some(focus_deadline));
     assert!(!read_fixture_requests(&mut peer).is_empty());
+}
+
+#[test]
+fn aggregate_deadline_handler_expires_data_bridge_transfers() {
+    let generation = generation(41);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let (_source_peer, source) = UnixStream::pair().expect("transfer source");
+    let (sink, _sink_peer) = UnixStream::pair().expect("transfer sink");
+    xwm.data_bridge
+        .transfers
+        .start(
+            super::super::data_bridge::BridgeGeneration::from(generation),
+            source.into(),
+            sink.into(),
+            123,
+        )
+        .expect("data bridge transfer");
+
+    assert_eq!(xwm.next_deadline_ns(), Some(123));
+    let outcome = xwm.handle_deadlines(123);
+    assert!(outcome.error.is_none());
+    assert_eq!(xwm.data_bridge.active_transfers(), 0);
+    assert_eq!(xwm.next_deadline_ns(), None);
 }
 
 fn request_opcodes(bytes: &[u8]) -> Vec<u8> {
