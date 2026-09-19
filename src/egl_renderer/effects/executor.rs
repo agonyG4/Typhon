@@ -1197,6 +1197,12 @@ fn execute_graph_passes_inner(
                 pass,
                 capture_execution_damage(graph, demand, pass, lifecycle_backdrop, debug_config),
             );
+            let capture_plan = checkpoint_capture_execution_plan_for_pass(
+                renderer,
+                pass,
+                lifecycle_backdrop,
+                debug_config,
+            );
             if renderer.effect_trace.enabled() {
                 renderer.effect_trace.execution_region(
                     pass,
@@ -1243,6 +1249,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1262,6 +1269,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1282,6 +1290,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1459,6 +1468,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1486,6 +1496,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1519,6 +1530,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1526,12 +1538,7 @@ fn execute_graph_passes_inner(
                 if renderer.capture_in_progress {
                     return None;
                 }
-                let capture_metadata = capture_timing_metadata_for_renderer(
-                    renderer,
-                    pass,
-                    lifecycle_backdrop,
-                    debug_config,
-                );
+                let capture_metadata = capture_timing_metadata(pass, capture_plan);
                 renderer.effect_gpu_profiler.begin_pass(
                     &renderer.gl,
                     scope,
@@ -1551,6 +1558,7 @@ fn execute_graph_passes_inner(
                 &execution_damage.region,
                 lifecycle_backdrop,
                 debug_config,
+                capture_plan,
                 graph_scope.is_some(),
                 &mut stats,
             );
@@ -1577,6 +1585,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -1645,6 +1654,7 @@ fn execute_graph_passes_inner(
                         framebuffer_origin,
                         lifecycle_backdrop,
                         debug_config,
+                        capture_plan,
                     ),
                 );
             }
@@ -2010,52 +2020,59 @@ fn is_direct_framebuffer_capture(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CapturePathDecision {
+struct CheckpointCaptureExecutionPlan {
     requested: Option<CheckpointCapturePath>,
-    mode: CaptureTimingMode,
+    executed: CaptureTimingMode,
     fallback_reason: Option<CapturePathFallbackReason>,
 }
 
-fn capture_path_decision(
-    renderer: &GlesSceneRenderer,
-    pass: &CompiledRenderPass,
+fn checkpoint_capture_execution_plan(
+    pass_kind: RenderPassKind,
+    checkpoint_dependency_count: usize,
     lifecycle_backdrop: bool,
-    debug_config: EffectDebugConfig,
-) -> CapturePathDecision {
-    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
-    let checkpoint_direct_capture = pass.kind == RenderPassKind::SceneCapture
-        && !pass.checkpoint_dependencies.is_empty()
+    capture_mode: EffectDebugCaptureMode,
+    requested_path: CheckpointCapturePath,
+    active_output_texture_available: bool,
+) -> CheckpointCaptureExecutionPlan {
+    let direct_capture = match pass_kind {
+        RenderPassKind::SceneCapture => {
+            lifecycle_backdrop
+                || checkpoint_dependency_count > 0
+                || capture_mode == EffectDebugCaptureMode::Framebuffer
+        }
+        RenderPassKind::SurfaceCapture => checkpoint_dependency_count > 0,
+        _ => false,
+    };
+    let checkpoint_direct_capture = pass_kind == RenderPassKind::SceneCapture
+        && checkpoint_dependency_count > 0
         && !lifecycle_backdrop
-        && debug_config.capture_mode() == EffectDebugCaptureMode::Replay
-        && direct_capture;
+        && capture_mode == EffectDebugCaptureMode::Replay;
     if checkpoint_direct_capture {
-        let requested = Some(debug_config.checkpoint_capture_path());
-        return match debug_config.checkpoint_capture_path() {
-            CheckpointCapturePath::FramebufferBlit => CapturePathDecision {
+        let requested = Some(requested_path);
+        return match requested_path {
+            CheckpointCapturePath::FramebufferBlit => CheckpointCaptureExecutionPlan {
                 requested,
-                mode: CaptureTimingMode::FramebufferBlit,
+                executed: CaptureTimingMode::FramebufferBlit,
                 fallback_reason: None,
             },
-            CheckpointCapturePath::FramebufferShaderCopy
-                if renderer.active_output_texture.is_some() =>
-            {
-                CapturePathDecision {
+            CheckpointCapturePath::FramebufferShaderCopy if active_output_texture_available => {
+                CheckpointCaptureExecutionPlan {
                     requested,
-                    mode: CaptureTimingMode::FramebufferShaderCopy,
+                    executed: CaptureTimingMode::FramebufferShaderCopy,
                     fallback_reason: None,
                 }
             }
-            CheckpointCapturePath::FramebufferShaderCopy => CapturePathDecision {
+            CheckpointCapturePath::FramebufferShaderCopy => CheckpointCaptureExecutionPlan {
                 requested,
-                mode: CaptureTimingMode::FramebufferBlit,
+                executed: CaptureTimingMode::FramebufferBlit,
                 fallback_reason: Some(CapturePathFallbackReason::NoSampleableOutputTexture),
             },
         };
     }
 
-    CapturePathDecision {
+    CheckpointCaptureExecutionPlan {
         requested: None,
-        mode: if direct_capture {
+        executed: if direct_capture {
             CaptureTimingMode::FramebufferBlit
         } else {
             CaptureTimingMode::Replay
@@ -2064,40 +2081,32 @@ fn capture_path_decision(
     }
 }
 
-#[cfg(test)]
-fn capture_timing_metadata(
-    pass: &CompiledRenderPass,
-    lifecycle_backdrop: bool,
-    debug_config: EffectDebugConfig,
-) -> Option<CaptureTimingMetadata> {
-    if !matches!(
-        pass.kind,
-        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
-    ) {
-        return None;
-    }
-    Some(CaptureTimingMetadata {
-        mode: if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
-            CaptureTimingMode::FramebufferBlit
-        } else {
-            CaptureTimingMode::Replay
-        },
-        checkpoint_count: pass.checkpoint_dependencies.len(),
-    })
-}
-
-fn capture_timing_metadata_for_renderer(
+fn checkpoint_capture_execution_plan_for_pass(
     renderer: &GlesSceneRenderer,
     pass: &CompiledRenderPass,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+) -> CheckpointCaptureExecutionPlan {
+    checkpoint_capture_execution_plan(
+        pass.kind,
+        pass.checkpoint_dependencies.len(),
+        lifecycle_backdrop,
+        debug_config.capture_mode(),
+        debug_config.checkpoint_capture_path(),
+        renderer.active_output_texture.is_some(),
+    )
+}
+
+fn capture_timing_metadata(
+    pass: &CompiledRenderPass,
+    capture_plan: CheckpointCaptureExecutionPlan,
 ) -> Option<CaptureTimingMetadata> {
     matches!(
         pass.kind,
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
     )
     .then_some(CaptureTimingMetadata {
-        mode: capture_path_decision(renderer, pass, lifecycle_backdrop, debug_config).mode,
+        mode: capture_plan.executed,
         checkpoint_count: pass.checkpoint_dependencies.len(),
     })
 }
@@ -2425,6 +2434,7 @@ fn pass_trace_summary(
     framebuffer_origin: OutputFramebufferOrigin,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    capture_plan: CheckpointCaptureExecutionPlan,
 ) -> PassTraceSummary {
     if !renderer.effect_trace.enabled() {
         return PassTraceSummary::default();
@@ -2467,12 +2477,11 @@ fn pass_trace_summary(
     } else {
         "precise"
     };
-    let capture_decision = capture_path_decision(renderer, pass, lifecycle_backdrop, debug_config);
     let capture_mode = matches!(
         pass.kind,
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
     )
-    .then_some(capture_decision.mode.as_str());
+    .then_some(capture_plan.executed.as_str());
     let capture_command_count = if capture_mode == Some("replay") {
         let layers = renderer
             .commands
@@ -2514,15 +2523,15 @@ fn pass_trace_summary(
         damage_rect_count: execution_damage.rects().len(),
         damage_bounding_box,
         capture_mode,
-        requested_capture_path: capture_decision
+        requested_capture_path: capture_plan
             .requested
             .map(CheckpointCapturePath::as_str),
         executed_capture_path: matches!(
             pass.kind,
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
         )
-        .then_some(capture_decision.mode.as_str()),
-        capture_fallback_reason: capture_decision
+        .then_some(capture_plan.executed.as_str()),
+        capture_fallback_reason: capture_plan
             .fallback_reason
             .map(CapturePathFallbackReason::as_str),
         capture_command_count,
@@ -2648,6 +2657,7 @@ fn execute_pass(
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    capture_plan: CheckpointCaptureExecutionPlan,
     host_timing_enabled: bool,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
@@ -2662,6 +2672,7 @@ fn execute_pass(
                 execution_damage,
                 lifecycle_backdrop,
                 debug_config,
+                capture_plan,
                 host_timing_enabled,
                 stats,
             )?;
@@ -3347,6 +3358,7 @@ fn execute_capture(
     execution_damage: &EffectRegion,
     lifecycle_backdrop: bool,
     debug_config: EffectDebugConfig,
+    capture_plan: CheckpointCaptureExecutionPlan,
     host_timing_enabled: bool,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
@@ -3398,10 +3410,9 @@ fn execute_capture(
             output_rect_pixels(&capture_rects),
         );
     }
-    let capture_decision = capture_path_decision(renderer, pass, lifecycle_backdrop, debug_config);
     if direct_capture {
-        stats.record_capture_execution_with_mode(pass, capture_decision.mode, physical_pixels, 0);
-        match capture_decision.mode {
+        stats.record_capture_execution_with_mode(pass, capture_plan.executed, physical_pixels, 0);
+        match capture_plan.executed {
             CaptureTimingMode::FramebufferBlit => {
                 capture_output_region_to_graph_texture(
                     renderer,
@@ -5521,14 +5532,15 @@ mod tests {
             output,
             Vec::new(),
         );
-        let replay_metadata = capture_timing_metadata(
-            &replay_pass,
+        let replay_plan = checkpoint_capture_execution_plan(
+            replay_pass.kind,
+            replay_pass.checkpoint_dependencies.len(),
             false,
-            EffectDebugConfig::new(
-                EffectDebugCaptureMode::Replay,
-                EffectDebugKawaseMode::Partial,
-            ),
-        )
+            EffectDebugCaptureMode::Replay,
+            CheckpointCapturePath::FramebufferBlit,
+            false,
+        );
+        let replay_metadata = capture_timing_metadata(&replay_pass, replay_plan)
         .expect("capture metadata");
         assert_eq!(replay_metadata.mode, CaptureTimingMode::Replay);
         assert_eq!(replay_metadata.checkpoint_count, 0);
@@ -5541,14 +5553,15 @@ mod tests {
             output,
             vec![GraphPassId::new(2).unwrap()],
         );
-        let checkpoint_metadata = capture_timing_metadata(
-            &checkpoint_pass,
+        let checkpoint_plan = checkpoint_capture_execution_plan(
+            checkpoint_pass.kind,
+            checkpoint_pass.checkpoint_dependencies.len(),
             false,
-            EffectDebugConfig::new(
-                EffectDebugCaptureMode::Replay,
-                EffectDebugKawaseMode::Partial,
-            ),
-        )
+            EffectDebugCaptureMode::Replay,
+            CheckpointCapturePath::FramebufferBlit,
+            false,
+        );
+        let checkpoint_metadata = capture_timing_metadata(&checkpoint_pass, checkpoint_plan)
         .expect("checkpoint capture metadata");
         assert_eq!(checkpoint_metadata.mode, CaptureTimingMode::FramebufferBlit);
         assert_eq!(checkpoint_metadata.checkpoint_count, 1);
