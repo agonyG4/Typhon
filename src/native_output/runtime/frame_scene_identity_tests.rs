@@ -10,6 +10,12 @@ use oblivion_one::compositor::{
 use oblivion_one::core::OutputId;
 use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+use crate::presentation_animation::{
+    PresentationGroupOpacity, PresentationOpacity, PresentationOpacityTransitionEvidence,
+    PresentationRevisionId, PresentationSampleTimeSource, PresentationSceneSample,
+    PresentationTransactionId,
+};
+use std::num::NonZeroU64;
 use wayland_server::protocol::wl_output;
 
 fn node(raw: u64) -> SceneNodeId {
@@ -68,6 +74,34 @@ fn frame_snapshot(
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
     }
+}
+
+fn frame_snapshot_with_opacity(
+    frame_id: u64,
+    root_surface_id: u32,
+    scene_node_id: SceneNodeId,
+    opacity: PresentationOpacity,
+    transaction_id: PresentationTransactionId,
+    revision_id: PresentationRevisionId,
+) -> NativeFrameSceneSnapshot {
+    let mut snapshot = frame_snapshot(frame_id, root_surface_id, scene_node_id);
+    let mut sample = PresentationSceneSample::empty_for_output(
+        snapshot.output_id,
+        AnimationTime::from_nanos(frame_id),
+        PresentationSampleTimeSource::ZeroFallback,
+    );
+    sample.opacities.push(PresentationGroupOpacity::with_scene_node(
+        scene_node_id,
+        root_surface_id,
+        opacity,
+        Some(PresentationOpacityTransitionEvidence {
+            transaction_id,
+            revision_id,
+            mathematically_settled: false,
+        }),
+    ));
+    snapshot.presentation = PresentationFrameSnapshot::from_sample(&sample);
+    snapshot
 }
 
 #[test]
@@ -236,6 +270,73 @@ fn only_physical_promotion_replaces_presented_scene_node_evidence() {
         history.presented_scene_node_for_surface(901),
         Some(second_node),
     );
+}
+
+#[test]
+fn submitted_opacity_history_preserves_old_backing_evidence() {
+    let scene_node_id = node(61);
+    let transaction_id = PresentationTransactionId::new(
+        NonZeroU64::new(17).expect("nonzero presentation transaction"),
+    );
+    let revision_id = PresentationRevisionId::new(
+        NonZeroU64::new(29).expect("nonzero presentation revision"),
+    );
+    let frame_a = frame_snapshot_with_opacity(
+        1,
+        1001,
+        scene_node_id,
+        PresentationOpacity::new(0.25).expect("frame A opacity"),
+        transaction_id,
+        revision_id,
+    );
+    let frame_b = frame_snapshot_with_opacity(
+        2,
+        1002,
+        scene_node_id,
+        PresentationOpacity::new(0.75).expect("frame B opacity"),
+        transaction_id,
+        revision_id,
+    );
+    let expected_a = frame_a.presentation.clone();
+    let expected_b = frame_b.presentation.clone();
+    let mut history = NativeSceneHistory::new(frame_snapshot(0, 1000, scene_node_id));
+
+    assert!(history.replace_ready(frame_a));
+    assert!(history.queue_submission(41));
+    assert!(history.replace_ready(frame_b));
+    assert!(history.queue_submission(42));
+
+    assert!(history.promote_pageflip(41));
+    let presented_a = history
+        .presented_presentation_if_any()
+        .expect("frame A presentation");
+    assert_eq!(presented_a, &expected_a);
+    let opacity_a = presented_a
+        .opacities
+        .iter()
+        .find(|opacity| opacity.scene_node_id == scene_node_id)
+        .expect("frame A opacity evidence");
+    assert_eq!(opacity_a.root_surface_id, 1001);
+    assert_eq!(opacity_a.opacity, PresentationOpacity::new(0.25).unwrap());
+    let transition_a = opacity_a.transition.expect("frame A transition evidence");
+    assert_eq!(transition_a.transaction_id, transaction_id);
+    assert_eq!(transition_a.revision_id, revision_id);
+
+    assert!(history.promote_pageflip(42));
+    let presented_b = history
+        .presented_presentation_if_any()
+        .expect("frame B presentation");
+    assert_eq!(presented_b, &expected_b);
+    let opacity_b = presented_b
+        .opacities
+        .iter()
+        .find(|opacity| opacity.scene_node_id == scene_node_id)
+        .expect("frame B opacity evidence");
+    assert_eq!(opacity_b.root_surface_id, 1002);
+    assert_eq!(opacity_b.opacity, PresentationOpacity::new(0.75).unwrap());
+    let transition_b = opacity_b.transition.expect("frame B transition evidence");
+    assert_eq!(transition_b.transaction_id, transaction_id);
+    assert_eq!(transition_b.revision_id, revision_id);
 }
 
 #[test]
