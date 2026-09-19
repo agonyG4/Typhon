@@ -3439,11 +3439,15 @@ fn execute_capture(
                 )?;
             }
             CaptureTimingMode::FramebufferShaderCopy => {
+                let output_texture = renderer.active_output_texture.ok_or_else(|| {
+                    io::Error::other("shader-copy capture has no sampleable output texture")
+                })?;
                 capture_output_region_to_graph_texture_shader_copy(
                     renderer,
                     target,
                     target_plan,
                     framebuffer_origin,
+                    output_texture,
                 )?;
             }
             CaptureTimingMode::Replay => unreachable!("direct capture selected replay timing"),
@@ -3941,6 +3945,7 @@ pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
     target: &PooledEffectTexture,
     target_plan: &oblivion_one::effects::GraphTexturePlan,
     framebuffer_origin: OutputFramebufferOrigin,
+    output_texture: glow::Texture,
 ) -> RendererResult<()> {
     if target_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft {
         return Err(io::Error::other("direct capture target is not bottom-left oriented").into());
@@ -3952,9 +3957,6 @@ pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
         framebuffer_origin,
     )
     .ok_or_else(|| io::Error::other("direct capture domain is outside the output"))?;
-    let output_texture = renderer
-        .active_output_texture
-        .ok_or_else(|| io::Error::other("shader-copy capture has no sampleable output texture"))?;
     let result = (|| {
         let draw_framebuffer = renderer
             .effect_resources
