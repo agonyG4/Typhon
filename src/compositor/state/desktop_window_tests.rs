@@ -339,12 +339,18 @@ fn visible_opacity_track_blocks_scanout_but_hidden_unrelated_track_does_not() {
     assert!(visible_blockers
         .reasons()
         .contains(&DirectScanoutSceneRejection::PresentationOpacity));
+    state.presentation_animator.cancel_all(visible_node);
 
     let hidden_surface_id = 352;
     let hidden_window = state.allocate_window_id().expect("hidden window id");
     state
         .insert_desktop_window(DesktopWindow::new_xdg(hidden_window, hidden_surface_id))
         .expect("hidden window");
+    state.window_mut(hidden_window).expect("hidden window").management = Some(
+        WindowManagementState::new(WorkspaceLocation::Regular(
+            WorkspaceId::new(2).expect("hidden workspace"),
+        )),
+    );
     state.append_renderable_surface(x11_shm_surface(
         hidden_surface_id,
         16,
@@ -1575,6 +1581,125 @@ fn logical_window_removal_cancels_opacity_only_track_and_transaction() {
     assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     assert_eq!(state.presentation_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
+}
+
+#[test]
+fn xwayland_backing_replacement_preserves_opacity_owner_revision_and_frame_evidence() {
+    let mut state = CompositorState::new(None);
+    state.presentation_animator.set_enabled(true);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(37).expect("generation"));
+    let root_a = 371;
+    let root_b = 372;
+    let snapshot = x11_snapshot(generation, 3_701, root_a);
+    let handle = snapshot.handle;
+    let window_id = insert_x11(&mut state, snapshot);
+    state
+        .window_mut(window_id)
+        .expect("XWayland window")
+        .set_canonical_opacity(PresentationOpacity::new(0.5).expect("half opacity"));
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("WindowGroup scene node");
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(0),
+            vec![PresentationOpacityMutation::new(
+                scene_node_id,
+                PresentationOpacity::new(0.5).expect("half opacity"),
+                PresentationOpacity::new(0.0).expect("transparent target"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("opacity transition");
+    let revision = state
+        .presentation_animator
+        .opacity_track_revision(scene_node_id)
+        .expect("opacity revision");
+    let sample_t1 = state
+        .presentation_animator
+        .sample_opacity_for_scene_node(scene_node_id, AnimationTime::from_nanos(5_000_000))
+        .expect("opacity sample at T1")
+        .0;
+    let output_id = state.ensure_native_output_id().expect("output identity");
+    let mut submitted = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(5_000_000),
+        PresentationSampleTimeSource::ZeroFallback,
+    );
+    submitted.opacities.push(PresentationGroupOpacity::with_scene_node(
+        scene_node_id,
+        root_a,
+        sample_t1,
+        None,
+    ));
+    state.publish_presented_presentation(10, &submitted.frame_snapshot());
+
+    assert_eq!(state.attach_x11_surface(handle, root_b), Ok(Some(root_a)));
+    assert_eq!(state.window(window_id).expect("XWayland window").root_surface_id, root_b);
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("XWayland window")
+            .canonical_opacity(),
+        PresentationOpacity::new(0.5).expect("half opacity")
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state
+            .presentation_animator
+            .opacity_track_revision(scene_node_id),
+        Some(revision)
+    );
+    assert_eq!(state.presented_presentation_frame_id(), 10);
+    assert_eq!(state.presented_presentation_opacity(root_a), sample_t1);
+    let sample_t2 = state
+        .presentation_animator
+        .sample_opacity_for_scene_node(scene_node_id, AnimationTime::from_nanos(6_000_000))
+        .expect("opacity sample at T2")
+        .0;
+    assert!(
+        sample_t2.get() < sample_t1.get(),
+        "backing replacement must not restart the track"
+    );
+}
+
+#[test]
+fn zero_opacity_window_remains_input_eligible_and_does_not_reconfigure_geometry() {
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    let root_surface_id = 381;
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
+        .expect("window");
+    state.append_renderable_surface(x11_shm_surface(
+        root_surface_id,
+        64,
+        64,
+        SurfacePlacement::absolute_root_at(40, 50),
+    ));
+    state
+        .surface_presentation_generations
+        .insert(root_surface_id, 1);
+    state.rebuild_active_scene_view();
+    let before_frame = state.desktop_window_frame(window_id);
+    let before_render_generation = state.scene_render_generation;
+    let before_backend_commands = state.backend_commands.len();
+
+    state
+        .set_window_canonical_opacity(
+            window_id,
+            PresentationOpacity::new(0.0).expect("zero opacity"),
+            None,
+        )
+        .expect("set zero opacity");
+
+    assert_eq!(state.desktop_window_frame(window_id), before_frame);
+    assert_eq!(state.backend_commands.len(), before_backend_commands);
+    assert_eq!(state.scene_render_generation, before_render_generation + 1);
+    assert!(state
+        .presentation_input_point_for_root(root_surface_id, 45.0, 55.0)
+        .is_some());
 }
 
 #[test]

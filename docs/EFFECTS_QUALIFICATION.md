@@ -131,11 +131,74 @@ are `replay` and `framebuffer_blit`; scopes without a valid capture pass emit
 the executor pass-timing call site from `is_direct_framebuffer_capture` and
 `checkpoint_dependencies`, then carried by the existing timestamp span.
 
+Replay Capture Attribution v2 appends bounded structural and host-side fields
+to the same line. The units are counts unless a field ends in `_ns`, which is
+integer nanoseconds:
+
+```text
+replay_capture_materialization_rects replay_capture_execution_regions replay_capture_disjoint_overflows
+replay_capture_command_region_pairs replay_capture_scene_scan_pairs
+replay_capture_planner_commands_visited replay_capture_planner_commands_drawable
+replay_capture_commands_executed replay_capture_draw_calls
+replay_capture_host_cpu_ns replay_capture_selection_cpu_ns replay_capture_visibility_cpu_ns replay_capture_draw_submit_cpu_ns
+max_capture_execution_pixels max_capture_materialization_rects max_capture_execution_regions max_capture_disjoint_overflow
+max_capture_replay_commands max_capture_command_region_pairs max_capture_scene_commands max_capture_scene_scan_pairs
+max_capture_planner_commands_visited max_capture_planner_commands_drawable max_capture_commands_executed max_capture_draw_calls
+max_capture_host_cpu_ns max_capture_selection_cpu_ns max_capture_visibility_cpu_ns max_capture_draw_submit_cpu_ns
+```
+
+`replay_capture_commands` retains its legacy meaning: the number of candidate
+command indices selected once for each Replay capture pass. It is not a region
+multiplier. `replay_capture_command_region_pairs` is the actual accumulated
+number of candidate-command visibility evaluations returned by
+`plan_capture_visibility()` across all post-canonicalization execution
+regions. It can differ from `replay_capture_commands * execution_regions` when
+indices are malformed or future filtering changes the work.
+
+`replay_capture_scene_scan_pairs` is the actual number of scene-command
+iterations performed by the existing draw phase across all Replay execution
+regions. It measures full-scene scanning and is intentionally independent of
+candidate planning. `max_capture_scene_commands` is the total scene command
+count observed by the max pass, so native analysis can compare it with
+`max_capture_scene_scan_pairs`. `*_planner_commands_*` come from the existing
+visibility planner, while `*_commands_executed` and `*_draw_calls` come from
+the existing renderer draw counters; occluded, outside-damage, and unavailable
+commands are not counted as executed draws.
+
+`replay_capture_materialization_rects` counts incoming Replay materialization
+rectangles. `replay_capture_execution_regions` counts the actual rectangles
+iterated after the existing bounded disjointification. A value of one for
+`replay_capture_disjoint_overflows` means that bounded disjointification
+overflowed and execution used its existing conservative bounding rectangle;
+the fallback behavior itself is unchanged. The corresponding
+`max_capture_*` fields are copied from the exact valid timed pass that became
+the longest capture span. Framebuffer-blit max passes emit stable zero Replay
+fields and do not fabricate Replay detail.
+
+`replay_capture_host_cpu_ns` measures the whole Replay capture path while GPU
+effect profiling is active. It includes fixed setup such as materialization,
+render-target binding, clear/scissor/uniform setup, region canonicalization,
+resource restoration, and any host time spent inside GL/driver calls.
+`replay_capture_selection_cpu_ns` covers CaptureLayer/VisualGroup metadata and
+`indices_for_capture()`. `replay_capture_visibility_cpu_ns` sums
+`plan_capture_visibility()` across actual regions. `replay_capture_draw_submit_cpu_ns`
+covers the existing visibility-driven draw submission after planning,
+including GL/driver calls. These clocks are not read when effect GPU profiling
+is disabled, so the CPU fields remain zero/unavailable outside the active
+profiler gate.
+
 Capture timing includes any GPU idle or ordering dependency that occurs between
 the existing begin-pass and end-pass timestamp commands. In particular,
 `framebuffer_capture_ns` is not a pure memory-copy bandwidth measurement: a
 framebuffer blit may include GL dependency, resolve, and cache-ordering costs
 required by the command stream.
+
+The same interpretation applies to `replay_capture_ns`: it is the existing GPU
+timestamp interval around Replay capture execution, not necessarily pure shader
+execution time. It may include GPU idle or ordering/dependency waits while the
+host is still constructing or submitting Replay commands. Host CPU phase fields
+are provided specifically to distinguish that ambiguity; they do not prewarm,
+synchronize, or otherwise alter client textures or capture policy.
 
 The active profiler preallocates a fixed pool of 4,096 query objects (2,048
 timestamp-pair slots), sized from Typhon's 128-instance bound, the current

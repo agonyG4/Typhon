@@ -33,7 +33,7 @@ pub(crate) use executor::{
     execute_effect_graph, execute_effect_graph_for_lifecycle, plan_effect_surface_consumers,
     select_effect_execution,
 };
-pub(crate) use gpu_timing::EffectGpuProfiler;
+pub(crate) use gpu_timing::{EffectGpuProfiler, ReplayCaptureExecutionDetail};
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
 pub(crate) use resources::{
     EffectGlResourceCache, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,

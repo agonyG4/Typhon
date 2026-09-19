@@ -3379,6 +3379,7 @@ impl Default for DesktopSceneRenderer {
 mod tests {
     use super::*;
     use crate::compositor::{SurfaceCommitSequence, SurfacePlacement, ViewportSourceRect};
+    use crate::presentation_animation::PresentationOpacity;
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
     };
@@ -3676,6 +3677,87 @@ mod tests {
             client_cursor: None,
         });
         assert_eq!(frame[0], 0xff00_00ff);
+    }
+
+    #[test]
+    fn popup_visual_groups_inherit_toplevel_presentation_opacity_once() {
+        let root = solid_test_surface(701, 0, 0, 1, 1, 0xffff_6432);
+        let mut subsurface = solid_test_surface(702, 0, 0, 1, 1, 0xffff_6432);
+        subsurface.placement = SurfacePlacement::subsurface(701, 1, 0);
+        let mut popup = solid_test_surface(703, 0, 0, 1, 1, 0xffff_6432);
+        popup.placement = SurfacePlacement::subsurface(701, 2, 0);
+        let mut popup_subsurface = solid_test_surface(704, 0, 0, 1, 1, 0xffff_6432);
+        popup_subsurface.placement = SurfacePlacement::subsurface(703, 1, 0);
+        let surfaces = vec![root, subsurface, popup, popup_subsurface];
+        let opacity = PresentationGroupOpacity::with_scene_node(
+            SceneNodeId::from_raw(1).expect("presentation scene node"),
+            701,
+            PresentationOpacity::new(0.5).expect("half opacity"),
+            None,
+        );
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_popup_surface_ids(&[703]);
+        renderer.set_presentation_projection(
+            &[opacity],
+            [(701, 701), (702, 701), (703, 701), (704, 701)],
+        );
+        let mut frame = vec![0; 4];
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 4,
+            frame_height: 1,
+            output_scale: 1.0,
+            surfaces: &surfaces,
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        let expected = blend_premultiplied_argb_over_opaque(
+            scale_premultiplied_argb(0xffff_6432, 0.5),
+            OUTPUT_BACKGROUND,
+        );
+        assert_eq!(frame[0], expected, "root uses owner opacity");
+        assert_eq!(frame[1], expected, "ordinary subsurface uses owner opacity");
+        assert_eq!(frame[2], expected, "popup uses owner opacity exactly once");
+        assert_eq!(frame[3], expected, "popup subsurface uses owner opacity exactly once");
+    }
+
+    #[test]
+    fn server_side_decoration_matches_client_presentation_opacity() {
+        let surface = solid_test_surface(705, 0, 0, 1, 1, 0xffff_6432);
+        let mut decoration = solid_test_decoration(
+            WindowId::from_raw(7).expect("window id"),
+            705,
+            1,
+            1,
+            [0xff, 0x64, 0x32, 0xff],
+        );
+        decoration.origin_x = 1;
+        let opacity = PresentationGroupOpacity::with_scene_node(
+            SceneNodeId::from_raw(1).expect("presentation scene node"),
+            705,
+            PresentationOpacity::new(0.5).expect("half opacity"),
+            None,
+        );
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_decoration_instances(&[decoration]);
+        renderer.set_presentation_projection(&[opacity], [(705, 705)]);
+        let mut frame = vec![0; 2];
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 2,
+            frame_height: 1,
+            output_scale: 1.0,
+            surfaces: &[surface],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        assert_eq!(frame[0], frame[1], "SSD and client use the same owner opacity");
     }
 
     #[test]

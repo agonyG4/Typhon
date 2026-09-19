@@ -77,6 +77,31 @@ pub(crate) struct CaptureTimingMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReplayCaptureExecutionDetail {
+    pub(crate) execution_pixels: u64,
+    pub(crate) materialization_rects: usize,
+    pub(crate) execution_regions: usize,
+    pub(crate) disjoint_overflowed: bool,
+
+    pub(crate) candidate_commands: usize,
+    pub(crate) command_region_pairs: usize,
+    pub(crate) scene_commands_total: usize,
+    pub(crate) scene_scan_pairs: usize,
+
+    pub(crate) planner_commands_visited: usize,
+    pub(crate) planner_commands_drawable: usize,
+
+    pub(crate) commands_considered: usize,
+    pub(crate) commands_executed: usize,
+    pub(crate) draw_calls: usize,
+
+    pub(crate) host_cpu_ns: u64,
+    pub(crate) selection_cpu_ns: u64,
+    pub(crate) visibility_cpu_ns: u64,
+    pub(crate) draw_submit_cpu_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CaptureExecutionTimingSummary {
     pub(crate) capture_execution_pixels: u64,
     pub(crate) scene_capture_execution_pixels: u64,
@@ -89,6 +114,19 @@ pub(crate) struct CaptureExecutionTimingSummary {
     pub(crate) checkpoint_capture_passes: usize,
     pub(crate) replay_capture_commands: usize,
     pub(crate) checkpoint_dependency_edges: usize,
+    pub(crate) replay_capture_materialization_rects: usize,
+    pub(crate) replay_capture_execution_regions: usize,
+    pub(crate) replay_capture_disjoint_overflows: usize,
+    pub(crate) replay_capture_command_region_pairs: usize,
+    pub(crate) replay_capture_scene_scan_pairs: usize,
+    pub(crate) replay_capture_planner_commands_visited: usize,
+    pub(crate) replay_capture_planner_commands_drawable: usize,
+    pub(crate) replay_capture_commands_executed: usize,
+    pub(crate) replay_capture_draw_calls: usize,
+    pub(crate) replay_capture_host_cpu_ns: u64,
+    pub(crate) replay_capture_selection_cpu_ns: u64,
+    pub(crate) replay_capture_visibility_cpu_ns: u64,
+    pub(crate) replay_capture_draw_submit_cpu_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +138,7 @@ struct TimingSpanMetadata {
     kind: Option<oblivion_one::effects::RenderPassKind>,
     pixels: u64,
     capture: Option<CaptureTimingMetadata>,
+    replay_execution: Option<ReplayCaptureExecutionDetail>,
     is_total: bool,
 }
 
@@ -170,6 +209,7 @@ struct MaxCapturePassTiming {
     mode: CaptureTimingMode,
     effect_pixels: u64,
     checkpoint_count: usize,
+    replay_execution: Option<ReplayCaptureExecutionDetail>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +251,19 @@ struct GpuTimingRecord {
     checkpoint_capture_execution_passes: usize,
     replay_capture_commands: usize,
     checkpoint_dependency_edges: usize,
+    replay_capture_materialization_rects: usize,
+    replay_capture_execution_regions: usize,
+    replay_capture_disjoint_overflows: usize,
+    replay_capture_command_region_pairs: usize,
+    replay_capture_scene_scan_pairs: usize,
+    replay_capture_planner_commands_visited: usize,
+    replay_capture_planner_commands_drawable: usize,
+    replay_capture_commands_executed: usize,
+    replay_capture_draw_calls: usize,
+    replay_capture_host_cpu_ns: u64,
+    replay_capture_selection_cpu_ns: u64,
+    replay_capture_visibility_cpu_ns: u64,
+    replay_capture_draw_submit_cpu_ns: u64,
     capture_execution_summary_available: bool,
     max_capture_pass: Option<MaxCapturePassTiming>,
 }
@@ -339,6 +392,7 @@ impl TimingState {
             kind: None,
             pixels: 0,
             capture: None,
+            replay_execution: None,
             is_total: true,
         });
         let token = token?;
@@ -451,6 +505,21 @@ impl TimingState {
             .find(|aggregate| aggregate.scope_id == scope_id)
         {
             aggregate.capture_execution = Some(summary);
+        }
+    }
+
+    fn attach_replay_execution_detail(
+        &mut self,
+        token: SpanToken,
+        detail: Option<ReplayCaptureExecutionDetail>,
+    ) {
+        let Some(detail) = detail else {
+            return;
+        };
+        if let Some(pending) = self.pending.back_mut()
+            && pending.token == token
+        {
+            pending.metadata.replay_execution = Some(detail);
         }
     }
 
@@ -638,6 +707,8 @@ impl TimingState {
                 mode: capture.mode,
                 effect_pixels: metadata.pixels,
                 checkpoint_count: capture.checkpoint_count,
+                replay_execution: (capture.mode == CaptureTimingMode::Replay)
+                    .then_some(metadata.replay_execution.unwrap_or_default()),
             };
             if aggregate
                 .max_capture_pass
@@ -718,6 +789,47 @@ impl TimingState {
             checkpoint_dependency_edges: aggregate
                 .capture_execution
                 .map_or(0, |summary| summary.checkpoint_dependency_edges),
+            replay_capture_materialization_rects: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_materialization_rects),
+            replay_capture_execution_regions: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_execution_regions),
+            replay_capture_disjoint_overflows: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_disjoint_overflows),
+            replay_capture_command_region_pairs: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_command_region_pairs),
+            replay_capture_scene_scan_pairs: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_scene_scan_pairs),
+            replay_capture_planner_commands_visited: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_planner_commands_visited),
+            replay_capture_planner_commands_drawable: aggregate
+                .capture_execution
+                .map_or(0, |summary| {
+                    summary.replay_capture_planner_commands_drawable
+                }),
+            replay_capture_commands_executed: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_commands_executed),
+            replay_capture_draw_calls: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_draw_calls),
+            replay_capture_host_cpu_ns: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_host_cpu_ns),
+            replay_capture_selection_cpu_ns: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_selection_cpu_ns),
+            replay_capture_visibility_cpu_ns: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_visibility_cpu_ns),
+            replay_capture_draw_submit_cpu_ns: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.replay_capture_draw_submit_cpu_ns),
             capture_execution_summary_available: aggregate.capture_execution.is_some(),
             max_capture_pass: aggregate.max_capture_pass,
         })
@@ -1024,8 +1136,41 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
     let max_capture_checkpoint_count = record
         .max_capture_pass
         .map_or(0, |pass| pass.checkpoint_count);
+    let max_replay_detail = record
+        .max_capture_pass
+        .and_then(|pass| pass.replay_execution);
+    let max_capture_execution_pixels =
+        max_replay_detail.map_or(0, |detail| detail.execution_pixels);
+    let max_capture_materialization_rects =
+        max_replay_detail.map_or(0, |detail| detail.materialization_rects);
+    let max_capture_execution_regions =
+        max_replay_detail.map_or(0, |detail| detail.execution_regions);
+    let max_capture_disjoint_overflow =
+        max_replay_detail.map_or(0, |detail| usize::from(detail.disjoint_overflowed));
+    let max_capture_replay_commands =
+        max_replay_detail.map_or(0, |detail| detail.candidate_commands);
+    let max_capture_command_region_pairs =
+        max_replay_detail.map_or(0, |detail| detail.command_region_pairs);
+    let max_capture_scene_commands =
+        max_replay_detail.map_or(0, |detail| detail.scene_commands_total);
+    let max_capture_scene_scan_pairs =
+        max_replay_detail.map_or(0, |detail| detail.scene_scan_pairs);
+    let max_capture_planner_commands_visited =
+        max_replay_detail.map_or(0, |detail| detail.planner_commands_visited);
+    let max_capture_planner_commands_drawable =
+        max_replay_detail.map_or(0, |detail| detail.planner_commands_drawable);
+    let max_capture_commands_executed =
+        max_replay_detail.map_or(0, |detail| detail.commands_executed);
+    let max_capture_draw_calls = max_replay_detail.map_or(0, |detail| detail.draw_calls);
+    let max_capture_host_cpu_ns = max_replay_detail.map_or(0, |detail| detail.host_cpu_ns);
+    let max_capture_selection_cpu_ns =
+        max_replay_detail.map_or(0, |detail| detail.selection_cpu_ns);
+    let max_capture_visibility_cpu_ns =
+        max_replay_detail.map_or(0, |detail| detail.visibility_cpu_ns);
+    let max_capture_draw_submit_cpu_ns =
+        max_replay_detail.map_or(0, |detail| detail.draw_submit_cpu_ns);
     format!(
-        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={}",
+        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
             .frame_id
             .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
@@ -1082,6 +1227,19 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         record.checkpoint_capture_execution_passes,
         record.replay_capture_commands,
         record.checkpoint_dependency_edges,
+        record.replay_capture_materialization_rects,
+        record.replay_capture_execution_regions,
+        record.replay_capture_disjoint_overflows,
+        record.replay_capture_command_region_pairs,
+        record.replay_capture_scene_scan_pairs,
+        record.replay_capture_planner_commands_visited,
+        record.replay_capture_planner_commands_drawable,
+        record.replay_capture_commands_executed,
+        record.replay_capture_draw_calls,
+        record.replay_capture_host_cpu_ns,
+        record.replay_capture_selection_cpu_ns,
+        record.replay_capture_visibility_cpu_ns,
+        record.replay_capture_draw_submit_cpu_ns,
         max_capture_pass_ns,
         max_capture_pass_id,
         max_capture_instance_id,
@@ -1089,6 +1247,22 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_mode,
         max_capture_pixels,
         max_capture_checkpoint_count,
+        max_capture_execution_pixels,
+        max_capture_materialization_rects,
+        max_capture_execution_regions,
+        max_capture_disjoint_overflow,
+        max_capture_replay_commands,
+        max_capture_command_region_pairs,
+        max_capture_scene_commands,
+        max_capture_scene_scan_pairs,
+        max_capture_planner_commands_visited,
+        max_capture_planner_commands_drawable,
+        max_capture_commands_executed,
+        max_capture_draw_calls,
+        max_capture_host_cpu_ns,
+        max_capture_selection_cpu_ns,
+        max_capture_visibility_cpu_ns,
+        max_capture_draw_submit_cpu_ns,
     )
 }
 
@@ -1229,6 +1403,7 @@ impl EffectGpuProfiler {
             kind: Some(kind),
             pixels,
             capture,
+            replay_execution: None,
             is_total: false,
         };
         let token = active.timing.begin_pass(scope, metadata)?;
@@ -1237,7 +1412,12 @@ impl EffectGpuProfiler {
         Some(PassTimingSpan { token })
     }
 
-    pub(crate) fn end_pass(&mut self, gl: &glow::Context, span: Option<PassTimingSpan>) {
+    pub(crate) fn end_pass(
+        &mut self,
+        gl: &glow::Context,
+        span: Option<PassTimingSpan>,
+        replay_execution: Option<ReplayCaptureExecutionDetail>,
+    ) {
         let Some(span) = span else {
             return;
         };
@@ -1247,6 +1427,9 @@ impl EffectGpuProfiler {
         if active.timing.finish(span.token) {
             let query = active.queries[span.token.slot].end;
             unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+            active
+                .timing
+                .attach_replay_execution_detail(span.token, replay_execution);
         }
     }
 
@@ -1359,6 +1542,28 @@ mod tests {
         }
     }
 
+    fn replay_detail(seed: usize) -> ReplayCaptureExecutionDetail {
+        ReplayCaptureExecutionDetail {
+            execution_pixels: seed as u64,
+            materialization_rects: seed,
+            execution_regions: seed.saturating_add(1),
+            disjoint_overflowed: seed % 2 == 1,
+            candidate_commands: seed.saturating_add(2),
+            command_region_pairs: seed.saturating_add(3),
+            scene_commands_total: seed.saturating_add(4),
+            scene_scan_pairs: seed.saturating_add(5),
+            planner_commands_visited: seed.saturating_add(6),
+            planner_commands_drawable: seed.saturating_add(7),
+            commands_considered: seed.saturating_add(8),
+            commands_executed: seed.saturating_add(9),
+            draw_calls: seed.saturating_add(10),
+            host_cpu_ns: seed as u64 + 11,
+            selection_cpu_ns: seed as u64 + 12,
+            visibility_cpu_ns: seed as u64 + 13,
+            draw_submit_cpu_ns: seed as u64 + 14,
+        }
+    }
+
     fn pass_metadata(
         pass_id: u64,
         kind: RenderPassKind,
@@ -1373,6 +1578,7 @@ mod tests {
             kind: Some(kind),
             pixels,
             capture,
+            replay_execution: None,
             is_total: false,
         }
     }
@@ -1801,6 +2007,127 @@ mod tests {
     }
 
     #[test]
+    fn max_capture_pass_carries_the_exact_slowest_replay_detail() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let first = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    7,
+                    RenderPassKind::SceneCapture,
+                    70,
+                    Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                ),
+            )
+            .expect("first capture slot");
+        assert!(state.finish(first));
+        state.attach_replay_execution_detail(first, Some(replay_detail(1)));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 110))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        let second_detail = replay_detail(20);
+        let second = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    8,
+                    RenderPassKind::SurfaceCapture,
+                    80,
+                    Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                ),
+            )
+            .expect("second capture slot");
+        assert!(state.finish(second));
+        state.attach_replay_execution_detail(second, Some(second_detail));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 160))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+        let max = record.max_capture_pass.expect("max capture pass");
+
+        assert_eq!(max.pass_id, 8);
+        assert_eq!(max.replay_execution, Some(second_detail));
+    }
+
+    #[test]
+    fn framebuffer_max_capture_has_zero_replay_detail() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let pass = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    7,
+                    RenderPassKind::SceneCapture,
+                    70,
+                    Some(capture_metadata(CaptureTimingMode::FramebufferBlit, 0)),
+                ),
+            )
+            .expect("framebuffer capture slot");
+        assert!(state.finish(pass));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert_eq!(
+            record
+                .max_capture_pass
+                .expect("framebuffer max capture")
+                .replay_execution,
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_or_dropped_replay_spans_have_no_max_detail() {
+        let mut state = TimingState::active_for_test(1);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        assert!(
+            state
+                .begin_pass(
+                    scope,
+                    pass_metadata(
+                        7,
+                        RenderPassKind::SceneCapture,
+                        70,
+                        Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                    ),
+                )
+                .is_none()
+        );
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+        assert!(record.max_capture_pass.is_none());
+    }
+
+    #[test]
     fn invalid_capture_span_does_not_contribute_to_attribution() {
         let mut state = TimingState::active_for_test(2);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
@@ -1816,6 +2143,7 @@ mod tests {
             )
             .expect("capture slot");
         assert!(state.finish(pass));
+        state.attach_replay_execution_detail(pass, Some(replay_detail(4)));
         assert_eq!(
             state.poll_front(true, Some((200, 100))),
             PollOutcome::Invalid
@@ -1845,6 +2173,8 @@ mod tests {
             first.scope_id,
             CaptureExecutionTimingSummary {
                 capture_execution_pixels: 111,
+                replay_capture_command_region_pairs: 11,
+                replay_capture_host_cpu_ns: 101,
                 ..Default::default()
             },
         );
@@ -1852,6 +2182,8 @@ mod tests {
             second.scope_id,
             CaptureExecutionTimingSummary {
                 capture_execution_pixels: 222,
+                replay_capture_command_region_pairs: 22,
+                replay_capture_host_cpu_ns: 202,
                 ..Default::default()
             },
         );
@@ -1875,6 +2207,20 @@ mod tests {
 
         assert_eq!(first_record.capture_execution_pixels, 111);
         assert_eq!(second_record.capture_execution_pixels, 222);
+        assert_eq!(first_record.replay_capture_command_region_pairs, 11);
+        assert_eq!(second_record.replay_capture_command_region_pairs, 22);
+        assert_eq!(first_record.replay_capture_host_cpu_ns, 101);
+        assert_eq!(second_record.replay_capture_host_cpu_ns, 202);
+    }
+
+    #[test]
+    fn replay_host_timing_fields_remain_zero_when_the_profiler_gate_is_disabled() {
+        let detail = ReplayCaptureExecutionDetail::default();
+
+        assert_eq!(detail.host_cpu_ns, 0);
+        assert_eq!(detail.selection_cpu_ns, 0);
+        assert_eq!(detail.visibility_cpu_ns, 0);
+        assert_eq!(detail.draw_submit_cpu_ns, 0);
     }
 
     #[test]
@@ -1964,12 +2310,25 @@ mod tests {
             checkpoint_capture_execution_passes: 0,
             replay_capture_commands: 0,
             checkpoint_dependency_edges: 0,
+            replay_capture_materialization_rects: 0,
+            replay_capture_execution_regions: 0,
+            replay_capture_disjoint_overflows: 0,
+            replay_capture_command_region_pairs: 0,
+            replay_capture_scene_scan_pairs: 0,
+            replay_capture_planner_commands_visited: 0,
+            replay_capture_planner_commands_drawable: 0,
+            replay_capture_commands_executed: 0,
+            replay_capture_draw_calls: 0,
+            replay_capture_host_cpu_ns: 0,
+            replay_capture_selection_cpu_ns: 0,
+            replay_capture_visibility_cpu_ns: 0,
+            replay_capture_draw_submit_cpu_ns: 0,
             capture_execution_summary_available: false,
             max_capture_pass: None,
         };
         assert_eq!(
             format_gpu_timing_line(&record),
-            "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 checkpoint_capture_passes=0 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=0 replay_capture_commands=0 checkpoint_dependency_edges=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0"
+            "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 checkpoint_capture_passes=0 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=0 replay_capture_commands=0 checkpoint_dependency_edges=0 replay_capture_materialization_rects=0 replay_capture_execution_regions=0 replay_capture_disjoint_overflows=0 replay_capture_command_region_pairs=0 replay_capture_scene_scan_pairs=0 replay_capture_planner_commands_visited=0 replay_capture_planner_commands_drawable=0 replay_capture_commands_executed=0 replay_capture_draw_calls=0 replay_capture_host_cpu_ns=0 replay_capture_selection_cpu_ns=0 replay_capture_visibility_cpu_ns=0 replay_capture_draw_submit_cpu_ns=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0 max_capture_execution_pixels=0 max_capture_materialization_rects=0 max_capture_execution_regions=0 max_capture_disjoint_overflow=0 max_capture_replay_commands=0 max_capture_command_region_pairs=0 max_capture_scene_commands=0 max_capture_scene_scan_pairs=0 max_capture_planner_commands_visited=0 max_capture_planner_commands_drawable=0 max_capture_commands_executed=0 max_capture_draw_calls=0 max_capture_host_cpu_ns=0 max_capture_selection_cpu_ns=0 max_capture_visibility_cpu_ns=0 max_capture_draw_submit_cpu_ns=0"
         );
     }
 
