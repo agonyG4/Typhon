@@ -2,7 +2,8 @@ use super::*;
 use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationFrameSnapshot,
     PresentationGeometryMutation, PresentationGroupOpacity, PresentationOpacity,
-    PresentationOpacityMutation, PresentationSampleTimeSource, PresentationTransactionRequest,
+    PresentationOpacityMutation, PresentationOpacityTransitionEvidence,
+    PresentationSampleTimeSource, PresentationTransactionRequest,
 };
 use crate::render_backend::buffer::{
     BufferIdAllocator, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DmabufPlane,
@@ -294,10 +295,12 @@ fn canonical_opacity_blocks_an_opaque_direct_scanout_candidate() {
         "source coverage proof remains independent from presentation opacity"
     );
     assert!(analysis.candidate.is_none());
-    assert!(analysis
-        .blockers
-        .reasons()
-        .contains(&DirectScanoutSceneRejection::PresentationOpacity));
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
 }
 
 #[test]
@@ -336,9 +339,11 @@ fn visible_opacity_track_blocks_scanout_but_hidden_unrelated_track_does_not() {
         .expect("visible opacity transaction");
 
     let visible_blockers = state.direct_scanout_scene_blockers();
-    assert!(visible_blockers
-        .reasons()
-        .contains(&DirectScanoutSceneRejection::PresentationOpacity));
+    assert!(
+        visible_blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
     state.presentation_animator.cancel_all(visible_node);
 
     let hidden_surface_id = 352;
@@ -346,11 +351,12 @@ fn visible_opacity_track_blocks_scanout_but_hidden_unrelated_track_does_not() {
     state
         .insert_desktop_window(DesktopWindow::new_xdg(hidden_window, hidden_surface_id))
         .expect("hidden window");
-    state.window_mut(hidden_window).expect("hidden window").management = Some(
-        WindowManagementState::new(WorkspaceLocation::Regular(
-            WorkspaceId::new(2).expect("hidden workspace"),
-        )),
-    );
+    state
+        .window_mut(hidden_window)
+        .expect("hidden window")
+        .management = Some(WindowManagementState::new(WorkspaceLocation::Regular(
+        WorkspaceId::new(2).expect("hidden workspace"),
+    )));
     state.append_renderable_surface(x11_shm_surface(
         hidden_surface_id,
         16,
@@ -378,9 +384,11 @@ fn visible_opacity_track_blocks_scanout_but_hidden_unrelated_track_does_not() {
         .expect("hidden opacity transaction");
 
     let hidden_blockers = state.direct_scanout_scene_blockers();
-    assert!(!hidden_blockers
-        .reasons()
-        .contains(&DirectScanoutSceneRejection::PresentationOpacity));
+    assert!(
+        !hidden_blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
 }
 
 #[test]
@@ -436,10 +444,12 @@ fn direct_scanout_opacity_recovers_only_after_opaque_frame_is_physically_present
             )),
         )
         .expect("start opaque recovery transition");
-    assert!(state
-        .direct_scanout_scene_blockers()
-        .reasons()
-        .contains(&DirectScanoutSceneRejection::PresentationOpacity));
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
 
     let settled_sample = state.presentation_scene_sample_for_targets_at_with_source(
         AnimationTime::from_nanos(20_000_000),
@@ -452,10 +462,12 @@ fn direct_scanout_opacity_recovers_only_after_opaque_frame_is_physically_present
                 .transition
                 .is_some_and(|transition| transition.mathematically_settled)
     }));
-    assert!(state
-        .direct_scanout_scene_blockers()
-        .reasons()
-        .contains(&DirectScanoutSceneRejection::PresentationOpacity));
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
 
     let settled_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
         &settled_sample,
@@ -463,11 +475,13 @@ fn direct_scanout_opacity_recovers_only_after_opaque_frame_is_physically_present
     );
     state.publish_presented_presentation(2, &settled_snapshot);
     assert!(!state.presentation_animation_has_pending_visible_opacity());
-    assert!(state
-        .direct_scanout_scene_blockers()
-        .reasons()
-        .iter()
-        .all(|reason| *reason != DirectScanoutSceneRejection::PresentationOpacity));
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .iter()
+            .all(|reason| *reason != DirectScanoutSceneRejection::PresentationOpacity)
+    );
     assert!(state.direct_scanout_scene_candidate().is_ok());
 }
 
@@ -1616,6 +1630,10 @@ fn xwayland_backing_replacement_preserves_opacity_owner_revision_and_frame_evide
         .presentation_animator
         .opacity_track_revision(scene_node_id)
         .expect("opacity revision");
+    let transaction_id = state
+        .presentation_animator
+        .opacity_track_transaction(scene_node_id)
+        .expect("opacity transaction");
     let sample_t1 = state
         .presentation_animator
         .sample_opacity_for_scene_node(scene_node_id, AnimationTime::from_nanos(5_000_000))
@@ -1627,16 +1645,28 @@ fn xwayland_backing_replacement_preserves_opacity_owner_revision_and_frame_evide
         AnimationTime::from_nanos(5_000_000),
         PresentationSampleTimeSource::ZeroFallback,
     );
-    submitted.opacities.push(PresentationGroupOpacity::with_scene_node(
-        scene_node_id,
-        root_a,
-        sample_t1,
-        None,
-    ));
+    submitted
+        .opacities
+        .push(PresentationGroupOpacity::with_scene_node(
+            scene_node_id,
+            root_a,
+            sample_t1,
+            Some(PresentationOpacityTransitionEvidence {
+                transaction_id,
+                revision_id: revision,
+                mathematically_settled: false,
+            }),
+        ));
     state.publish_presented_presentation(10, &submitted.frame_snapshot());
 
     assert_eq!(state.attach_x11_surface(handle, root_b), Ok(Some(root_a)));
-    assert_eq!(state.window(window_id).expect("XWayland window").root_surface_id, root_b);
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("XWayland window")
+            .root_surface_id,
+        root_b
+    );
     assert_eq!(
         state
             .window(window_id)
@@ -1653,6 +1683,18 @@ fn xwayland_backing_replacement_preserves_opacity_owner_revision_and_frame_evide
     );
     assert_eq!(state.presented_presentation_frame_id(), 10);
     assert_eq!(state.presented_presentation_opacity(root_a), sample_t1);
+    let submitted_opacity = &state
+        .presented_presentation
+        .as_ref()
+        .expect("submitted presentation")
+        .opacities[0];
+    assert_eq!(
+        submitted_opacity
+            .transition
+            .expect("submitted opacity evidence")
+            .revision_id,
+        revision
+    );
     let sample_t2 = state
         .presentation_animator
         .sample_opacity_for_scene_node(scene_node_id, AnimationTime::from_nanos(6_000_000))
@@ -1697,9 +1739,11 @@ fn zero_opacity_window_remains_input_eligible_and_does_not_reconfigure_geometry(
     assert_eq!(state.desktop_window_frame(window_id), before_frame);
     assert_eq!(state.backend_commands.len(), before_backend_commands);
     assert_eq!(state.scene_render_generation, before_render_generation + 1);
-    assert!(state
-        .presentation_input_point_for_root(root_surface_id, 45.0, 55.0)
-        .is_some());
+    assert!(
+        state
+            .presentation_input_point_for_root(root_surface_id, 45.0, 55.0)
+            .is_some()
+    );
 }
 
 #[test]

@@ -3721,7 +3721,10 @@ mod tests {
         assert_eq!(frame[0], expected, "root uses owner opacity");
         assert_eq!(frame[1], expected, "ordinary subsurface uses owner opacity");
         assert_eq!(frame[2], expected, "popup uses owner opacity exactly once");
-        assert_eq!(frame[3], expected, "popup subsurface uses owner opacity exactly once");
+        assert_eq!(
+            frame[3], expected,
+            "popup subsurface uses owner opacity exactly once"
+        );
     }
 
     #[test]
@@ -3761,10 +3764,7 @@ mod tests {
             scale_premultiplied_argb(0xffff_6432, 0.5),
             OUTPUT_BACKGROUND,
         );
-        let expected_ssd = rgba_to_pixel(scale_premultiplied_rgba(
-            [0xff, 0x64, 0x32, 0xff],
-            0.5,
-        ));
+        let expected_ssd = rgba_to_pixel(scale_premultiplied_rgba([0xff, 0x64, 0x32, 0xff], 0.5));
         assert_eq!(frame[0], expected_client, "client uses owner opacity");
         assert_eq!(frame[1], expected_ssd, "SSD uses owner opacity");
         assert_eq!(
