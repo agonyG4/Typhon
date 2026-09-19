@@ -141,12 +141,6 @@ impl CompositorState {
         let mut effects = self.direct_scanout_effect_analysis(&fullscreen_plan, output_size, None);
 
         let mut blockers = DirectScanoutSceneBlockers::default();
-        if self.presentation_animation_has_pending_visible_geometry() {
-            blockers.push(DirectScanoutSceneRejection::AnimationTransform);
-        }
-        if self.presentation_animation_has_pending_visible_opacity() {
-            blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
-        }
         if self.lifecycle_animation_has_pending_visible() {
             blockers.push(DirectScanoutSceneRejection::LifecycleAnimation);
         }
@@ -164,6 +158,15 @@ impl CompositorState {
             };
         };
         let root_surface_id = covering_group.root_surface_id;
+
+        if let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) {
+            if self.presentation_animator.has_geometry_track(scene_node_id) {
+                blockers.push(DirectScanoutSceneRejection::AnimationTransform);
+            }
+            if self.presentation_animator.has_opacity_track(scene_node_id) {
+                blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
+            }
+        }
 
         if self
             .window_id_for_surface(root_surface_id)

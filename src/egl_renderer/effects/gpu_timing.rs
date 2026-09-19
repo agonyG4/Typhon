@@ -526,16 +526,26 @@ impl TimingState {
 
     fn attach_capture_execution_summary(
         &mut self,
-        scope_id: u64,
+        scope: GraphTimingScope,
         summary: CaptureExecutionTimingSummary,
-    ) {
+    ) -> bool {
+        let owns_finished_total = self.pending.iter().any(|pending| {
+            pending.token == scope.total
+                && pending.metadata.is_total
+                && pending.metadata.scope_id == scope.scope_id
+        });
+        if !owns_finished_total {
+            return false;
+        }
         if let Some(aggregate) = self
             .aggregates
             .iter_mut()
-            .find(|aggregate| aggregate.scope_id == scope_id)
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
         {
             aggregate.capture_execution = Some(summary);
+            return true;
         }
+        false
     }
 
     fn attach_replay_execution_detail(
@@ -770,7 +780,8 @@ impl TimingState {
                 effect_pixels: metadata.pixels,
                 checkpoint_count: capture.checkpoint_count,
                 replay_execution: (capture.mode == CaptureTimingMode::Replay)
-                    .then_some(metadata.replay_execution.unwrap_or_default()),
+                    .then_some(metadata.replay_execution)
+                    .flatten(),
             };
             if aggregate
                 .max_capture_pass
@@ -1187,6 +1198,12 @@ enum ProfilerState {
     Active(ActiveProfiler),
 }
 
+fn max_capture_replay_detail_available(record: &GpuTimingRecord) -> bool {
+    record.max_capture_pass.is_some_and(|pass| {
+        pass.mode == CaptureTimingMode::Replay && pass.replay_execution.is_some()
+    })
+}
+
 fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
     let capture_ns = record.capture_ns();
     let capture_pixels = record.pixels[TimingCategory::SceneCapture.index()]
@@ -1242,7 +1259,7 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_replay_detail.map_or(0, |detail| detail.visibility_cpu_ns);
     let max_capture_draw_submit_cpu_ns =
         max_replay_detail.map_or(0, |detail| detail.draw_submit_cpu_ns);
-    format!(
+    let line = format!(
         "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
             .frame_id
@@ -1340,6 +1357,10 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_selection_cpu_ns,
         max_capture_visibility_cpu_ns,
         max_capture_draw_submit_cpu_ns,
+    );
+    format!(
+        "{line} max_capture_replay_detail_available={}",
+        usize::from(max_capture_replay_detail_available(record)),
     )
 }
 
@@ -1451,23 +1472,35 @@ impl EffectGpuProfiler {
         &mut self,
         gl: &glow::Context,
         scope: Option<GraphTimingScope>,
-        capture_execution: Option<CaptureExecutionTimingSummary>,
-    ) {
+    ) -> bool {
         let Some(scope) = scope else {
-            return;
+            return false;
         };
         let ProfilerState::Active(active) = &mut self.state else {
-            return;
+            return false;
         };
-        if let Some(summary) = capture_execution {
-            active
-                .timing
-                .attach_capture_execution_summary(scope.scope_id, summary);
+        if !active.timing.finish(scope.total) {
+            return false;
         }
-        if active.timing.finish(scope.total) {
-            let query = active.queries[scope.total.slot].end;
-            unsafe { gl.query_counter(query, glow::TIMESTAMP) };
-        }
+        let query = active.queries[scope.total.slot].end;
+        unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+        true
+    }
+
+    pub(crate) fn attach_capture_execution_summary(
+        &mut self,
+        scope: Option<GraphTimingScope>,
+        summary: CaptureExecutionTimingSummary,
+    ) -> bool {
+        let Some(scope) = scope else {
+            return false;
+        };
+        let ProfilerState::Active(active) = &mut self.state else {
+            return false;
+        };
+        active
+            .timing
+            .attach_capture_execution_summary(scope, summary)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2297,26 +2330,26 @@ mod tests {
         let mut state = TimingState::active_for_test(4);
         let first = state.begin_scope(Some(120)).expect("first scope");
         let second = state.begin_scope(Some(120)).expect("second scope");
-        state.attach_capture_execution_summary(
-            first.scope_id,
+        assert!(state.finish(first.total));
+        assert!(state.finish(second.total));
+        assert!(state.attach_capture_execution_summary(
+            first,
             CaptureExecutionTimingSummary {
                 capture_execution_pixels: 111,
                 replay_capture_command_region_pairs: 11,
                 replay_capture_host_cpu_ns: 101,
                 ..Default::default()
             },
-        );
-        state.attach_capture_execution_summary(
-            second.scope_id,
+        ));
+        assert!(state.attach_capture_execution_summary(
+            second,
             CaptureExecutionTimingSummary {
                 capture_execution_pixels: 222,
                 replay_capture_command_region_pairs: 22,
                 replay_capture_host_cpu_ns: 202,
                 ..Default::default()
             },
-        );
-        assert!(state.finish(first.total));
-        assert!(state.finish(second.total));
+        ));
 
         let first_record = match state.poll_front(true, Some((100, 140))) {
             PollOutcome::Ready {
@@ -2339,6 +2372,118 @@ mod tests {
         assert_eq!(second_record.replay_capture_command_region_pairs, 22);
         assert_eq!(first_record.replay_capture_host_cpu_ns, 101);
         assert_eq!(second_record.replay_capture_host_cpu_ns, 202);
+    }
+
+    #[test]
+    fn stale_total_scope_cannot_attach_to_a_reused_slot() {
+        let mut state = TimingState::active_for_test(1);
+        let stale = state.begin_scope(Some(120)).expect("stale scope");
+        assert!(!state.attach_capture_execution_summary(
+            stale,
+            CaptureExecutionTimingSummary {
+                capture_execution_pixels: 999,
+                ..Default::default()
+            },
+        ));
+        assert!(state.finish(stale.total));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: Some(_), .. }
+        ));
+
+        let current = state.begin_scope(Some(120)).expect("current scope");
+        assert!(state.finish(current.total));
+        assert!(!state.attach_capture_execution_summary(
+            stale,
+            CaptureExecutionTimingSummary {
+                capture_execution_pixels: 777,
+                ..Default::default()
+            },
+        ));
+        assert!(state.attach_capture_execution_summary(
+            current,
+            CaptureExecutionTimingSummary {
+                capture_execution_pixels: 222,
+                ..Default::default()
+            },
+        ));
+
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+        assert_eq!(record.capture_execution_pixels, 222);
+    }
+
+    #[test]
+    fn replay_max_without_detail_preserves_missing_evidence() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let pass = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    7,
+                    RenderPassKind::SceneCapture,
+                    70,
+                    Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                ),
+            )
+            .expect("replay capture slot");
+        assert!(state.finish(pass));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        let max = record.max_capture_pass.expect("replay max capture");
+        assert_eq!(max.replay_execution, None);
+        assert!(!max_capture_replay_detail_available(&record));
+    }
+
+    #[test]
+    fn replay_max_with_detail_sets_availability_field() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let pass = state
+            .begin_pass(
+                scope,
+                pass_metadata(
+                    7,
+                    RenderPassKind::SceneCapture,
+                    70,
+                    Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                ),
+            )
+            .expect("replay capture slot");
+        assert!(state.finish(pass));
+        state.attach_replay_execution_detail(pass, Some(replay_detail(9)));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((200, 300))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert!(max_capture_replay_detail_available(&record));
+        assert!(format_gpu_timing_line(&record).ends_with("max_capture_replay_detail_available=1"));
     }
 
     #[test]
@@ -2459,9 +2604,12 @@ mod tests {
             max_capture_pass: None,
         };
         assert_eq!(
-            format_gpu_timing_line(&record),
+            format_gpu_timing_line(&record)
+                .strip_suffix(" max_capture_replay_detail_available=0")
+                .expect("availability field"),
             "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 checkpoint_capture_passes=0 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=0 replay_capture_commands=0 checkpoint_dependency_edges=0 replay_capture_materialization_rects=0 replay_capture_execution_regions=0 replay_capture_disjoint_overflows=0 replay_capture_command_region_pairs=0 replay_capture_scene_scan_pairs=0 replay_capture_planner_commands_visited=0 replay_capture_planner_commands_drawable=0 replay_capture_commands_executed=0 replay_capture_draw_calls=0 replay_capture_host_cpu_ns=0 replay_capture_selection_cpu_ns=0 replay_capture_visibility_cpu_ns=0 replay_capture_draw_submit_cpu_ns=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0 max_capture_execution_pixels=0 max_capture_materialization_rects=0 max_capture_execution_regions=0 max_capture_disjoint_overflow=0 max_capture_replay_commands=0 max_capture_command_region_pairs=0 max_capture_scene_commands=0 max_capture_scene_scan_pairs=0 max_capture_planner_commands_visited=0 max_capture_planner_commands_drawable=0 max_capture_commands_executed=0 max_capture_draw_calls=0 max_capture_host_cpu_ns=0 max_capture_selection_cpu_ns=0 max_capture_visibility_cpu_ns=0 max_capture_draw_submit_cpu_ns=0"
         );
+        assert!(format_gpu_timing_line(&record).ends_with("max_capture_replay_detail_available=0"));
     }
 
     #[test]

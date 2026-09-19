@@ -190,6 +190,26 @@ fn install_x11_scanout_surface(
     state.rebuild_active_scene_view();
 }
 
+fn install_off_output_xdg_window(state: &mut CompositorState, root_surface_id: u32) -> SceneNodeId {
+    let window_id = state.allocate_window_id().expect("off-output window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
+        .expect("off-output window");
+    state.append_renderable_surface(x11_shm_surface(
+        root_surface_id,
+        16,
+        16,
+        SurfacePlacement::absolute_root_at(2_000, 0),
+    ));
+    state
+        .surface_presentation_generations
+        .insert(root_surface_id, 1);
+    state.rebuild_active_scene_view();
+    state
+        .scene_node_id_for_window_group(window_id)
+        .expect("off-output WindowGroup scene node")
+}
+
 #[test]
 fn window_id_is_nonzero_monotonic_and_not_reused() {
     let mut state = CompositorState::new(None);
@@ -304,7 +324,7 @@ fn canonical_opacity_blocks_an_opaque_direct_scanout_candidate() {
 }
 
 #[test]
-fn visible_opacity_track_blocks_scanout_but_hidden_unrelated_track_does_not() {
+fn candidate_opacity_track_blocks_direct_scanout() {
     let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
@@ -344,48 +364,246 @@ fn visible_opacity_track_blocks_scanout_but_hidden_unrelated_track_does_not() {
             .reasons()
             .contains(&DirectScanoutSceneRejection::PresentationOpacity)
     );
-    state.presentation_animator.cancel_all(visible_node);
+}
 
-    let hidden_surface_id = 352;
-    let hidden_window = state.allocate_window_id().expect("hidden window id");
-    state
-        .insert_desktop_window(DesktopWindow::new_xdg(hidden_window, hidden_surface_id))
-        .expect("hidden window");
-    state
-        .window_mut(hidden_window)
-        .expect("hidden window")
-        .management = Some(WindowManagementState::new(WorkspaceLocation::Regular(
-        WorkspaceId::new(2).expect("hidden workspace"),
-    )));
-    state.append_renderable_surface(x11_shm_surface(
-        hidden_surface_id,
-        16,
-        16,
-        SurfacePlacement::absolute_root_at(2_000, 0),
-    ));
-    state
-        .surface_presentation_generations
-        .insert(hidden_surface_id, 1);
-    state.rebuild_active_scene_view();
-    let hidden_node = state
-        .scene_node_id_for_window_group(hidden_window)
-        .expect("hidden WindowGroup scene node");
+#[test]
+fn unrelated_off_output_opacity_track_does_not_block_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(352).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            352,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, 352, 352),
+    );
+    let unrelated_node = install_off_output_xdg_window(&mut state, 353);
+    state.presentation_animator.set_enabled(true);
     state
         .presentation_animator
         .commit(PresentationTransactionRequest::opacity(
             AnimationTime::from_nanos(0),
             vec![PresentationOpacityMutation::new(
-                hidden_node,
+                unrelated_node,
                 PresentationOpacity::OPAQUE,
                 PresentationOpacity::new(0.5).expect("half opacity"),
                 AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
             )],
         ))
-        .expect("hidden opacity transaction");
+        .expect("off-output opacity transaction");
 
-    let hidden_blockers = state.direct_scanout_scene_blockers();
+    let blockers = state.direct_scanout_scene_blockers();
     assert!(
-        !hidden_blockers
+        !blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
+    assert!(state.direct_scanout_scene_candidate().is_ok());
+}
+
+#[test]
+fn candidate_geometry_track_blocks_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(354).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            354,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, 354, 354),
+    );
+    let window_id = state.window_id_for_surface(354).expect("candidate window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("candidate WindowGroup scene node");
+    state.presentation_animator.set_enabled(true);
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                PresentationRect::new(0.0, 0.0, 100.0, 100.0).expect("geometry start"),
+                PresentationRect::new(1.0, 0.0, 100.0, 100.0).expect("geometry target"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("candidate geometry transaction");
+
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
+    );
+}
+
+#[test]
+fn unrelated_off_output_geometry_track_does_not_block_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(355).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            355,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, 355, 355),
+    );
+    let unrelated_node = install_off_output_xdg_window(&mut state, 356);
+    state.presentation_animator.set_enabled(true);
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                unrelated_node,
+                PresentationRect::new(0.0, 0.0, 16.0, 16.0).expect("geometry start"),
+                PresentationRect::new(1.0, 0.0, 16.0, 16.0).expect("geometry target"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("off-output geometry transaction");
+
+    let blockers = state.direct_scanout_scene_blockers();
+    assert!(
+        !blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
+    );
+    assert!(state.direct_scanout_scene_candidate().is_ok());
+}
+
+#[test]
+fn unrelated_track_without_output_candidate_does_not_report_animation_blockers() {
+    let mut state = CompositorState::new(None);
+    let unrelated_node = install_off_output_xdg_window(&mut state, 357);
+    state.presentation_animator.set_enabled(true);
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::mixed(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                unrelated_node,
+                PresentationRect::new(0.0, 0.0, 16.0, 16.0).expect("geometry start"),
+                PresentationRect::new(1.0, 0.0, 16.0, 16.0).expect("geometry target"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+            vec![PresentationOpacityMutation::new(
+                unrelated_node,
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("half opacity"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("off-output mixed transaction");
+
+    let blockers = state.direct_scanout_scene_blockers();
+    assert!(
+        blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::NoOutputCoveringApplication)
+    );
+    assert!(
+        !blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
+    );
+    assert!(
+        !blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
+}
+
+#[test]
+fn xwayland_backing_replacement_preserves_candidate_presentation_track_blockers() {
+    let mut state = CompositorState::new(None);
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(358).expect("generation"));
+    let root_a = 358;
+    let root_b = 359;
+    let snapshot = x11_output_snapshot(generation, 3_580, root_a);
+    let handle = snapshot.handle;
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            root_a,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        snapshot,
+    );
+    let window_id = state
+        .window_id_for_surface(root_a)
+        .expect("candidate window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("candidate WindowGroup scene node");
+    state.presentation_animator.set_enabled(true);
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::mixed(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                PresentationRect::new(0.0, 0.0, 100.0, 100.0).expect("geometry start"),
+                PresentationRect::new(1.0, 0.0, 100.0, 100.0).expect("geometry target"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+            vec![PresentationOpacityMutation::new(
+                scene_node_id,
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("half opacity"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("candidate presentation transaction");
+
+    state.retire_xwayland_attachment(root_a);
+    assert_eq!(state.attach_x11_surface(handle, root_b), Ok(Some(root_a)));
+    state.append_renderable_surface(x11_scanout_surface(
+        root_b,
+        output_width,
+        output_height,
+        SurfacePlacement::absolute_root_at(0, 0),
+        DrmFormat::Xrgb8888,
+    ));
+    state.surface_presentation_generations.insert(root_b, 1);
+    state.rebuild_active_scene_view();
+
+    assert_eq!(
+        state.presentation_scene_node_id_for_root(root_b),
+        Some(scene_node_id)
+    );
+    let blockers = state.direct_scanout_scene_blockers();
+    assert!(
+        blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
+    );
+    assert!(
+        blockers
             .reasons()
             .contains(&DirectScanoutSceneRejection::PresentationOpacity)
     );
@@ -474,7 +692,7 @@ fn direct_scanout_opacity_recovers_only_after_opaque_frame_is_physically_present
         state.presented_window_geometries_for_targets(&settled_sample, &targets),
     );
     state.publish_presented_presentation(2, &settled_snapshot);
-    assert!(!state.presentation_animation_has_pending_visible_opacity());
+    assert!(!state.presentation_animation_has_pending_visible());
     assert!(
         state
             .direct_scanout_scene_blockers()

@@ -1083,13 +1083,14 @@ pub(crate) fn execute_graph_passes(
         scene_replay_work_mode_override,
         graph_scope,
     );
-    let capture_execution = result
-        .as_ref()
-        .ok()
-        .map(EffectExecutionStats::capture_timing_summary);
-    renderer
+    let graph_timing_finished = renderer
         .effect_gpu_profiler
-        .end_graph(&renderer.gl, graph_scope, capture_execution);
+        .end_graph(&renderer.gl, graph_scope);
+    if graph_timing_finished && let Ok(stats) = &result {
+        renderer
+            .effect_gpu_profiler
+            .attach_capture_execution_summary(graph_scope, stats.capture_timing_summary());
+    }
     result
 }
 
@@ -1563,12 +1564,17 @@ fn execute_graph_passes_inner(
                 &mut stats,
             );
             let replay_execution = execute_result.as_ref().ok().copied().flatten();
-            renderer
-                .effect_gpu_profiler
-                .end_pass(&renderer.gl, pass_timing, replay_execution);
-            if let Some(detail) = replay_execution {
-                stats.record_replay_capture_detail(detail);
-            }
+            finalize_pass_timing_and_replay_detail(
+                || {
+                    renderer.effect_gpu_profiler.end_pass(
+                        &renderer.gl,
+                        pass_timing,
+                        replay_execution,
+                    );
+                },
+                replay_execution,
+                |detail| stats.record_replay_capture_detail(detail),
+            );
             if renderer.effect_trace.enabled() {
                 renderer.effect_trace.pass_boundary(
                     "execute_end",
@@ -2644,6 +2650,17 @@ fn composition_range(
         oblivion_one::compositor::EffectAnchor::OutputPostProcess => {
             (commands.len(), commands.len())
         }
+    }
+}
+
+fn finalize_pass_timing_and_replay_detail(
+    finish_timing: impl FnOnce(),
+    replay_execution: Option<ReplayCaptureExecutionDetail>,
+    mut record_detail: impl FnMut(ReplayCaptureExecutionDetail),
+) {
+    finish_timing();
+    if let Some(detail) = replay_execution {
+        record_detail(detail);
     }
 }
 
@@ -7128,6 +7145,52 @@ mod tests {
         assert_eq!(summary.replay_capture_selection_cpu_ns, 11);
         assert_eq!(summary.replay_capture_visibility_cpu_ns, 22);
         assert_eq!(summary.replay_capture_draw_submit_cpu_ns, 33);
+    }
+
+    #[test]
+    fn replay_detail_is_aggregated_once_after_pass_timing_finalization() {
+        use std::cell::RefCell;
+
+        let mut stats = EffectExecutionStats::default();
+        let detail = ReplayCaptureExecutionDetail {
+            execution_regions: 2,
+            commands_executed: 3,
+            ..Default::default()
+        };
+        let events = RefCell::new(Vec::new());
+
+        finalize_pass_timing_and_replay_detail(
+            || events.borrow_mut().push("gpu_end"),
+            Some(detail),
+            |detail| {
+                events.borrow_mut().push("aggregate");
+                stats.record_replay_capture_detail(detail);
+            },
+        );
+
+        assert_eq!(*events.borrow(), ["gpu_end", "aggregate"]);
+        assert_eq!(stats.replay_capture_execution_regions, 2);
+        assert_eq!(stats.replay_capture_commands_executed, 3);
+    }
+
+    #[test]
+    fn replay_failure_does_not_aggregate_detail() {
+        use std::cell::RefCell;
+
+        let mut stats = EffectExecutionStats::default();
+        let events = RefCell::new(Vec::new());
+
+        finalize_pass_timing_and_replay_detail(
+            || events.borrow_mut().push("gpu_end"),
+            None,
+            |detail| {
+                events.borrow_mut().push("aggregate");
+                stats.record_replay_capture_detail(detail);
+            },
+        );
+
+        assert_eq!(*events.borrow(), ["gpu_end"]);
+        assert_eq!(stats, EffectExecutionStats::default());
     }
 
     #[test]

@@ -87,6 +87,42 @@ fn opacity_transaction_uses_exact_revision_and_sample_evidence() {
 }
 
 #[test]
+fn property_specific_track_queries_do_not_cross_properties() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(120);
+    let curve = AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear);
+
+    engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(1.0, 0.0, 10.0, 10.0),
+                curve,
+            )],
+        ))
+        .expect("geometry transaction");
+    assert!(engine.has_geometry_track(scene_node_id));
+    assert!(!engine.has_opacity_track(scene_node_id));
+
+    engine.cancel_geometry(scene_node_id);
+    engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(0),
+            vec![PresentationOpacityMutation::new(
+                scene_node_id,
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("opacity"),
+                curve,
+            )],
+        ))
+        .expect("opacity transaction");
+    assert!(!engine.has_geometry_track(scene_node_id));
+    assert!(engine.has_opacity_track(scene_node_id));
+}
+
+#[test]
 fn geometry_and_opacity_share_transaction_but_settle_independently() {
     let mut engine = PresentationEngine::enabled();
     let transaction = engine

@@ -546,6 +546,10 @@ impl PresentationEngine {
             || self.opacity_tracks.contains_key(&scene_node_id)
     }
 
+    pub fn has_geometry_track(&self, scene_node_id: SceneNodeId) -> bool {
+        self.geometry_tracks.contains_key(&scene_node_id)
+    }
+
     pub fn has_opacity_track(&self, scene_node_id: SceneNodeId) -> bool {
         self.opacity_tracks.contains_key(&scene_node_id)
     }

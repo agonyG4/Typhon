@@ -389,24 +389,6 @@ impl CompositorState {
             .has_pending_visible(&visible_keys)
     }
 
-    pub(in crate::compositor) fn presentation_animation_has_pending_visible_geometry(
-        &self,
-    ) -> bool {
-        let surfaces = self.native_frame_renderable_surfaces();
-        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
-        let visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
-        self.presentation_animator
-            .has_pending_visible_geometry(&visible_keys)
-    }
-
-    pub(in crate::compositor) fn presentation_animation_has_pending_visible_opacity(&self) -> bool {
-        let surfaces = self.native_frame_renderable_surfaces();
-        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
-        let visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
-        self.presentation_animator
-            .has_pending_visible_opacity(&visible_keys)
-    }
-
     pub(in crate::compositor) fn presentation_animation_pending_for_root(
         &self,
         root_surface_id: u32,

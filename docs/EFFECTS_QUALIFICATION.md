@@ -145,6 +145,7 @@ max_capture_execution_pixels max_capture_materialization_rects max_capture_execu
 max_capture_replay_commands max_capture_command_region_pairs max_capture_scene_commands max_capture_scene_scan_pairs
 max_capture_planner_commands_visited max_capture_planner_commands_drawable max_capture_commands_executed max_capture_draw_calls
 max_capture_host_cpu_ns max_capture_selection_cpu_ns max_capture_visibility_cpu_ns max_capture_draw_submit_cpu_ns
+max_capture_replay_detail_available
 ```
 
 `replay_capture_commands` retains its legacy meaning: the number of candidate
@@ -173,7 +174,11 @@ overflowed and execution used its existing conservative bounding rectangle;
 the fallback behavior itself is unchanged. The corresponding
 `max_capture_*` fields are copied from the exact valid timed pass that became
 the longest capture span. Framebuffer-blit max passes emit stable zero Replay
-fields and do not fabricate Replay detail.
+fields and do not fabricate Replay detail. `max_capture_replay_detail_available=1`
+means the max capture pass was Replay and its exact `ReplayCaptureExecutionDetail`
+was attached; `0` means the max pass was framebuffer capture or Replay detail was
+unavailable. The existing zero-valued max Replay fields remain for compatibility
+when the availability bit is zero.
 
 `replay_capture_host_cpu_ns` measures the whole Replay capture path while GPU
 effect profiling is active. It includes fixed setup such as materialization,
