@@ -3,8 +3,10 @@ use super::desktop_window_tests::{
 };
 use super::*;
 use crate::presentation_animation::{
-    AnimationCurve, AnimationTime, EasingCurve, PresentationGeometryMutation, PresentationOpacity,
-    PresentationOpacityMutation, PresentationRect, PresentationTransactionRequest,
+    AnimationCurve, AnimationTime, EasingCurve, PresentationGeometryMutation,
+    PresentationGroupTransform, PresentationOpacity, PresentationOpacityMutation, PresentationRect,
+    PresentationRevisionId, PresentationSampleTimeSource, PresentationTransactionId,
+    PresentationTransactionRequest,
 };
 use crate::render_backend::buffer::DrmFormat;
 use crate::xwayland::XwaylandGeneration;
@@ -309,5 +311,64 @@ fn xwayland_backing_replacement_preserves_candidate_presentation_track_blockers(
         blockers
             .reasons()
             .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
+}
+
+#[test]
+fn physically_presented_geometry_remains_a_direct_scanout_blocker_after_track_retirement() {
+    let mut state = CompositorState::new(None);
+    let (width, height) = (state.output_size.width, state.output_size.height);
+    let root_surface_id = 365;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(365).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            root_surface_id,
+            width,
+            height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, root_surface_id, root_surface_id),
+    );
+    let window_id = state
+        .window_id_for_surface(root_surface_id)
+        .expect("candidate window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("candidate WindowGroup scene node");
+    let output_id = state.ensure_native_output_id().expect("output identity");
+    let canonical_rect = PresentationRect::new(0.0, 0.0, f64::from(width), f64::from(height))
+        .expect("canonical candidate rect");
+    let presented_rect = PresentationRect::new(8.0, 0.0, f64::from(width), f64::from(height))
+        .expect("nonidentity presented rect");
+    let mut sample = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(1),
+        PresentationSampleTimeSource::ZeroFallback,
+    );
+    sample
+        .transforms
+        .push(PresentationGroupTransform::with_scene_node(
+            scene_node_id,
+            root_surface_id,
+            PresentationTransactionId::new(NonZeroU64::new(77).expect("transaction")),
+            PresentationRevisionId::new(NonZeroU64::new(88).expect("revision")),
+            canonical_rect,
+            presented_rect,
+            false,
+        ));
+    state.publish_presented_presentation(1, &sample.frame_snapshot());
+
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::AnimationTransform)
     );
 }
