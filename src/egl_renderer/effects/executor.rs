@@ -6124,6 +6124,36 @@ mod tests {
     }
 
     #[test]
+    fn builtin_background_blur_uses_source_over_below_opaque_owner_opacity() {
+        let registry = oblivion_one::effects::EffectRegistry::with_builtin_background_blur();
+        let program = registry
+            .get(oblivion_one::effects::builtin_background_blur_program_id())
+            .expect("builtin background blur must be registered");
+        assert_eq!(
+            program.program.alpha_mode,
+            oblivion_one::effects::EffectAlphaMode::Opaque
+        );
+        assert_eq!(
+            effect_pass_blend_mode(
+                RenderPassKind::Composite,
+                true,
+                program.program.alpha_mode,
+                0.5,
+            ),
+            EffectPassBlendMode::PremultipliedSourceOver
+        );
+        assert_eq!(
+            effect_pass_blend_mode(
+                RenderPassKind::Composite,
+                true,
+                program.program.alpha_mode,
+                1.0,
+            ),
+            EffectPassBlendMode::Replace
+        );
+    }
+
+    #[test]
     fn capture_materialization_plan_keeps_region_and_raster_rects_authoritative() {
         let domain = oblivion_one::effects::EffectRect::new(100, 80, 120, 90).unwrap();
         let mut execution = EffectRegion::from_rect(
