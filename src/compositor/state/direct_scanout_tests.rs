@@ -4,8 +4,7 @@ use super::desktop_window_tests::{
 use super::*;
 use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationGeometryMutation, PresentationOpacity,
-    PresentationOpacityMutation, PresentationRect, PresentationSampleTimeSource,
-    PresentationTransactionRequest,
+    PresentationOpacityMutation, PresentationRect, PresentationTransactionRequest,
 };
 use crate::render_backend::buffer::DrmFormat;
 use crate::xwayland::XwaylandGeneration;

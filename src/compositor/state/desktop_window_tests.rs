@@ -1,10 +1,9 @@
 use super::*;
 use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationFrameSnapshot,
-    PresentationGeometryMutation, PresentationGroupOpacity, PresentationGroupTransform,
-    PresentationOpacity, PresentationOpacityMutation, PresentationOpacityTransitionEvidence,
-    PresentationRect, PresentationRevisionId, PresentationSampleTimeSource,
-    PresentationTransactionId, PresentationTransactionRequest,
+    PresentationGeometryMutation, PresentationGroupOpacity, PresentationOpacity,
+    PresentationOpacityMutation, PresentationOpacityTransitionEvidence, PresentationRect,
+    PresentationTransactionRequest,
 };
 use crate::render_backend::buffer::{
     BufferIdAllocator, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DmabufPlane,
@@ -64,7 +63,7 @@ fn insert_x11(state: &mut CompositorState, snapshot: X11WindowSnapshot) -> Windo
     id
 }
 
-fn x11_scanout_surface(
+pub(super) fn x11_scanout_surface(
     surface_id: u32,
     width: u32,
     height: u32,
@@ -117,7 +116,7 @@ fn x11_scanout_surface(
     }
 }
 
-fn x11_shm_surface(
+pub(super) fn x11_shm_surface(
     surface_id: u32,
     width: u32,
     height: u32,
@@ -163,7 +162,7 @@ fn install_x11_visual_tree(
     state.rebuild_active_scene_view();
 }
 
-fn x11_output_snapshot(
+pub(super) fn x11_output_snapshot(
     generation: XwaylandGeneration,
     xid: u32,
     surface_id: u32,
@@ -179,7 +178,7 @@ fn x11_output_snapshot(
     snapshot
 }
 
-fn install_x11_scanout_surface(
+pub(super) fn install_x11_scanout_surface(
     state: &mut CompositorState,
     surface: RenderableSurface,
     snapshot: X11WindowSnapshot,
