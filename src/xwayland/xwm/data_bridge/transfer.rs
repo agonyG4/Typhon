@@ -8,11 +8,23 @@ use super::BridgeGeneration;
 
 pub const MAX_TRANSFER_CHUNK: usize = 64 * 1024;
 pub const MAX_ACTIVE_TRANSFERS: usize = 64;
+const MAX_INTERRUPTED_SYSCALLS_PER_PUMP: usize = 8;
+
+pub const TRANSFER_TERMINAL_EVENTS: u32 =
+    (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransferId {
     pub generation: BridgeGeneration,
     pub serial: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferPumpOutcome {
+    Pending,
+    Completed,
+    TimedOut,
+    Gone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +57,7 @@ pub struct TransferInterest {
     pub id: TransferId,
     pub fd: RawFd,
     pub interest: TransferIoInterest,
+    pub events: u32,
     pub deadline_ns: u64,
 }
 
@@ -117,7 +130,7 @@ impl TransferManager {
         Ok(id)
     }
 
-    pub fn pump(&mut self, id: TransferId, now_ns: u64) -> io::Result<bool> {
+    pub fn pump(&mut self, id: TransferId, now_ns: u64) -> io::Result<TransferPumpOutcome> {
         let mut io = SyscallIo;
         self.pump_with_io(id, now_ns, &mut io)
     }
@@ -127,13 +140,16 @@ impl TransferManager {
         id: TransferId,
         now_ns: u64,
         io: &mut I,
-    ) -> io::Result<bool> {
+    ) -> io::Result<TransferPumpOutcome> {
         let Some(transfer) = self.transfers.get(&id) else {
-            return Ok(true);
+            return Ok(TransferPumpOutcome::Gone);
         };
-        if transfer.id != id || now_ns >= transfer.deadline_ns {
+        if transfer.id != id {
+            return Ok(TransferPumpOutcome::Gone);
+        }
+        if now_ns >= transfer.deadline_ns {
             self.transfers.remove(&id);
-            return Ok(true);
+            return Ok(TransferPumpOutcome::TimedOut);
         }
 
         let result = self
@@ -142,11 +158,11 @@ impl TransferManager {
             .expect("transfer remained present after deadline check")
             .pump(io);
         match result {
-            Ok(finished) => {
-                if finished {
+            Ok(outcome) => {
+                if outcome == TransferPumpOutcome::Completed {
                     self.transfers.remove(&id);
                 }
-                Ok(finished)
+                Ok(outcome)
             }
             Err(error) => {
                 self.transfers.remove(&id);
@@ -164,10 +180,15 @@ impl TransferManager {
             ),
             TransferPhase::Writing => (transfer.sink.as_raw_fd(), TransferIoInterest::SinkWritable),
         };
+        let events = match interest {
+            TransferIoInterest::SourceReadable => libc::EPOLLIN as u32,
+            TransferIoInterest::SinkWritable => libc::EPOLLOUT as u32,
+        } | TRANSFER_TERMINAL_EVENTS;
         Some(TransferInterest {
             id,
             fd,
             interest,
+            events,
             deadline_ns: transfer.deadline_ns,
         })
     }
@@ -179,7 +200,7 @@ impl TransferManager {
             .min()
     }
 
-    pub fn expire(&mut self, now_ns: u64) -> Vec<TransferId> {
+    pub fn expire_deadlines(&mut self, now_ns: u64) -> Vec<TransferId> {
         let expired = self
             .transfers
             .iter()
@@ -209,18 +230,16 @@ impl TransferManager {
 }
 
 impl Transfer {
-    fn pump<I: TransferIo>(&mut self, io: &mut I) -> io::Result<bool> {
+    fn pump<I: TransferIo>(&mut self, io: &mut I) -> io::Result<TransferPumpOutcome> {
         self.assert_invariants();
         if self.phase == TransferPhase::Reading {
             self.buffer.resize(MAX_TRANSFER_CHUNK, 0);
+            let mut interrupted = 0;
             loop {
                 match io.read(self.source.as_raw_fd(), &mut self.buffer) {
                     Ok(0) => {
-                        self.buffer.clear();
-                        self.offset = 0;
-                        self.phase = TransferPhase::Reading;
-                        self.assert_invariants();
-                        return Ok(true);
+                        self.transition_to_reading();
+                        return Ok(TransferPumpOutcome::Completed);
                     }
                     Ok(read) if read <= MAX_TRANSFER_CHUNK => {
                         self.buffer.truncate(read);
@@ -235,13 +254,17 @@ impl Transfer {
                             "transfer source returned more than its bounded chunk",
                         ));
                     }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        interrupted += 1;
+                        if interrupted >= MAX_INTERRUPTED_SYSCALLS_PER_PUMP {
+                            self.transition_to_reading();
+                            return Ok(TransferPumpOutcome::Pending);
+                        }
+                        continue;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        self.buffer.clear();
-                        self.offset = 0;
-                        self.phase = TransferPhase::Reading;
-                        self.assert_invariants();
-                        return Ok(false);
+                        self.transition_to_reading();
+                        return Ok(TransferPumpOutcome::Pending);
                     }
                     Err(error) => return Err(error),
                 }
@@ -249,6 +272,7 @@ impl Transfer {
         }
 
         debug_assert_eq!(self.phase, TransferPhase::Writing);
+        let mut interrupted = 0;
         while self.offset < self.buffer.len() {
             let write_result = {
                 let remaining = &self.buffer[self.offset..];
@@ -264,11 +288,8 @@ impl Transfer {
                 Ok(written) if written <= self.buffer.len() - self.offset => {
                     self.offset += written;
                     if self.offset == self.buffer.len() {
-                        self.buffer.clear();
-                        self.offset = 0;
-                        self.phase = TransferPhase::Reading;
-                        self.assert_invariants();
-                        return Ok(false);
+                        self.transition_to_reading();
+                        return Ok(TransferPumpOutcome::Pending);
                     }
                 }
                 Ok(_) => {
@@ -277,10 +298,17 @@ impl Transfer {
                         "transfer sink reported more bytes than requested",
                     ));
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupted += 1;
+                    if interrupted >= MAX_INTERRUPTED_SYSCALLS_PER_PUMP {
+                        self.assert_invariants();
+                        return Ok(TransferPumpOutcome::Pending);
+                    }
+                    continue;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.assert_invariants();
-                    return Ok(false);
+                    return Ok(TransferPumpOutcome::Pending);
                 }
                 Err(error) => return Err(error),
             }
@@ -289,7 +317,15 @@ impl Transfer {
         unreachable!("writing phase always normalizes after draining its buffer")
     }
 
+    fn transition_to_reading(&mut self) {
+        self.buffer.clear();
+        self.offset = 0;
+        self.phase = TransferPhase::Reading;
+        self.assert_invariants();
+    }
+
     fn assert_invariants(&self) {
+        debug_assert!(self.buffer.capacity() <= MAX_TRANSFER_CHUNK);
         debug_assert!(self.offset <= self.buffer.len());
         match self.phase {
             TransferPhase::Reading => {
@@ -343,6 +379,11 @@ mod tests {
             .expect("transfer");
         let interest = manager.interest(id).expect("initial interest");
         assert_eq!(interest.interest, TransferIoInterest::SourceReadable);
+        assert_eq!(
+            interest.events & TRANSFER_TERMINAL_EVENTS,
+            TRANSFER_TERMINAL_EVENTS
+        );
+        assert_ne!(interest.events & libc::EPOLLIN as u32, 0);
         assert_eq!(interest.deadline_ns, u64::MAX);
         assert!(interest.fd >= 0);
         let _ = manager.pump(id, 0).expect("pump");
@@ -381,11 +422,17 @@ mod tests {
             )
             .expect("transfer");
 
-        manager.pump(id, 0).expect("payload pump");
+        assert_eq!(
+            manager.pump(id, 0).expect("payload pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(read_available(&mut sink_reader), b"abc");
         drop(source_writer);
 
-        assert!(manager.pump(id, 1).expect("EOF pump"));
+        assert_eq!(
+            manager.pump(id, 1).expect("EOF pump"),
+            TransferPumpOutcome::Completed
+        );
         assert_eq!(manager.len(), 0);
     }
 
@@ -406,12 +453,21 @@ mod tests {
             )
             .expect("transfer");
 
-        manager.pump(id, 0).expect("first pump");
+        assert_eq!(
+            manager.pump(id, 0).expect("first pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(read_available(&mut sink_reader), b"abc");
-        manager.pump(id, 1).expect("EAGAIN pump");
+        assert_eq!(
+            manager.pump(id, 1).expect("EAGAIN pump"),
+            TransferPumpOutcome::Pending
+        );
         source_writer.write_all(b"def").expect("later source write");
 
-        manager.pump(id, 2).expect("later data pump");
+        assert_eq!(
+            manager.pump(id, 2).expect("later data pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(read_available(&mut sink_reader), b"def");
     }
 
@@ -490,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_writes_preserve_exact_payload_and_normalize() {
+    fn partial_sink_write_resumes_from_exact_offset() {
         let (mut manager, id) = scripted_transfer(u64::MAX);
         let mut io = ScriptedIo {
             reads: VecDeque::from([ReadOutcome::Data(b"ABCDEFGH".to_vec()), ReadOutcome::Eof]),
@@ -504,7 +560,10 @@ mod tests {
             received: Vec::new(),
         };
 
-        manager.pump_with_io(id, 0, &mut io).expect("partial pump");
+        assert_eq!(
+            manager.pump_with_io(id, 0, &mut io).expect("partial pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(io.received, b"AB");
         assert_eq!(io.reads.len(), 1, "one source chunk per pump");
         assert_eq!(
@@ -512,15 +571,96 @@ mod tests {
             TransferIoInterest::SinkWritable
         );
 
-        manager.pump_with_io(id, 1, &mut io).expect("resume pump");
+        assert_eq!(
+            manager.pump_with_io(id, 1, &mut io).expect("resume pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(io.received, b"ABCDEFGH");
         assert_eq!(io.reads.len(), 1, "draining does not read a second chunk");
         assert_eq!(
             manager.interest(id).expect("reading interest").interest,
             TransferIoInterest::SourceReadable
         );
-        assert!(manager.pump_with_io(id, 2, &mut io).expect("EOF pump"));
+        assert_eq!(
+            manager.pump_with_io(id, 2, &mut io).expect("EOF pump"),
+            TransferPumpOutcome::Completed
+        );
         assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn sink_eagain_preserves_buffer_and_offset() {
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        let mut io = ScriptedIo {
+            reads: VecDeque::from([ReadOutcome::Data(b"abcdef".to_vec())]),
+            writes: VecDeque::from([
+                WriteOutcome::Count(2),
+                WriteOutcome::WouldBlock,
+                WriteOutcome::Count(4),
+            ]),
+            received: Vec::new(),
+        };
+
+        assert_eq!(
+            manager
+                .pump_with_io(id, 0, &mut io)
+                .expect("initial partial write"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, b"ab");
+        assert_eq!(
+            manager.interest(id).expect("sink interest").interest,
+            TransferIoInterest::SinkWritable
+        );
+
+        assert_eq!(
+            manager
+                .pump_with_io(id, 1, &mut io)
+                .expect("resume after EAGAIN"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, b"abcdef");
+        assert_eq!(
+            manager.interest(id).expect("source interest").interest,
+            TransferIoInterest::SourceReadable
+        );
+    }
+
+    #[test]
+    fn arbitrary_partial_write_schedule_conserves_repeated_bytes() {
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        let mut io = ScriptedIo {
+            reads: VecDeque::from([ReadOutcome::Data(vec![b'x'; 10]), ReadOutcome::Eof]),
+            writes: VecDeque::from([
+                WriteOutcome::Count(1),
+                WriteOutcome::Count(2),
+                WriteOutcome::WouldBlock,
+                WriteOutcome::Count(3),
+                WriteOutcome::Count(1),
+                WriteOutcome::Count(3),
+            ]),
+            received: Vec::new(),
+        };
+
+        assert_eq!(
+            manager
+                .pump_with_io(id, 0, &mut io)
+                .expect("first partial schedule"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, vec![b'x'; 3]);
+        assert_eq!(
+            manager
+                .pump_with_io(id, 1, &mut io)
+                .expect("second partial schedule"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, vec![b'x'; 10]);
+        assert_eq!(
+            manager.pump_with_io(id, 2, &mut io).expect("scheduled EOF"),
+            TransferPumpOutcome::Completed
+        );
+        assert_eq!(io.received, vec![b'x'; 10]);
     }
 
     #[test]
@@ -536,9 +676,12 @@ mod tests {
             received: Vec::new(),
         };
 
-        manager
-            .pump_with_io(id, 0, &mut io)
-            .expect("backpressured pump");
+        assert_eq!(
+            manager
+                .pump_with_io(id, 0, &mut io)
+                .expect("backpressured pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(io.received, b"pa");
         assert_eq!(manager.len(), 1);
         assert_eq!(
@@ -546,7 +689,10 @@ mod tests {
             TransferIoInterest::SinkWritable
         );
 
-        manager.pump_with_io(id, 1, &mut io).expect("drain pump");
+        assert_eq!(
+            manager.pump_with_io(id, 1, &mut io).expect("drain pump"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(io.received, b"payload");
         assert_eq!(
             manager.interest(id).expect("source interest").interest,
@@ -554,7 +700,10 @@ mod tests {
         );
         assert_eq!(manager.len(), 1);
 
-        assert!(manager.pump_with_io(id, 2, &mut io).expect("EOF pump"));
+        assert_eq!(
+            manager.pump_with_io(id, 2, &mut io).expect("EOF pump"),
+            TransferPumpOutcome::Completed
+        );
         assert!(manager.is_empty());
     }
 
@@ -570,16 +719,88 @@ mod tests {
             received: Vec::new(),
         };
 
-        manager.pump_with_io(id, 0, &mut io).expect("source EAGAIN");
+        assert_eq!(
+            manager.pump_with_io(id, 0, &mut io).expect("source EAGAIN"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(manager.len(), 1);
         assert_eq!(
             manager.interest(id).expect("source interest").interest,
             TransferIoInterest::SourceReadable
         );
-        manager
-            .pump_with_io(id, 1, &mut io)
-            .expect("later source data");
+        assert_eq!(
+            manager
+                .pump_with_io(id, 1, &mut io)
+                .expect("later source data"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(io.received, b"later");
+    }
+
+    #[test]
+    fn readiness_tracks_reading_and_writing_phase() {
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        assert_eq!(
+            manager.interest(id).expect("initial interest").interest,
+            TransferIoInterest::SourceReadable
+        );
+
+        let mut io = ScriptedIo {
+            reads: VecDeque::from([
+                ReadOutcome::Data(b"abc".to_vec()),
+                ReadOutcome::WouldBlock,
+                ReadOutcome::Eof,
+            ]),
+            writes: VecDeque::from([
+                WriteOutcome::Count(1),
+                WriteOutcome::WouldBlock,
+                WriteOutcome::Count(2),
+            ]),
+            received: Vec::new(),
+        };
+        assert_eq!(
+            manager
+                .pump_with_io(id, 0, &mut io)
+                .expect("partial sink write"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(
+            manager.interest(id).expect("sink interest").interest,
+            TransferIoInterest::SinkWritable
+        );
+        assert_eq!(
+            manager.interest(id).expect("sink interest").events & TRANSFER_TERMINAL_EVENTS,
+            TRANSFER_TERMINAL_EVENTS
+        );
+        assert_ne!(
+            manager.interest(id).expect("sink interest").events & libc::EPOLLOUT as u32,
+            0
+        );
+
+        assert_eq!(
+            manager.pump_with_io(id, 1, &mut io).expect("drain sink"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(
+            manager.interest(id).expect("source interest").interest,
+            TransferIoInterest::SourceReadable
+        );
+
+        assert_eq!(
+            manager.pump_with_io(id, 2, &mut io).expect("source EAGAIN"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(
+            manager.interest(id).expect("source interest").interest,
+            TransferIoInterest::SourceReadable
+        );
+
+        assert_eq!(
+            manager.pump_with_io(id, 3, &mut io).expect("EOF"),
+            TransferPumpOutcome::Completed
+        );
+        assert!(manager.interest(id).is_none());
+        assert_eq!(io.received, b"abc");
     }
 
     #[test]
@@ -591,15 +812,86 @@ mod tests {
             received: Vec::new(),
         };
 
-        manager
-            .pump_with_io(id, 0, &mut io)
-            .expect("interrupted I/O");
+        assert_eq!(
+            manager
+                .pump_with_io(id, 0, &mut io)
+                .expect("interrupted I/O"),
+            TransferPumpOutcome::Pending
+        );
         assert_eq!(io.received, b"abc");
         assert_eq!(
             manager.interest(id).expect("source interest").interest,
             TransferIoInterest::SourceReadable
         );
         assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn source_eintr_does_not_abort_transfer() {
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        let mut io = ScriptedIo {
+            reads: VecDeque::from([ReadOutcome::Interrupted, ReadOutcome::Data(b"abc".to_vec())]),
+            writes: VecDeque::from([WriteOutcome::Count(3)]),
+            received: Vec::new(),
+        };
+
+        assert_eq!(
+            manager.pump_with_io(id, 0, &mut io).expect("source EINTR"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, b"abc");
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn sink_eintr_does_not_abort_transfer() {
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        let mut io = ScriptedIo {
+            reads: VecDeque::from([ReadOutcome::Data(b"abc".to_vec())]),
+            writes: VecDeque::from([WriteOutcome::Interrupted, WriteOutcome::Count(3)]),
+            received: Vec::new(),
+        };
+
+        assert_eq!(
+            manager.pump_with_io(id, 0, &mut io).expect("sink EINTR"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, b"abc");
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn repeated_eintr_is_bounded_without_losing_state() {
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        let mut io = ScriptedIo {
+            reads: std::iter::repeat_with(|| ReadOutcome::Interrupted)
+                .take(32)
+                .collect(),
+            writes: VecDeque::new(),
+            received: Vec::new(),
+        };
+
+        assert_eq!(
+            manager
+                .pump_with_io(id, 0, &mut io)
+                .expect("bounded source EINTR"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.reads.len(), 24);
+        assert_eq!(
+            manager.interest(id).expect("source interest").interest,
+            TransferIoInterest::SourceReadable
+        );
+
+        io.reads.push_front(ReadOutcome::Data(b"abc".to_vec()));
+        io.writes.push_back(WriteOutcome::Count(3));
+        assert_eq!(
+            manager
+                .pump_with_io(id, 1, &mut io)
+                .expect("data after bounded EINTR"),
+            TransferPumpOutcome::Pending
+        );
+        assert_eq!(io.received, b"abc");
     }
 
     #[test]
@@ -654,10 +946,24 @@ mod tests {
     fn deadline_expires_without_fd_readiness() {
         let (mut manager, id) = scripted_transfer(100);
         assert_eq!(manager.next_deadline_ns(), Some(100));
-        assert!(manager.expire(99).is_empty());
+        assert!(manager.expire_deadlines(99).is_empty());
         assert_eq!(manager.len(), 1);
-        assert_eq!(manager.expire(100), vec![id]);
+        assert_eq!(manager.expire_deadlines(100), vec![id]);
         assert_eq!(manager.next_deadline_ns(), None);
+        assert!(manager.is_empty());
+
+        let (mut manager, id) = scripted_transfer(100);
+        let mut io = ScriptedIo {
+            reads: VecDeque::from([ReadOutcome::Data(b"must not read".to_vec())]),
+            ..ScriptedIo::default()
+        };
+        assert_eq!(
+            manager
+                .pump_with_io(id, 100, &mut io)
+                .expect("deadline outcome"),
+            TransferPumpOutcome::TimedOut
+        );
+        assert_eq!(io.reads.len(), 1, "expired transfer attempted I/O");
         assert!(manager.is_empty());
     }
 
@@ -672,10 +978,11 @@ mod tests {
             .start(old_id.generation, source.into(), sink.into(), u64::MAX)
             .expect("replacement transfer");
         let mut io = ScriptedIo::default();
-        assert!(
+        assert_eq!(
             manager
                 .pump_with_io(old_id, 0, &mut io)
-                .expect("stale event")
+                .expect("stale event"),
+            TransferPumpOutcome::Gone
         );
         assert!(io.reads.is_empty());
         assert_eq!(manager.len(), 1);
@@ -765,7 +1072,7 @@ mod tests {
 
         let mut manager = TransferManager::default();
         let _ = fill_capacity(&mut manager, generation);
-        manager.expire(u64::MAX);
+        manager.expire_deadlines(u64::MAX);
         assert_slot_reusable(&mut manager, generation);
 
         let mut manager = TransferManager::default();
@@ -775,7 +1082,10 @@ mod tests {
 
         let mut manager = TransferManager::default();
         let ids = fill_capacity(&mut manager, generation);
-        assert!(manager.pump(ids[0], 0).expect("EOF completion"));
+        assert_eq!(
+            manager.pump(ids[0], 0).expect("EOF completion"),
+            TransferPumpOutcome::Completed
+        );
         assert_slot_reusable(&mut manager, generation);
 
         let mut manager = TransferManager::default();
@@ -828,5 +1138,54 @@ mod tests {
         ] {
             assert_eq!(transfer_payload_exact(payload.clone()), payload);
         }
+    }
+
+    #[test]
+    fn large_slow_transfer_preserves_every_byte_and_bounded_buffer() {
+        let chunks = [
+            vec![b'a'; MAX_TRANSFER_CHUNK],
+            vec![b'b'; MAX_TRANSFER_CHUNK],
+            vec![b'c'; MAX_TRANSFER_CHUNK],
+            vec![b'd'; MAX_TRANSFER_CHUNK],
+            vec![b'e'; MAX_TRANSFER_CHUNK],
+            vec![b'f'; 17],
+        ];
+        let payload = chunks.concat();
+        let mut writes = VecDeque::new();
+        for chunk in &chunks {
+            writes.push_back(WriteOutcome::Count(1));
+            writes.push_back(WriteOutcome::WouldBlock);
+            writes.push_back(WriteOutcome::Count(chunk.len() - 1));
+        }
+        let (mut manager, id) = scripted_transfer(u64::MAX);
+        let mut io = ScriptedIo {
+            reads: chunks
+                .iter()
+                .cloned()
+                .map(ReadOutcome::Data)
+                .chain([ReadOutcome::Eof])
+                .collect(),
+            writes,
+            received: Vec::new(),
+        };
+
+        for now_ns in 0..32 {
+            if manager.is_empty() {
+                break;
+            }
+            let outcome = manager
+                .pump_with_io(id, now_ns, &mut io)
+                .expect("large slow transfer");
+            if let Some(transfer) = manager.transfers.get(&id) {
+                assert!(transfer.buffer.capacity() <= MAX_TRANSFER_CHUNK);
+                assert!(transfer.buffer.len() <= MAX_TRANSFER_CHUNK);
+            }
+            if outcome == TransferPumpOutcome::Completed {
+                break;
+            }
+        }
+
+        assert_eq!(io.received, payload);
+        assert!(manager.is_empty());
     }
 }
