@@ -226,7 +226,10 @@ pub use decoration::types::DecorationRect;
 pub use direct_scanout::DirectScanoutSceneBlockers;
 #[cfg(test)]
 pub(crate) use direct_scanout::direct_scanout_scene_rejection_for_effects;
-pub use direct_scanout::{DirectScanoutSceneCandidate, DirectScanoutSceneRejection};
+pub use direct_scanout::{
+    DirectScanoutEffectAnalysis, DirectScanoutEffectDisposition, DirectScanoutEffectDoctorDetails,
+    DirectScanoutEffectInstanceAnalysis, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
+};
 pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
     EffectAnchor, EffectAnchorScope, EffectFrameDemandSnapshot, EffectSceneOrder,

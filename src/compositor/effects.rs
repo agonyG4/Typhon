@@ -356,11 +356,44 @@ impl super::CompositorState {
 
     pub(in crate::compositor) fn direct_scanout_effect_doctor_details(
         &self,
-    ) -> (u32, Vec<String>, bool) {
+        analysis: &super::DirectScanoutSceneAnalysis,
+    ) -> super::DirectScanoutEffectDoctorDetails {
         super::direct_scanout_doctor::effect_details(
-            &self.resolved_effect_scene(),
+            &analysis.effects,
             &self.trusted_effect_registry.current(),
         )
+    }
+
+    pub(in crate::compositor) fn resolved_effect_scene_for_composition_plan(
+        &self,
+        fullscreen_plan: &FullscreenCompositionPlan,
+    ) -> ResolvedEffectScene {
+        let scene = self.resolved_effect_scene();
+        let instances = scene
+            .instances
+            .into_iter()
+            .filter(|instance| self.effect_instance_allows_presentation(instance, fullscreen_plan))
+            .collect();
+        ResolvedEffectScene::new(scene.generation, instances)
+    }
+
+    pub(in crate::compositor) fn effect_instance_allows_presentation(
+        &self,
+        instance: &ResolvedEffectInstance,
+        fullscreen_plan: &FullscreenCompositionPlan,
+    ) -> bool {
+        let root_surface_id = match instance.anchor {
+            EffectAnchor::BeforeSurface(surface_id)
+            | EffectAnchor::ReplaceSurface(surface_id)
+            | EffectAnchor::AfterSurface(surface_id) => {
+                Some(self.root_surface_id_for_surface(surface_id))
+            }
+            EffectAnchor::OutputPostProcess => None,
+        };
+        root_surface_id.is_none_or(|root| {
+            !self.lifecycle_surface_is_suppressed(root)
+                && fullscreen_plan.allows_presentation_root(root)
+        })
     }
 
     fn scene_order_for_instance(&self, instance: &ResolvedEffectInstance) -> EffectSceneOrder {
@@ -406,24 +439,10 @@ impl super::CompositorState {
         presentation: &PresentationSceneSample,
         fullscreen_plan: &FullscreenCompositionPlan,
     ) -> ResolvedEffectScene {
-        let scene = self.resolved_effect_scene();
+        let scene = self.resolved_effect_scene_for_composition_plan(fullscreen_plan);
         let instances = scene
             .instances
             .into_iter()
-            .filter(|instance| {
-                let root_surface_id = match instance.anchor {
-                    EffectAnchor::BeforeSurface(surface_id)
-                    | EffectAnchor::ReplaceSurface(surface_id)
-                    | EffectAnchor::AfterSurface(surface_id) => {
-                        Some(self.root_surface_id_for_surface(surface_id))
-                    }
-                    EffectAnchor::OutputPostProcess => None,
-                };
-                root_surface_id.is_none_or(|root| {
-                    !self.lifecycle_surface_is_suppressed(root)
-                        && fullscreen_plan.allows_presentation_root(root)
-                })
-            })
             .map(|mut instance| {
                 let surface_id = match instance.anchor {
                     EffectAnchor::BeforeSurface(surface_id)

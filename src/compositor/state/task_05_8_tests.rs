@@ -5,7 +5,9 @@ use super::*;
 #[cfg(test)]
 mod task_05_8_tests {
     use super::*;
+    use crate::compositor::direct_scanout::DirectScanoutEffectSource;
     use crate::compositor::interaction::MAX_IN_FLIGHT_RESIZE_CONFIGURES;
+    use crate::effects::{EffectRect, EffectRegion};
     use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceSwitchOutcome};
     use std::borrow::Cow;
     use std::fs;
@@ -296,6 +298,264 @@ mod task_05_8_tests {
                 .collect::<Vec<_>>(),
             [905]
         );
+    }
+
+    #[test]
+    fn fullscreen_presentation_filters_anchored_effects_with_surface_visibility() {
+        let mut state = CompositorState::default();
+        let panel_window = WindowId::from_raw(41).expect("panel window id");
+        let fullscreen_window = WindowId::from_raw(42).expect("fullscreen window id");
+        let panel = test_surface(941, 320, 180);
+        let mut fullscreen = test_surface(942, state.output_size.width, state.output_size.height);
+        fullscreen.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![panel, fullscreen],
+            &[(941, panel_window), (942, fullscreen_window)],
+            None,
+        );
+        let blur_region = EffectRegion::from_rect(EffectRect::new(40, 30, 320, 180).unwrap());
+        let blur_program = crate::effects::builtin_background_blur_program_id();
+        assert!(state.set_internal_surface_effect(
+            941,
+            EffectAnchor::BeforeSurface(941),
+            blur_program,
+            blur_region,
+        ));
+        assert!(state.set_internal_surface_effect(
+            0,
+            EffectAnchor::OutputPostProcess,
+            blur_program,
+            EffectRegion::from_rect(EffectRect::new(0, 0, 64, 64).unwrap()),
+        ));
+
+        let output_id = state
+            .ensure_native_output_id()
+            .expect("test output identity");
+        let presentation = PresentationSceneSample::empty_for_output(
+            output_id,
+            AnimationTime::from_nanos(0),
+            PresentationSampleTimeSource::ZeroFallback,
+        );
+        let normal_plan = state.fullscreen_composition_plan();
+        let normal_effects =
+            state.resolved_effect_scene_with_presentation(&presentation, &normal_plan);
+        assert_eq!(normal_effects.instances.len(), 2);
+        assert_eq!(
+            normal_effects
+                .instances
+                .iter()
+                .find(|instance| instance.anchor == EffectAnchor::BeforeSurface(941))
+                .map(|instance| instance.anchor),
+            Some(EffectAnchor::BeforeSurface(941))
+        );
+        assert!(
+            normal_effects
+                .instances
+                .iter()
+                .any(|instance| instance.anchor == EffectAnchor::OutputPostProcess)
+        );
+
+        state.set_fullscreen_presentation_owner(942);
+        let (renderable, fullscreen_plan, metrics) =
+            state.native_frame_renderable_surfaces_with_composition_plan();
+        assert!(metrics.fullscreen_composition_active);
+        assert_eq!(
+            renderable
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [942]
+        );
+        let fullscreen_effects =
+            state.resolved_effect_scene_with_presentation(&presentation, &fullscreen_plan);
+        assert_eq!(fullscreen_effects.instances.len(), 1);
+        assert_eq!(
+            fullscreen_effects.instances[0].anchor,
+            EffectAnchor::OutputPostProcess
+        );
+        assert!(
+            fullscreen_effects
+                .instances
+                .iter()
+                .all(|instance| instance.anchor != EffectAnchor::BeforeSurface(941)),
+            "effects anchored to culled roots must be absent from the presentation scene"
+        );
+        let canonical_fullscreen_effects =
+            state.resolved_effect_scene_for_composition_plan(&fullscreen_plan);
+        assert_eq!(canonical_fullscreen_effects.instances.len(), 1);
+        assert!(
+            canonical_fullscreen_effects
+                .instances
+                .iter()
+                .all(|instance| instance.anchor != EffectAnchor::BeforeSurface(941))
+        );
+        let fullscreen_effect_analysis = state.direct_scanout_effect_analysis(
+            &fullscreen_plan,
+            BufferSize::new(state.output_size.width, state.output_size.height)
+                .expect("test output size"),
+            None,
+        );
+        assert_eq!(fullscreen_effect_analysis.raw_instance_count, 2);
+        assert_eq!(fullscreen_effect_analysis.presentation_instance_count, 1);
+        assert_eq!(fullscreen_effect_analysis.culled_instance_count, 1);
+        assert_eq!(fullscreen_effect_analysis.contributing_instance_count, 1);
+
+        let fullscreen_source = DirectScanoutEffectSource {
+            group_order: state.visual_group_for_surface(942).map(|group| group.get()),
+            surface_order: state
+                .active_scene_surfaces()
+                .iter()
+                .position(|surface| surface.surface_id == 942)
+                .and_then(|index| u32::try_from(index).ok()),
+            can_occlude: true,
+        };
+        let source_relative_effect_analysis = state.direct_scanout_effect_analysis(
+            &fullscreen_plan,
+            BufferSize::new(state.output_size.width, state.output_size.height)
+                .expect("test output size"),
+            Some(fullscreen_source),
+        );
+        assert_eq!(
+            source_relative_effect_analysis.presentation_instance_count,
+            1
+        );
+        assert_eq!(source_relative_effect_analysis.culled_instance_count, 1);
+        assert_eq!(source_relative_effect_analysis.occluded_instance_count, 0);
+        assert_eq!(
+            source_relative_effect_analysis.contributing_instance_count,
+            1
+        );
+        assert!(source_relative_effect_analysis.requires_composition);
+
+        let mut allowed_plan = fullscreen_plan.clone();
+        allowed_plan.allowed_application_roots.push(941);
+        let allowed_effects =
+            state.resolved_effect_scene_with_presentation(&presentation, &allowed_plan);
+        assert_eq!(allowed_effects.instances.len(), 2);
+        assert!(
+            allowed_effects
+                .instances
+                .iter()
+                .any(|instance| instance.anchor == EffectAnchor::BeforeSurface(941))
+        );
+        assert!(
+            allowed_effects
+                .instances
+                .iter()
+                .any(|instance| instance.anchor == EffectAnchor::OutputPostProcess)
+        );
+
+        state.clear_fullscreen_presentation_owner(942);
+        let (_, restored_plan, restored_metrics) =
+            state.native_frame_renderable_surfaces_with_composition_plan();
+        assert!(!restored_metrics.fullscreen_composition_active);
+        let restored_effects =
+            state.resolved_effect_scene_with_presentation(&presentation, &restored_plan);
+        assert_eq!(restored_effects.instances.len(), 2);
+        assert!(
+            restored_effects
+                .instances
+                .iter()
+                .any(|instance| instance.anchor == EffectAnchor::BeforeSurface(941))
+        );
+        assert!(
+            restored_effects
+                .instances
+                .iter()
+                .any(|instance| instance.anchor == EffectAnchor::OutputPostProcess)
+        );
+    }
+
+    #[test]
+    fn direct_scanout_effect_analysis_has_zero_effect_fast_path() {
+        let state = CompositorState::default();
+        let plan = state.fullscreen_composition_plan();
+        let analysis = state.direct_scanout_effect_analysis(
+            &plan,
+            BufferSize::new(state.output_size.width, state.output_size.height)
+                .expect("test output size"),
+            None,
+        );
+
+        assert_eq!(analysis, DirectScanoutEffectAnalysis::default());
+        assert!(!analysis.requires_composition);
+    }
+
+    #[test]
+    fn direct_scanout_effect_analysis_uses_output_intersection_and_opaque_proof() {
+        let mut state = CompositorState::default();
+        let panel_window = WindowId::from_raw(51).expect("panel window id");
+        let fullscreen_window = WindowId::from_raw(52).expect("fullscreen window id");
+        let panel = test_surface(951, 320, 180);
+        let mut fullscreen = test_surface(952, state.output_size.width, state.output_size.height);
+        fullscreen.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![panel, fullscreen],
+            &[(951, panel_window), (952, fullscreen_window)],
+            None,
+        );
+        let plan = state.fullscreen_composition_plan();
+        let source = DirectScanoutEffectSource {
+            group_order: state.visual_group_for_surface(952).map(|group| group.get()),
+            surface_order: state
+                .active_scene_surfaces()
+                .iter()
+                .position(|surface| surface.surface_id == 952)
+                .and_then(|index| u32::try_from(index).ok()),
+            can_occlude: true,
+        };
+
+        assert!(state.set_internal_surface_effect(
+            952,
+            EffectAnchor::AfterSurface(952),
+            crate::effects::builtin_background_blur_program_id(),
+            EffectRegion::from_rect(EffectRect::new(1270, 0, 20, 20).unwrap()),
+        ));
+        let partial = state.direct_scanout_effect_analysis(
+            &plan,
+            BufferSize::new(state.output_size.width, state.output_size.height)
+                .expect("test output size"),
+            Some(source),
+        );
+        assert_eq!(partial.outside_output_instance_count, 0);
+        assert_eq!(partial.contributing_instance_count, 1);
+        assert!(partial.requires_composition);
+
+        assert!(state.clear_internal_surface_effect(952));
+        assert!(state.set_internal_surface_effect(
+            952,
+            EffectAnchor::BeforeSurface(952),
+            crate::effects::builtin_background_blur_program_id(),
+            EffectRegion::from_rect(EffectRect::new(2000, 0, 20, 20).unwrap()),
+        ));
+        let outside = state.direct_scanout_effect_analysis(
+            &plan,
+            BufferSize::new(state.output_size.width, state.output_size.height)
+                .expect("test output size"),
+            Some(source),
+        );
+        assert_eq!(outside.outside_output_instance_count, 1);
+        assert_eq!(outside.contributing_instance_count, 0);
+        assert!(!outside.requires_composition);
+
+        assert!(state.clear_internal_surface_effect(952));
+        assert!(state.set_internal_surface_effect(
+            952,
+            EffectAnchor::BeforeSurface(952),
+            crate::effects::builtin_background_blur_program_id(),
+            EffectRegion::from_rect(EffectRect::new(0, 0, 20, 20).unwrap()),
+        ));
+        let unknown_opacity = state.direct_scanout_effect_analysis(
+            &plan,
+            BufferSize::new(state.output_size.width, state.output_size.height)
+                .expect("test output size"),
+            Some(DirectScanoutEffectSource {
+                can_occlude: false,
+                ..source
+            }),
+        );
+        assert_eq!(unknown_opacity.contributing_instance_count, 1);
+        assert!(unknown_opacity.requires_composition);
     }
 
     #[test]

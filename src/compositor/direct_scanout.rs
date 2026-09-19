@@ -1,6 +1,77 @@
+use super::effects::{EffectAnchor, EffectAnchorScope};
 use super::state_data::ViewportSourceRect;
 use super::{BufferIdentity, BufferSize, DmabufBufferHandle, SurfaceCommitSequence};
+use crate::effects::{EffectInstanceId, EffectProgramId, EffectRegion};
 use wayland_server::protocol::wl_output;
+
+pub(crate) const MAX_DIRECT_SCANOUT_EFFECT_DETAILS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectScanoutEffectDisposition {
+    PresentationCulled,
+    OutsideOutput,
+    OccludedByOpaqueScanoutSource,
+    ContributingAboveSource,
+    ContributingAtSource,
+    OutputPostProcess,
+    UnknownOrder,
+}
+
+impl DirectScanoutEffectDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PresentationCulled => "presentation_culled",
+            Self::OutsideOutput => "outside_output",
+            Self::OccludedByOpaqueScanoutSource => "occluded_by_scanout_source",
+            Self::ContributingAboveSource => "contributing_above_source",
+            Self::ContributingAtSource => "contributing_at_source",
+            Self::OutputPostProcess => "output_post_process",
+            Self::UnknownOrder => "unknown_order",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectScanoutEffectInstanceAnalysis {
+    pub id: EffectInstanceId,
+    pub program: EffectProgramId,
+    pub anchor: EffectAnchor,
+    pub region: EffectRegion,
+    pub disposition: DirectScanoutEffectDisposition,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectScanoutEffectAnalysis {
+    pub raw_instance_count: u32,
+    pub presentation_instance_count: u32,
+    pub culled_instance_count: u32,
+    pub outside_output_instance_count: u32,
+    pub occluded_instance_count: u32,
+    pub contributing_instance_count: u32,
+    pub requires_composition: bool,
+    pub instances: Vec<DirectScanoutEffectInstanceAnalysis>,
+    pub instances_truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectScanoutEffectDoctorDetails {
+    pub raw_instance_count: u32,
+    pub presentation_instance_count: u32,
+    pub culled_instance_count: u32,
+    pub outside_output_instance_count: u32,
+    pub occluded_instance_count: u32,
+    pub contributing_instance_count: u32,
+    pub requires_composition: bool,
+    pub details: Vec<String>,
+    pub details_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectScanoutEffectSource {
+    pub(crate) group_order: Option<u32>,
+    pub(crate) surface_order: Option<u32>,
+    pub(crate) can_occlude: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct DirectScanoutSceneCandidate {
@@ -113,6 +184,73 @@ impl DirectScanoutSceneBlockers {
     }
 }
 
+pub(crate) fn classify_direct_scanout_effect(
+    instance: &crate::compositor::ResolvedEffectInstance,
+    source: DirectScanoutEffectSource,
+    anchor_surface_order: Option<u32>,
+) -> DirectScanoutEffectDisposition {
+    if instance.anchor == EffectAnchor::OutputPostProcess {
+        return DirectScanoutEffectDisposition::OutputPostProcess;
+    }
+    let Some(effect_group_order) = instance.visual_group.map(|group| group.get()) else {
+        return DirectScanoutEffectDisposition::UnknownOrder;
+    };
+    let Some(source_group_order) = source.group_order else {
+        return DirectScanoutEffectDisposition::UnknownOrder;
+    };
+
+    if effect_group_order < source_group_order {
+        return if source.can_occlude {
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        } else {
+            DirectScanoutEffectDisposition::UnknownOrder
+        };
+    }
+    if effect_group_order > source_group_order {
+        return DirectScanoutEffectDisposition::ContributingAboveSource;
+    }
+
+    if instance.anchor_scope == EffectAnchorScope::VisualGroup {
+        return match instance.anchor {
+            EffectAnchor::BeforeSurface(_) if source.can_occlude => {
+                DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+            }
+            EffectAnchor::BeforeSurface(_) => DirectScanoutEffectDisposition::UnknownOrder,
+            EffectAnchor::ReplaceSurface(_) | EffectAnchor::AfterSurface(_) => {
+                DirectScanoutEffectDisposition::ContributingAtSource
+            }
+            EffectAnchor::OutputPostProcess => DirectScanoutEffectDisposition::OutputPostProcess,
+        };
+    }
+
+    let Some(source_surface_order) = source.surface_order else {
+        return DirectScanoutEffectDisposition::UnknownOrder;
+    };
+    let Some(anchor_surface_order) = anchor_surface_order else {
+        return DirectScanoutEffectDisposition::UnknownOrder;
+    };
+    if anchor_surface_order < source_surface_order {
+        return if source.can_occlude {
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        } else {
+            DirectScanoutEffectDisposition::UnknownOrder
+        };
+    }
+    if anchor_surface_order > source_surface_order {
+        return DirectScanoutEffectDisposition::ContributingAboveSource;
+    }
+    match instance.anchor {
+        EffectAnchor::BeforeSurface(_) if source.can_occlude => {
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        }
+        EffectAnchor::BeforeSurface(_) => DirectScanoutEffectDisposition::UnknownOrder,
+        EffectAnchor::ReplaceSurface(_) | EffectAnchor::AfterSurface(_) => {
+            DirectScanoutEffectDisposition::ContributingAtSource
+        }
+        EffectAnchor::OutputPostProcess => DirectScanoutEffectDisposition::OutputPostProcess,
+    }
+}
+
 pub(crate) fn direct_scanout_viewport_compatibility(
     buffer_size: BufferSize,
     output_size: BufferSize,
@@ -170,6 +308,7 @@ pub(crate) const fn direct_scanout_scene_rejection_for_flags(
     }
 }
 
+#[cfg(test)]
 pub(crate) const fn direct_scanout_scene_rejection_for_effects(
     summary: crate::compositor::EffectSceneSummary,
 ) -> Option<DirectScanoutSceneRejection> {
@@ -177,5 +316,172 @@ pub(crate) const fn direct_scanout_scene_rejection_for_effects(
         Some(DirectScanoutSceneRejection::EffectRequiresComposition)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compositor::{EffectAnchorScope, EffectSceneOrder, VisualGroupId};
+    use crate::effects::{
+        EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect,
+        EffectRegion,
+    };
+
+    fn effect(
+        anchor: EffectAnchor,
+        anchor_scope: EffectAnchorScope,
+        group: u32,
+    ) -> crate::compositor::ResolvedEffectInstance {
+        let region = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 10).unwrap());
+        crate::compositor::ResolvedEffectInstance {
+            id: EffectInstanceId::new(1).unwrap(),
+            program: EffectProgramId::new(2).unwrap(),
+            anchor,
+            region: region.clone(),
+            target_bounds: EffectRect::new(0, 0, 10, 10).unwrap(),
+            parameter_block: EffectParameterBlock::default(),
+            signature: 0,
+            frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: VisualGroupId::new(group),
+            anchor_scope,
+            scene_order: EffectSceneOrder::for_anchor(anchor),
+        }
+    }
+
+    fn source() -> DirectScanoutEffectSource {
+        DirectScanoutEffectSource {
+            group_order: Some(2),
+            surface_order: Some(1),
+            can_occlude: true,
+        }
+    }
+
+    #[test]
+    fn source_relative_effect_order_uses_scope_and_anchor_phase() {
+        let source = source();
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::BeforeSurface(20),
+                    EffectAnchorScope::Surface,
+                    2,
+                ),
+                source,
+                Some(1),
+            ),
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::ReplaceSurface(20),
+                    EffectAnchorScope::Surface,
+                    2,
+                ),
+                source,
+                Some(1),
+            ),
+            DirectScanoutEffectDisposition::ContributingAtSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::AfterSurface(20),
+                    EffectAnchorScope::Surface,
+                    2
+                ),
+                source,
+                Some(1),
+            ),
+            DirectScanoutEffectDisposition::ContributingAtSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::BeforeSurface(10),
+                    EffectAnchorScope::Surface,
+                    2
+                ),
+                source,
+                Some(0),
+            ),
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::BeforeSurface(30),
+                    EffectAnchorScope::Surface,
+                    2
+                ),
+                source,
+                Some(2),
+            ),
+            DirectScanoutEffectDisposition::ContributingAboveSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::BeforeSurface(10),
+                    EffectAnchorScope::VisualGroup,
+                    2,
+                ),
+                source,
+                None,
+            ),
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::ReplaceSurface(10),
+                    EffectAnchorScope::VisualGroup,
+                    2,
+                ),
+                source,
+                None,
+            ),
+            DirectScanoutEffectDisposition::ContributingAtSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::AfterSurface(10),
+                    EffectAnchorScope::VisualGroup,
+                    1
+                ),
+                source,
+                None,
+            ),
+            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::AfterSurface(30),
+                    EffectAnchorScope::Surface,
+                    3
+                ),
+                source,
+                Some(0),
+            ),
+            DirectScanoutEffectDisposition::ContributingAboveSource
+        );
+        assert_eq!(
+            classify_direct_scanout_effect(
+                &effect(
+                    EffectAnchor::BeforeSurface(10),
+                    EffectAnchorScope::Surface,
+                    1
+                ),
+                DirectScanoutEffectSource {
+                    group_order: None,
+                    ..source
+                },
+                Some(0),
+            ),
+            DirectScanoutEffectDisposition::UnknownOrder
+        );
     }
 }

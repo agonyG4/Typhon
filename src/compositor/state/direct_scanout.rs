@@ -1,12 +1,19 @@
 use super::*;
 use crate::compositor::direct_scanout::{
+    DirectScanoutEffectAnalysis, DirectScanoutEffectDisposition,
+    DirectScanoutEffectInstanceAnalysis, DirectScanoutEffectSource,
+    MAX_DIRECT_SCANOUT_EFFECT_DETAILS,
+};
+use crate::compositor::direct_scanout::{
     DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
     direct_scanout_viewport_compatibility,
 };
+use crate::compositor::effects::EffectAnchor;
 use crate::compositor::presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageContentKind,
 };
 use crate::compositor::render::SurfaceTargetRect;
+use crate::effects::EffectRect;
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 use crate::wm::WorkspaceLocation;
 use wayland_server::Resource;
@@ -14,11 +21,115 @@ use wayland_server::Resource;
 #[derive(Debug, Clone)]
 pub struct DirectScanoutSceneAnalysis {
     pub coverage: PresentationCoverageAnalysis,
+    pub effects: DirectScanoutEffectAnalysis,
     pub candidate: Option<DirectScanoutSceneCandidate>,
     pub blockers: DirectScanoutSceneBlockers,
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn direct_scanout_effect_analysis(
+        &self,
+        fullscreen_plan: &FullscreenCompositionPlan,
+        output_size: BufferSize,
+        source: Option<DirectScanoutEffectSource>,
+    ) -> DirectScanoutEffectAnalysis {
+        if self.effect_scene_summary().visible_instance_count == 0 {
+            return DirectScanoutEffectAnalysis::default();
+        }
+
+        let scene = self.resolved_effect_scene();
+        let output_bounds = EffectRect::new(0, 0, output_size.width, output_size.height)
+            .expect("configured output size is nonzero");
+        let mut analysis = DirectScanoutEffectAnalysis {
+            raw_instance_count: scene.summary.visible_instance_count,
+            instances_truncated: scene.instances.len() > MAX_DIRECT_SCANOUT_EFFECT_DETAILS,
+            ..DirectScanoutEffectAnalysis::default()
+        };
+
+        for instance in &scene.instances {
+            let disposition = if !self
+                .effect_instance_allows_presentation(instance, fullscreen_plan)
+            {
+                analysis.culled_instance_count = analysis.culled_instance_count.saturating_add(1);
+                DirectScanoutEffectDisposition::PresentationCulled
+            } else {
+                analysis.presentation_instance_count =
+                    analysis.presentation_instance_count.saturating_add(1);
+                if instance.region.intersect_rect(output_bounds).is_empty() {
+                    analysis.outside_output_instance_count =
+                        analysis.outside_output_instance_count.saturating_add(1);
+                    DirectScanoutEffectDisposition::OutsideOutput
+                } else {
+                    let disposition = self.classify_direct_scanout_effect(instance, source);
+                    match disposition {
+                        DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource => {
+                            analysis.occluded_instance_count =
+                                analysis.occluded_instance_count.saturating_add(1);
+                        }
+                        DirectScanoutEffectDisposition::ContributingAboveSource
+                        | DirectScanoutEffectDisposition::ContributingAtSource
+                        | DirectScanoutEffectDisposition::OutputPostProcess
+                        | DirectScanoutEffectDisposition::UnknownOrder => {
+                            analysis.contributing_instance_count =
+                                analysis.contributing_instance_count.saturating_add(1);
+                        }
+                        DirectScanoutEffectDisposition::PresentationCulled
+                        | DirectScanoutEffectDisposition::OutsideOutput => {}
+                    }
+                    disposition
+                }
+            };
+
+            if analysis.instances.len() < MAX_DIRECT_SCANOUT_EFFECT_DETAILS {
+                analysis
+                    .instances
+                    .push(DirectScanoutEffectInstanceAnalysis {
+                        id: instance.id,
+                        program: instance.program,
+                        anchor: instance.anchor,
+                        region: instance.region.clone(),
+                        disposition,
+                    });
+            }
+        }
+        analysis.requires_composition = analysis.contributing_instance_count > 0;
+        analysis
+    }
+
+    fn classify_direct_scanout_effect(
+        &self,
+        instance: &crate::compositor::ResolvedEffectInstance,
+        source: Option<DirectScanoutEffectSource>,
+    ) -> DirectScanoutEffectDisposition {
+        if instance.anchor == EffectAnchor::OutputPostProcess {
+            return DirectScanoutEffectDisposition::OutputPostProcess;
+        }
+        let Some(source) = source else {
+            return DirectScanoutEffectDisposition::UnknownOrder;
+        };
+        let Some(anchor_surface_id) = (match instance.anchor {
+            EffectAnchor::BeforeSurface(surface_id)
+            | EffectAnchor::ReplaceSurface(surface_id)
+            | EffectAnchor::AfterSurface(surface_id) => Some(surface_id),
+            EffectAnchor::OutputPostProcess => None,
+        }) else {
+            return DirectScanoutEffectDisposition::UnknownOrder;
+        };
+        let anchor_surface_order = self.active_scene_surface_order(anchor_surface_id);
+        crate::compositor::direct_scanout::classify_direct_scanout_effect(
+            instance,
+            source,
+            anchor_surface_order,
+        )
+    }
+
+    fn active_scene_surface_order(&self, surface_id: u32) -> Option<u32> {
+        self.active_scene_surfaces()
+            .iter()
+            .position(|surface| surface.surface_id == surface_id)
+            .and_then(|index| u32::try_from(index).ok())
+    }
+
     pub(in crate::compositor) fn direct_scanout_scene_analysis(
         &self,
     ) -> DirectScanoutSceneAnalysis {
@@ -26,15 +137,10 @@ impl CompositorState {
             .expect("configured output size is nonzero");
         let active_surfaces = self.active_scene_surfaces();
         let coverage = self.presentation_coverage_analysis();
+        let fullscreen_plan = self.fullscreen_composition_plan();
+        let mut effects = self.direct_scanout_effect_analysis(&fullscreen_plan, output_size, None);
 
         let mut blockers = DirectScanoutSceneBlockers::default();
-        if let Some(rejection) =
-            crate::compositor::direct_scanout::direct_scanout_scene_rejection_for_effects(
-                self.effect_scene_summary(),
-            )
-        {
-            blockers.push(rejection);
-        }
         if self.presentation_animation_has_pending_visible_geometry() {
             blockers.push(DirectScanoutSceneRejection::AnimationTransform);
         }
@@ -47,8 +153,12 @@ impl CompositorState {
 
         let Some(covering_group) = coverage.covering_application_group.as_ref() else {
             blockers.push(DirectScanoutSceneRejection::NoOutputCoveringApplication);
+            if effects.requires_composition {
+                blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
+            }
             return DirectScanoutSceneAnalysis {
                 coverage,
+                effects,
                 candidate: None,
                 blockers,
             };
@@ -109,8 +219,12 @@ impl CompositorState {
             if self.has_pending_frame_prepare_work() {
                 blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
             }
+            if effects.requires_composition {
+                blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
+            }
             return DirectScanoutSceneAnalysis {
                 coverage,
+                effects,
                 candidate: None,
                 blockers,
             };
@@ -124,8 +238,12 @@ impl CompositorState {
             if self.has_pending_frame_prepare_work() {
                 blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
             }
+            if effects.requires_composition {
+                blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
+            }
             return DirectScanoutSceneAnalysis {
                 coverage,
+                effects,
                 candidate: None,
                 blockers,
             };
@@ -155,6 +273,26 @@ impl CompositorState {
             ) {
                 blockers.push(rejection);
             }
+        }
+        effects = self.direct_scanout_effect_analysis(
+            &fullscreen_plan,
+            output_size,
+            Some(DirectScanoutEffectSource {
+                group_order: self
+                    .visual_group_for_surface(source_surface_id)
+                    .map(|group| group.get()),
+                surface_order: self.active_scene_surface_order(source_surface_id),
+                can_occlude: covering_surface.target
+                    == SurfaceTargetRect::new(0, 0, output_size.width, output_size.height)
+                    && coverage.geometrically_covers_output()
+                    && coverage.can_occlude_behind_content()
+                    && buffer
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.format().is_opaque_rgb8888()),
+            }),
+        );
+        if effects.requires_composition {
+            blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
         }
         if source.visual_clip.is_some() {
             blockers.push(DirectScanoutSceneRejection::VisualClipPresent);
@@ -234,6 +372,7 @@ impl CompositorState {
         debug_assert_eq!(candidate.is_some(), blockers.is_empty());
         DirectScanoutSceneAnalysis {
             coverage,
+            effects,
             candidate,
             blockers,
         }

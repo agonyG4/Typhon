@@ -2,7 +2,8 @@ use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_serve
 use super::*;
 
 use oblivion_one::compositor::{
-    DirectScanoutFeedbackCapabilities, DirectScanoutSceneAnalysis, SurfaceRenderBackend,
+    DirectScanoutEffectDoctorDetails, DirectScanoutFeedbackCapabilities,
+    DirectScanoutSceneAnalysis, SurfaceRenderBackend,
 };
 use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
@@ -932,14 +933,16 @@ impl NativeRuntime {
                 let visible_above = self.server.direct_scanout_layer_shell_doctor_details(
                     &direct_scene_analysis.coverage.visible_content_above,
                 );
-                let effects = self.server.direct_scanout_effect_doctor_details();
+                let effects = self
+                    .server
+                    .direct_scanout_effect_doctor_details(&direct_scene_analysis);
                 let scanout_capabilities = self.scanout.dmabuf_scanout_capabilities();
                 let direct_scene = DirectScanoutDoctorScene::from_analysis(
                     &direct_scene_analysis,
                     semantic_solitary_fullscreen,
                     scanout_capabilities.as_ref(),
                     visible_above,
-                    effects,
+                    &effects,
                 );
                 let direct_runtime = DirectScanoutDoctorRuntime {
                     direct_pending: self.scanout.direct_scanout_pending(),
@@ -2182,6 +2185,12 @@ mod tests {
             opacity: "unknown",
             scene_blockers: vec!["application_content_above", "popup_visible"],
             effects_visible_instance_count: 0,
+            effects_presentation_instance_count: 0,
+            effects_culled_instance_count: 0,
+            effects_outside_output_instance_count: 0,
+            effects_occluded_instance_count: 0,
+            effects_contributing_instance_count: 0,
+            effect_requires_composition: false,
             effects: Vec::new(),
             effects_truncated: false,
             semantic_solitary_fullscreen: false,
@@ -2229,8 +2238,14 @@ mod tests {
             opacity: "opaque_rgb8888",
             scene_blockers: Vec::new(),
             effects_visible_instance_count: 1,
+            effects_presentation_instance_count: 1,
+            effects_culled_instance_count: 0,
+            effects_outside_output_instance_count: 0,
+            effects_occluded_instance_count: 1,
+            effects_contributing_instance_count: 0,
+            effect_requires_composition: false,
             effects: vec![
-                "{id:123 program:background_blur anchor:before_surface:7 region:0,0,1920,64 target_surface:7 requires_composition:true}".to_string(),
+                "{id:123 program:background_blur anchor:before_surface:7 region:0,0,1920,64 target_surface:7 disposition:occluded_by_scanout_source requires_composition:false}".to_string(),
             ],
             effects_truncated: false,
             semantic_solitary_fullscreen: false,
@@ -2265,6 +2280,10 @@ mod tests {
         ));
         assert!(detail.contains("namespace:astrea-dock"));
         assert!(detail.contains("effects_visible_instance_count=1"));
+        assert!(detail.contains("effects_presentation_instance_count=1"));
+        assert!(detail.contains("effects_occluded_instance_count=1"));
+        assert!(detail.contains("effects_contributing_instance_count=0"));
+        assert!(detail.contains("effect_requires_composition=false"));
         assert!(detail.contains("program:background_blur"));
         assert!(detail.contains("effects_truncated=false"));
         assert!(detail.contains("group_surfaces_truncated=false"));
@@ -2297,6 +2316,12 @@ mod tests {
                 opacity: "opaque_rgb8888",
                 scene_blockers: Vec::new(),
                 effects_visible_instance_count: 0,
+                effects_presentation_instance_count: 0,
+                effects_culled_instance_count: 0,
+                effects_outside_output_instance_count: 0,
+                effects_occluded_instance_count: 0,
+                effects_contributing_instance_count: 0,
+                effect_requires_composition: false,
                 effects: Vec::new(),
                 effects_truncated: false,
                 semantic_solitary_fullscreen: true,
@@ -3090,6 +3115,12 @@ struct DirectScanoutDoctorScene {
     opacity: &'static str,
     scene_blockers: Vec<&'static str>,
     effects_visible_instance_count: u32,
+    effects_presentation_instance_count: u32,
+    effects_culled_instance_count: u32,
+    effects_outside_output_instance_count: u32,
+    effects_occluded_instance_count: u32,
+    effects_contributing_instance_count: u32,
+    effect_requires_composition: bool,
     effects: Vec<String>,
     effects_truncated: bool,
     semantic_solitary_fullscreen: bool,
@@ -3101,7 +3132,7 @@ impl DirectScanoutDoctorScene {
         semantic_solitary_fullscreen: bool,
         scanout_capabilities: Option<&DirectScanoutFeedbackCapabilities>,
         (visible_above, visible_above_truncated): (Vec<String>, bool),
-        (effects_visible_instance_count, effects, effects_truncated): (u32, Vec<String>, bool),
+        effects: &DirectScanoutEffectDoctorDetails,
     ) -> Self {
         const MAX_GROUP_SURFACES: usize = 32;
         let group = analysis.coverage.covering_application_group.as_ref();
@@ -3184,9 +3215,15 @@ impl DirectScanoutDoctorScene {
                 .iter()
                 .map(|reason| reason.as_str())
                 .collect(),
-            effects_visible_instance_count,
-            effects,
-            effects_truncated,
+            effects_visible_instance_count: effects.raw_instance_count,
+            effects_presentation_instance_count: effects.presentation_instance_count,
+            effects_culled_instance_count: effects.culled_instance_count,
+            effects_outside_output_instance_count: effects.outside_output_instance_count,
+            effects_occluded_instance_count: effects.occluded_instance_count,
+            effects_contributing_instance_count: effects.contributing_instance_count,
+            effect_requires_composition: effects.requires_composition,
+            effects: effects.details.clone(),
+            effects_truncated: effects.details_truncated,
             semantic_solitary_fullscreen,
         }
     }
@@ -3297,7 +3334,7 @@ fn format_direct_scanout_doctor_detail(
         scene.scene_blockers.join(",")
     };
     format!(
-        "scene_candidate={} scene_root={} scanout_source={} scanout_format={} group_surfaces=[{}] group_surfaces_truncated={} visible_above=[{}] visible_above_truncated={} opacity={} effects_visible_instance_count={} effects=[{}] effects_truncated={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
+        "scene_candidate={} scene_root={} scanout_source={} scanout_format={} group_surfaces=[{}] group_surfaces_truncated={} visible_above=[{}] visible_above_truncated={} opacity={} effects_visible_instance_count={} effects_presentation_instance_count={} effects_culled_instance_count={} effects_outside_output_instance_count={} effects_occluded_instance_count={} effects_contributing_instance_count={} effect_requires_composition={} effects=[{}] effects_truncated={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
         scene.scene_candidate,
         scene_root,
         scanout_source,
@@ -3308,6 +3345,12 @@ fn format_direct_scanout_doctor_detail(
         scene.visible_above_truncated,
         scene.opacity,
         scene.effects_visible_instance_count,
+        scene.effects_presentation_instance_count,
+        scene.effects_culled_instance_count,
+        scene.effects_outside_output_instance_count,
+        scene.effects_occluded_instance_count,
+        scene.effects_contributing_instance_count,
+        scene.effect_requires_composition,
         scene.effects.join(","),
         scene.effects_truncated,
         scene_blockers,

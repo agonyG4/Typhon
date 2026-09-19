@@ -1804,8 +1804,11 @@ impl OwnCompositorServer {
         (details, visible_content.len() > MAX_VISIBLE_CONTENT)
     }
 
-    pub fn direct_scanout_effect_doctor_details(&self) -> (u32, Vec<String>, bool) {
-        self.state.direct_scanout_effect_doctor_details()
+    pub fn direct_scanout_effect_doctor_details(
+        &self,
+        analysis: &DirectScanoutSceneAnalysis,
+    ) -> crate::compositor::DirectScanoutEffectDoctorDetails {
+        self.state.direct_scanout_effect_doctor_details(analysis)
     }
 
     pub fn fullscreen_tree_presentation_metadata(&self) -> Option<SurfacePresentationMetadata> {

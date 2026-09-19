@@ -210,10 +210,7 @@ fn resolved_blur_scene_controls_direct_scanout_transition() {
         background_effect_count(&capture_resolved_effect_scene(&commands)),
         1
     );
-    assert_eq!(
-        capture_direct_scanout_candidate(&commands),
-        Err(DirectScanoutSceneRejection::EffectRequiresComposition)
-    );
+    assert!(capture_direct_scanout_candidate(&commands).is_ok());
 
     replace_blur_policy_config(&commands, crate::blur_policy::BlurPolicyConfig::default());
     assert_eq!(
