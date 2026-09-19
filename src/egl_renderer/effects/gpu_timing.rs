@@ -2458,6 +2458,7 @@ mod tests {
         ));
 
         let current = state.begin_scope(Some(120)).expect("current scope");
+        assert!(!state.finish(stale.total));
         assert!(state.finish(current.total));
         assert!(!state.attach_capture_execution_summary(
             stale,
