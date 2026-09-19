@@ -521,6 +521,7 @@ impl EffectExecutionTrace {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn checkpoint_source_validity(
         &self,
         pass: &CompiledRenderPass,

@@ -48,4 +48,5 @@ pub type TransitionId = PresentationRevisionId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PresentationPropertyKind {
     Geometry,
+    Opacity,
 }

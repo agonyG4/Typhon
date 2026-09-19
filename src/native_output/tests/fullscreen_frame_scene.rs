@@ -7,6 +7,7 @@ use oblivion_one::compositor::{
     AnimationTime, FullscreenRenderPlanMetrics, PresentationSceneSample, ResolvedEffectScene,
     SceneNodeId,
 };
+use oblivion_one::effects::{EffectRect, EffectRegion};
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
 use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 use oblivion_one::window_lifecycle_animation::LifecycleSceneSample;
@@ -39,9 +40,11 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         ),
     ];
     let snapshot = NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new());
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Owned(renderer_surfaces.clone()),
         surface_scene_node_ids: Cow::Owned(vec![SceneNodeId::from_raw(1).unwrap()]),
+        presentation_owner_root_surface_ids: Cow::Owned(vec![901]),
         decorations: Vec::new(),
         popup_surface_ids: Cow::Owned(Vec::new()),
         external_overlay_surface_ids: Vec::new(),
@@ -66,13 +69,17 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         snapshot,
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample {
+            output_id,
             sampled_at: AnimationTime::from_nanos(0),
+            sample_time_source:
+                oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
             windows: Vec::new(),
             transforms: Vec::new(),
+            opacities: Vec::new(),
             active_transitions: 0,
             sampled_windows: 0,
         },
-        presentation_snapshot: PresentationFrameSnapshot::empty(),
+        presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(0),
             lamps: Vec::new(),
@@ -83,7 +90,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         lifecycle_snapshot: LifecycleFrameSnapshot::default(),
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
-        OutputId::from_raw(1).expect("nonzero output id"),
+        output_id,
         1,
         &resolved_scene,
         NativeCursorDamageBounds::default(),
@@ -124,9 +131,11 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         .as_ptr();
     let surfaces = vec![surface];
     let snapshot = NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new());
+    let output_id = OutputId::from_raw(1).expect("test output id");
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Borrowed(&surfaces),
         surface_scene_node_ids: Cow::Borrowed(&[SceneNodeId::from_raw(1).unwrap()]),
+        presentation_owner_root_surface_ids: Cow::Borrowed(&[901]),
         decorations: Vec::new(),
         popup_surface_ids: Cow::Borrowed(&[]),
         external_overlay_surface_ids: Vec::new(),
@@ -135,8 +144,12 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         scene_identity_signature: snapshot.identity_signature(),
         snapshot,
         effects: ResolvedEffectScene::default(),
-        presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(7)),
-        presentation_snapshot: PresentationFrameSnapshot::empty(),
+        presentation: PresentationSceneSample::empty_for_output(
+            output_id,
+            AnimationTime::from_nanos(7),
+            oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+        ),
+        presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(7),
             lamps: Vec::new(),
@@ -252,6 +265,11 @@ fn scene_pixel(scene: &NativeSceneSnapshot, x: i32, y: i32) -> u32 {
             pixel = 0xffff_0000 | (window_id.get() as u32 & 0xff);
         }
     }
+    if scene.effect_damage.contains_point(x, y) {
+        let red = (x.saturating_mul(17).saturating_add(y.saturating_mul(5)) & 0xff) as u32;
+        let green = (x.saturating_mul(3).saturating_add(y.saturating_mul(19)) & 0xff) as u32;
+        return 0xff00_0000 | (red << 16) | (green << 8) | 0x40;
+    }
     pixel
 }
 
@@ -294,24 +312,25 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
     let restored = restored_scene();
 
     for age in 1..=3_u32 {
+        let output_id = OutputId::from_raw(1).expect("nonzero output id");
         let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            output_id,
             frame_id: 0,
             render_generation: 0,
             scene: normal.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
-            presentation: PresentationFrameSnapshot::empty(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
         });
         for frame_id in 1..=20_u64 {
             let scene = fullscreen_scene(frame_id);
             history.replace_ready(NativeFrameSceneSnapshot {
-                output_id: OutputId::from_raw(1).expect("nonzero output id"),
+                output_id,
                 frame_id,
                 render_generation: frame_id,
                 scene,
                 cursor_damage: NativeCursorDamageBounds::default(),
-                presentation: PresentationFrameSnapshot::empty(),
+                presentation: PresentationFrameSnapshot::empty_for_output(output_id),
                 lifecycle: LifecycleFrameSnapshot::default(),
             });
             let token = 700 + frame_id;
@@ -376,4 +395,50 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
             );
         }
     }
+}
+
+#[test]
+fn fullscreen_enter_repairs_removed_nonuniform_blur_pixels() {
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 40;
+    let owner = test_renderable_surface(401, 0, 0, WIDTH, HEIGHT, RenderableSurfaceDamage::Empty);
+    let blur_region = EffectRegion::from_rect(EffectRect::new(7, 9, 18, 12).unwrap());
+    let mut previous = NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&owner), Vec::new());
+    previous.effect_damage = blur_region;
+    previous.effect_identity_signature = 1;
+    let current = NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&owner), Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+    let repair_rects = damage
+        .rects
+        .iter()
+        .map(|rect| NativeDamageRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        })
+        .collect::<Vec<_>>();
+    let mut reused = vec![0; (WIDTH * HEIGHT) as usize];
+    paint_scene(&mut reused, WIDTH, HEIGHT, &previous, None);
+    paint_scene(&mut reused, WIDTH, HEIGHT, &current, Some(&repair_rects));
+    let mut reference = vec![0; (WIDTH * HEIGHT) as usize];
+    paint_scene(&mut reference, WIDTH, HEIGHT, &current, None);
+
+    assert_eq!(reused, reference);
+    assert!(
+        damage.rects.iter().any(|rect| {
+            rect.x <= 7
+                && rect.y <= 9
+                && rect.x.saturating_add(rect.width as i32) >= 25
+                && rect.y.saturating_add(rect.height as i32) >= 21
+        }),
+        "fullscreen effect removal must repair the old blur region"
+    );
 }

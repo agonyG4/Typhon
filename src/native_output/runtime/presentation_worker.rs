@@ -347,14 +347,32 @@ pub(super) fn native_output_damage_for_presented_scene(
     let Some(previous_scene) = scene_history.presented_scene_if_any() else {
         return NativeOutputDamage::full_output(width, height);
     };
-    native_output_damage_for_resolved_scene(
+    let damage = native_output_damage_for_resolved_scene(
         direct,
         width,
         height,
         previous_scene,
         resolved_scene,
         scene_history.cursor_damage(cursor),
-    )
+    );
+    if direct {
+        damage
+    } else {
+        let Some(previous_presentation) = scene_history.presented_presentation_if_any() else {
+            return damage;
+        };
+        damage.union_surface_rects(
+            opacity_damage_for_frame_snapshots(
+                width,
+                height,
+                previous_presentation,
+                &resolved_scene.presentation_snapshot,
+                previous_scene,
+                resolved_scene.snapshot_ref(),
+            )
+            .rects,
+        )
+    }
 }
 
 pub(super) fn replace_ready_scene(

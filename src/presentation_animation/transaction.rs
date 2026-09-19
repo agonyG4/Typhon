@@ -1,7 +1,7 @@
 use crate::core::SceneNodeId;
 
 use super::{
-    AnimationCurve, AnimationTime, PresentationPropertyKind, PresentationRect,
+    AnimationCurve, AnimationTime, PresentationOpacity, PresentationPropertyKind, PresentationRect,
     PresentationRevisionId, PresentationTransactionId, PresentationVelocity,
 };
 
@@ -11,6 +11,47 @@ pub struct PresentationGeometryMutation {
     pub start: PresentationRect,
     pub target: PresentationRect,
     pub curve: AnimationCurve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentationOpacityMutation {
+    scene_node_id: Option<SceneNodeId>,
+    pub start: PresentationOpacity,
+    pub target: PresentationOpacity,
+    pub curve: AnimationCurve,
+}
+
+impl PresentationOpacityMutation {
+    pub const fn new(
+        scene_node_id: SceneNodeId,
+        start: PresentationOpacity,
+        target: PresentationOpacity,
+        curve: AnimationCurve,
+    ) -> Self {
+        Self {
+            scene_node_id: Some(scene_node_id),
+            start,
+            target,
+            curve,
+        }
+    }
+
+    pub const fn without_owner(
+        start: PresentationOpacity,
+        target: PresentationOpacity,
+        curve: AnimationCurve,
+    ) -> Self {
+        Self {
+            scene_node_id: None,
+            start,
+            target,
+            curve,
+        }
+    }
+
+    pub const fn scene_node_id(self) -> Option<SceneNodeId> {
+        self.scene_node_id
+    }
 }
 
 impl PresentationGeometryMutation {
@@ -50,6 +91,7 @@ impl PresentationGeometryMutation {
 pub struct PresentationTransactionRequest {
     pub started_at: AnimationTime,
     pub geometry: Vec<PresentationGeometryMutation>,
+    pub opacity: Vec<PresentationOpacityMutation>,
 }
 
 impl PresentationTransactionRequest {
@@ -60,6 +102,27 @@ impl PresentationTransactionRequest {
         Self {
             started_at,
             geometry,
+            opacity: Vec::new(),
+        }
+    }
+
+    pub fn opacity(started_at: AnimationTime, opacity: Vec<PresentationOpacityMutation>) -> Self {
+        Self {
+            started_at,
+            geometry: Vec::new(),
+            opacity,
+        }
+    }
+
+    pub fn mixed(
+        started_at: AnimationTime,
+        geometry: Vec<PresentationGeometryMutation>,
+        opacity: Vec<PresentationOpacityMutation>,
+    ) -> Self {
+        Self {
+            started_at,
+            geometry,
+            opacity,
         }
     }
 }
@@ -169,6 +232,16 @@ pub(crate) struct PreparedGeometryMutation {
     pub start: PresentationRect,
     pub target: PresentationRect,
     pub start_velocity: PresentationVelocity,
+    pub curve: AnimationCurve,
+    pub preserve_start_velocity: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PreparedOpacityMutation {
+    pub scene_node_id: SceneNodeId,
+    pub start: PresentationOpacity,
+    pub target: PresentationOpacity,
+    pub start_velocity: f64,
     pub curve: AnimationCurve,
     pub preserve_start_velocity: bool,
 }

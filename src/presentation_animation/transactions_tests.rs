@@ -36,6 +36,287 @@ fn geometry_ack(
     }
 }
 
+fn opacity_ack(
+    output_id: OutputId,
+    scene_node_id: SceneNodeId,
+    transaction_id: PresentationTransactionId,
+    revision_id: PresentationRevisionId,
+    presented_opacity: f64,
+) -> PresentedOpacityAck {
+    PresentedOpacityAck {
+        output_id,
+        scene_node_id,
+        property: PresentationPropertyKind::Opacity,
+        transaction_id,
+        revision_id,
+        presented_opacity: PresentationOpacity::new(presented_opacity).expect("valid test opacity"),
+    }
+}
+
+#[test]
+fn opacity_transaction_uses_exact_revision_and_sample_evidence() {
+    let mut engine = PresentationEngine::enabled();
+    let transaction = engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(0),
+            vec![PresentationOpacityMutation::new(
+                node(101),
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("opacity"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("opacity transaction");
+    let frame = engine.sample(
+        OutputId::from_raw(1).expect("output"),
+        AnimationTime::from_nanos(5_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(101), 101, rect(0.0, 0.0, 10.0, 10.0))],
+    );
+    let opacity = frame.opacities[0];
+    let transition = opacity.transition.expect("active opacity evidence");
+    assert_eq!(transition.transaction_id, transaction.id());
+    assert_eq!(
+        transition.revision_id,
+        transaction.members()[0].revision_id()
+    );
+    assert_eq!(
+        opacity.opacity,
+        PresentationOpacity::new(0.75).expect("opacity")
+    );
+}
+
+#[test]
+fn geometry_and_opacity_share_transaction_but_settle_independently() {
+    let mut engine = PresentationEngine::enabled();
+    let transaction = engine
+        .commit(PresentationTransactionRequest::mixed(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                node(102),
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(10.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+            vec![PresentationOpacityMutation::new(
+                node(102),
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("opacity"),
+                AnimationCurve::easing(Duration::from_millis(20), EasingCurve::Linear),
+            )],
+        ))
+        .expect("mixed transaction");
+    assert_eq!(transaction.members().len(), 2);
+    assert_ne!(
+        transaction.members()[0].revision_id(),
+        transaction.members()[1].revision_id()
+    );
+    let output = OutputId::from_raw(1).expect("output");
+    let frame = engine.sample(
+        output,
+        AnimationTime::from_nanos(20_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(102), 102, rect(10.0, 0.0, 10.0, 10.0))],
+    );
+    let geometry = frame.transforms[0];
+    let opacity = frame.opacities[0];
+    assert!(engine.acknowledge_presented_geometry(
+        output,
+        PresentedGeometryAck::from_transform(output, geometry)
+    ));
+    assert_eq!(engine.active_count(), 1);
+    assert_eq!(engine.transaction_count(), 1);
+    let opacity_transition = opacity.transition.expect("opacity transition");
+    assert!(engine.acknowledge_presented_opacity(
+        output,
+        opacity_ack(
+            output,
+            node(102),
+            opacity_transition.transaction_id,
+            opacity_transition.revision_id,
+            0.5,
+        )
+    ));
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn invalid_opacity_does_not_partially_commit_geometry() {
+    let mut engine = PresentationEngine::enabled();
+    let result = engine.commit(PresentationTransactionRequest::mixed(
+        AnimationTime::from_nanos(0),
+        vec![PresentationGeometryMutation::new(
+            node(103),
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(10.0, 0.0, 10.0, 10.0),
+            AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+        )],
+        vec![PresentationOpacityMutation::without_owner(
+            PresentationOpacity::OPAQUE,
+            PresentationOpacity::TRANSPARENT,
+            AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+        )],
+    ));
+    assert_eq!(
+        result,
+        Err(PresentationTransactionError::MissingPresentationOwner)
+    );
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn settled_unacked_opacity_same_target_preserves_revision() {
+    let mut engine = PresentationEngine::enabled();
+    let target_opacity = PresentationOpacity::new(0.5).expect("opacity");
+    let first = engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(0),
+            vec![PresentationOpacityMutation::new(
+                node(104),
+                PresentationOpacity::OPAQUE,
+                target_opacity,
+                AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+            )],
+        ))
+        .expect("first opacity transaction");
+    let second = engine.commit(PresentationTransactionRequest::opacity(
+        AnimationTime::from_nanos(2_000_000),
+        vec![PresentationOpacityMutation::new(
+            node(104),
+            PresentationOpacity::OPAQUE,
+            target_opacity,
+            AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+        )],
+    ));
+    assert_eq!(second, Err(PresentationTransactionError::Empty));
+    assert_eq!(
+        engine.opacity_track_transaction(node(104)),
+        Some(first.id())
+    );
+    assert_eq!(
+        engine.opacity_track_revision(node(104)),
+        Some(first.members()[0].revision_id())
+    );
+}
+
+#[test]
+fn stale_and_wrong_output_opacity_acks_preserve_the_current_revision() {
+    let mut engine = PresentationEngine::enabled();
+    let output = OutputId::from_raw(1).expect("output");
+    let other_output = OutputId::from_raw(2).expect("other output");
+    let first = engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(0),
+            vec![PresentationOpacityMutation::new(
+                node(108),
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("opacity"),
+                AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+            )],
+        ))
+        .expect("first transaction");
+    let old_frame = engine.sample(
+        output,
+        AnimationTime::from_nanos(1_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(108), 108, rect(0.0, 0.0, 10.0, 10.0))],
+    );
+    let old_transition = old_frame.opacities[0].transition.expect("old transition");
+    assert!(old_transition.mathematically_settled);
+
+    let second = engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(1_000_000),
+            vec![PresentationOpacityMutation::new(
+                node(108),
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.25).expect("opacity"),
+                AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+            )],
+        ))
+        .expect("retarget transaction");
+    let new_frame = engine.sample(
+        output,
+        AnimationTime::from_nanos(2_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(node(108), 108, rect(0.0, 0.0, 10.0, 10.0))],
+    );
+    let new_transition = new_frame.opacities[0].transition.expect("new transition");
+    assert!(new_transition.mathematically_settled);
+    assert!(!engine.acknowledge_presented_opacity(
+        output,
+        opacity_ack(
+            output,
+            node(108),
+            old_transition.transaction_id,
+            old_transition.revision_id,
+            0.5,
+        ),
+    ));
+    assert!(!engine.acknowledge_presented_opacity(
+        output,
+        opacity_ack(
+            other_output,
+            node(108),
+            new_transition.transaction_id,
+            new_transition.revision_id,
+            0.25,
+        ),
+    ));
+    assert!(engine.acknowledge_presented_opacity(
+        output,
+        opacity_ack(
+            output,
+            node(108),
+            second.id(),
+            new_transition.revision_id,
+            0.25,
+        ),
+    ));
+    assert_eq!(engine.transaction_count(), 0);
+    assert_eq!(first.members().len(), 1);
+}
+
+#[test]
+fn opacity_spring_visible_sample_is_bounded_on_both_sides() {
+    let mut engine = PresentationEngine::enabled();
+    let spring = AnimationCurve::spring(SpringSpec::new(100.0, 1.0));
+    engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(0),
+            vec![PresentationOpacityMutation::new(
+                node(105),
+                PresentationOpacity::TRANSPARENT,
+                PresentationOpacity::OPAQUE,
+                spring,
+            )],
+        ))
+        .expect("upper overshoot track");
+    engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(100_000_000),
+            vec![PresentationOpacityMutation::new(
+                node(106),
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::TRANSPARENT,
+                spring,
+            )],
+        ))
+        .expect("lower overshoot track");
+
+    for node_id in [node(105), node(106)] {
+        let (opacity, velocity, _) = engine
+            .sample_opacity_for_scene_node(node_id, AnimationTime::from_nanos(300_000_000))
+            .expect("opacity sample");
+        assert!((0.0..=1.0).contains(&opacity.get()));
+        if opacity.is_transparent() || opacity.is_opaque() {
+            assert_eq!(velocity, 0.0);
+        }
+    }
+}
+
 #[test]
 fn geometry_transaction_assigns_one_transaction_and_distinct_revisions() {
     let mut engine = PresentationEngine::enabled();

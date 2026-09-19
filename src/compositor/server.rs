@@ -1129,6 +1129,10 @@ impl OwnCompositorServer {
         self.state.native_frame_presentation_targets(surfaces)
     }
 
+    pub fn presentation_owner_root_for_surface(&self, surface_id: u32) -> u32 {
+        self.state.presentation_owner_root_for_surface(surface_id)
+    }
+
     pub fn lifecycle_scene_sample_at(
         &self,
         at: AnimationTime,
@@ -1224,6 +1228,18 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn install_native_frame_test_effect(
+        &mut self,
+        surface_id: u32,
+        anchor: crate::compositor::EffectAnchor,
+        program: crate::effects::EffectProgramId,
+        region: crate::effects::EffectRegion,
+    ) -> bool {
+        self.state
+            .set_internal_surface_effect(surface_id, anchor, program, region)
+    }
+
+    #[doc(hidden)]
     pub fn start_test_presentation_transition(
         &mut self,
         root_surface_id: u32,
@@ -1315,6 +1331,28 @@ impl OwnCompositorServer {
 
     pub fn presentation_geometry_signature(&self, sample: &PresentationSceneSample) -> u64 {
         self.state.presentation_geometry_signature(sample)
+    }
+
+    pub fn presentation_visual_signature(&self, sample: &PresentationSceneSample) -> u64 {
+        sample.presentation_visual_signature()
+    }
+
+    #[doc(hidden)]
+    pub fn set_window_canonical_opacity(
+        &mut self,
+        window_id: WindowId,
+        opacity: crate::presentation_animation::PresentationOpacity,
+        curve: Option<crate::presentation_animation::AnimationCurve>,
+    ) -> Result<(), crate::presentation_animation::PresentationTransactionError> {
+        self.state
+            .set_window_canonical_opacity(window_id, opacity, curve)
+    }
+
+    pub fn presented_presentation_opacity(
+        &self,
+        root_surface_id: u32,
+    ) -> crate::presentation_animation::PresentationOpacity {
+        self.state.presented_presentation_opacity(root_surface_id)
     }
 
     pub fn presented_presentation_transform(

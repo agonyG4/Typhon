@@ -12,7 +12,9 @@ use super::{
 };
 use crate::core::SceneNodeId;
 use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
-use crate::presentation_animation::{PresentationGroupTransform, PresentationRect};
+use crate::presentation_animation::{
+    PresentationGroupOpacity, PresentationGroupTransform, PresentationRect,
+};
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 #[cfg(test)]
 use wayland_server::protocol::wl_output;
@@ -875,6 +877,8 @@ pub struct DesktopSceneRenderer {
     decoration_instances: Vec<DecorationRenderInstance>,
     decoration_damage_rects: Vec<DecorationRect>,
     popup_surface_ids: Vec<u32>,
+    presentation_opacities: HashMap<u32, f32>,
+    presentation_owner_roots: HashMap<u32, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,7 +911,32 @@ impl DesktopSceneRenderer {
             decoration_instances: Vec::new(),
             decoration_damage_rects: Vec::new(),
             popup_surface_ids: Vec::new(),
+            presentation_opacities: HashMap::new(),
+            presentation_owner_roots: HashMap::new(),
         }
+    }
+
+    pub fn set_presentation_projection(
+        &mut self,
+        opacities: &[PresentationGroupOpacity],
+        owner_roots: impl IntoIterator<Item = (u32, u32)>,
+    ) {
+        let next_opacities = opacities
+            .iter()
+            .map(|entry| (entry.root_surface_id, entry.opacity.get() as f32))
+            .collect::<HashMap<_, _>>();
+        let next_owner_roots = owner_roots.into_iter().collect::<HashMap<_, _>>();
+        if next_opacities == self.presentation_opacities
+            && next_owner_roots == self.presentation_owner_roots
+        {
+            return;
+        }
+        self.presentation_opacities = next_opacities;
+        self.presentation_owner_roots = next_owner_roots;
+        self.scene_width = 0;
+        self.scene_height = 0;
+        self.scene_surface_snapshots.clear();
+        self.reusable_frame_key = None;
     }
 
     pub fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
@@ -1249,6 +1278,8 @@ impl DesktopSceneRenderer {
                 output_scale,
                 decorations: &self.decoration_instances,
                 popup_surface_ids: &self.popup_surface_ids,
+                presentation_opacities: &self.presentation_opacities,
+                presentation_owner_roots: &self.presentation_owner_roots,
                 clip: Some(damage_rect),
             });
         }
@@ -1323,6 +1354,8 @@ impl DesktopSceneRenderer {
             output_scale,
             decorations: &self.decoration_instances,
             popup_surface_ids: &self.popup_surface_ids,
+            presentation_opacities: &self.presentation_opacities,
+            presentation_owner_roots: &self.presentation_owner_roots,
             clip: None,
         });
         self.scene_surface_snapshots = snapshots;
@@ -1396,6 +1429,7 @@ fn draw_decoration_instance(
     frame_height: u32,
     instance: &DecorationRenderInstance,
     output_scale: f64,
+    presentation_opacity: f32,
     clip: Option<OutputRect>,
 ) {
     let output_clip = clip.map(|clip| ServerFrameRect {
@@ -1416,10 +1450,18 @@ fn draw_decoration_instance(
                         frame_height,
                         output_rect,
                         *color,
+                        presentation_opacity,
                         clip,
                     );
                 } else {
-                    fill_decoration_rect(frame, frame_width, frame_height, output_rect, *color);
+                    fill_decoration_rect(
+                        frame,
+                        frame_width,
+                        frame_height,
+                        output_rect,
+                        *color,
+                        presentation_opacity,
+                    );
                 }
             }
             DecorationRenderPrimitive::Image { rect, asset } => {
@@ -1430,6 +1472,7 @@ fn draw_decoration_instance(
                     decoration_output_rect(instance, *rect, output_scale),
                     asset,
                     output_clip,
+                    presentation_opacity,
                 );
             }
             DecorationRenderPrimitive::Text {
@@ -1450,6 +1493,7 @@ fn draw_decoration_instance(
                     effective_clip,
                     asset,
                     output_scale,
+                    presentation_opacity,
                 );
             }
         }
@@ -1462,6 +1506,7 @@ fn fill_decoration_rect_clipped(
     frame_height: u32,
     rect: ServerFrameRect,
     color: [u8; 4],
+    presentation_opacity: f32,
     clip: OutputRect,
 ) {
     let Some(clipped) = (OutputRect {
@@ -1486,6 +1531,7 @@ fn fill_decoration_rect_clipped(
             height: clipped.height,
         },
         color,
+        presentation_opacity,
     );
 }
 
@@ -1534,6 +1580,7 @@ fn fill_decoration_rect(
     frame_height: u32,
     rect: ServerFrameRect,
     color: [u8; 4],
+    presentation_opacity: f32,
 ) {
     let start_x = i64::from(rect.x).max(0);
     let start_y = i64::from(rect.y).max(0);
@@ -1546,7 +1593,7 @@ fn fill_decoration_rect(
     if start_x >= end_x || start_y >= end_y {
         return;
     }
-    let pixel = rgba_to_pixel(color);
+    let pixel = rgba_to_pixel(scale_premultiplied_rgba(color, presentation_opacity));
     let frame_width = frame_width as usize;
     for target_y in start_y..end_y {
         let row_start = target_y as usize * frame_width + start_x as usize;
@@ -1564,6 +1611,7 @@ fn draw_decoration_raster_asset(
     rect: ServerFrameRect,
     asset: &super::decoration::raster::DecorationRasterAsset,
     clip: Option<ServerFrameRect>,
+    presentation_opacity: f32,
 ) {
     let clip_left = clip.map_or(rect.x, |clip| clip.x).max(rect.x).max(0);
     let clip_top = clip.map_or(rect.y, |clip| clip.y).max(rect.y).max(0);
@@ -1610,7 +1658,11 @@ fn draw_decoration_raster_asset(
             let Some(destination) = frame.get_mut(index) else {
                 continue;
             };
-            *destination = blend_premultiplied_rgba(*destination, source);
+            let scaled = scale_premultiplied_rgba(
+                [source[0], source[1], source[2], source[3]],
+                presentation_opacity,
+            );
+            *destination = blend_premultiplied_rgba(*destination, &scaled);
         }
     }
 }
@@ -1636,6 +1688,7 @@ fn blend_premultiplied_rgba(destination: u32, source: &[u8]) -> u32 {
     (output_alpha << 24) | (red << 16) | (green << 8) | blue
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_decoration_text(
     frame: &mut [u32],
     frame_width: u32,
@@ -1644,8 +1697,22 @@ fn draw_decoration_text(
     clip: ServerFrameRect,
     asset: &super::decoration::raster::DecorationRasterAsset,
     _output_scale: f64,
+    presentation_opacity: f32,
 ) {
-    draw_decoration_raster_asset(frame, frame_width, frame_height, rect, asset, Some(clip));
+    draw_decoration_raster_asset(
+        frame,
+        frame_width,
+        frame_height,
+        rect,
+        asset,
+        Some(clip),
+        presentation_opacity,
+    );
+}
+
+fn scale_premultiplied_rgba(color: [u8; 4], opacity: f32) -> [u8; 4] {
+    let opacity = opacity.clamp(0.0, 1.0);
+    color.map(|channel| (f32::from(channel) * opacity).round() as u8)
 }
 
 fn rgba_to_pixel(color: [u8; 4]) -> u32 {
@@ -1769,6 +1836,7 @@ fn draw_client_surfaces_scaled_with_snapshots(
             frame_height,
             surface,
             snapshot,
+            1.0,
             clip,
         );
     }
@@ -1783,6 +1851,8 @@ struct WindowVisualDrawRequest<'a> {
     output_scale: f64,
     decorations: &'a [DecorationRenderInstance],
     popup_surface_ids: &'a [u32],
+    presentation_opacities: &'a HashMap<u32, f32>,
+    presentation_owner_roots: &'a HashMap<u32, u32>,
     clip: Option<OutputRect>,
 }
 
@@ -1796,6 +1866,8 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
         output_scale,
         decorations,
         popup_surface_ids,
+        presentation_opacities,
+        presentation_owner_roots,
         clip,
     } = request;
     for group in window_visual_stack_order_with_popups(surfaces, decorations, popup_surface_ids) {
@@ -1812,6 +1884,15 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
                 frame_height,
                 surface,
                 snapshot,
+                presentation_opacities
+                    .get(
+                        &presentation_owner_roots
+                            .get(&surface.surface_id)
+                            .copied()
+                            .unwrap_or(surface.surface_id),
+                    )
+                    .copied()
+                    .unwrap_or(1.0),
                 clip,
             );
         }
@@ -1824,6 +1905,10 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
                 frame_height,
                 decoration,
                 output_scale,
+                presentation_opacities
+                    .get(&decoration.root_surface_id())
+                    .copied()
+                    .unwrap_or(1.0),
                 clip,
             );
         }
@@ -1836,6 +1921,7 @@ fn draw_client_surface_with_snapshot(
     frame_height: u32,
     surface: &RenderableSurface,
     snapshot: &SceneSurfaceSnapshot,
+    presentation_opacity: f32,
     clip: Option<OutputRect>,
 ) {
     if let Some(backing) = snapshot.backing_target {
@@ -1847,8 +1933,17 @@ fn draw_client_surface_with_snapshot(
             height: backing.height(),
         };
         match clip {
-            Some(clip) => fill_rect_clipped(frame, frame_width, frame_height, rect, clip),
-            None => fill_rect(frame, frame_width, frame_height, rect),
+            Some(clip) => fill_rect_clipped_with_opacity(
+                frame,
+                frame_width,
+                frame_height,
+                rect,
+                clip,
+                presentation_opacity,
+            ),
+            None => {
+                fill_rect_with_opacity(frame, frame_width, frame_height, rect, presentation_opacity)
+            }
         }
     }
 
@@ -1856,7 +1951,15 @@ fn draw_client_surface_with_snapshot(
         if clip.is_some_and(|clip| !plan.content_target.output_rect().intersects(clip)) {
             continue;
         }
-        blit_surface_with_plan(frame, frame_width, frame_height, surface, *plan, clip);
+        blit_surface_with_plan(
+            frame,
+            frame_width,
+            frame_height,
+            surface,
+            *plan,
+            presentation_opacity,
+            clip,
+        );
     }
 }
 
@@ -3019,7 +3122,7 @@ fn blit_surface_to_rect_clipped(
     clip: Option<OutputRect>,
 ) {
     let plan = surface_render_plan(surface, target);
-    blit_surface_with_plan(frame, frame_width, frame_height, surface, plan, clip);
+    blit_surface_with_plan(frame, frame_width, frame_height, surface, plan, 1.0, clip);
 }
 
 fn blit_surface_with_plan(
@@ -3028,6 +3131,7 @@ fn blit_surface_with_plan(
     frame_height: u32,
     surface: &RenderableSurface,
     plan: SurfaceRenderPlan,
+    presentation_opacity: f32,
     clip: Option<OutputRect>,
 ) {
     let Some(surface_pixels) = surface.cpu_pixels() else {
@@ -3081,11 +3185,14 @@ fn blit_surface_with_plan(
             let Some(target_row) = frame.get_mut(target_start..target_start + row_width) else {
                 continue;
             };
-            if source_row_is_opaque(source_row) {
+            if presentation_opacity >= 1.0 && source_row_is_opaque(source_row) {
                 target_row.copy_from_slice(source_row);
             } else {
                 for (source, target) in source_row.iter().copied().zip(target_row.iter_mut()) {
-                    *target = blend_premultiplied_argb_over_opaque(source, *target);
+                    *target = blend_premultiplied_argb_over_opaque(
+                        scale_premultiplied_argb(source, presentation_opacity),
+                        *target,
+                    );
                 }
             }
         }
@@ -3118,7 +3225,10 @@ fn blit_surface_with_plan(
                 as usize;
             let source_index = source_y * buffer_width + source_x;
             if let Some(source) = surface_pixels.get(source_index).copied() {
-                *target_pixel = blend_premultiplied_argb_over_opaque(source, *target_pixel);
+                *target_pixel = blend_premultiplied_argb_over_opaque(
+                    scale_premultiplied_argb(source, presentation_opacity),
+                    *target_pixel,
+                );
             }
         }
     }
@@ -3152,12 +3262,25 @@ fn source_row_is_opaque(row: &[u32]) -> bool {
     row.iter().all(|pixel| pixel >> 24 == 0xff)
 }
 
-fn fill_rect_clipped(
+fn scale_premultiplied_argb(pixel: u32, opacity: f32) -> u32 {
+    if opacity >= 1.0 {
+        return pixel;
+    }
+    let opacity = opacity.clamp(0.0, 1.0);
+    let scale = |channel: u32| (channel as f32 * opacity).round() as u32;
+    (scale(pixel >> 24) << 24)
+        | (scale((pixel >> 16) & 0xff) << 16)
+        | (scale((pixel >> 8) & 0xff) << 8)
+        | scale(pixel & 0xff)
+}
+
+fn fill_rect_clipped_with_opacity(
     frame: &mut [u32],
     frame_width: u32,
     frame_height: u32,
     rect: ServerFrameRect,
     clip: OutputRect,
+    presentation_opacity: f32,
 ) {
     let Some(clipped) = (OutputRect {
         x: rect.x,
@@ -3170,7 +3293,7 @@ fn fill_rect_clipped(
         return;
     };
 
-    fill_rect(
+    fill_rect_with_opacity(
         frame,
         frame_width,
         frame_height,
@@ -3181,10 +3304,17 @@ fn fill_rect_clipped(
             width: clipped.width,
             height: clipped.height,
         },
+        presentation_opacity,
     );
 }
 
-fn fill_rect(frame: &mut [u32], frame_width: u32, frame_height: u32, rect: ServerFrameRect) {
+fn fill_rect_with_opacity(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    rect: ServerFrameRect,
+    presentation_opacity: f32,
+) {
     let start_x = i64::from(rect.x).max(0);
     let start_y = i64::from(rect.y).max(0);
     let end_x = i64::from(rect.x)
@@ -3199,7 +3329,7 @@ fn fill_rect(frame: &mut [u32], frame_width: u32, frame_height: u32, rect: Serve
     }
 
     let frame_width = frame_width as usize;
-    let color = rect.color.pixel();
+    let color = scale_premultiplied_argb(rect.color.pixel(), presentation_opacity);
     for target_y in start_y..end_y {
         let row_start = target_y as usize * frame_width + start_x as usize;
         let row_end = row_start + (end_x - start_x) as usize;

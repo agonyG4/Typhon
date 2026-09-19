@@ -1,7 +1,8 @@
 # Typhon Generalized Presentation Engine — Gate and Design
 
 Date: 2026-09-15
-Status: approved design; Geometry Presentation Engine v2 hardened and closed
+Status: approved design; Geometry Presentation Engine v2 hardened and closed;
+Opacity implemented as the second production property
 
 ## Decision
 
@@ -11,8 +12,9 @@ the first production stage of the generalized engine: transactional,
 SceneNode-owned sparse tracks with exact physical revision acknowledgement.
 The geometry stage is now hardened for repeated pending mutations, immutable
 output-qualified physical ACK evidence, and exact transaction-member
-retirement. Lifecycle/Lamp retention and additional generalized properties
-remain deferred.
+retirement. Opacity now uses the same transactional SceneNode/revision
+architecture while retaining canonical final state on `DesktopWindow`.
+Lifecycle/Lamp retention and additional generalized properties remain deferred.
 
 Future implementation stages must preserve the physical frame authority and
 the compatibility boundaries described below.
@@ -105,8 +107,10 @@ prerequisite status is:
   Dwindle geometry transactions are active. Pending duplicate mutations keep
   the first start and final target; physical ACKs use only immutable promoted
   frame evidence; and transaction members retire by exact
-  node/property/revision identity. Opacity/clip, retained lifecycle/Lamp
-  migration, and new animation effects remain pending.
+  node/property/revision identity. Opacity is implemented as a bounded,
+  canonical-window-backed second property with inherited rendering, physical
+  damage, and conservative Direct Scanout qualification. Clip, retained
+  lifecycle/Lamp migration, and new animation effects remain pending.
 
 Typhon remains a single-output product. This internal `OutputId` foundation
 does not add hotplug, multi-output layout, or a multi-output product model.
@@ -312,7 +316,8 @@ pageflip timing, or fullscreen gaming performance.
 
 ## Current result
 
-The first production geometry stage is complete and closed:
+The first production geometry stage is complete and closed, and Opacity is
+implemented as the second production property:
 
 ```text
 OutputId foundation                         implemented
@@ -334,7 +339,7 @@ synthetic presentation OutputId defaults     removed
 effective geometry no-op elision             implemented
 Geometry v2                                  closed
 
-Opacity                                      pending
+Opacity                                      implemented
 Clip                                         pending
 retained lifecycle/Lamp migration            pending
 new animation effects                        pending

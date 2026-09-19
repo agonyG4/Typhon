@@ -486,7 +486,8 @@ impl CompositorState {
     pub(in crate::compositor) fn native_frame_renderable_surfaces(
         &self,
     ) -> Cow<'_, [RenderableSurface]> {
-        self.native_frame_renderable_surfaces_with_metrics().0
+        self.native_frame_renderable_surfaces_with_composition_plan()
+            .0
     }
 
     pub(in crate::compositor) fn native_frame_renderable_surfaces_with_metrics(

@@ -337,6 +337,7 @@ pub(crate) struct NativeSceneSurfaceSnapshot {
     pub(crate) scene_node_id: SceneNodeId,
     pub(crate) surface_id: u32,
     pub(crate) visual_root_surface_id: u32,
+    pub(crate) presentation_owner_root_surface_id: u32,
     pub(crate) bounds: Option<NativeDamageRect>,
     pub(crate) damage: NativeSurfaceDamageEvidence,
     pub(crate) content_generation: u64,
@@ -355,38 +356,10 @@ pub(crate) struct NativeSceneSnapshot {
 }
 
 impl NativeSceneSnapshot {
-    #[cfg(test)]
-    pub(crate) fn from_surfaces(
-        surfaces: &[RenderableSurface],
-        decorations: Vec<DecorationSceneSnapshot>,
-    ) -> Self {
-        Self::from_surfaces_with_popup_ids(surfaces, decorations, &[])
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_surfaces_with_popup_ids(
-        surfaces: &[RenderableSurface],
-        decorations: Vec<DecorationSceneSnapshot>,
-        popup_surface_ids: &[u32],
-    ) -> Self {
-        let scene_node_ids = surfaces
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                SceneNodeId::from_raw((index as u64).saturating_add(1)).expect("test scene node id")
-            })
-            .collect::<Vec<_>>();
-        Self::from_surfaces_with_scene_nodes(
-            surfaces,
-            &scene_node_ids,
-            decorations,
-            popup_surface_ids,
-        )
-    }
-
-    pub(crate) fn from_surfaces_with_scene_nodes(
+    pub(crate) fn from_surfaces_with_scene_nodes_and_presentation_owners(
         surfaces: &[RenderableSurface],
         scene_node_ids: &[SceneNodeId],
+        presentation_owner_roots: &[u32],
         decorations: Vec<DecorationSceneSnapshot>,
         popup_surface_ids: &[u32],
     ) -> Self {
@@ -395,6 +368,7 @@ impl NativeSceneSnapshot {
             scene_node_ids.len(),
             "native scene surface and SceneNode projections must stay aligned"
         );
+        assert_eq!(surfaces.len(), presentation_owner_roots.len());
         #[cfg(test)]
         note_native_snapshot_build();
         let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
@@ -416,58 +390,62 @@ impl NativeSceneSnapshot {
             .iter()
             .zip(surfaces)
             .zip(scene_node_ids.iter().copied())
-            .map(|((element, surface), scene_node_id)| {
-                #[cfg(test)]
-                note_native_snapshot_surface_projection();
-                let RenderSceneElementId::Surface(surface_id) = element.id();
-                let buffer_size = element.buffer_size();
-                let damage = match &surface.damage {
-                    oblivion_one::compositor::RenderableSurfaceDamage::Empty => {
-                        NativeSurfaceDamageEvidence::AuthoritativeEmpty
+            .zip(presentation_owner_roots.iter().copied())
+            .map(
+                |(((element, surface), scene_node_id), presentation_owner_root_surface_id)| {
+                    #[cfg(test)]
+                    note_native_snapshot_surface_projection();
+                    let RenderSceneElementId::Surface(surface_id) = element.id();
+                    let buffer_size = element.buffer_size();
+                    let damage = match &surface.damage {
+                        oblivion_one::compositor::RenderableSurfaceDamage::Empty => {
+                            NativeSurfaceDamageEvidence::AuthoritativeEmpty
+                        }
+                        oblivion_one::compositor::RenderableSurfaceDamage::HistoryLost => {
+                            NativeSurfaceDamageEvidence::HistoryLost
+                        }
+                        oblivion_one::compositor::RenderableSurfaceDamage::Full => {
+                            let target = element.visible_target();
+                            NativeSurfaceDamageEvidence::Known(
+                                (target.width() > 0 && target.height() > 0)
+                                    .then_some(NativeDamageRect {
+                                        x: target.x(),
+                                        y: target.y(),
+                                        width: target.width(),
+                                        height: target.height(),
+                                    })
+                                    .into_iter()
+                                    .collect(),
+                            )
+                        }
+                        oblivion_one::compositor::RenderableSurfaceDamage::Partial(_) => {
+                            NativeSurfaceDamageEvidence::Known(
+                                element
+                                    .damage()
+                                    .clipped_rects(buffer_size.width, buffer_size.height)
+                                    .into_iter()
+                                    .flat_map(|rect| {
+                                        NativeDamageRect::from_render_element_damage(element, rect)
+                                    })
+                                    .collect(),
+                            )
+                        }
+                    };
+                    NativeSceneSurfaceSnapshot {
+                        scene_node_id,
+                        surface_id,
+                        visual_root_surface_id: visual_root_by_surface_id
+                            .get(&surface_id)
+                            .copied()
+                            .unwrap_or(surface_id),
+                        presentation_owner_root_surface_id,
+                        bounds: NativeDamageRect::from_render_element_bounds(element),
+                        damage,
+                        content_generation: element.generation(),
+                        commit_sequence: surface.commit_sequence.get(),
                     }
-                    oblivion_one::compositor::RenderableSurfaceDamage::HistoryLost => {
-                        NativeSurfaceDamageEvidence::HistoryLost
-                    }
-                    oblivion_one::compositor::RenderableSurfaceDamage::Full => {
-                        let target = element.visible_target();
-                        NativeSurfaceDamageEvidence::Known(
-                            (target.width() > 0 && target.height() > 0)
-                                .then_some(NativeDamageRect {
-                                    x: target.x(),
-                                    y: target.y(),
-                                    width: target.width(),
-                                    height: target.height(),
-                                })
-                                .into_iter()
-                                .collect(),
-                        )
-                    }
-                    oblivion_one::compositor::RenderableSurfaceDamage::Partial(_) => {
-                        NativeSurfaceDamageEvidence::Known(
-                            element
-                                .damage()
-                                .clipped_rects(buffer_size.width, buffer_size.height)
-                                .into_iter()
-                                .flat_map(|rect| {
-                                    NativeDamageRect::from_render_element_damage(element, rect)
-                                })
-                                .collect(),
-                        )
-                    }
-                };
-                NativeSceneSurfaceSnapshot {
-                    scene_node_id,
-                    surface_id,
-                    visual_root_surface_id: visual_root_by_surface_id
-                        .get(&surface_id)
-                        .copied()
-                        .unwrap_or(surface_id),
-                    bounds: NativeDamageRect::from_render_element_bounds(element),
-                    damage,
-                    content_generation: element.generation(),
-                    commit_sequence: surface.commit_sequence.get(),
-                }
-            })
+                },
+            )
             .collect();
         let surface_order_signature =
             surface_order_signature(surfaces.iter().map(|surface| surface.surface_id));
@@ -493,6 +471,7 @@ impl NativeSceneSnapshot {
             mix(1);
             mix(u64::from(surface.surface_id));
             mix(u64::from(surface.visual_root_surface_id));
+            mix(u64::from(surface.presentation_owner_root_surface_id));
             if let Some(bounds) = surface.bounds {
                 mix(1);
                 mix(bounds.x as u64);

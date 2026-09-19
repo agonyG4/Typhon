@@ -35,8 +35,11 @@ impl CompositorState {
         {
             blockers.push(rejection);
         }
-        if self.presentation_animation_has_pending_visible() {
+        if self.presentation_animation_has_pending_visible_geometry() {
             blockers.push(DirectScanoutSceneRejection::AnimationTransform);
+        }
+        if self.presentation_animation_has_pending_visible_opacity() {
+            blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
         }
         if self.lifecycle_animation_has_pending_visible() {
             blockers.push(DirectScanoutSceneRejection::LifecycleAnimation);
@@ -52,6 +55,14 @@ impl CompositorState {
         };
         let root_surface_id = covering_group.root_surface_id;
 
+        if self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| !window.canonical_opacity().is_opaque())
+        {
+            blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
+        }
+
         if !self.toplevel_surfaces.contains_key(&root_surface_id)
             && self.window_id_for_surface(root_surface_id).is_none()
         {
@@ -66,6 +77,9 @@ impl CompositorState {
         }
         if self.presented_presentation_is_non_identity(root_surface_id) {
             blockers.push(DirectScanoutSceneRejection::AnimationTransform);
+        }
+        if self.presented_presentation_opacity_is_non_identity(root_surface_id) {
+            blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
         }
         if !covering_group.visible_surface_ids_above_covering.is_empty() {
             blockers.push(DirectScanoutSceneRejection::OwnerTreeContentAboveSource);

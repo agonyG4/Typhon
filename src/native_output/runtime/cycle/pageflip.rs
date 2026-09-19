@@ -558,6 +558,7 @@ fn should_continue_resuming_recovery(
 }
 
 impl NativeRuntime {
+    #[allow(clippy::collapsible_if)]
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
         let slow_cycle_start_ns = if self.slow_cycle_trace.enabled() {

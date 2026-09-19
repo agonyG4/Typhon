@@ -117,6 +117,7 @@ void main() {
 pub(super) const COMPOSITE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
+uniform float u_presentation_opacity;
 uniform vec4 u_effect_input_domain;
 uniform vec2 u_effect_output_size;
 uniform int u_effect_encode_srgb;
@@ -159,6 +160,7 @@ void main() {
         discard;
     }
     vec4 result = texture(u_effect_input, typhon_effect_sample_uv(logical_input_uv));
+    result *= clamp(u_presentation_opacity, 0.0, 1.0);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     if (u_effect_force_opaque != 0) result.a = 1.0;
     out_color = typhon_sanitize_premultiplied(result);
@@ -3260,12 +3262,15 @@ fn execute_capture(
         .expect("replay capture has a materialization plan")
         .output_rects
         .clone();
-    renderer.draw_capture_commands_for_regions(
+    renderer.capture_unattenuated_visual_group = pass.visual_group;
+    let draw_result = renderer.draw_capture_commands_for_regions(
         &indices,
         &scissors,
         target_plan.domain,
         (target_plan.width, target_plan.height),
-    )?;
+    );
+    renderer.capture_unattenuated_visual_group = None;
+    draw_result?;
     renderer.effect_resources.unbind_render_target(&renderer.gl);
     renderer.bind_active_output_framebuffer();
     restore_output_viewport(renderer);
@@ -3708,6 +3713,23 @@ fn execute_fullscreen_pass(
     let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
     unsafe {
         renderer.gl.use_program(Some(program));
+        if matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        ) && let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_presentation_opacity",
+        ) {
+            let opacity = if output_is_framebuffer {
+                renderer.presentation_opacity_for_visual_group(pass.visual_group)
+            } else {
+                1.0
+            };
+            renderer.gl.uniform_1_f32(Some(&location), opacity);
+        }
         if let Some(location) = uniform_location(
             &mut renderer.effect_shaders,
             &renderer.gl,

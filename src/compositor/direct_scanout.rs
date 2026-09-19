@@ -50,6 +50,7 @@ pub enum DirectScanoutSceneRejection {
     PlacementMismatch,
     ResizePreviewActive,
     AnimationTransform,
+    PresentationOpacity,
     LifecycleAnimation,
     PendingOrUnpublishedWork,
 }
@@ -80,6 +81,7 @@ impl DirectScanoutSceneRejection {
             Self::PlacementMismatch => "placement_mismatch",
             Self::ResizePreviewActive => "resize_preview_active",
             Self::AnimationTransform => "animation_transform",
+            Self::PresentationOpacity => "presentation_opacity",
             Self::LifecycleAnimation => "lifecycle_animation",
             Self::PendingOrUnpublishedWork => "pending_or_unpublished_work",
         }

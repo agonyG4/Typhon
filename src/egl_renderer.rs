@@ -532,7 +532,11 @@ pub struct EglSceneDrawRequest<'a> {
     pub output_scale: f64,
     pub decoration_instances: &'a [DecorationRenderInstance],
     pub effects: &'a compositor::ResolvedEffectScene,
-    pub presentation_geometry_signature: u64,
+    /// Compatibility-shaped cache input carrying the complete visual signature.
+    pub presentation_visual_signature: u64,
+    pub presentation_opacities:
+        &'a [oblivion_one::presentation_animation::PresentationGroupOpacity],
+    pub presentation_owner_root_surface_ids: &'a [u32],
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
     pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
@@ -571,6 +575,7 @@ pub(crate) struct GlesSceneRenderer {
     program: GlProgram,
     capture_program: GlProgram,
     capture_uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
+    presentation_opacity_location: Option<glow::UniformLocation>,
     scene_vertex_array: GlVertexArray,
     scene_vertex_buffer: GlBuffer,
     scene_vertex_buffer_capacity: usize,
@@ -602,6 +607,9 @@ pub(crate) struct GlesSceneRenderer {
     commands: Vec<EglDrawCommand>,
     cursor_vertices: Vec<EglTexturedVertex>,
     cursor_commands: Vec<EglDrawCommand>,
+    presentation_opacities: Vec<f32>,
+    cursor_presentation_opacities: Vec<f32>,
+    presentation_visual_group_opacities: HashMap<VisualGroupId, f32>,
     scene_visibility_plan: Vec<EglVisibilityDecision>,
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
@@ -633,6 +641,7 @@ pub(crate) struct GlesSceneRenderer {
     effect_delta_seconds: f32,
     effect_output_scale: f32,
     pub(crate) capture_in_progress: bool,
+    capture_unattenuated_visual_group: Option<VisualGroupId>,
 }
 
 struct CaptureRendererState {
@@ -654,6 +663,7 @@ struct CaptureRendererState {
     failed_surface_generations: HashMap<u32, u64>,
     active_output_framebuffer: Option<glow::Framebuffer>,
     capture_in_progress: bool,
+    capture_unattenuated_visual_group: Option<VisualGroupId>,
 }
 
 impl CaptureRendererState {
@@ -677,6 +687,7 @@ impl CaptureRendererState {
             failed_surface_generations: renderer.failed_surface_generations.clone(),
             active_output_framebuffer: renderer.active_output_framebuffer,
             capture_in_progress: renderer.capture_in_progress,
+            capture_unattenuated_visual_group: renderer.capture_unattenuated_visual_group,
         }
     }
 
@@ -699,6 +710,7 @@ impl CaptureRendererState {
         renderer.failed_surface_generations = self.failed_surface_generations;
         renderer.active_output_framebuffer = self.active_output_framebuffer;
         renderer.capture_in_progress = self.capture_in_progress;
+        renderer.capture_unattenuated_visual_group = self.capture_unattenuated_visual_group;
     }
 }
 
@@ -1130,9 +1142,15 @@ impl GlesSceneRenderer {
             if let Some(location) = gl.get_uniform_location(program, "u_texture") {
                 gl.uniform_1_i32(Some(&location), 0);
             }
+            if let Some(location) = gl.get_uniform_location(program, "u_opacity") {
+                gl.uniform_1_f32(Some(&location), 1.0);
+            }
             gl.use_program(Some(capture_program));
             if let Some(location) = gl.get_uniform_location(capture_program, "u_texture") {
                 gl.uniform_1_i32(Some(&location), 0);
+            }
+            if let Some(location) = gl.get_uniform_location(capture_program, "u_opacity") {
+                gl.uniform_1_f32(Some(&location), 1.0);
             }
             if let Some(lamp_program) = lamp_program {
                 gl.use_program(Some(lamp_program));
@@ -1179,11 +1197,14 @@ impl GlesSceneRenderer {
                 .map(|symbol| symbol as *const c_void)
         });
 
+        let presentation_opacity_location =
+            unsafe { gl.get_uniform_location(program, "u_opacity") };
         Ok(Self {
             gl,
             program,
             capture_program,
             capture_uniform_locations: HashMap::new(),
+            presentation_opacity_location,
             scene_vertex_array,
             scene_vertex_buffer,
             scene_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
@@ -1216,6 +1237,9 @@ impl GlesSceneRenderer {
             commands: Vec::new(),
             cursor_vertices: Vec::new(),
             cursor_commands: Vec::new(),
+            presentation_opacities: Vec::new(),
+            cursor_presentation_opacities: Vec::new(),
+            presentation_visual_group_opacities: HashMap::new(),
             scene_visibility_plan: Vec::new(),
             scene_cache_key: None,
             presented_scene_key: None,
@@ -1250,6 +1274,7 @@ impl GlesSceneRenderer {
             effect_delta_seconds: 0.0,
             effect_output_scale: 1.0,
             capture_in_progress: false,
+            capture_unattenuated_visual_group: None,
         })
     }
 
@@ -1306,6 +1331,20 @@ impl GlesSceneRenderer {
                 glow::ONE_MINUS_SRC_ALPHA,
             );
         }
+    }
+
+    pub(crate) fn presentation_opacity_for_visual_group(
+        &self,
+        visual_group: Option<VisualGroupId>,
+    ) -> f32 {
+        visual_group
+            .and_then(|group| {
+                self.presentation_visual_group_opacities
+                    .get(&group)
+                    .copied()
+            })
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0)
     }
 
     pub(crate) fn capture_uniform_location(&mut self, name: &str) -> Option<glow::UniformLocation> {
@@ -1651,7 +1690,9 @@ impl GlesSceneRenderer {
             output_scale,
             decoration_instances,
             effects,
-            presentation_geometry_signature,
+            presentation_visual_signature,
+            presentation_opacities,
+            presentation_owner_root_surface_ids,
             popup_surface_ids,
             client_cursor,
             current_damage,
@@ -1760,6 +1801,11 @@ impl GlesSceneRenderer {
 
         let (base_surfaces, overlay_surfaces) =
             split_external_overlay_surfaces(surfaces, external_overlay_surface_ids);
+        let presentation_owner_roots_by_surface = surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .zip(presentation_owner_root_surface_ids.iter().copied())
+            .collect::<HashMap<_, _>>();
         let scene_surfaces = if external_overlay_surface_ids.is_empty() {
             surfaces
         } else {
@@ -1772,7 +1818,7 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
-            presentation_geometry_signature,
+            presentation_visual_signature,
             external_overlay_surface_ids,
             decoration_instances,
             popup_surface_ids,
@@ -1788,7 +1834,7 @@ impl GlesSceneRenderer {
             external_overlay_surface_ids,
             decoration_instances,
             popup_surface_ids,
-            presentation_geometry_signature,
+            presentation_visual_signature,
             framebuffer_origin,
         );
         let client_cursor_damage = client_cursor.map(|cursor| {
@@ -1849,7 +1895,9 @@ impl GlesSceneRenderer {
                 output_scale_key,
                 &surface_signatures,
                 external_overlay_surface_ids,
-                presentation_geometry_signature,
+                presentation_visual_signature,
+                presentation_opacities,
+                &presentation_owner_roots_by_surface,
                 framebuffer_origin,
             );
         }
@@ -2897,12 +2945,16 @@ impl GlesSceneRenderer {
         surface_signatures: &[EglSceneSurfaceSignature],
         external_overlay_surface_ids: &[u32],
         presentation_geometry_signature: u64,
+        presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
+        presentation_owner_roots_by_surface: &HashMap<u32, u32>,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
         self.frame_stats.orphan_decoration_count =
             compositor::WindowVisualGroup::orphan_decoration_count(surfaces, decoration_instances);
         self.vertices.clear();
         self.commands.clear();
+        self.presentation_opacities.clear();
+        self.presentation_visual_group_opacities.clear();
         self.scene_geometry_dirty = true;
         self.vertices.reserve((1 + surfaces.len()) * 6);
         self.commands.reserve(1 + surfaces.len());
@@ -2925,6 +2977,7 @@ impl GlesSceneRenderer {
         .into_iter()
         .enumerate()
         {
+            let command_start = self.commands.len();
             let visual_group = VisualGroupId::new(
                 u32::try_from(group_index)
                     .unwrap_or(u32::MAX.saturating_sub(1))
@@ -2962,6 +3015,36 @@ impl GlesSceneRenderer {
                     visual_group,
                 );
             }
+            let owner_root = group
+                .surface_indices()
+                .first()
+                .and_then(|index| surfaces.get(*index))
+                .and_then(|surface| presentation_owner_roots_by_surface.get(&surface.surface_id))
+                .copied()
+                .or_else(|| {
+                    group
+                        .decoration_index()
+                        .and_then(|index| decoration_instances.get(index))
+                        .map(DecorationRenderInstance::root_surface_id)
+                })
+                .unwrap_or_else(|| group.root_surface_id());
+            let opacity = presentation_opacities
+                .iter()
+                .find(|entry| entry.root_surface_id == owner_root)
+                .map_or(1.0, |entry| entry.opacity.get() as f32)
+                .clamp(0.0, 1.0);
+            if let Some(visual_group) = visual_group {
+                self.presentation_visual_group_opacities
+                    .insert(visual_group, opacity);
+            }
+            for _ in command_start..self.commands.len() {
+                self.presentation_opacities.push(opacity);
+            }
+            if opacity < 1.0 {
+                for command in &mut self.commands[command_start..] {
+                    command.opaque_regions.clear();
+                }
+            }
         }
 
         self.scene_cache_key = Some(
@@ -2996,11 +3079,13 @@ impl GlesSceneRenderer {
     ) {
         self.cursor_vertices.clear();
         self.cursor_commands.clear();
+        self.cursor_presentation_opacities.clear();
         self.overlay_geometry_dirty = true;
 
         let render_assignments =
             compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
         for (surface, render_assignment) in overlay_surfaces.iter().zip(render_assignments) {
+            let command_start = self.cursor_commands.len();
             push_egl_surface_commands(
                 &mut self.cursor_vertices,
                 &mut self.cursor_commands,
@@ -3011,6 +3096,11 @@ impl GlesSceneRenderer {
                 framebuffer_origin,
                 None,
             );
+            self.cursor_presentation_opacities
+                .extend(std::iter::repeat_n(
+                    1.0,
+                    self.cursor_commands.len().saturating_sub(command_start),
+                ));
         }
 
         if let Some((cursor_x, cursor_y)) = visual_state.cursor
@@ -3031,6 +3121,7 @@ impl GlesSceneRenderer {
                 height,
                 framebuffer_origin,
             );
+            self.cursor_presentation_opacities.push(1.0);
         }
 
         if let Some(cursor) = client_cursor {
@@ -3072,6 +3163,7 @@ impl GlesSceneRenderer {
                 height,
                 framebuffer_origin,
             );
+            self.cursor_presentation_opacities.push(1.0);
         }
     }
 
@@ -4081,10 +4173,21 @@ impl GlesSceneRenderer {
         if scene && plan_scene_visibility {
             self.plan_scene_visibility(scissor);
         }
+        let opacity_location =
+            if self.capture_in_progress || self.capture_unattenuated_visual_group.is_some() {
+                self.capture_uniform_location("u_opacity")
+            } else {
+                self.presentation_opacity_location
+            };
         let (vertices, commands) = if scene {
             (&self.vertices, &self.commands)
         } else {
             (&self.cursor_vertices, &self.cursor_commands)
+        };
+        let presentation_opacities = if scene {
+            &self.presentation_opacities
+        } else {
+            &self.cursor_presentation_opacities
         };
         if vertices.is_empty() || commands.is_empty() {
             return Ok(());
@@ -4188,6 +4291,18 @@ impl GlesSceneRenderer {
                     self.gl
                         .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
                     current_sampling = Some(command.sampling);
+                }
+                if let Some(location) = opacity_location.as_ref() {
+                    let presentation_opacity =
+                        if self.capture_unattenuated_visual_group == command.visual_group {
+                            1.0
+                        } else {
+                            presentation_opacities
+                                .get(command_index)
+                                .copied()
+                                .unwrap_or(1.0)
+                        };
+                    self.gl.uniform_1_f32(Some(location), presentation_opacity);
                 }
                 self.gl.draw_arrays(
                     glow::TRIANGLES,
@@ -7751,6 +7866,7 @@ mod tests {
             .expect("diagnostic pixel has four channels")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn diagnostic_matrix_mismatch_counts_for_origin(
         actual: &[u8],
         previous: &[u8],

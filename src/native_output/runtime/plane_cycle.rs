@@ -67,7 +67,7 @@ pub(super) fn plane_delta_reservation_outcome(
     result.map_err(|_| KmsWorkerAdmissionError::QueueFull)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
 pub(super) fn queue_plane_delta(
     worker: &KmsCommitWorkerHandle,
     server: &mut OwnCompositorServer,

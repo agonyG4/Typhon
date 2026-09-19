@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::io;
 
 use glow::HasContext;
@@ -73,11 +75,12 @@ void main() {
 const EGL_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision mediump float;
 uniform sampler2D u_texture;
+uniform float u_opacity;
 in vec2 v_uv;
 out vec4 out_color;
 
 void main() {
-    out_color = texture(u_texture, v_uv);
+    out_color = texture(u_texture, v_uv) * clamp(u_opacity, 0.0, 1.0);
 }
 "#;
 

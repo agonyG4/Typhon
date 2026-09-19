@@ -732,13 +732,16 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureLifecycleEffectPath(reply) => {
                         let at =
                             AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-                        let canonical_surfaces = server.native_frame_renderable_surfaces();
+                        let (canonical_surfaces, fullscreen_plan, _) =
+                            server.native_frame_renderable_surfaces_with_composition_plan();
                         let targets =
                             server.native_frame_presentation_targets(canonical_surfaces.as_ref());
                         let presentation =
                             server.presentation_scene_sample_for_targets_at(at, &targets);
-                        let presentation_effects =
-                            server.resolved_effect_scene_for_presentation(&presentation);
+                        let presentation_effects = server.resolved_effect_scene_for_presentation(
+                            &presentation,
+                            &fullscreen_plan,
+                        );
                         let lifecycle = server.lifecycle_scene_sample_at(at);
                         let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
                         let lifecycle_surface_ids = lifecycle_surfaces

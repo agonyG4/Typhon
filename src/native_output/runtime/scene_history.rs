@@ -78,6 +78,14 @@ impl NativeSceneHistory {
         self.presented.as_ref().map(|snapshot| &snapshot.scene)
     }
 
+    pub(crate) fn presented_presentation_if_any(
+        &self,
+    ) -> Option<&oblivion_one::compositor::PresentationFrameSnapshot> {
+        self.presented
+            .as_ref()
+            .map(|snapshot| &snapshot.presentation)
+    }
+
     pub(crate) fn presented_frame_id(&self) -> Option<u64> {
         self.presented.as_ref().map(|snapshot| snapshot.frame_id)
     }
@@ -250,6 +258,17 @@ impl NativeSceneHistory {
                     previous_software: previous.cursor_damage.software,
                     software: current.cursor_damage.software,
                 },
+            )
+            .union_surface_rects(
+                opacity_damage_for_frame_snapshots(
+                    output_width,
+                    output_height,
+                    &previous.presentation,
+                    &current.presentation,
+                    &previous.scene,
+                    &current.scene,
+                )
+                .rects,
             )
             .union_surface_rects(
                 lifecycle_damage_rects(&previous.lifecycle, output_width, output_height)

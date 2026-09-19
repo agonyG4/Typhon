@@ -67,6 +67,7 @@ pub(crate) fn note_identity_computation() {
 /// A native frame projection keeps canonical surface identity paired with the
 /// surface it qualified.  The pair is filtered together whenever a frame-local
 /// projection needs to own a subset of the active scene.
+#[allow(dead_code)]
 pub(crate) fn filter_surface_scene_nodes<'a, F>(
     surfaces: Cow<'a, [RenderableSurface]>,
     scene_nodes: Cow<'a, [SceneNodeId]>,
@@ -90,6 +91,45 @@ where
     )
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) fn filter_surface_scene_nodes_with_owners<'a, F>(
+    surfaces: Cow<'a, [RenderableSurface]>,
+    scene_nodes: Cow<'a, [SceneNodeId]>,
+    owner_roots: Cow<'a, [u32]>,
+    mut keep: F,
+) -> (
+    Cow<'a, [RenderableSurface]>,
+    Cow<'a, [SceneNodeId]>,
+    Cow<'a, [u32]>,
+)
+where
+    F: FnMut(&RenderableSurface) -> bool,
+{
+    debug_assert_eq!(surfaces.len(), scene_nodes.len());
+    debug_assert_eq!(surfaces.len(), owner_roots.len());
+    let mut filtered_surfaces = Vec::with_capacity(surfaces.len());
+    let mut filtered_scene_nodes = Vec::with_capacity(scene_nodes.len());
+    let mut filtered_owner_roots = Vec::with_capacity(owner_roots.len());
+    for ((surface, scene_node), owner_root) in surfaces
+        .iter()
+        .zip(scene_nodes.iter().copied())
+        .zip(owner_roots.iter().copied())
+    {
+        if keep(surface) {
+            filtered_surfaces.push(surface.clone());
+            filtered_scene_nodes.push(scene_node);
+            filtered_owner_roots.push(owner_root);
+        }
+    }
+    debug_assert_eq!(filtered_surfaces.len(), filtered_scene_nodes.len());
+    debug_assert_eq!(filtered_surfaces.len(), filtered_owner_roots.len());
+    (
+        Cow::Owned(filtered_surfaces),
+        Cow::Owned(filtered_scene_nodes),
+        Cow::Owned(filtered_owner_roots),
+    )
+}
+
 pub(crate) fn assert_surface_scene_node_alignment(
     surfaces: &[RenderableSurface],
     scene_nodes: &[SceneNodeId],
@@ -98,6 +138,14 @@ pub(crate) fn assert_surface_scene_node_alignment(
         surfaces.len(),
         scene_nodes.len(),
         "native frame surfaces and SceneNode IDs must have equal cardinality"
+    );
+}
+
+pub(crate) fn assert_surface_owner_alignment(surfaces: &[RenderableSurface], owner_roots: &[u32]) {
+    debug_assert_eq!(
+        surfaces.len(),
+        owner_roots.len(),
+        "native frame surfaces and presentation owners must have equal cardinality"
     );
 }
 

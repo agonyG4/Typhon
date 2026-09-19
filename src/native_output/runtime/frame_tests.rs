@@ -244,6 +244,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
         let resolved = ResolvedNativeFrameScene {
             surfaces: Cow::Borrowed(surfaces),
             surface_scene_node_ids: Cow::Borrowed(&[]),
+            presentation_owner_root_surface_ids: Cow::Borrowed(&[]),
             decorations: Vec::new(),
             popup_surface_ids: Cow::Borrowed(popup_surface_ids),
             external_overlay_surface_ids: Vec::new(),

@@ -339,7 +339,7 @@ fn normal_predecessor_pacing_id_cannot_touch_predictive_successor() {
 
     let successor = physical_identity(5_520);
     pacing.queue_visual(1, successor.render_generation);
-    pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+    let _ = pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
     let attempt = pacing
         .active_predictive_attempt
         .expect("predictive attempt");

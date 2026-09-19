@@ -9,6 +9,7 @@ mod engine;
 mod frame;
 mod geometry;
 mod ids;
+mod opacity;
 mod time;
 mod transaction;
 
@@ -19,8 +20,9 @@ pub use engine::{
 };
 pub use frame::{
     FramePresentationSample, NativeFramePresentationTargets, PresentationFrameSnapshot,
-    PresentationGroupTransform, PresentationSampleTimeSource, PresentationSceneSample,
-    PresentationWindowTarget, PresentedGeometryAck, PresentedWindowGeometry,
+    PresentationGroupOpacity, PresentationGroupTransform, PresentationOpacityTransitionEvidence,
+    PresentationSampleTimeSource, PresentationSceneSample, PresentationWindowTarget,
+    PresentedGeometryAck, PresentedOpacityAck, PresentedWindowGeometry,
 };
 pub use geometry::{
     PresentationDamageRect, PresentationGeometryTransform, PresentationRect, PresentationVelocity,
@@ -29,17 +31,18 @@ pub use geometry::{
 pub use ids::{
     PresentationPropertyKind, PresentationRevisionId, PresentationTransactionId, TransitionId,
 };
+pub use opacity::PresentationOpacity;
 pub use time::AnimationTime;
 pub use transaction::{
-    PresentationGeometryMutation, PresentationTransactionError, PresentationTransactionMember,
-    PresentationTransactionRecord, PresentationTransactionRequest,
+    PresentationGeometryMutation, PresentationOpacityMutation, PresentationTransactionError,
+    PresentationTransactionMember, PresentationTransactionRecord, PresentationTransactionRequest,
 };
 
 /// Compatibility alias retained while compositor call sites converge on the
 /// v2 engine name. It is not a second production authority.
 pub type PresentationAnimator = PresentationEngine;
 
-pub(crate) use transaction::PreparedGeometryMutation;
+pub(crate) use transaction::{PreparedGeometryMutation, PreparedOpacityMutation};
 
 #[cfg(test)]
 mod math_tests;

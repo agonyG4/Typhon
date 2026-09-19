@@ -3,6 +3,7 @@
 use std::io;
 
 use crate::core::WindowId;
+use crate::presentation_animation::PresentationOpacity;
 use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
 use crate::xwayland::xwm::{
@@ -102,6 +103,7 @@ pub(super) struct X11GeometryState {
 pub struct DesktopWindow {
     pub id: WindowId,
     pub root_surface_id: u32,
+    pub(crate) canonical_opacity: PresentationOpacity,
     pub backend: WindowBackend,
     pub(crate) x11_surface_id: Option<u32>,
     pub kind: DesktopWindowKind,
@@ -172,6 +174,7 @@ impl DesktopWindow {
         Self {
             id,
             root_surface_id,
+            canonical_opacity: PresentationOpacity::OPAQUE,
             backend: WindowBackend::Xdg(XdgWindowHandle::new(root_surface_id)),
             x11_surface_id: None,
             kind: DesktopWindowKind::Managed,
@@ -204,6 +207,7 @@ impl DesktopWindow {
         Self {
             id,
             root_surface_id: snapshot.surface_id,
+            canonical_opacity: PresentationOpacity::OPAQUE,
             backend: WindowBackend::X11(snapshot.handle),
             x11_surface_id: Some(snapshot.surface_id),
             kind: snapshot.kind,
@@ -230,6 +234,14 @@ impl DesktopWindow {
             state: WindowState::default(),
             last_focus_serial: 0,
         }
+    }
+
+    pub(crate) const fn canonical_opacity(&self) -> PresentationOpacity {
+        self.canonical_opacity
+    }
+
+    pub(crate) fn set_canonical_opacity(&mut self, opacity: PresentationOpacity) {
+        self.canonical_opacity = opacity;
     }
 }
 

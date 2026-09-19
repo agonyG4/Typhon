@@ -3084,6 +3084,7 @@ impl NativeFramePacing {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn note_submit_frame(
         &mut self,
         id: Option<NativeOutputFrameId>,
@@ -3709,6 +3710,7 @@ impl NativeFramePacing {
         self.note_ready_frame(now_ns, true);
     }
 
+    #[allow(clippy::collapsible_if)]
     pub(crate) fn note_predictive_binding_after_predecessor_pageflip(
         &mut self,
         advanced_intervals: u64,
@@ -3737,6 +3739,7 @@ impl NativeFramePacing {
         }
     }
 
+    #[allow(clippy::collapsible_if)]
     pub(crate) fn note_predictive_unbound_ready(&mut self) {
         if self.enabled {
             self.predictive_unbound_ready = self.predictive_unbound_ready.saturating_add(1);
@@ -3750,6 +3753,7 @@ impl NativeFramePacing {
         }
     }
 
+    #[allow(clippy::collapsible_if)]
     pub(crate) fn note_predictive_binding_after_render_completion(
         &mut self,
         advanced_intervals: u64,

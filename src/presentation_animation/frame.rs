@@ -1,8 +1,9 @@
 use crate::core::{OutputId, SceneNodeId};
 
 use super::{
-    AnimationTime, PresentationGeometryTransform, PresentationPropertyKind, PresentationRect,
-    PresentationRevisionId, PresentationTransactionId, PresentationWindowSample, TransitionId,
+    AnimationTime, PresentationGeometryTransform, PresentationOpacity, PresentationPropertyKind,
+    PresentationRect, PresentationRevisionId, PresentationTransactionId, PresentationWindowSample,
+    TransitionId,
 };
 
 /// The source used to choose the immutable timestamp attached to a frame.
@@ -20,6 +21,7 @@ pub struct PresentationWindowTarget {
     window_group_scene_node_id: SceneNodeId,
     root_surface_id: u32,
     canonical_rect: PresentationRect,
+    canonical_opacity: PresentationOpacity,
 }
 
 impl PresentationWindowTarget {
@@ -32,6 +34,7 @@ impl PresentationWindowTarget {
             window_group_scene_node_id,
             root_surface_id,
             canonical_rect,
+            canonical_opacity: PresentationOpacity::OPAQUE,
         }
     }
 
@@ -58,6 +61,15 @@ impl PresentationWindowTarget {
 
     pub const fn canonical_rect(self) -> PresentationRect {
         self.canonical_rect
+    }
+
+    pub const fn with_canonical_opacity(mut self, canonical_opacity: PresentationOpacity) -> Self {
+        self.canonical_opacity = canonical_opacity;
+        self
+    }
+
+    pub const fn canonical_opacity(self) -> PresentationOpacity {
+        self.canonical_opacity
     }
 }
 
@@ -202,6 +214,49 @@ impl PresentationGroupTransform {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationOpacityTransitionEvidence {
+    pub transaction_id: PresentationTransactionId,
+    pub revision_id: PresentationRevisionId,
+    pub mathematically_settled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentationGroupOpacity {
+    pub scene_node_id: SceneNodeId,
+    pub root_surface_id: u32,
+    pub opacity: PresentationOpacity,
+    pub transition: Option<PresentationOpacityTransitionEvidence>,
+}
+
+impl PresentationGroupOpacity {
+    pub const fn with_scene_node(
+        scene_node_id: SceneNodeId,
+        root_surface_id: u32,
+        opacity: PresentationOpacity,
+        transition: Option<PresentationOpacityTransitionEvidence>,
+    ) -> Self {
+        Self {
+            scene_node_id,
+            root_surface_id,
+            opacity,
+            transition,
+        }
+    }
+
+    pub fn signature(self) -> u64 {
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        for value in [
+            u64::from(self.root_surface_id),
+            self.opacity.get().to_bits(),
+        ] {
+            signature ^= value;
+            signature = signature.wrapping_mul(0x1000_0000_01b3);
+        }
+        signature
+    }
+}
+
 /// Immutable physical evidence used to acknowledge one settled geometry track.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresentedGeometryAck {
@@ -226,6 +281,35 @@ impl PresentedGeometryAck {
             revision_id: transform.revision_id,
             presented_rect: transform.presented_rect,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentedOpacityAck {
+    pub output_id: OutputId,
+    pub scene_node_id: SceneNodeId,
+    pub property: PresentationPropertyKind,
+    pub transaction_id: PresentationTransactionId,
+    pub revision_id: PresentationRevisionId,
+    pub presented_opacity: PresentationOpacity,
+}
+
+impl PresentedOpacityAck {
+    pub const fn from_group_opacity(
+        output_id: OutputId,
+        group: PresentationGroupOpacity,
+    ) -> Option<Self> {
+        let Some(transition) = group.transition else {
+            return None;
+        };
+        Some(Self {
+            output_id,
+            scene_node_id: group.scene_node_id,
+            property: PresentationPropertyKind::Opacity,
+            transaction_id: transition.transaction_id,
+            revision_id: transition.revision_id,
+            presented_opacity: group.opacity,
+        })
     }
 }
 
@@ -280,6 +364,7 @@ pub struct PresentationSceneSample {
     pub sample_time_source: PresentationSampleTimeSource,
     pub windows: Vec<PresentationWindowSample>,
     pub transforms: Vec<PresentationGroupTransform>,
+    pub opacities: Vec<PresentationGroupOpacity>,
     pub active_transitions: usize,
     pub sampled_windows: usize,
 }
@@ -298,6 +383,7 @@ impl PresentationSceneSample {
             sample_time_source,
             windows: Vec::new(),
             transforms: Vec::new(),
+            opacities: Vec::new(),
             active_transitions: 0,
             sampled_windows: 0,
         }
@@ -327,6 +413,25 @@ impl PresentationSceneSample {
     pub fn geometry_signature(&self) -> u64 {
         self.frame_snapshot().signature
     }
+
+    pub fn presentation_visual_signature(&self) -> u64 {
+        self.frame_snapshot().signature
+    }
+
+    pub fn opacity_for_root(&self, root_surface_id: u32) -> PresentationOpacity {
+        self.opacities
+            .binary_search_by_key(&root_surface_id, |opacity| opacity.root_surface_id)
+            .ok()
+            .map(|index| self.opacities[index].opacity)
+            .unwrap_or(PresentationOpacity::OPAQUE)
+    }
+
+    pub fn opacity_for_scene_node(&self, scene_node_id: SceneNodeId) -> PresentationOpacity {
+        self.opacities
+            .iter()
+            .find(|opacity| opacity.scene_node_id == scene_node_id)
+            .map_or(PresentationOpacity::OPAQUE, |opacity| opacity.opacity)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -335,6 +440,7 @@ pub struct PresentationFrameSnapshot {
     pub sampled_at: AnimationTime,
     pub sample_time_source: PresentationSampleTimeSource,
     pub transforms: Vec<PresentationGroupTransform>,
+    pub opacities: Vec<PresentationGroupOpacity>,
     pub presented_windows: Vec<PresentedWindowGeometry>,
     pub signature: u64,
 }
@@ -357,11 +463,14 @@ impl PresentationFrameSnapshot {
         mut presented_windows: Vec<PresentedWindowGeometry>,
     ) -> Self {
         presented_windows.sort_unstable_by_key(|window| window.root_surface_id());
+        let mut opacities = sample.opacities.clone();
+        opacities.sort_unstable_by_key(|opacity| opacity.root_surface_id);
         let mut snapshot = Self {
             output_id: sample.output_id,
             sampled_at: sample.sampled_at,
             sample_time_source: sample.sample_time_source,
             transforms: sample.transforms.clone(),
+            opacities,
             presented_windows,
             signature: 0,
         };
@@ -384,6 +493,21 @@ impl PresentationFrameSnapshot {
             .iter()
             .find(|transform| transform.scene_node_id == scene_node_id)
             .copied()
+    }
+
+    pub fn opacity_for_root(&self, root_surface_id: u32) -> PresentationOpacity {
+        self.opacities
+            .binary_search_by_key(&root_surface_id, |opacity| opacity.root_surface_id)
+            .ok()
+            .map(|index| self.opacities[index].opacity)
+            .unwrap_or(PresentationOpacity::OPAQUE)
+    }
+
+    pub fn opacity_for_scene_node(&self, scene_node_id: SceneNodeId) -> PresentationOpacity {
+        self.opacities
+            .iter()
+            .find(|opacity| opacity.scene_node_id == scene_node_id)
+            .map_or(PresentationOpacity::OPAQUE, |opacity| opacity.opacity)
     }
 
     pub fn presented_window_geometry(
@@ -415,6 +539,10 @@ impl PresentationFrameSnapshot {
         let mut signature = 0xcbf2_9ce4_8422_2325_u64;
         for transform in &self.transforms {
             signature ^= transform.signature();
+            signature = signature.wrapping_mul(0x1000_0000_01b3);
+        }
+        for opacity in &self.opacities {
+            signature ^= opacity.signature();
             signature = signature.wrapping_mul(0x1000_0000_01b3);
         }
         for window in &self.presented_windows {

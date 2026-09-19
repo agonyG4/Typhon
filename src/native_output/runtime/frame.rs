@@ -10,7 +10,8 @@ use oblivion_one::compositor::{
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
 use super::frame_scene_identity::{
-    assert_surface_scene_node_alignment, filter_surface_scene_nodes, finalize_snapshot,
+    assert_surface_owner_alignment, assert_surface_scene_node_alignment,
+    filter_surface_scene_nodes_with_owners, finalize_snapshot,
 };
 
 #[cfg(test)]
@@ -22,6 +23,7 @@ use super::frame_scene_identity::{
 pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) surfaces: Cow<'a, [RenderableSurface]>,
     pub(crate) surface_scene_node_ids: Cow<'a, [SceneNodeId]>,
+    pub(crate) presentation_owner_root_surface_ids: Cow<'a, [u32]>,
     pub(crate) decorations: Vec<DecorationRenderInstance>,
     pub(crate) popup_surface_ids: Cow<'a, [u32]>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
@@ -71,22 +73,36 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     ) -> Self {
         let (canonical_surfaces, canonical_scene_nodes, fullscreen_plan, visibility) =
             server.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
+        let canonical_owner_roots = Cow::Owned(
+            canonical_surfaces
+                .iter()
+                .map(|surface| server.presentation_owner_root_for_surface(surface.surface_id))
+                .collect::<Vec<_>>(),
+        );
         let lifecycle = server.lifecycle_scene_sample_at(at);
         let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
         let lifecycle_decorations =
             server.lifecycle_decoration_render_instances(&lifecycle, &lifecycle_surfaces);
-        let (canonical_surfaces, canonical_scene_nodes) =
+        let (canonical_surfaces, canonical_scene_nodes, canonical_owner_roots) =
             if server.lifecycle_render_suppressed_roots().is_empty() {
-                (canonical_surfaces, canonical_scene_nodes)
+                (
+                    canonical_surfaces,
+                    canonical_scene_nodes,
+                    canonical_owner_roots,
+                )
             } else {
-                filter_surface_scene_nodes(canonical_surfaces, canonical_scene_nodes, |surface| {
-                    !server.lifecycle_surface_is_suppressed(surface.surface_id)
-                })
+                filter_surface_scene_nodes_with_owners(
+                    canonical_surfaces,
+                    canonical_scene_nodes,
+                    canonical_owner_roots,
+                    |surface| !server.lifecycle_surface_is_suppressed(surface.surface_id),
+                )
             };
         assert_surface_scene_node_alignment(
             canonical_surfaces.as_ref(),
             canonical_scene_nodes.as_ref(),
         );
+        assert_surface_owner_alignment(canonical_surfaces.as_ref(), canonical_owner_roots.as_ref());
         let targets = server.native_frame_presentation_targets(canonical_surfaces.as_ref());
         let presentation = server.presentation_scene_sample_for_targets_at_with_source(
             at,
@@ -115,9 +131,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let render_generation = server.scene_render_generation();
         let effects =
             server.resolved_effect_scene_for_presentation(&presentation, &fullscreen_plan);
-        let snapshot = NativeSceneSnapshot::from_surfaces_with_scene_nodes(
+        let snapshot = NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
             surfaces.as_ref(),
             canonical_scene_nodes.as_ref(),
+            canonical_owner_roots.as_ref(),
             decorations
                 .iter()
                 .map(DecorationRenderInstance::scene_snapshot)
@@ -138,6 +155,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         Self {
             surfaces,
             surface_scene_node_ids: canonical_scene_nodes,
+            presentation_owner_root_surface_ids: canonical_owner_roots,
             decorations,
             popup_surface_ids,
             external_overlay_surface_ids,
@@ -158,6 +176,9 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         ResolvedNativeFrameScene {
             surfaces: Cow::Owned(self.surfaces.into_owned()),
             surface_scene_node_ids: Cow::Owned(self.surface_scene_node_ids.into_owned()),
+            presentation_owner_root_surface_ids: Cow::Owned(
+                self.presentation_owner_root_surface_ids.into_owned(),
+            ),
             decorations: self.decorations,
             popup_surface_ids: Cow::Owned(self.popup_surface_ids.into_owned()),
             external_overlay_surface_ids: self.external_overlay_surface_ids,
@@ -954,6 +975,19 @@ impl NativeFrameRenderer {
             .set_decoration_instances(&resolved_scene.decorations);
         self.scene_renderer
             .set_popup_surface_ids(&resolved_scene.popup_surface_ids);
+        self.scene_renderer.set_presentation_projection(
+            &resolved_scene.presentation.opacities,
+            resolved_scene
+                .surfaces
+                .iter()
+                .map(|surface| surface.surface_id)
+                .zip(
+                    resolved_scene
+                        .presentation_owner_root_surface_ids
+                        .iter()
+                        .copied(),
+                ),
+        );
         let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
         self.render_frame(NativeFrameRequest {
             width,
@@ -1055,7 +1089,13 @@ impl NativeFrameRenderer {
             visual_state: input_state.desktop_visual_state(cursor_mode, cursor_visible),
             output_scale: 1.0,
             decoration_instances: &resolved_scene.decorations,
-            presentation_geometry_signature: resolved_scene.presentation.geometry_signature(),
+            presentation_visual_signature: resolved_scene
+                .presentation
+                .presentation_visual_signature(),
+            presentation_opacities: &resolved_scene.presentation.opacities,
+            presentation_owner_root_surface_ids: resolved_scene
+                .presentation_owner_root_surface_ids
+                .as_ref(),
             client_cursor: cursor_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())

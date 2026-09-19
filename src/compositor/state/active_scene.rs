@@ -1,4 +1,5 @@
 use super::*;
+use crate::presentation_animation::PresentationOpacity;
 use crate::wm::{SpecialWorkspaceId, WorkspaceId};
 use std::time::Duration;
 
@@ -175,11 +176,21 @@ impl CompositorState {
                     .or_else(|| self.current_root_window_geometry(root_surface_id))?;
                 let canonical_rect =
                     self.presentation_rect_for_geometry(root_surface_id, geometry)?;
-                Some(PresentationWindowTarget::with_scene_node(
-                    scene_node_id,
-                    root_surface_id,
-                    canonical_rect,
-                ))
+                let canonical_opacity = self
+                    .window_id_for_surface(root_surface_id)
+                    .and_then(|window_id| self.window(window_id))
+                    .map_or(
+                        PresentationOpacity::OPAQUE,
+                        DesktopWindow::canonical_opacity,
+                    );
+                Some(
+                    PresentationWindowTarget::with_scene_node(
+                        scene_node_id,
+                        root_surface_id,
+                        canonical_rect,
+                    )
+                    .with_canonical_opacity(canonical_opacity),
+                )
             })
             .collect();
         NativeFramePresentationTargets::from_windows(windows)
@@ -190,6 +201,58 @@ impl CompositorState {
         surfaces: &[RenderableSurface],
     ) -> NativeFramePresentationTargets {
         self.presentation_targets_for_surfaces(surfaces)
+    }
+
+    pub(in crate::compositor) fn set_window_canonical_opacity(
+        &mut self,
+        window_id: WindowId,
+        opacity: PresentationOpacity,
+        curve: Option<AnimationCurve>,
+    ) -> Result<(), crate::presentation_animation::PresentationTransactionError> {
+        let Some(window) = self.window(window_id) else {
+            return Err(crate::presentation_animation::PresentationTransactionError::
+                MissingPresentationOwner);
+        };
+        let scene_node_id = self.scene_node_id_for_window_group(window_id).ok_or(
+            crate::presentation_animation::PresentationTransactionError::MissingPresentationOwner,
+        )?;
+        let previous = window.canonical_opacity();
+        if previous == opacity && !self.presentation_animator.has_opacity_track(scene_node_id) {
+            return Ok(());
+        }
+        let Some(now) = self
+            .layout_animation_epoch
+            .or_else(AnimationTime::monotonic_now)
+        else {
+            return Err(crate::presentation_animation::PresentationTransactionError::Empty);
+        };
+
+        if let Some(curve) = curve.filter(|_| self.presentation_animator.is_enabled()) {
+            let request = crate::presentation_animation::PresentationTransactionRequest::opacity(
+                now,
+                vec![
+                    crate::presentation_animation::PresentationOpacityMutation::new(
+                        scene_node_id,
+                        previous,
+                        opacity,
+                        curve,
+                    ),
+                ],
+            );
+            match self.presentation_animator.commit(request) {
+                Ok(_) | Err(crate::presentation_animation::PresentationTransactionError::Empty) => {
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            self.presentation_animator.cancel_opacity(scene_node_id);
+        }
+
+        if let Some(window) = self.window_mut(window_id) {
+            window.set_canonical_opacity(opacity);
+        }
+        self.advance_render_generation(RenderGenerationCause::WindowMode);
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -326,6 +389,24 @@ impl CompositorState {
             .has_pending_visible(&visible_keys)
     }
 
+    pub(in crate::compositor) fn presentation_animation_has_pending_visible_geometry(
+        &self,
+    ) -> bool {
+        let surfaces = self.native_frame_renderable_surfaces();
+        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
+        let visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
+        self.presentation_animator
+            .has_pending_visible_geometry(&visible_keys)
+    }
+
+    pub(in crate::compositor) fn presentation_animation_has_pending_visible_opacity(&self) -> bool {
+        let surfaces = self.native_frame_renderable_surfaces();
+        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
+        let visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
+        self.presentation_animator
+            .has_pending_visible_opacity(&visible_keys)
+    }
+
     pub(in crate::compositor) fn presentation_animation_pending_for_root(
         &self,
         root_surface_id: u32,
@@ -367,6 +448,26 @@ impl CompositorState {
         self.presented_presentation
             .as_ref()?
             .transform_for_root(root_surface_id)
+    }
+
+    pub(in crate::compositor) fn presented_presentation_opacity(
+        &self,
+        root_surface_id: u32,
+    ) -> PresentationOpacity {
+        self.presented_presentation
+            .as_ref()
+            .map_or(PresentationOpacity::OPAQUE, |presentation| {
+                presentation.opacity_for_root(root_surface_id)
+            })
+    }
+
+    pub(in crate::compositor) fn presented_presentation_opacity_is_non_identity(
+        &self,
+        root_surface_id: u32,
+    ) -> bool {
+        !self
+            .presented_presentation_opacity(root_surface_id)
+            .is_opaque()
     }
 
     pub(in crate::compositor) fn presented_window_geometry(
@@ -522,6 +623,20 @@ impl CompositorState {
                 );
             }
         }
+        for opacity in &presentation.opacities {
+            if opacity
+                .transition
+                .is_some_and(|transition| transition.mathematically_settled)
+                && let Some(ack) =
+                    crate::presentation_animation::PresentedOpacityAck::from_group_opacity(
+                        presentation.output_id,
+                        *opacity,
+                    )
+            {
+                self.presentation_animator
+                    .acknowledge_presented_opacity(expected_output_id, ack);
+            }
+        }
         self.advance_pointer_hit_generation();
     }
 
@@ -536,12 +651,15 @@ impl CompositorState {
         if let Some(window_id) = self.window_id_for_surface(root_surface_id)
             && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
         {
-            self.presentation_animator.cancel(scene_node_id);
+            self.presentation_animator.cancel_all(scene_node_id);
         }
         if let Some(presentation) = self.presented_presentation.as_mut() {
             presentation
                 .transforms
                 .retain(|transform| transform.root_surface_id != root_surface_id);
+            presentation
+                .opacities
+                .retain(|opacity| opacity.root_surface_id != root_surface_id);
             presentation.refresh_signature();
         }
         self.presented_window_geometries
@@ -553,7 +671,7 @@ impl CompositorState {
         root_surface_id: u32,
     ) {
         if let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) {
-            self.presentation_animator.cancel(scene_node_id);
+            self.presentation_animator.cancel_geometry(scene_node_id);
         }
     }
 
@@ -589,7 +707,7 @@ impl CompositorState {
             if let Some(window_id) = self.window_id_for_surface(root_surface_id)
                 && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
             {
-                self.presentation_animator.cancel(scene_node_id);
+                self.presentation_animator.cancel_geometry(scene_node_id);
             }
             return;
         };
@@ -597,23 +715,23 @@ impl CompositorState {
             return;
         };
         if interaction_active {
-            self.presentation_animator.cancel(scene_node_id);
+            self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         }
         let Some(previous) =
             self.presentation_rect_for_geometry(root_surface_id, previous_geometry)
         else {
-            self.presentation_animator.cancel(scene_node_id);
+            self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         };
         let Some(target) = self.presentation_rect_for_geometry(root_surface_id, target_geometry)
         else {
-            self.presentation_animator.cancel(scene_node_id);
+            self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         };
         let current_curve = self.animation_control.curve_for(kind);
         let Some(curve) = current_curve else {
-            self.presentation_animator.cancel(scene_node_id);
+            self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         };
         let mutation = crate::presentation_animation::PresentationGeometryMutation::new(
