@@ -10,7 +10,7 @@ use oblivion_one::compositor::{
 use oblivion_one::core::OutputId;
 use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
-use crate::presentation_animation::{
+use oblivion_one::presentation_animation::{
     PresentationGroupOpacity, PresentationOpacity, PresentationOpacityTransitionEvidence,
     PresentationRevisionId, PresentationSampleTimeSource, PresentationSceneSample,
     PresentationTransactionId,
