@@ -190,26 +190,6 @@ pub(super) fn install_x11_scanout_surface(
     state.rebuild_active_scene_view();
 }
 
-fn install_off_output_xdg_window(state: &mut CompositorState, root_surface_id: u32) -> SceneNodeId {
-    let window_id = state.allocate_window_id().expect("off-output window id");
-    state
-        .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
-        .expect("off-output window");
-    state.append_renderable_surface(x11_shm_surface(
-        root_surface_id,
-        16,
-        16,
-        SurfacePlacement::absolute_root_at(2_000, 0),
-    ));
-    state
-        .surface_presentation_generations
-        .insert(root_surface_id, 1);
-    state.rebuild_active_scene_view();
-    state
-        .scene_node_id_for_window_group(window_id)
-        .expect("off-output WindowGroup scene node")
-}
-
 #[test]
 fn window_id_is_nonzero_monotonic_and_not_reused() {
     let mut state = CompositorState::new(None);
