@@ -316,6 +316,16 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 popup_surface_ids.as_ref(),
             );
         let (output_width, output_height) = server.output_dimensions();
+        let physical_effect_damage = EffectRect::new(0, 0, output_width, output_height)
+            .map(|output_bounds| {
+                freeze_native_effect_damage(&effects, &effect_registry_generation, output_bounds)
+            })
+            .unwrap_or_else(|| {
+                NativeEffectDamageFrameSnapshot::conservative_full(
+                    effects.frame_demand_snapshot().dirty_region,
+                )
+            });
+        snapshot.physical_effect_damage = physical_effect_damage;
         if let Some(output_bounds) = EffectRect::new(0, 0, output_width, output_height) {
             snapshot.presentation_effect_influences = freeze_presentation_effect_influences(
                 &effects,

@@ -1,5 +1,6 @@
 use super::*;
 use oblivion_one::compositor::PresentationFrameSnapshot;
+use oblivion_one::effects::EffectRect;
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, lamp_footprint};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,50 +248,66 @@ impl NativeSceneHistory {
             return None;
         }
         let damage = match self.presented.as_ref() {
-            Some(previous) => native_output_damage_for_scene_snapshots(
-                output_width,
-                output_height,
-                &previous.scene,
-                &current.scene,
-                NativeCursorDamageBounds {
-                    previous_client: previous.cursor_damage.client,
-                    client: current.cursor_damage.client,
-                    previous_software: previous.cursor_damage.software,
-                    software: current.cursor_damage.software,
-                },
-            )
-            .union_surface_rects(
-                opacity_damage_for_frame_snapshots(
+            Some(previous) => {
+                let base_damage = native_output_damage_for_scene_snapshots(
                     output_width,
                     output_height,
-                    &previous.presentation,
-                    &current.presentation,
                     &previous.scene,
                     &current.scene,
+                    NativeCursorDamageBounds {
+                        previous_client: previous.cursor_damage.client,
+                        client: current.cursor_damage.client,
+                        previous_software: previous.cursor_damage.software,
+                        software: current.cursor_damage.software,
+                    },
                 )
-                .rects,
-            )
-            .union_surface_rects(
-                clip_damage_for_frame_snapshots(
-                    output_width,
-                    output_height,
-                    &previous.presentation,
-                    &current.presentation,
-                    &previous.scene,
-                    &current.scene,
-                )
-                .rects,
-            )
-            .union_surface_rects(
-                lifecycle_damage_rects(&previous.lifecycle, output_width, output_height)
-                    .into_iter()
-                    .chain(lifecycle_damage_rects(
-                        &current.lifecycle,
+                .union_surface_rects(
+                    opacity_damage_for_frame_snapshots(
                         output_width,
                         output_height,
-                    )),
-            )
-            .as_renderer_damage(output_width, output_height),
+                        &previous.presentation,
+                        &current.presentation,
+                        &previous.scene,
+                        &current.scene,
+                    )
+                    .rects,
+                )
+                .union_surface_rects(
+                    clip_damage_for_frame_snapshots(
+                        output_width,
+                        output_height,
+                        &previous.presentation,
+                        &current.presentation,
+                        &previous.scene,
+                        &current.scene,
+                    )
+                    .rects,
+                )
+                .union_surface_rects(
+                    lifecycle_damage_rects(&previous.lifecycle, output_width, output_height)
+                        .into_iter()
+                        .chain(lifecycle_damage_rects(
+                            &current.lifecycle,
+                            output_width,
+                            output_height,
+                        )),
+                );
+                let Some(output_bounds) = EffectRect::new(0, 0, output_width, output_height) else {
+                    return Some(PreparedNativePresentationTransition {
+                        token,
+                        previous_frame_id,
+                        current_frame_id: current.frame_id,
+                        damage: OutputDamage::Full,
+                    });
+                };
+                expand_physical_effect_damage(
+                    base_damage,
+                    &previous.scene.physical_effect_damage,
+                    &current.scene.physical_effect_damage,
+                    output_bounds,
+                )
+                .as_renderer_damage(output_width, output_height)
+            }
             None => NativeOutputDamage::full_output(output_width, output_height)
                 .as_renderer_damage(output_width, output_height),
         };
