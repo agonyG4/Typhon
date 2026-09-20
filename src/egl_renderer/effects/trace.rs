@@ -177,7 +177,7 @@ fn parse_checkpoint_capture_path(value: Option<&OsStr>) -> CheckpointCapturePath
     match value.and_then(OsStr::to_str) {
         None => DEFAULT_CHECKPOINT_CAPTURE_PATH,
         Some("blit") => CheckpointCapturePath::FramebufferBlit,
-        Some("shader-copy") => DEFAULT_CHECKPOINT_CAPTURE_PATH,
+        Some("shader-copy") => CheckpointCapturePath::FramebufferShaderCopy,
         Some(value) => {
             static WARNED: OnceLock<()> = OnceLock::new();
             if WARNED.set(()).is_ok() {
@@ -911,6 +911,30 @@ mod tests {
         assert_eq!(
             invalid_checkpoint.checkpoint_capture_path(),
             CheckpointCapturePath::FramebufferShaderCopy
+        );
+    }
+
+    #[test]
+    fn checkpoint_capture_path_overrides_are_independent_of_production_default() {
+        assert_eq!(
+            parse_checkpoint_capture_path(None),
+            DEFAULT_CHECKPOINT_CAPTURE_PATH,
+            "unset selects the production default"
+        );
+        assert_eq!(
+            parse_checkpoint_capture_path(Some(OsStr::new("shader-copy"))),
+            CheckpointCapturePath::FramebufferShaderCopy,
+            "shader-copy keeps its explicit meaning if the production default changes"
+        );
+        assert_eq!(
+            parse_checkpoint_capture_path(Some(OsStr::new("blit"))),
+            CheckpointCapturePath::FramebufferBlit,
+            "blit remains an explicit diagnostic override"
+        );
+        assert_eq!(
+            parse_checkpoint_capture_path(Some(OsStr::new("invalid"))),
+            DEFAULT_CHECKPOINT_CAPTURE_PATH,
+            "invalid values warn and select the production default"
         );
     }
 
