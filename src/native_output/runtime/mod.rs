@@ -94,6 +94,8 @@ mod kms_worker_teardown;
 #[cfg(test)]
 mod kms_worker_tests;
 mod metrics;
+#[cfg(test)]
+mod physical_effect_damage_tests;
 mod plane_cycle;
 #[cfg(test)]
 mod plane_cycle_tests;

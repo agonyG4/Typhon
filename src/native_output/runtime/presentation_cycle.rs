@@ -1169,7 +1169,10 @@ impl NativeRuntime {
                     (current_client_cursor_damage, current_software_cursor_damage),
                 );
                 let output_damage = output_damage.union_effect_region(
-                    &effect_demand.dirty_region,
+                    &resolved_scene
+                        .snapshot_ref()
+                        .physical_effect_damage
+                        .frame_local_dirty,
                     target.width,
                     target.height,
                 );

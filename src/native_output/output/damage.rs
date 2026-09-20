@@ -361,6 +361,8 @@ pub(crate) struct NativeSceneSnapshot {
     pub(crate) popup_surface_ids: Vec<u32>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
     pub(crate) effect_damage: oblivion_one::effects::EffectRegion,
+    /// Frozen effect damage evidence for this physical frame.
+    pub(crate) physical_effect_damage: NativeEffectDamageFrameSnapshot,
     pub(crate) presentation_effect_influences: Vec<NativePresentationEffectInfluenceSnapshot>,
     pub(crate) effect_identity_signature: u64,
     pub(crate) visibility_signature: u64,
@@ -467,6 +469,7 @@ impl NativeSceneSnapshot {
             popup_surface_ids: popup_surface_ids.to_vec(),
             external_overlay_surface_ids: Vec::new(),
             effect_damage: oblivion_one::effects::EffectRegion::empty(),
+            physical_effect_damage: NativeEffectDamageFrameSnapshot::default(),
             presentation_effect_influences: Vec::new(),
             effect_identity_signature: 0,
             visibility_signature: 0,
