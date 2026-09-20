@@ -963,7 +963,11 @@ mod tests {
                 .expect("deadline outcome"),
             TransferPumpOutcome::TimedOut
         );
-        assert_eq!(io.reads.len(), 1, "expired transfer attempted I/O");
+        assert_eq!(
+            io.reads.len(),
+            1,
+            "expired transfer must not attempt source I/O"
+        );
         assert!(manager.is_empty());
     }
 

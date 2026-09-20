@@ -121,12 +121,13 @@ fn aggregate_deadline_handler_services_focus_and_adoption_due_together() {
 }
 
 #[test]
-fn aggregate_deadline_handler_expires_data_bridge_transfers() {
+fn data_bridge_transfer_deadline_remains_manager_local_until_reactor_integration() {
     let generation = generation(41);
     let (mut xwm, _peer) = test_fixture(generation);
     let (_source_peer, source) = UnixStream::pair().expect("transfer source");
     let (sink, _sink_peer) = UnixStream::pair().expect("transfer sink");
-    xwm.data_bridge
+    let transfer_id = xwm
+        .data_bridge
         .transfers
         .start(
             super::super::data_bridge::BridgeGeneration::from(generation),
@@ -136,10 +137,20 @@ fn aggregate_deadline_handler_expires_data_bridge_transfers() {
         )
         .expect("data bridge transfer");
 
-    assert_eq!(xwm.next_deadline_ns(), Some(123));
+    assert_eq!(xwm.data_bridge.transfers.next_deadline_ns(), Some(123));
+    assert_ne!(xwm.next_deadline_ns(), Some(123));
+
     let outcome = xwm.handle_deadlines(123);
     assert!(outcome.error.is_none());
+    assert_eq!(xwm.data_bridge.active_transfers(), 1);
+    assert_eq!(xwm.data_bridge.transfers.next_deadline_ns(), Some(123));
+
+    assert_eq!(
+        xwm.data_bridge.transfers.expire_deadlines(123),
+        vec![transfer_id]
+    );
     assert_eq!(xwm.data_bridge.active_transfers(), 0);
+    assert_eq!(xwm.data_bridge.transfers.next_deadline_ns(), None);
     assert_eq!(xwm.next_deadline_ns(), None);
 }
 

@@ -7,7 +7,6 @@ impl Xwm {
             .into_iter()
             .chain(self.next_focus_deadline_ns())
             .chain(self.next_adoption_deadline_ns())
-            .chain(self.data_bridge.transfers.next_deadline_ns())
             .min()
     }
 
@@ -23,7 +22,6 @@ impl Xwm {
         let adoption_timeout_summary = self.collect_adoption_expirations(now_ns);
         let resize_error = self.handle_resize_sync_deadline(now_ns).err();
         let focus_error = self.handle_focus_deadline(now_ns).err();
-        self.data_bridge.transfers.expire_deadlines(now_ns);
         XwmDeadlineOutcome {
             adoption_timeout_summary,
             adoption_metrics: self.adoption_metrics(),
