@@ -1425,12 +1425,19 @@ impl CompositorState {
         mode: ToplevelMode,
         resizing: bool,
     ) {
+        let resize_epoch = self
+            .window(window_id)
+            .and_then(|window| match window.backend {
+                WindowBackend::X11(handle) => self.x11_resize_interaction_epoch(handle),
+                WindowBackend::Xdg(_) => None,
+            });
         self.backend_commands.push(
             crate::compositor::window_backend::WindowBackendCommand::Configure {
                 window: window_id,
                 geometry,
                 mode,
                 resizing,
+                resize_epoch,
             },
         );
     }
@@ -1441,11 +1448,18 @@ impl CompositorState {
         geometry: WindowGeometry,
         mode: ToplevelMode,
     ) {
+        let resize_epoch = self
+            .window(window_id)
+            .and_then(|window| match window.backend {
+                WindowBackend::X11(handle) => self.x11_resize_interaction_epoch(handle),
+                WindowBackend::Xdg(_) => None,
+            });
         self.backend_commands.push(
             crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
                 window: window_id,
                 geometry,
                 mode,
+                resize_epoch,
             },
         );
     }
@@ -1541,6 +1555,7 @@ impl CompositorState {
     pub(in crate::compositor) fn has_pending_x11_resize_backend_command(
         &self,
         handle: crate::xwayland::X11WindowHandle,
+        resize_epoch: u64,
     ) -> bool {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
@@ -1550,12 +1565,14 @@ impl CompositorState {
             crate::compositor::window_backend::WindowBackendCommand::Configure {
                 window,
                 resizing,
+                resize_epoch: command_epoch,
                 ..
-            } => *window == window_id && *resizing,
+            } => *window == window_id && *resizing && *command_epoch == Some(resize_epoch),
             crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
                 window,
+                resize_epoch: command_epoch,
                 ..
-            } => *window == window_id,
+            } => *window == window_id && *command_epoch == Some(resize_epoch),
             _ => false,
         })
     }

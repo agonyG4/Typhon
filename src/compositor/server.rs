@@ -1089,8 +1089,10 @@ impl OwnCompositorServer {
                 resize_epoch,
                 has_followup,
             } => {
-                let local_resize_followup_pending =
-                    self.state.has_pending_x11_resize_backend_command(window);
+                let local_resize_followup_pending = resize_epoch.is_some_and(|resize_epoch| {
+                    self.state
+                        .has_pending_x11_resize_backend_command(window, resize_epoch)
+                });
                 let accepted = self.state.finalize_x11_resize_timeout_for_epoch(
                     window,
                     fallback_geometry,

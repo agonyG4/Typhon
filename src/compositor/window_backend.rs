@@ -9,11 +9,13 @@ pub(crate) enum WindowBackendCommand {
         geometry: WindowGeometry,
         mode: ToplevelMode,
         resizing: bool,
+        resize_epoch: Option<u64>,
     },
     FinalizeResize {
         window: WindowId,
         geometry: WindowGeometry,
         mode: ToplevelMode,
+        resize_epoch: Option<u64>,
     },
     Close {
         window: WindowId,

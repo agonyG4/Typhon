@@ -90,6 +90,8 @@ mod xwayland_geometry_ordering;
 mod xwayland_pointer_batch;
 #[path = "xwayland_resize_visual.rs"]
 mod xwayland_resize_visual;
+#[path = "xwayland_resize_visual_ownership.rs"]
+mod xwayland_resize_visual_ownership;
 #[path = "xwayland_root_stack.rs"]
 mod xwayland_root_stack;
 #[path = "xwayland_tiled.rs"]

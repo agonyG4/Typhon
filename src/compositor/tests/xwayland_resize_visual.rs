@@ -422,7 +422,7 @@ fn timeout_keeps_epoch_for_queued_local_resize_finalization() {
         fixture
             .server
             .state
-            .has_pending_x11_resize_backend_command(handle)
+            .has_pending_x11_resize_backend_command(handle, resize_epoch)
     );
     assert_eq!(
         fixture
