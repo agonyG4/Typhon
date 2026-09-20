@@ -135,6 +135,8 @@ capture_execution_pixels scene_capture_execution_pixels surface_capture_executio
 replay_capture_execution_passes framebuffer_capture_execution_passes checkpoint_capture_execution_passes
 replay_capture_commands checkpoint_dependency_edges
 max_capture_pass_ns max_capture_pass_id max_capture_instance_id max_capture_kind max_capture_mode max_capture_pixels max_capture_checkpoint_count
+pass_timed_ns graph_unattributed_ns max_effect_pass_ns max_effect_pass_id max_effect_instance_id max_effect_kind max_effect_capture_mode
+max_effect_pixels max_effect_damage_rects max_effect_damage_bbox_pixels max_effect_target_width max_effect_target_height
 ```
 
 `capture_pixels` and its SceneCapture/SurfaceCapture and replay/framebuffer/
@@ -250,6 +252,52 @@ timestamp-pair slots), sized from Typhon's 128-instance bound, the current
 six-pass built-in blur instance shape, and two expected in-flight graph
 scopes. Pool exhaustion drops only timing spans; it never changes effect
 execution or rendering. No query is allocated in the per-pass path.
+
+### Pass-level tail attribution and graph coverage
+
+The same one-line record appends `pass_timed_ns` and
+`graph_unattributed_ns`, plus a single `max_effect_*` attribution:
+
+```text
+pass_timed_ns graph_unattributed_ns
+max_effect_pass_ns max_effect_pass_id max_effect_instance_id max_effect_kind max_effect_capture_mode
+max_effect_pixels max_effect_damage_rects max_effect_damage_bbox_pixels max_effect_target_width max_effect_target_height
+```
+
+`max_effect_*` identifies the longest valid individually timed pass of any
+kind in that graph scope. Its stable `max_effect_kind` values are `scene`,
+`surface`, `normalize`, `kawase_down`, `kawase_up`, `fragment`, `blend`,
+`mask`, `composite`, and `postprocess`. Its capture mode is `replay`,
+`framebuffer_blit`, or `framebuffer_shader_copy` only when that winning pass is
+a capture with valid capture metadata; otherwise it is `none`. If the scope has
+no valid timed pass, its max-effect values are zero and both kind and mode are
+`none`. `max_capture_*` remains an independent selection of the longest valid
+capture pass, including its existing Replay Attribution v2 detail. Both max
+records can identify the same physical pass when that capture is also the
+longest pass overall.
+
+`max_effect_pixels` retains the existing unit of effect-space demanded-region
+area. It does not imply physical fragments or target allocation size. The
+target width and height come from the pass's planned output `GraphTexturePlan`;
+passes without an output target report zero dimensions. `max_effect_damage_rects`
+counts the exact execution damage rectangles supplied to the pass (bounded by
+the existing 128-rectangle region policy) and describes damage shape, not draw
+calls. Replay and specialized capture paths can have different physical draw
+semantics. `max_effect_damage_bbox_pixels` is the area of the bounding
+rectangle around that same execution damage; empty damage
+reports zero. These values let native analysis compare demanded effect-space
+pixels, physical target dimensions, and fragmented or sparse damage shape
+without conflating their units.
+
+`pass_timed_ns` is the saturating sum of the valid resolved pass-category
+durations: capture, normalize, Kawase downsample, Kawase upsample, fragment,
+blend, mask, composite, and postprocess. `graph_unattributed_ns` is
+`total_ns.saturating_sub(pass_timed_ns)`. It is only the graph-total remainder
+outside valid individually timed pass spans. It may include GPU work or idle
+time associated with resource realization, state/setup, scene reconstruction
+outside pass spans, driver scheduling gaps, CPU submission gaps between GPU
+timestamp commands, or other currently untimed graph work. It does not by
+itself identify resource allocation, driver overhead, or CPU overhead.
 
 With `GL_EXT_disjoint_timer_query`, a `GPU_DISJOINT_EXT` event invalidates all
 affected pending measurements. Their query slots are recycled, the invalidated

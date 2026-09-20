@@ -146,6 +146,15 @@ pub(crate) struct CaptureExecutionTimingSummary {
     pub(crate) replay_capture_draw_submit_cpu_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PassTimingWork {
+    pub(crate) effect_pixels: u64,
+    pub(crate) damage_rect_count: usize,
+    pub(crate) damage_bbox_pixels: u64,
+    pub(crate) target_width: u32,
+    pub(crate) target_height: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TimingSpanMetadata {
     scope_id: u64,
@@ -153,7 +162,7 @@ struct TimingSpanMetadata {
     pass_id: Option<u64>,
     instance_id: Option<u64>,
     kind: Option<oblivion_one::effects::RenderPassKind>,
-    pixels: u64,
+    work: PassTimingWork,
     capture: Option<CaptureTimingMetadata>,
     replay_execution: Option<ReplayCaptureExecutionDetail>,
     is_total: bool,
@@ -230,6 +239,20 @@ struct MaxCapturePassTiming {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxEffectPassTiming {
+    duration_ns: u64,
+    pass_id: u64,
+    instance_id: u64,
+    kind: RenderPassKind,
+    effect_pixels: u64,
+    damage_rect_count: usize,
+    damage_bbox_pixels: u64,
+    target_width: u32,
+    target_height: u32,
+    capture_mode: Option<CaptureTimingMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GpuTimingRecord {
     frame_id: Option<u64>,
     scope_id: u64,
@@ -290,12 +313,24 @@ struct GpuTimingRecord {
     replay_capture_draw_submit_cpu_ns: u64,
     capture_execution_summary_available: bool,
     max_capture_pass: Option<MaxCapturePassTiming>,
+    max_effect_pass: Option<MaxEffectPassTiming>,
 }
 
 impl GpuTimingRecord {
     fn capture_ns(&self) -> u64 {
         self.durations_ns[TimingCategory::SceneCapture.index()]
             .saturating_add(self.durations_ns[TimingCategory::SurfaceCapture.index()])
+    }
+
+    fn pass_timed_ns(&self) -> u64 {
+        self.durations_ns
+            .iter()
+            .copied()
+            .fold(0, u64::saturating_add)
+    }
+
+    fn graph_unattributed_ns(&self) -> u64 {
+        self.total_ns.saturating_sub(self.pass_timed_ns())
     }
 }
 
@@ -343,6 +378,7 @@ struct GraphAggregate {
     checkpoint_capture_pixels: u64,
     capture_execution: Option<CaptureExecutionTimingSummary>,
     max_capture_pass: Option<MaxCapturePassTiming>,
+    max_effect_pass: Option<MaxEffectPassTiming>,
 }
 
 #[derive(Debug)]
@@ -423,7 +459,7 @@ impl TimingState {
             pass_id: None,
             instance_id: None,
             kind: None,
-            pixels: 0,
+            work: PassTimingWork::default(),
             capture: None,
             replay_execution: None,
             is_total: true,
@@ -459,6 +495,7 @@ impl TimingState {
             checkpoint_capture_pixels: 0,
             capture_execution: None,
             max_capture_pass: None,
+            max_effect_pass: None,
         });
         Some(GraphTimingScope {
             scope_id,
@@ -694,13 +731,38 @@ impl TimingState {
         let category = TimingCategory::from_render_pass_kind(kind);
         let index = category.index();
         aggregate.durations_ns[index] = aggregate.durations_ns[index].saturating_add(duration_ns);
-        aggregate.pixels[index] = aggregate.pixels[index].saturating_add(metadata.pixels);
+        aggregate.pixels[index] =
+            aggregate.pixels[index].saturating_add(metadata.work.effect_pixels);
         aggregate.timed_passes = aggregate.timed_passes.saturating_add(1);
 
         let is_capture = matches!(
             kind,
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
         );
+        if let (Some(pass_id), Some(instance_id)) = (metadata.pass_id, metadata.instance_id) {
+            let candidate = MaxEffectPassTiming {
+                duration_ns,
+                pass_id,
+                instance_id,
+                kind,
+                effect_pixels: metadata.work.effect_pixels,
+                damage_rect_count: metadata.work.damage_rect_count,
+                damage_bbox_pixels: metadata.work.damage_bbox_pixels,
+                target_width: metadata.work.target_width,
+                target_height: metadata.work.target_height,
+                capture_mode: if is_capture {
+                    metadata.capture.map(|capture| capture.mode)
+                } else {
+                    None
+                },
+            };
+            if aggregate
+                .max_effect_pass
+                .is_none_or(|current| candidate.duration_ns > current.duration_ns)
+            {
+                aggregate.max_effect_pass = Some(candidate);
+            }
+        }
         let Some(capture) = metadata.capture.filter(|_| is_capture) else {
             return;
         };
@@ -711,7 +773,7 @@ impl TimingState {
             kind,
             mode: capture.mode,
             checkpoint_count: capture.checkpoint_count,
-            pixels: metadata.pixels,
+            pixels: metadata.work.effect_pixels,
             duration_ns,
         });
         match kind {
@@ -720,7 +782,7 @@ impl TimingState {
                 aggregate.scene_capture_passes = aggregate.scene_capture_passes.saturating_add(1);
                 aggregate.scene_capture_pixels = aggregate
                     .scene_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
             }
             RenderPassKind::SurfaceCapture => {
                 aggregate.surface_capture_ns =
@@ -729,7 +791,7 @@ impl TimingState {
                     aggregate.surface_capture_passes.saturating_add(1);
                 aggregate.surface_capture_pixels = aggregate
                     .surface_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
             }
             _ => unreachable!("capture metadata filtered to capture pass kinds"),
         }
@@ -740,7 +802,7 @@ impl TimingState {
                 aggregate.replay_capture_passes = aggregate.replay_capture_passes.saturating_add(1);
                 aggregate.replay_capture_pixels = aggregate
                     .replay_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
             }
             CaptureTimingMode::FramebufferBlit => {
                 aggregate.framebuffer_capture_ns =
@@ -749,7 +811,7 @@ impl TimingState {
                     aggregate.framebuffer_capture_passes.saturating_add(1);
                 aggregate.framebuffer_capture_pixels = aggregate
                     .framebuffer_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
                 aggregate.framebuffer_blit_capture_ns = aggregate
                     .framebuffer_blit_capture_ns
                     .saturating_add(duration_ns);
@@ -757,7 +819,7 @@ impl TimingState {
                     aggregate.framebuffer_blit_capture_passes.saturating_add(1);
                 aggregate.framebuffer_blit_capture_pixels = aggregate
                     .framebuffer_blit_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
             }
             CaptureTimingMode::FramebufferShaderCopy => {
                 aggregate.framebuffer_capture_ns =
@@ -766,7 +828,7 @@ impl TimingState {
                     aggregate.framebuffer_capture_passes.saturating_add(1);
                 aggregate.framebuffer_capture_pixels = aggregate
                     .framebuffer_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
                 aggregate.framebuffer_shader_copy_capture_ns = aggregate
                     .framebuffer_shader_copy_capture_ns
                     .saturating_add(duration_ns);
@@ -775,7 +837,7 @@ impl TimingState {
                     .saturating_add(1);
                 aggregate.framebuffer_shader_copy_capture_pixels = aggregate
                     .framebuffer_shader_copy_capture_pixels
-                    .saturating_add(metadata.pixels);
+                    .saturating_add(metadata.work.effect_pixels);
             }
         }
         if capture.checkpoint_count > 0 {
@@ -785,7 +847,7 @@ impl TimingState {
                 aggregate.checkpoint_capture_passes.saturating_add(1);
             aggregate.checkpoint_capture_pixels = aggregate
                 .checkpoint_capture_pixels
-                .saturating_add(metadata.pixels);
+                .saturating_add(metadata.work.effect_pixels);
         }
         if let (Some(pass_id), Some(instance_id)) = (metadata.pass_id, metadata.instance_id) {
             let candidate = MaxCapturePassTiming {
@@ -794,7 +856,7 @@ impl TimingState {
                 instance_id,
                 kind,
                 mode: capture.mode,
-                effect_pixels: metadata.pixels,
+                effect_pixels: metadata.work.effect_pixels,
                 checkpoint_count: capture.checkpoint_count,
                 replay_execution: (capture.mode == CaptureTimingMode::Replay)
                     .then_some(metadata.replay_execution)
@@ -935,6 +997,7 @@ impl TimingState {
                 .map_or(0, |summary| summary.replay_capture_draw_submit_cpu_ns),
             capture_execution_summary_available: aggregate.capture_execution.is_some(),
             max_capture_pass: aggregate.max_capture_pass,
+            max_effect_pass: aggregate.max_effect_pass,
         })
     }
 
@@ -1224,6 +1287,21 @@ fn max_capture_replay_detail_available(record: &GpuTimingRecord) -> bool {
     })
 }
 
+const fn render_pass_kind_name(kind: RenderPassKind) -> &'static str {
+    match kind {
+        RenderPassKind::SceneCapture => "scene",
+        RenderPassKind::SurfaceCapture => "surface",
+        RenderPassKind::NormalizeInput => "normalize",
+        RenderPassKind::DualKawaseDownsample => "kawase_down",
+        RenderPassKind::DualKawaseUpsample => "kawase_up",
+        RenderPassKind::Fragment => "fragment",
+        RenderPassKind::Blend => "blend",
+        RenderPassKind::Mask => "mask",
+        RenderPassKind::Composite => "composite",
+        RenderPassKind::OutputPostProcess => "postprocess",
+    }
+}
+
 fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
     let capture_ns = record.capture_ns();
     let capture_pixels = record.pixels[TimingCategory::SceneCapture.index()]
@@ -1279,6 +1357,24 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_replay_detail.map_or(0, |detail| detail.visibility_cpu_ns);
     let max_capture_draw_submit_cpu_ns =
         max_replay_detail.map_or(0, |detail| detail.draw_submit_cpu_ns);
+    let max_effect_pass_ns = record.max_effect_pass.map_or(0, |pass| pass.duration_ns);
+    let max_effect_pass_id = record.max_effect_pass.map_or(0, |pass| pass.pass_id);
+    let max_effect_instance_id = record.max_effect_pass.map_or(0, |pass| pass.instance_id);
+    let max_effect_kind = record
+        .max_effect_pass
+        .map_or("none", |pass| render_pass_kind_name(pass.kind));
+    let max_effect_capture_mode = record.max_effect_pass.map_or("none", |pass| {
+        pass.capture_mode.map_or("none", |mode| mode.as_str())
+    });
+    let max_effect_pixels = record.max_effect_pass.map_or(0, |pass| pass.effect_pixels);
+    let max_effect_damage_rects = record
+        .max_effect_pass
+        .map_or(0, |pass| pass.damage_rect_count);
+    let max_effect_damage_bbox_pixels = record
+        .max_effect_pass
+        .map_or(0, |pass| pass.damage_bbox_pixels);
+    let max_effect_target_width = record.max_effect_pass.map_or(0, |pass| pass.target_width);
+    let max_effect_target_height = record.max_effect_pass.map_or(0, |pass| pass.target_height);
     let line = format!(
         "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
@@ -1382,8 +1478,20 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_draw_submit_cpu_ns,
     );
     format!(
-        "{line} max_capture_replay_detail_available={}",
+        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={}",
         usize::from(max_capture_replay_detail_available(record)),
+        record.pass_timed_ns(),
+        record.graph_unattributed_ns(),
+        max_effect_pass_ns,
+        max_effect_pass_id,
+        max_effect_instance_id,
+        max_effect_kind,
+        max_effect_capture_mode,
+        max_effect_pixels,
+        max_effect_damage_rects,
+        max_effect_damage_bbox_pixels,
+        max_effect_target_width,
+        max_effect_target_height,
     )
 }
 
@@ -1534,7 +1642,7 @@ impl EffectGpuProfiler {
         pass_id: u64,
         instance_id: u64,
         kind: RenderPassKind,
-        pixels: u64,
+        work: PassTimingWork,
         capture: Option<CaptureTimingMetadata>,
     ) -> Option<PassTimingSpan> {
         let ProfilerState::Active(active) = &mut self.state else {
@@ -1546,7 +1654,7 @@ impl EffectGpuProfiler {
             pass_id: Some(pass_id),
             instance_id: Some(instance_id),
             kind: Some(kind),
-            pixels,
+            work,
             capture,
             replay_execution: None,
             is_total: false,
@@ -1722,7 +1830,10 @@ mod tests {
             pass_id: Some(pass_id),
             instance_id: Some(1),
             kind: Some(kind),
-            pixels,
+            work: PassTimingWork {
+                effect_pixels: pixels,
+                ..PassTimingWork::default()
+            },
             capture,
             replay_execution: None,
             is_total: false,
@@ -2153,6 +2264,194 @@ mod tests {
     }
 
     #[test]
+    fn effect_gpu_timing_slowest_non_capture_pass_has_independent_max_attribution() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        for (
+            pass_id,
+            instance_id,
+            kind,
+            duration_ns,
+            pixels,
+            capture,
+            damage_rect_count,
+            damage_bbox_pixels,
+            target_width,
+            target_height,
+        ) in [
+            (
+                7,
+                11,
+                RenderPassKind::SceneCapture,
+                40,
+                700,
+                Some(capture_metadata(CaptureTimingMode::Replay, 0)),
+                1,
+                70_000,
+                800,
+                600,
+            ),
+            (
+                8,
+                12,
+                RenderPassKind::DualKawaseDownsample,
+                300,
+                800,
+                None,
+                7,
+                98_765,
+                480,
+                270,
+            ),
+            (
+                9,
+                13,
+                RenderPassKind::DualKawaseUpsample,
+                100,
+                900,
+                None,
+                2,
+                10_000,
+                960,
+                540,
+            ),
+            (
+                10,
+                14,
+                RenderPassKind::Composite,
+                80,
+                1_000,
+                None,
+                3,
+                6_400,
+                1_920,
+                1_080,
+            ),
+        ] {
+            let mut metadata = pass_metadata(pass_id, kind, pixels, capture);
+            metadata.instance_id = Some(instance_id);
+            metadata.work.damage_rect_count = damage_rect_count;
+            metadata.work.damage_bbox_pixels = damage_bbox_pixels;
+            metadata.work.target_width = target_width;
+            metadata.work.target_height = target_height;
+            let pass = state.begin_pass(scope, metadata).expect("pass slot");
+            assert!(state.finish(pass));
+            assert!(matches!(
+                state.poll_front(true, Some((100, 100 + duration_ns))),
+                PollOutcome::Ready {
+                    duration_ns: Some(_),
+                    record: None
+                }
+            ));
+        }
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((500, 1_000))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("max_effect_pass_ns=300"));
+        assert!(line.contains("max_effect_pass_id=8"));
+        assert!(line.contains("max_effect_instance_id=12"));
+        assert!(line.contains("max_effect_kind=kawase_down"));
+        assert!(line.contains("max_effect_pixels=800"));
+        assert!(line.contains("max_effect_capture_mode=none"));
+        assert!(line.contains("max_effect_damage_rects=7"));
+        assert!(line.contains("max_effect_damage_bbox_pixels=98765"));
+        assert!(line.contains("max_effect_target_width=480"));
+        assert!(line.contains("max_effect_target_height=270"));
+        assert!(line.contains("max_capture_pass_ns=40"));
+    }
+
+    #[test]
+    fn render_pass_kind_names_are_stable_machine_values() {
+        for (kind, name) in [
+            (RenderPassKind::SceneCapture, "scene"),
+            (RenderPassKind::SurfaceCapture, "surface"),
+            (RenderPassKind::NormalizeInput, "normalize"),
+            (RenderPassKind::DualKawaseDownsample, "kawase_down"),
+            (RenderPassKind::DualKawaseUpsample, "kawase_up"),
+            (RenderPassKind::Fragment, "fragment"),
+            (RenderPassKind::Blend, "blend"),
+            (RenderPassKind::Mask, "mask"),
+            (RenderPassKind::Composite, "composite"),
+            (RenderPassKind::OutputPostProcess, "postprocess"),
+        ] {
+            assert_eq!(render_pass_kind_name(kind), name);
+        }
+    }
+
+    #[test]
+    fn capture_max_effect_and_capture_attribution_identify_the_same_span() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let mut capture = pass_metadata(
+            7,
+            RenderPassKind::SurfaceCapture,
+            700,
+            Some(capture_metadata(
+                CaptureTimingMode::FramebufferShaderCopy,
+                2,
+            )),
+        );
+        capture.instance_id = Some(77);
+        capture.work.damage_rect_count = 4;
+        capture.work.damage_bbox_pixels = 123_456;
+        capture.work.target_width = 1_280;
+        capture.work.target_height = 720;
+        let capture_token = state.begin_pass(scope, capture).expect("capture slot");
+        assert!(state.finish(capture_token));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 600))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        let effect_token = state
+            .begin_pass(
+                scope,
+                pass_metadata(8, RenderPassKind::Composite, 900, None),
+            )
+            .expect("composite slot");
+        assert!(state.finish(effect_token));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 400))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((700, 1_000))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        let max_effect = record.max_effect_pass.expect("max effect pass");
+        let max_capture = record.max_capture_pass.expect("max capture pass");
+        assert_eq!(max_effect.pass_id, 7);
+        assert_eq!(max_effect.instance_id, 77);
+        assert_eq!(max_effect.kind, RenderPassKind::SurfaceCapture);
+        assert_eq!(
+            max_effect.capture_mode,
+            Some(CaptureTimingMode::FramebufferShaderCopy)
+        );
+        assert_eq!(max_effect.damage_rect_count, 4);
+        assert_eq!(max_effect.damage_bbox_pixels, 123_456);
+        assert_eq!(max_effect.target_width, 1_280);
+        assert_eq!(max_effect.target_height, 720);
+        assert_eq!(max_capture.pass_id, max_effect.pass_id);
+        assert_eq!(max_capture.instance_id, max_effect.instance_id);
+        assert_eq!(max_capture.kind, max_effect.kind);
+        assert_eq!(max_capture.mode, CaptureTimingMode::FramebufferShaderCopy);
+        assert_eq!(max_capture.effect_pixels, 700);
+        assert_eq!(max_capture.checkpoint_count, 2);
+    }
+
+    #[test]
     fn max_capture_pass_carries_the_exact_slowest_replay_detail() {
         let mut state = TimingState::active_for_test(3);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
@@ -2386,6 +2685,7 @@ mod tests {
         assert_eq!(record.framebuffer_capture_passes, 0);
         assert_eq!(record.checkpoint_capture_ns, 0);
         assert!(record.max_capture_pass.is_none());
+        assert!(record.max_effect_pass.is_none());
         assert_eq!(record.dropped_passes, 1);
     }
 
@@ -2436,6 +2736,72 @@ mod tests {
         assert_eq!(second_record.replay_capture_command_region_pairs, 22);
         assert_eq!(first_record.replay_capture_host_cpu_ns, 101);
         assert_eq!(second_record.replay_capture_host_cpu_ns, 202);
+    }
+
+    #[test]
+    fn max_effect_attribution_follows_scope_id_when_frame_ids_match() {
+        let mut state = TimingState::active_for_test(4);
+        let first = state.begin_scope(Some(120)).expect("first scope");
+        let second = state.begin_scope(Some(120)).expect("second scope");
+
+        let mut first_metadata = pass_metadata(11, RenderPassKind::Fragment, 111, None);
+        first_metadata.instance_id = Some(101);
+        first_metadata.work.damage_rect_count = 1;
+        first_metadata.work.damage_bbox_pixels = 111;
+        first_metadata.work.target_width = 320;
+        first_metadata.work.target_height = 240;
+        let first_pass = state.begin_pass(first, first_metadata).expect("first pass");
+        assert!(state.finish(first_pass));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 201))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        let mut second_metadata = pass_metadata(22, RenderPassKind::Mask, 222, None);
+        second_metadata.instance_id = Some(202);
+        second_metadata.work.damage_rect_count = 2;
+        second_metadata.work.damage_bbox_pixels = 222;
+        second_metadata.work.target_width = 640;
+        second_metadata.work.target_height = 480;
+        let second_pass = state
+            .begin_pass(second, second_metadata)
+            .expect("second pass");
+        assert!(state.finish(second_pass));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 302))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        assert!(state.finish(first.total));
+        assert!(state.finish(second.total));
+        let first_record = match state.poll_front(true, Some((500, 900))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected first scope outcome: {outcome:?}"),
+        };
+        let second_record = match state.poll_front(true, Some((600, 1_000))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected second scope outcome: {outcome:?}"),
+        };
+
+        assert_eq!(first_record.frame_id, second_record.frame_id);
+        let first_max = first_record.max_effect_pass.expect("first max effect");
+        let second_max = second_record.max_effect_pass.expect("second max effect");
+        assert_eq!(first_max.pass_id, 11);
+        assert_eq!(first_max.instance_id, 101);
+        assert_eq!(first_max.damage_rect_count, 1);
+        assert_eq!(first_max.target_width, 320);
+        assert_eq!(first_max.target_height, 240);
+        assert_eq!(second_max.pass_id, 22);
+        assert_eq!(second_max.instance_id, 202);
+        assert_eq!(second_max.damage_rect_count, 2);
+        assert_eq!(second_max.target_width, 640);
+        assert_eq!(second_max.target_height, 480);
     }
 
     #[test]
@@ -2551,7 +2917,7 @@ mod tests {
         };
 
         assert!(max_capture_replay_detail_available(&record));
-        assert!(format_gpu_timing_line(&record).ends_with("max_capture_replay_detail_available=1"));
+        assert!(format_gpu_timing_line(&record).contains("max_capture_replay_detail_available=1"));
     }
 
     #[test]
@@ -2673,6 +3039,7 @@ mod tests {
             replay_capture_draw_submit_cpu_ns: 0,
             capture_execution_summary_available: false,
             max_capture_pass: None,
+            max_effect_pass: None,
         };
         let line = format_gpu_timing_line(&record);
         let mut keys = HashSet::new();
@@ -2680,14 +3047,45 @@ mod tests {
             let (key, _) = field.split_once('=').expect("telemetry key=value field");
             assert!(keys.insert(key), "duplicate telemetry key: {key}");
         }
+        for key in [
+            "pass_timed_ns",
+            "graph_unattributed_ns",
+            "max_effect_pass_ns",
+            "max_effect_pass_id",
+            "max_effect_instance_id",
+            "max_effect_kind",
+            "max_effect_capture_mode",
+            "max_effect_pixels",
+            "max_effect_damage_rects",
+            "max_effect_damage_bbox_pixels",
+            "max_effect_target_width",
+            "max_effect_target_height",
+        ] {
+            assert_eq!(line.matches(&format!("{key}=")).count(), 1, "{key}");
+        }
+        assert!(line.contains("pass_timed_ns=281400"));
+        assert!(line.contains("graph_unattributed_ns=0"));
+        assert!(line.contains("max_effect_pass_ns=0"));
+        assert!(line.contains("max_effect_pass_id=0"));
+        assert!(line.contains("max_effect_instance_id=0"));
+        assert!(line.contains("max_effect_kind=none"));
+        assert!(line.contains("max_effect_capture_mode=none"));
+        assert!(line.contains("max_effect_pixels=0"));
+        assert!(line.contains("max_effect_damage_rects=0"));
+        assert!(line.contains("max_effect_damage_bbox_pixels=0"));
+        assert!(line.contains("max_effect_target_width=0"));
+        assert!(line.contains("max_effect_target_height=0"));
+        let mut category_sum_exceeds_total = record;
+        category_sum_exceeds_total.total_ns = 100;
+        let saturated_line = format_gpu_timing_line(&category_sum_exceeds_total);
+        assert!(saturated_line.contains("graph_unattributed_ns=0"));
         assert!(line.contains("checkpoint_capture_passes=3"));
         assert!(line.contains("checkpoint_capture_execution_passes=2"));
         assert_eq!(
-            line.strip_suffix(" max_capture_replay_detail_available=0")
-                .expect("availability field"),
+            line.strip_suffix(" max_capture_replay_detail_available=0 pass_timed_ns=281400 graph_unattributed_ns=0 max_effect_pass_ns=0 max_effect_pass_id=0 max_effect_instance_id=0 max_effect_kind=none max_effect_capture_mode=none max_effect_pixels=0 max_effect_damage_rects=0 max_effect_damage_bbox_pixels=0 max_effect_target_width=0 max_effect_target_height=0")
+                .expect("appended timing coverage and max-effect fields"),
             "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 framebuffer_blit_capture_ns=0 framebuffer_shader_copy_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 framebuffer_blit_capture_passes=0 framebuffer_shader_copy_capture_passes=0 checkpoint_capture_passes=3 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 framebuffer_blit_capture_pixels=0 framebuffer_shader_copy_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 framebuffer_shader_copy_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=2 replay_capture_commands=0 checkpoint_dependency_edges=0 replay_capture_materialization_rects=0 replay_capture_execution_regions=0 replay_capture_disjoint_overflows=0 replay_capture_command_region_pairs=0 replay_capture_scene_scan_pairs=0 replay_capture_planner_commands_visited=0 replay_capture_planner_commands_drawable=0 replay_capture_commands_executed=0 replay_capture_draw_calls=0 replay_capture_host_cpu_ns=0 replay_capture_selection_cpu_ns=0 replay_capture_visibility_cpu_ns=0 replay_capture_draw_submit_cpu_ns=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0 max_capture_execution_pixels=0 max_capture_materialization_rects=0 max_capture_execution_regions=0 max_capture_disjoint_overflow=0 max_capture_replay_commands=0 max_capture_command_region_pairs=0 max_capture_scene_commands=0 max_capture_scene_scan_pairs=0 max_capture_planner_commands_visited=0 max_capture_planner_commands_drawable=0 max_capture_commands_executed=0 max_capture_draw_calls=0 max_capture_host_cpu_ns=0 max_capture_selection_cpu_ns=0 max_capture_visibility_cpu_ns=0 max_capture_draw_submit_cpu_ns=0",
         );
-        assert!(format_gpu_timing_line(&record).ends_with("max_capture_replay_detail_available=0"));
     }
 
     #[test]

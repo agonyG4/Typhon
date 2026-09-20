@@ -19,7 +19,7 @@ use super::super::{
     output_rect_for_egl_clip,
 };
 use super::gpu_timing::{
-    CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
+    CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode, PassTimingWork,
     ReplayCaptureExecutionDetail,
 };
 use super::{
@@ -1542,6 +1542,23 @@ fn execute_graph_passes_inner(
                 if renderer.capture_in_progress {
                     return None;
                 }
+                let output_target = pass.output.and_then(|output_id| {
+                    graph
+                        .textures
+                        .iter()
+                        .find(|texture| texture.id == output_id)
+                });
+                let damage_bbox_pixels =
+                    execution_damage.region.bounding_rect().map_or(0, |rect| {
+                        u64::from(rect.width).saturating_mul(u64::from(rect.height))
+                    });
+                let work = PassTimingWork {
+                    effect_pixels: effect_region_pixels(&execution_damage.region),
+                    damage_rect_count: execution_damage.region.rects().len(),
+                    damage_bbox_pixels,
+                    target_width: output_target.map_or(0, |texture| texture.width),
+                    target_height: output_target.map_or(0, |texture| texture.height),
+                };
                 let capture_metadata = capture_timing_metadata(pass, capture_plan);
                 renderer.effect_gpu_profiler.begin_pass(
                     &renderer.gl,
@@ -1549,7 +1566,7 @@ fn execute_graph_passes_inner(
                     u64::from(pass.id.get()),
                     pass.instance.get(),
                     pass.kind,
-                    effect_region_pixels(&execution_damage.region),
+                    work,
                     capture_metadata,
                 )
             });
