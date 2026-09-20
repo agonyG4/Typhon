@@ -5497,13 +5497,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_capture_execution_plan_selects_shader_copy_for_eligible_scene_capture() {
+    fn checkpoint_capture_execution_plan_uses_production_default_when_output_is_sampleable() {
+        let config =
+            EffectDebugConfig::from_env_values_with_checkpoint_capture_path(None, None, None);
         let plan = checkpoint_capture_execution_plan(
             RenderPassKind::SceneCapture,
             1,
             false,
-            EffectDebugCaptureMode::Replay,
-            CheckpointCapturePath::FramebufferShaderCopy,
+            config.capture_mode(),
+            config.checkpoint_capture_path(),
             true,
         );
 
@@ -5516,16 +5518,22 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_capture_execution_plan_falls_back_without_output_texture() {
+    fn checkpoint_capture_execution_plan_production_default_falls_back_without_output_texture() {
+        let config =
+            EffectDebugConfig::from_env_values_with_checkpoint_capture_path(None, None, None);
         let plan = checkpoint_capture_execution_plan(
             RenderPassKind::SceneCapture,
             1,
             false,
-            EffectDebugCaptureMode::Replay,
-            CheckpointCapturePath::FramebufferShaderCopy,
+            config.capture_mode(),
+            config.checkpoint_capture_path(),
             false,
         );
 
+        assert_eq!(
+            plan.requested,
+            Some(CheckpointCapturePath::FramebufferShaderCopy)
+        );
         assert_eq!(
             plan.executed,
             CaptureTimingMode::FramebufferBlit,
@@ -5535,6 +5543,83 @@ mod tests {
             plan.fallback_reason,
             Some(CapturePathFallbackReason::NoSampleableOutputTexture)
         );
+    }
+
+    #[test]
+    fn checkpoint_capture_execution_plan_honors_explicit_blit_with_sampleable_output() {
+        let config = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            None,
+            None,
+            Some(std::ffi::OsStr::new("blit")),
+        );
+        let plan = checkpoint_capture_execution_plan(
+            RenderPassKind::SceneCapture,
+            1,
+            false,
+            config.capture_mode(),
+            config.checkpoint_capture_path(),
+            true,
+        );
+
+        assert_eq!(plan.requested, Some(CheckpointCapturePath::FramebufferBlit));
+        assert_eq!(plan.executed, CaptureTimingMode::FramebufferBlit);
+        assert_eq!(plan.fallback_reason, None);
+    }
+
+    #[test]
+    fn checkpoint_capture_production_default_does_not_widen_other_capture_paths() {
+        let replay_default =
+            EffectDebugConfig::from_env_values_with_checkpoint_capture_path(None, None, None);
+        let framebuffer_debug = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            Some(std::ffi::OsStr::new("framebuffer")),
+            None,
+            None,
+        );
+        let cases = [
+            (
+                RenderPassKind::SceneCapture,
+                0,
+                false,
+                replay_default,
+                CaptureTimingMode::Replay,
+            ),
+            (
+                RenderPassKind::SceneCapture,
+                0,
+                true,
+                replay_default,
+                CaptureTimingMode::FramebufferBlit,
+            ),
+            (
+                RenderPassKind::SceneCapture,
+                0,
+                false,
+                framebuffer_debug,
+                CaptureTimingMode::FramebufferBlit,
+            ),
+            (
+                RenderPassKind::SurfaceCapture,
+                1,
+                false,
+                replay_default,
+                CaptureTimingMode::FramebufferBlit,
+            ),
+        ];
+
+        for (kind, checkpoint_count, lifecycle_backdrop, config, expected_mode) in cases {
+            let plan = checkpoint_capture_execution_plan(
+                kind,
+                checkpoint_count,
+                lifecycle_backdrop,
+                config.capture_mode(),
+                config.checkpoint_capture_path(),
+                true,
+            );
+
+            assert_eq!(plan.requested, None);
+            assert_eq!(plan.executed, expected_mode);
+            assert_eq!(plan.fallback_reason, None);
+        }
     }
 
     #[test]

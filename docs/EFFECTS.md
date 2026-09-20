@@ -56,6 +56,19 @@ program and are never compiled on the frame-critical path.
 anchors are composed at their scene insertion points. Target-content capture is
 distinct from backdrop capture and captures the requested target tree.
 
+For checkpoint-dependent Replay `SceneCapture` passes, framebuffer shader-copy
+is the production-preferred path when the current output is sampleable. The
+existing execution planner falls back to framebuffer blit when no sampleable
+output texture is available. This preference applies only to that eligible
+checkpoint Replay case; other capture categories retain their existing planner
+behavior.
+
+`TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH=blit` forces the diagnostic
+framebuffer-blit path. Setting it to `shader-copy` explicitly requests the
+preferred shader-copy path while retaining the no-sampleable-output fallback.
+When unset, the production default is the same shader-copy preference. Invalid
+values emit the existing bounded warning and use that production default.
+
 ## Color and alpha
 
 Captured output is decoded from output-encoded sRGB once at the first effect

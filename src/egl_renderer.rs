@@ -10113,6 +10113,31 @@ mod tests {
     }
 
     #[test]
+    fn native_faithful_stacked_dock_production_default_uses_shader_copy() {
+        let fixture = native_dock_fixture();
+        let config = effects::EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            None, None, None,
+        );
+        assert_eq!(
+            config.checkpoint_capture_path(),
+            effects::CheckpointCapturePath::FramebufferShaderCopy
+        );
+
+        let (_, _, _, events) = render_native_stacked_candidate(fixture, config, None);
+        let checkpoint_event = events
+            .iter()
+            .find(|line| {
+                line.contains("event=effect_pass_execute_end")
+                    && line.contains("kind=SceneCapture")
+                    && line.contains("checkpoints=1")
+            })
+            .expect("production-default checkpoint capture trace event");
+        assert!(checkpoint_event.contains("requested_capture_path=shader-copy"));
+        assert!(checkpoint_event.contains("executed_capture_path=framebuffer_shader_copy"));
+        assert!(checkpoint_event.contains("fallback_reason=none"));
+    }
+
+    #[test]
     fn native_three_checkpoint_blit_and_shader_copy_preserve_dependencies() {
         let fixture = native_three_checkpoint_fixture();
         let blit_config = effects::EffectDebugConfig::new(

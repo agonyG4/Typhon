@@ -1,8 +1,9 @@
 # Effects qualification
 
-Status: fresh deterministic closure gates pass; native TTY/DRM qualification is
-blocked in this environment because the process has no controlling TTY. The
-available render node and NVIDIA GPU do not satisfy the real-TTY prerequisite.
+Status: checkpoint shader-copy is the production-preferred path based on the
+direct path qualification recorded below. The post-promotion native run with
+the path override unset is blocked here because the process has no controlling
+TTY; an available render node does not satisfy that prerequisite.
 
 This document records the reproducible procedure for the Typhon effects engine.
 It does not convert unit tests, shader-source inspection, or the dry-run matrix
@@ -41,6 +42,39 @@ The dry-run enumerated all 18 phases.
 The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no
 GPU or presentation timing.
+
+## Checkpoint capture path policy
+
+Checkpoint-dependent Replay `SceneCapture` prefers framebuffer shader-copy
+when the current output is sampleable. The execution planner uses framebuffer
+blit as the capability fallback when no sampleable output texture is available.
+This is limited to the eligible checkpoint Replay case and does not widen
+shader-copy to ordinary Replay captures, lifecycle backdrop captures,
+framebuffer debug capture mode, `SurfaceCapture`, or other direct framebuffer
+captures.
+
+`TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH=blit` forces diagnostic framebuffer
+blit. `TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH=shader-copy` explicitly
+requests the preferred shader-copy path and retains the no-sampleable-output
+fallback. When unset, the parser selects the same shader-copy preference. An
+invalid value emits the existing bounded warning and uses that production
+default. These choices are capability-based and do not inspect GPU vendor.
+
+The direct checkpoint-path comparison was qualified on an NVIDIA RTX 3060 Ti
+at `1920x1080@165 Hz` using Replay Attribution v2. The measurements are
+qualification evidence, not CI thresholds:
+
+| Measurement | Framebuffer blit | Shader-copy |
+| --- | ---: | ---: |
+| p50 per pass | 40.96 us | 12.29 us |
+| p99 per pass | 806.83 us | 327.54 us |
+| total GPU time | 310.75 ms | 126.01 ms |
+| weighted ns/pixel | 0.2423 | 0.0742 |
+
+The shader-copy session processed more total checkpoint pixels while using
+substantially less measured GPU time. With checkpoint blit removed, the
+remaining heavy frames were dominated by large Replay work, Kawase, and
+Composite.
 
 ## GLES effect GPU timing
 
@@ -263,11 +297,14 @@ run.
 
 ## Current result
 
-No live native run was performed for this checkout: `tty` reports `not a tty`,
-`/dev/dri/renderD128` and an NVIDIA GeForce RTX 3060 Ti are available, and no
-controlling `/dev/dri/card0` node is present. Therefore all native baseline,
-blur, overlap, presentation-combination, custom-frame-demand, and Settings
-visual-acceptance observations are `DEFERRED`, and no production-default
-decision is claimed from performance data. Direct Scanout remains conservative
-and effects continue to require composition whenever visible effect pixels are
+No post-promotion native acceptance run was performed for this checkout:
+`tty` reports `not a tty`, `/dev/dri/renderD128` and an NVIDIA GeForce RTX 3060
+Ti are available, but there is no controlling TTY for a live DRM session. The
+required run with `TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH` unset is
+therefore deferred. The production preference follows the direct checkpoint
+path qualification above; this environment does not add an unset-override trace
+from the live Atomic EGL/GBM backend. Broader native baseline, blur, overlap,
+presentation-combination, custom-frame-demand, and Settings visual-acceptance
+observations also remain deferred. Direct Scanout remains conservative and
+effects continue to require composition whenever visible effect pixels are
 present.

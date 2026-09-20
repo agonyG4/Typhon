@@ -59,6 +59,9 @@ pub(crate) enum CheckpointCapturePath {
     FramebufferShaderCopy,
 }
 
+const DEFAULT_CHECKPOINT_CAPTURE_PATH: CheckpointCapturePath =
+    CheckpointCapturePath::FramebufferShaderCopy;
+
 impl CheckpointCapturePath {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -172,16 +175,17 @@ impl EffectDebugConfig {
 
 fn parse_checkpoint_capture_path(value: Option<&OsStr>) -> CheckpointCapturePath {
     match value.and_then(OsStr::to_str) {
-        None | Some("blit") => CheckpointCapturePath::FramebufferBlit,
-        Some("shader-copy") => CheckpointCapturePath::FramebufferShaderCopy,
+        None => DEFAULT_CHECKPOINT_CAPTURE_PATH,
+        Some("blit") => CheckpointCapturePath::FramebufferBlit,
+        Some("shader-copy") => DEFAULT_CHECKPOINT_CAPTURE_PATH,
         Some(value) => {
             static WARNED: OnceLock<()> = OnceLock::new();
             if WARNED.set(()).is_ok() {
                 eprintln!(
-                    "warning: invalid {DEBUG_CHECKPOINT_CAPTURE_PATH_ENV}={value:?}; using blit"
+                    "warning: invalid {DEBUG_CHECKPOINT_CAPTURE_PATH_ENV}={value:?}; using shader-copy default"
                 );
             }
-            CheckpointCapturePath::FramebufferBlit
+            DEFAULT_CHECKPOINT_CAPTURE_PATH
         }
     }
 }
@@ -851,7 +855,17 @@ mod tests {
         assert_eq!(defaults.kawase_mode(), EffectDebugKawaseMode::Partial);
         assert_eq!(
             defaults.checkpoint_capture_path(),
-            CheckpointCapturePath::FramebufferBlit
+            CheckpointCapturePath::FramebufferShaderCopy
+        );
+
+        let test_helper_defaults = EffectDebugConfig::new(
+            EffectDebugCaptureMode::Replay,
+            EffectDebugKawaseMode::Partial,
+        );
+        assert_eq!(
+            test_helper_defaults.checkpoint_capture_path(),
+            CheckpointCapturePath::FramebufferBlit,
+            "the two-argument test helper retains historical blit semantics"
         );
 
         let framebuffer_full = EffectDebugConfig::from_env_values(
@@ -879,6 +893,16 @@ mod tests {
             CheckpointCapturePath::FramebufferShaderCopy
         );
 
+        let blit = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            None,
+            None,
+            Some(OsStr::new("blit")),
+        );
+        assert_eq!(
+            blit.checkpoint_capture_path(),
+            CheckpointCapturePath::FramebufferBlit
+        );
+
         let invalid_checkpoint = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
             None,
             None,
@@ -886,7 +910,7 @@ mod tests {
         );
         assert_eq!(
             invalid_checkpoint.checkpoint_capture_path(),
-            CheckpointCapturePath::FramebufferBlit
+            CheckpointCapturePath::FramebufferShaderCopy
         );
     }
 
