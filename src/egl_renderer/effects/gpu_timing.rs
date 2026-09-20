@@ -253,6 +253,80 @@ struct MaxEffectPassTiming {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimedPassBoundary {
+    pass_id: u64,
+    instance_id: u64,
+    kind: RenderPassKind,
+    capture_mode: Option<CaptureTimingMode>,
+    checkpoint_count: usize,
+}
+
+impl TimedPassBoundary {
+    fn from_metadata(metadata: TimingSpanMetadata, kind: RenderPassKind) -> Option<Self> {
+        let (Some(pass_id), Some(instance_id)) = (metadata.pass_id, metadata.instance_id) else {
+            return None;
+        };
+        let capture = matches!(
+            kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        )
+        .then_some(metadata.capture)
+        .flatten();
+        Some(Self {
+            pass_id,
+            instance_id,
+            kind,
+            capture_mode: capture.map(|capture| capture.mode),
+            checkpoint_count: capture.map_or(0, |capture| capture.checkpoint_count),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimedPassEndpoint {
+    timestamp_ns: u64,
+    boundary: TimedPassBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphGapPosition {
+    None,
+    Pre,
+    Inter,
+    Post,
+}
+
+impl GraphGapPosition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pre => "pre",
+            Self::Inter => "inter",
+            Self::Post => "post",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphGapTiming {
+    duration_ns: u64,
+    position: GraphGapPosition,
+    after: Option<TimedPassBoundary>,
+    before: Option<TimedPassBoundary>,
+}
+
+impl GraphGapTiming {
+    const fn unavailable() -> Self {
+        Self {
+            duration_ns: 0,
+            position: GraphGapPosition::None,
+            after: None,
+            before: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GpuTimingRecord {
     frame_id: Option<u64>,
     scope_id: u64,
@@ -314,6 +388,8 @@ struct GpuTimingRecord {
     capture_execution_summary_available: bool,
     max_capture_pass: Option<MaxCapturePassTiming>,
     max_effect_pass: Option<MaxEffectPassTiming>,
+    graph_gap_attribution_available: bool,
+    max_graph_gap: GraphGapTiming,
 }
 
 impl GpuTimingRecord {
@@ -379,6 +455,86 @@ struct GraphAggregate {
     capture_execution: Option<CaptureExecutionTimingSummary>,
     max_capture_pass: Option<MaxCapturePassTiming>,
     max_effect_pass: Option<MaxEffectPassTiming>,
+    graph_gap_timeline_valid: bool,
+    first_pass_start: Option<TimedPassEndpoint>,
+    last_pass_end: Option<TimedPassEndpoint>,
+    max_inter_pass_gap: Option<GraphGapTiming>,
+}
+
+impl GraphAggregate {
+    fn record_pass_interval(&mut self, start_ns: u64, end_ns: u64, boundary: TimedPassBoundary) {
+        if !self.graph_gap_timeline_valid {
+            return;
+        }
+        let current_start = TimedPassEndpoint {
+            timestamp_ns: start_ns,
+            boundary,
+        };
+        let current_end = TimedPassEndpoint {
+            timestamp_ns: end_ns,
+            boundary,
+        };
+        let Some(previous_end) = self.last_pass_end else {
+            self.first_pass_start = Some(current_start);
+            self.last_pass_end = Some(current_end);
+            return;
+        };
+        if start_ns < previous_end.timestamp_ns {
+            self.graph_gap_timeline_valid = false;
+            return;
+        }
+        let candidate = GraphGapTiming {
+            duration_ns: start_ns - previous_end.timestamp_ns,
+            position: GraphGapPosition::Inter,
+            after: Some(previous_end.boundary),
+            before: Some(boundary),
+        };
+        if self
+            .max_inter_pass_gap
+            .is_none_or(|current| candidate.duration_ns > current.duration_ns)
+        {
+            self.max_inter_pass_gap = Some(candidate);
+        }
+        self.last_pass_end = Some(current_end);
+    }
+
+    fn graph_gap_attribution(
+        &self,
+        total_start_ns: u64,
+        total_end_ns: u64,
+    ) -> (bool, GraphGapTiming) {
+        if !self.graph_gap_timeline_valid || self.dropped_passes != 0 || self.timed_passes == 0 {
+            return (false, GraphGapTiming::unavailable());
+        }
+        let (Some(first), Some(last)) = (self.first_pass_start, self.last_pass_end) else {
+            return (false, GraphGapTiming::unavailable());
+        };
+        if first.timestamp_ns < total_start_ns || last.timestamp_ns > total_end_ns {
+            return (false, GraphGapTiming::unavailable());
+        }
+
+        let mut largest = GraphGapTiming {
+            duration_ns: first.timestamp_ns - total_start_ns,
+            position: GraphGapPosition::Pre,
+            after: None,
+            before: Some(first.boundary),
+        };
+        if let Some(inter) = self.max_inter_pass_gap
+            && inter.duration_ns > largest.duration_ns
+        {
+            largest = inter;
+        }
+        let post = GraphGapTiming {
+            duration_ns: total_end_ns - last.timestamp_ns,
+            position: GraphGapPosition::Post,
+            after: Some(last.boundary),
+            before: None,
+        };
+        if post.duration_ns > largest.duration_ns {
+            largest = post;
+        }
+        (true, largest)
+    }
 }
 
 #[derive(Debug)]
@@ -496,6 +652,10 @@ impl TimingState {
             capture_execution: None,
             max_capture_pass: None,
             max_effect_pass: None,
+            graph_gap_timeline_valid: true,
+            first_pass_start: None,
+            last_pass_end: None,
+            max_inter_pass_gap: None,
         });
         Some(GraphTimingScope {
             scope_id,
@@ -523,6 +683,7 @@ impl TimingState {
                 .find(|aggregate| aggregate.scope_id == scope.scope_id)
         {
             aggregate.dropped_passes = aggregate.dropped_passes.saturating_add(1);
+            aggregate.graph_gap_timeline_valid = false;
         }
         if let Some(token) = token {
             debug_assert!(!metadata.is_total);
@@ -682,9 +843,9 @@ impl TimingState {
         }
         let duration_ns = end_ns - start_ns;
         let record = if pending.metadata.is_total {
-            self.finish_total(pending.metadata, duration_ns)
+            self.finish_total(pending.metadata, start_ns, end_ns, duration_ns)
         } else {
-            self.finish_pass(pending.metadata, duration_ns);
+            self.finish_pass(pending.metadata, start_ns, end_ns, duration_ns);
             None
         };
         PollOutcome::Ready {
@@ -710,6 +871,7 @@ impl TimingState {
                 .find(|aggregate| aggregate.scope_id == metadata.scope_id)
         {
             aggregate.dropped_passes = aggregate.dropped_passes.saturating_add(1);
+            aggregate.graph_gap_timeline_valid = false;
         }
         if metadata.is_total {
             self.aggregates
@@ -717,8 +879,21 @@ impl TimingState {
         }
     }
 
-    fn finish_pass(&mut self, metadata: TimingSpanMetadata, duration_ns: u64) {
+    fn finish_pass(
+        &mut self,
+        metadata: TimingSpanMetadata,
+        start_ns: u64,
+        end_ns: u64,
+        duration_ns: u64,
+    ) {
         let Some(kind) = metadata.kind else {
+            if let Some(aggregate) = self
+                .aggregates
+                .iter_mut()
+                .find(|aggregate| aggregate.scope_id == metadata.scope_id)
+            {
+                aggregate.graph_gap_timeline_valid = false;
+            }
             return;
         };
         let Some(aggregate) = self
@@ -728,6 +903,13 @@ impl TimingState {
         else {
             return;
         };
+        if aggregate.graph_gap_timeline_valid {
+            if let Some(boundary) = TimedPassBoundary::from_metadata(metadata, kind) {
+                aggregate.record_pass_interval(start_ns, end_ns, boundary);
+            } else {
+                aggregate.graph_gap_timeline_valid = false;
+            }
+        }
         let category = TimingCategory::from_render_pass_kind(kind);
         let index = category.index();
         aggregate.durations_ns[index] = aggregate.durations_ns[index].saturating_add(duration_ns);
@@ -874,6 +1056,8 @@ impl TimingState {
     fn finish_total(
         &mut self,
         metadata: TimingSpanMetadata,
+        total_start_ns: u64,
+        total_end_ns: u64,
         total_ns: u64,
     ) -> Option<GpuTimingRecord> {
         let index = self
@@ -881,6 +1065,8 @@ impl TimingState {
             .iter()
             .position(|aggregate| aggregate.scope_id == metadata.scope_id)?;
         let aggregate = self.aggregates.remove(index);
+        let (graph_gap_attribution_available, max_graph_gap) =
+            aggregate.graph_gap_attribution(total_start_ns, total_end_ns);
         Some(GpuTimingRecord {
             frame_id: aggregate.frame_id,
             scope_id: aggregate.scope_id,
@@ -998,6 +1184,8 @@ impl TimingState {
             capture_execution_summary_available: aggregate.capture_execution.is_some(),
             max_capture_pass: aggregate.max_capture_pass,
             max_effect_pass: aggregate.max_effect_pass,
+            graph_gap_attribution_available,
+            max_graph_gap,
         })
     }
 
@@ -1375,6 +1563,13 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         .map_or(0, |pass| pass.damage_bbox_pixels);
     let max_effect_target_width = record.max_effect_pass.map_or(0, |pass| pass.target_width);
     let max_effect_target_height = record.max_effect_pass.map_or(0, |pass| pass.target_height);
+    let graph_gap = if record.graph_gap_attribution_available {
+        record.max_graph_gap
+    } else {
+        GraphGapTiming::unavailable()
+    };
+    let graph_gap_after = graph_gap.after;
+    let graph_gap_before = graph_gap.before;
     let line = format!(
         "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
@@ -1478,7 +1673,7 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_draw_submit_cpu_ns,
     );
     format!(
-        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={}",
+        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={} graph_gap_attribution_available={} max_graph_gap_ns={} max_graph_gap_position={} max_graph_gap_after_pass_id={} max_graph_gap_after_instance_id={} max_graph_gap_after_kind={} max_graph_gap_after_capture_mode={} max_graph_gap_after_checkpoint_count={} max_graph_gap_before_pass_id={} max_graph_gap_before_instance_id={} max_graph_gap_before_kind={} max_graph_gap_before_capture_mode={} max_graph_gap_before_checkpoint_count={}",
         usize::from(max_capture_replay_detail_available(record)),
         record.pass_timed_ns(),
         record.graph_unattributed_ns(),
@@ -1492,6 +1687,23 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_effect_damage_bbox_pixels,
         max_effect_target_width,
         max_effect_target_height,
+        usize::from(record.graph_gap_attribution_available),
+        graph_gap.duration_ns,
+        graph_gap.position.as_str(),
+        graph_gap_after.map_or(0, |boundary| boundary.pass_id),
+        graph_gap_after.map_or(0, |boundary| boundary.instance_id),
+        graph_gap_after.map_or("none", |boundary| render_pass_kind_name(boundary.kind)),
+        graph_gap_after
+            .and_then(|boundary| boundary.capture_mode)
+            .map_or("none", CaptureTimingMode::as_str),
+        graph_gap_after.map_or(0, |boundary| boundary.checkpoint_count),
+        graph_gap_before.map_or(0, |boundary| boundary.pass_id),
+        graph_gap_before.map_or(0, |boundary| boundary.instance_id),
+        graph_gap_before.map_or("none", |boundary| render_pass_kind_name(boundary.kind)),
+        graph_gap_before
+            .and_then(|boundary| boundary.capture_mode)
+            .map_or("none", CaptureTimingMode::as_str),
+        graph_gap_before.map_or(0, |boundary| boundary.checkpoint_count),
     )
 }
 
@@ -1838,6 +2050,431 @@ mod tests {
             replay_execution: None,
             is_total: false,
         }
+    }
+
+    fn resolve_test_pass(
+        state: &mut TimingState,
+        scope: GraphTimingScope,
+        metadata: TimingSpanMetadata,
+        start_ns: u64,
+        end_ns: u64,
+    ) {
+        let pass = state.begin_pass(scope, metadata).expect("pass slot");
+        assert!(state.finish(pass));
+        assert!(matches!(
+            state.poll_front(true, Some((start_ns, end_ns))),
+            PollOutcome::Ready {
+                duration_ns: Some(_),
+                record: None,
+            }
+        ));
+    }
+
+    fn resolve_test_total(
+        state: &mut TimingState,
+        scope: GraphTimingScope,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> GpuTimingRecord {
+        assert!(state.finish(scope.total));
+        match state.poll_front(true, Some((start_ns, end_ns))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected total outcome: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_gap_inter_wins_equal_post_gap_and_accounts_for_remainder() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(7, RenderPassKind::Composite, 64, None),
+            200,
+            300,
+        );
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(8, RenderPassKind::Fragment, 64, None),
+            600,
+            700,
+        );
+
+        let record = resolve_test_total(&mut state, scope, 100, 1_000);
+        let expected_gap_sum = (200 - 100) + (600 - 300) + (1_000 - 700);
+        assert_eq!(record.pass_timed_ns(), 200);
+        assert_eq!(record.graph_unattributed_ns(), 700);
+        assert_eq!(expected_gap_sum, record.graph_unattributed_ns());
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("graph_gap_attribution_available=1"));
+        assert!(line.contains("max_graph_gap_ns=300"));
+        assert!(line.contains("max_graph_gap_position=inter"));
+        assert!(line.contains("max_graph_gap_after_pass_id=7"));
+        assert!(line.contains("max_graph_gap_after_kind=composite"));
+        assert!(line.contains("max_graph_gap_before_pass_id=8"));
+        assert!(line.contains("max_graph_gap_before_kind=fragment"));
+    }
+
+    #[test]
+    fn graph_gap_pre_winner_has_no_after_boundary() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(7, RenderPassKind::Composite, 64, None),
+            500,
+            600,
+        );
+        let record = resolve_test_total(&mut state, scope, 100, 1_000);
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("graph_gap_attribution_available=1"));
+        assert!(line.contains("max_graph_gap_ns=400"));
+        assert!(line.contains("max_graph_gap_position=pre"));
+        assert!(line.contains("max_graph_gap_after_pass_id=0"));
+        assert!(line.contains("max_graph_gap_after_instance_id=0"));
+        assert!(line.contains("max_graph_gap_after_kind=none"));
+        assert!(line.contains("max_graph_gap_after_capture_mode=none"));
+        assert!(line.contains("max_graph_gap_after_checkpoint_count=0"));
+        assert!(line.contains("max_graph_gap_before_pass_id=7"));
+        assert!(line.contains("max_graph_gap_before_kind=composite"));
+    }
+
+    #[test]
+    fn graph_gap_post_winner_has_no_before_boundary() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(9, RenderPassKind::Mask, 64, None),
+            200,
+            300,
+        );
+        let record = resolve_test_total(&mut state, scope, 100, 1_000);
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("graph_gap_attribution_available=1"));
+        assert!(line.contains("max_graph_gap_ns=700"));
+        assert!(line.contains("max_graph_gap_position=post"));
+        assert!(line.contains("max_graph_gap_after_pass_id=9"));
+        assert!(line.contains("max_graph_gap_after_instance_id=1"));
+        assert!(line.contains("max_graph_gap_after_kind=mask"));
+        assert!(line.contains("max_graph_gap_before_pass_id=0"));
+        assert!(line.contains("max_graph_gap_before_instance_id=0"));
+        assert!(line.contains("max_graph_gap_before_kind=none"));
+        assert!(line.contains("max_graph_gap_before_capture_mode=none"));
+        assert!(line.contains("max_graph_gap_before_checkpoint_count=0"));
+    }
+
+    #[test]
+    fn graph_gap_largest_inter_boundary_keeps_exact_capture_metadata() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let mut first = pass_metadata(
+            10,
+            RenderPassKind::SurfaceCapture,
+            64,
+            Some(capture_metadata(CaptureTimingMode::FramebufferBlit, 0)),
+        );
+        first.instance_id = Some(101);
+        resolve_test_pass(&mut state, scope, first, 120, 180);
+
+        let mut middle = pass_metadata(
+            20,
+            RenderPassKind::SceneCapture,
+            64,
+            Some(capture_metadata(CaptureTimingMode::Replay, 2)),
+        );
+        middle.instance_id = Some(202);
+        resolve_test_pass(&mut state, scope, middle, 230, 290);
+
+        let mut last = pass_metadata(30, RenderPassKind::Mask, 64, None);
+        last.instance_id = Some(303);
+        resolve_test_pass(&mut state, scope, last, 710, 770);
+        let record = resolve_test_total(&mut state, scope, 100, 1_000);
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("max_graph_gap_ns=420"));
+        assert!(line.contains("max_graph_gap_position=inter"));
+        assert!(line.contains("max_graph_gap_after_pass_id=20"));
+        assert!(line.contains("max_graph_gap_after_instance_id=202"));
+        assert!(line.contains("max_graph_gap_after_kind=scene"));
+        assert!(line.contains("max_graph_gap_after_capture_mode=replay"));
+        assert!(line.contains("max_graph_gap_after_checkpoint_count=2"));
+        assert!(line.contains("max_graph_gap_before_pass_id=30"));
+        assert!(line.contains("max_graph_gap_before_instance_id=303"));
+        assert!(line.contains("max_graph_gap_before_kind=mask"));
+        assert!(line.contains("max_graph_gap_before_capture_mode=none"));
+        assert!(line.contains("max_graph_gap_before_checkpoint_count=0"));
+    }
+
+    #[test]
+    fn graph_gap_equal_intervals_keep_the_earliest_boundary() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(1, RenderPassKind::SurfaceCapture, 64, None),
+            150,
+            200,
+        );
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(2, RenderPassKind::NormalizeInput, 64, None),
+            300,
+            350,
+        );
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(3, RenderPassKind::Fragment, 64, None),
+            450,
+            500,
+        );
+        let record = resolve_test_total(&mut state, scope, 100, 600);
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("max_graph_gap_ns=100"));
+        assert!(line.contains("max_graph_gap_position=inter"));
+        assert!(line.contains("max_graph_gap_after_pass_id=1"));
+        assert!(line.contains("max_graph_gap_before_pass_id=2"));
+    }
+
+    #[test]
+    fn graph_gap_scopes_with_same_frame_id_keep_separate_timeline_state() {
+        let mut state = TimingState::active_for_test(4);
+        let first = state.begin_scope(Some(120)).expect("first scope");
+        let second = state.begin_scope(Some(120)).expect("second scope");
+        resolve_test_pass(
+            &mut state,
+            first,
+            pass_metadata(11, RenderPassKind::Composite, 64, None),
+            200,
+            300,
+        );
+        resolve_test_pass(
+            &mut state,
+            second,
+            pass_metadata(22, RenderPassKind::Mask, 64, None),
+            400,
+            450,
+        );
+        let first_record = resolve_test_total(&mut state, first, 100, 500);
+        let second_record = resolve_test_total(&mut state, second, 200, 900);
+
+        assert_eq!(first_record.frame_id, second_record.frame_id);
+        assert_ne!(first_record.scope_id, second_record.scope_id);
+        let first_line = format_gpu_timing_line(&first_record);
+        let second_line = format_gpu_timing_line(&second_record);
+        assert!(first_line.contains("max_graph_gap_ns=200"));
+        assert!(first_line.contains("max_graph_gap_position=post"));
+        assert!(first_line.contains("max_graph_gap_after_pass_id=11"));
+        assert!(second_line.contains("max_graph_gap_ns=450"));
+        assert!(second_line.contains("max_graph_gap_position=post"));
+        assert!(second_line.contains("max_graph_gap_after_pass_id=22"));
+    }
+
+    #[test]
+    fn graph_gap_slot_reuse_does_not_retain_previous_scope_boundary() {
+        let mut state = TimingState::active_for_test(2);
+        let first = state.begin_scope(Some(120)).expect("first scope");
+        resolve_test_pass(
+            &mut state,
+            first,
+            pass_metadata(7, RenderPassKind::Composite, 64, None),
+            200,
+            300,
+        );
+        resolve_test_pass(
+            &mut state,
+            first,
+            pass_metadata(8, RenderPassKind::Fragment, 64, None),
+            600,
+            700,
+        );
+        let first_record = resolve_test_total(&mut state, first, 100, 1_000);
+
+        let second = state.begin_scope(Some(120)).expect("reused-slot scope");
+        resolve_test_pass(
+            &mut state,
+            second,
+            pass_metadata(90, RenderPassKind::Mask, 64, None),
+            700,
+            800,
+        );
+        let second_record = resolve_test_total(&mut state, second, 600, 900);
+
+        assert_ne!(first_record.scope_id, second_record.scope_id);
+        let first_line = format_gpu_timing_line(&first_record);
+        let second_line = format_gpu_timing_line(&second_record);
+        assert!(first_line.contains("max_graph_gap_after_pass_id=7"));
+        assert!(first_line.contains("max_graph_gap_before_pass_id=8"));
+        assert!(second_line.contains("max_graph_gap_ns=100"));
+        assert!(second_line.contains("max_graph_gap_position=pre"));
+        assert!(second_line.contains("max_graph_gap_after_pass_id=0"));
+        assert!(second_line.contains("max_graph_gap_before_pass_id=90"));
+    }
+
+    #[test]
+    fn graph_gap_unavailable_after_dropped_or_invalid_pass_spans() {
+        let mut dropped_state = TimingState::active_for_test(1);
+        let dropped_scope = dropped_state.begin_scope(Some(120)).expect("scope slot");
+        assert!(
+            dropped_state
+                .begin_pass(
+                    dropped_scope,
+                    pass_metadata(7, RenderPassKind::Composite, 64, None),
+                )
+                .is_none()
+        );
+        let dropped = resolve_test_total(&mut dropped_state, dropped_scope, 100, 900);
+        assert_eq!(dropped.total_ns, 800);
+        assert_eq!(dropped.pass_timed_ns(), 0);
+        assert_eq!(dropped.graph_unattributed_ns(), 800);
+        let dropped_line = format_gpu_timing_line(&dropped);
+        assert!(dropped_line.contains("graph_gap_attribution_available=0"));
+        assert!(dropped_line.contains("max_graph_gap_ns=0"));
+        assert!(dropped_line.contains("max_graph_gap_position=none"));
+
+        let mut invalid_state = TimingState::active_for_test(2);
+        let invalid_scope = invalid_state.begin_scope(Some(120)).expect("scope slot");
+        let invalid_pass = invalid_state
+            .begin_pass(
+                invalid_scope,
+                pass_metadata(8, RenderPassKind::Fragment, 64, None),
+            )
+            .expect("pass slot");
+        assert!(invalid_state.finish(invalid_pass));
+        assert_eq!(
+            invalid_state.poll_front(true, Some((300, 200))),
+            PollOutcome::Invalid
+        );
+        let invalid = resolve_test_total(&mut invalid_state, invalid_scope, 100, 900);
+        assert_eq!(invalid.total_ns, 800);
+        assert_eq!(invalid.pass_timed_ns(), 0);
+        assert_eq!(invalid.dropped_passes, 1);
+        let invalid_line = format_gpu_timing_line(&invalid);
+        assert!(invalid_line.contains("graph_gap_attribution_available=0"));
+        assert!(invalid_line.contains("max_graph_gap_ns=0"));
+        assert!(invalid_line.contains("max_graph_gap_position=none"));
+    }
+
+    #[test]
+    fn graph_gap_unavailable_after_cross_span_ordering_violation() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(7, RenderPassKind::Composite, 64, None),
+            200,
+            300,
+        );
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(8, RenderPassKind::Mask, 64, None),
+            250,
+            350,
+        );
+        let record = resolve_test_total(&mut state, scope, 100, 900);
+
+        assert_eq!(record.pass_timed_ns(), 200);
+        assert_eq!(record.graph_unattributed_ns(), 600);
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("graph_gap_attribution_available=0"));
+        assert!(line.contains("max_graph_gap_ns=0"));
+        assert!(line.contains("max_graph_gap_position=none"));
+    }
+
+    #[test]
+    fn graph_gap_unavailable_when_passes_fall_outside_total_or_no_pass_resolves() {
+        let mut before_state = TimingState::active_for_test(2);
+        let before_scope = before_state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut before_state,
+            before_scope,
+            pass_metadata(7, RenderPassKind::Composite, 64, None),
+            100,
+            200,
+        );
+        let before = resolve_test_total(&mut before_state, before_scope, 150, 300);
+        let before_line = format_gpu_timing_line(&before);
+        assert!(before_line.contains("graph_gap_attribution_available=0"));
+        assert!(before_line.contains("max_graph_gap_ns=0"));
+        assert!(before_line.contains("max_graph_gap_position=none"));
+
+        let mut after_state = TimingState::active_for_test(2);
+        let after_scope = after_state.begin_scope(Some(121)).expect("scope slot");
+        resolve_test_pass(
+            &mut after_state,
+            after_scope,
+            pass_metadata(8, RenderPassKind::Fragment, 64, None),
+            200,
+            400,
+        );
+        let after = resolve_test_total(&mut after_state, after_scope, 100, 350);
+        let after_line = format_gpu_timing_line(&after);
+        assert!(after_line.contains("graph_gap_attribution_available=0"));
+        assert!(after_line.contains("max_graph_gap_ns=0"));
+        assert!(after_line.contains("max_graph_gap_position=none"));
+
+        let mut empty_state = TimingState::active_for_test(1);
+        let empty_scope = empty_state.begin_scope(Some(122)).expect("scope slot");
+        let empty = resolve_test_total(&mut empty_state, empty_scope, 100, 900);
+        assert_eq!(empty.total_ns, 800);
+        assert_eq!(empty.pass_timed_ns(), 0);
+        assert_eq!(empty.graph_unattributed_ns(), 800);
+        let empty_line = format_gpu_timing_line(&empty);
+        assert!(empty_line.contains("graph_gap_attribution_available=0"));
+        assert!(empty_line.contains("max_graph_gap_ns=0"));
+        assert!(empty_line.contains("max_graph_gap_position=none"));
+    }
+
+    #[test]
+    fn disjoint_removes_resolved_graph_gap_state_with_its_scope() {
+        let mut state = TimingState::active_for_test(2);
+        let invalidated = state.begin_scope(Some(120)).expect("invalidated scope");
+        resolve_test_pass(
+            &mut state,
+            invalidated,
+            pass_metadata(7, RenderPassKind::Composite, 64, None),
+            200,
+            300,
+        );
+        assert!(state.finish(invalidated.total));
+        assert_eq!(state.invalidate_pending_for_test(), 1);
+        assert_eq!(state.aggregate_count_for_test(), 0);
+        assert_eq!(
+            state.poll_front(true, Some((100, 1_000))),
+            PollOutcome::Empty
+        );
+
+        let current = state.begin_scope(Some(120)).expect("current scope");
+        resolve_test_pass(
+            &mut state,
+            current,
+            pass_metadata(90, RenderPassKind::Mask, 64, None),
+            700,
+            800,
+        );
+        let record = resolve_test_total(&mut state, current, 600, 900);
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("graph_gap_attribution_available=1"));
+        assert!(line.contains("max_graph_gap_ns=100"));
+        assert!(line.contains("max_graph_gap_position=pre"));
+        assert!(line.contains("max_graph_gap_after_pass_id=0"));
+        assert!(line.contains("max_graph_gap_before_pass_id=90"));
     }
 
     #[test]
@@ -3040,6 +3677,8 @@ mod tests {
             capture_execution_summary_available: false,
             max_capture_pass: None,
             max_effect_pass: None,
+            graph_gap_attribution_available: false,
+            max_graph_gap: GraphGapTiming::unavailable(),
         };
         let line = format_gpu_timing_line(&record);
         let mut keys = HashSet::new();
@@ -3060,6 +3699,19 @@ mod tests {
             "max_effect_damage_bbox_pixels",
             "max_effect_target_width",
             "max_effect_target_height",
+            "graph_gap_attribution_available",
+            "max_graph_gap_ns",
+            "max_graph_gap_position",
+            "max_graph_gap_after_pass_id",
+            "max_graph_gap_after_instance_id",
+            "max_graph_gap_after_kind",
+            "max_graph_gap_after_capture_mode",
+            "max_graph_gap_after_checkpoint_count",
+            "max_graph_gap_before_pass_id",
+            "max_graph_gap_before_instance_id",
+            "max_graph_gap_before_kind",
+            "max_graph_gap_before_capture_mode",
+            "max_graph_gap_before_checkpoint_count",
         ] {
             assert_eq!(line.matches(&format!("{key}=")).count(), 1, "{key}");
         }
@@ -3075,6 +3727,19 @@ mod tests {
         assert!(line.contains("max_effect_damage_bbox_pixels=0"));
         assert!(line.contains("max_effect_target_width=0"));
         assert!(line.contains("max_effect_target_height=0"));
+        assert!(line.contains("graph_gap_attribution_available=0"));
+        assert!(line.contains("max_graph_gap_ns=0"));
+        assert!(line.contains("max_graph_gap_position=none"));
+        assert!(line.contains("max_graph_gap_after_pass_id=0"));
+        assert!(line.contains("max_graph_gap_after_instance_id=0"));
+        assert!(line.contains("max_graph_gap_after_kind=none"));
+        assert!(line.contains("max_graph_gap_after_capture_mode=none"));
+        assert!(line.contains("max_graph_gap_after_checkpoint_count=0"));
+        assert!(line.contains("max_graph_gap_before_pass_id=0"));
+        assert!(line.contains("max_graph_gap_before_instance_id=0"));
+        assert!(line.contains("max_graph_gap_before_kind=none"));
+        assert!(line.contains("max_graph_gap_before_capture_mode=none"));
+        assert!(line.contains("max_graph_gap_before_checkpoint_count=0"));
         let mut category_sum_exceeds_total = record;
         category_sum_exceeds_total.total_ns = 100;
         let saturated_line = format_gpu_timing_line(&category_sum_exceeds_total);
@@ -3082,7 +3747,7 @@ mod tests {
         assert!(line.contains("checkpoint_capture_passes=3"));
         assert!(line.contains("checkpoint_capture_execution_passes=2"));
         assert_eq!(
-            line.strip_suffix(" max_capture_replay_detail_available=0 pass_timed_ns=281400 graph_unattributed_ns=0 max_effect_pass_ns=0 max_effect_pass_id=0 max_effect_instance_id=0 max_effect_kind=none max_effect_capture_mode=none max_effect_pixels=0 max_effect_damage_rects=0 max_effect_damage_bbox_pixels=0 max_effect_target_width=0 max_effect_target_height=0")
+            line.strip_suffix(" max_capture_replay_detail_available=0 pass_timed_ns=281400 graph_unattributed_ns=0 max_effect_pass_ns=0 max_effect_pass_id=0 max_effect_instance_id=0 max_effect_kind=none max_effect_capture_mode=none max_effect_pixels=0 max_effect_damage_rects=0 max_effect_damage_bbox_pixels=0 max_effect_target_width=0 max_effect_target_height=0 graph_gap_attribution_available=0 max_graph_gap_ns=0 max_graph_gap_position=none max_graph_gap_after_pass_id=0 max_graph_gap_after_instance_id=0 max_graph_gap_after_kind=none max_graph_gap_after_capture_mode=none max_graph_gap_after_checkpoint_count=0 max_graph_gap_before_pass_id=0 max_graph_gap_before_instance_id=0 max_graph_gap_before_kind=none max_graph_gap_before_capture_mode=none max_graph_gap_before_checkpoint_count=0")
                 .expect("appended timing coverage and max-effect fields"),
             "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 framebuffer_blit_capture_ns=0 framebuffer_shader_copy_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 framebuffer_blit_capture_passes=0 framebuffer_shader_copy_capture_passes=0 checkpoint_capture_passes=3 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 framebuffer_blit_capture_pixels=0 framebuffer_shader_copy_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 framebuffer_shader_copy_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=2 replay_capture_commands=0 checkpoint_dependency_edges=0 replay_capture_materialization_rects=0 replay_capture_execution_regions=0 replay_capture_disjoint_overflows=0 replay_capture_command_region_pairs=0 replay_capture_scene_scan_pairs=0 replay_capture_planner_commands_visited=0 replay_capture_planner_commands_drawable=0 replay_capture_commands_executed=0 replay_capture_draw_calls=0 replay_capture_host_cpu_ns=0 replay_capture_selection_cpu_ns=0 replay_capture_visibility_cpu_ns=0 replay_capture_draw_submit_cpu_ns=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0 max_capture_execution_pixels=0 max_capture_materialization_rects=0 max_capture_execution_regions=0 max_capture_disjoint_overflow=0 max_capture_replay_commands=0 max_capture_command_region_pairs=0 max_capture_scene_commands=0 max_capture_scene_scan_pairs=0 max_capture_planner_commands_visited=0 max_capture_planner_commands_drawable=0 max_capture_commands_executed=0 max_capture_draw_calls=0 max_capture_host_cpu_ns=0 max_capture_selection_cpu_ns=0 max_capture_visibility_cpu_ns=0 max_capture_draw_submit_cpu_ns=0",
         );

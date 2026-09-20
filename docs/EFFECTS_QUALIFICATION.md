@@ -137,6 +137,9 @@ replay_capture_commands checkpoint_dependency_edges
 max_capture_pass_ns max_capture_pass_id max_capture_instance_id max_capture_kind max_capture_mode max_capture_pixels max_capture_checkpoint_count
 pass_timed_ns graph_unattributed_ns max_effect_pass_ns max_effect_pass_id max_effect_instance_id max_effect_kind max_effect_capture_mode
 max_effect_pixels max_effect_damage_rects max_effect_damage_bbox_pixels max_effect_target_width max_effect_target_height
+graph_gap_attribution_available max_graph_gap_ns max_graph_gap_position
+max_graph_gap_after_pass_id max_graph_gap_after_instance_id max_graph_gap_after_kind max_graph_gap_after_capture_mode max_graph_gap_after_checkpoint_count
+max_graph_gap_before_pass_id max_graph_gap_before_instance_id max_graph_gap_before_kind max_graph_gap_before_capture_mode max_graph_gap_before_checkpoint_count
 ```
 
 `capture_pixels` and its SceneCapture/SurfaceCapture and replay/framebuffer/
@@ -298,6 +301,32 @@ time associated with resource realization, state/setup, scene reconstruction
 outside pass spans, driver scheduling gaps, CPU submission gaps between GPU
 timestamp commands, or other currently untimed graph work. It does not by
 itself identify resource allocation, driver overhead, or CPU overhead.
+
+Graph Gap Attribution reuses the absolute start and end timestamps from those
+existing graph and pass query pairs. `graph_gap_attribution_available=1` means
+the graph has a valid TOTAL interval and at least one valid timed pass, every
+expected timed pass resolved without a drop, pass intervals are ordered, and
+the first and last pass intervals lie inside TOTAL. Otherwise attribution is
+unavailable and `max_graph_gap_ns=0`,
+`max_graph_gap_position=none`, and all boundary fields use stable zero/`none`
+values. `max_graph_gap_ns` is the largest single contiguous timestamp interval
+outside the valid individually timed pass spans when attribution is available;
+its position is `pre` (TOTAL START to first pass START), `inter` (one pass END
+to the next pass START), or `post` (last pass END to TOTAL END). Equal gaps keep
+the earliest physical interval in graph order.
+
+The `max_graph_gap_after_*` and `max_graph_gap_before_*` fields identify the
+timed pass boundaries adjacent to the selected interval. A `pre` interval has
+no `after` pass, and a `post` interval has no `before` pass. Boundary identity
+includes pass and instance IDs, stable pass kind, capture mode, and capture
+checkpoint count. These fields describe neighboring timed passes; they do not
+assign causal ownership to either pass.
+
+A gap may contain untimed GPU commands; GPU idle time while later commands are
+waiting to be submitted; driver or context scheduling delay; CPU submission
+delay visible as GPU timeline idle time; or resource and setup work outside
+pass timestamps. The interval alone does not identify which of these, if any,
+accounts for its duration.
 
 With `GL_EXT_disjoint_timer_query`, a `GPU_DISJOINT_EXT` event invalidates all
 affected pending measurements. Their query slots are recycled, the invalidated
