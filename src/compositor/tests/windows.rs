@@ -2141,6 +2141,76 @@ fn xdg_toplevel_move_request_starts_interactive_move_from_pointer_serial() {
 }
 
 #[test]
+fn xdg_toplevel_move_accepts_an_earlier_serial_while_its_button_is_still_held() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_buffered_toplevel_request_move_with_older_held_serial(
+        &socket_path,
+        &commands,
+        false,
+        false,
+    )
+    .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let origins = render::surface_origins(server.renderable_surfaces());
+
+    assert_eq!(origins.first().copied(), Some((112, 100)));
+}
+
+#[test]
+fn xdg_toplevel_move_rejects_a_serial_after_its_button_is_released() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_buffered_toplevel_request_move_with_older_held_serial(
+        &socket_path,
+        &commands,
+        true,
+        false,
+    )
+    .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let origins = render::surface_origins(server.renderable_surfaces());
+
+    assert_eq!(origins.first().copied(), Some((72, 72)));
+}
+
+#[test]
+fn xdg_toplevel_move_rejects_a_press_from_another_toplevel_in_the_same_client() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_buffered_toplevel_request_move_with_older_held_serial(
+        &socket_path,
+        &commands,
+        false,
+        true,
+    )
+    .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let surfaces = server.renderable_surfaces();
+    let origins = render::surface_origins(surfaces);
+    let first_index = surfaces
+        .iter()
+        .position(|surface| surface.width == 100 && surface.height == 80)
+        .expect("pressed toplevel remains renderable");
+    let other_index = surfaces
+        .iter()
+        .position(|surface| surface.width == 80 && surface.height == 60)
+        .expect("requested toplevel remains renderable");
+
+    assert_eq!(origins[first_index], render::cascaded_root_position(0));
+    assert_eq!(origins[other_index], render::cascaded_root_position(1));
+}
+
+#[test]
 fn xdg_toplevel_resize_request_uses_requested_edge() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

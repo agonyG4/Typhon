@@ -1280,10 +1280,98 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_request_move_and_dr
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn create_buffered_toplevel_request_move_with_older_held_serial(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    release_older_button_before_request: bool,
+    request_other_toplevel: bool,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let _pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 80)?;
+    surface.commit();
+    let other_toplevel = if request_other_toplevel {
+        let (other_surface, other_xdg_surface, other_toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 80, 60)?;
+        other_surface.commit();
+        Some((other_surface, other_xdg_surface, other_toplevel))
+    } else {
+        None
+    };
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0)
+            + if request_other_toplevel { 8.0 } else { 12.0 },
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1)
+            + if request_other_toplevel { 8.0 } else { 14.0 },
+    })?;
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: true,
+    })?;
+    queue.roundtrip(&mut state)?;
+    let first_serial = state
+        .pointer_button_serial
+        .ok_or_else(|| io::Error::other("first pointer press serial was not delivered"))?;
+
+    commands.send(ServerCommand::PointerButton {
+        button: 0x111,
+        pressed: true,
+    })?;
+    queue.roundtrip(&mut state)?;
+    if release_older_button_before_request {
+        commands.send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })?;
+        queue.roundtrip(&mut state)?;
+    }
+    if let Some((_, _, other_toplevel)) = &other_toplevel {
+        other_toplevel._move(&seat, first_serial);
+    } else {
+        toplevel._move(&seat, first_serial);
+    }
+    connection.flush()?;
+    wait_for_server_commands(commands);
+
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 52.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 42.0,
+    })?;
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: false,
+    })?;
+    commands.send(ServerCommand::PointerButton {
+        button: 0x111,
+        pressed: false,
+    })?;
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_toplevel_request_move_from_client_chrome_surface(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
-) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    request_resize: bool,
+) -> Result<(RegistryTestState, Option<WindowInteractionDebugSnapshot>), Box<dyn std::error::Error>>
+{
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     retain_live_test_connection(connection.clone());
@@ -1345,9 +1433,14 @@ pub(in crate::compositor::tests) fn create_toplevel_request_move_from_client_chr
     let serial = state
         .pointer_button_serial
         .ok_or_else(|| io::Error::other("pointer button serial was not delivered"))?;
-    toplevel._move(&seat, serial);
+    if request_resize {
+        toplevel.resize(&seat, serial, client_xdg_toplevel::ResizeEdge::BottomRight);
+    } else {
+        toplevel._move(&seat, serial);
+    }
     connection.flush()?;
     wait_for_server_commands(commands);
+    let interaction = capture_window_interaction_debug_snapshot(commands);
     commands.send(ServerCommand::UpdateInteraction {
         x: f64::from(render::FIRST_SURFACE_OFFSET.0 + render::SURFACE_CASCADE_STEP) + 92.0,
         y: f64::from(render::FIRST_SURFACE_OFFSET.1 + render::SURFACE_CASCADE_STEP) + 74.0,
@@ -1358,7 +1451,7 @@ pub(in crate::compositor::tests) fn create_toplevel_request_move_from_client_chr
     })?;
     commands.send(ServerCommand::EndInteraction)?;
     wait_for_server_commands(commands);
-    Ok(state)
+    Ok((state, interaction))
 }
 
 pub(in crate::compositor::tests) fn create_buffered_toplevel_request_top_left_resize_and_drag(

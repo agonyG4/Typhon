@@ -5,6 +5,29 @@ use crate::wm::LayoutMembership;
 const MAX_WINDOW_INTERACTION_RELEASE_DEBUG_RECORDS: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
+pub(in crate::compositor) enum HeldPointerPressRejection {
+    SerialNotHeld,
+    DeadSurface,
+    WrongClient,
+    WrongRoot,
+    WrongWindow,
+    ImplicitGrabMismatch,
+}
+
+impl HeldPointerPressRejection {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SerialNotHeld => "serial_not_held",
+            Self::DeadSurface => "dead_surface",
+            Self::WrongClient => "wrong_client",
+            Self::WrongRoot => "wrong_root",
+            Self::WrongWindow => "wrong_window",
+            Self::ImplicitGrabMismatch => "implicit_grab_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) struct BeginWindowInteraction {
     pub(super) window_id: Option<WindowId>,
     pub(super) root_surface_id: u32,
@@ -248,18 +271,27 @@ impl CompositorState {
     ) -> bool {
         let root_surface_id =
             self.presentation_owner_root_for_surface(compositor_surface_id(surface));
-        let Some(press) = self.valid_pointer_press_for_surface(root_surface_id, surface, serial)
-        else {
-            log_begin_rejection_without_target(
-                "invalid_press_serial",
-                0.0,
-                0.0,
-                WindowInteractionKind::Move,
-                WindowInteractionSource::XdgToplevelMove,
-                0,
-            );
-            return false;
-        };
+        let press =
+            match self.held_pointer_press_for_surface_serial(root_surface_id, surface, serial) {
+                Ok(press) => {
+                    log_xdg_pointer_press_admission(
+                        serial,
+                        WindowInteractionKind::Move,
+                        Some(&press),
+                        None,
+                    );
+                    press
+                }
+                Err(reason) => {
+                    log_xdg_pointer_press_admission(
+                        serial,
+                        WindowInteractionKind::Move,
+                        None,
+                        Some(reason),
+                    );
+                    return false;
+                }
+            };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
             window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
@@ -282,18 +314,27 @@ impl CompositorState {
     ) -> bool {
         let root_surface_id =
             self.presentation_owner_root_for_surface(compositor_surface_id(surface));
-        let Some(press) = self.valid_pointer_press_for_surface(root_surface_id, surface, serial)
-        else {
-            log_begin_rejection_without_target(
-                "invalid_press_serial",
-                0.0,
-                0.0,
-                WindowInteractionKind::Resize(edges),
-                WindowInteractionSource::XdgToplevelResize,
-                0,
-            );
-            return false;
-        };
+        let press =
+            match self.held_pointer_press_for_surface_serial(root_surface_id, surface, serial) {
+                Ok(press) => {
+                    log_xdg_pointer_press_admission(
+                        serial,
+                        WindowInteractionKind::Resize(edges),
+                        Some(&press),
+                        None,
+                    );
+                    press
+                }
+                Err(reason) => {
+                    log_xdg_pointer_press_admission(
+                        serial,
+                        WindowInteractionKind::Resize(edges),
+                        None,
+                        Some(reason),
+                    );
+                    return false;
+                }
+            };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
             window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
@@ -992,17 +1033,55 @@ impl CompositorState {
         ResizeInteractionId::new(self.next_resize_interaction_id.max(1))
     }
 
-    pub(in crate::compositor) fn valid_pointer_press_for_surface(
+    pub(in crate::compositor) fn held_pointer_press_for_surface_serial(
         &self,
         root_surface_id: u32,
         surface: &wl_surface::WlSurface,
         serial: u32,
-    ) -> Option<PointerPress> {
-        let press = self.last_pointer_press.as_ref()?;
-        let valid_surface = press.root_surface_id == root_surface_id
-            || press.surface.id().same_client_as(&surface.id());
-        let valid_window = press.window_id == self.window_id_for_surface(root_surface_id);
-        (press.serial == serial && valid_surface && valid_window).then_some(press.clone())
+    ) -> Result<PointerPress, HeldPointerPressRejection> {
+        let press = self
+            .held_pointer_buttons
+            .iter()
+            .find(|press| press.serial == serial)
+            .ok_or(HeldPointerPressRejection::SerialNotHeld)?;
+        let press_surface_id = compositor_surface_id(&press.surface);
+        let requested_surface_id = compositor_surface_id(surface);
+        if !press.surface.is_alive()
+            || !surface.is_alive()
+            || self.surface_resource_by_id(press_surface_id).is_none()
+            || self.surface_resource_by_id(root_surface_id).is_none()
+            || self.surface_resource_by_id(requested_surface_id).is_none()
+        {
+            return Err(HeldPointerPressRejection::DeadSurface);
+        }
+        if !press.surface.id().same_client_as(&surface.id()) {
+            return Err(HeldPointerPressRejection::WrongClient);
+        }
+        if press.root_surface_id != root_surface_id
+            || self.presentation_owner_root_for_surface(press_surface_id) != root_surface_id
+            || self.presentation_owner_root_for_surface(requested_surface_id) != root_surface_id
+        {
+            return Err(HeldPointerPressRejection::WrongRoot);
+        }
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return Err(HeldPointerPressRejection::WrongWindow);
+        };
+        if press.window_id != Some(window_id) {
+            return Err(HeldPointerPressRejection::WrongWindow);
+        }
+        let Some(grab) = self.implicit_pointer_grab.as_ref() else {
+            return Err(HeldPointerPressRejection::ImplicitGrabMismatch);
+        };
+        let grab_surface_id = compositor_surface_id(&grab.surface);
+        if !grab.surface.is_alive()
+            || self.surface_resource_by_id(grab_surface_id).is_none()
+            || grab.root_surface_id != root_surface_id
+            || self.presentation_owner_root_for_surface(grab_surface_id) != root_surface_id
+            || !grab.surface.id().same_client_as(&surface.id())
+        {
+            return Err(HeldPointerPressRejection::ImplicitGrabMismatch);
+        }
+        Ok(press.clone())
     }
 
     pub(in crate::compositor) fn window_frame_hit_at(
@@ -1687,6 +1766,34 @@ pub(in crate::compositor) fn window_interaction_allowed_for_mode(
 fn log_begin_rejection(state: &CompositorState, begin: BeginWindowInteraction, reason: &str) {
     let active = state.window_interaction_debug_snapshot();
     resize_debug_log(|| format_begin_rejection(reason, begin, active));
+}
+
+fn log_xdg_pointer_press_admission(
+    serial: u32,
+    kind: WindowInteractionKind,
+    press: Option<&PointerPress>,
+    rejection: Option<HeldPointerPressRejection>,
+) {
+    let (outcome, reason) = rejection.map_or(("accepted", "held_serial"), |reason| {
+        ("rejected", reason.label())
+    });
+    resize_debug_log(|| {
+        format!(
+            "event=xdg_pointer_press_admission outcome={outcome} reason={reason} serial={serial} kind={kind:?} button={} root={} window={} surface={}",
+            press.map_or_else(|| "none".to_string(), |press| press.button.to_string()),
+            press.map_or_else(
+                || "none".to_string(),
+                |press| press.root_surface_id.to_string()
+            ),
+            press
+                .and_then(|press| press.window_id)
+                .map_or_else(|| "none".to_string(), |window_id| format!("{window_id:?}")),
+            press.map_or_else(
+                || "none".to_string(),
+                |press| compositor_surface_id(&press.surface).to_string()
+            ),
+        )
+    });
 }
 
 pub(in crate::compositor) fn format_begin_rejection(

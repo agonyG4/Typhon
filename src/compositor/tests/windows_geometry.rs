@@ -99,22 +99,63 @@ fn xdg_toplevel_move_request_accepts_serial_from_same_client_chrome_surface() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let state =
-        create_toplevel_request_move_from_client_chrome_surface(&socket_path, &commands).unwrap();
+    let (state, interaction) =
+        create_toplevel_request_move_from_client_chrome_surface(&socket_path, &commands, false)
+            .unwrap();
     let server = stop_controllable_test_server(commands, server_thread);
-    let origins = render::surface_origins(server.renderable_surfaces());
-    let toplevel_index = server
-        .renderable_surfaces()
+    let surfaces = server.renderable_surfaces();
+    let origins = render::surface_origins(surfaces);
+    let toplevel_index = surfaces
         .iter()
         .position(|surface| surface.width == 100 && surface.height == 80)
         .expect("toplevel should remain renderable");
-    let toplevel_id = server.renderable_surfaces()[toplevel_index].surface_id;
+    let toplevel_id = surfaces[toplevel_index].surface_id;
+    let chrome_id = surfaces
+        .iter()
+        .find(|surface| surface.width == 120 && surface.height == 20)
+        .expect("CSD surface should remain renderable")
+        .surface_id;
 
     assert_eq!(state.pointer_surface_x, Some(12.0));
     assert_eq!(state.pointer_surface_y, Some(14.0));
+    let interaction = interaction.expect("the CSD-owned press must authorize move");
+    assert_eq!(interaction.root_surface_id, toplevel_id);
+    assert_eq!(interaction.pointer_motion_surface_id, Some(chrome_id));
+    assert!(matches!(interaction.kind, WindowInteractionKind::Move));
     assert_eq!(
         server.state.surface_placement(toplevel_id),
         initial_root_placement(80, 60)
     );
     assert_eq!(origins[toplevel_index], initial_offset(80, 60));
+}
+
+#[test]
+fn xdg_toplevel_resize_request_accepts_serial_from_same_client_chrome_surface() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (state, interaction) =
+        create_toplevel_request_move_from_client_chrome_surface(&socket_path, &commands, true)
+            .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let surfaces = server.renderable_surfaces();
+    let toplevel_id = surfaces
+        .iter()
+        .find(|surface| surface.width == 100 && surface.height == 80)
+        .expect("toplevel should remain renderable")
+        .surface_id;
+    let chrome_id = surfaces
+        .iter()
+        .find(|surface| surface.width == 120 && surface.height == 20)
+        .expect("CSD surface should remain renderable")
+        .surface_id;
+    let interaction = interaction.expect("the CSD-owned press must authorize resize");
+
+    assert_eq!(state.pointer_surface_x, Some(12.0));
+    assert_eq!(state.pointer_surface_y, Some(14.0));
+    assert_eq!(interaction.root_surface_id, toplevel_id);
+    assert_eq!(interaction.pointer_motion_surface_id, Some(chrome_id));
+    assert!(matches!(interaction.kind, WindowInteractionKind::Resize(_)));
 }
