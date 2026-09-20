@@ -887,6 +887,7 @@ impl CompositorState {
         handle: crate::xwayland::X11WindowHandle,
         fallback_geometry: Option<crate::xwayland::xwm::X11Geometry>,
         resize_epoch: Option<u64>,
+        local_resize_followup_pending: bool,
     ) -> bool {
         let Some(resize_epoch) = resize_epoch else {
             return false;
@@ -907,6 +908,9 @@ impl CompositorState {
             false
         };
         if self.x11_resize_interaction_active(handle) {
+            return promoted;
+        }
+        if local_resize_followup_pending {
             return promoted;
         }
         if fallback_geometry.is_some() && !active.superseded_by_move && !promoted {
@@ -930,7 +934,20 @@ impl CompositorState {
                 return true;
             }
         }
-        self.retire_x11_resize_preview(surface_id, visual);
+        if promoted {
+            let canonical = self
+                .window_id_for_x11_handle(handle)
+                .and_then(|window_id| self.window(window_id))
+                .and_then(|window| window.x11_geometry)
+                .map(|geometry| geometry.frame);
+            if let Some(canonical) = canonical {
+                self.retire_x11_resize_preview_to_geometry(surface_id, canonical);
+            } else {
+                self.retire_x11_resize_preview(surface_id, visual);
+            }
+        } else {
+            self.retire_x11_resize_preview(surface_id, visual);
+        }
         resize_debug_log(|| {
             format!(
                 "event=xwayland_resize_final_retired xid={} resize_epoch={} promoted={} reason=timeout_fallback",

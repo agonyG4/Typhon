@@ -299,11 +299,17 @@ fn timeout_fallback_promotes_geometry_and_retires_after_resize_interaction_ends(
         width: 620,
         height: 480,
     };
+    let visual_geometry = X11Geometry {
+        x: 160,
+        y: 100,
+        width: 580,
+        height: 480,
+    };
     assert!(fixture.server.state.preview_resize_root_window_to(
         fixture.surface_id,
-        fallback_geometry.width,
-        fallback_geometry.height,
-        SurfacePlacement::absolute_root_at(fallback_geometry.x, fallback_geometry.y),
+        visual_geometry.width,
+        visual_geometry.height,
+        SurfacePlacement::absolute_root_at(visual_geometry.x, visual_geometry.y),
         crate::compositor::ResizeEdges::new(false, false, true, false),
         interaction_id,
     ));
@@ -320,11 +326,196 @@ fn timeout_fallback_promotes_geometry_and_retires_after_resize_interaction_ends(
         fixture.server.state.x11_authoritative_geometry(handle),
         Some(fallback_geometry)
     );
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let canonical_frame = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry)
+        .expect("canonical X11 geometry")
+        .frame;
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(canonical_frame),
+        "terminal timeout must settle the visual preview to the promoted canonical frame"
+    );
     assert_eq!(
         fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
         None
     );
     assert!(!fixture.server.state.x11_resize_active(handle));
+}
+
+#[test]
+fn timeout_keeps_epoch_for_queued_local_resize_finalization() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let initial_geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    snapshot.geometry = initial_geometry;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let canonical_before = fixture
+        .server
+        .state
+        .x11_authoritative_geometry(handle)
+        .expect("initial canonical X11 geometry");
+
+    let edges = crate::compositor::ResizeEdges::new(false, false, false, true);
+    assert!(fixture.server.state.begin_window_interaction_for_root(
+        crate::compositor::BeginWindowInteraction::for_test(
+            Some(window_id),
+            fixture.surface_id,
+            0.0,
+            0.0,
+            WindowInteractionKind::Resize(edges),
+            WindowInteractionSource::NativeBinding,
+            Some(fixture.surface_id),
+        )
+    ));
+    assert!(fixture.server.state.update_window_interaction(40.0, 0.0));
+    assert!(
+        fixture
+            .server
+            .state
+            .flush_pending_floating_interaction_geometry()
+    );
+    let visual = fixture
+        .server
+        .state
+        .current_visual_root_window_geometry(fixture.surface_id)
+        .expect("live resize preview");
+    let visual_geometry = X11Geometry {
+        x: visual.placement.local_x,
+        y: visual.placement.local_y,
+        width: visual.width,
+        height: visual.height,
+    };
+    let resize_epoch = fixture
+        .server
+        .state
+        .x11_resize_interaction_epoch(handle)
+        .expect("active X11 resize epoch");
+
+    fixture.server.state.end_window_interaction();
+    assert!(!fixture.server.state.window_interaction_active());
+    assert!(
+        fixture
+            .server
+            .state
+            .has_pending_x11_resize_backend_command(handle)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(visual)
+    );
+
+    let fallback_geometry = X11Geometry {
+        x: 120,
+        y: 100,
+        width: 620,
+        height: 480,
+    };
+    assert_ne!(fallback_geometry, canonical_before);
+    assert_ne!(fallback_geometry, visual_geometry);
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncTimedOut {
+            window: handle,
+            fallback_geometry: Some(fallback_geometry),
+            resize_epoch: Some(resize_epoch),
+            has_followup: false,
+        });
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(fallback_geometry)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(visual)
+    );
+    assert_eq!(
+        fixture.server.state.x11_resize_interaction_epoch(handle),
+        Some(resize_epoch),
+        "queued local resize work still owns the active epoch"
+    );
+
+    let commands = fixture.server.take_xwayland_backend_commands(0);
+    let translated_final_geometry = commands.iter().find_map(|command| match command {
+        crate::xwayland::xwm::XwmCommand::BeginResizeSync {
+            geometry,
+            final_pending: true,
+            resize_epoch: Some(command_epoch),
+            ..
+        } if *command_epoch == resize_epoch => Some(*geometry),
+        _ => None,
+    });
+    assert_eq!(
+        translated_final_geometry,
+        Some(visual_geometry),
+        "the queued final resize command must retain the epoch after translation"
+    );
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncImmediate {
+            window: handle,
+            resize_epoch: Some(resize_epoch),
+            geometry: visual_geometry,
+            final_pending: true,
+        });
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(visual_geometry)
+    );
+    let canonical_frame = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry)
+        .expect("final canonical X11 geometry")
+        .frame;
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(canonical_frame)
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        None
+    );
+    assert_eq!(
+        fixture.server.state.x11_resize_interaction_epoch(handle),
+        None
+    );
 }
 
 #[test]

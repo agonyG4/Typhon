@@ -1538,6 +1538,28 @@ impl CompositorState {
         })
     }
 
+    pub(in crate::compositor) fn has_pending_x11_resize_backend_command(
+        &self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+
+        self.backend_commands.iter().any(|command| match command {
+            crate::compositor::window_backend::WindowBackendCommand::Configure {
+                window,
+                resizing,
+                ..
+            } => *window == window_id && *resizing,
+            crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
+                window,
+                ..
+            } => *window == window_id,
+            _ => false,
+        })
+    }
+
     pub(in crate::compositor) fn window_id_for_surface(&self, surface_id: u32) -> Option<WindowId> {
         self.window_by_root_surface.get(&surface_id).copied()
     }

@@ -1085,10 +1085,13 @@ impl OwnCompositorServer {
                 resize_epoch,
                 has_followup,
             } => {
+                let local_resize_followup_pending =
+                    self.state.has_pending_x11_resize_backend_command(window);
                 let accepted = self.state.finalize_x11_resize_timeout_for_epoch(
                     window,
                     fallback_geometry,
                     resize_epoch,
+                    local_resize_followup_pending,
                 );
                 trace::emit("xwayland_resize_timeout_fallback", || {
                     TraceFields::new()
@@ -1100,6 +1103,10 @@ impl OwnCompositorServer {
                             fallback_geometry.map(|geometry| format!("{geometry:?}")),
                         )
                         .field("has_followup", has_followup)
+                        .field(
+                            "local_resize_followup_pending",
+                            local_resize_followup_pending,
+                        )
                         .field("canonical_promoted_or_retired", accepted)
                 });
                 Vec::new()
