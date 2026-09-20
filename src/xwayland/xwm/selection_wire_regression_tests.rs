@@ -157,9 +157,29 @@ fn raw_selection_owner_event(
     selection_timestamp: u32,
     sequence: u16,
 ) -> [u8; 32] {
+    raw_xfixes_selection_event(
+        selection,
+        observer,
+        xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        owner,
+        timestamp,
+        selection_timestamp,
+        sequence,
+    )
+}
+
+fn raw_xfixes_selection_event(
+    selection: u32,
+    observer: u32,
+    subtype: xfixes::SelectionEvent,
+    owner: u32,
+    timestamp: u32,
+    selection_timestamp: u32,
+    sequence: u16,
+) -> [u8; 32] {
     xfixes::SelectionNotifyEvent {
         response_type: TEST_XFIXES_FIRST_EVENT + xfixes::SELECTION_NOTIFY_EVENT,
-        subtype: xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        subtype,
         sequence,
         window: observer,
         owner,
@@ -168,6 +188,102 @@ fn raw_selection_owner_event(
         selection_timestamp,
     }
     .serialize()
+}
+
+fn assert_owner_loss_clears_pending_targets(
+    generation_id: u64,
+    kind: super::super::data_bridge::SelectionKind,
+    selection_atom: u32,
+    observer: u32,
+    owner_loss_subtype: xfixes::SelectionEvent,
+) {
+    use super::super::data_bridge::selection::TargetsDiscoveryState;
+
+    let (mut xwm, mut peer) = test_fixture(generation(generation_id));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_selection_owner_event(
+        selection_atom,
+        observer,
+        0x330,
+        40,
+        35,
+        0,
+    ))
+    .expect("write serialized XFixes owner event");
+    xwm.drain_events(32).expect("start TARGETS conversion");
+    let conversion = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner TARGETS conversion");
+    peer.write_all(&raw_selection_notify(
+        conversion.requestor,
+        conversion.selection,
+        conversion.target,
+        conversion.property,
+        conversion.time,
+        1,
+    ))
+    .expect("write serialized SelectionNotify");
+    xwm.drain_events(32)
+        .expect("start asynchronous TARGETS property read");
+    let pending_sequence =
+        super::super::selection_wire::pending_sequence_for_test(&xwm, kind, true)
+            .expect("owner property reply must be pending before owner loss");
+    let _ = read_fixture_requests(&mut peer);
+
+    peer.write_all(&raw_xfixes_selection_event(
+        selection_atom,
+        observer,
+        owner_loss_subtype,
+        0,
+        41,
+        35,
+        2,
+    ))
+    .expect("write serialized XFixes owner-loss event with owner NONE");
+    xwm.drain_events(32)
+        .expect("normalize XFixes owner-loss event through the XWM stream");
+
+    let selection = xwm
+        .data_bridge
+        .selections
+        .current(kind)
+        .expect("selection channel remains generation scoped");
+    assert_eq!(selection.owner, None);
+    assert_eq!(selection.origin, None);
+    assert!(selection.targets.is_empty());
+    assert_eq!(selection.targets_state, TargetsDiscoveryState::Idle);
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(&xwm, kind, true).is_none(),
+        "owner loss must cancel the previous revision's tracked property reply"
+    );
+    let owner_loss_requests = read_fixture_requests(&mut peer);
+    assert!(
+        convert_selection_requests(&owner_loss_requests).is_empty(),
+        "clearing an owner must not start another TARGETS conversion"
+    );
+
+    peer.write_all(&raw_get_property_reply(
+        pending_sequence as u16,
+        4,
+        &[TEST_TARGETS_ATOM],
+    ))
+    .expect("write late old-revision property reply");
+    xwm.drain_events(32)
+        .expect("discard late property reply after owner loss");
+    let selection = xwm
+        .data_bridge
+        .selections
+        .current(kind)
+        .expect("selection channel remains generation scoped");
+    assert_eq!(selection.owner, None);
+    assert_eq!(selection.targets_state, TargetsDiscoveryState::Idle);
+    assert!(selection.targets.is_empty());
 }
 
 fn raw_selection_notify(
@@ -307,6 +423,363 @@ fn xfixes_external_primary_owner_has_independent_state() {
             .current(super::super::data_bridge::SelectionKind::Clipboard)
             .and_then(|selection| selection.owner),
         None
+    );
+}
+
+#[test]
+fn xfixes_window_destroy_clears_current_selection_owner() {
+    assert_owner_loss_clears_pending_targets(
+        121,
+        super::super::data_bridge::SelectionKind::Clipboard,
+        TEST_CLIPBOARD_ATOM,
+        TEST_CLIPBOARD_OBSERVER_WINDOW,
+        xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+    );
+}
+
+#[test]
+fn xfixes_client_close_clears_current_selection_owner() {
+    assert_owner_loss_clears_pending_targets(
+        122,
+        super::super::data_bridge::SelectionKind::Primary,
+        TEST_PRIMARY_ATOM,
+        TEST_PRIMARY_OBSERVER_WINDOW,
+        xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE,
+    );
+}
+
+#[test]
+fn different_timestamp_pending_conversion_reuses_requestor() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+
+    let (mut xwm, mut peer) = test_fixture(generation(123));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x331, 40, 35, 0))
+        .expect("write owner A event");
+    xwm.drain_events(32).expect("start owner A conversion");
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner A conversion");
+
+    peer.write_all(&raw_clipboard_owner_event(0x332, 41, 36, 1))
+        .expect("write owner B event with a distinct timestamp");
+    xwm.drain_events(32).expect("start owner B conversion");
+    let requests_b = read_fixture_requests(&mut peer);
+    let conversion_b = convert_selection_requests(&requests_b)
+        .pop()
+        .expect("owner B conversion");
+    assert_eq!(conversion_b.requestor, conversion_a.requestor);
+    assert!(
+        fixture_request_opcodes(&requests_b)
+            .iter()
+            .all(|(opcode, _)| !matches!(*opcode, 1 | 4))
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        2,
+    ))
+    .expect("write late owner A SelectionNotify");
+    xwm.drain_events(32)
+        .expect("reject owner A by its stale timestamp");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+    let selection = xwm
+        .data_bridge
+        .selections
+        .current(SelectionKind::Clipboard)
+        .expect("owner B state after stale SelectionNotify");
+    assert_eq!(selection.owner, Some(0x332));
+    assert_eq!(
+        selection.targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_b.requestor,
+        conversion_b.selection,
+        conversion_b.target,
+        conversion_b.property,
+        conversion_b.time,
+        3,
+    ))
+    .expect("write matching owner B SelectionNotify");
+    xwm.drain_events(32)
+        .expect("accept owner B and begin property read");
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingProperty
+    );
+}
+
+#[test]
+fn same_timestamp_pending_conversion_rotates_requestor() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+
+    let (mut xwm, mut peer) = test_fixture(generation(127));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x33a, 40, 35, 0))
+        .expect("write owner A event");
+    xwm.drain_events(32).expect("start owner A conversion");
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner A conversion");
+
+    peer.write_all(&raw_clipboard_owner_event(0x33b, 41, 35, 1))
+        .expect("write owner B replacement at the same timestamp");
+    xwm.drain_events(32).expect("start owner B conversion");
+    let conversion_b = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner B conversion");
+    assert_ne!(conversion_a.requestor, conversion_b.requestor);
+
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        2,
+    ))
+    .expect("write late owner A SelectionNotify");
+    xwm.drain_events(32)
+        .expect("ignore owner A by its retired requestor");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+    let selection = xwm
+        .data_bridge
+        .selections
+        .current(SelectionKind::Clipboard)
+        .expect("owner B state after stale SelectionNotify");
+    assert_eq!(selection.owner, Some(0x33b));
+    assert_eq!(
+        selection.targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_b.requestor,
+        conversion_b.selection,
+        conversion_b.target,
+        conversion_b.property,
+        conversion_b.time,
+        3,
+    ))
+    .expect("write matching owner B SelectionNotify");
+    xwm.drain_events(32)
+        .expect("accept owner B and start its property read");
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingProperty
+    );
+}
+
+#[test]
+fn unknown_timestamp_pending_conversion_rotates_requestor() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+
+    let (mut xwm, mut peer) = test_fixture(generation(126));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x338, 40, 0, 0))
+        .expect("write owner A event with unknown timestamp");
+    xwm.drain_events(32).expect("start owner A conversion");
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner A conversion with unknown timestamp");
+    assert_eq!(conversion_a.time, 0);
+
+    peer.write_all(&raw_clipboard_owner_event(0x339, 41, 0, 1))
+        .expect("write owner B event with unknown timestamp");
+    xwm.drain_events(32).expect("start owner B conversion");
+    let conversion_b = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner B conversion");
+    assert_ne!(conversion_a.requestor, conversion_b.requestor);
+
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        55,
+        2,
+    ))
+    .expect("write late owner A SelectionNotify with unknown old time");
+    xwm.drain_events(32)
+        .expect("reject owner A through requestor identity");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_b.requestor,
+        conversion_b.selection,
+        conversion_b.target,
+        conversion_b.property,
+        56,
+        3,
+    ))
+    .expect("write matching owner B SelectionNotify");
+    xwm.drain_events(32)
+        .expect("accept owner B using its distinct requestor");
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true,
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn owner_clear_with_pending_notify_prevents_requestor_alias() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+
+    let (mut xwm, mut peer) = test_fixture(generation(124));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x333, 40, 35, 0))
+        .expect("write owner A event");
+    xwm.drain_events(32).expect("start owner A conversion");
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner A conversion");
+
+    peer.write_all(&raw_xfixes_selection_event(
+        TEST_CLIPBOARD_ATOM,
+        TEST_CLIPBOARD_OBSERVER_WINDOW,
+        xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+        0,
+        41,
+        35,
+        1,
+    ))
+    .expect("write owner destroy with owner NONE and the same selection timestamp");
+    xwm.drain_events(32)
+        .expect("clear owner and retire its pending SelectionNotify");
+    xwm.flush()
+        .expect("flush owner-loss requestor retirement without a conversion");
+    let clear_requests = read_fixture_requests(&mut peer);
+    assert!(convert_selection_requests(&clear_requests).is_empty());
+    assert!(
+        fixture_request_opcodes(&clear_requests)
+            .iter()
+            .any(|(opcode, _)| *opcode == 1),
+        "owner loss must serialize a fresh requestor for the pending old notification"
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .owner,
+        None
+    );
+
+    peer.write_all(&raw_clipboard_owner_event(0x334, 42, 35, 2))
+        .expect("write owner B event reusing timestamp T");
+    xwm.drain_events(32).expect("start owner B conversion");
+    let owner_b_requests = read_fixture_requests(&mut peer);
+    let conversion_b = convert_selection_requests(&owner_b_requests)
+        .pop()
+        .expect("owner B conversion");
+    assert_ne!(conversion_a.requestor, conversion_b.requestor);
+
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        3,
+    ))
+    .expect("write late owner A SelectionNotify");
+    xwm.drain_events(32)
+        .expect("ignore owner A by its retired requestor");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_b.requestor,
+        conversion_b.selection,
+        conversion_b.target,
+        conversion_b.property,
+        conversion_b.time,
+        4,
+    ))
+    .expect("write matching owner B SelectionNotify");
+    xwm.drain_events(32)
+        .expect("accept owner B on its distinct requestor");
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true,
+        )
+        .is_some()
     );
 }
 
@@ -582,24 +1055,15 @@ fn stale_targets_reply_after_owner_replacement_is_ignored() {
     let conversion_b = convert_selection_requests(&read_fixture_requests(&mut peer))
         .pop()
         .expect("owner B conversion");
-    assert_ne!(conversion_a.requestor, conversion_b.requestor);
-
-    let stale_reply = raw_get_property_reply(sequence_a as u16, 4, &[0x101, 0x102]);
-    peer.write_all(&stale_reply)
-        .expect("write late owner A GetProperty reply");
-    xwm.drain_events(32)
-        .expect("discard stale owner A property completion");
-    let selection_b = xwm
-        .data_bridge
-        .selections
-        .current(SelectionKind::Clipboard)
-        .expect("owner B selection record");
-    assert_eq!(selection_b.owner, Some(0x308));
+    assert_eq!(conversion_a.requestor, conversion_b.requestor);
     assert_eq!(
-        selection_b.targets_state,
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
         TargetsDiscoveryState::AwaitingSelectionNotify
     );
-    assert!(selection_b.targets.is_empty());
 
     peer.write_all(&raw_selection_notify(
         conversion_b.requestor,
@@ -612,28 +1076,26 @@ fn stale_targets_reply_after_owner_replacement_is_ignored() {
     .expect("write owner B SelectionNotify");
     xwm.drain_events(32)
         .expect("start owner B GetProperty request");
-    let sequence_b = super::super::selection_wire::pending_sequence_for_test(
-        &xwm,
-        SelectionKind::Clipboard,
-        true,
-    )
-    .expect("owner B property reply sequence");
     let _ = read_fixture_requests(&mut peer);
     peer.write_all(&raw_get_property_reply(
-        sequence_b as u16,
+        sequence_a as u16,
         4,
-        &[0x101, 0x102, 0x101],
+        &[0x101, 0x102],
     ))
-    .expect("write matching owner B GetProperty reply");
-    xwm.drain_events(32).expect("resolve owner B TARGETS reply");
+    .expect("write late owner A GetProperty reply");
+    xwm.drain_events(32)
+        .expect("discard stale owner A GetProperty completion");
     let selection_b = xwm
         .data_bridge
         .selections
         .current(SelectionKind::Clipboard)
         .expect("owner B selection record");
     assert_eq!(selection_b.owner, Some(0x308));
-    assert_eq!(selection_b.targets_state, TargetsDiscoveryState::Resolved);
-    assert_eq!(selection_b.targets, vec![0x101, 0x102]);
+    assert_eq!(
+        selection_b.targets_state,
+        TargetsDiscoveryState::AwaitingProperty
+    );
+    assert!(selection_b.targets.is_empty());
 }
 
 #[test]
@@ -812,7 +1274,7 @@ fn selection_owner_replacement_has_a_distinct_stale_reply_identity() {
 }
 
 #[test]
-fn owner_churn_has_a_hard_requestor_window_creation_bound() {
+fn timestamp_distinguished_owner_churn_does_not_exhaust_requestor_windows() {
     let (mut xwm, mut peer) = test_fixture(generation(112));
     install_extension(
         &mut xwm,
@@ -823,7 +1285,7 @@ fn owner_churn_has_a_hard_requestor_window_creation_bound() {
     );
 
     let mut created_windows = 0;
-    let mut conversions = 0;
+    let mut conversions = Vec::new();
     for index in 0..5_000_u32 {
         peer.write_all(&raw_clipboard_owner_event(
             0x400 + index,
@@ -834,10 +1296,11 @@ fn owner_churn_has_a_hard_requestor_window_creation_bound() {
         .expect("write owner replacement event");
         xwm.drain_events(8)
             .expect("process bounded owner replacement");
-        for (opcode, _) in fixture_request_opcodes(&read_fixture_requests(&mut peer)) {
+        let requests = read_fixture_requests(&mut peer);
+        for (opcode, _) in fixture_request_opcodes(&requests) {
             created_windows += usize::from(opcode == 1);
-            conversions += usize::from(opcode == 24);
         }
+        conversions.extend(convert_selection_requests(&requests));
     }
 
     let selection = xwm
@@ -845,16 +1308,122 @@ fn owner_churn_has_a_hard_requestor_window_creation_bound() {
         .selections
         .current(super::super::data_bridge::SelectionKind::Clipboard)
         .expect("current CLIPBOARD wire state");
-    assert_eq!(created_windows, 4_095);
-    assert_eq!(conversions, 4_096);
+    assert_eq!(created_windows, 0);
+    assert_eq!(conversions.len(), 5_000);
+    assert!(
+        conversions
+            .iter()
+            .all(|request| request.requestor == TEST_CLIPBOARD_REQUESTOR_WINDOW)
+    );
     assert_eq!(selection.owner, Some(0x400 + 4_999));
     assert_eq!(
         selection.targets_state,
-        super::super::data_bridge::selection::TargetsDiscoveryState::Failed
+        super::super::data_bridge::selection::TargetsDiscoveryState::AwaitingSelectionNotify
     );
     assert!(super::super::selection_wire::is_internal_window(
         TEST_CLIPBOARD_REQUESTOR_WINDOW,
         Some(xwm.supporting_wm_check),
         Some(&xwm.data_bridge.selection_wire),
     ));
+}
+
+#[test]
+fn rotation_bound_failure_recovers_on_distinguishable_timestamp() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+
+    let (mut xwm, mut peer) = test_fixture(generation(125));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x335, 40, 500, 0))
+        .expect("write owner A event");
+    xwm.drain_events(32).expect("start owner A conversion");
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner A conversion");
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+
+    peer.write_all(&raw_clipboard_owner_event(0x336, 41, 500, 1))
+        .expect("write ambiguous owner B event at exhausted rotation bound");
+    xwm.drain_events(32)
+        .expect("fail unsafe owner B conversion without aliasing");
+    let failed_requests = read_fixture_requests(&mut peer);
+    assert!(convert_selection_requests(&failed_requests).is_empty());
+    assert!(
+        fixture_request_opcodes(&failed_requests)
+            .iter()
+            .all(|(opcode, _)| !matches!(*opcode, 1 | 4))
+    );
+    let failed = xwm
+        .data_bridge
+        .selections
+        .current(SelectionKind::Clipboard)
+        .expect("failed owner B state");
+    assert_eq!(failed.owner, Some(0x336));
+    assert_eq!(failed.targets_state, TargetsDiscoveryState::Failed);
+
+    peer.write_all(&raw_clipboard_owner_event(0x337, 42, 501, 2))
+        .expect("write owner C event with a distinguishable timestamp");
+    xwm.drain_events(32)
+        .expect("recover using the existing requestor");
+    let conversion_c = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner C conversion after bound exhaustion");
+    assert_eq!(conversion_c.requestor, conversion_a.requestor);
+    assert_eq!(conversion_c.time, 501);
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        3,
+    ))
+    .expect("write old owner A SelectionNotify");
+    xwm.drain_events(32)
+        .expect("reject owner A by timestamp after recovery");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
+    );
+
+    peer.write_all(&raw_selection_notify(
+        conversion_c.requestor,
+        conversion_c.selection,
+        conversion_c.target,
+        conversion_c.property,
+        conversion_c.time,
+        4,
+    ))
+    .expect("write matching owner C SelectionNotify");
+    xwm.drain_events(32)
+        .expect("continue owner C property discovery");
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true,
+        )
+        .is_some()
+    );
 }

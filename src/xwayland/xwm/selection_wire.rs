@@ -150,6 +150,13 @@ impl SelectionWireState {
     }
 
     #[cfg(test)]
+    pub(crate) fn exhaust_requestor_window_budget_for_test(&mut self, kind: SelectionKind) {
+        if let Some(windows) = self.windows.get_mut(&kind) {
+            windows.requestor_windows_created = MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn pending_sequence_for_test(
         &self,
         kind: SelectionKind,
@@ -328,72 +335,13 @@ pub(crate) fn observe_xfixes(
         return Ok(());
     }
 
-    let prior = xwm.data_bridge.selections.current(kind).cloned();
     let owner = match event.subtype {
         xfixes::SelectionEvent::SET_SELECTION_OWNER => (event.owner != 0).then_some(event.owner),
         xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY
-        | xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE => {
-            if prior.as_ref().and_then(|state| state.owner) != Some(event.owner) {
-                return Ok(());
-            }
-            None
-        }
+        | xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE => None,
         _ => return Ok(()),
     };
-    let origin = owner.map(|owner| {
-        if is_internal_window(
-            owner,
-            Some(xwm.supporting_wm_check),
-            Some(&xwm.data_bridge.selection_wire),
-        ) {
-            SelectionOrigin::Wayland
-        } else {
-            SelectionOrigin::X11
-        }
-    });
-    let Some(_revision) = xwm.data_bridge.selections.observe_owner(
-        generation,
-        kind,
-        owner,
-        origin,
-        event.selection_timestamp,
-    ) else {
-        return Ok(());
-    };
-
-    cancel_channel_replies(xwm, generation, kind);
-    let current_requestor = xwm.data_bridge.selection_wire.requestor(kind);
-    let owner_is_requestor = owner.is_some() && owner == current_requestor;
-    let requestor_ready =
-        if prior.as_ref().is_some_and(|state| state.revision.is_some()) && !owner_is_requestor {
-            replace_requestor(xwm, kind)?
-        } else {
-            current_requestor.is_some()
-        };
-    let Some(_owner) = owner else {
-        return Ok(());
-    };
-    let Some(identity) = xwm
-        .data_bridge
-        .selections
-        .current(kind)
-        .and_then(|state| state.identity())
-    else {
-        return Ok(());
-    };
-    if origin == Some(SelectionOrigin::Wayland) {
-        xwm.data_bridge
-            .selections
-            .mark_discovery_state(identity, TargetsDiscoveryState::Inactive);
-        return Ok(());
-    }
-    if !requestor_ready {
-        xwm.data_bridge
-            .selections
-            .mark_discovery_state(identity, TargetsDiscoveryState::Failed);
-        return Ok(());
-    }
-    start_targets_conversion(xwm, identity)
+    apply_owner_transition(xwm, generation, kind, owner, event.selection_timestamp)
 }
 
 fn replace_requestor(xwm: &mut Xwm, kind: SelectionKind) -> Result<bool, XwmError> {
@@ -454,6 +402,14 @@ fn start_targets_conversion(xwm: &mut Xwm, identity: SelectionIdentity) -> Resul
         .map_err(XwmError::Connection)?;
     std::mem::forget(cookie);
     xwm.connection.flush().map_err(XwmError::Connection)
+}
+
+fn requestor_rotation_required(
+    prior: &super::data_bridge::selection::SelectionSnapshot,
+    next_timestamp: u32,
+) -> bool {
+    prior.targets_state == TargetsDiscoveryState::AwaitingSelectionNotify
+        && (next_timestamp == 0 || next_timestamp == prior.timestamp)
 }
 
 pub(crate) fn selection_notify(
@@ -722,12 +678,15 @@ fn apply_owner_transition(
     cancel_channel_replies(xwm, generation, kind);
     let current_requestor = xwm.data_bridge.selection_wire.requestor(kind);
     let owner_is_requestor = owner.is_some() && owner == current_requestor;
-    let requestor_ready =
-        if prior.as_ref().is_some_and(|state| state.revision.is_some()) && !owner_is_requestor {
-            replace_requestor(xwm, kind)?
-        } else {
-            current_requestor.is_some()
-        };
+    let requestor_ready = if prior
+        .as_ref()
+        .is_some_and(|state| requestor_rotation_required(state, timestamp))
+        && !owner_is_requestor
+    {
+        replace_requestor(xwm, kind)?
+    } else {
+        current_requestor.is_some()
+    };
     let Some(_owner) = owner else {
         return Ok(());
     };
