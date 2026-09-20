@@ -1833,6 +1833,7 @@ mod task_05_8_tests {
                 flow_sequence: 1,
                 edges: ResizeEdges::BOTTOM_RIGHT,
                 activated_at: Instant::now(),
+                superseded_by_move: false,
             },
         );
 
@@ -1930,6 +1931,7 @@ mod task_05_8_tests {
                 flow_sequence: 1,
                 edges: ResizeEdges::new(false, false, false, true),
                 activated_at: Instant::now(),
+                superseded_by_move: false,
             },
         );
         assert!(state.preview_resize_root_window_to(

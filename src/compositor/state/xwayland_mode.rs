@@ -188,6 +188,64 @@ impl CompositorState {
         true
     }
 
+    pub(in crate::compositor) fn promote_x11_resize_geometry(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+        resize_epoch: u64,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        let Some(active) = self.active_toplevel_resizes.get(&root_surface_id).copied() else {
+            return false;
+        };
+        let Some(visual) = self.toplevel_visual_geometries.get(&root_surface_id) else {
+            return false;
+        };
+        if active.interaction_id.get() != resize_epoch
+            || active.superseded_by_move
+            || visual.active_resize != Some(active.interaction_id)
+        {
+            return false;
+        }
+        let Some(filtered) = self.filter_x11_geometry(handle, geometry) else {
+            return false;
+        };
+        let placement = SurfacePlacement::absolute_root_at(filtered.x, filtered.y);
+        let frame = WindowGeometry::new(placement, filtered.width, filtered.height);
+        let Some(window) = self.window_mut(window_id) else {
+            return false;
+        };
+        let placement_policy = window.x11_placement_policy;
+        let Some(x11_geometry) = window.x11_geometry.as_mut() else {
+            return false;
+        };
+        x11_geometry.client = if placement_policy == Some(X11PlacementPolicy::CompositorManaged) {
+            crate::xwayland::xwm::X11Geometry {
+                x: placement.local_x,
+                y: placement.local_y,
+                ..filtered
+            }
+        } else {
+            filtered
+        };
+        x11_geometry.frame = frame;
+        resize_debug_log(|| {
+            format!(
+                "event=xwayland_resize_geometry_promoted xid={} resize_epoch={} geometry={:?} visual_preserved=true",
+                handle.xid(),
+                resize_epoch,
+                filtered,
+            )
+        });
+        true
+    }
+
     pub(in crate::compositor) fn install_x11_visual_geometry(
         &mut self,
         root_surface_id: u32,

@@ -56,6 +56,42 @@ For each failure, keep the XID and inspect the ordered records for:
 - moveresize result and rejection reason;
 - focus before/after `WindowReady` and metadata repair.
 
+## Interactive resize geometry ownership
+
+Interactive XWayland resize keeps three geometry states separate:
+
+- Visual resize geometry may lead the client.
+- Canonical X11 geometry may only advance from XWM progress, including an
+  immediate configure or the geometry explicitly selected as timeout fallback.
+- Committed buffer content may lag both and is tracked separately.
+
+During an active resize, a client `ConfigureRequest` is answered with canonical
+applied geometry. It does not turn the pointer preview into X11 authority.
+Intermediate XSync presentations advance canonical geometry while preserving
+the latest pointer preview; only a valid final presentation or timeout fallback
+can retire that preview.
+
+## Interactive move and resize session matrix
+
+Start Typhon with input and resize tracing enabled:
+
+```sh
+TYPHON_XWAYLAND_TRACE=1 TYPHON_XWAYLAND_LOG=1 \
+TYPHON_RESIZE_DEBUG=1 TYPHON_POINTER_DEBUG=1 \
+  typhon 2>typhon-interaction.log
+```
+
+On a native session, exercise a native Wayland/XDG application through move,
+slow resize, rapid resize, and release followed immediately by move. Repeat the
+same cases with a Flatpak application after determining from the session events
+whether that client is native XDG or has an XWayland window; packaging does not
+identify its window protocol. For an XWayland application, exercise move, slow
+and rapid resize, repeated direction changes, release followed immediately by
+move, and maximize/restore where supported. After each interaction settles,
+check the trace for a retired interaction, converged canonical and visual
+geometry, and no later resize presentation overwriting a move. Record this as
+native session evidence separately from deterministic test results.
+
 Classify the sequence before changing code. The useful categories are stale
 classification, provisional focus, client withdrawal, WM self-unmap, missing
 association/buffer, stale resize commit, missing commit edge, moveresize

@@ -561,6 +561,7 @@ struct ActiveToplevelResize {
     flow_sequence: u64,
     edges: ResizeEdges,
     activated_at: Instant,
+    superseded_by_move: bool,
 }
 #[derive(Debug, Default, Clone, Copy)]
 struct XdgConfigureSerialState {

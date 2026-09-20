@@ -1234,6 +1234,7 @@ fn command_after_destroy_configure_is_obsolete_not_fatal() {
             fields: super::super::X11ConfigureFlags::all(),
             source: super::super::ConfigureSource::Compositor,
             border_width: 0,
+            resize_epoch: None,
         },
     );
 
@@ -1267,6 +1268,7 @@ fn stacking_only_configure_does_not_create_geometry_timeline() {
             },
             source: super::super::ConfigureSource::Compositor,
             border_width: 0,
+            resize_epoch: None,
         },
     );
 
@@ -1434,6 +1436,7 @@ fn target_gone_single_target_commands_are_nonfatal_after_destroy() {
                     fields: super::super::X11ConfigureFlags::all(),
                     source: super::super::ConfigureSource::Compositor,
                     border_width: 0,
+                    resize_epoch: None,
                 },
                 3 => XwmCommand::ConfigureFrame {
                     window: handle,
@@ -1461,6 +1464,7 @@ fn target_gone_single_target_commands_are_nonfatal_after_destroy() {
                     counter_value: 1,
                     deadline_ns: 10,
                     final_pending: false,
+                    resize_epoch: None,
                 },
                 10 => XwmCommand::SetAllowCommits {
                     window: handle,
@@ -1546,6 +1550,7 @@ fn stale_generation_commands_are_dropped_without_touching_current_xwm() {
                 fields: super::super::X11ConfigureFlags::all(),
                 source: super::super::ConfigureSource::Compositor,
                 border_width: 0,
+                resize_epoch: None,
             },
         ),
         Ok(super::super::XwmCommandOutcome::DroppedStaleGeneration { window: Some(window) })
@@ -2280,6 +2285,149 @@ fn same_geometry_final_does_not_start_sync_roundtrip() {
 }
 
 #[test]
+fn immediate_resize_configures_report_epoch_scoped_preview_and_final_progress() {
+    let generation = generation(241);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 241, true, false, false);
+    let resize_epoch = 73;
+    let preview_geometry = X11Geometry {
+        x: 110,
+        y: 120,
+        width: 820,
+        height: 620,
+    };
+
+    super::super::commands::begin_resize_sync_for_epoch(
+        &mut xwm,
+        handle,
+        preview_geometry,
+        0,
+        100,
+        false,
+        Some(resize_epoch),
+    )
+    .expect("immediate resize preview configure");
+    assert!(matches!(
+        xwm.take_events().collect::<Vec<_>>().as_slice(),
+        [super::super::XwmEvent::ResizeSyncImmediate {
+            window,
+            geometry,
+            resize_epoch: Some(73),
+            final_pending: false,
+        }] if *window == handle && *geometry == preview_geometry
+    ));
+    assert_eq!(xwm.resize_sync.state(handle), ResizeSyncState::Idle);
+
+    super::super::commands::begin_resize_sync_for_epoch(
+        &mut xwm,
+        handle,
+        preview_geometry,
+        0,
+        100,
+        false,
+        Some(resize_epoch),
+    )
+    .expect("repeat immediate resize preview configure");
+    assert!(
+        xwm.take_events().next().is_none(),
+        "identical already-reported immediate geometry must not duplicate progress"
+    );
+
+    let final_geometry = X11Geometry {
+        width: 840,
+        height: 640,
+        ..preview_geometry
+    };
+    super::super::commands::begin_resize_sync_for_epoch(
+        &mut xwm,
+        handle,
+        final_geometry,
+        0,
+        100,
+        true,
+        Some(resize_epoch),
+    )
+    .expect("immediate resize final configure");
+    assert!(matches!(
+        xwm.take_events().collect::<Vec<_>>().as_slice(),
+        [super::super::XwmEvent::ResizeSyncImmediate {
+            window,
+            geometry,
+            resize_epoch: Some(73),
+            final_pending: true,
+        }] if *window == handle && *geometry == final_geometry
+    ));
+    assert_eq!(xwm.resize_sync.state(handle), ResizeSyncState::Idle);
+}
+
+#[test]
+fn timeout_reports_the_selected_transaction_fallback_and_resize_epoch() {
+    let generation = generation(242);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 242, true, false, false);
+    let fallback_geometry = X11Geometry {
+        x: 31,
+        y: 47,
+        width: 701,
+        height: 503,
+    };
+    xwm.resize_sync
+        .begin_transaction_for_epoch(handle, 19, 100, fallback_geometry, true, Some(74))
+        .expect("begin resize transaction");
+
+    xwm.handle_resize_sync_deadline(100)
+        .expect("handle resize timeout");
+
+    assert!(matches!(
+        xwm.take_events().collect::<Vec<_>>().as_slice(),
+        [super::super::XwmEvent::ResizeSyncTimedOut {
+            window,
+            fallback_geometry: Some(geometry),
+            resize_epoch: Some(74),
+            has_followup: false,
+        }] if *window == handle && *geometry == fallback_geometry
+    ));
+}
+
+#[test]
+fn timeout_reports_the_coalesced_followup_as_fallback() {
+    let generation = generation(243);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 243, true, false, false);
+    let first_geometry = X11Geometry {
+        width: 700,
+        height: 500,
+        ..X11Geometry::default()
+    };
+    let followup_geometry = X11Geometry {
+        x: 25,
+        y: 35,
+        width: 910,
+        height: 680,
+    };
+    xwm.resize_sync
+        .begin_transaction_for_epoch(handle, 20, 100, first_geometry, false, Some(75))
+        .expect("begin resize transaction");
+    assert!(
+        xwm.resize_sync
+            .queue_desired_for_epoch(handle, followup_geometry, true, Some(75),)
+    );
+
+    xwm.handle_resize_sync_deadline(100)
+        .expect("handle resize timeout");
+
+    assert!(matches!(
+        xwm.take_events().collect::<Vec<_>>().as_slice(),
+        [super::super::XwmEvent::ResizeSyncTimedOut {
+            window,
+            fallback_geometry: Some(geometry),
+            resize_epoch: Some(75),
+            has_followup: true,
+        }] if *window == handle && *geometry == followup_geometry
+    ));
+}
+
+#[test]
 fn position_only_move_bypasses_pending_resize_size_queue() {
     let generation = generation(204);
     let (mut xwm, mut peer) = test_fixture(generation);
@@ -2311,6 +2459,7 @@ fn position_only_move_bypasses_pending_resize_size_queue() {
             },
             source: super::super::ConfigureSource::Compositor,
             border_width: 0,
+            resize_epoch: None,
         },
     )
     .expect("position-only configure");
@@ -2350,6 +2499,7 @@ fn position_only_move_bypasses_pending_resize_size_queue() {
             },
             source: super::super::ConfigureSource::Compositor,
             border_width: 0,
+            resize_epoch: None,
         },
     )
     .expect("position-only configure while a final content target is queued");

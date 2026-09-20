@@ -79,6 +79,7 @@ pub enum XwmEvent {
     ResizeSyncPresented {
         window: X11WindowHandle,
         transaction_id: u64,
+        resize_epoch: Option<u64>,
         geometry: X11Geometry,
     },
     /// A transaction presented while another desired geometry still belongs to
@@ -88,12 +89,19 @@ pub enum XwmEvent {
     ResizeSyncPresentedIntermediate {
         window: X11WindowHandle,
         transaction_id: u64,
+        resize_epoch: Option<u64>,
         geometry: X11Geometry,
     },
     ResizeSyncImmediate {
         window: X11WindowHandle,
+        resize_epoch: Option<u64>,
         geometry: X11Geometry,
+        final_pending: bool,
     },
-    ResizeSyncTimedOut(X11WindowHandle),
-    ResizeSyncTimedOutWithFollowup(X11WindowHandle),
+    ResizeSyncTimedOut {
+        window: X11WindowHandle,
+        fallback_geometry: Option<X11Geometry>,
+        resize_epoch: Option<u64>,
+        has_followup: bool,
+    },
 }

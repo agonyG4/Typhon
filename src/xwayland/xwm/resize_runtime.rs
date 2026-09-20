@@ -75,6 +75,7 @@ impl Xwm {
             if let Some(timed_out) = self.resize_sync.timeout(handle, now_ns) {
                 self.resize_sync.disable_after_timeout(handle);
                 let transaction = self.resize_sync.transaction(handle);
+                let transaction_resize_epoch = self.resize_sync.transaction_resize_epoch(handle);
                 let counter_value = timed_out.counter_value;
                 let latest_desired = self
                     .resize_sync
@@ -85,6 +86,9 @@ impl Xwm {
                 let fallback_geometry = desired
                     .map(|desired| desired.geometry)
                     .or_else(|| transaction.map(|(_, geometry, _)| geometry));
+                let resize_epoch = desired
+                    .and_then(|desired| desired.resize_epoch)
+                    .or(transaction_resize_epoch);
                 let allow_result = commands::set_allow_commits(self, handle, true)
                     .and_then(|()| self.connection.flush().map_err(XwmError::Connection));
                 self.timed_out_resize_counters.insert(handle, counter_value);
@@ -121,13 +125,22 @@ impl Xwm {
                     );
                 }
                 if let Some(geometry) = fallback_geometry {
-                    commands::configure_immediate(self, handle, geometry, false)?;
+                    commands::configure_immediate(
+                        self,
+                        handle,
+                        geometry,
+                        false,
+                        resize_epoch,
+                        false,
+                    )?;
                 }
-                self.outgoing_events.push_back(if has_followup {
-                    XwmEvent::ResizeSyncTimedOutWithFollowup(handle)
-                } else {
-                    XwmEvent::ResizeSyncTimedOut(handle)
-                });
+                self.outgoing_events
+                    .push_back(XwmEvent::ResizeSyncTimedOut {
+                        window: handle,
+                        fallback_geometry,
+                        resize_epoch,
+                        has_followup,
+                    });
             }
         }
         Ok(())
@@ -166,19 +179,21 @@ impl Xwm {
                             transaction_id: presented_transaction
                                 .map(|(transaction_id, _, _)| transaction_id)
                                 .unwrap_or_default(),
+                            resize_epoch: desired.resize_epoch,
                             geometry: desired.geometry,
                         });
                 }
                 return Ok(());
             }
             let now = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
-            commands::begin_resize_sync(
+            commands::begin_resize_sync_for_epoch(
                 self,
                 handle,
                 desired.geometry,
                 0,
                 now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                 desired.final_pending,
+                desired.resize_epoch,
             )?;
         }
         Ok(())

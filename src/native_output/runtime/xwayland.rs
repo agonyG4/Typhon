@@ -590,6 +590,7 @@ mod tests {
                     fields: Default::default(),
                     source: oblivion_one::xwayland::xwm::ConfigureSource::Compositor,
                     border_width: 0,
+                    resize_epoch: None,
                 },
                 XwmCommand::SetState {
                     window: dead,

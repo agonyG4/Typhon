@@ -202,6 +202,7 @@ pub enum XwmCommand {
         fields: X11ConfigureFlags,
         source: ConfigureSource,
         border_width: u32,
+        resize_epoch: Option<u64>,
     },
     ConfigureFrame {
         window: X11WindowHandle,
@@ -268,6 +269,7 @@ pub enum XwmCommand {
         counter_value: u64,
         deadline_ns: u64,
         final_pending: bool,
+        resize_epoch: Option<u64>,
     },
     SetAllowCommits {
         window: X11WindowHandle,
@@ -674,16 +676,19 @@ impl Xwm {
                         };
                         let final_presented =
                             final_pending && self.resize_sync.desired(handle).is_none();
+                        let resize_epoch = self.resize_sync.transaction_resize_epoch(handle);
                         self.outgoing_events.push_back(if final_presented {
                             XwmEvent::ResizeSyncPresented {
                                 window: handle,
                                 transaction_id,
+                                resize_epoch,
                                 geometry,
                             }
                         } else {
                             XwmEvent::ResizeSyncPresentedIntermediate {
                                 window: handle,
                                 transaction_id,
+                                resize_epoch,
                                 geometry,
                             }
                         });

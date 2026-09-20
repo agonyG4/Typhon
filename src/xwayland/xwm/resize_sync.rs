@@ -58,6 +58,7 @@ pub(crate) struct TimedOutResize {
 pub(crate) struct ResizeSyncDesired {
     pub(crate) geometry: X11Geometry,
     pub(crate) final_pending: bool,
+    pub(crate) resize_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,7 @@ struct ResizeSyncTransaction {
     id: u64,
     geometry: X11Geometry,
     final_pending: bool,
+    resize_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +105,7 @@ pub(crate) struct ResizeSyncTracker {
 }
 
 impl ResizeSyncTracker {
+    #[cfg(test)]
     pub(crate) fn begin_transaction(
         &mut self,
         handle: X11WindowHandle,
@@ -110,6 +113,25 @@ impl ResizeSyncTracker {
         deadline_ns: u64,
         geometry: X11Geometry,
         final_pending: bool,
+    ) -> Result<(), ResizeSyncError> {
+        self.begin_transaction_for_epoch(
+            handle,
+            counter_value,
+            deadline_ns,
+            geometry,
+            final_pending,
+            None,
+        )
+    }
+
+    pub(crate) fn begin_transaction_for_epoch(
+        &mut self,
+        handle: X11WindowHandle,
+        counter_value: u64,
+        deadline_ns: u64,
+        geometry: X11Geometry,
+        final_pending: bool,
+        resize_epoch: Option<u64>,
     ) -> Result<(), ResizeSyncError> {
         if counter_value == 0 {
             return Err(ResizeSyncError::InvalidCounter);
@@ -125,6 +147,7 @@ impl ResizeSyncTracker {
                 id: *next_id,
                 geometry,
                 final_pending,
+                resize_epoch,
             },
         );
         self.states.insert(
@@ -137,15 +160,27 @@ impl ResizeSyncTracker {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_desired(
         &mut self,
         handle: X11WindowHandle,
         geometry: X11Geometry,
         final_pending: bool,
     ) -> bool {
+        self.queue_desired_for_epoch(handle, geometry, final_pending, None)
+    }
+
+    pub(crate) fn queue_desired_for_epoch(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: X11Geometry,
+        final_pending: bool,
+        resize_epoch: Option<u64>,
+    ) -> bool {
         let desired = ResizeSyncDesired {
             geometry,
             final_pending,
+            resize_epoch,
         };
         if self.desired.get(&handle).copied() == Some(desired) {
             return false;
@@ -194,6 +229,12 @@ impl ResizeSyncTracker {
                 transaction.final_pending,
             )
         })
+    }
+
+    pub(crate) fn transaction_resize_epoch(&self, handle: X11WindowHandle) -> Option<u64> {
+        self.transactions
+            .get(&handle)
+            .and_then(|transaction| transaction.resize_epoch)
     }
 
     pub(crate) fn acknowledge(&mut self, handle: X11WindowHandle, counter_value: u64) -> bool {

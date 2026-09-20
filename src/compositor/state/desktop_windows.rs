@@ -1051,6 +1051,8 @@ impl CompositorState {
         changed
     }
 
+    /// Returns the canonical geometry Typhon has accepted as applied for X11.
+    /// Interactive resize preview geometry is stored separately.
     pub(in crate::compositor) fn x11_authoritative_geometry(
         &self,
         handle: X11WindowHandle,

@@ -1417,6 +1417,7 @@ fn state_with_preview_resize(
             flow_sequence: 1,
             edges: desired.edges,
             activated_at: Instant::now(),
+            superseded_by_move: false,
         },
     );
     assert!(state.preview_resize_root_window_to(

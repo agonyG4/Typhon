@@ -302,9 +302,6 @@ impl CompositorState {
                 mode_transition: false,
             },
         );
-        if let Some(window_id) = self.window_id_for_surface(surface_id) {
-            self.set_x11_frame_geometry(window_id, WindowGeometry::new(placement, width, height));
-        }
         self.update_toplevel_visual_render_assignment(surface_id);
         let previous_resize = self.active_toplevel_resizes.get(&surface_id).copied();
         if previous_resize.is_none() {
@@ -315,6 +312,7 @@ impl CompositorState {
                     flow_sequence,
                     edges,
                     activated_at: Instant::now(),
+                    superseded_by_move: false,
                 },
             );
             self.resize_flow_metrics.preview_activations = self
@@ -329,6 +327,7 @@ impl CompositorState {
                     flow_sequence,
                     edges,
                     activated_at: Instant::now(),
+                    superseded_by_move: false,
                 },
             );
             self.resize_flow_metrics.preview_ownership_transfers = self
@@ -731,6 +730,7 @@ impl CompositorState {
         true
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn finalize_x11_resize(
         &mut self,
         handle: crate::xwayland::X11WindowHandle,
@@ -738,6 +738,7 @@ impl CompositorState {
         self.finalize_x11_resize_with_geometry(handle, None)
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn finalize_x11_resize_with_geometry(
         &mut self,
         handle: crate::xwayland::X11WindowHandle,
@@ -808,6 +809,19 @@ impl CompositorState {
             })
     }
 
+    pub(in crate::compositor) fn x11_resize_interaction_epoch(
+        &self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> Option<u64> {
+        let root_surface_id = self
+            .window_id_for_x11_handle(handle)
+            .and_then(|window_id| self.window(window_id))
+            .map(|window| window.root_surface_id)?;
+        let active = self.active_toplevel_resizes.get(&root_surface_id)?;
+        let visual = self.toplevel_visual_geometries.get(&root_surface_id)?;
+        (visual.active_resize == Some(active.interaction_id)).then_some(active.interaction_id.get())
+    }
+
     pub(in crate::compositor) fn x11_resize_interaction_active(
         &self,
         handle: crate::xwayland::X11WindowHandle,
@@ -823,15 +837,154 @@ impl CompositorState {
             .is_some_and(|interaction| interaction.root_surface_id == root_surface_id)
     }
 
-    pub(in crate::compositor) fn finalize_x11_resize_if_interaction_ended(
+    pub(in crate::compositor) fn finalize_x11_resize_for_epoch(
         &mut self,
         handle: crate::xwayland::X11WindowHandle,
+        presented_geometry: crate::xwayland::xwm::X11Geometry,
+        resize_epoch: Option<u64>,
     ) -> bool {
-        if self.x11_resize_interaction_active(handle) {
+        let Some(resize_epoch) = resize_epoch else {
+            return false;
+        };
+        let Some((surface_id, active, visual)) = self.x11_resize_state(handle) else {
+            return false;
+        };
+        if active.interaction_id.get() != resize_epoch
+            || visual.active_resize != Some(active.interaction_id)
+            || self.x11_resize_interaction_active(handle)
+        {
             return false;
         }
-        self.finalize_x11_resize(handle)
+        if active.superseded_by_move {
+            self.retire_x11_resize_preview(surface_id, visual);
+            resize_debug_log(|| {
+                format!(
+                    "event=xwayland_resize_final_retired xid={} resize_epoch={} promoted=false reason=superseded_by_move",
+                    handle.xid(),
+                    resize_epoch,
+                )
+            });
+            return false;
+        }
+        if !x11_geometry_matches_visual(presented_geometry, visual.window_geometry())
+            || !self.promote_x11_resize_geometry(handle, presented_geometry, resize_epoch)
+        {
+            return false;
+        }
+        self.retire_x11_resize_preview(surface_id, visual);
+        resize_debug_log(|| {
+            format!(
+                "event=xwayland_resize_final_retired xid={} resize_epoch={} promoted=true reason=final_content_epoch",
+                handle.xid(),
+                resize_epoch,
+            )
+        });
+        true
     }
+
+    pub(in crate::compositor) fn finalize_x11_resize_timeout_for_epoch(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+        fallback_geometry: Option<crate::xwayland::xwm::X11Geometry>,
+        resize_epoch: Option<u64>,
+    ) -> bool {
+        let Some(resize_epoch) = resize_epoch else {
+            return false;
+        };
+        let Some((surface_id, active, visual)) = self.x11_resize_state(handle) else {
+            return false;
+        };
+        if active.interaction_id.get() != resize_epoch
+            || visual.active_resize != Some(active.interaction_id)
+        {
+            return false;
+        }
+        let promoted = if active.superseded_by_move {
+            false
+        } else if let Some(fallback_geometry) = fallback_geometry {
+            self.promote_x11_resize_geometry(handle, fallback_geometry, resize_epoch)
+        } else {
+            false
+        };
+        if self.x11_resize_interaction_active(handle) {
+            return promoted;
+        }
+        if fallback_geometry.is_some() && !active.superseded_by_move && !promoted {
+            return false;
+        }
+        if fallback_geometry.is_none() && !active.superseded_by_move {
+            let canonical = self
+                .window_id_for_x11_handle(handle)
+                .and_then(|window_id| self.window(window_id))
+                .and_then(|window| window.x11_geometry)
+                .map(|geometry| geometry.frame);
+            if let Some(canonical) = canonical {
+                self.retire_x11_resize_preview_to_geometry(surface_id, canonical);
+                resize_debug_log(|| {
+                    format!(
+                        "event=xwayland_resize_final_retired xid={} resize_epoch={} promoted=false reason=timeout_without_fallback_reverted_to_canonical",
+                        handle.xid(),
+                        resize_epoch,
+                    )
+                });
+                return true;
+            }
+        }
+        self.retire_x11_resize_preview(surface_id, visual);
+        resize_debug_log(|| {
+            format!(
+                "event=xwayland_resize_final_retired xid={} resize_epoch={} promoted={} reason=timeout_fallback",
+                handle.xid(),
+                resize_epoch,
+                promoted,
+            )
+        });
+        true
+    }
+
+    fn x11_resize_state(
+        &self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> Option<(u32, ActiveToplevelResize, ToplevelVisualGeometry)> {
+        let surface_id = self
+            .window_id_for_x11_handle(handle)
+            .and_then(|window_id| self.window(window_id))
+            .map(|window| window.root_surface_id)?;
+        let active = self.active_toplevel_resizes.get(&surface_id).copied()?;
+        let visual = self.toplevel_visual_geometries.get(&surface_id).copied()?;
+        Some((surface_id, active, visual))
+    }
+
+    fn retire_x11_resize_preview(&mut self, surface_id: u32, visual: ToplevelVisualGeometry) {
+        self.retire_x11_resize_preview_to_geometry(surface_id, visual.window_geometry());
+    }
+
+    fn retire_x11_resize_preview_to_geometry(&mut self, surface_id: u32, geometry: WindowGeometry) {
+        self.active_toplevel_resizes.remove(&surface_id);
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id) {
+            visual.placement = geometry.placement;
+            visual.width = geometry.width;
+            visual.height = geometry.height;
+            visual.active_resize = None;
+        }
+        self.set_surface_placement_with_cause(
+            surface_id,
+            geometry.placement,
+            RenderGenerationCause::WindowResize,
+        );
+        self.update_pending_xwayland_visual_content(surface_id);
+        self.update_toplevel_visual_render_assignment(surface_id);
+    }
+}
+
+fn x11_geometry_matches_visual(
+    geometry: crate::xwayland::xwm::X11Geometry,
+    visual: WindowGeometry,
+) -> bool {
+    geometry.x == visual.placement.local_x
+        && geometry.y == visual.placement.local_y
+        && geometry.width == visual.width
+        && geometry.height == visual.height
 }
 
 pub(crate) fn derive_root_render_placement(

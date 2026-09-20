@@ -15,9 +15,20 @@ fn xwayland_resize_preview_survives_buffer_commit() {
         width: 640,
         height: 480,
     };
+    let handle = snapshot.handle;
     fixture
         .server
         .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let canonical_before = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry);
 
     let interaction_id = ResizeInteractionId::new(1);
     let preview_placement = SurfacePlacement::absolute_root_at(120, 100);
@@ -29,6 +40,24 @@ fn xwayland_resize_preview_survives_buffer_commit() {
         crate::compositor::ResizeEdges::new(false, false, true, false),
         interaction_id,
     ));
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .and_then(|window| window.x11_geometry),
+        canonical_before,
+        "pointer-owned preview must not promote canonical X11 geometry"
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id)
+            .map(|geometry| (geometry.width, geometry.height)),
+        Some((620, 480))
+    );
 
     let pending = fixture
         .server
@@ -65,6 +94,527 @@ fn xwayland_resize_preview_survives_buffer_commit() {
             .as_ref()
             .map(|clip| clip.x() + i32::try_from(clip.width()).unwrap()),
         Some(740)
+    );
+}
+
+#[test]
+fn intermediate_resize_presentation_promotes_canonical_geometry_without_rewinding_preview() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let interaction_id = ResizeInteractionId::new(6);
+    let latest_visual = WindowGeometry::new(SurfacePlacement::absolute_root_at(160, 100), 580, 480);
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        latest_visual.width,
+        latest_visual.height,
+        latest_visual.placement,
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        interaction_id,
+    ));
+
+    let commands =
+        fixture
+            .server
+            .apply_xwayland_window_event(XwmEvent::ResizeSyncPresentedIntermediate {
+                window: handle,
+                transaction_id: 1,
+                resize_epoch: Some(interaction_id.get()),
+                geometry: X11Geometry {
+                    x: 120,
+                    y: 100,
+                    width: 620,
+                    height: 480,
+                },
+            });
+
+    assert_eq!(commands, vec![XwmCommand::CompleteResizeSync(handle)]);
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(X11Geometry {
+            x: 120,
+            y: 100,
+            width: 620,
+            height: 480,
+        })
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(latest_visual)
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        Some(interaction_id)
+    );
+    assert!(fixture.server.state.x11_resize_active(handle));
+}
+
+#[test]
+fn immediate_resize_progress_promotes_canonical_geometry_and_keeps_preview_active() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let interaction_id = ResizeInteractionId::new(7);
+    let latest_visual = WindowGeometry::new(SurfacePlacement::absolute_root_at(140, 100), 600, 480);
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        latest_visual.width,
+        latest_visual.height,
+        latest_visual.placement,
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        interaction_id,
+    ));
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncImmediate {
+            window: handle,
+            resize_epoch: Some(interaction_id.get()),
+            geometry: X11Geometry {
+                x: 120,
+                y: 100,
+                width: 620,
+                height: 480,
+            },
+            final_pending: false,
+        });
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(X11Geometry {
+            x: 120,
+            y: 100,
+            width: 620,
+            height: 480,
+        })
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(latest_visual)
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        Some(interaction_id)
+    );
+}
+
+#[test]
+fn immediate_final_resize_progress_converges_and_retires_the_preview() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let interaction_id = ResizeInteractionId::new(8);
+    let final_geometry = X11Geometry {
+        x: 120,
+        y: 100,
+        width: 620,
+        height: 480,
+    };
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        final_geometry.width,
+        final_geometry.height,
+        SurfacePlacement::absolute_root_at(final_geometry.x, final_geometry.y),
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        interaction_id,
+    ));
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncImmediate {
+            window: handle,
+            resize_epoch: Some(interaction_id.get()),
+            geometry: final_geometry,
+            final_pending: true,
+        });
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(final_geometry)
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        None
+    );
+    assert!(!fixture.server.state.x11_resize_active(handle));
+}
+
+#[test]
+fn timeout_fallback_promotes_geometry_and_retires_after_resize_interaction_ends() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let interaction_id = ResizeInteractionId::new(9);
+    let fallback_geometry = X11Geometry {
+        x: 120,
+        y: 100,
+        width: 620,
+        height: 480,
+    };
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        fallback_geometry.width,
+        fallback_geometry.height,
+        SurfacePlacement::absolute_root_at(fallback_geometry.x, fallback_geometry.y),
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        interaction_id,
+    ));
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncTimedOut {
+            window: handle,
+            fallback_geometry: Some(fallback_geometry),
+            resize_epoch: Some(interaction_id.get()),
+            has_followup: false,
+        });
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(fallback_geometry)
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        None
+    );
+    assert!(!fixture.server.state.x11_resize_active(handle));
+}
+
+#[test]
+fn timeout_with_coalesced_followup_promotes_latest_geometry_but_keeps_live_preview() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let edges = crate::compositor::ResizeEdges::new(false, false, false, true);
+    assert!(fixture.server.state.begin_window_interaction_for_root(
+        crate::compositor::BeginWindowInteraction::for_test(
+            Some(window_id),
+            fixture.surface_id,
+            0.0,
+            0.0,
+            WindowInteractionKind::Resize(edges),
+            WindowInteractionSource::NativeBinding,
+            Some(fixture.surface_id),
+        )
+    ));
+    assert!(fixture.server.state.update_window_interaction(40.0, 0.0));
+    assert!(
+        fixture
+            .server
+            .state
+            .flush_pending_floating_interaction_geometry()
+    );
+    let visual = fixture
+        .server
+        .state
+        .current_visual_root_window_geometry(fixture.surface_id)
+        .expect("live resize preview");
+    let resize_epoch = fixture
+        .server
+        .state
+        .x11_resize_interaction_epoch(handle)
+        .expect("active X11 resize epoch");
+    let latest_geometry = X11Geometry {
+        x: visual.placement.local_x,
+        y: visual.placement.local_y,
+        width: visual.width,
+        height: visual.height,
+    };
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncTimedOut {
+            window: handle,
+            fallback_geometry: Some(latest_geometry),
+            resize_epoch: Some(resize_epoch),
+            has_followup: true,
+        });
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(latest_geometry)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(visual)
+    );
+    assert!(fixture.server.state.x11_resize_active(handle));
+}
+
+#[test]
+fn timeout_without_fallback_reverts_ended_preview_to_canonical_geometry() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let canonical_before = fixture
+        .server
+        .state
+        .x11_authoritative_geometry(handle)
+        .expect("canonical X11 geometry");
+    let canonical_frame = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry)
+        .expect("canonical X11 frame geometry")
+        .frame;
+
+    let interaction_id = ResizeInteractionId::new(79);
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        580,
+        480,
+        SurfacePlacement::absolute_root_at(160, 100),
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        interaction_id,
+    ));
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncTimedOut {
+            window: handle,
+            fallback_geometry: None,
+            resize_epoch: Some(interaction_id.get()),
+            has_followup: false,
+        });
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(canonical_before)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(canonical_frame)
+    );
+    assert!(!fixture.server.state.x11_resize_active(handle));
+}
+
+#[test]
+fn rapid_resize_promotes_presented_geometry_then_converges_to_latest_pointer_target() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let interaction_id = ResizeInteractionId::new(18);
+    let edges = crate::compositor::ResizeEdges::new(false, false, true, false);
+    let pointer_targets = [
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(120, 100), 620, 480),
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(140, 100), 600, 480),
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(160, 100), 580, 480),
+    ];
+    for target in pointer_targets {
+        assert!(fixture.server.state.preview_resize_root_window_to(
+            fixture.surface_id,
+            target.width,
+            target.height,
+            target.placement,
+            edges,
+            interaction_id,
+        ));
+    }
+
+    let intermediate = X11Geometry {
+        x: pointer_targets[0].placement.local_x,
+        y: pointer_targets[0].placement.local_y,
+        width: pointer_targets[0].width,
+        height: pointer_targets[0].height,
+    };
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncPresentedIntermediate {
+            window: handle,
+            transaction_id: 1,
+            resize_epoch: Some(interaction_id.get()),
+            geometry: intermediate,
+        });
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(intermediate)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(pointer_targets[2])
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        Some(interaction_id)
+    );
+
+    let final_geometry = X11Geometry {
+        x: pointer_targets[2].placement.local_x,
+        y: pointer_targets[2].placement.local_y,
+        width: pointer_targets[2].width,
+        height: pointer_targets[2].height,
+    };
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
+            window: handle,
+            transaction_id: 2,
+            resize_epoch: Some(interaction_id.get()),
+            geometry: final_geometry,
+        });
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(final_geometry)
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        None
+    );
+}
+
+#[test]
+fn stale_final_with_matching_dimensions_cannot_retire_a_new_resize_epoch() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let geometry = WindowGeometry::new(SurfacePlacement::absolute_root_at(120, 100), 620, 480);
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        geometry.width,
+        geometry.height,
+        geometry.placement,
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        ResizeInteractionId::new(19),
+    ));
+    assert!(fixture.server.state.preview_resize_root_window_to(
+        fixture.surface_id,
+        geometry.width,
+        geometry.height,
+        geometry.placement,
+        crate::compositor::ResizeEdges::new(false, false, true, false),
+        ResizeInteractionId::new(20),
+    ));
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
+            window: handle,
+            transaction_id: 1,
+            resize_epoch: Some(19),
+            geometry: X11Geometry {
+                x: geometry.placement.local_x,
+                y: geometry.placement.local_y,
+                width: geometry.width,
+                height: geometry.height,
+            },
+        });
+
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        Some(ResizeInteractionId::new(20))
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(geometry)
     );
 }
 
@@ -413,6 +963,7 @@ fn xwayland_final_resize_keeps_backing_until_matching_content_commit() {
         .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
             window: handle,
             transaction_id: 1,
+            resize_epoch: Some(interaction_id.get()),
             geometry: X11Geometry {
                 x: 120,
                 y: 100,
@@ -420,6 +971,15 @@ fn xwayland_final_resize_keeps_backing_until_matching_content_commit() {
                 height: 480,
             },
         });
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(X11Geometry {
+            x: 120,
+            y: 100,
+            width: 620,
+            height: 480,
+        })
+    );
     assert_eq!(
         fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
         None
@@ -891,6 +1451,7 @@ fn late_resize_presentation_cannot_retire_newer_resize_epoch() {
         .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
             window: handle,
             transaction_id: 1,
+            resize_epoch: Some(10),
             geometry: X11Geometry {
                 x: 120,
                 y: 100,
@@ -1106,6 +1667,11 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         sealed.placement,
         "release must seal authoritative placement before client presentation"
     );
+    let resize_epoch = fixture
+        .server
+        .state
+        .x11_resize_interaction_epoch(handle)
+        .expect("released resize epoch stays associated with its preview");
 
     assert!(
         fixture.server.state.begin_window_interaction_for_root(
@@ -1134,7 +1700,30 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         expected_move
     );
 
-    assert!(fixture.server.state.finalize_x11_resize(handle));
+    let canonical_after_move = fixture
+        .server
+        .state
+        .x11_authoritative_geometry(handle)
+        .expect("moved canonical X11 geometry");
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
+            window: handle,
+            transaction_id: 1,
+            resize_epoch: Some(resize_epoch),
+            geometry: X11Geometry {
+                x: sealed.placement.local_x,
+                y: sealed.placement.local_y,
+                width: sealed.width,
+                height: sealed.height,
+            },
+        });
+    assert_eq!(commands, vec![XwmCommand::CompleteResizeSync(handle)]);
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(canonical_after_move),
+        "late resize progress must not overwrite a newer move"
+    );
     assert_eq!(
         fixture.server.state.surface_placement(fixture.surface_id),
         expected_move,
@@ -1148,5 +1737,9 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
             .expect("current visual geometry")
             .placement,
         expected_move
+    );
+    assert_eq!(
+        fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
+        None
     );
 }

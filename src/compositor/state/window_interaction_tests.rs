@@ -1500,6 +1500,7 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
             flow_sequence: 1,
             edges: ResizeEdges::BOTTOM_RIGHT,
             activated_at: Instant::now(),
+            superseded_by_move: false,
         },
     );
     state.update_toplevel_visual_render_assignment(surface_id);
@@ -1576,6 +1577,7 @@ fn active_x11_resize_keeps_stale_surface_at_committed_size() {
             flow_sequence: 1,
             edges: ResizeEdges::BOTTOM_RIGHT,
             activated_at: Instant::now(),
+            superseded_by_move: false,
         },
     );
 
@@ -1619,6 +1621,7 @@ fn finished_x11_resize_keeps_stale_surface_at_one_to_one() {
             flow_sequence: 1,
             edges: ResizeEdges::BOTTOM_RIGHT,
             activated_at: Instant::now(),
+            superseded_by_move: false,
         },
     );
     assert!(state.set_x11_geometry(

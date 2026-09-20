@@ -754,6 +754,11 @@ impl CompositorState {
         );
         self.pending_window_interaction_pointer = None;
         self.pending_floating_resize = None;
+        if matches!(kind, WindowInteractionKind::Move)
+            && let Some(active_resize) = self.active_toplevel_resizes.get_mut(&root_surface_id)
+        {
+            active_resize.superseded_by_move = true;
+        }
         self.window_interaction = Some(WindowInteraction {
             id,
             window_id,

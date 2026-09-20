@@ -281,9 +281,10 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             fields,
             source,
             border_width,
+            resize_epoch,
         } => {
             if (fields.width || fields.height || fields.border_width)
-                && queue_resize_desired(xwm, window, geometry, true)?
+                && queue_resize_desired(xwm, window, geometry, true, resize_epoch)?
             {
                 return Ok(command_outcome(pruned_handles));
             }
@@ -316,7 +317,12 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             {
                 xwm.last_resize_geometries.remove(&window);
                 xwm.outgoing_events
-                    .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
+                    .push_back(XwmEvent::ResizeSyncImmediate {
+                        window,
+                        resize_epoch,
+                        geometry,
+                        final_pending: false,
+                    });
             }
         }
         XwmCommand::ConfigureFrame {
@@ -564,6 +570,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             counter_value,
             deadline_ns,
             final_pending,
+            resize_epoch,
         } => {
             trace::emit("resize_begin_commanded", || {
                 TraceFields::new()
@@ -573,14 +580,16 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                     .field("deadline_ns", deadline_ns)
                     .field("allow_commits", false)
                     .field("final_pending", final_pending)
+                    .optional("resize_epoch", resize_epoch)
             });
-            begin_resize_sync(
+            begin_resize_sync_for_epoch(
                 xwm,
                 window,
                 geometry,
                 counter_value,
                 deadline_ns,
                 final_pending,
+                resize_epoch,
             )?
         }
         XwmCommand::SetAllowCommits { window, allowed } => {
@@ -818,12 +827,19 @@ pub(crate) fn configure_immediate(
     window: super::X11WindowHandle,
     geometry: X11Geometry,
     final_pending: bool,
+    resize_epoch: Option<u64>,
+    report_progress: bool,
 ) -> Result<(), XwmError> {
     if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
         if final_pending {
             xwm.immediate_resize_windows.remove(&window);
             xwm.outgoing_events
-                .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
+                .push_back(XwmEvent::ResizeSyncImmediate {
+                    window,
+                    resize_epoch,
+                    geometry,
+                    final_pending: true,
+                });
         }
         return Ok(());
     }
@@ -836,10 +852,17 @@ pub(crate) fn configure_immediate(
         .map_err(XwmError::Connection)?;
     if final_pending {
         xwm.immediate_resize_windows.remove(&window);
-        xwm.outgoing_events
-            .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
     } else {
         xwm.immediate_resize_windows.insert(window);
+    }
+    if report_progress || final_pending {
+        xwm.outgoing_events
+            .push_back(XwmEvent::ResizeSyncImmediate {
+                window,
+                resize_epoch,
+                geometry,
+                final_pending,
+            });
     }
     xwm.last_resize_geometries.insert(window, geometry);
     let configure_cookie_sequence = Some(cookie.sequence_number());
@@ -854,6 +877,7 @@ pub(crate) fn configure_immediate(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn begin_resize_sync(
     xwm: &mut Xwm,
     window: super::X11WindowHandle,
@@ -861,6 +885,26 @@ pub(crate) fn begin_resize_sync(
     counter_value: u64,
     deadline_ns: u64,
     final_pending: bool,
+) -> Result<(), XwmError> {
+    begin_resize_sync_for_epoch(
+        xwm,
+        window,
+        geometry,
+        counter_value,
+        deadline_ns,
+        final_pending,
+        None,
+    )
+}
+
+pub(crate) fn begin_resize_sync_for_epoch(
+    xwm: &mut Xwm,
+    window: super::X11WindowHandle,
+    geometry: X11Geometry,
+    counter_value: u64,
+    deadline_ns: u64,
+    final_pending: bool,
+    resize_epoch: Option<u64>,
 ) -> Result<(), XwmError> {
     xwm.fallback_resize_windows.remove(&window);
     let Some(sync_counter) = xwm
@@ -870,18 +914,18 @@ pub(crate) fn begin_resize_sync(
         .filter(|snapshot| snapshot.supports_sync_request)
         .and_then(|snapshot| snapshot.sync_counter)
     else {
-        return configure_immediate(xwm, window, geometry, final_pending);
+        return configure_immediate(xwm, window, geometry, final_pending, resize_epoch, true);
     };
     if !xwm.capabilities.sync {
-        return configure_immediate(xwm, window, geometry, final_pending);
+        return configure_immediate(xwm, window, geometry, final_pending, resize_epoch, true);
     }
     if xwm.resize_sync.sync_disabled(window) {
-        return configure_immediate(xwm, window, geometry, final_pending);
+        return configure_immediate(xwm, window, geometry, final_pending, resize_epoch, true);
     }
     if xwm.resize_sync.is_pending(window) {
         if xwm
             .resize_sync
-            .queue_desired(window, geometry, final_pending)
+            .queue_desired_for_epoch(window, geometry, final_pending, resize_epoch)
         {
             log_resize_event(
                 if final_pending {
@@ -900,7 +944,12 @@ pub(crate) fn begin_resize_sync(
     if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
         if final_pending {
             xwm.outgoing_events
-                .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
+                .push_back(XwmEvent::ResizeSyncImmediate {
+                    window,
+                    resize_epoch,
+                    geometry,
+                    final_pending: true,
+                });
         }
         return Ok(());
     }
@@ -934,12 +983,13 @@ pub(crate) fn begin_resize_sync(
                 .events(1u32),
         )
         .map_err(XwmError::Connection)?;
-    if let Err(error) = xwm.resize_sync.begin_transaction(
+    if let Err(error) = xwm.resize_sync.begin_transaction_for_epoch(
         window,
         requested_counter_value,
         deadline_ns,
         desired,
         final_pending,
+        resize_epoch,
     ) {
         let _ = xwm.connection.sync_destroy_alarm(alarm);
         return Err(XwmError::ResizeSync(error));
@@ -1069,13 +1119,14 @@ fn queue_resize_desired(
     window: super::X11WindowHandle,
     geometry: X11Geometry,
     final_pending: bool,
+    resize_epoch: Option<u64>,
 ) -> Result<bool, XwmError> {
     if !xwm.resize_sync.is_pending(window) {
         return Ok(false);
     }
     if xwm
         .resize_sync
-        .queue_desired(window, geometry, final_pending)
+        .queue_desired_for_epoch(window, geometry, final_pending, resize_epoch)
     {
         log_resize_event(
             if final_pending {

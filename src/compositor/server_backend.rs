@@ -143,6 +143,7 @@ impl OwnCompositorServer {
                         height: geometry.height,
                     };
                     let position_only = !resizing && self.state.x11_resize_active(handle);
+                    let resize_epoch = self.state.x11_resize_interaction_epoch(handle);
                     if resizing {
                         Some(XwmCommand::BeginResizeSync {
                             window: handle,
@@ -150,6 +151,7 @@ impl OwnCompositorServer {
                             counter_value: 0,
                             deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                             final_pending: false,
+                            resize_epoch,
                         })
                     } else if position_only {
                         Some(XwmCommand::Configure {
@@ -162,6 +164,7 @@ impl OwnCompositorServer {
                             },
                             source: ConfigureSource::Compositor,
                             border_width: 0,
+                            resize_epoch,
                         })
                     } else {
                         Some(XwmCommand::ConfigureFrame {
@@ -191,6 +194,7 @@ impl OwnCompositorServer {
                         counter_value: 0,
                         deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                         final_pending: true,
+                        resize_epoch: self.state.x11_resize_interaction_epoch(handle),
                     })
                 }
                 crate::compositor::window_backend::WindowBackendCommand::Close { window } => {

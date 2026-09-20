@@ -315,6 +315,7 @@ mod tests {
                 flow_sequence: 1,
                 edges: ResizeEdges::BOTTOM_RIGHT,
                 activated_at: Instant::now(),
+                superseded_by_move: false,
             },
         );
         let desired = PendingResizeConfigure {

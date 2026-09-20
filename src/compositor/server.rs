@@ -756,6 +756,8 @@ impl OwnCompositorServer {
             }
             XwmEvent::ConfigureRequested { window, request } => {
                 if self.state.x11_resize_active(window) {
+                    // Replies during resize use canonical applied geometry. The newer pointer
+                    // target stays visual-only until the XWM reports resize progress.
                     let mut commands = Vec::with_capacity(2);
                     if let Some(mode) = request.stack_mode
                         && self
@@ -821,6 +823,7 @@ impl OwnCompositorServer {
                     fields: request.fields,
                     source: ConfigureSource::ClientRequest,
                     border_width,
+                    resize_epoch: None,
                 }];
                 if let Some(mode) = request.stack_mode
                     && self
@@ -993,11 +996,12 @@ impl OwnCompositorServer {
             XwmEvent::ResizeSyncPresented {
                 window,
                 transaction_id,
+                resize_epoch,
                 geometry,
             } => {
-                let accepted = self
-                    .state
-                    .finalize_x11_resize_with_geometry(window, Some(geometry));
+                let accepted =
+                    self.state
+                        .finalize_x11_resize_for_epoch(window, geometry, resize_epoch);
                 trace::emit("xwayland_resize_presentation", || {
                     TraceFields::new()
                         .field("source", "compositor")
@@ -1010,29 +1014,63 @@ impl OwnCompositorServer {
                             if accepted {
                                 "current_content_epoch"
                             } else {
-                                "older_content_epoch"
+                                "stale_or_unowned_content_epoch"
                             },
                         )
                 });
                 vec![XwmCommand::CompleteResizeSync(window)]
             }
-            XwmEvent::ResizeSyncPresentedIntermediate { window, .. } => {
+            XwmEvent::ResizeSyncPresentedIntermediate {
+                window,
+                transaction_id,
+                resize_epoch,
+                geometry,
+            } => {
+                let accepted = resize_epoch.is_some_and(|resize_epoch| {
+                    self.state
+                        .promote_x11_resize_geometry(window, geometry, resize_epoch)
+                });
+                trace::emit("xwayland_resize_intermediate_promoted", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("transaction_id", transaction_id)
+                        .optional("resize_epoch", resize_epoch)
+                        .field("geometry", format!("{geometry:?}"))
+                        .field("canonical_promoted", accepted)
+                        .field("preview_kept", true)
+                });
                 vec![XwmCommand::CompleteResizeSync(window)]
             }
-            XwmEvent::ResizeSyncImmediate { window, geometry } => {
-                let accepted = self
-                    .state
-                    .finalize_x11_resize_with_geometry(window, Some(geometry));
+            XwmEvent::ResizeSyncImmediate {
+                window,
+                resize_epoch,
+                geometry,
+                final_pending,
+            } => {
+                let accepted = if final_pending {
+                    self.state
+                        .finalize_x11_resize_for_epoch(window, geometry, resize_epoch)
+                } else {
+                    resize_epoch.is_some_and(|resize_epoch| {
+                        self.state
+                            .promote_x11_resize_geometry(window, geometry, resize_epoch)
+                    })
+                };
                 trace::emit("xwayland_resize_presentation", || {
                     TraceFields::new()
                         .field("source", "compositor")
                         .field("xid", window.xid())
                         .field("transaction_id", 0)
+                        .optional("resize_epoch", resize_epoch)
+                        .field("final_pending", final_pending)
                         .field("geometry", format!("{geometry:?}"))
-                        .field("accepted", accepted)
+                        .field("canonical_promoted", accepted)
                         .field(
                             "reason",
-                            if accepted {
+                            if accepted && final_pending {
+                                "immediate_final_content_epoch"
+                            } else if accepted {
                                 "immediate_content_epoch"
                             } else {
                                 "older_content_epoch"
@@ -1041,9 +1079,29 @@ impl OwnCompositorServer {
                 });
                 Vec::new()
             }
-            XwmEvent::ResizeSyncTimedOut(window)
-            | XwmEvent::ResizeSyncTimedOutWithFollowup(window) => {
-                let _ = self.state.finalize_x11_resize_if_interaction_ended(window);
+            XwmEvent::ResizeSyncTimedOut {
+                window,
+                fallback_geometry,
+                resize_epoch,
+                has_followup,
+            } => {
+                let accepted = self.state.finalize_x11_resize_timeout_for_epoch(
+                    window,
+                    fallback_geometry,
+                    resize_epoch,
+                );
+                trace::emit("xwayland_resize_timeout_fallback", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .optional("resize_epoch", resize_epoch)
+                        .optional(
+                            "fallback_geometry",
+                            fallback_geometry.map(|geometry| format!("{geometry:?}")),
+                        )
+                        .field("has_followup", has_followup)
+                        .field("canonical_promoted_or_retired", accepted)
+                });
                 Vec::new()
             }
             XwmEvent::CloseRequestedByClient(window) => {
