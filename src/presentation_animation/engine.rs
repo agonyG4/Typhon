@@ -9,12 +9,14 @@ use std::{
 use crate::core::{OutputId, SceneNodeId};
 
 use super::{
-    AnimationCurve, AnimationTime, PresentationGroupOpacity, PresentationGroupTransform,
-    PresentationOpacity, PresentationOpacityTransitionEvidence, PresentationPropertyKind,
-    PresentationRect, PresentationRevisionId, PresentationSampleTimeSource,
-    PresentationSceneSample, PresentationTransactionError, PresentationTransactionId,
-    PresentationTransactionMember, PresentationTransactionRecord, PresentationTransactionRequest,
-    PresentationVelocity, PresentationWindowSample, PresentationWindowTarget, PresentedGeometryAck,
+    AnimationCurve, AnimationTime, PresentationClip, PresentationClipRect,
+    PresentationClipTransitionEvidence, PresentationGeometryTransform, PresentationGroupClip,
+    PresentationGroupOpacity, PresentationGroupTransform, PresentationOpacity,
+    PresentationOpacityTransitionEvidence, PresentationPropertyKind, PresentationRect,
+    PresentationRevisionId, PresentationSampleTimeSource, PresentationSceneSample,
+    PresentationTransactionError, PresentationTransactionId, PresentationTransactionMember,
+    PresentationTransactionRecord, PresentationTransactionRequest, PresentationVelocity,
+    PresentationWindowSample, PresentationWindowTarget, PresentedClipAck, PresentedGeometryAck,
     PresentedOpacityAck,
 };
 
@@ -154,6 +156,9 @@ pub struct PresentationAnimationMetrics {
     pub opacity_starts: u64,
     pub opacity_retargets: u64,
     pub opacity_cancels: u64,
+    pub clip_starts: u64,
+    pub clip_retargets: u64,
+    pub clip_cancels: u64,
     pub active_tracks: u64,
     pub mathematical_settlements: u64,
     pub physical_revision_acks: u64,
@@ -183,6 +188,88 @@ struct OpacityTrack {
     preserve_start_velocity: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClipTrack {
+    scene_node_id: SceneNodeId,
+    transaction_id: PresentationTransactionId,
+    revision_id: PresentationRevisionId,
+    start: PresentationClip,
+    target: PresentationClip,
+    start_rect: PresentationClipRect,
+    target_rect: PresentationClipRect,
+    start_velocity: PresentationVelocity,
+    started_at: AnimationTime,
+    curve: AnimationCurve,
+    preserve_start_velocity: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PresentationClipSample {
+    clip: PresentationClip,
+    rect: PresentationClipRect,
+    velocity: PresentationVelocity,
+    mathematically_settled: bool,
+}
+
+impl ClipTrack {
+    fn sample(self, now: AnimationTime) -> PresentationClipSample {
+        if now <= self.started_at {
+            return PresentationClipSample {
+                clip: self.start,
+                rect: self.start_rect,
+                velocity: self.start_velocity,
+                mathematically_settled: false,
+            };
+        }
+        let elapsed = now.elapsed_seconds(self.started_at);
+        let starts = [
+            self.start_rect.x(),
+            self.start_rect.y(),
+            self.start_rect.width(),
+            self.start_rect.height(),
+        ];
+        let targets = [
+            self.target_rect.x(),
+            self.target_rect.y(),
+            self.target_rect.width(),
+            self.target_rect.height(),
+        ];
+        let mut values = [0.0; 4];
+        let mut velocities = [0.0; 4];
+        let mut settled = true;
+        for index in 0..4 {
+            let (raw, velocity, component_settled) = self.curve.sample_scalar(
+                starts[index],
+                targets[index],
+                self.start_velocity.component(index),
+                elapsed,
+                self.preserve_start_velocity,
+            );
+            let lower_bounded = index >= 2 && raw < 0.0;
+            values[index] = if lower_bounded { 0.0 } else { raw };
+            velocities[index] = if lower_bounded { 0.0 } else { velocity };
+            settled &= component_settled;
+        }
+        let rect = PresentationClipRect::new(values[0], values[1], values[2], values[3])
+            .expect("finite analytical Clip sample remains valid");
+        PresentationClipSample {
+            clip: if settled {
+                self.target
+            } else {
+                PresentationClip::Rect(rect)
+            },
+            rect,
+            velocity: PresentationVelocity::new(
+                velocities[0],
+                velocities[1],
+                velocities[2],
+                velocities[3],
+            ),
+            mathematically_settled: settled,
+        }
+    }
+}
+
 impl OpacityTrack {
     fn sample(self, now: AnimationTime) -> (PresentationOpacity, f64, bool) {
         let elapsed = now.elapsed_seconds(self.started_at);
@@ -208,6 +295,7 @@ pub struct PresentationEngine {
     enabled: bool,
     geometry_tracks: BTreeMap<SceneNodeId, GeometryTrack>,
     opacity_tracks: BTreeMap<SceneNodeId, OpacityTrack>,
+    clip_tracks: BTreeMap<SceneNodeId, ClipTrack>,
     transactions: BTreeMap<PresentationTransactionId, PresentationTransactionRecord>,
     next_transaction_id: NonZeroU64,
     next_revision_id: NonZeroU64,
@@ -255,6 +343,7 @@ impl PresentationEngine {
             enabled,
             geometry_tracks: BTreeMap::new(),
             opacity_tracks: BTreeMap::new(),
+            clip_tracks: BTreeMap::new(),
             transactions: BTreeMap::new(),
             next_transaction_id: NonZeroU64::MIN,
             next_revision_id: NonZeroU64::MIN,
@@ -280,8 +369,13 @@ impl PresentationEngine {
                 .metrics
                 .opacity_cancels
                 .saturating_add(self.opacity_tracks.len() as u64);
+            self.metrics.clip_cancels = self
+                .metrics
+                .clip_cancels
+                .saturating_add(self.clip_tracks.len() as u64);
             self.geometry_tracks.clear();
             self.opacity_tracks.clear();
+            self.clip_tracks.clear();
             self.transactions.clear();
         }
     }
@@ -297,11 +391,13 @@ impl PresentationEngine {
         if !self.enabled {
             return Err(PresentationTransactionError::Disabled);
         }
-        if request.geometry.is_empty() && request.opacity.is_empty() {
+        if request.geometry.is_empty() && request.opacity.is_empty() && request.clip.is_empty() {
             return Err(PresentationTransactionError::Empty);
         }
 
-        let mut seen = HashSet::with_capacity(request.geometry.len() + request.opacity.len());
+        let mut seen = HashSet::with_capacity(
+            request.geometry.len() + request.opacity.len() + request.clip.len(),
+        );
         let mut prepared_geometry = Vec::with_capacity(request.geometry.len());
         for mutation in request.geometry {
             let Some(scene_node_id) = mutation.scene_node_id() else {
@@ -369,12 +465,59 @@ impl PresentationEngine {
             });
         }
 
-        if prepared_geometry.is_empty() && prepared_opacity.is_empty() {
+        let mut prepared_clip = Vec::with_capacity(request.clip.len());
+        for mutation in request.clip {
+            let Some(scene_node_id) = mutation.scene_node_id() else {
+                return Err(PresentationTransactionError::MissingPresentationOwner);
+            };
+            if !seen.insert((scene_node_id, PresentationPropertyKind::Clip)) {
+                return Err(PresentationTransactionError::DuplicateProperty);
+            }
+            if !valid_clip(mutation.start) || !valid_clip(mutation.target) {
+                return Err(PresentationTransactionError::InvalidClip);
+            }
+            if mutation.start == mutation.target && !self.clip_tracks.contains_key(&scene_node_id) {
+                continue;
+            }
+            let (start, start_rect, start_velocity, preserve_start_velocity) =
+                if let Some(track) = self.clip_tracks.get(&scene_node_id).copied() {
+                    let sample = track.sample(request.started_at);
+                    if sample.mathematically_settled && sample.clip == mutation.target {
+                        continue;
+                    }
+                    (sample.clip, sample.rect, sample.velocity, true)
+                } else {
+                    let start_rect =
+                        resolve_clip_rect(mutation.start, mutation.frozen_identity_envelope)?;
+                    (
+                        mutation.start,
+                        start_rect,
+                        PresentationVelocity::default(),
+                        false,
+                    )
+                };
+            let target_rect =
+                resolve_clip_rect(mutation.target, mutation.frozen_identity_envelope)?;
+            prepared_clip.push(super::PreparedClipMutation {
+                scene_node_id,
+                start,
+                target: mutation.target,
+                start_rect,
+                target_rect,
+                start_velocity,
+                curve: mutation.curve,
+                preserve_start_velocity,
+            });
+        }
+
+        if prepared_geometry.is_empty() && prepared_opacity.is_empty() && prepared_clip.is_empty() {
             return Err(PresentationTransactionError::Empty);
         }
 
         let transaction_id = self.peek_transaction_id()?;
-        let member_count = prepared_geometry.len() + prepared_opacity.len();
+        let geometry_count = prepared_geometry.len();
+        let opacity_count = prepared_opacity.len();
+        let member_count = geometry_count + opacity_count + prepared_clip.len();
         let revision_ids = self.peek_revision_ids(member_count)?;
         let mut revision_ids_iter = revision_ids.iter().copied();
         let mut members = Vec::with_capacity(member_count);
@@ -390,6 +533,14 @@ impl PresentationEngine {
             members.push(PresentationTransactionMember::new(
                 mutation.scene_node_id,
                 PresentationPropertyKind::Opacity,
+                transaction_id,
+                revision_ids_iter.next().expect("revision count matches"),
+            ));
+        }
+        for mutation in &prepared_clip {
+            members.push(PresentationTransactionMember::new(
+                mutation.scene_node_id,
+                PresentationPropertyKind::Clip,
                 transaction_id,
                 revision_ids_iter.next().expect("revision count matches"),
             ));
@@ -450,15 +601,10 @@ impl PresentationEngine {
                 self.metrics.geometry_starts = self.metrics.geometry_starts.saturating_add(1);
             }
         }
-        for (mutation, revision_id) in prepared_opacity.into_iter().zip(
-            revision_ids.into_iter().skip(
-                record
-                    .members()
-                    .iter()
-                    .filter(|member| member.property() == PresentationPropertyKind::Geometry)
-                    .count(),
-            ),
-        ) {
+        for (mutation, revision_id) in prepared_opacity
+            .into_iter()
+            .zip(revision_ids.iter().copied().skip(geometry_count))
+        {
             if let Some(old) = self.opacity_tracks.get(&mutation.scene_node_id) {
                 self.remove_transaction_member(
                     old.transaction_id,
@@ -490,6 +636,47 @@ impl PresentationEngine {
                 self.metrics.transitions_started =
                     self.metrics.transitions_started.saturating_add(1);
                 self.metrics.opacity_starts = self.metrics.opacity_starts.saturating_add(1);
+            }
+        }
+        for (mutation, revision_id) in prepared_clip.into_iter().zip(
+            revision_ids
+                .iter()
+                .copied()
+                .skip(geometry_count + opacity_count),
+        ) {
+            if let Some(old) = self.clip_tracks.get(&mutation.scene_node_id) {
+                self.remove_transaction_member(
+                    old.transaction_id,
+                    mutation.scene_node_id,
+                    PresentationPropertyKind::Clip,
+                    old.revision_id,
+                );
+            }
+            let track = ClipTrack {
+                scene_node_id: mutation.scene_node_id,
+                transaction_id,
+                revision_id,
+                start: mutation.start,
+                target: mutation.target,
+                start_rect: mutation.start_rect,
+                target_rect: mutation.target_rect,
+                start_velocity: mutation.start_velocity,
+                started_at: request.started_at,
+                curve: mutation.curve,
+                preserve_start_velocity: mutation.preserve_start_velocity,
+            };
+            if self
+                .clip_tracks
+                .insert(mutation.scene_node_id, track)
+                .is_some()
+            {
+                self.metrics.transitions_retargeted =
+                    self.metrics.transitions_retargeted.saturating_add(1);
+                self.metrics.clip_retargets = self.metrics.clip_retargets.saturating_add(1);
+            } else {
+                self.metrics.transitions_started =
+                    self.metrics.transitions_started.saturating_add(1);
+                self.metrics.clip_starts = self.metrics.clip_starts.saturating_add(1);
             }
         }
         self.transactions.insert(transaction_id, record.clone());
@@ -532,18 +719,35 @@ impl PresentationEngine {
         self.metrics.active_tracks = self.active_count() as u64;
     }
 
+    pub(crate) fn cancel_clip(&mut self, scene_node_id: SceneNodeId) {
+        let Some(track) = self.clip_tracks.remove(&scene_node_id) else {
+            return;
+        };
+        self.remove_transaction_member(
+            track.transaction_id,
+            scene_node_id,
+            PresentationPropertyKind::Clip,
+            track.revision_id,
+        );
+        self.metrics.transitions_cancelled = self.metrics.transitions_cancelled.saturating_add(1);
+        self.metrics.clip_cancels = self.metrics.clip_cancels.saturating_add(1);
+        self.metrics.active_tracks = self.active_count() as u64;
+    }
+
     pub(crate) fn cancel_all(&mut self, scene_node_id: SceneNodeId) {
         self.cancel_geometry(scene_node_id);
         self.cancel_opacity(scene_node_id);
+        self.cancel_clip(scene_node_id);
     }
 
     pub fn active_count(&self) -> usize {
-        self.geometry_tracks.len() + self.opacity_tracks.len()
+        self.geometry_tracks.len() + self.opacity_tracks.len() + self.clip_tracks.len()
     }
 
     pub fn has_track(&self, scene_node_id: SceneNodeId) -> bool {
         self.geometry_tracks.contains_key(&scene_node_id)
             || self.opacity_tracks.contains_key(&scene_node_id)
+            || self.clip_tracks.contains_key(&scene_node_id)
     }
 
     pub fn has_geometry_track(&self, scene_node_id: SceneNodeId) -> bool {
@@ -554,10 +758,15 @@ impl PresentationEngine {
         self.opacity_tracks.contains_key(&scene_node_id)
     }
 
+    pub fn has_clip_track(&self, scene_node_id: SceneNodeId) -> bool {
+        self.clip_tracks.contains_key(&scene_node_id)
+    }
+
     pub fn has_pending_visible(&self, visible_scene_nodes: &[SceneNodeId]) -> bool {
         visible_scene_nodes.iter().any(|scene_node_id| {
             self.geometry_tracks.contains_key(scene_node_id)
                 || self.opacity_tracks.contains_key(scene_node_id)
+                || self.clip_tracks.contains_key(scene_node_id)
         })
     }
 
@@ -573,6 +782,12 @@ impl PresentationEngine {
             .any(|scene_node_id| self.opacity_tracks.contains_key(scene_node_id))
     }
 
+    pub fn has_pending_visible_clip(&self, visible_scene_nodes: &[SceneNodeId]) -> bool {
+        visible_scene_nodes
+            .iter()
+            .any(|scene_node_id| self.clip_tracks.contains_key(scene_node_id))
+    }
+
     pub fn sample(
         &self,
         output_id: OutputId,
@@ -583,6 +798,7 @@ impl PresentationEngine {
         let mut sampled = Vec::new();
         let mut transforms = Vec::new();
         let mut opacities = Vec::new();
+        let mut clips = Vec::new();
         let mut sample_metrics = self.sample_metrics.get();
         sample_metrics.frame_samples = sample_metrics.frame_samples.saturating_add(1);
         match time_source {
@@ -651,7 +867,51 @@ impl PresentationEngine {
                 ));
             }
         }
+        for target in targets {
+            let scene_node_id = target.window_group_scene_node_id();
+            let (clip, transition) =
+                if let Some(track) = self.clip_tracks.get(&scene_node_id).copied() {
+                    debug_assert_eq!(track.scene_node_id, scene_node_id);
+                    let sample = track.sample(target_presentation_time);
+                    if sample.mathematically_settled {
+                        sample_metrics.mathematical_settlements =
+                            sample_metrics.mathematical_settlements.saturating_add(1);
+                    }
+                    (
+                        sample.clip,
+                        Some(PresentationClipTransitionEvidence {
+                            transaction_id: track.transaction_id,
+                            revision_id: track.revision_id,
+                            mathematically_settled: sample.mathematically_settled,
+                        }),
+                    )
+                } else {
+                    (target.canonical_clip(), None)
+                };
+            if clip.is_unbounded() && transition.is_none() {
+                continue;
+            }
+            let presented_rect = transforms
+                .iter()
+                .find(|transform: &&PresentationGroupTransform| {
+                    transform.scene_node_id == scene_node_id
+                })
+                .map_or(target.canonical_rect(), |transform| {
+                    transform.presented_rect
+                });
+            let geometry =
+                PresentationGeometryTransform::new(target.canonical_rect(), presented_rect);
+            let presented_clip = clip.rect().and_then(|rect| geometry.map_clip_rect(rect));
+            clips.push(PresentationGroupClip::with_scene_node(
+                scene_node_id,
+                target.root_surface_id(),
+                clip,
+                presented_clip,
+                transition,
+            ));
+        }
         opacities.sort_unstable_by_key(|opacity| opacity.root_surface_id);
+        clips.sort_unstable_by_key(|clip| clip.root_surface_id);
         let sampled_windows = sampled.len();
         self.sampled_windows.set(
             self.sampled_windows
@@ -666,6 +926,7 @@ impl PresentationEngine {
             windows: sampled,
             transforms,
             opacities,
+            clips,
             active_transitions: self.active_count(),
             sampled_windows,
         }
@@ -746,6 +1007,46 @@ impl PresentationEngine {
             current.transaction_id,
             scene_node_id,
             PresentationPropertyKind::Opacity,
+            current.revision_id,
+        );
+        self.metrics.transitions_acknowledged =
+            self.metrics.transitions_acknowledged.saturating_add(1);
+        self.metrics.physical_revision_acks = self.metrics.physical_revision_acks.saturating_add(1);
+        self.metrics.active_tracks = self.active_count() as u64;
+        true
+    }
+
+    pub fn acknowledge_presented_clip(
+        &mut self,
+        expected_output_id: OutputId,
+        ack: PresentedClipAck,
+    ) -> bool {
+        if ack.output_id != expected_output_id {
+            self.metrics.wrong_output_acks = self.metrics.wrong_output_acks.saturating_add(1);
+            return false;
+        }
+        let scene_node_id = ack.scene_node_id;
+        let Some(current) = self.clip_tracks.get(&scene_node_id).copied() else {
+            return false;
+        };
+        let sample = current.sample(AnimationTime::from_nanos(u64::MAX));
+        if ack.property != PresentationPropertyKind::Clip
+            || current.revision_id != ack.revision_id
+            || current.transaction_id != ack.transaction_id
+            || !sample.mathematically_settled
+            || sample.clip != ack.presented_clip
+            || sample.clip != current.target
+        {
+            self.metrics.stale_acknowledgements =
+                self.metrics.stale_acknowledgements.saturating_add(1);
+            self.metrics.stale_revision_acks = self.metrics.stale_revision_acks.saturating_add(1);
+            return false;
+        }
+        self.clip_tracks.remove(&scene_node_id);
+        self.remove_transaction_member(
+            current.transaction_id,
+            scene_node_id,
+            PresentationPropertyKind::Clip,
             current.revision_id,
         );
         self.metrics.transitions_acknowledged =
@@ -840,6 +1141,38 @@ impl PresentationEngine {
         self.opacity_tracks
             .get(&scene_node_id)
             .map(|track| track.transaction_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clip_track_revision(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> Option<PresentationRevisionId> {
+        self.clip_tracks
+            .get(&scene_node_id)
+            .map(|track| track.revision_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clip_track_transaction(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> Option<PresentationTransactionId> {
+        self.clip_tracks
+            .get(&scene_node_id)
+            .map(|track| track.transaction_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sample_clip_for_scene_node(
+        &self,
+        scene_node_id: SceneNodeId,
+        now: AnimationTime,
+    ) -> Option<(PresentationClip, PresentationVelocity, bool)> {
+        self.clip_tracks.get(&scene_node_id).copied().map(|track| {
+            let sample = track.sample(now);
+            (sample.clip, sample.velocity, sample.mathematically_settled)
+        })
     }
 
     #[cfg(test)]
@@ -1013,6 +1346,23 @@ fn valid_rect(rect: PresentationRect) -> bool {
         && rect.height().is_finite()
         && rect.width() > 0.0
         && rect.height() > 0.0
+}
+
+fn valid_clip(clip: PresentationClip) -> bool {
+    clip.rect().is_none_or(PresentationClipRect::is_finite)
+}
+
+fn resolve_clip_rect(
+    clip: PresentationClip,
+    frozen_identity_envelope: Option<PresentationClipRect>,
+) -> Result<PresentationClipRect, PresentationTransactionError> {
+    match clip {
+        PresentationClip::Rect(rect) if rect.is_finite() => Ok(rect),
+        PresentationClip::Rect(_) => Err(PresentationTransactionError::InvalidClip),
+        PresentationClip::Unbounded => frozen_identity_envelope
+            .filter(|rect| rect.is_finite())
+            .ok_or(PresentationTransactionError::MissingClipEnvelope),
+    }
 }
 
 const fn synthetic_scene_node_id() -> SceneNodeId {

@@ -1,8 +1,9 @@
 use crate::core::SceneNodeId;
 
 use super::{
-    AnimationCurve, AnimationTime, PresentationOpacity, PresentationPropertyKind, PresentationRect,
-    PresentationRevisionId, PresentationTransactionId, PresentationVelocity,
+    AnimationCurve, AnimationTime, PresentationClip, PresentationClipRect, PresentationOpacity,
+    PresentationPropertyKind, PresentationRect, PresentationRevisionId, PresentationTransactionId,
+    PresentationVelocity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -19,6 +20,52 @@ pub struct PresentationOpacityMutation {
     pub start: PresentationOpacity,
     pub target: PresentationOpacity,
     pub curve: AnimationCurve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentationClipMutation {
+    scene_node_id: Option<SceneNodeId>,
+    pub start: PresentationClip,
+    pub target: PresentationClip,
+    pub frozen_identity_envelope: Option<PresentationClipRect>,
+    pub curve: AnimationCurve,
+}
+
+impl PresentationClipMutation {
+    pub const fn new(
+        scene_node_id: SceneNodeId,
+        start: PresentationClip,
+        target: PresentationClip,
+        frozen_identity_envelope: Option<PresentationClipRect>,
+        curve: AnimationCurve,
+    ) -> Self {
+        Self {
+            scene_node_id: Some(scene_node_id),
+            start,
+            target,
+            frozen_identity_envelope,
+            curve,
+        }
+    }
+
+    pub const fn without_owner(
+        start: PresentationClip,
+        target: PresentationClip,
+        frozen_identity_envelope: Option<PresentationClipRect>,
+        curve: AnimationCurve,
+    ) -> Self {
+        Self {
+            scene_node_id: None,
+            start,
+            target,
+            frozen_identity_envelope,
+            curve,
+        }
+    }
+
+    pub const fn scene_node_id(self) -> Option<SceneNodeId> {
+        self.scene_node_id
+    }
 }
 
 impl PresentationOpacityMutation {
@@ -92,6 +139,7 @@ pub struct PresentationTransactionRequest {
     pub started_at: AnimationTime,
     pub geometry: Vec<PresentationGeometryMutation>,
     pub opacity: Vec<PresentationOpacityMutation>,
+    pub clip: Vec<PresentationClipMutation>,
 }
 
 impl PresentationTransactionRequest {
@@ -103,6 +151,7 @@ impl PresentationTransactionRequest {
             started_at,
             geometry,
             opacity: Vec::new(),
+            clip: Vec::new(),
         }
     }
 
@@ -111,6 +160,35 @@ impl PresentationTransactionRequest {
             started_at,
             geometry: Vec::new(),
             opacity,
+            clip: Vec::new(),
+        }
+    }
+
+    pub fn clip(started_at: AnimationTime, clip: Vec<PresentationClipMutation>) -> Self {
+        Self {
+            started_at,
+            geometry: Vec::new(),
+            opacity: Vec::new(),
+            clip,
+        }
+    }
+
+    pub fn with_clip(mut self, clip: Vec<PresentationClipMutation>) -> Self {
+        self.clip = clip;
+        self
+    }
+
+    pub fn mixed_all(
+        started_at: AnimationTime,
+        geometry: Vec<PresentationGeometryMutation>,
+        opacity: Vec<PresentationOpacityMutation>,
+        clip: Vec<PresentationClipMutation>,
+    ) -> Self {
+        Self {
+            started_at,
+            geometry,
+            opacity,
+            clip,
         }
     }
 
@@ -123,6 +201,7 @@ impl PresentationTransactionRequest {
             started_at,
             geometry,
             opacity,
+            clip: Vec::new(),
         }
     }
 }
@@ -134,6 +213,8 @@ pub enum PresentationTransactionError {
     MissingPresentationOwner,
     DuplicateProperty,
     InvalidGeometry,
+    InvalidClip,
+    MissingClipEnvelope,
     TransactionIdExhausted,
     RevisionIdExhausted,
 }
@@ -242,6 +323,18 @@ pub(crate) struct PreparedOpacityMutation {
     pub start: PresentationOpacity,
     pub target: PresentationOpacity,
     pub start_velocity: f64,
+    pub curve: AnimationCurve,
+    pub preserve_start_velocity: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PreparedClipMutation {
+    pub scene_node_id: SceneNodeId,
+    pub start: PresentationClip,
+    pub target: PresentationClip,
+    pub start_rect: PresentationClipRect,
+    pub target_rect: PresentationClipRect,
+    pub start_velocity: PresentationVelocity,
     pub curve: AnimationCurve,
     pub preserve_start_velocity: bool,
 }

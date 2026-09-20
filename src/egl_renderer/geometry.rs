@@ -173,7 +173,12 @@ pub(super) fn plan_visibility(
             break;
         }
         let command = &commands[index];
-        if !remaining.intersects(command.bounds) {
+        let Some(visible_bounds) = command.visible_bounds() else {
+            decisions[index] = EglVisibilityDecision::OutsideRemaining;
+            stats.commands_rejected_outside_remaining += 1;
+            continue;
+        };
+        if !remaining.intersects(visible_bounds) {
             decisions[index] = EglVisibilityDecision::OutsideRemaining;
             stats.commands_rejected_outside_remaining += 1;
             continue;
@@ -185,8 +190,16 @@ pub(super) fn plan_visibility(
             continue;
         }
         for opaque_region in &command.opaque_regions {
+            let Some(opaque_region) = command
+                .presentation_clip
+                .map_or(Some(*opaque_region), |clip| {
+                    opaque_region.intersection(clip)
+                })
+            else {
+                continue;
+            };
             stats.opaque_rectangles_subtracted += 1;
-            if !remaining.subtract(*opaque_region) {
+            if !remaining.subtract(opaque_region) {
                 stats.overflow_fallback = true;
                 remaining.disable_occlusion(repair);
                 break;
@@ -212,6 +225,7 @@ pub(super) fn plan_capture_visibility(
     commands: &[EglDrawCommand],
     command_indices: &[usize],
     repair: EglRect,
+    unclipped_visual_groups: &[oblivion_one::compositor::VisualGroupId],
     decisions: &mut Vec<EglVisibilityDecision>,
 ) -> EglVisibilityPlanStats {
     decisions.clear();
@@ -222,7 +236,18 @@ pub(super) fn plan_capture_visibility(
             continue;
         };
         stats.commands_visited = stats.commands_visited.saturating_add(1);
-        if repair.intersection(command.bounds).is_none() {
+        let visible_bounds = if command
+            .visual_group
+            .is_some_and(|group| unclipped_visual_groups.contains(&group))
+        {
+            Some(command.bounds)
+        } else {
+            command.visible_bounds()
+        };
+        if visible_bounds
+            .and_then(|bounds| repair.intersection(bounds))
+            .is_none()
+        {
             stats.commands_rejected_outside_remaining =
                 stats.commands_rejected_outside_remaining.saturating_add(1);
             decisions[index] = EglVisibilityDecision::OutsideRemaining;
@@ -454,9 +479,17 @@ pub(super) struct EglDrawCommand {
     pub(super) visual_group: Option<oblivion_one::compositor::VisualGroupId>,
     pub(super) bounds: EglRect,
     pub(super) opaque_regions: Vec<EglRect>,
+    pub(super) presentation_clip: Option<EglRect>,
     pub(super) vertex_start: u32,
     pub(super) vertex_count: u32,
     pub(super) sampling: SurfaceSampling,
+}
+
+impl EglDrawCommand {
+    fn visible_bounds(&self) -> Option<EglRect> {
+        self.presentation_clip
+            .map_or(Some(self.bounds), |clip| self.bounds.intersection(clip))
+    }
 }
 
 #[repr(C)]
@@ -564,6 +597,7 @@ pub(super) fn push_draw_command_with_quad(
             visual_group: None,
             bounds: rect,
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start,
             vertex_count,
             sampling,
@@ -853,6 +887,7 @@ mod tests {
             visual_group: None,
             bounds,
             opaque_regions,
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ScaledLinear,
@@ -957,6 +992,7 @@ mod tests {
             &commands,
             &[0],
             EglRect::new(0.0, 0.0, 100.0, 100.0),
+            &[],
             &mut decisions,
         );
         assert_eq!(
@@ -970,6 +1006,60 @@ mod tests {
     }
 
     #[test]
+    fn presentation_clip_limits_visibility_and_opaque_occlusion() {
+        let lower = test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new());
+        let mut upper = test_command(
+            EglRect::new(0.0, 0.0, 100.0, 100.0),
+            vec![EglRect::new(0.0, 0.0, 100.0, 100.0)],
+        );
+        upper.presentation_clip = Some(EglRect::new(0.0, 0.0, 50.0, 100.0));
+        let mut decisions = Vec::new();
+
+        plan_visibility(
+            &[lower, upper],
+            EglRect::new(0.0, 0.0, 100.0, 100.0),
+            &mut decisions,
+        );
+
+        assert_eq!(decisions[0], EglVisibilityDecision::Drawable);
+        assert_eq!(decisions[1], EglVisibilityDecision::Drawable);
+    }
+
+    #[test]
+    fn same_owner_capture_bypasses_only_that_owners_final_clip() {
+        let same_owner = oblivion_one::compositor::VisualGroupId::new(1).expect("group");
+        let other_owner = oblivion_one::compositor::VisualGroupId::new(2).expect("group");
+        let mut own = test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new());
+        own.visual_group = Some(same_owner);
+        own.presentation_clip = Some(EglRect::new(0.0, 0.0, 50.0, 100.0));
+        let mut other = test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new());
+        other.visual_group = Some(other_owner);
+        other.presentation_clip = Some(EglRect::new(0.0, 0.0, 50.0, 100.0));
+        let mut decisions = Vec::new();
+
+        plan_capture_visibility(
+            &[own, other],
+            &[0, 1],
+            EglRect::new(60.0, 0.0, 10.0, 10.0),
+            &[same_owner],
+            &mut decisions,
+        );
+
+        assert_eq!(decisions[0], EglVisibilityDecision::Drawable);
+        assert_eq!(decisions[1], EglVisibilityDecision::OutsideRemaining);
+    }
+
+    #[test]
+    fn surface_consumer_planner_discards_zero_area_clips() {
+        let mut hidden = test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new());
+        hidden.layer = EglDrawLayer::Surface(9);
+        hidden.presentation_clip = Some(EglRect::new(10.0, 10.0, 0.0, 20.0));
+        let plan = plan_surface_consumers(&[hidden], &[OutputRect::new(0, 0, 100, 100)]);
+
+        assert!(plan.surface_ids().is_empty());
+    }
+
+    #[test]
     fn surface_consumer_plan_excludes_occluded_and_outside_surfaces() {
         let commands = vec![
             EglDrawCommand {
@@ -977,6 +1067,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,
@@ -986,6 +1077,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
                 opaque_regions: vec![EglRect::new(0.0, 0.0, 100.0, 100.0)],
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,
@@ -995,6 +1087,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(200.0, 0.0, 10.0, 10.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,
@@ -1014,6 +1107,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,
@@ -1023,6 +1117,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 50.0, 100.0),
                 opaque_regions: vec![EglRect::new(0.0, 0.0, 50.0, 100.0)],
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,
@@ -1053,6 +1148,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,
@@ -1062,6 +1158,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
                 opaque_regions,
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ScaledLinear,

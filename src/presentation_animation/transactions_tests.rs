@@ -7,6 +7,20 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
     PresentationRect::new(x, y, width, height).expect("valid presentation rect")
 }
 
+fn clip_rect(x: f64, y: f64, width: f64, height: f64) -> PresentationClipRect {
+    PresentationClipRect::new(x, y, width, height).expect("valid presentation clip rect")
+}
+
+fn clip_mutation(
+    scene_node_id: SceneNodeId,
+    start: PresentationClip,
+    target: PresentationClip,
+    envelope: Option<PresentationClipRect>,
+    curve: AnimationCurve,
+) -> PresentationClipMutation {
+    PresentationClipMutation::new(scene_node_id, start, target, envelope, curve)
+}
+
 fn node(raw: u64) -> SceneNodeId {
     SceneNodeId::from_raw(raw).expect("nonzero scene node")
 }
@@ -53,6 +67,23 @@ fn opacity_ack(
     }
 }
 
+fn clip_ack(
+    output_id: OutputId,
+    scene_node_id: SceneNodeId,
+    transaction_id: PresentationTransactionId,
+    revision_id: PresentationRevisionId,
+    presented_clip: PresentationClip,
+) -> PresentedClipAck {
+    PresentedClipAck {
+        output_id,
+        scene_node_id,
+        property: PresentationPropertyKind::Clip,
+        transaction_id,
+        revision_id,
+        presented_clip,
+    }
+}
+
 #[test]
 fn opacity_transaction_uses_exact_revision_and_sample_evidence() {
     let mut engine = PresentationEngine::enabled();
@@ -84,6 +115,286 @@ fn opacity_transaction_uses_exact_revision_and_sample_evidence() {
         opacity.opacity,
         PresentationOpacity::new(0.75).expect("opacity")
     );
+}
+
+#[test]
+fn clip_transaction_projects_with_geometry_sample_from_same_timestamp() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(119);
+    let curve = AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear);
+    let start_clip = PresentationClip::Rect(clip_rect(10.0, 5.0, 20.0, 10.0));
+    let target_clip = PresentationClip::Rect(clip_rect(30.0, 20.0, 60.0, 20.0));
+    let transaction = engine
+        .commit(PresentationTransactionRequest::mixed_all(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(100.0, 100.0, 100.0, 100.0),
+                rect(200.0, 150.0, 200.0, 300.0),
+                curve,
+            )],
+            Vec::new(),
+            vec![clip_mutation(
+                scene_node_id,
+                start_clip,
+                target_clip,
+                None,
+                curve,
+            )],
+        ))
+        .expect("geometry and clip transaction");
+    assert_eq!(transaction.members().len(), 2);
+    assert_ne!(
+        transaction.members()[0].revision_id(),
+        transaction.members()[1].revision_id()
+    );
+
+    let frame = engine.sample(
+        OutputId::from_raw(1).expect("output"),
+        AnimationTime::from_nanos(5_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(scene_node_id, 119, rect(100.0, 100.0, 100.0, 100.0))],
+    );
+    assert_eq!(
+        frame.clips[0].clip,
+        PresentationClip::Rect(clip_rect(20.0, 12.5, 40.0, 15.0))
+    );
+    assert_eq!(
+        frame.clips[0].presented_clip,
+        Some(clip_rect(180.0, 150.0, 60.0, 30.0))
+    );
+}
+
+#[test]
+fn unbounded_clip_endpoints_remain_semantic_and_identity_signatures_stay_sparse() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(121);
+    let output = OutputId::from_raw(1).expect("output");
+    let envelope = clip_rect(-200.0, -100.0, 600.0, 400.0);
+    let rect_clip = PresentationClip::Rect(clip_rect(10.0, 20.0, 100.0, 80.0));
+    let _transaction = engine
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Unbounded,
+                rect_clip,
+                Some(envelope),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("unbounded to rect");
+    let target_window = target(scene_node_id, 121, rect(50.0, 60.0, 300.0, 200.0));
+    let start = engine.sample(
+        output,
+        AnimationTime::from_nanos(0),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target_window],
+    );
+    assert_eq!(start.clips[0].clip, PresentationClip::Unbounded);
+    assert_eq!(start.clips[0].presented_clip, None);
+    assert!(start.clips[0].transition.is_some());
+
+    let settled = engine.sample(
+        output,
+        AnimationTime::from_nanos(10_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target_window],
+    );
+    let settled_clip = settled.clips[0];
+    assert_eq!(settled_clip.clip, rect_clip);
+    assert!(
+        settled_clip
+            .transition
+            .is_some_and(|transition| transition.mathematically_settled)
+    );
+    let ack = PresentedClipAck::from_group_clip(output, settled_clip).expect("active track ack");
+    assert!(engine.acknowledge_presented_clip(output, ack));
+
+    let reverse = engine
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(20_000_000),
+            vec![clip_mutation(
+                scene_node_id,
+                rect_clip,
+                PresentationClip::Unbounded,
+                Some(envelope),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("rect to unbounded");
+    let unbounded = engine.sample(
+        output,
+        AnimationTime::from_nanos(30_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target_window],
+    );
+    assert_eq!(unbounded.clips[0].clip, PresentationClip::Unbounded);
+    assert_eq!(unbounded.clips[0].presented_clip, None);
+    assert!(
+        unbounded.clips[0]
+            .transition
+            .is_some_and(|transition| transition.mathematically_settled)
+    );
+    assert!(engine.acknowledge_presented_clip(
+        output,
+        PresentedClipAck::from_group_clip(output, unbounded.clips[0]).expect("unbounded ack"),
+    ));
+    assert_eq!(engine.transaction_count(), 0);
+    assert_eq!(reverse.members().len(), 1);
+
+    let static_identity = engine.sample(
+        output,
+        AnimationTime::from_nanos(40_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target_window],
+    );
+    assert!(static_identity.clips.is_empty());
+    assert_eq!(static_identity.presentation_visual_signature(), {
+        let active_identity = PresentationSceneSample {
+            clips: vec![PresentationGroupClip::with_scene_node(
+                scene_node_id,
+                121,
+                PresentationClip::Unbounded,
+                None,
+                Some(PresentationClipTransitionEvidence {
+                    transaction_id: reverse.id(),
+                    revision_id: reverse.members()[0].revision_id(),
+                    mathematically_settled: true,
+                }),
+            )],
+            ..static_identity.clone()
+        };
+        active_identity.presentation_visual_signature()
+    });
+}
+
+#[test]
+fn invalid_clip_member_does_not_partially_commit_geometry() {
+    let mut engine = PresentationEngine::enabled();
+    let result = engine.commit(PresentationTransactionRequest::mixed_all(
+        AnimationTime::from_nanos(0),
+        vec![PresentationGeometryMutation::new(
+            node(122),
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(10.0, 0.0, 10.0, 10.0),
+            AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+        )],
+        Vec::new(),
+        vec![clip_mutation(
+            node(122),
+            PresentationClip::Unbounded,
+            PresentationClip::Rect(clip_rect(0.0, 0.0, 10.0, 10.0)),
+            None,
+            AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+        )],
+    ));
+    assert_eq!(
+        result,
+        Err(PresentationTransactionError::MissingClipEnvelope)
+    );
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn clip_retarget_preserves_position_velocity_and_same_settled_target_revision() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(123);
+    let spring = AnimationCurve::spring(SpringSpec::new(100.0, 16.0));
+    let first = engine
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Rect(clip_rect(0.0, 0.0, 10.0, 10.0)),
+                PresentationClip::Rect(clip_rect(100.0, 20.0, 30.0, 40.0)),
+                None,
+                spring,
+            )],
+        ))
+        .expect("first clip transition");
+    let at = AnimationTime::from_nanos(120_000_000);
+    let before = engine
+        .sample_clip_for_scene_node(scene_node_id, at)
+        .expect("sample before retarget");
+    let retarget = engine
+        .commit(PresentationTransactionRequest::clip(
+            at,
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Rect(clip_rect(-50.0, -50.0, 5.0, 5.0)),
+                PresentationClip::Rect(clip_rect(20.0, 80.0, 20.0, 20.0)),
+                None,
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::EaseOut),
+            )],
+        ))
+        .expect("clip retarget");
+    let after = engine
+        .sample_clip_for_scene_node(scene_node_id, at)
+        .expect("sample after retarget");
+    assert_eq!(after, before);
+    assert_eq!(
+        engine.clip_track_transaction(scene_node_id),
+        Some(retarget.id())
+    );
+    assert_ne!(
+        retarget.members()[0].revision_id(),
+        first.members()[0].revision_id()
+    );
+
+    let output = OutputId::from_raw(1).expect("output");
+    let target_window = target(scene_node_id, 123, rect(0.0, 0.0, 100.0, 100.0));
+    let settled = engine.sample(
+        output,
+        AnimationTime::from_nanos(1_000_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target_window],
+    );
+    let revision = settled.clips[0]
+        .transition
+        .expect("settled transition")
+        .revision_id;
+    let same_target = engine.commit(PresentationTransactionRequest::clip(
+        AnimationTime::from_nanos(1_100_000_000),
+        vec![clip_mutation(
+            scene_node_id,
+            PresentationClip::Rect(clip_rect(0.0, 0.0, 10.0, 10.0)),
+            PresentationClip::Rect(clip_rect(20.0, 80.0, 20.0, 20.0)),
+            None,
+            spring,
+        )],
+    ));
+    assert_eq!(same_target, Err(PresentationTransactionError::Empty));
+    assert_eq!(engine.clip_track_revision(scene_node_id), Some(revision));
+}
+
+#[test]
+fn clip_zero_area_and_spring_lower_bound_are_visible_and_bounded() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(124);
+    let zero = PresentationClip::Rect(clip_rect(4.0, 5.0, 0.0, 8.0));
+    let spring = AnimationCurve::spring(SpringSpec::new(100.0, 1.0));
+    engine
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Rect(clip_rect(0.0, 0.0, 1.0, 1.0)),
+                zero,
+                None,
+                spring,
+            )],
+        ))
+        .expect("zero dimension spring");
+    let sample = engine
+        .sample_clip_for_scene_node(scene_node_id, AnimationTime::from_nanos(300_000_000))
+        .expect("spring sample");
+    let rect = sample.0.rect().expect("intermediate clip rect");
+    assert!(rect.width() >= 0.0 && rect.height() >= 0.0);
+    if rect.width() == 0.0 {
+        assert_eq!(sample.1.width(), 0.0);
+    }
 }
 
 #[test]
@@ -175,6 +486,157 @@ fn geometry_and_opacity_share_transaction_but_settle_independently() {
     ));
     assert_eq!(engine.active_count(), 0);
     assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn geometry_opacity_and_clip_share_one_transaction_and_ack_independently() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(125);
+    let output = OutputId::from_raw(1).expect("output");
+    let transaction = engine
+        .commit(PresentationTransactionRequest::mixed_all(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(10.0, 0.0, 20.0, 20.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+            vec![PresentationOpacityMutation::new(
+                scene_node_id,
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("opacity"),
+                AnimationCurve::easing(Duration::from_millis(20), EasingCurve::Linear),
+            )],
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Unbounded,
+                PresentationClip::Rect(clip_rect(2.0, 3.0, 4.0, 5.0)),
+                Some(clip_rect(-50.0, -50.0, 120.0, 120.0)),
+                AnimationCurve::easing(Duration::from_millis(30), EasingCurve::Linear),
+            )],
+        ))
+        .expect("three-property transaction");
+    assert_eq!(transaction.members().len(), 3);
+    assert_eq!(
+        transaction
+            .members()
+            .iter()
+            .map(|member| member.property())
+            .collect::<Vec<_>>(),
+        [
+            PresentationPropertyKind::Geometry,
+            PresentationPropertyKind::Opacity,
+            PresentationPropertyKind::Clip,
+        ]
+    );
+    assert_eq!(
+        transaction
+            .members()
+            .iter()
+            .map(|member| member.revision_id())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+
+    let frame = engine.sample(
+        output,
+        AnimationTime::from_nanos(30_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(scene_node_id, 125, rect(10.0, 0.0, 20.0, 20.0))],
+    );
+    let geometry = frame.transforms[0];
+    let opacity = frame.opacities[0];
+    let clip = frame.clips[0];
+    assert!(engine.acknowledge_presented_geometry(
+        output,
+        PresentedGeometryAck::from_transform(output, geometry)
+    ));
+    assert_eq!(engine.active_count(), 2);
+    let opacity_transition = opacity.transition.expect("opacity transition evidence");
+    assert!(engine.acknowledge_presented_opacity(
+        output,
+        opacity_ack(
+            output,
+            scene_node_id,
+            opacity_transition.transaction_id,
+            opacity_transition.revision_id,
+            0.5,
+        )
+    ));
+    assert_eq!(engine.active_count(), 1);
+    assert!(engine.acknowledge_presented_clip(
+        output,
+        PresentedClipAck::from_group_clip(output, clip).expect("clip transition evidence"),
+    ));
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn clip_identity_noop_and_wrong_output_or_stale_ack_do_not_retire_track() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(126);
+    let output = OutputId::from_raw(1).expect("output");
+    let other_output = OutputId::from_raw(2).expect("other output");
+    assert_eq!(
+        engine.commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Unbounded,
+                PresentationClip::Unbounded,
+                None,
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        )),
+        Err(PresentationTransactionError::Empty)
+    );
+    let target_clip = PresentationClip::Rect(clip_rect(0.0, 0.0, 10.0, 10.0));
+    let transaction = engine
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![clip_mutation(
+                scene_node_id,
+                PresentationClip::Unbounded,
+                target_clip,
+                Some(clip_rect(-100.0, -100.0, 200.0, 200.0)),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("clip transition");
+    assert_eq!(transaction.id().get(), 1, "identity no-op allocates no id");
+    let frame = engine.sample(
+        output,
+        AnimationTime::from_nanos(10_000_000),
+        PresentationSampleTimeSource::ScheduledTarget,
+        &[target(scene_node_id, 126, rect(0.0, 0.0, 10.0, 10.0))],
+    );
+    let group = frame.clips[0];
+    let transition = group.transition.expect("transition evidence");
+    let wrong_output = clip_ack(
+        other_output,
+        scene_node_id,
+        transition.transaction_id,
+        transition.revision_id,
+        target_clip,
+    );
+    assert!(!engine.acknowledge_presented_clip(output, wrong_output));
+    let stale = clip_ack(
+        output,
+        scene_node_id,
+        transition.transaction_id,
+        PresentationRevisionId::from_raw(999).expect("stale revision"),
+        target_clip,
+    );
+    assert!(!engine.acknowledge_presented_clip(output, stale));
+    assert!(engine.has_clip_track(scene_node_id));
+    assert!(engine.acknowledge_presented_clip(
+        output,
+        PresentedClipAck::from_group_clip(output, group).expect("exact physical ack"),
+    ));
+    assert!(!engine.has_clip_track(scene_node_id));
 }
 
 #[test]

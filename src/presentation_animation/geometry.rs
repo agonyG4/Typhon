@@ -1,5 +1,6 @@
 use crate::core::SceneNodeId;
 
+use super::PresentationClipRect;
 use super::ids::{PresentationRevisionId, PresentationTransactionId, TransitionId};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -138,6 +139,23 @@ impl PresentationGeometryTransform {
         let top_left = self.map_point((rect.x(), rect.y()));
         let bottom_right = self.map_point((rect.x() + rect.width(), rect.y() + rect.height()));
         PresentationRect::new(
+            top_left.0,
+            top_left.1,
+            bottom_right.0 - top_left.0,
+            bottom_right.1 - top_left.1,
+        )
+    }
+
+    pub fn map_clip_rect(self, rect: PresentationClipRect) -> Option<PresentationClipRect> {
+        let top_left = self.map_point((
+            self.canonical_rect.x() + rect.x(),
+            self.canonical_rect.y() + rect.y(),
+        ));
+        let bottom_right = self.map_point((
+            self.canonical_rect.x() + rect.x() + rect.width(),
+            self.canonical_rect.y() + rect.y() + rect.height(),
+        ));
+        PresentationClipRect::new(
             top_left.0,
             top_left.1,
             bottom_right.0 - top_left.0,

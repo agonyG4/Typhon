@@ -183,13 +183,21 @@ impl CompositorState {
                         PresentationOpacity::OPAQUE,
                         DesktopWindow::canonical_opacity,
                     );
+                let canonical_clip = self
+                    .window_id_for_surface(root_surface_id)
+                    .and_then(|window_id| self.window(window_id))
+                    .map_or(
+                        crate::presentation_animation::PresentationClip::Unbounded,
+                        DesktopWindow::canonical_clip,
+                    );
                 Some(
                     PresentationWindowTarget::with_scene_node(
                         scene_node_id,
                         root_surface_id,
                         canonical_rect,
                     )
-                    .with_canonical_opacity(canonical_opacity),
+                    .with_canonical_opacity(canonical_opacity)
+                    .with_canonical_clip(canonical_clip),
                 )
             })
             .collect();
@@ -253,6 +261,102 @@ impl CompositorState {
         }
         self.advance_render_generation(RenderGenerationCause::WindowMode);
         Ok(())
+    }
+
+    #[allow(dead_code)] // Reserved internal seam; Clip v1 does not activate visible animations.
+    pub(in crate::compositor) fn set_window_canonical_clip(
+        &mut self,
+        window_id: WindowId,
+        clip: crate::presentation_animation::PresentationClip,
+        curve: Option<AnimationCurve>,
+    ) -> Result<(), crate::presentation_animation::PresentationTransactionError> {
+        let Some(window) = self.window(window_id) else {
+            return Err(crate::presentation_animation::PresentationTransactionError::MissingPresentationOwner);
+        };
+        let root_surface_id = window.root_surface_id;
+        let previous = window.canonical_clip();
+        let scene_node_id = self.scene_node_id_for_window_group(window_id).ok_or(
+            crate::presentation_animation::PresentationTransactionError::MissingPresentationOwner,
+        )?;
+        let active_track = self.presentation_animator.has_clip_track(scene_node_id);
+        if previous == clip && !active_track {
+            return Ok(());
+        }
+        let Some(now) = self
+            .layout_animation_epoch
+            .or_else(AnimationTime::monotonic_now)
+        else {
+            return Err(crate::presentation_animation::PresentationTransactionError::Empty);
+        };
+
+        if let Some(curve) = curve.filter(|_| self.presentation_animator.is_enabled()) {
+            let geometry = self
+                .current_visual_root_window_geometry(root_surface_id)
+                .or_else(|| self.current_root_window_geometry(root_surface_id))
+                .ok_or(crate::presentation_animation::PresentationTransactionError::MissingPresentationOwner)?;
+            let canonical_rect = self
+                .presentation_rect_for_geometry(root_surface_id, geometry)
+                .ok_or(crate::presentation_animation::PresentationTransactionError::MissingPresentationOwner)?;
+            let frozen_identity_envelope =
+                if previous.is_unbounded() && clip.is_unbounded() && !active_track {
+                    None
+                } else {
+                    self.frozen_window_group_clip_envelope(canonical_rect)
+                };
+            let request = crate::presentation_animation::PresentationTransactionRequest::clip(
+                now,
+                vec![
+                    crate::presentation_animation::PresentationClipMutation::new(
+                        scene_node_id,
+                        previous,
+                        clip,
+                        frozen_identity_envelope,
+                        curve,
+                    ),
+                ],
+            );
+            match self.presentation_animator.commit(request) {
+                Ok(_) | Err(crate::presentation_animation::PresentationTransactionError::Empty) => {
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            self.presentation_animator.cancel_clip(scene_node_id);
+        }
+
+        if let Some(window) = self.window_mut(window_id) {
+            window.set_canonical_clip(clip);
+        }
+        self.advance_render_generation(RenderGenerationCause::WindowMode);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn frozen_window_group_clip_envelope(
+        &self,
+        canonical_rect: PresentationRect,
+    ) -> Option<crate::presentation_animation::PresentationClipRect> {
+        // This transition-local output-derived fallback conservatively covers
+        // the current output footprint plus one output extent of movement on
+        // each side. It is not retained as canonical Clip state.
+        let output_width = f64::from(self.output_size.width.max(1));
+        let output_height = f64::from(self.output_size.height.max(1));
+        let left = 0.0_f64.min(-canonical_rect.x()) - output_width;
+        let top = 0.0_f64.min(-canonical_rect.y()) - output_height;
+        let right = canonical_rect
+            .width()
+            .max(output_width - canonical_rect.x())
+            + output_width;
+        let bottom = canonical_rect
+            .height()
+            .max(output_height - canonical_rect.y())
+            + output_height;
+        crate::presentation_animation::PresentationClipRect::new(
+            left,
+            top,
+            right - left,
+            bottom - top,
+        )
     }
 
     #[doc(hidden)]
@@ -472,6 +576,16 @@ impl CompositorState {
             .is_opaque()
     }
 
+    pub(in crate::compositor) fn presented_presentation_clip_for_scene_node(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> crate::presentation_animation::PresentationClip {
+        self.presented_presentation.as_ref().map_or(
+            crate::presentation_animation::PresentationClip::Unbounded,
+            |frame| frame.clip_for_scene_node(scene_node_id),
+        )
+    }
+
     pub(in crate::compositor) fn presented_window_geometry(
         &self,
         root_surface_id: u32,
@@ -639,6 +753,19 @@ impl CompositorState {
                     .acknowledge_presented_opacity(expected_output_id, ack);
             }
         }
+        for clip in &presentation.clips {
+            if clip
+                .transition
+                .is_some_and(|transition| transition.mathematically_settled)
+                && let Some(ack) = crate::presentation_animation::PresentedClipAck::from_group_clip(
+                    presentation.output_id,
+                    *clip,
+                )
+            {
+                self.presentation_animator
+                    .acknowledge_presented_clip(expected_output_id, ack);
+            }
+        }
         self.advance_pointer_hit_generation();
     }
 
@@ -662,6 +789,9 @@ impl CompositorState {
             presentation
                 .opacities
                 .retain(|opacity| opacity.root_surface_id != root_surface_id);
+            presentation
+                .clips
+                .retain(|clip| clip.root_surface_id != root_surface_id);
             presentation.refresh_signature();
         }
         self.presented_window_geometries

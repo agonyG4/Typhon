@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::core::WindowId;
-use crate::presentation_animation::PresentationOpacity;
+use crate::presentation_animation::{PresentationClip, PresentationOpacity};
 use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
 use crate::xwayland::xwm::{
@@ -104,6 +104,7 @@ pub struct DesktopWindow {
     pub id: WindowId,
     pub root_surface_id: u32,
     pub(crate) canonical_opacity: PresentationOpacity,
+    pub(crate) canonical_clip: PresentationClip,
     pub backend: WindowBackend,
     pub(crate) x11_surface_id: Option<u32>,
     pub kind: DesktopWindowKind,
@@ -175,6 +176,7 @@ impl DesktopWindow {
             id,
             root_surface_id,
             canonical_opacity: PresentationOpacity::OPAQUE,
+            canonical_clip: PresentationClip::Unbounded,
             backend: WindowBackend::Xdg(XdgWindowHandle::new(root_surface_id)),
             x11_surface_id: None,
             kind: DesktopWindowKind::Managed,
@@ -208,6 +210,7 @@ impl DesktopWindow {
             id,
             root_surface_id: snapshot.surface_id,
             canonical_opacity: PresentationOpacity::OPAQUE,
+            canonical_clip: PresentationClip::Unbounded,
             backend: WindowBackend::X11(snapshot.handle),
             x11_surface_id: Some(snapshot.surface_id),
             kind: snapshot.kind,
@@ -242,6 +245,14 @@ impl DesktopWindow {
 
     pub(crate) fn set_canonical_opacity(&mut self, opacity: PresentationOpacity) {
         self.canonical_opacity = opacity;
+    }
+
+    pub(crate) const fn canonical_clip(&self) -> PresentationClip {
+        self.canonical_clip
+    }
+
+    pub(crate) fn set_canonical_clip(&mut self, clip: PresentationClip) {
+        self.canonical_clip = clip;
     }
 }
 

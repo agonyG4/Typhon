@@ -1,9 +1,9 @@
 use crate::core::{OutputId, SceneNodeId};
 
 use super::{
-    AnimationTime, PresentationGeometryTransform, PresentationOpacity, PresentationPropertyKind,
-    PresentationRect, PresentationRevisionId, PresentationTransactionId, PresentationWindowSample,
-    TransitionId,
+    AnimationTime, PresentationClip, PresentationClipRect, PresentationGeometryTransform,
+    PresentationOpacity, PresentationPropertyKind, PresentationRect, PresentationRevisionId,
+    PresentationTransactionId, PresentationWindowSample, TransitionId,
 };
 
 /// The source used to choose the immutable timestamp attached to a frame.
@@ -22,6 +22,7 @@ pub struct PresentationWindowTarget {
     root_surface_id: u32,
     canonical_rect: PresentationRect,
     canonical_opacity: PresentationOpacity,
+    canonical_clip: PresentationClip,
 }
 
 impl PresentationWindowTarget {
@@ -35,6 +36,7 @@ impl PresentationWindowTarget {
             root_surface_id,
             canonical_rect,
             canonical_opacity: PresentationOpacity::OPAQUE,
+            canonical_clip: PresentationClip::Unbounded,
         }
     }
 
@@ -70,6 +72,15 @@ impl PresentationWindowTarget {
 
     pub const fn canonical_opacity(self) -> PresentationOpacity {
         self.canonical_opacity
+    }
+
+    pub const fn with_canonical_clip(mut self, canonical_clip: PresentationClip) -> Self {
+        self.canonical_clip = canonical_clip;
+        self
+    }
+
+    pub const fn canonical_clip(self) -> PresentationClip {
+        self.canonical_clip
     }
 }
 
@@ -169,6 +180,25 @@ impl PresentationGroupTransform {
         self.geometry().map_rect(rect)
     }
 
+    pub fn map_clip_rect(self, rect: PresentationClipRect) -> Option<PresentationClipRect> {
+        let local_top_left = (
+            self.canonical_rect.x() + rect.x(),
+            self.canonical_rect.y() + rect.y(),
+        );
+        let local_bottom_right = (
+            local_top_left.0 + rect.width(),
+            local_top_left.1 + rect.height(),
+        );
+        let top_left = self.map_point(local_top_left);
+        let bottom_right = self.map_point(local_bottom_right);
+        PresentationClipRect::new(
+            top_left.0,
+            top_left.1,
+            bottom_right.0 - top_left.0,
+            bottom_right.1 - top_left.1,
+        )
+    }
+
     pub fn map_rect_outward(self, rect: PresentationRect) -> Option<super::PresentationDamageRect> {
         self.map_rect(rect)
             .map(|mapped| super::presentation_damage(mapped, mapped))
@@ -227,6 +257,59 @@ pub struct PresentationGroupOpacity {
     pub root_surface_id: u32,
     pub opacity: PresentationOpacity,
     pub transition: Option<PresentationOpacityTransitionEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationClipTransitionEvidence {
+    pub transaction_id: PresentationTransactionId,
+    pub revision_id: PresentationRevisionId,
+    pub mathematically_settled: bool,
+}
+
+/// Immutable WindowGroup-local Clip and its exact output-space projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentationGroupClip {
+    pub scene_node_id: SceneNodeId,
+    pub root_surface_id: u32,
+    pub clip: PresentationClip,
+    pub presented_clip: Option<PresentationClipRect>,
+    pub transition: Option<PresentationClipTransitionEvidence>,
+}
+
+impl PresentationGroupClip {
+    pub const fn with_scene_node(
+        scene_node_id: SceneNodeId,
+        root_surface_id: u32,
+        clip: PresentationClip,
+        presented_clip: Option<PresentationClipRect>,
+        transition: Option<PresentationClipTransitionEvidence>,
+    ) -> Self {
+        Self {
+            scene_node_id,
+            root_surface_id,
+            clip,
+            presented_clip,
+            transition,
+        }
+    }
+
+    /// Identity clips are deliberately omitted from pixel identity. Their
+    /// exact transition evidence remains available for physical ACK.
+    pub fn visual_signature(self) -> Option<u64> {
+        let clip = self.presented_clip?;
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        for value in [
+            u64::from(self.root_surface_id),
+            clip.x().to_bits(),
+            clip.y().to_bits(),
+            clip.width().to_bits(),
+            clip.height().to_bits(),
+        ] {
+            signature ^= value;
+            signature = signature.wrapping_mul(0x1000_0000_01b3);
+        }
+        Some(signature)
+    }
 }
 
 impl PresentationGroupOpacity {
@@ -292,6 +375,35 @@ pub struct PresentedOpacityAck {
     pub transaction_id: PresentationTransactionId,
     pub revision_id: PresentationRevisionId,
     pub presented_opacity: PresentationOpacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentedClipAck {
+    pub output_id: OutputId,
+    pub scene_node_id: SceneNodeId,
+    pub property: PresentationPropertyKind,
+    pub transaction_id: PresentationTransactionId,
+    pub revision_id: PresentationRevisionId,
+    pub presented_clip: PresentationClip,
+}
+
+impl PresentedClipAck {
+    pub const fn from_group_clip(
+        output_id: OutputId,
+        group: PresentationGroupClip,
+    ) -> Option<Self> {
+        let Some(transition) = group.transition else {
+            return None;
+        };
+        Some(Self {
+            output_id,
+            scene_node_id: group.scene_node_id,
+            property: PresentationPropertyKind::Clip,
+            transaction_id: transition.transaction_id,
+            revision_id: transition.revision_id,
+            presented_clip: group.clip,
+        })
+    }
 }
 
 impl PresentedOpacityAck {
@@ -365,6 +477,7 @@ pub struct PresentationSceneSample {
     pub windows: Vec<PresentationWindowSample>,
     pub transforms: Vec<PresentationGroupTransform>,
     pub opacities: Vec<PresentationGroupOpacity>,
+    pub clips: Vec<PresentationGroupClip>,
     pub active_transitions: usize,
     pub sampled_windows: usize,
 }
@@ -384,6 +497,7 @@ impl PresentationSceneSample {
             windows: Vec::new(),
             transforms: Vec::new(),
             opacities: Vec::new(),
+            clips: Vec::new(),
             active_transitions: 0,
             sampled_windows: 0,
         }
@@ -432,6 +546,21 @@ impl PresentationSceneSample {
             .find(|opacity| opacity.scene_node_id == scene_node_id)
             .map_or(PresentationOpacity::OPAQUE, |opacity| opacity.opacity)
     }
+
+    pub fn clip_for_root(&self, root_surface_id: u32) -> PresentationClip {
+        self.clips
+            .binary_search_by_key(&root_surface_id, |clip| clip.root_surface_id)
+            .ok()
+            .map(|index| self.clips[index].clip)
+            .unwrap_or(PresentationClip::Unbounded)
+    }
+
+    pub fn clip_for_scene_node(&self, scene_node_id: SceneNodeId) -> PresentationClip {
+        self.clips
+            .iter()
+            .find(|clip| clip.scene_node_id == scene_node_id)
+            .map_or(PresentationClip::Unbounded, |clip| clip.clip)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -441,6 +570,7 @@ pub struct PresentationFrameSnapshot {
     pub sample_time_source: PresentationSampleTimeSource,
     pub transforms: Vec<PresentationGroupTransform>,
     pub opacities: Vec<PresentationGroupOpacity>,
+    pub clips: Vec<PresentationGroupClip>,
     pub presented_windows: Vec<PresentedWindowGeometry>,
     pub signature: u64,
 }
@@ -471,6 +601,11 @@ impl PresentationFrameSnapshot {
             sample_time_source: sample.sample_time_source,
             transforms: sample.transforms.clone(),
             opacities,
+            clips: {
+                let mut clips = sample.clips.clone();
+                clips.sort_unstable_by_key(|clip| clip.root_surface_id);
+                clips
+            },
             presented_windows,
             signature: 0,
         };
@@ -510,6 +645,21 @@ impl PresentationFrameSnapshot {
             .map_or(PresentationOpacity::OPAQUE, |opacity| opacity.opacity)
     }
 
+    pub fn clip_for_root(&self, root_surface_id: u32) -> PresentationClip {
+        self.clips
+            .binary_search_by_key(&root_surface_id, |clip| clip.root_surface_id)
+            .ok()
+            .map(|index| self.clips[index].clip)
+            .unwrap_or(PresentationClip::Unbounded)
+    }
+
+    pub fn clip_for_scene_node(&self, scene_node_id: SceneNodeId) -> PresentationClip {
+        self.clips
+            .iter()
+            .find(|clip| clip.scene_node_id == scene_node_id)
+            .map_or(PresentationClip::Unbounded, |clip| clip.clip)
+    }
+
     pub fn presented_window_geometry(
         &self,
         root_surface_id: u32,
@@ -544,6 +694,12 @@ impl PresentationFrameSnapshot {
         for opacity in &self.opacities {
             signature ^= opacity.signature();
             signature = signature.wrapping_mul(0x1000_0000_01b3);
+        }
+        for clip in &self.clips {
+            if let Some(clip_signature) = clip.visual_signature() {
+                signature ^= clip_signature;
+                signature = signature.wrapping_mul(0x1000_0000_01b3);
+            }
         }
         for window in &self.presented_windows {
             signature ^= u64::from(window.root_surface_id());

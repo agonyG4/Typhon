@@ -3,7 +3,8 @@ use super::desktop_window_tests::{
 };
 use super::*;
 use crate::presentation_animation::{
-    AnimationCurve, AnimationTime, EasingCurve, PresentationGeometryMutation,
+    AnimationCurve, AnimationTime, EasingCurve, PresentationClip, PresentationClipMutation,
+    PresentationClipRect, PresentationGeometryMutation, PresentationGroupClip,
     PresentationGroupOpacity, PresentationGroupTransform, PresentationOpacity,
     PresentationOpacityMutation, PresentationRect, PresentationRevisionId,
     PresentationSampleTimeSource, PresentationTransactionId, PresentationTransactionRequest,
@@ -112,6 +113,32 @@ fn publish_physical_presentation(
                 opacity,
                 None,
             ));
+    }
+    state.publish_presented_presentation(frame_id, &sample.frame_snapshot());
+}
+
+fn publish_physical_clip_presentation(
+    state: &mut CompositorState,
+    output_id: OutputId,
+    scene_node_id: SceneNodeId,
+    root_surface_id: u32,
+    clip: PresentationClip,
+    presented_clip: Option<PresentationClipRect>,
+    frame_id: u64,
+) {
+    let mut sample = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(frame_id),
+        PresentationSampleTimeSource::ZeroFallback,
+    );
+    if !clip.is_unbounded() {
+        sample.clips.push(PresentationGroupClip::with_scene_node(
+            scene_node_id,
+            root_surface_id,
+            clip,
+            presented_clip,
+            None,
+        ));
     }
     state.publish_presented_presentation(frame_id, &sample.frame_snapshot());
 }
@@ -588,6 +615,246 @@ fn unrelated_physical_presentation_owner_does_not_block_scanout_candidate() {
         !blockers
             .reasons()
             .contains(&DirectScanoutSceneRejection::PresentationOpacity)
+    );
+    assert!(state.direct_scanout_scene_candidate().is_ok());
+}
+
+#[test]
+fn candidate_clip_track_blocks_direct_scanout_but_unrelated_track_does_not() {
+    let mut state = CompositorState::new(None);
+    let (width, height) = (state.output_size.width, state.output_size.height);
+    let candidate_root = 370;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(370).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            candidate_root,
+            width,
+            height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, candidate_root, candidate_root),
+    );
+    let candidate_window = state
+        .window_id_for_surface(candidate_root)
+        .expect("candidate window");
+    let candidate_node = state
+        .scene_node_id_for_window_group(candidate_window)
+        .expect("candidate WindowGroup");
+    state.presentation_animator.set_enabled(true);
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![PresentationClipMutation::new(
+                candidate_node,
+                PresentationClip::Rect(
+                    PresentationClipRect::new(0.0, 0.0, 10.0, 10.0).expect("clip start"),
+                ),
+                PresentationClip::Rect(
+                    PresentationClipRect::new(1.0, 0.0, 8.0, 10.0).expect("clip target"),
+                ),
+                None,
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("candidate clip transaction");
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationClip)
+    );
+
+    state.presentation_animator.cancel_clip(candidate_node);
+    let unrelated_node = install_off_output_xdg_window(&mut state, 371);
+    state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![PresentationClipMutation::new(
+                unrelated_node,
+                PresentationClip::Rect(
+                    PresentationClipRect::new(0.0, 0.0, 10.0, 10.0).expect("clip start"),
+                ),
+                PresentationClip::Rect(
+                    PresentationClipRect::new(1.0, 0.0, 8.0, 10.0).expect("clip target"),
+                ),
+                None,
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("off-output clip transaction");
+    let blockers = state.direct_scanout_scene_blockers();
+    assert!(
+        !blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationClip)
+    );
+    assert!(state.direct_scanout_scene_candidate().is_ok());
+}
+
+#[test]
+fn canonical_presentation_clip_blocks_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let (width, height) = (state.output_size.width, state.output_size.height);
+    let root_surface_id = 372;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(372).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            root_surface_id,
+            width,
+            height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, root_surface_id, root_surface_id),
+    );
+    let window_id = state
+        .window_id_for_surface(root_surface_id)
+        .expect("candidate window");
+    state
+        .window_mut(window_id)
+        .expect("candidate DesktopWindow")
+        .set_canonical_clip(PresentationClip::Rect(
+            PresentationClipRect::new(0.0, 0.0, 64.0, 64.0).expect("canonical clip"),
+        ));
+
+    let blockers = state.direct_scanout_scene_blockers();
+    assert!(
+        blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationClip)
+    );
+    assert_eq!(
+        DirectScanoutSceneRejection::PresentationClip.as_str(),
+        "presentation_clip"
+    );
+}
+
+#[test]
+fn xwayland_clip_track_and_physical_clip_follow_window_group_across_backing_replacement() {
+    let mut state = CompositorState::new(None);
+    let (width, height) = (state.output_size.width, state.output_size.height);
+    let root_a = 373;
+    let root_b = 374;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(373).expect("generation"));
+    let snapshot = x11_output_snapshot(generation, 3_730, root_a);
+    let handle = snapshot.handle;
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            root_a,
+            width,
+            height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        snapshot,
+    );
+    let window_id = state
+        .window_id_for_surface(root_a)
+        .expect("candidate window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("candidate WindowGroup");
+    let target_clip = PresentationClip::Rect(
+        PresentationClipRect::new(5.0, 6.0, 70.0, 80.0).expect("canonical Clip"),
+    );
+    state
+        .window_mut(window_id)
+        .expect("candidate DesktopWindow")
+        .set_canonical_clip(target_clip);
+    state.presentation_animator.set_enabled(true);
+    let transaction = state
+        .presentation_animator
+        .commit(PresentationTransactionRequest::clip(
+            AnimationTime::from_nanos(0),
+            vec![PresentationClipMutation::new(
+                scene_node_id,
+                PresentationClip::Rect(
+                    PresentationClipRect::new(0.0, 0.0, 100.0, 100.0).expect("clip start"),
+                ),
+                target_clip,
+                None,
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("active Clip revision");
+    let revision_id = transaction.members()[0].revision_id();
+
+    state.retire_xwayland_attachment(root_a);
+    assert_eq!(state.attach_x11_surface(handle, root_b), Ok(Some(root_a)));
+    state.append_renderable_surface(x11_scanout_surface(
+        root_b,
+        width,
+        height,
+        SurfacePlacement::absolute_root_at(0, 0),
+        DrmFormat::Xrgb8888,
+    ));
+    state.surface_presentation_generations.insert(root_b, 1);
+    state.rebuild_active_scene_view();
+    assert_eq!(state.window_id_for_surface(root_b), Some(window_id));
+    assert_eq!(
+        state.presentation_scene_node_id_for_root(root_b),
+        Some(scene_node_id)
+    );
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("same logical DesktopWindow")
+            .canonical_clip(),
+        target_clip
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .clip_track_revision(scene_node_id),
+        Some(revision_id)
+    );
+
+    state.presentation_animator.cancel_clip(scene_node_id);
+    state
+        .window_mut(window_id)
+        .expect("candidate DesktopWindow")
+        .set_canonical_clip(PresentationClip::Unbounded);
+    let output_id = state.ensure_native_output_id().expect("output identity");
+    let physical_rect =
+        PresentationClipRect::new(10.0, 12.0, 80.0, 60.0).expect("physical nonidentity clip");
+    // This represents a submitted frame frozen with root A that promotes after B
+    // has become the current render adapter.
+    publish_physical_clip_presentation(
+        &mut state,
+        output_id,
+        scene_node_id,
+        root_a,
+        PresentationClip::Rect(physical_rect),
+        Some(physical_rect),
+        1,
+    );
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationClip)
+    );
+
+    publish_physical_clip_presentation(
+        &mut state,
+        output_id,
+        scene_node_id,
+        root_b,
+        PresentationClip::Unbounded,
+        None,
+        2,
+    );
+    let recovered = state.direct_scanout_scene_blockers();
+    assert!(
+        !recovered
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::PresentationClip)
     );
     assert!(state.direct_scanout_scene_candidate().is_ok());
 }

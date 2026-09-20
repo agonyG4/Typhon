@@ -49,4 +49,5 @@ pub type TransitionId = PresentationRevisionId;
 pub enum PresentationPropertyKind {
     Geometry,
     Opacity,
+    Clip,
 }

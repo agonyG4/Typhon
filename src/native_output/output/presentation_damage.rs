@@ -139,6 +139,162 @@ pub(crate) fn opacity_damage_for_frame_snapshots(
     NativeOutputDamage::surface_damage(rects)
 }
 
+/// Damage the old and new visible contribution for every WindowGroup whose
+/// immutable physical Clip changed.
+pub(crate) fn clip_damage_for_frame_snapshots(
+    output_width: u32,
+    output_height: u32,
+    previous_presentation: &PresentationFrameSnapshot,
+    current_presentation: &PresentationFrameSnapshot,
+    previous_scene: &NativeSceneSnapshot,
+    current_scene: &NativeSceneSnapshot,
+) -> NativeOutputDamage {
+    use oblivion_one::core::SceneNodeId;
+
+    let previous_clips = previous_presentation
+        .clips
+        .iter()
+        .filter_map(|entry| {
+            entry.presented_clip.map(|clip| {
+                (
+                    entry.scene_node_id,
+                    (entry.root_surface_id, presentation_clip_damage_rect(clip)),
+                )
+            })
+        })
+        .collect::<HashMap<SceneNodeId, _>>();
+    let current_clips = current_presentation
+        .clips
+        .iter()
+        .filter_map(|entry| {
+            entry.presented_clip.map(|clip| {
+                (
+                    entry.scene_node_id,
+                    (entry.root_surface_id, presentation_clip_damage_rect(clip)),
+                )
+            })
+        })
+        .collect::<HashMap<SceneNodeId, _>>();
+    let changed_owners = previous_clips
+        .keys()
+        .chain(current_clips.keys())
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .filter(|owner| {
+            previous_clips.get(owner).map(|(_, rect)| *rect)
+                != current_clips.get(owner).map(|(_, rect)| *rect)
+        })
+        .collect::<Vec<_>>();
+
+    let mut rects = Vec::new();
+    for owner in changed_owners {
+        for (presentation, scene, clips) in [
+            (previous_presentation, previous_scene, &previous_clips),
+            (current_presentation, current_scene, &current_clips),
+        ] {
+            let clip_record = clips.get(&owner).copied();
+            let root = clip_record.map(|(root, _)| root).or_else(|| {
+                presentation
+                    .presented_window_geometry_for_scene_node(owner)
+                    .map(|window| window.root_surface_id())
+            });
+            let Some(root) = root else {
+                continue;
+            };
+            let mask = clip_record.map(|(_, rect)| rect);
+            for surface in scene
+                .surfaces
+                .iter()
+                .filter(|surface| surface.presentation_owner_root_surface_id == root)
+            {
+                push_clipped_rect(
+                    &mut rects,
+                    surface.bounds,
+                    mask,
+                    output_width,
+                    output_height,
+                );
+            }
+            for decoration in scene
+                .decorations
+                .iter()
+                .filter(|decoration| decoration.identity().1 == root)
+            {
+                let (x, y, width, height) = decoration.bounds();
+                push_clipped_rect(
+                    &mut rects,
+                    Some(NativeDamageRect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    }),
+                    mask,
+                    output_width,
+                    output_height,
+                );
+            }
+        }
+    }
+    NativeOutputDamage::surface_damage(rects)
+}
+
+fn presentation_clip_damage_rect(
+    clip: oblivion_one::presentation_animation::PresentationClipRect,
+) -> NativeDamageRect {
+    let left = clip
+        .x()
+        .floor()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let top = clip
+        .y()
+        .floor()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let right = (clip.x() + clip.width())
+        .ceil()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let bottom = (clip.y() + clip.height())
+        .ceil()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    NativeDamageRect {
+        x: left,
+        y: top,
+        width: (i64::from(right) - i64::from(left)).clamp(0, i64::from(u32::MAX)) as u32,
+        height: (i64::from(bottom) - i64::from(top)).clamp(0, i64::from(u32::MAX)) as u32,
+    }
+}
+
+fn push_clipped_rect(
+    rects: &mut Vec<NativeDamageRect>,
+    rect: Option<NativeDamageRect>,
+    mask: Option<NativeDamageRect>,
+    output_width: u32,
+    output_height: u32,
+) {
+    let rect =
+        rect.and_then(|rect| mask.map_or(Some(rect), |mask| intersect_damage_rect(rect, mask)));
+    push_rect(rects, rect, output_width, output_height);
+}
+
+fn intersect_damage_rect(
+    left: NativeDamageRect,
+    right: NativeDamageRect,
+) -> Option<NativeDamageRect> {
+    let x = left.left().max(right.left());
+    let y = left.top().max(right.top());
+    let right_edge = left.right().min(right.right());
+    let bottom_edge = left.bottom().min(right.bottom());
+    (right_edge > x && bottom_edge > y).then_some(NativeDamageRect {
+        x: x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width: (right_edge - x).clamp(0, i64::from(u32::MAX)) as u32,
+        height: (bottom_edge - y).clamp(0, i64::from(u32::MAX)) as u32,
+    })
+}
+
 fn push_rect(
     rects: &mut Vec<NativeDamageRect>,
     rect: Option<NativeDamageRect>,
@@ -174,10 +330,14 @@ fn push_decoration_rect(
 mod tests {
     use super::*;
     use oblivion_one::compositor::{
-        AnimationTime, PresentationSampleTimeSource, PresentationSceneSample, SceneNodeId,
+        AnimationTime, DecorationSceneSnapshot, PresentationSampleTimeSource,
+        PresentationSceneSample, PresentedWindowGeometry, SceneNodeId, WindowId,
     };
     use oblivion_one::core::OutputId;
-    use oblivion_one::presentation_animation::PresentationGroupOpacity;
+    use oblivion_one::presentation_animation::{
+        PresentationClip, PresentationClipRect, PresentationGroupClip, PresentationGroupOpacity,
+        PresentationRect,
+    };
 
     fn frame_snapshot(opacities: &[(u32, f64)]) -> PresentationFrameSnapshot {
         let output_id = OutputId::from_raw(1).expect("test output");
@@ -239,6 +399,99 @@ mod tests {
         }
     }
 
+    fn clip_frame_snapshot(clip: Option<PresentationClipRect>) -> PresentationFrameSnapshot {
+        let output_id = OutputId::from_raw(1).expect("test output");
+        let mut sample = PresentationSceneSample::empty_for_output(
+            output_id,
+            AnimationTime::from_nanos(1),
+            PresentationSampleTimeSource::MonotonicFallback,
+        );
+        if let Some(rect) = clip {
+            sample.clips.push(PresentationGroupClip::with_scene_node(
+                SceneNodeId::from_raw(7).expect("test node"),
+                7,
+                PresentationClip::Rect(rect),
+                Some(rect),
+                None,
+            ));
+        }
+        PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &sample,
+            vec![PresentedWindowGeometry::with_scene_node(
+                SceneNodeId::from_raw(7).expect("test node"),
+                7,
+                PresentationRect::new(0.0, 0.0, 400.0, 300.0).expect("window geometry"),
+            )],
+        )
+    }
+
+    fn clip_scene() -> NativeSceneSnapshot {
+        let mut scene = NativeSceneSnapshot {
+            surfaces: vec![
+                super::super::NativeSceneSurfaceSnapshot {
+                    scene_node_id: SceneNodeId::from_raw(7).expect("test node"),
+                    surface_id: 70,
+                    visual_root_surface_id: 70,
+                    presentation_owner_root_surface_id: 7,
+                    bounds: Some(NativeDamageRect {
+                        x: 10,
+                        y: 20,
+                        width: 80,
+                        height: 80,
+                    }),
+                    damage: super::super::NativeSurfaceDamageEvidence::AuthoritativeEmpty,
+                    content_generation: 1,
+                    commit_sequence: 1,
+                },
+                super::super::NativeSceneSurfaceSnapshot {
+                    scene_node_id: SceneNodeId::from_raw(8).expect("test node"),
+                    surface_id: 80,
+                    visual_root_surface_id: 80,
+                    presentation_owner_root_surface_id: 7,
+                    bounds: Some(NativeDamageRect {
+                        x: 100,
+                        y: 40,
+                        width: 60,
+                        height: 50,
+                    }),
+                    damage: super::super::NativeSurfaceDamageEvidence::AuthoritativeEmpty,
+                    content_generation: 1,
+                    commit_sequence: 1,
+                },
+                super::super::NativeSceneSurfaceSnapshot {
+                    scene_node_id: SceneNodeId::from_raw(9).expect("test node"),
+                    surface_id: 90,
+                    visual_root_surface_id: 90,
+                    presentation_owner_root_surface_id: 9,
+                    bounds: Some(NativeDamageRect {
+                        x: 300,
+                        y: 30,
+                        width: 50,
+                        height: 50,
+                    }),
+                    damage: super::super::NativeSurfaceDamageEvidence::AuthoritativeEmpty,
+                    content_generation: 1,
+                    commit_sequence: 1,
+                },
+            ],
+            decorations: vec![DecorationSceneSnapshot::from_bounds_with_scene_node(
+                SceneNodeId::from_raw(7).expect("test node"),
+                WindowId::from_raw(7).expect("test window"),
+                7,
+                20,
+                10,
+                60,
+                10,
+                1,
+            )],
+            ..NativeSceneSnapshot::default()
+        };
+        scene
+            .surfaces
+            .sort_unstable_by_key(|surface| surface.scene_node_id);
+        scene
+    }
+
     #[test]
     fn opacity_change_damages_owner_footprint_but_equal_opacity_does_not() {
         let previous = frame_snapshot(&[(7, 1.0)]);
@@ -263,5 +516,86 @@ mod tests {
         let damage =
             opacity_damage_for_frame_snapshots(400, 300, &previous, &current, &scene, &scene);
         assert!(damage.is_empty());
+    }
+
+    #[test]
+    fn clip_change_damages_previous_and_current_visible_group_contribution() {
+        let previous = clip_frame_snapshot(Some(
+            PresentationClipRect::new(10.0, 10.0, 40.0, 40.0).expect("previous clip"),
+        ));
+        let current = clip_frame_snapshot(Some(
+            PresentationClipRect::new(50.0, 10.0, 60.0, 50.0).expect("current clip"),
+        ));
+        let scene = clip_scene();
+        let damage = clip_damage_for_frame_snapshots(400, 300, &previous, &current, &scene, &scene);
+
+        for expected in [
+            NativeDamageRect {
+                x: 10,
+                y: 20,
+                width: 40,
+                height: 30,
+            },
+            NativeDamageRect {
+                x: 50,
+                y: 20,
+                width: 40,
+                height: 40,
+            },
+            NativeDamageRect {
+                x: 100,
+                y: 40,
+                width: 10,
+                height: 20,
+            },
+            NativeDamageRect {
+                x: 20,
+                y: 10,
+                width: 30,
+                height: 10,
+            },
+            NativeDamageRect {
+                x: 50,
+                y: 10,
+                width: 30,
+                height: 10,
+            },
+        ] {
+            assert!(
+                damage.rects.iter().any(|actual| {
+                    actual.left() <= expected.left()
+                        && actual.top() <= expected.top()
+                        && actual.right() >= expected.right()
+                        && actual.bottom() >= expected.bottom()
+                }),
+                "missing owner damage {expected:?} in {:?}",
+                damage.rects
+            );
+        }
+        assert!(damage.rects.iter().all(|rect| rect.right() <= 160));
+    }
+
+    #[test]
+    fn identity_clip_transitions_damage_hidden_and_revealed_content() {
+        let identity = clip_frame_snapshot(None);
+        let bounded = clip_frame_snapshot(Some(
+            PresentationClipRect::new(50.0, 10.0, 20.0, 20.0).expect("bounded clip"),
+        ));
+        let scene = clip_scene();
+
+        let hidden = clip_damage_for_frame_snapshots(400, 300, &identity, &bounded, &scene, &scene);
+        assert!(hidden.rects.iter().any(|rect| {
+            rect.left() <= 10 && rect.top() <= 20 && rect.right() >= 90 && rect.bottom() >= 100
+        }));
+
+        let revealed =
+            clip_damage_for_frame_snapshots(400, 300, &bounded, &identity, &scene, &scene);
+        assert!(revealed.rects.iter().any(|rect| {
+            rect.left() <= 100 && rect.top() <= 40 && rect.right() >= 160 && rect.bottom() >= 90
+        }));
+        assert!(
+            clip_damage_for_frame_snapshots(400, 300, &identity, &identity, &scene, &scene)
+                .is_empty()
+        );
     }
 }

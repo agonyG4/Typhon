@@ -167,6 +167,9 @@ impl CompositorState {
             if self.presentation_animator.has_opacity_track(scene_node_id) {
                 blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
             }
+            if self.presentation_animator.has_clip_track(scene_node_id) {
+                blockers.push(DirectScanoutSceneRejection::PresentationClip);
+            }
         }
 
         if self
@@ -175,6 +178,13 @@ impl CompositorState {
             .is_some_and(|window| !window.canonical_opacity().is_opaque())
         {
             blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
+        }
+        if self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| !window.canonical_clip().is_unbounded())
+        {
+            blockers.push(DirectScanoutSceneRejection::PresentationClip);
         }
 
         if !self.toplevel_surfaces.contains_key(&root_surface_id)
@@ -198,6 +208,13 @@ impl CompositorState {
             self.presented_presentation_opacity_is_non_identity_for_scene_node(scene_node_id)
         }) {
             blockers.push(DirectScanoutSceneRejection::PresentationOpacity);
+        }
+        if candidate_scene_node_id.is_some_and(|scene_node_id| {
+            !self
+                .presented_presentation_clip_for_scene_node(scene_node_id)
+                .is_unbounded()
+        }) {
+            blockers.push(DirectScanoutSceneRejection::PresentationClip);
         }
         if !covering_group.visible_surface_ids_above_covering.is_empty() {
             blockers.push(DirectScanoutSceneRejection::OwnerTreeContentAboveSource);

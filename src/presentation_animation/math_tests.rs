@@ -11,6 +11,16 @@ fn close(actual: f64, expected: f64) {
 }
 
 #[test]
+fn presentation_clip_rect_accepts_finite_zero_area_and_clip_has_explicit_identity() {
+    assert!(PresentationClipRect::new(1.0, -2.0, 0.0, 4.0).is_some());
+    assert!(PresentationClipRect::new(1.0, -2.0, 3.0, 0.0).is_some());
+    assert!(PresentationClipRect::new(f64::NAN, 0.0, 1.0, 1.0).is_none());
+    assert!(PresentationClipRect::new(0.0, 0.0, -1.0, 1.0).is_none());
+    assert!(PresentationClipRect::new(0.0, 0.0, 1.0, f64::INFINITY).is_none());
+    assert_eq!(PresentationClip::default(), PresentationClip::Unbounded);
+}
+
+#[test]
 fn easing_has_exact_start_and_end_samples() {
     let transition = PresentationTransition::new(
         rect(0.0, 10.0, 100.0, 80.0),

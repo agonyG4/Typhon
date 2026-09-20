@@ -271,6 +271,17 @@ impl NativeSceneHistory {
                 .rects,
             )
             .union_surface_rects(
+                clip_damage_for_frame_snapshots(
+                    output_width,
+                    output_height,
+                    &previous.presentation,
+                    &current.presentation,
+                    &previous.scene,
+                    &current.scene,
+                )
+                .rects,
+            )
+            .union_surface_rects(
                 lifecycle_damage_rects(&previous.lifecycle, output_width, output_height)
                     .into_iter()
                     .chain(lifecycle_damage_rects(
@@ -418,6 +429,54 @@ mod tests {
                     7,
                     oblivion_one::compositor::PresentationRect::new(x, 0.0, 100.0, 80.0)
                         .expect("valid window rect"),
+                ),
+            ],
+        );
+        NativeFrameSceneSnapshot {
+            output_id,
+            frame_id,
+            render_generation: frame_id,
+            scene: NativeSceneSnapshot::default(),
+            cursor_damage: NativeCursorDamageBounds::default(),
+            presentation,
+            lifecycle: LifecycleFrameSnapshot::default(),
+        }
+    }
+
+    fn snapshot_with_group_clip(
+        frame_id: u64,
+        root_surface_id: u32,
+        clip: oblivion_one::presentation_animation::PresentationClip,
+        presented_clip: Option<oblivion_one::presentation_animation::PresentationClipRect>,
+        transition: Option<
+            oblivion_one::presentation_animation::PresentationClipTransitionEvidence,
+        >,
+    ) -> NativeFrameSceneSnapshot {
+        let output_id = OutputId::from_raw(1).expect("nonzero output id");
+        let scene_node_id =
+            oblivion_one::core::SceneNodeId::from_raw(7).expect("WindowGroup scene node");
+        let mut sample = oblivion_one::compositor::PresentationSceneSample::empty_for_output(
+            output_id,
+            oblivion_one::compositor::AnimationTime::from_nanos(frame_id),
+            oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+        );
+        sample.clips.push(
+            oblivion_one::presentation_animation::PresentationGroupClip::with_scene_node(
+                scene_node_id,
+                root_surface_id,
+                clip,
+                presented_clip,
+                transition,
+            ),
+        );
+        let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &sample,
+            vec![
+                oblivion_one::compositor::PresentedWindowGeometry::with_scene_node(
+                    scene_node_id,
+                    root_surface_id,
+                    oblivion_one::compositor::PresentationRect::new(0.0, 0.0, 100.0, 80.0)
+                        .expect("valid frame geometry"),
                 ),
             ],
         );
@@ -667,6 +726,82 @@ mod tests {
             .expect("C transition must remain available");
         assert_eq!(transition.previous_frame_id, Some(2));
         assert_eq!(transition.current_frame_id, 3);
+    }
+
+    #[test]
+    fn submitted_xwayland_clip_evidence_survives_backing_replacement_unchanged() {
+        use oblivion_one::presentation_animation::{
+            PresentationClip, PresentationClipRect, PresentationClipTransitionEvidence,
+        };
+
+        let scene_node_id =
+            oblivion_one::core::SceneNodeId::from_raw(7).expect("WindowGroup scene node");
+        let output_id = OutputId::from_raw(1).expect("output");
+        let transaction_id =
+            oblivion_one::presentation_animation::PresentationTransactionId::from_raw(55)
+                .expect("transaction");
+        let revision_id =
+            oblivion_one::presentation_animation::PresentationRevisionId::from_raw(66)
+                .expect("revision");
+        let clip_a = PresentationClipRect::new(4.0, 5.0, 40.0, 30.0).expect("root A clip");
+        let clip_b = PresentationClipRect::new(12.0, 15.0, 20.0, 25.0).expect("root B clip");
+        let frozen_a = snapshot_with_group_clip(
+            1,
+            70,
+            PresentationClip::Rect(clip_a),
+            Some(clip_a),
+            Some(PresentationClipTransitionEvidence {
+                transaction_id,
+                revision_id,
+                mathematically_settled: true,
+            }),
+        );
+        let root_b_frame =
+            snapshot_with_group_clip(2, 80, PresentationClip::Rect(clip_b), Some(clip_b), None);
+        let mut history = NativeSceneHistory::new(snapshot(0));
+        assert!(history.replace_ready(frozen_a));
+        assert!(history.queue_submission(20));
+
+        // The next frame uses root B, but the submitted root A snapshot stays frozen.
+        assert!(history.replace_ready(root_b_frame));
+        assert!(history.queue_submission(30));
+        let (_, submitted_a) = history
+            .submitted
+            .iter()
+            .find(|(token, _)| *token == 20)
+            .expect("root A frame remains submitted");
+        let clip = submitted_a
+            .presentation
+            .clips
+            .first()
+            .expect("submitted Clip evidence");
+        assert_eq!(clip.scene_node_id, scene_node_id);
+        assert_eq!(clip.root_surface_id, 70);
+        assert_eq!(clip.clip, PresentationClip::Rect(clip_a));
+        let transition = clip.transition.expect("submitted exact Clip revision");
+        assert_eq!(transition.transaction_id, transaction_id);
+        assert_eq!(transition.revision_id, revision_id);
+        assert_eq!(submitted_a.presentation.output_id, output_id);
+
+        assert!(history.promote_pageflip(20));
+        let promoted_a = history
+            .presented_snapshot()
+            .expect("root A frame physically promoted");
+        assert_eq!(promoted_a.presentation.clips[0].root_surface_id, 70);
+        assert_eq!(
+            promoted_a.presentation.clips[0].clip,
+            PresentationClip::Rect(clip_a)
+        );
+
+        assert!(history.promote_pageflip(30));
+        let promoted_b = history
+            .presented_snapshot()
+            .expect("root B frame physically promoted");
+        assert_eq!(promoted_b.presentation.clips[0].root_surface_id, 80);
+        assert_eq!(
+            promoted_b.presentation.clips[0].clip,
+            PresentationClip::Rect(clip_b)
+        );
     }
 
     #[test]

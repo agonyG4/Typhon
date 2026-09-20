@@ -13,7 +13,8 @@ use super::{
 use crate::core::SceneNodeId;
 use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
 use crate::presentation_animation::{
-    PresentationGroupOpacity, PresentationGroupTransform, PresentationRect,
+    PresentationClipRect, PresentationGroupClip, PresentationGroupOpacity,
+    PresentationGroupTransform, PresentationRect,
 };
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 #[cfg(test)]
@@ -878,6 +879,7 @@ pub struct DesktopSceneRenderer {
     decoration_damage_rects: Vec<DecorationRect>,
     popup_surface_ids: Vec<u32>,
     presentation_opacities: HashMap<u32, f32>,
+    presentation_clips: HashMap<u32, PresentationClipRect>,
     presentation_owner_roots: HashMap<u32, u32>,
 }
 
@@ -912,6 +914,7 @@ impl DesktopSceneRenderer {
             decoration_damage_rects: Vec::new(),
             popup_surface_ids: Vec::new(),
             presentation_opacities: HashMap::new(),
+            presentation_clips: HashMap::new(),
             presentation_owner_roots: HashMap::new(),
         }
     }
@@ -921,17 +924,36 @@ impl DesktopSceneRenderer {
         opacities: &[PresentationGroupOpacity],
         owner_roots: impl IntoIterator<Item = (u32, u32)>,
     ) {
+        self.set_presentation_projection_with_clips(opacities, &[], owner_roots);
+    }
+
+    pub fn set_presentation_projection_with_clips(
+        &mut self,
+        opacities: &[PresentationGroupOpacity],
+        clips: &[PresentationGroupClip],
+        owner_roots: impl IntoIterator<Item = (u32, u32)>,
+    ) {
         let next_opacities = opacities
             .iter()
             .map(|entry| (entry.root_surface_id, entry.opacity.get() as f32))
             .collect::<HashMap<_, _>>();
+        let next_clips = clips
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .presented_clip
+                    .map(|rect| (entry.root_surface_id, rect))
+            })
+            .collect::<HashMap<_, _>>();
         let next_owner_roots = owner_roots.into_iter().collect::<HashMap<_, _>>();
         if next_opacities == self.presentation_opacities
+            && next_clips == self.presentation_clips
             && next_owner_roots == self.presentation_owner_roots
         {
             return;
         }
         self.presentation_opacities = next_opacities;
+        self.presentation_clips = next_clips;
         self.presentation_owner_roots = next_owner_roots;
         self.scene_width = 0;
         self.scene_height = 0;
@@ -1279,6 +1301,7 @@ impl DesktopSceneRenderer {
                 decorations: &self.decoration_instances,
                 popup_surface_ids: &self.popup_surface_ids,
                 presentation_opacities: &self.presentation_opacities,
+                presentation_clips: &self.presentation_clips,
                 presentation_owner_roots: &self.presentation_owner_roots,
                 clip: Some(damage_rect),
             });
@@ -1355,6 +1378,7 @@ impl DesktopSceneRenderer {
             decorations: &self.decoration_instances,
             popup_surface_ids: &self.popup_surface_ids,
             presentation_opacities: &self.presentation_opacities,
+            presentation_clips: &self.presentation_clips,
             presentation_owner_roots: &self.presentation_owner_roots,
             clip: None,
         });
@@ -1852,6 +1876,7 @@ struct WindowVisualDrawRequest<'a> {
     decorations: &'a [DecorationRenderInstance],
     popup_surface_ids: &'a [u32],
     presentation_opacities: &'a HashMap<u32, f32>,
+    presentation_clips: &'a HashMap<u32, PresentationClipRect>,
     presentation_owner_roots: &'a HashMap<u32, u32>,
     clip: Option<OutputRect>,
 }
@@ -1867,10 +1892,33 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
         decorations,
         popup_surface_ids,
         presentation_opacities,
+        presentation_clips,
         presentation_owner_roots,
         clip,
     } = request;
     for group in window_visual_stack_order_with_popups(surfaces, decorations, popup_surface_ids) {
+        let owner_root = presentation_owner_roots
+            .get(&group.root_surface_id())
+            .copied()
+            .unwrap_or_else(|| {
+                group
+                    .decoration_index()
+                    .and_then(|index| decorations.get(index))
+                    .map(DecorationRenderInstance::root_surface_id)
+                    .unwrap_or_else(|| group.root_surface_id())
+            });
+        let group_clip = presentation_clips.get(&owner_root).copied();
+        if group_clip.is_some_and(PresentationClipRect::is_empty) {
+            continue;
+        }
+        let effective_clip = group_clip
+            .map(|clip| presentation_clip_output_rect(clip, output_scale))
+            .map_or(clip, |group_clip| {
+                clip.map_or(Some(group_clip), |damage| damage.intersection(group_clip))
+            });
+        if group_clip.is_some() && effective_clip.is_none() {
+            continue;
+        }
         for &surface_index in group.surface_indices() {
             let Some((surface, snapshot)) = surfaces
                 .get(surface_index)
@@ -1893,7 +1941,7 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
                     )
                     .copied()
                     .unwrap_or(1.0),
-                clip,
+                effective_clip,
             );
         }
         if let Some(decoration_index) = group.decoration_index()
@@ -1906,10 +1954,10 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
                 decoration,
                 output_scale,
                 presentation_opacities
-                    .get(&decoration.root_surface_id())
+                    .get(&owner_root)
                     .copied()
                     .unwrap_or(1.0),
-                clip,
+                effective_clip,
             );
         }
     }
@@ -2732,6 +2780,20 @@ impl OutputRect {
             width: u32::try_from(right.saturating_sub(i64::from(left))).unwrap_or(u32::MAX),
             height: u32::try_from(bottom.saturating_sub(i64::from(top))).unwrap_or(u32::MAX),
         }
+    }
+}
+
+fn presentation_clip_output_rect(clip: PresentationClipRect, output_scale: f64) -> OutputRect {
+    let scale = normalized_output_scale(output_scale);
+    let left = saturating_i32_from_f64((clip.x() * scale).floor());
+    let top = saturating_i32_from_f64((clip.y() * scale).floor());
+    let right = saturating_i32_from_f64(((clip.x() + clip.width()) * scale).ceil());
+    let bottom = saturating_i32_from_f64(((clip.y() + clip.height()) * scale).ceil());
+    OutputRect {
+        x: left,
+        y: top,
+        width: (i64::from(right) - i64::from(left)).clamp(0, i64::from(u32::MAX)) as u32,
+        height: (i64::from(bottom) - i64::from(top)).clamp(0, i64::from(u32::MAX)) as u32,
     }
 }
 
@@ -3725,6 +3787,96 @@ mod tests {
             frame[3], expected,
             "popup subsurface uses owner opacity exactly once"
         );
+    }
+
+    #[test]
+    fn presentation_clip_masks_client_popup_and_server_decoration_by_owner() {
+        let mut root = solid_test_surface(711, 0, 0, 4, 1, 0xffff_0000);
+        root.visual_clip = Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+            0, 0, 2, 1,
+        )));
+        let mut popup = solid_test_surface(712, 0, 0, 4, 1, 0xff00_00ff);
+        popup.visual_clip = Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+            0, 0, 2, 1,
+        )));
+        popup.placement = SurfacePlacement::subsurface(711, 0, 0);
+        let surfaces = vec![root, popup];
+        let decorations = vec![solid_test_decoration(
+            WindowId::from_raw(1).expect("window id"),
+            711,
+            2,
+            1,
+            [0x00, 0xff, 0x00, 0xff],
+        )];
+        let clip = PresentationClipRect::new(1.0, 0.0, 2.0, 1.0).expect("presentation clip");
+        let group_clip = PresentationGroupClip::with_scene_node(
+            SceneNodeId::from_raw(7).expect("presentation scene node"),
+            711,
+            crate::presentation_animation::PresentationClip::Rect(clip),
+            Some(clip),
+            None,
+        );
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_popup_surface_ids(&[712]);
+        renderer.set_decoration_instances(&decorations);
+        renderer.set_presentation_projection_with_clips(
+            &[],
+            &[group_clip],
+            [(711, 711), (712, 711)],
+        );
+        let mut frame = vec![0; 4];
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 4,
+            frame_height: 1,
+            output_scale: 1.0,
+            surfaces: &surfaces,
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        assert_eq!(frame[0], OUTPUT_BACKGROUND);
+        assert_ne!(frame[1], OUTPUT_BACKGROUND);
+        assert_eq!(frame[2], OUTPUT_BACKGROUND);
+        assert_eq!(frame[3], OUTPUT_BACKGROUND);
+    }
+
+    #[test]
+    fn zero_area_presentation_clip_emits_no_client_or_decoration_pixels() {
+        let surface = solid_test_surface(713, 0, 0, 4, 1, 0xffff_0000);
+        let decorations = vec![solid_test_decoration(
+            WindowId::from_raw(2).expect("window id"),
+            713,
+            4,
+            1,
+            [0x00, 0xff, 0x00, 0xff],
+        )];
+        let clip = PresentationClipRect::new(2.0, 0.0, 0.0, 1.0).expect("zero clip");
+        let group_clip = PresentationGroupClip::with_scene_node(
+            SceneNodeId::from_raw(8).expect("presentation scene node"),
+            713,
+            crate::presentation_animation::PresentationClip::Rect(clip),
+            Some(clip),
+            None,
+        );
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_decoration_instances(&decorations);
+        renderer.set_presentation_projection_with_clips(&[], &[group_clip], [(713, 713)]);
+        let mut frame = vec![0; 4];
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 4,
+            frame_height: 1,
+            output_scale: 1.0,
+            surfaces: &[surface],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+        assert_eq!(frame, vec![OUTPUT_BACKGROUND; 4]);
     }
 
     #[test]

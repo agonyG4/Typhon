@@ -361,17 +361,29 @@ pub(super) fn native_output_damage_for_presented_scene(
         let Some(previous_presentation) = scene_history.presented_presentation_if_any() else {
             return damage;
         };
-        damage.union_surface_rects(
-            opacity_damage_for_frame_snapshots(
-                width,
-                height,
-                previous_presentation,
-                &resolved_scene.presentation_snapshot,
-                previous_scene,
-                resolved_scene.snapshot_ref(),
+        damage
+            .union_surface_rects(
+                opacity_damage_for_frame_snapshots(
+                    width,
+                    height,
+                    previous_presentation,
+                    &resolved_scene.presentation_snapshot,
+                    previous_scene,
+                    resolved_scene.snapshot_ref(),
+                )
+                .rects,
             )
-            .rects,
-        )
+            .union_surface_rects(
+                clip_damage_for_frame_snapshots(
+                    width,
+                    height,
+                    previous_presentation,
+                    &resolved_scene.presentation_snapshot,
+                    previous_scene,
+                    resolved_scene.snapshot_ref(),
+                )
+                .rects,
+            )
     }
 }
 

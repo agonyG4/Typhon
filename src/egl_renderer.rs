@@ -537,6 +537,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub presentation_visual_signature: u64,
     pub presentation_opacities:
         &'a [oblivion_one::presentation_animation::PresentationGroupOpacity],
+    pub presentation_clips: &'a [oblivion_one::presentation_animation::PresentationGroupClip],
     pub presentation_owner_root_surface_ids: &'a [u32],
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
@@ -613,6 +614,8 @@ pub(crate) struct GlesSceneRenderer {
     presentation_opacities: Vec<f32>,
     cursor_presentation_opacities: Vec<f32>,
     presentation_visual_group_opacities: HashMap<VisualGroupId, f32>,
+    presentation_visual_group_clips: HashMap<VisualGroupId, EglRect>,
+    presentation_visual_group_owners: HashMap<VisualGroupId, u32>,
     scene_visibility_plan: Vec<EglVisibilityDecision>,
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
@@ -646,6 +649,7 @@ pub(crate) struct GlesSceneRenderer {
     effect_output_scale: f32,
     pub(crate) capture_in_progress: bool,
     capture_unattenuated_visual_group: Option<VisualGroupId>,
+    capture_unclipped_presentation_owner: Option<u32>,
 }
 
 struct CaptureRendererState {
@@ -669,6 +673,7 @@ struct CaptureRendererState {
     active_output_texture: Option<glow::Texture>,
     capture_in_progress: bool,
     capture_unattenuated_visual_group: Option<VisualGroupId>,
+    capture_unclipped_presentation_owner: Option<u32>,
 }
 
 impl CaptureRendererState {
@@ -694,6 +699,7 @@ impl CaptureRendererState {
             active_output_texture: renderer.active_output_texture,
             capture_in_progress: renderer.capture_in_progress,
             capture_unattenuated_visual_group: renderer.capture_unattenuated_visual_group,
+            capture_unclipped_presentation_owner: renderer.capture_unclipped_presentation_owner,
         }
     }
 
@@ -718,6 +724,7 @@ impl CaptureRendererState {
         renderer.active_output_texture = self.active_output_texture;
         renderer.capture_in_progress = self.capture_in_progress;
         renderer.capture_unattenuated_visual_group = self.capture_unattenuated_visual_group;
+        renderer.capture_unclipped_presentation_owner = self.capture_unclipped_presentation_owner;
     }
 }
 
@@ -1301,6 +1308,8 @@ impl GlesSceneRenderer {
             presentation_opacities: Vec::new(),
             cursor_presentation_opacities: Vec::new(),
             presentation_visual_group_opacities: HashMap::new(),
+            presentation_visual_group_clips: HashMap::new(),
+            presentation_visual_group_owners: HashMap::new(),
             scene_visibility_plan: Vec::new(),
             scene_cache_key: None,
             presented_scene_key: None,
@@ -1337,6 +1346,7 @@ impl GlesSceneRenderer {
             effect_output_scale: 1.0,
             capture_in_progress: false,
             capture_unattenuated_visual_group: None,
+            capture_unclipped_presentation_owner: None,
         })
     }
 
@@ -1407,6 +1417,20 @@ impl GlesSceneRenderer {
             })
             .unwrap_or(1.0)
             .clamp(0.0, 1.0)
+    }
+
+    fn presentation_clip_for_visual_group(
+        &self,
+        visual_group: Option<VisualGroupId>,
+    ) -> Option<EglRect> {
+        visual_group.and_then(|group| self.presentation_visual_group_clips.get(&group).copied())
+    }
+
+    pub(crate) fn presentation_owner_for_visual_group(
+        &self,
+        visual_group: Option<VisualGroupId>,
+    ) -> Option<u32> {
+        visual_group.and_then(|group| self.presentation_visual_group_owners.get(&group).copied())
     }
 
     fn presentation_opacity_for_root(
@@ -1787,6 +1811,7 @@ impl GlesSceneRenderer {
             effects,
             presentation_visual_signature,
             presentation_opacities,
+            presentation_clips,
             presentation_owner_root_surface_ids,
             popup_surface_ids,
             client_cursor,
@@ -1993,6 +2018,7 @@ impl GlesSceneRenderer {
                 external_overlay_surface_ids,
                 presentation_visual_signature,
                 presentation_opacities,
+                presentation_clips,
                 &presentation_owner_roots_by_surface,
                 framebuffer_origin,
             );
@@ -3042,6 +3068,7 @@ impl GlesSceneRenderer {
         external_overlay_surface_ids: &[u32],
         presentation_geometry_signature: u64,
         presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
+        presentation_clips: &[oblivion_one::presentation_animation::PresentationGroupClip],
         presentation_owner_roots_by_surface: &HashMap<u32, u32>,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
@@ -3051,6 +3078,8 @@ impl GlesSceneRenderer {
         self.commands.clear();
         self.presentation_opacities.clear();
         self.presentation_visual_group_opacities.clear();
+        self.presentation_visual_group_clips.clear();
+        self.presentation_visual_group_owners.clear();
         self.scene_geometry_dirty = true;
         self.vertices.reserve((1 + surfaces.len()) * 6);
         self.commands.reserve(1 + surfaces.len());
@@ -3111,26 +3140,42 @@ impl GlesSceneRenderer {
                     visual_group,
                 );
             }
-            let owner_root = group
-                .surface_indices()
-                .first()
-                .and_then(|index| surfaces.get(*index))
-                .and_then(|surface| presentation_owner_roots_by_surface.get(&surface.surface_id))
+            let group_root = group.root_surface_id();
+            let owner_root = presentation_owner_roots_by_surface
+                .get(&group_root)
                 .copied()
-                .or_else(|| {
-                    group
-                        .decoration_index()
-                        .and_then(|index| decoration_instances.get(index))
-                        .map(DecorationRenderInstance::root_surface_id)
-                })
-                .unwrap_or_else(|| group.root_surface_id());
+                .unwrap_or(group_root);
             let opacity = Self::presentation_opacity_for_root(presentation_opacities, owner_root);
             if let Some(visual_group) = visual_group {
+                self.presentation_visual_group_owners
+                    .insert(visual_group, owner_root);
                 self.presentation_visual_group_opacities
                     .insert(visual_group, opacity);
+                if let Some(clip) = presentation_clips
+                    .iter()
+                    .find(|clip| clip.root_surface_id == owner_root)
+                    .and_then(|clip| clip.presented_clip)
+                {
+                    let scale = output_scale.max(0.01);
+                    self.presentation_visual_group_clips.insert(
+                        visual_group,
+                        EglRect::new(
+                            (clip.x() * scale) as f32,
+                            (clip.y() * scale) as f32,
+                            (clip.width() * scale) as f32,
+                            (clip.height() * scale) as f32,
+                        ),
+                    );
+                }
             }
             for _ in command_start..self.commands.len() {
                 self.presentation_opacities.push(opacity);
+            }
+            let presentation_clip = visual_group
+                .and_then(|visual_group| self.presentation_visual_group_clips.get(&visual_group))
+                .copied();
+            for command in &mut self.commands[command_start..] {
+                command.presentation_clip = presentation_clip;
             }
             if opacity < 1.0 {
                 for command in &mut self.commands[command_start..] {
@@ -4338,6 +4383,8 @@ impl GlesSceneRenderer {
         }
 
         let mut current_sampling = None;
+        let initial_scissor = scissor;
+        let mut current_scissor = scissor;
         let mut commands_considered = 0;
         let mut commands_executed = 0;
         let mut commands_rejected_outside_damage = 0;
@@ -4351,7 +4398,37 @@ impl GlesSceneRenderer {
                 continue;
             }
             commands_considered += 1;
-            if scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
+            let bypass_presentation_clip =
+                self.capture_unclipped_presentation_owner
+                    .is_some_and(|owner| {
+                        command
+                            .visual_group
+                            .and_then(|group| self.presentation_visual_group_owners.get(&group))
+                            .is_some_and(|command_owner| *command_owner == owner)
+                    });
+            let presentation_clip = if bypass_presentation_clip {
+                None
+            } else {
+                command.presentation_clip
+            };
+            let effective_scissor = if let Some(clip) = presentation_clip {
+                let Some(clip) = output_rect_for_egl_clip(clip) else {
+                    continue;
+                };
+                let Some(effective) =
+                    scissor.map_or(Some(clip), |damage| intersect_output_rect(damage, clip))
+                else {
+                    continue;
+                };
+                Some(effective)
+            } else {
+                scissor
+            };
+            if current_scissor != effective_scissor {
+                self.set_scene_scissor(effective_scissor);
+                current_scissor = effective_scissor;
+            }
+            if effective_scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
                 commands_rejected_outside_damage += 1;
                 continue;
             }
@@ -4405,6 +4482,9 @@ impl GlesSceneRenderer {
             commands_executed += 1;
             draw_calls += 1;
         }
+        if current_scissor != initial_scissor {
+            self.set_scene_scissor(initial_scissor);
+        }
         self.frame_stats.commands_considered = self
             .frame_stats
             .commands_considered
@@ -4448,6 +4528,26 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
+    fn set_scene_scissor(&self, scissor: Option<OutputRect>) {
+        unsafe {
+            if let Some(rect) = scissor {
+                let y = match self.current_framebuffer_origin {
+                    OutputFramebufferOrigin::BottomLeft => self
+                        .current_size
+                        .1
+                        .saturating_sub(rect.y.max(0) as u32 + rect.height)
+                        as i32,
+                    OutputFramebufferOrigin::TopLeftScanout => rect.y,
+                };
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl
+                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
+            } else {
+                self.gl.disable(glow::SCISSOR_TEST);
+            }
+        }
+    }
+
     fn draw_capture_commands(
         &mut self,
         command_indices: &[usize],
@@ -4488,10 +4588,22 @@ impl GlesSceneRenderer {
             output_rect.height as f32,
         );
         let visibility_start = host_timing_enabled.then(Instant::now);
+        let unclipped_visual_groups = self
+            .capture_unclipped_presentation_owner
+            .map(|owner| {
+                self.presentation_visual_group_owners
+                    .iter()
+                    .filter_map(|(group, command_owner)| {
+                        (*command_owner == owner).then_some(*group)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let capture_stats = plan_capture_visibility(
             &self.commands,
             command_indices,
             repair,
+            &unclipped_visual_groups,
             &mut self.scene_visibility_plan,
         );
         let visibility_cpu_ns = monotonic_elapsed_ns(visibility_start);
@@ -6454,6 +6566,46 @@ fn gl_scissor_to_output_rect(
     (width > 0 && height > 0).then_some(OutputRect::new(x, top, width as u32, height as u32))
 }
 
+fn output_rect_for_egl_clip(clip: EglRect) -> Option<OutputRect> {
+    if !clip.x().is_finite()
+        || !clip.y().is_finite()
+        || !clip.width().is_finite()
+        || !clip.height().is_finite()
+        || clip.width() <= 0.0
+        || clip.height() <= 0.0
+    {
+        return None;
+    }
+    let left = f64::from(clip.x()).floor();
+    let top = f64::from(clip.y()).floor();
+    let right = (f64::from(clip.x()) + f64::from(clip.width())).ceil();
+    let bottom = (f64::from(clip.y()) + f64::from(clip.height())).ceil();
+    let left = left.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let top = top.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let right = right.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let bottom = bottom.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let width = (i64::from(right) - i64::from(left)).clamp(0, i64::from(u32::MAX)) as u32;
+    let height = (i64::from(bottom) - i64::from(top)).clamp(0, i64::from(u32::MAX)) as u32;
+    (width > 0 && height > 0).then_some(OutputRect::new(left, top, width, height))
+}
+
+pub(super) fn intersect_output_rect(left: OutputRect, right: OutputRect) -> Option<OutputRect> {
+    let x = i64::from(left.x).max(i64::from(right.x));
+    let y = i64::from(left.y).max(i64::from(right.y));
+    let right_edge = i64::from(left.x)
+        .saturating_add(i64::from(left.width))
+        .min(i64::from(right.x).saturating_add(i64::from(right.width)));
+    let bottom_edge = i64::from(left.y)
+        .saturating_add(i64::from(left.height))
+        .min(i64::from(right.y).saturating_add(i64::from(right.height)));
+    (right_edge > x && bottom_edge > y).then_some(OutputRect::new(
+        x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        (right_edge - x).clamp(0, i64::from(u32::MAX)) as u32,
+        (bottom_edge - y).clamp(0, i64::from(u32::MAX)) as u32,
+    ))
+}
+
 pub(crate) fn choose_native_egl_config(
     egl: &EglInstance,
     display: egl::Display,
@@ -6823,6 +6975,8 @@ mod tests {
         LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind,
     };
 
+    mod presentation_clip;
+
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
 
@@ -7095,6 +7249,7 @@ mod tests {
             &[],
             0,
             &[opacity],
+            &[],
             &HashMap::from([(7, owner_root)]),
             OutputFramebufferOrigin::BottomLeft,
         );
@@ -7126,6 +7281,7 @@ mod tests {
             &[],
             0,
             &[opaque],
+            &[],
             &HashMap::from([(7, owner_root)]),
             OutputFramebufferOrigin::BottomLeft,
         );
@@ -7157,6 +7313,7 @@ mod tests {
             &[],
             0,
             &[zero],
+            &[],
             &HashMap::from([(7, owner_root)]),
             OutputFramebufferOrigin::BottomLeft,
         );

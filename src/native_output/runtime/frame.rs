@@ -975,8 +975,9 @@ impl NativeFrameRenderer {
             .set_decoration_instances(&resolved_scene.decorations);
         self.scene_renderer
             .set_popup_surface_ids(&resolved_scene.popup_surface_ids);
-        self.scene_renderer.set_presentation_projection(
+        self.scene_renderer.set_presentation_projection_with_clips(
             &resolved_scene.presentation.opacities,
+            &resolved_scene.presentation.clips,
             resolved_scene
                 .surfaces
                 .iter()
@@ -1093,6 +1094,7 @@ impl NativeFrameRenderer {
                 .presentation
                 .presentation_visual_signature(),
             presentation_opacities: &resolved_scene.presentation.opacities,
+            presentation_clips: &resolved_scene.presentation.clips,
             presentation_owner_root_surface_ids: resolved_scene
                 .presentation_owner_root_surface_ids
                 .as_ref(),

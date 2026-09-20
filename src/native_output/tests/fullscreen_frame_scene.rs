@@ -76,6 +76,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             windows: Vec::new(),
             transforms: Vec::new(),
             opacities: Vec::new(),
+            clips: Vec::new(),
             active_transitions: 0,
             sampled_windows: 0,
         },

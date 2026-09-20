@@ -14,7 +14,10 @@ use super::super::geometry::{
     EglDrawCommand, EglDrawLayer, SurfaceConsumerPlan, add_surface_consumers_for_capture_indices,
     add_surface_consumers_for_command_range,
 };
-use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
+use super::super::{
+    GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult, intersect_output_rect,
+    output_rect_for_egl_clip,
+};
 use super::gpu_timing::{
     CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
     ReplayCaptureExecutionDetail,
@@ -3002,6 +3005,7 @@ fn execute_fullscreen_stage(
             execution_damage,
             output_plan,
             framebuffer_origin,
+            None,
         );
         renderer.gl.bind_vertex_array(None);
         for unit in 0..=pass.inputs.len() {
@@ -3528,6 +3532,8 @@ fn execute_capture(
         .output_rects
         .clone();
     renderer.capture_unattenuated_visual_group = pass.visual_group;
+    renderer.capture_unclipped_presentation_owner =
+        renderer.presentation_owner_for_visual_group(pass.visual_group);
     let draw_result = renderer.draw_capture_commands_for_regions(
         &indices,
         &scissors,
@@ -3536,6 +3542,7 @@ fn execute_capture(
         replay_host_timing_enabled,
     );
     renderer.capture_unattenuated_visual_group = None;
+    renderer.capture_unclipped_presentation_owner = None;
     let mut detail = draw_result?;
     renderer.effect_resources.unbind_render_target(&renderer.gl);
     renderer.bind_active_output_framebuffer();
@@ -4082,6 +4089,11 @@ fn execute_fullscreen_pass(
     } else {
         1.0
     };
+    let presentation_clip = if output_is_framebuffer && pass.kind == RenderPassKind::Composite {
+        renderer.presentation_clip_for_visual_group(pass.visual_group)
+    } else {
+        None
+    };
     let blend_mode = effect_pass_blend_mode(
         pass.kind,
         output_is_framebuffer,
@@ -4319,6 +4331,7 @@ fn execute_fullscreen_pass(
             execution_damage,
             output_plan,
             framebuffer_origin,
+            presentation_clip,
         );
         renderer.gl.bind_vertex_array(None);
         renderer.gl.bind_texture(glow::TEXTURE_2D, None);
@@ -4711,8 +4724,18 @@ fn draw_damage_scissors(
     damage: &EffectRegion,
     target: &oblivion_one::effects::GraphTexturePlan,
     framebuffer_origin: OutputFramebufferOrigin,
+    presentation_clip: Option<super::super::geometry::EglRect>,
 ) {
-    let rects = effect_damage_to_texture_rects(damage, target, framebuffer_origin);
+    let mut rects = effect_damage_to_texture_rects(damage, target, framebuffer_origin);
+    if let Some(clip) = presentation_clip {
+        let clip = output_rect_for_egl_clip(clip);
+        rects = clip.map_or_else(Vec::new, |clip| {
+            rects
+                .into_iter()
+                .filter_map(|damage| intersect_output_rect(damage, clip))
+                .collect()
+        });
+    }
     unsafe {
         gl.enable(glow::SCISSOR_TEST);
         for rect in rects {
@@ -5192,6 +5215,7 @@ mod coordinate_tests {
             visual_group: None,
             bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -5239,6 +5263,7 @@ mod coordinate_tests {
             visual_group: Some(group),
             bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -5316,6 +5341,7 @@ mod coordinate_tests {
             visual_group: Some(group),
             bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -5902,6 +5928,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(0.0, 0.0, 10.0, 10.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ExactNearest,
@@ -5911,6 +5938,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(20.0, 0.0, 10.0, 10.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ExactNearest,
@@ -5920,6 +5948,7 @@ mod tests {
                 visual_group: None,
                 bounds: EglRect::new(40.0, 0.0, 10.0, 10.0),
                 opaque_regions: Vec::new(),
+                presentation_clip: None,
                 vertex_start: 0,
                 vertex_count: 6,
                 sampling: SurfaceSampling::ExactNearest,
@@ -6013,6 +6042,7 @@ mod tests {
                 rect.height as f32,
             ),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -7346,6 +7376,7 @@ mod tests {
             visual_group: None,
             bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -7404,6 +7435,7 @@ mod tests {
             visual_group: None,
             bounds: EglRect::new(x, 0.0, 20.0, 20.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -7470,6 +7502,7 @@ mod tests {
             visual_group: None,
             bounds: EglRect::new(x, 0.0, width, 20.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
@@ -7539,6 +7572,7 @@ mod tests {
             visual_group: None,
             bounds: EglRect::new(x, 0.0, 20.0, 20.0),
             opaque_regions: Vec::new(),
+            presentation_clip: None,
             vertex_start: 0,
             vertex_count: 6,
             sampling: SurfaceSampling::ExactNearest,
