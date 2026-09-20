@@ -9,6 +9,7 @@ use std::{
     fmt,
     os::fd::RawFd,
 };
+use x11rb::connection::{DiscardMode, RequestConnection, RequestKind};
 use x11rb::protocol::xproto;
 mod adoption;
 mod api;
@@ -36,6 +37,7 @@ mod reactor;
 mod resize_runtime;
 mod resize_sync;
 mod root_stack;
+mod selection_wire;
 #[allow(dead_code)]
 pub(crate) mod shape;
 pub(crate) mod startup;
@@ -552,8 +554,16 @@ impl Xwm {
         self.clear_resize_sync_generation(generation);
         self.shapes
             .retain(|handle, _| handle.generation() != generation);
-        self.data_bridge
-            .clear_generation(data_bridge::BridgeGeneration::from(generation));
+        for sequence in self
+            .data_bridge
+            .clear_generation(data_bridge::BridgeGeneration::from(generation))
+        {
+            self.connection.discard_reply(
+                sequence,
+                RequestKind::HasResponse,
+                DiscardMode::DiscardReply,
+            );
+        }
         if generation == self.generation {
             self.focus.reset_generation(generation);
         }

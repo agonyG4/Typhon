@@ -35,13 +35,42 @@ pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> 
         budget_exhausted: processed == budget && budget != 0,
         events_processed: processed,
         property_replies_processed: 0,
+        selection_replies_processed: 0,
         events_quiescent: budget != 0 && processed < budget,
         property_replies_quiescent: true,
+        selection_replies_quiescent: true,
         quiescent: budget != 0 && processed < budget,
     })
 }
+
+fn normalized_window_event_target(event: &Event) -> Option<u32> {
+    match event {
+        Event::CreateNotify(event) => Some(event.window),
+        Event::MapRequest(event) => Some(event.window),
+        Event::MapNotify(event) => Some(event.window),
+        Event::UnmapNotify(event) => Some(event.window),
+        Event::DestroyNotify(event) => Some(event.window),
+        Event::ConfigureRequest(event) => Some(event.window),
+        Event::ConfigureNotify(event) => Some(event.window),
+        Event::ClientMessage(event) => Some(event.window),
+        Event::PropertyNotify(event) => Some(event.window),
+        Event::FocusIn(event) => Some(event.event),
+        Event::FocusOut(event) => Some(event.event),
+        _ => None,
+    }
+}
+
 fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     trace_raw_event(&event);
+    if normalized_window_event_target(&event).is_some_and(|window| {
+        super::selection_wire::is_internal_window(
+            window,
+            Some(xwm.supporting_wm_check),
+            Some(&xwm.data_bridge.selection_wire),
+        )
+    }) {
+        return Ok(());
+    }
     match event {
         Event::CreateNotify(event) => {
             if event.window == xwm.root {
@@ -338,7 +367,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::ClientMessage(event) if event.format == 32 => {
             normalize_client_message(xwm, event)?;
         }
-        Event::PropertyNotify(event) => normalize_property_change(xwm, event)?,
+        Event::PropertyNotify(event) => {
+            normalize_property_change(xwm, event)?;
+        }
+        Event::SelectionNotify(event) => super::selection_wire::selection_notify(xwm, event)?,
+        Event::XfixesSelectionNotify(event) if xwm.capabilities.xfixes => {
+            super::selection_wire::observe_xfixes(xwm, event)?;
+        }
         Event::SyncCounterNotify(event) => {
             if xwm.capabilities.sync {
                 xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
@@ -617,7 +652,11 @@ pub(crate) mod tests {
 
     use super::*;
 
-    pub(crate) fn test_fixture(generation: super::super::XwaylandGeneration) -> (Xwm, UnixStream) {
+    pub(crate) fn connection_fixture() -> (
+        super::super::connection::X11Connection,
+        UnixStream,
+        std::os::fd::RawFd,
+    ) {
         let (stream, peer) = UnixStream::pair().expect("XWM fixture socket pair");
         let reactor_stream = super::super::connection::ReactorStream::from_unix_stream(stream)
             .expect("XWM fixture reactor stream");
@@ -639,14 +678,21 @@ pub(crate) mod tests {
             .expect("XWM fixture X11 connection");
         let raw_fd = std::os::fd::AsRawFd::as_raw_fd(inner.stream());
         let connection = super::super::connection::X11Connection::new(inner, HashMap::new());
-        let atoms = super::super::atoms::XwmAtoms::from_values(
-            super::super::atoms::XwmAtomName::ALL
-                .iter()
-                .enumerate()
-                .map(|(index, name)| (*name, (index as u32).saturating_add(1)))
-                .collect(),
-        );
-        let xwm = Xwm {
+        (connection, peer, raw_fd)
+    }
+
+    pub(crate) fn test_fixture(generation: super::super::XwaylandGeneration) -> (Xwm, UnixStream) {
+        let (connection, peer, raw_fd) = connection_fixture();
+        let mut atom_values = super::super::atoms::XwmAtomName::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (*name, (index as u32).saturating_add(1)))
+            .collect::<HashMap<_, _>>();
+        atom_values.insert(super::super::atoms::XwmAtomName::Clipboard, 0xcafe);
+        atom_values.insert(super::super::atoms::XwmAtomName::Targets, 0xcaff);
+        atom_values.insert(super::super::atoms::XwmAtomName::SelectionTargets, 0xcb00);
+        let atoms = super::super::atoms::XwmAtoms::from_values(atom_values);
+        let mut xwm = Xwm {
             generation,
             connection,
             adoption: Default::default(),
@@ -692,6 +738,17 @@ pub(crate) mod tests {
             supporting_wm_check: 2,
             raw_fd,
         };
+        let bridge_generation = super::super::data_bridge::BridgeGeneration::from(generation);
+        xwm.data_bridge
+            .selections
+            .initialize_generation(bridge_generation);
+        xwm.data_bridge.selection_wire.install_fixture_windows(
+            bridge_generation,
+            0xa010,
+            0xa011,
+            0xa012,
+            0xa013,
+        );
         (xwm, peer)
     }
 
@@ -1572,3 +1629,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "events_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(test)]
+#[path = "selection_wire_regression_tests.rs"]
+mod selection_wire_regression_tests;

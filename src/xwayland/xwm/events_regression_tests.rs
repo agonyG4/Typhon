@@ -66,7 +66,7 @@ fn raw_alarm_notify(
     .serialize()
 }
 
-fn install_extension(
+pub(super) fn install_extension(
     xwm: &mut super::super::Xwm,
     name: &'static str,
     major_opcode: u8,
@@ -83,7 +83,7 @@ fn install_extension(
     )]));
 }
 
-fn read_fixture_requests(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+pub(super) fn read_fixture_requests(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
     peer.set_nonblocking(true)
         .expect("nonblocking fixture peer");
     let mut bytes = Vec::new();

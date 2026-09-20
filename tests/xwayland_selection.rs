@@ -8,24 +8,25 @@ use oblivion_one::xwayland::xwm::data_bridge::{
 fn selection_foundation_keeps_clipboard_and_primary_generation_bound() {
     let generation = BridgeGeneration::new(NonZeroU64::new(1).expect("nonzero"));
     let mut bridge = SelectionBridge::default();
+    bridge.initialize_generation(generation);
     bridge
-        .replace(
+        .observe_owner(
             generation,
             SelectionKind::Clipboard,
-            SelectionOrigin::Wayland,
-            ["TARGETS".to_owned(), "UTF8_STRING".to_owned()],
+            Some(10),
+            Some(SelectionOrigin::Wayland),
             1,
         )
-        .expect("clipboard");
+        .expect("clipboard revision");
     bridge
-        .replace(
+        .observe_owner(
             generation,
             SelectionKind::Primary,
-            SelectionOrigin::X11,
-            ["STRING".to_owned()],
+            Some(20),
+            Some(SelectionOrigin::X11),
             2,
         )
-        .expect("primary");
+        .expect("primary revision");
     assert_eq!(
         bridge.current(SelectionKind::Clipboard).unwrap().timestamp,
         1

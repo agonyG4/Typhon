@@ -24,8 +24,10 @@ The following are present only as generation-bound adapter/model foundations;
 they are not connected end to end and must not be treated as compatibility
 support:
 
-- XFixes CLIPBOARD bridge: inactive foundation;
-- PRIMARY bridge: inactive foundation;
+- XFixes CLIPBOARD ownership and bounded TARGETS discovery exist as an
+  internal XWM wire foundation; cross-protocol transfer remains inactive;
+- PRIMARY ownership and bounded TARGETS discovery use an independent internal
+  XWM wire foundation; cross-protocol transfer remains inactive;
 - Xdnd ClientMessage bridge: inactive foundation;
 - runtime RandR publication: inactive foundation; no live output publication;
 - X11 cursor ownership integration: inactive foundation.

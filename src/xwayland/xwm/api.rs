@@ -234,8 +234,10 @@ impl Xwm {
         let budget = budget.min(XWM_EVENT_BUDGET);
         let mut events_processed = 0;
         let mut replies_processed = 0;
+        let mut selection_replies_processed = 0;
         let mut events_quiescent = budget != 0;
         let mut property_replies_quiescent = budget != 0;
+        let mut selection_replies_quiescent = budget != 0;
         let mut budget_exhausted = false;
         loop {
             let event_budget = budget.saturating_sub(events_processed);
@@ -263,23 +265,42 @@ impl Xwm {
                 budget_exhausted |= drain.budget_exhausted;
                 Some(drain)
             };
+            let selection_budget = budget.saturating_sub(selection_replies_processed);
+            let selection_reply_drain = if selection_budget == 0 {
+                selection_replies_quiescent = false;
+                budget_exhausted = budget_exhausted || budget != 0;
+                None
+            } else {
+                let drain = super::selection_wire::poll_replies(self, selection_budget)?;
+                selection_replies_processed =
+                    selection_replies_processed.saturating_add(drain.processed);
+                selection_replies_quiescent &= drain.quiescent;
+                budget_exhausted |= drain.budget_exhausted;
+                Some(drain)
+            };
             if event_drain.is_none_or(|drain| drain.processed == 0)
                 && reply_drain.is_none_or(|drain| drain.processed == 0)
+                && selection_reply_drain.is_none_or(|drain| drain.processed == 0)
             {
                 break;
             }
         }
-        let quiescent = events_quiescent && property_replies_quiescent;
+        let quiescent =
+            events_quiescent && property_replies_quiescent && selection_replies_quiescent;
         if quiescent {
             self.reconcile_override_redirect_stack()?;
         }
         Ok(XwmDrain {
-            processed: events_processed.saturating_add(replies_processed),
+            processed: events_processed
+                .saturating_add(replies_processed)
+                .saturating_add(selection_replies_processed),
             budget_exhausted,
             events_processed,
             property_replies_processed: replies_processed,
+            selection_replies_processed,
             events_quiescent,
             property_replies_quiescent,
+            selection_replies_quiescent,
             quiescent,
         })
     }

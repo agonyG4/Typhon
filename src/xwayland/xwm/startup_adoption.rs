@@ -47,6 +47,10 @@ impl XwmStartup {
         let mut queued = false;
         let available = MAX_ADOPTION_IN_FLIGHT.saturating_sub(self.adoption_candidates.len());
         for xid in adoption::take_batch(&mut self.adoption_queue, available) {
+            if super::super::selection_wire::is_internal_window(xid, self.supporting_wm_check, None)
+            {
+                continue;
+            }
             if self.adoption_candidates.contains_key(&xid) {
                 continue;
             }

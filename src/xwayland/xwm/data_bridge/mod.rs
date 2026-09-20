@@ -10,6 +10,8 @@ pub mod transfer;
 
 use std::num::NonZeroU64;
 
+use x11rb::connection::SequenceNumber;
+
 use super::super::XwaylandGeneration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,15 +44,18 @@ impl From<XwaylandGeneration> for BridgeGeneration {
 #[derive(Debug, Default)]
 pub struct DataBridge {
     pub selections: selection::SelectionBridge,
+    pub(crate) selection_wire: super::selection_wire::SelectionWireState,
     pub transfers: transfer::TransferManager,
     pub dnd: dnd::DndManager,
 }
 
 impl DataBridge {
-    pub fn clear_generation(&mut self, generation: BridgeGeneration) {
+    pub fn clear_generation(&mut self, generation: BridgeGeneration) -> Vec<SequenceNumber> {
         self.selections.clear_generation(generation);
+        let pending_selection_replies = self.selection_wire.clear_generation(generation);
         self.transfers.clear_generation(generation);
         self.dnd.clear_generation(generation);
+        pending_selection_replies
     }
 
     pub fn active_transfers(&self) -> usize {

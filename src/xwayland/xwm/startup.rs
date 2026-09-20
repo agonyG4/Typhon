@@ -11,7 +11,7 @@ use std::{
 };
 
 use x11rb::{
-    connection::{Connection, RequestConnection},
+    connection::{Connection, DiscardMode, RequestConnection, RequestKind},
     cookie::Cookie,
     protocol::{
         composite,
@@ -1383,6 +1383,18 @@ impl XwmStartup {
             }
         }
         xwm.mark_override_redirect_stack_dirty();
+        if super::selection_wire::initialize(&mut xwm).is_err() {
+            for sequence in xwm
+                .data_bridge
+                .clear_generation(super::data_bridge::BridgeGeneration::from(self.generation))
+            {
+                xwm.connection.discard_reply(
+                    sequence,
+                    RequestKind::HasResponse,
+                    DiscardMode::DiscardReply,
+                );
+            }
+        }
         self.state = XwmStartupState::Running;
         Some(xwm)
     }
@@ -1419,5 +1431,60 @@ mod tests {
         assert!(startup.progress().expect("pending setup").is_none());
         assert!(started.elapsed().as_millis() < 100);
         assert_eq!(startup.state(), XwmStartupState::SocketConnected);
+    }
+
+    #[test]
+    fn missing_xfixes_keeps_managed_xwm_running() {
+        let generation = XwaylandGeneration::new(NonZeroU64::new(2).expect("nonzero"));
+        let (connection, _connection_peer, _) = super::super::events::tests::connection_fixture();
+        let (stream, _startup_peer) = UnixStream::pair().expect("startup stream pair");
+        let mut startup = XwmStartup::new(generation, stream).expect("startup driver");
+        startup.stream = None;
+        startup.setup_reader = None;
+        startup.connection = Some(connection);
+        startup.atoms = Some(XwmAtoms::from_values(
+            XwmAtomName::ALL
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (*name, (index as u32).saturating_add(1)))
+                .collect(),
+        ));
+        startup.capabilities = Some(XwmCapabilities {
+            composite: true,
+            xfixes: false,
+            shape: false,
+            randr: false,
+            sync: false,
+        });
+        startup.root = Some(1);
+        startup.supporting_wm_check = Some(2);
+
+        startup.ownership.note_root_redirect_verified().unwrap();
+        startup
+            .ownership
+            .note_composite_redirect_requested()
+            .unwrap();
+        startup
+            .ownership
+            .note_composite_redirect_verified()
+            .unwrap();
+        startup
+            .ownership
+            .note_supporting_window_requested()
+            .unwrap();
+        startup.ownership.note_supporting_window_created(2).unwrap();
+        startup.ownership.note_ewmh_properties_requested().unwrap();
+        startup.ownership.note_ewmh_properties_installed().unwrap();
+        startup.ownership.note_existing_windows_adopted().unwrap();
+        startup.ownership.note_selection_claim_requested().unwrap();
+        startup.ownership.note_selection_owner_verified(2).unwrap();
+        startup.ownership.queue_manager_message().unwrap();
+
+        let xwm = startup
+            .finish()
+            .expect("XWM reaches Running without XFixes");
+
+        assert_eq!(startup.state(), XwmStartupState::Running);
+        assert!(!xwm.data_bridge.selection_wire.is_active());
     }
 }

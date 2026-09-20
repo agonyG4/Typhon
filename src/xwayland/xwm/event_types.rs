@@ -7,8 +7,10 @@ pub struct XwmDrain {
     pub budget_exhausted: bool,
     pub events_processed: usize,
     pub property_replies_processed: usize,
+    pub selection_replies_processed: usize,
     pub events_quiescent: bool,
     pub property_replies_quiescent: bool,
+    pub selection_replies_quiescent: bool,
     pub quiescent: bool,
 }
 
