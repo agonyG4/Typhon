@@ -1,5 +1,7 @@
 use super::*;
-use oblivion_one::effects::EffectRegion;
+use oblivion_one::effects::{
+    EffectRect, EffectRegion, EffectRegistryGeneration, effect_output_influence_region,
+};
 use std::borrow::Cow;
 
 use oblivion_one::compositor::{
@@ -38,6 +40,176 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) lifecycle_surfaces: Vec<RenderableSurface>,
     pub(crate) lifecycle_decorations: Vec<DecorationRenderInstance>,
     pub(crate) lifecycle_snapshot: LifecycleFrameSnapshot,
+}
+
+fn freeze_presentation_effect_influences(
+    effects: &ResolvedEffectScene,
+    registry_generation: &EffectRegistryGeneration,
+    output_bounds: EffectRect,
+    mut owner_for_surface: impl FnMut(u32) -> Option<(SceneNodeId, u32)>,
+) -> Vec<crate::native_output::output::NativePresentationEffectInfluenceSnapshot> {
+    let mut influences =
+        Vec::<crate::native_output::output::NativePresentationEffectInfluenceSnapshot>::new();
+
+    for instance in &effects.instances {
+        let surface_id = match instance.anchor {
+            oblivion_one::compositor::EffectAnchor::BeforeSurface(surface_id)
+            | oblivion_one::compositor::EffectAnchor::ReplaceSurface(surface_id)
+            | oblivion_one::compositor::EffectAnchor::AfterSurface(surface_id) => surface_id,
+            oblivion_one::compositor::EffectAnchor::OutputPostProcess => continue,
+        };
+        let Some((scene_node_id, root_surface_id)) = owner_for_surface(surface_id) else {
+            eprintln!(
+                "native effects: anchor surface={surface_id} has no presentation owner SceneNode; skipping owner damage evidence"
+            );
+            continue;
+        };
+        let region = match registry_generation.effect_for_program(instance.program) {
+            Some(effect) => effect_output_influence_region(
+                effect.program.aggregate_footprint,
+                &instance.region,
+                output_bounds,
+            ),
+            None => {
+                eprintln!(
+                    "native effects: resolved program {:?} for owner {:?} is missing from the captured registry generation; using output bounds for presentation damage",
+                    instance.program, scene_node_id
+                );
+                EffectRegion::from_rect(output_bounds)
+            }
+        };
+
+        if let Some(existing) = influences
+            .iter_mut()
+            .find(|influence| influence.scene_node_id == scene_node_id)
+        {
+            debug_assert_eq!(existing.presentation_owner_root_surface_id, root_surface_id);
+            existing.region = existing.region.union(&region);
+        } else {
+            influences.push(
+                crate::native_output::output::NativePresentationEffectInfluenceSnapshot {
+                    scene_node_id,
+                    presentation_owner_root_surface_id: root_surface_id,
+                    region,
+                },
+            );
+        }
+    }
+
+    influences.sort_unstable_by_key(|influence| influence.scene_node_id);
+    influences
+}
+
+#[cfg(test)]
+mod presentation_effect_influence_tests {
+    use super::*;
+    use oblivion_one::compositor::{
+        EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
+    };
+    use oblivion_one::effects::{
+        EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId,
+        EffectRegistryGeneration,
+    };
+
+    fn instance(
+        id: u64,
+        program: EffectProgramId,
+        anchor: EffectAnchor,
+        rect: EffectRect,
+    ) -> ResolvedEffectInstance {
+        ResolvedEffectInstance {
+            id: EffectInstanceId::new(id).expect("test instance id"),
+            program,
+            anchor,
+            region: EffectRegion::from_rect(rect),
+            target_bounds: rect,
+            parameter_block: EffectParameterBlock::default(),
+            signature: id,
+            frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::Surface,
+            scene_order: EffectSceneOrder::for_anchor(anchor),
+        }
+    }
+
+    #[test]
+    fn owned_effects_merge_by_scene_node_and_postprocess_is_excluded() {
+        let generation = EffectRegistryGeneration::with_builtin_background_blur();
+        let program = oblivion_one::effects::builtin_background_blur_program_id();
+        let owner = SceneNodeId::from_raw(7).expect("WindowGroup node");
+        let output_bounds = EffectRect::new(0, 0, 400, 300).expect("output bounds");
+        let first_rect = EffectRect::new(50, 50, 30, 30).expect("first effect");
+        let second_rect = EffectRect::new(200, 100, 20, 20).expect("second effect");
+        let post_rect = EffectRect::new(300, 200, 40, 30).expect("postprocess effect");
+        let effects = ResolvedEffectScene::new(
+            1,
+            vec![
+                instance(1, program, EffectAnchor::BeforeSurface(10), first_rect),
+                instance(2, program, EffectAnchor::AfterSurface(11), second_rect),
+                instance(3, program, EffectAnchor::OutputPostProcess, post_rect),
+            ],
+        );
+
+        let mut resolved_surfaces = Vec::new();
+        let influences = freeze_presentation_effect_influences(
+            &effects,
+            &generation,
+            output_bounds,
+            |surface_id| {
+                resolved_surfaces.push(surface_id);
+                match surface_id {
+                    10 | 11 => Some((owner, 70)),
+                    _ => None,
+                }
+            },
+        );
+
+        let footprint = generation
+            .effect_for_program(program)
+            .expect("registered builtin effect")
+            .program
+            .aggregate_footprint;
+        let expected = effect_output_influence_region(
+            footprint,
+            &EffectRegion::from_rect(first_rect),
+            output_bounds,
+        )
+        .union(&effect_output_influence_region(
+            footprint,
+            &EffectRegion::from_rect(second_rect),
+            output_bounds,
+        ));
+        assert_eq!(influences.len(), 1);
+        assert_eq!(influences[0].scene_node_id, owner);
+        assert_eq!(influences[0].presentation_owner_root_surface_id, 70);
+        assert_eq!(influences[0].region, expected);
+        assert_eq!(resolved_surfaces, [10, 11]);
+    }
+
+    #[test]
+    fn missing_program_uses_bounded_output_influence_for_its_owner() {
+        let generation = EffectRegistryGeneration::empty();
+        let owner = SceneNodeId::from_raw(7).expect("WindowGroup node");
+        let output_bounds = EffectRect::new(0, 0, 400, 300).expect("output bounds");
+        let effects = ResolvedEffectScene::new(
+            1,
+            vec![instance(
+                1,
+                EffectProgramId::new(777).expect("missing program id"),
+                EffectAnchor::ReplaceSurface(10),
+                EffectRect::new(50, 50, 30, 30).expect("effect"),
+            )],
+        );
+
+        let influences =
+            freeze_presentation_effect_influences(&effects, &generation, output_bounds, |_| {
+                Some((owner, 70))
+            });
+
+        assert_eq!(influences.len(), 1);
+        assert_eq!(influences[0].region, EffectRegion::from_rect(output_bounds));
+        assert_eq!(influences[0].presentation_owner_root_surface_id, 70);
+    }
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
@@ -129,18 +301,34 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
+        let effect_registry_generation = server.trusted_effect_registry().current();
         let effects =
             server.resolved_effect_scene_for_presentation(&presentation, &fullscreen_plan);
-        let snapshot = NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
-            surfaces.as_ref(),
-            canonical_scene_nodes.as_ref(),
-            canonical_owner_roots.as_ref(),
-            decorations
-                .iter()
-                .map(DecorationRenderInstance::scene_snapshot)
-                .collect(),
-            popup_surface_ids.as_ref(),
-        );
+        let mut snapshot =
+            NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
+                surfaces.as_ref(),
+                canonical_scene_nodes.as_ref(),
+                canonical_owner_roots.as_ref(),
+                decorations
+                    .iter()
+                    .map(DecorationRenderInstance::scene_snapshot)
+                    .collect(),
+                popup_surface_ids.as_ref(),
+            );
+        let (output_width, output_height) = server.output_dimensions();
+        if let Some(output_bounds) = EffectRect::new(0, 0, output_width, output_height) {
+            snapshot.presentation_effect_influences = freeze_presentation_effect_influences(
+                &effects,
+                &effect_registry_generation,
+                output_bounds,
+                |surface_id| {
+                    let root_surface_id = server.presentation_owner_root_for_surface(surface_id);
+                    server
+                        .presentation_scene_node_id_for_root(root_surface_id)
+                        .map(|scene_node_id| (scene_node_id, root_surface_id))
+                },
+            );
+        }
         let (snapshot, scene_identity_signature) = finalize_snapshot(
             snapshot,
             &external_overlay_surface_ids,

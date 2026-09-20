@@ -150,6 +150,10 @@ impl OwnCompositorServer {
         self.state.native_output_id()
     }
 
+    pub fn output_dimensions(&self) -> (u32, u32) {
+        self.state.output_dimensions()
+    }
+
     pub fn trusted_effect_registry(&self) -> &crate::effects::TrustedEffectRegistry {
         self.state.trusted_effect_registry()
     }

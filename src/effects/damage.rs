@@ -536,6 +536,28 @@ pub struct EffectDamagePlan {
     pub(crate) output_clip_fallback: Option<EffectRegionClipFallback>,
 }
 
+/// Returns the bounded final output influence of an effect instance.
+///
+/// Sample radii describe source dependency and remain part of the capture and
+/// damage plan. Only output outsets extend the pixels contributed to output.
+pub fn effect_output_influence_region(
+    footprint: EffectFootprint,
+    visible_region: &EffectRegion,
+    output_bounds: EffectRect,
+) -> EffectRegion {
+    visible_region.expand_clamped_xy(
+        footprint
+            .output_outsets
+            .left
+            .max(footprint.output_outsets.right),
+        footprint
+            .output_outsets
+            .top
+            .max(footprint.output_outsets.bottom),
+        output_bounds,
+    )
+}
+
 pub fn plan_effect_damage(
     footprint: EffectFootprint,
     visible_region: &EffectRegion,
@@ -557,17 +579,8 @@ pub fn plan_effect_damage(
         ),
         output_bounds,
     );
-    let output_influence_region = visible_region.expand_clamped_xy(
-        footprint
-            .output_outsets
-            .left
-            .max(footprint.output_outsets.right),
-        footprint
-            .output_outsets
-            .top
-            .max(footprint.output_outsets.bottom),
-        output_bounds,
-    );
+    let output_influence_region =
+        effect_output_influence_region(footprint, visible_region, output_bounds);
     let output_damage_result = source_damage
         .expand_clamped_xy(
             footprint.sample_radius_x,
@@ -618,6 +631,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::EffectOutsets;
 
     fn rounded_test_region(
         x: i32,
@@ -694,6 +708,32 @@ mod tests {
         );
         assert!(plan.output_damage.contains_point(30, 10));
         assert!(plan.output_damage.contains_point(61, 41));
+    }
+
+    #[test]
+    fn final_output_influence_uses_outsets_without_sample_radius() {
+        let footprint = EffectFootprint {
+            sample_radius_x: 50,
+            sample_radius_y: 70,
+            output_outsets: EffectOutsets {
+                left: 10,
+                right: 20,
+                top: 30,
+                bottom: 40,
+            },
+        };
+        let visible = EffectRegion::from_rect(EffectRect::new(100, 100, 100, 100).unwrap());
+
+        let influence = effect_output_influence_region(
+            footprint,
+            &visible,
+            EffectRect::new(0, 0, 400, 300).unwrap(),
+        );
+
+        assert_eq!(
+            influence.rects(),
+            &[EffectRect::new(80, 60, 140, 180).unwrap()]
+        );
     }
 
     #[test]

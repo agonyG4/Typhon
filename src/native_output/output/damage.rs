@@ -343,6 +343,17 @@ pub(crate) struct NativeSceneSurfaceSnapshot {
     pub(crate) content_generation: u64,
     pub(crate) commit_sequence: u64,
 }
+
+/// Frozen final output influence for the effects owned by one WindowGroup in
+/// one physical frame. `scene_node_id` is the semantic owner; the root surface
+/// is retained only as that frame's backing adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativePresentationEffectInfluenceSnapshot {
+    pub(crate) scene_node_id: SceneNodeId,
+    pub(crate) presentation_owner_root_surface_id: u32,
+    pub(crate) region: oblivion_one::effects::EffectRegion,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NativeSceneSnapshot {
     pub(crate) surfaces: Vec<NativeSceneSurfaceSnapshot>,
@@ -350,6 +361,7 @@ pub(crate) struct NativeSceneSnapshot {
     pub(crate) popup_surface_ids: Vec<u32>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
     pub(crate) effect_damage: oblivion_one::effects::EffectRegion,
+    pub(crate) presentation_effect_influences: Vec<NativePresentationEffectInfluenceSnapshot>,
     pub(crate) effect_identity_signature: u64,
     pub(crate) visibility_signature: u64,
     pub(crate) surface_order_signature: u64,
@@ -455,6 +467,7 @@ impl NativeSceneSnapshot {
             popup_surface_ids: popup_surface_ids.to_vec(),
             external_overlay_surface_ids: Vec::new(),
             effect_damage: oblivion_one::effects::EffectRegion::empty(),
+            presentation_effect_influences: Vec::new(),
             effect_identity_signature: 0,
             visibility_signature: 0,
             surface_order_signature,

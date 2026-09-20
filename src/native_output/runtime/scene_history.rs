@@ -414,6 +414,19 @@ mod tests {
         }
     }
 
+    fn output_damage_covers(damage: &OutputDamage, expected: NativeDamageRect) -> bool {
+        match damage {
+            OutputDamage::Full => true,
+            OutputDamage::Empty => false,
+            OutputDamage::Rects(rects) => rects.iter().any(|actual| {
+                i64::from(actual.x) <= expected.left()
+                    && i64::from(actual.y) <= expected.top()
+                    && i64::from(actual.x) + i64::from(actual.width) >= expected.right()
+                    && i64::from(actual.y) + i64::from(actual.height) >= expected.bottom()
+            }),
+        }
+    }
+
     fn snapshot_with_root(frame_id: u64, x: f64) -> NativeFrameSceneSnapshot {
         let output_id = OutputId::from_raw(1).expect("nonzero output id");
         let sample = oblivion_one::compositor::PresentationSceneSample::empty_for_output(
@@ -743,9 +756,9 @@ mod tests {
         let revision_id =
             oblivion_one::presentation_animation::PresentationRevisionId::from_raw(66)
                 .expect("revision");
-        let clip_a = PresentationClipRect::new(4.0, 5.0, 40.0, 30.0).expect("root A clip");
-        let clip_b = PresentationClipRect::new(12.0, 15.0, 20.0, 25.0).expect("root B clip");
-        let frozen_a = snapshot_with_group_clip(
+        let clip_a = PresentationClipRect::new(100.0, 0.0, 100.0, 80.0).expect("root A clip");
+        let clip_b = PresentationClipRect::new(200.0, 100.0, 100.0, 80.0).expect("root B clip");
+        let mut frozen_a = snapshot_with_group_clip(
             1,
             70,
             PresentationClip::Rect(clip_a),
@@ -756,8 +769,28 @@ mod tests {
                 mathematically_settled: true,
             }),
         );
-        let root_b_frame =
+        let region_a = oblivion_one::effects::EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(120, 10, 60, 40).expect("frame A influence"),
+        );
+        frozen_a.scene.presentation_effect_influences.push(
+            super::super::output::NativePresentationEffectInfluenceSnapshot {
+                scene_node_id,
+                presentation_owner_root_surface_id: 70,
+                region: region_a.clone(),
+            },
+        );
+        let mut root_b_frame =
             snapshot_with_group_clip(2, 80, PresentationClip::Rect(clip_b), Some(clip_b), None);
+        let region_b = oblivion_one::effects::EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(220, 110, 60, 40).expect("frame B influence"),
+        );
+        root_b_frame.scene.presentation_effect_influences.push(
+            super::super::output::NativePresentationEffectInfluenceSnapshot {
+                scene_node_id,
+                presentation_owner_root_surface_id: 80,
+                region: region_b.clone(),
+            },
+        );
         let mut history = NativeSceneHistory::new(snapshot(0));
         assert!(history.replace_ready(frozen_a));
         assert!(history.queue_submission(20));
@@ -782,6 +815,27 @@ mod tests {
         assert_eq!(transition.transaction_id, transaction_id);
         assert_eq!(transition.revision_id, revision_id);
         assert_eq!(submitted_a.presentation.output_id, output_id);
+        assert_eq!(
+            submitted_a.scene.presentation_effect_influences[0].region,
+            region_a
+        );
+        assert_eq!(
+            submitted_a.scene.presentation_effect_influences[0].presentation_owner_root_surface_id,
+            70
+        );
+
+        let prepared_a = history
+            .prepare_pageflip_transition(20, 400, 300)
+            .expect("submitted A transition remains frozen");
+        assert!(output_damage_covers(
+            &prepared_a.damage,
+            NativeDamageRect {
+                x: 120,
+                y: 10,
+                width: 60,
+                height: 40,
+            }
+        ));
 
         assert!(history.promote_pageflip(20));
         let promoted_a = history
@@ -793,10 +847,38 @@ mod tests {
             PresentationClip::Rect(clip_a)
         );
 
+        let prepared_b = history
+            .prepare_pageflip_transition(30, 400, 300)
+            .expect("submitted B transition compares the frozen A and B scenes");
+        for expected in [
+            NativeDamageRect {
+                x: 120,
+                y: 10,
+                width: 60,
+                height: 40,
+            },
+            NativeDamageRect {
+                x: 220,
+                y: 110,
+                width: 60,
+                height: 40,
+            },
+        ] {
+            assert!(output_damage_covers(&prepared_b.damage, expected));
+        }
+
         assert!(history.promote_pageflip(30));
         let promoted_b = history
             .presented_snapshot()
             .expect("root B frame physically promoted");
+        assert_eq!(
+            promoted_b.scene.presentation_effect_influences[0].region,
+            region_b
+        );
+        assert_eq!(
+            promoted_b.scene.presentation_effect_influences[0].presentation_owner_root_surface_id,
+            80
+        );
         assert_eq!(promoted_b.presentation.clips[0].root_surface_id, 80);
         assert_eq!(
             promoted_b.presentation.clips[0].clip,
