@@ -132,6 +132,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) surface_configured: bool,
     pub(in crate::compositor::tests) surface_configure_count: usize,
     pub(in crate::compositor::tests) surface_configure_serials: Vec<u32>,
+    pub(in crate::compositor::tests) suppress_xdg_surface_ack: bool,
+    pub(in crate::compositor::tests) suppress_xdg_surface_commit: bool,
     pub(in crate::compositor::tests) layer_surface_configured: bool,
     pub(in crate::compositor::tests) layer_surface_configure_count: usize,
     pub(in crate::compositor::tests) layer_surface_configure_serials: Vec<u32>,
@@ -155,6 +157,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) toplevel_wm_capabilities_count: usize,
     pub(in crate::compositor::tests) toplevel_wm_capabilities: Vec<u32>,
     pub(in crate::compositor::tests) toplevel_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) decoration_configure_count: usize,
+    pub(in crate::compositor::tests) decoration_configure_modes: Vec<u32>,
     pub(in crate::compositor::tests) toplevel_width: i32,
     pub(in crate::compositor::tests) toplevel_height: i32,
     pub(in crate::compositor::tests) toplevel_states: Vec<u8>,
@@ -1817,8 +1821,12 @@ impl Dispatch<client_xdg_surface::XdgSurface, ()> for RegistryTestState {
             state.surface_configure_count += 1;
             state.surface_configure_serials.push(serial);
             state.toplevel_event_log.push("xdg_surface_configure");
-            proxy.ack_configure(serial);
-            commit_registered_initial_xdg_test_buffer(proxy);
+            if !state.suppress_xdg_surface_ack {
+                proxy.ack_configure(serial);
+            }
+            if !state.suppress_xdg_surface_commit {
+                commit_registered_initial_xdg_test_buffer(proxy);
+            }
             let _ = conn.roundtrip();
         }
     }
@@ -1923,13 +1931,23 @@ impl Dispatch<client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()>
     for RegistryTestState
 {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
-        _event: client_zxdg_toplevel_decoration_v1::Event,
+        event: client_zxdg_toplevel_decoration_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        if let client_zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
+            let mode = match mode {
+                WEnum::Value(client_zxdg_toplevel_decoration_v1::Mode::ClientSide) => 1,
+                WEnum::Value(client_zxdg_toplevel_decoration_v1::Mode::ServerSide) => 2,
+                WEnum::Unknown(mode) => mode,
+            };
+            state.decoration_configure_count += 1;
+            state.decoration_configure_modes.push(mode);
+            state.toplevel_event_log.push("decoration_configure");
+        }
     }
 }
 
