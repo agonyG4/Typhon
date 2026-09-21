@@ -62,12 +62,8 @@ impl WindowDecorationState {
             .effective_mode(self.object_present, fullscreen)
     }
 
-    pub(in crate::compositor) const fn applied_mode(self, fullscreen: bool) -> DecorationMode {
-        if fullscreen {
-            DecorationMode::None
-        } else {
-            self.applied_mode
-        }
+    pub(in crate::compositor) const fn applied_mode(self) -> DecorationMode {
+        self.applied_mode
     }
 
     pub(in crate::compositor) fn set_preference(
@@ -191,9 +187,6 @@ impl super::super::CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
-        if mode == ToplevelMode::Fullscreen {
-            return false;
-        }
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
@@ -201,8 +194,11 @@ impl super::super::CompositorState {
             return false;
         };
         if let Some(decoration_state) = self.xdg_decoration_states.get(&surface_id) {
-            return decoration_state.applied_mode(false)
+            return decoration_state.applied_mode()
                 == DecorationMode::ServerSide;
+        }
+        if mode == ToplevelMode::Fullscreen {
+            return false;
         }
         effective_x11_decoration_mode(window, mode) == DecorationMode::ServerSide
     }
@@ -345,7 +341,7 @@ impl super::super::CompositorState {
         let fullscreen = mode == ToplevelMode::Fullscreen;
         let decoration_mode =
             if let Some(decoration_state) = self.xdg_decoration_states.get(&root_surface_id) {
-                decoration_state.applied_mode(fullscreen)
+                decoration_state.applied_mode()
             } else if matches!(window.backend, WindowBackend::X11(_)) {
                 effective_x11_decoration_mode(window, mode)
             } else {
@@ -644,7 +640,7 @@ impl super::super::CompositorState {
                 let decoration_mode = if let Some(decoration_state) =
                     self.xdg_decoration_states.get(&surface.surface_id)
                 {
-                    decoration_state.applied_mode(fullscreen)
+                    decoration_state.applied_mode()
                 } else if matches!(window.backend, WindowBackend::X11(_)) {
                     effective_x11_decoration_mode(window, mode)
                 } else {
