@@ -199,6 +199,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePointerInputMetrics(Sender<PointerInputMetrics>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
+    CaptureNativeDecorationCount(Sender<usize>),
     CaptureNativeFrameSurfaceIds(Sender<Vec<u32>>),
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
@@ -814,6 +815,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureRenderableSurfaceCount(reply) => {
                         let _ = reply.send(server.renderable_surfaces().len());
+                    }
+                    ServerCommand::CaptureNativeDecorationCount(reply) => {
+                        let count = server
+                            .native_decoration_render_instances(&server.renderable_surfaces())
+                            .len();
+                        let _ = reply.send(count);
                     }
                     ServerCommand::CaptureNativeFrameSurfaceIds(reply) => {
                         let _ = reply.send(
@@ -2001,6 +2008,18 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_count(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface count")
+}
+
+pub(in crate::compositor::tests) fn capture_native_decoration_count(
+    commands: &Sender<ServerCommand>,
+) -> usize {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureNativeDecorationCount(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report native decoration count")
 }
 
 pub(in crate::compositor::tests) fn capture_surface_resource_count(

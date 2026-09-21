@@ -80,18 +80,8 @@ impl DecorationClient {
         self.pump(commands)
     }
 
-    fn titlebar_hit(&self, commands: &Sender<ServerCommand>) -> Option<u32> {
-        let surface = capture_renderable_surface_snapshot(commands)
-            .into_iter()
-            .next()
-            .expect("decorated test surface")
-            .clone();
-        capture_pointer_scene_hit(
-            commands,
-            f64::from(surface.origin_x + 80),
-            f64::from(surface.origin_y - 13),
-        )
-        .0
+    fn decoration_count(&self, commands: &Sender<ServerCommand>) -> usize {
+        capture_native_decoration_count(commands)
     }
 }
 
@@ -116,7 +106,7 @@ fn dynamic_client_to_server_waits_for_ack_and_commit() {
         client_zxdg_toplevel_decoration_v1::Mode::ClientSide,
     )
     .expect("connect decoration client");
-    assert!(client.titlebar_hit(&commands).is_none());
+    assert_eq!(client.decoration_count(&commands), 0);
     let generation_before = capture_scene_render_generation(&commands);
     let serial_count_before = client.state.surface_configure_count;
     let decoration_count_before = client.state.decoration_configure_count;
@@ -136,12 +126,12 @@ fn dynamic_client_to_server_waits_for_ack_and_commit() {
         decoration_count_before + 1
     );
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
-    assert!(client.titlebar_hit(&commands).is_none());
+    assert_eq!(client.decoration_count(&commands), 0);
     assert_eq!(capture_scene_render_generation(&commands), generation_before);
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
-    assert!(client.titlebar_hit(&commands).is_some());
+    assert_eq!(client.decoration_count(&commands), 1);
     assert_eq!(
         capture_scene_render_generation(&commands),
         generation_before + 1
@@ -159,7 +149,7 @@ fn dynamic_server_to_client_waits_for_ack_and_commit() {
         client_zxdg_toplevel_decoration_v1::Mode::ServerSide,
     )
     .expect("connect decoration client");
-    assert!(client.titlebar_hit(&commands).is_some());
+    assert_eq!(client.decoration_count(&commands), 1);
     let generation_before = capture_scene_render_generation(&commands);
 
     client
@@ -167,12 +157,12 @@ fn dynamic_server_to_client_waits_for_ack_and_commit() {
         .set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
-    assert!(client.titlebar_hit(&commands).is_some());
+    assert_eq!(client.decoration_count(&commands), 1);
     assert_eq!(capture_scene_render_generation(&commands), generation_before);
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
-    assert!(client.titlebar_hit(&commands).is_none());
+    assert_eq!(client.decoration_count(&commands), 0);
     assert_eq!(
         capture_scene_render_generation(&commands),
         generation_before + 1
@@ -194,13 +184,13 @@ fn unset_mode_uses_the_same_configure_transaction() {
     client.decoration.unset_mode();
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
-    assert!(client.titlebar_hit(&commands).is_none());
+    assert_eq!(client.decoration_count(&commands), 0);
     assert_eq!(capture_scene_render_generation(&commands), generation_before);
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
-    assert!(client.titlebar_hit(&commands).is_some());
+    assert_eq!(client.decoration_count(&commands), 1);
     assert_eq!(
         capture_scene_render_generation(&commands),
         generation_before + 1
@@ -275,11 +265,11 @@ fn newest_acknowledged_decoration_configure_wins() {
             [client.state.decoration_configure_modes.len() - 2..],
         &[2, 1]
     );
-    assert!(client.titlebar_hit(&commands).is_none());
+    assert_eq!(client.decoration_count(&commands), 0);
 
     let newest_serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, newest_serial).unwrap();
-    assert!(client.titlebar_hit(&commands).is_none());
+    assert_eq!(client.decoration_count(&commands), 0);
     drop(client);
     stop_server(commands, server_thread);
 }
