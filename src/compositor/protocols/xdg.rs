@@ -190,6 +190,23 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                     return;
                 };
                 let surface_id = compositor_surface_id(&data.surface);
+                if resource.version() < 2
+                    && let Some(surface_data) = data.surface.data::<SurfaceData>()
+                    && (surface_data.has_pending_buffer()
+                        || state.current_surface_buffers.contains_key(&surface_id)
+                        || state
+                            .renderable_surfaces
+                            .iter()
+                            .any(|surface| surface.surface_id == surface_id))
+                {
+                    state.post_protocol_error(
+                        _client,
+                        resource,
+                        zxdg_toplevel_decoration_v1::Error::UnconfiguredBuffer,
+                        "version 1 decoration object created after surface content".to_string(),
+                    );
+                    return;
+                }
                 if state.xdg_decoration_resources.contains_key(&surface_id) {
                     state.post_protocol_error(
                         _client,

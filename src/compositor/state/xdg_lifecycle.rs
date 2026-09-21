@@ -176,7 +176,6 @@ impl XdgSurfaceLifecycle {
         self.configures.clear();
         self.last_acked_serial = None;
         self.last_configured_decoration_mode = None;
-        self.last_acked_decoration_mode = None;
         self.map_state = XdgMapState::AwaitingInitialEmptyCommit;
     }
 
