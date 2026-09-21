@@ -91,4 +91,3 @@ integration tests will drive real client protocol objects and assert:
 Existing native decoration, move, resize, focus, stacking, close, maximize,
 tiling, animation, and XWayland tests remain part of the focused and full
 verification runs.
-

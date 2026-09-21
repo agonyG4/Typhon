@@ -208,4 +208,3 @@
   If prior task commits exist, create a final verification commit only for any
   necessary corrections. Otherwise commit the complete implementation with a
   focused message and report every verification result honestly.
-
