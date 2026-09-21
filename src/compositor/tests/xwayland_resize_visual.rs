@@ -1886,16 +1886,37 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         sealed.placement.local_x.saturating_add(180),
         sealed.placement.local_y,
     );
+    let expected_move_geometry = WindowGeometry::new(expected_move, sealed.width, sealed.height);
     assert_eq!(
         fixture.server.state.surface_placement(fixture.surface_id),
         expected_move
     );
+
+    assert!(fixture.server.state.backend_commands.iter().any(|command| matches!(
+        command,
+        crate::compositor::window_backend::WindowBackendCommand::Configure {
+            window: command_window,
+            geometry,
+            resizing: false,
+            resize_epoch: Some(command_epoch),
+            ..
+        } if *command_window == fixture.server.state.window_id_for_x11_handle(handle).expect("moved X11 window")
+            && *geometry == expected_move_geometry
+            && *command_epoch == resize_epoch
+    )), "post-resize move must retain its enqueue-time resize context until dequeue");
 
     let canonical_after_move = fixture
         .server
         .state
         .x11_authoritative_geometry(handle)
         .expect("moved canonical X11 geometry");
+    let expected_move_x11_geometry = X11Geometry {
+        x: expected_move.local_x,
+        y: expected_move.local_y,
+        width: expected_move_geometry.width,
+        height: expected_move_geometry.height,
+    };
+    assert_eq!(canonical_after_move, expected_move_x11_geometry);
     let commands = fixture
         .server
         .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
@@ -1912,7 +1933,7 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
     assert_eq!(commands, vec![XwmCommand::CompleteResizeSync(handle)]);
     assert_eq!(
         fixture.server.state.x11_authoritative_geometry(handle),
-        Some(canonical_after_move),
+        Some(expected_move_x11_geometry),
         "late resize progress must not overwrite a newer move"
     );
     assert_eq!(
@@ -1925,12 +1946,34 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
             .server
             .state
             .current_visual_root_window_geometry(fixture.surface_id)
-            .expect("current visual geometry")
-            .placement,
-        expected_move
+            .expect("current visual geometry"),
+        expected_move_geometry
     );
     assert_eq!(
         fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
         None
     );
+    assert_eq!(
+        fixture.server.state.x11_resize_interaction_epoch(handle),
+        None,
+        "late presentation must retire the superseded resize context"
+    );
+
+    let commands = fixture.server.take_xwayland_backend_commands(0);
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            XwmCommand::ConfigureFrame { geometry, .. }
+                if *geometry == expected_move_x11_geometry
+        )),
+        "a valid move must survive retirement of its captured resize context"
+    );
+    assert!(!commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::Configure {
+            geometry,
+            resize_epoch: Some(command_epoch),
+            ..
+        } if *geometry == expected_move_x11_geometry && *command_epoch == resize_epoch
+    )));
 }
