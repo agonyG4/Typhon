@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(test)]
 use crate::compositor::decoration::types::DecorationMode;
 use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot};
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};

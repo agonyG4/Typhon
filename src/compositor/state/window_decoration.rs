@@ -53,10 +53,6 @@ impl WindowDecorationState {
         }
     }
 
-    pub(in crate::compositor) const fn preference(self) -> DecorationPreference {
-        self.preference
-    }
-
     pub(in crate::compositor) const fn requested_mode(self, fullscreen: bool) -> DecorationMode {
         self.preference
             .effective_mode(self.object_present, fullscreen)
