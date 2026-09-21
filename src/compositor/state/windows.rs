@@ -1084,6 +1084,17 @@ impl CompositorState {
         states: &[xdg_toplevel::State],
         force_decoration_event: bool,
     ) -> Option<u32> {
+        let decoration_mode = self.xdg_decoration_mode_for_configure(surface_id);
+        if let Some(mode) = decoration_mode
+            && self.xdg_decoration_configure_event_needed(
+                surface_id,
+                mode,
+                force_decoration_event,
+            )
+        {
+            self.send_xdg_decoration_configure(surface_id, mode);
+        }
+
         self.send_wm_capabilities_if_needed(surface_id);
         if let Err(error) = toplevel
             .toplevel
@@ -1095,17 +1106,6 @@ impl CompositorState {
             && compositor_debug_surface_logging_enabled()
         {
             eprintln!("oblivion-one compositor: failed to send toplevel configure: {error:?}");
-        }
-
-        let decoration_mode = self.xdg_decoration_mode_for_configure(surface_id);
-        if let Some(mode) = decoration_mode
-            && self.xdg_decoration_configure_event_needed(
-                surface_id,
-                mode,
-                force_decoration_event,
-            )
-        {
-            self.send_xdg_decoration_configure(surface_id, mode);
         }
 
         let serial = self.next_configure_serial();
