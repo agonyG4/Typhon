@@ -1090,7 +1090,11 @@ mod task_05_8_tests {
         assert_eq!(
             state
                 .presented_window_geometries_for_targets(
-                    &PresentationSceneSample::empty(AnimationTime::from_nanos(0)),
+                    &PresentationSceneSample::empty_for_output(
+                        OutputId::from_raw(1).expect("test output identity"),
+                        AnimationTime::from_nanos(0),
+                        PresentationSampleTimeSource::ZeroFallback,
+                    ),
                     &targets,
                 )
                 .into_iter()
@@ -1358,7 +1362,11 @@ mod task_05_8_tests {
             .presentation_rect_for_geometry(root_id, geometry_b)
             .expect("canonical window B");
         let composed = PresentationFrameSnapshot::from_sample_with_presented_windows(
-            &PresentationSceneSample::empty(AnimationTime::from_nanos(11)),
+            &PresentationSceneSample::empty_for_output(
+                OutputId::from_raw(1).expect("test output identity"),
+                AnimationTime::from_nanos(11),
+                PresentationSampleTimeSource::ZeroFallback,
+            ),
             vec![PresentedWindowGeometry::new(root_id, rect_b)],
         );
         state.publish_presented_presentation(11, &composed);
