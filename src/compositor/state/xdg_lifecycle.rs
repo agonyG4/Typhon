@@ -431,6 +431,39 @@ mod tests {
     }
 
     #[test]
+    fn decoration_mode_stays_bound_to_the_acknowledged_serial() {
+        let mut lifecycle = initialized_lifecycle();
+        lifecycle.record_configure_with_decoration(2, Some(DecorationMode::ServerSide));
+        lifecycle.record_configure_with_decoration(3, Some(DecorationMode::ClientSide));
+
+        assert!(lifecycle.acknowledge(3).is_ok());
+        assert_eq!(
+            lifecycle.take_acked_decoration_mode(),
+            Some(DecorationMode::ClientSide)
+        );
+        assert_eq!(lifecycle.take_acked_decoration_mode(), None);
+    }
+
+    #[test]
+    fn acknowledging_an_older_decoration_configure_preserves_newer_pending_state() {
+        let mut lifecycle = initialized_lifecycle();
+        lifecycle.record_configure_with_decoration(2, Some(DecorationMode::ServerSide));
+        lifecycle.record_configure_with_decoration(3, Some(DecorationMode::ClientSide));
+
+        assert!(lifecycle.acknowledge(2).is_ok());
+        assert_eq!(
+            lifecycle.take_acked_decoration_mode(),
+            Some(DecorationMode::ServerSide)
+        );
+        assert!(lifecycle.has_outstanding_configure());
+        assert!(lifecycle.acknowledge(3).is_ok());
+        assert_eq!(
+            lifecycle.take_acked_decoration_mode(),
+            Some(DecorationMode::ClientSide)
+        );
+    }
+
+    #[test]
     fn unknown_configure_acknowledgement_is_rejected() {
         let mut lifecycle = initialized_lifecycle();
         lifecycle.record_configure(2);

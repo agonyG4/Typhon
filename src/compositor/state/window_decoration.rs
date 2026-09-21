@@ -343,6 +343,7 @@ impl super::super::CompositorState {
             } else {
                 return None;
             };
+        let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
         let chrome_policy = window
             .management
             .map_or(crate::wm::WindowChromePolicy::Full, |management| {
@@ -353,7 +354,7 @@ impl super::super::CompositorState {
             visual_geometry.height,
             decoration_mode,
             mode == ToplevelMode::Maximized,
-            fullscreen,
+            decoration_fullscreen,
             chrome_policy,
             self.decoration_theme.metrics(),
         )?;
@@ -642,6 +643,7 @@ impl super::super::CompositorState {
                 } else {
                     return None;
                 };
+                let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
                 if decoration_mode != DecorationMode::ServerSide {
                     return None;
                 }
@@ -657,7 +659,7 @@ impl super::super::CompositorState {
                     visual_geometry.height,
                     decoration_mode,
                     mode == ToplevelMode::Maximized,
-                    fullscreen,
+                    decoration_fullscreen,
                     chrome_policy,
                     metrics,
                 )?;

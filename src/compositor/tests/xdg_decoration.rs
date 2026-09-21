@@ -9,6 +9,7 @@ struct DecorationClient {
     queue: EventQueue<RegistryTestState>,
     surface: client_wl_surface::WlSurface,
     xdg_surface: client_xdg_surface::XdgSurface,
+    toplevel: client_xdg_toplevel::XdgToplevel,
     manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     decoration: client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
     state: RegistryTestState,
@@ -57,6 +58,7 @@ impl DecorationClient {
             queue,
             surface,
             xdg_surface,
+            toplevel,
             manager,
             decoration,
             state,
@@ -307,6 +309,75 @@ fn initial_map_has_one_coherent_decoration_transaction() {
             "xdg_surface_configure"
         ]
     );
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn destroy_waits_for_commit_and_recreation_cancels_the_transition() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ServerSide,
+    )
+    .expect("connect decoration client");
+    let generation_before = capture_scene_render_generation(&commands);
+    let decoration_events_before = client.state.decoration_configure_count;
+
+    client.decoration.destroy();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
+    assert_eq!(
+        client.state.decoration_configure_count,
+        decoration_events_before
+    );
+    assert_eq!(capture_scene_render_generation(&commands), generation_before);
+
+    let qh = client.queue.handle();
+    client.decoration = client.manager.get_toplevel_decoration(&client.toplevel, &qh, ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn fullscreen_decoration_visibility_follows_the_applied_mode() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ServerSide,
+    )
+    .expect("connect decoration client");
+    assert_eq!(client.decoration_count(&commands), 1);
+
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(client.decoration_count(&commands), 0);
+
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 0);
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
     drop(client);
     stop_server(commands, server_thread);
 }
