@@ -1427,3 +1427,354 @@ fn rotation_bound_failure_recovers_on_distinguishable_timestamp() {
         .is_some()
     );
 }
+
+#[test]
+fn rotation_bound_same_timestamp_revision_remains_quarantined() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+    let (mut xwm, mut peer) = test_fixture(generation(128));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x340, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .unwrap();
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_clipboard_owner_event(0x341, 41, 500, 1))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    peer.write_all(&raw_clipboard_owner_event(0x342, 42, 500, 2))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let requests = read_fixture_requests(&mut peer);
+    assert!(convert_selection_requests(&requests).is_empty());
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        3,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true
+        )
+        .is_none()
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::Failed
+    );
+}
+
+#[test]
+fn rotation_bound_owner_clear_preserves_requestor_hazard() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+    let (mut xwm, mut peer) = test_fixture(generation(129));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x343, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .unwrap();
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_xfixes_selection_event(
+        TEST_CLIPBOARD_ATOM,
+        TEST_CLIPBOARD_OBSERVER_WINDOW,
+        xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+        0,
+        41,
+        500,
+        1,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    peer.write_all(&raw_clipboard_owner_event(0x344, 42, 500, 2))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let requests = read_fixture_requests(&mut peer);
+    assert!(convert_selection_requests(&requests).is_empty());
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        3,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(
+        super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+            true
+        )
+        .is_none()
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .owner,
+        Some(0x344)
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::Failed
+    );
+}
+
+#[test]
+fn rotation_bound_repeated_ambiguous_revisions_stay_bounded() {
+    use super::super::data_bridge::SelectionKind;
+    let (mut xwm, mut peer) = test_fixture(generation(130));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x345, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    for index in 0..32_u32 {
+        peer.write_all(&raw_clipboard_owner_event(
+            0x346 + index,
+            41 + index,
+            500,
+            (index + 1) as u16,
+        ))
+        .unwrap();
+        xwm.drain_events(32).unwrap();
+        let requests = read_fixture_requests(&mut peer);
+        assert!(convert_selection_requests(&requests).is_empty());
+        assert!(
+            fixture_request_opcodes(&requests)
+                .iter()
+                .all(|(opcode, _)| !matches!(*opcode, 1 | 4))
+        );
+    }
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
+        Some(500)
+    );
+}
+
+#[test]
+fn rotation_bound_zero_timestamp_stays_quarantined_until_recovery() {
+    use super::super::data_bridge::SelectionKind;
+    let (mut xwm, mut peer) = test_fixture(generation(131));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x366, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .unwrap();
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_clipboard_owner_event(0x367, 41, 0, 1))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    peer.write_all(&raw_clipboard_owner_event(0x368, 42, 501, 2))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let conversion_c = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .unwrap();
+    assert_eq!(conversion_c.requestor, conversion_a.requestor);
+    assert_eq!(conversion_c.time, 501);
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
+        None
+    );
+}
+
+#[test]
+fn requestor_hazard_isolated_between_clipboard_and_primary() {
+    use super::super::data_bridge::SelectionKind;
+    let (mut xwm, mut peer) = test_fixture(generation(132));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x369, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_clipboard_owner_event(0x36a, 41, 500, 1))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    peer.write_all(&raw_selection_owner_event(
+        TEST_PRIMARY_ATOM,
+        TEST_PRIMARY_OBSERVER_WINDOW,
+        0x36b,
+        42,
+        500,
+        2,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    let primary = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .unwrap();
+    assert_eq!(primary.selection, TEST_PRIMARY_ATOM);
+    assert_eq!(primary.requestor, TEST_PRIMARY_REQUESTOR_WINDOW);
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
+        Some(500)
+    );
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Primary),
+        None
+    );
+}
+
+#[test]
+fn internal_owner_does_not_erase_requestor_hazard() {
+    use super::super::data_bridge::{
+        SelectionKind, SelectionOrigin, selection::TargetsDiscoveryState,
+    };
+    let (mut xwm, mut peer) = test_fixture(generation(133));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x36c, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_clipboard_owner_event(0x36d, 41, 500, 1))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    peer.write_all(&raw_clipboard_owner_event(
+        TEST_CLIPBOARD_REQUESTOR_WINDOW,
+        42,
+        501,
+        2,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    let selection = xwm
+        .data_bridge
+        .selections
+        .current(SelectionKind::Clipboard)
+        .unwrap();
+    assert_eq!(selection.origin, Some(SelectionOrigin::Wayland));
+    assert_eq!(selection.targets_state, TargetsDiscoveryState::Inactive);
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
+        Some(500)
+    );
+}
+
+#[test]
+fn generation_teardown_clears_requestor_hazard() {
+    use super::super::data_bridge::SelectionKind;
+    let generation = generation(134);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x36e, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    xwm.data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_clipboard_owner_event(0x36f, 41, 500, 1))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
+        Some(500)
+    );
+    xwm.clear_generation(generation);
+    assert_eq!(
+        xwm.data_bridge
+            .selection_wire
+            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
+        None
+    );
+    assert!(!xwm.data_bridge.selection_wire.is_active());
+}
