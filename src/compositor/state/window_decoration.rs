@@ -15,8 +15,8 @@ use super::super::{
 };
 use super::hit_testing::PointerSceneHit;
 use super::surface_focus::WindowFocusReason;
-use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
 use crate::compositor::render;
+use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
 use wayland_server::Resource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +190,7 @@ impl super::super::CompositorState {
             return false;
         };
         if let Some(decoration_state) = self.xdg_decoration_states.get(&surface_id) {
-            return decoration_state.applied_mode()
-                == DecorationMode::ServerSide;
+            return decoration_state.applied_mode() == DecorationMode::ServerSide;
         }
         if mode == ToplevelMode::Fullscreen {
             return false;
@@ -280,10 +279,7 @@ impl super::super::CompositorState {
         });
     }
 
-    pub(in crate::compositor) fn apply_acked_xdg_decoration(
-        &mut self,
-        surface_id: u32,
-    ) -> bool {
+    pub(in crate::compositor) fn apply_acked_xdg_decoration(&mut self, surface_id: u32) -> bool {
         let Some(mode) = self.take_acked_xdg_decoration_mode(surface_id) else {
             return false;
         };

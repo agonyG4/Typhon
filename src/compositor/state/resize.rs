@@ -482,14 +482,8 @@ impl CompositorState {
         let width = self.clamp_toplevel_width(surface_id, width);
         let height = self.clamp_toplevel_height(surface_id, height);
         let toplevel = self.toplevel_surfaces.get(&surface_id).cloned()?;
-        let serial = self.send_toplevel_configure(
-            surface_id,
-            &toplevel,
-            width,
-            height,
-            states,
-            false,
-        )?;
+        let serial =
+            self.send_toplevel_configure(surface_id, &toplevel, width, height, states, false)?;
         if crate::compositor::fullscreen::fullscreen_trace_enabled()
             && states.contains(&xdg_toplevel::State::Fullscreen)
         {

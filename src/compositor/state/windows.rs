@@ -1086,11 +1086,7 @@ impl CompositorState {
     ) -> Option<u32> {
         let decoration_mode = self.xdg_decoration_mode_for_configure(surface_id);
         if let Some(mode) = decoration_mode
-            && self.xdg_decoration_configure_event_needed(
-                surface_id,
-                mode,
-                force_decoration_event,
-            )
+            && self.xdg_decoration_configure_event_needed(surface_id, mode, force_decoration_event)
         {
             self.send_xdg_decoration_configure(surface_id, mode);
         }

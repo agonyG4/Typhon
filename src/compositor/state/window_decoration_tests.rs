@@ -57,9 +57,8 @@ fn xdg_state(
         .expect("insert XDG window");
     let mut decoration_state = WindowDecorationState::new();
     decoration_state.set_preference(preference);
-    decoration_state.apply_configured_mode(
-        preference.effective_mode(true, mode == ToplevelMode::Fullscreen),
-    );
+    decoration_state
+        .apply_configured_mode(preference.effective_mode(true, mode == ToplevelMode::Fullscreen));
     state
         .xdg_decoration_states
         .insert(surface.surface_id, decoration_state);

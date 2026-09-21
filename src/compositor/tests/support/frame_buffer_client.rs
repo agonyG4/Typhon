@@ -1063,14 +1063,8 @@ fn create_viewport_dmabuf(
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
-    let buffer = create_test_dmabuf_buffer_with_format(
-        &dmabuf,
-        &qh,
-        0xff22_4466,
-        width,
-        height,
-        format,
-    )?;
+    let buffer =
+        create_test_dmabuf_buffer_with_format(&dmabuf, &qh, 0xff22_4466, width, height, format)?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width, height);
     surface.commit();
