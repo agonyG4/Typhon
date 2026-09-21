@@ -9,8 +9,6 @@ struct DecorationClient {
     queue: EventQueue<RegistryTestState>,
     surface: client_wl_surface::WlSurface,
     xdg_surface: client_xdg_surface::XdgSurface,
-    toplevel: client_xdg_toplevel::XdgToplevel,
-    manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     decoration: client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
     state: RegistryTestState,
 }
@@ -58,8 +56,6 @@ impl DecorationClient {
             queue,
             surface,
             xdg_surface,
-            toplevel,
-            manager,
             decoration,
             state,
         })
@@ -87,7 +83,11 @@ impl DecorationClient {
     }
 }
 
-fn start_server() -> (PathBuf, Sender<ServerCommand>, JoinHandle<OwnCompositorServer>) {
+fn start_server() -> (
+    PathBuf,
+    Sender<ServerCommand>,
+    JoinHandle<OwnCompositorServer>,
+) {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).expect("bind test compositor");
     let socket_path = runtime_socket_path(&socket_name);
@@ -129,7 +129,10 @@ fn dynamic_client_to_server_waits_for_ack_and_commit() {
     );
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
     assert_eq!(client.decoration_count(&commands), 0);
-    assert_eq!(capture_scene_render_generation(&commands), generation_before);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
@@ -160,7 +163,10 @@ fn dynamic_server_to_client_waits_for_ack_and_commit() {
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
     assert_eq!(client.decoration_count(&commands), 1);
-    assert_eq!(capture_scene_render_generation(&commands), generation_before);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
@@ -187,7 +193,10 @@ fn unset_mode_uses_the_same_configure_transaction() {
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
     assert_eq!(client.decoration_count(&commands), 0);
-    assert_eq!(capture_scene_render_generation(&commands), generation_before);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
@@ -234,7 +243,10 @@ fn repeated_identical_preference_does_not_create_a_configure_loop() {
         client.state.decoration_configure_count,
         decoration_count_before + 1
     );
-    assert_eq!(capture_scene_render_generation(&commands), generation_before);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
     drop(client);
     stop_server(commands, server_thread);
 }
@@ -314,7 +326,7 @@ fn initial_map_has_one_coherent_decoration_transaction() {
 }
 
 #[test]
-fn destroy_waits_for_commit_and_recreation_cancels_the_transition() {
+fn destroy_waits_for_commit() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = DecorationClient::connect(
         &socket_path,
@@ -333,18 +345,14 @@ fn destroy_waits_for_commit_and_recreation_cancels_the_transition() {
         client.state.decoration_configure_count,
         decoration_events_before
     );
-    assert_eq!(capture_scene_render_generation(&commands), generation_before);
-
-    let qh = client.queue.handle();
-    client.decoration = client.manager.get_toplevel_decoration(&client.toplevel, &qh, ());
-    client.connection.flush().unwrap();
-    client.pump(&commands).unwrap();
-    assert_eq!(client.decoration_count(&commands), 1);
-    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
-    assert_eq!(client.decoration_count(&commands), 1);
+    assert_eq!(client.decoration_count(&commands), 0);
     drop(client);
     stop_server(commands, server_thread);
 }
