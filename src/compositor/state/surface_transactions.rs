@@ -393,6 +393,7 @@ impl CompositorState {
         let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;
+        let render_generation_before_publication = self.render_generation;
         let inactive_subsurface = self.subsurface_content_is_inactive(surface_id);
         let mut parent_commit_applied = true;
         match attachment {
@@ -518,6 +519,12 @@ impl CompositorState {
                 self.surface_is_visible_in_active_scene(surface_id),
             );
             self.refresh_effect_scene_summary();
+        }
+        if parent_commit_applied
+            && self.apply_acked_xdg_decoration(surface_id)
+            && self.render_generation == render_generation_before_publication
+        {
+            self.advance_render_generation(RenderGenerationCause::WindowDecoration);
         }
     }
 }

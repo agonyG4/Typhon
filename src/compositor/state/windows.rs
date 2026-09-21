@@ -1039,30 +1039,9 @@ impl CompositorState {
         }
 
         if let Some(toplevel) = self.toplevel_surfaces.get(&surface_id).cloned() {
-            self.send_wm_capabilities_if_needed(surface_id);
-            if let Err(error) = toplevel
-                .toplevel
-                .send_event(xdg_toplevel::Event::Configure {
-                    width: 0,
-                    height: 0,
-                    states: Vec::new(),
-                })
-                && compositor_debug_surface_logging_enabled()
-            {
-                eprintln!("oblivion-one compositor: failed to send toplevel configure: {error:?}");
-            }
-            let serial = self.next_configure_serial();
-            if let Err(error) = toplevel
-                .xdg_surface
-                .send_event(xdg_surface::Event::Configure { serial })
-                && compositor_debug_surface_logging_enabled()
-            {
-                eprintln!(
-                    "oblivion-one compositor: failed to send toplevel xdg_surface configure serial={serial}: {error:?}"
-                );
-            }
-            self.record_xdg_configure(surface_id, serial);
-            return true;
+            return self
+                .send_toplevel_configure(surface_id, &toplevel, 0, 0, &[], true)
+                .is_some();
         }
 
         let Some(positioner) = self
@@ -1077,6 +1056,74 @@ impl CompositorState {
         }
 
         false
+    }
+
+    pub(in crate::compositor) fn configure_xdg_surface_for_decoration(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        let can_schedule = self
+            .xdg_surface_lifecycle(surface_id)
+            .is_some_and(XdgSurfaceLifecycle::can_schedule_decoration_configure);
+        if !can_schedule {
+            return false;
+        }
+        let Some(toplevel) = self.toplevel_surfaces.get(&surface_id).cloned() else {
+            return false;
+        };
+        self.send_toplevel_configure(surface_id, &toplevel, 0, 0, &[], true)
+            .is_some()
+    }
+
+    pub(in crate::compositor) fn send_toplevel_configure(
+        &mut self,
+        surface_id: u32,
+        toplevel: &ToplevelSurface,
+        width: u32,
+        height: u32,
+        states: &[xdg_toplevel::State],
+        force_decoration_event: bool,
+    ) -> Option<u32> {
+        self.send_wm_capabilities_if_needed(surface_id);
+        if let Err(error) = toplevel
+            .toplevel
+            .send_event(xdg_toplevel::Event::Configure {
+                width: width as i32,
+                height: height as i32,
+                states: xdg_toplevel_state_bytes(states),
+            })
+            && compositor_debug_surface_logging_enabled()
+        {
+            eprintln!("oblivion-one compositor: failed to send toplevel configure: {error:?}");
+        }
+
+        let decoration_mode = self.xdg_decoration_mode_for_configure(surface_id);
+        if let Some(mode) = decoration_mode
+            && self.xdg_decoration_configure_event_needed(
+                surface_id,
+                mode,
+                force_decoration_event,
+            )
+        {
+            self.send_xdg_decoration_configure(surface_id, mode);
+        }
+
+        let serial = self.next_configure_serial();
+        if let Err(error) = toplevel
+            .xdg_surface
+            .send_event(xdg_surface::Event::Configure { serial })
+            && compositor_debug_surface_logging_enabled()
+        {
+            eprintln!(
+                "oblivion-one compositor: failed to send toplevel xdg_surface configure serial={serial}: {error:?}"
+            );
+        }
+        self.xdg_configure_serials
+            .entry(surface_id)
+            .or_default()
+            .latest_sent = serial;
+        self.record_xdg_configure_with_decoration(surface_id, serial, decoration_mode);
+        Some(serial)
     }
 
     pub(in crate::compositor) fn send_wm_capabilities_if_needed(&mut self, surface_id: u32) {

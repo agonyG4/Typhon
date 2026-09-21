@@ -57,6 +57,9 @@ fn xdg_state(
         .expect("insert XDG window");
     let mut decoration_state = WindowDecorationState::new();
     decoration_state.set_preference(preference);
+    decoration_state.apply_configured_mode(
+        preference.effective_mode(true, mode == ToplevelMode::Fullscreen),
+    );
     state
         .xdg_decoration_states
         .insert(surface.surface_id, decoration_state);
@@ -358,11 +361,13 @@ fn pointer_scene_hit_returns_top_window_decoration_before_lower_client() {
         .expect("front window");
     let mut rear_decoration = WindowDecorationState::new();
     rear_decoration.set_preference(DecorationPreference::ServerSide);
+    rear_decoration.apply_configured_mode(DecorationMode::ServerSide);
     state
         .xdg_decoration_states
         .insert(rear.surface_id, rear_decoration);
     let mut front_decoration = WindowDecorationState::new();
     front_decoration.set_preference(DecorationPreference::ServerSide);
+    front_decoration.apply_configured_mode(DecorationMode::ServerSide);
     state
         .xdg_decoration_states
         .insert(front.surface_id, front_decoration);
