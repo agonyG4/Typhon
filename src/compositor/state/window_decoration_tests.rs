@@ -977,6 +977,26 @@ fn csd_and_fullscreen_have_no_server_decoration_instance() {
 }
 
 #[test]
+fn uncommitted_preference_does_not_render_or_invalidate_ssd() {
+    let surface_id = 52;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let generation_before = state.scene_render_generation;
+
+    state
+        .xdg_decoration_states
+        .get_mut(&surface_id)
+        .expect("test decoration state")
+        .set_preference(DecorationPreference::ServerSide);
+
+    assert!(decoration_instances(&state).is_empty());
+    assert_eq!(state.scene_render_generation, generation_before);
+}
+
+#[test]
 fn maximized_ssd_outer_frame_matches_usable_output_across_repeated_cycles() {
     let mut state = xdg_state(
         test_surface(47),
