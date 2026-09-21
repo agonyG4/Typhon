@@ -818,7 +818,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureNativeDecorationCount(reply) => {
                         let count = server
-                            .native_decoration_render_instances(&server.renderable_surfaces())
+                            .native_decoration_render_instances(server.renderable_surfaces())
                             .len();
                         let _ = reply.send(count);
                     }
