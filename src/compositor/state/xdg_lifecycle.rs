@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::decoration::types::DecorationMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum XdgConstructionState {

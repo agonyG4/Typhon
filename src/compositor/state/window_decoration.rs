@@ -15,6 +15,7 @@ use super::super::{
 };
 use super::hit_testing::PointerSceneHit;
 use super::surface_focus::WindowFocusReason;
+use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
 use crate::compositor::render;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
