@@ -15,11 +15,12 @@ use super::super::geometry::{
     add_surface_consumers_for_command_range,
 };
 use super::super::{
-    GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult, intersect_output_rect,
-    output_rect_for_egl_clip,
+    GlesSceneFrameStats, GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult,
+    intersect_output_rect, output_rect_for_egl_clip,
 };
 use super::gpu_timing::{
-    CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode, PassTimingWork,
+    CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
+    CompositeSceneReplayExecutionDetail, CompositeSceneReplayWork, PassTimingWork,
     ReplayCaptureExecutionDetail,
 };
 use super::{
@@ -1373,15 +1374,69 @@ fn execute_graph_passes_inner(
                         metrics.4,
                     );
                 }
-                renderer.draw_effect_scene_range(
-                    scene_work_state.active_work(),
+                let active_work = scene_work_state.active_work();
+                let composite_scene_replay = if pass.kind == RenderPassKind::Composite
+                    && graph_scope.is_some()
+                    && draw_end > scene_cursor
+                    && !active_work.is_empty()
+                    && !renderer.capture_in_progress
+                {
+                    let work = composite_scene_replay_work(
+                        scene_cursor,
+                        draw_end,
+                        renderer.commands.len(),
+                        active_work,
+                        scene_work_state.pending_checkpoint_requirements(),
+                    );
+                    graph_scope.and_then(|scope| {
+                        renderer.effect_gpu_profiler.begin_composite_scene_replay(
+                            &renderer.gl,
+                            scope,
+                            u64::from(pass.id.get()),
+                            pass.instance.get(),
+                            work,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let replay_host_start = composite_scene_replay.as_ref().map(|_| Instant::now());
+                let replay_stats_before = composite_scene_replay
+                    .as_ref()
+                    .map(|_| renderer.frame_stats);
+                let draw_result = renderer.draw_effect_scene_range(
+                    active_work,
                     scene_cursor,
                     draw_end,
                     framebuffer_origin,
-                )?;
+                );
+                if let Some(replay_span) = composite_scene_replay {
+                    let host_cpu_ns = monotonic_elapsed_ns(replay_host_start);
+                    let detail = finalize_composite_scene_replay_timing(
+                        true,
+                        || {
+                            renderer
+                                .effect_gpu_profiler
+                                .end_composite_scene_replay(&renderer.gl, replay_span)
+                        },
+                        || {
+                            composite_scene_replay_execution_detail(
+                                replay_stats_before
+                                    .expect("Composite replay timing captured before draw"),
+                                renderer.frame_stats,
+                                host_cpu_ns,
+                            )
+                        },
+                    );
+                    if let Some(detail) = detail {
+                        renderer
+                            .effect_gpu_profiler
+                            .attach_composite_scene_replay_execution_detail(replay_span, detail);
+                    }
+                }
+                draw_result?;
                 if draw_end > scene_cursor {
-                    scene_valid_region =
-                        scene_valid_region_after_scene_advance(scene_work_state.active_work());
+                    scene_valid_region = scene_valid_region_after_scene_advance(active_work);
                 }
                 if renderer.effect_trace.enabled() {
                     let metrics = scene_work_state.work_trace_metrics();
@@ -1780,10 +1835,56 @@ fn output_rects_pixels(rects: &[OutputRect]) -> u64 {
     })
 }
 
+fn composite_scene_replay_work(
+    command_start: usize,
+    command_end: usize,
+    scene_commands_total: usize,
+    active_work: &[OutputRect],
+    pending_checkpoint_requirements: usize,
+) -> CompositeSceneReplayWork {
+    let command_count = command_end.saturating_sub(command_start);
+    let active_work_rects = active_work.len();
+    CompositeSceneReplayWork {
+        command_start,
+        command_end,
+        command_count,
+        scene_commands_total,
+        active_work_rects,
+        active_work_pixels: output_rects_pixels(active_work),
+        command_region_pairs: command_count.saturating_mul(active_work_rects),
+        scene_scan_pairs: scene_commands_total.saturating_mul(active_work_rects),
+        pending_checkpoint_requirements,
+    }
+}
+
 fn monotonic_elapsed_ns(start: Option<Instant>) -> u64 {
     start.map_or(0, |start| {
         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     })
+}
+
+fn composite_scene_replay_execution_detail(
+    before: GlesSceneFrameStats,
+    after: GlesSceneFrameStats,
+    host_cpu_ns: u64,
+) -> CompositeSceneReplayExecutionDetail {
+    CompositeSceneReplayExecutionDetail {
+        host_cpu_ns,
+        commands_considered: after
+            .commands_considered
+            .saturating_sub(before.commands_considered),
+        commands_executed: after
+            .commands_executed
+            .saturating_sub(before.commands_executed),
+        draw_calls: after.draw_calls.saturating_sub(before.draw_calls),
+        texture_binds: after.texture_binds.saturating_sub(before.texture_binds),
+        scene_vbo_uploads: after
+            .scene_vbo_uploads
+            .saturating_sub(before.scene_vbo_uploads),
+        scene_vbo_upload_bytes: after
+            .scene_vbo_upload_bytes
+            .saturating_sub(before.scene_vbo_upload_bytes),
+    }
 }
 
 fn replay_capture_host_timing_enabled(host_timing_enabled: bool, direct_capture: bool) -> bool {
@@ -2679,6 +2780,18 @@ fn finalize_pass_timing_and_replay_detail(
     finish_timing();
     if let Some(detail) = replay_execution {
         record_detail(detail);
+    }
+}
+
+fn finalize_composite_scene_replay_timing(
+    timing_allocated: bool,
+    finish_timing: impl FnOnce() -> bool,
+    build_detail: impl FnOnce() -> CompositeSceneReplayExecutionDetail,
+) -> Option<CompositeSceneReplayExecutionDetail> {
+    if timing_allocated && finish_timing() {
+        Some(build_detail())
+    } else {
+        None
     }
 }
 
@@ -7303,6 +7416,71 @@ mod tests {
         assert_eq!(*events.borrow(), ["gpu_end", "aggregate"]);
         assert_eq!(stats.replay_capture_execution_regions, 2);
         assert_eq!(stats.replay_capture_commands_executed, 3);
+    }
+
+    #[test]
+    fn composite_scene_replay_finalization_builds_detail_after_gpu_end() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+
+        events.borrow_mut().push("draw_returns");
+        let detail = finalize_composite_scene_replay_timing(
+            true,
+            || {
+                events.borrow_mut().push("gpu_end");
+                true
+            },
+            || {
+                events.borrow_mut().push("detail_build");
+                CompositeSceneReplayExecutionDetail::default()
+            },
+        );
+        assert!(detail.is_some());
+        events.borrow_mut().push("detail_attach");
+
+        assert_eq!(
+            *events.borrow(),
+            ["draw_returns", "gpu_end", "detail_build", "detail_attach"]
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_finalization_skips_profiler_work_without_span() {
+        let detail = finalize_composite_scene_replay_timing(
+            false,
+            || panic!("disabled profiler must not issue GPU END"),
+            || panic!("disabled profiler must not build execution detail"),
+        );
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn composite_scene_replay_execution_detail_uses_saturating_frame_stat_deltas() {
+        let mut before = GlesSceneFrameStats::default();
+        before.commands_considered = 10;
+        before.commands_executed = 8;
+        before.draw_calls = 7;
+        before.texture_binds = 6;
+        before.scene_vbo_uploads = 5;
+        before.scene_vbo_upload_bytes = 4_000;
+        let mut after = before;
+        after.commands_considered = 15;
+        after.commands_executed = 9;
+        after.draw_calls = 10;
+        after.texture_binds = 12;
+        after.scene_vbo_uploads = 6;
+        after.scene_vbo_upload_bytes = 5_024;
+
+        let detail = composite_scene_replay_execution_detail(before, after, 123);
+
+        assert_eq!(detail.host_cpu_ns, 123);
+        assert_eq!(detail.commands_considered, 5);
+        assert_eq!(detail.commands_executed, 1);
+        assert_eq!(detail.draw_calls, 3);
+        assert_eq!(detail.texture_binds, 6);
+        assert_eq!(detail.scene_vbo_uploads, 1);
+        assert_eq!(detail.scene_vbo_upload_bytes, 1_024);
     }
 
     #[test]

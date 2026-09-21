@@ -14,15 +14,16 @@ const GPU_DISJOINT_EXT: u32 = 0x8fbb;
 const EXPECTED_IN_FLIGHT_GRAPH_SCOPES: usize = 2;
 const CURRENT_BUILTIN_BLUR_PASSES: usize = 2;
 const CURRENT_PASSES_PER_BLUR_INSTANCE: usize = 1 + CURRENT_BUILTIN_BLUR_PASSES * 2 + 1;
+const COMPOSITE_SCENE_REPLAY_SPANS_PER_INSTANCE: usize = 1;
 const TIMING_SPAN_POOL_CAPACITY: usize = 2048;
 const TIMING_QUERY_OBJECT_CAPACITY: usize = TIMING_SPAN_POOL_CAPACITY * 2;
 
-const _: () = assert!(
-    TIMING_SPAN_POOL_CAPACITY
-        >= EXPECTED_IN_FLIGHT_GRAPH_SCOPES
-            * MAX_EFFECT_INSTANCES_PER_OUTPUT
-            * CURRENT_PASSES_PER_BLUR_INSTANCE
-);
+const EXPECTED_TIMING_SPANS_PER_GRAPH_SCOPE: usize = 1 + MAX_EFFECT_INSTANCES_PER_OUTPUT
+    * (CURRENT_PASSES_PER_BLUR_INSTANCE + COMPOSITE_SCENE_REPLAY_SPANS_PER_INSTANCE);
+const EXPECTED_TIMING_SPANS: usize =
+    EXPECTED_IN_FLIGHT_GRAPH_SCOPES * EXPECTED_TIMING_SPANS_PER_GRAPH_SCOPE;
+
+const _: () = assert!(EXPECTED_TIMING_SPANS <= TIMING_SPAN_POOL_CAPACITY);
 const _: () = assert!(TIMING_SPAN_POOL_CAPACITY <= MAX_GRAPH_PASSES);
 
 fn gpu_timing_requested(value: Option<&OsStr>) -> bool {
@@ -55,6 +56,37 @@ pub(crate) struct GraphTimingScope {
     scope_id: u64,
     total: SpanToken,
     frame_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimingSpanPurpose {
+    Total,
+    Pass,
+    CompositeSceneReplay,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CompositeSceneReplayWork {
+    pub(crate) command_start: usize,
+    pub(crate) command_end: usize,
+    pub(crate) command_count: usize,
+    pub(crate) scene_commands_total: usize,
+    pub(crate) active_work_rects: usize,
+    pub(crate) active_work_pixels: u64,
+    pub(crate) command_region_pairs: usize,
+    pub(crate) scene_scan_pairs: usize,
+    pub(crate) pending_checkpoint_requirements: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CompositeSceneReplayExecutionDetail {
+    pub(crate) host_cpu_ns: u64,
+    pub(crate) commands_considered: usize,
+    pub(crate) commands_executed: usize,
+    pub(crate) draw_calls: usize,
+    pub(crate) texture_binds: usize,
+    pub(crate) scene_vbo_uploads: usize,
+    pub(crate) scene_vbo_upload_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,11 +193,13 @@ struct TimingSpanMetadata {
     frame_id: Option<u64>,
     pass_id: Option<u64>,
     instance_id: Option<u64>,
+    purpose: TimingSpanPurpose,
     kind: Option<oblivion_one::effects::RenderPassKind>,
     work: PassTimingWork,
     capture: Option<CaptureTimingMetadata>,
     replay_execution: Option<ReplayCaptureExecutionDetail>,
-    is_total: bool,
+    composite_scene_replay_work: Option<CompositeSceneReplayWork>,
+    composite_scene_replay_execution: Option<CompositeSceneReplayExecutionDetail>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -250,6 +284,29 @@ struct MaxEffectPassTiming {
     target_width: u32,
     target_height: u32,
     capture_mode: Option<CaptureTimingMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxCompositeSceneReplayTiming {
+    duration_ns: u64,
+    owner_pass_id: u64,
+    owner_instance_id: u64,
+    command_start: usize,
+    command_end: usize,
+    command_count: usize,
+    scene_commands_total: usize,
+    active_work_rects: usize,
+    active_work_pixels: u64,
+    command_region_pairs: usize,
+    scene_scan_pairs: usize,
+    pending_checkpoint_requirements: usize,
+    host_cpu_ns: u64,
+    commands_considered: usize,
+    commands_executed: usize,
+    draw_calls: usize,
+    texture_binds: usize,
+    scene_vbo_uploads: usize,
+    scene_vbo_upload_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -385,9 +442,19 @@ struct GpuTimingRecord {
     replay_capture_selection_cpu_ns: u64,
     replay_capture_visibility_cpu_ns: u64,
     replay_capture_draw_submit_cpu_ns: u64,
+    composite_scene_replay_timing_available: bool,
+    composite_scene_replay_expected_spans: usize,
+    composite_scene_replay_resolved_spans: usize,
+    composite_scene_replay_gpu_ns: u64,
+    composite_scene_replay_host_cpu_ns: u64,
+    composite_scene_replay_scene_scan_pairs: usize,
+    composite_scene_replay_commands_executed: usize,
+    composite_scene_replay_draw_calls: usize,
+    composite_scene_replay_texture_binds: usize,
     capture_execution_summary_available: bool,
     max_capture_pass: Option<MaxCapturePassTiming>,
     max_effect_pass: Option<MaxEffectPassTiming>,
+    max_composite_scene_replay: Option<MaxCompositeSceneReplayTiming>,
     graph_gap_attribution_available: bool,
     max_graph_gap: GraphGapTiming,
 }
@@ -455,6 +522,16 @@ struct GraphAggregate {
     capture_execution: Option<CaptureExecutionTimingSummary>,
     max_capture_pass: Option<MaxCapturePassTiming>,
     max_effect_pass: Option<MaxEffectPassTiming>,
+    composite_scene_replay_timing_available: bool,
+    composite_scene_replay_expected_spans: usize,
+    composite_scene_replay_resolved_spans: usize,
+    composite_scene_replay_gpu_ns: u64,
+    composite_scene_replay_host_cpu_ns: u64,
+    composite_scene_replay_scene_scan_pairs: usize,
+    composite_scene_replay_commands_executed: usize,
+    composite_scene_replay_draw_calls: usize,
+    composite_scene_replay_texture_binds: usize,
+    max_composite_scene_replay: Option<MaxCompositeSceneReplayTiming>,
     graph_gap_timeline_valid: bool,
     first_pass_start: Option<TimedPassEndpoint>,
     last_pass_end: Option<TimedPassEndpoint>,
@@ -614,11 +691,13 @@ impl TimingState {
             frame_id,
             pass_id: None,
             instance_id: None,
+            purpose: TimingSpanPurpose::Total,
             kind: None,
             work: PassTimingWork::default(),
             capture: None,
             replay_execution: None,
-            is_total: true,
+            composite_scene_replay_work: None,
+            composite_scene_replay_execution: None,
         });
         let token = token?;
         self.aggregates.push(GraphAggregate {
@@ -652,6 +731,16 @@ impl TimingState {
             capture_execution: None,
             max_capture_pass: None,
             max_effect_pass: None,
+            composite_scene_replay_timing_available: true,
+            composite_scene_replay_expected_spans: 0,
+            composite_scene_replay_resolved_spans: 0,
+            composite_scene_replay_gpu_ns: 0,
+            composite_scene_replay_host_cpu_ns: 0,
+            composite_scene_replay_scene_scan_pairs: 0,
+            composite_scene_replay_commands_executed: 0,
+            composite_scene_replay_draw_calls: 0,
+            composite_scene_replay_texture_binds: 0,
+            max_composite_scene_replay: None,
             graph_gap_timeline_valid: true,
             first_pass_start: None,
             last_pass_end: None,
@@ -686,11 +775,55 @@ impl TimingState {
             aggregate.graph_gap_timeline_valid = false;
         }
         if let Some(token) = token {
-            debug_assert!(!metadata.is_total);
+            debug_assert_eq!(metadata.purpose, TimingSpanPurpose::Pass);
             Some(token)
         } else {
             None
         }
+    }
+
+    fn begin_composite_scene_replay(
+        &mut self,
+        scope: GraphTimingScope,
+        owner_pass_id: u64,
+        owner_instance_id: u64,
+        work: CompositeSceneReplayWork,
+    ) -> Option<SpanToken> {
+        if !self.enabled || !self.has_scope(scope.scope_id) {
+            return None;
+        }
+        let Some(aggregate) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
+        else {
+            return None;
+        };
+        aggregate.composite_scene_replay_expected_spans = aggregate
+            .composite_scene_replay_expected_spans
+            .saturating_add(1);
+        let token = self.allocate_span(TimingSpanMetadata {
+            scope_id: scope.scope_id,
+            frame_id: scope.frame_id,
+            pass_id: Some(owner_pass_id),
+            instance_id: Some(owner_instance_id),
+            purpose: TimingSpanPurpose::CompositeSceneReplay,
+            kind: None,
+            work: PassTimingWork::default(),
+            capture: None,
+            replay_execution: None,
+            composite_scene_replay_work: Some(work),
+            composite_scene_replay_execution: None,
+        });
+        if token.is_none()
+            && let Some(aggregate) = self
+                .aggregates
+                .iter_mut()
+                .find(|aggregate| aggregate.scope_id == scope.scope_id)
+        {
+            aggregate.composite_scene_replay_timing_available = false;
+        }
+        token
     }
 
     fn allocate_span(&mut self, metadata: TimingSpanMetadata) -> Option<SpanToken> {
@@ -738,7 +871,7 @@ impl TimingState {
     ) -> bool {
         let owns_finished_total = self.pending.iter().any(|pending| {
             pending.token == scope.total
-                && pending.metadata.is_total
+                && pending.metadata.purpose == TimingSpanPurpose::Total
                 && pending.metadata.scope_id == scope.scope_id
         });
         if !owns_finished_total {
@@ -759,15 +892,35 @@ impl TimingState {
         &mut self,
         token: SpanToken,
         detail: Option<ReplayCaptureExecutionDetail>,
-    ) {
+    ) -> bool {
         let Some(detail) = detail else {
-            return;
+            return false;
         };
-        if let Some(pending) = self.pending.back_mut()
-            && pending.token == token
-        {
+        if let Some(pending) = self.pending.iter_mut().find(|pending| {
+            pending.token == token && pending.metadata.purpose == TimingSpanPurpose::Pass
+        }) {
             pending.metadata.replay_execution = Some(detail);
+            return true;
         }
+        false
+    }
+
+    fn attach_composite_scene_replay_execution_detail(
+        &mut self,
+        token: SpanToken,
+        detail: Option<CompositeSceneReplayExecutionDetail>,
+    ) -> bool {
+        let Some(detail) = detail else {
+            return false;
+        };
+        if let Some(pending) = self.pending.iter_mut().find(|pending| {
+            pending.token == token
+                && pending.metadata.purpose == TimingSpanPurpose::CompositeSceneReplay
+        }) {
+            pending.metadata.composite_scene_replay_execution = Some(detail);
+            return true;
+        }
+        false
     }
 
     fn drain_capture_gpu_timing_events(&mut self) -> Vec<CaptureGpuTimingEvent> {
@@ -842,11 +995,18 @@ impl TimingState {
             return PollOutcome::Invalid;
         }
         let duration_ns = end_ns - start_ns;
-        let record = if pending.metadata.is_total {
-            self.finish_total(pending.metadata, start_ns, end_ns, duration_ns)
-        } else {
-            self.finish_pass(pending.metadata, start_ns, end_ns, duration_ns);
-            None
+        let record = match pending.metadata.purpose {
+            TimingSpanPurpose::Total => {
+                self.finish_total(pending.metadata, start_ns, end_ns, duration_ns)
+            }
+            TimingSpanPurpose::Pass => {
+                self.finish_pass(pending.metadata, start_ns, end_ns, duration_ns);
+                None
+            }
+            TimingSpanPurpose::CompositeSceneReplay => {
+                self.finish_composite_scene_replay(pending.metadata, duration_ns);
+                None
+            }
         };
         PollOutcome::Ready {
             duration_ns: Some(duration_ns),
@@ -864,18 +1024,97 @@ impl TimingState {
     }
 
     fn invalidate_resolved_span(&mut self, metadata: TimingSpanMetadata) {
-        if !metadata.is_total
-            && let Some(aggregate) = self
-                .aggregates
-                .iter_mut()
-                .find(|aggregate| aggregate.scope_id == metadata.scope_id)
-        {
-            aggregate.dropped_passes = aggregate.dropped_passes.saturating_add(1);
-            aggregate.graph_gap_timeline_valid = false;
+        match metadata.purpose {
+            TimingSpanPurpose::Total => {
+                self.aggregates
+                    .retain(|aggregate| aggregate.scope_id != metadata.scope_id);
+            }
+            TimingSpanPurpose::Pass => {
+                if let Some(aggregate) = self
+                    .aggregates
+                    .iter_mut()
+                    .find(|aggregate| aggregate.scope_id == metadata.scope_id)
+                {
+                    aggregate.dropped_passes = aggregate.dropped_passes.saturating_add(1);
+                    aggregate.graph_gap_timeline_valid = false;
+                }
+            }
+            TimingSpanPurpose::CompositeSceneReplay => {
+                if let Some(aggregate) = self
+                    .aggregates
+                    .iter_mut()
+                    .find(|aggregate| aggregate.scope_id == metadata.scope_id)
+                {
+                    aggregate.composite_scene_replay_timing_available = false;
+                }
+            }
         }
-        if metadata.is_total {
-            self.aggregates
-                .retain(|aggregate| aggregate.scope_id != metadata.scope_id);
+    }
+
+    fn finish_composite_scene_replay(&mut self, metadata: TimingSpanMetadata, duration_ns: u64) {
+        let Some(aggregate) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == metadata.scope_id)
+        else {
+            return;
+        };
+        aggregate.composite_scene_replay_resolved_spans = aggregate
+            .composite_scene_replay_resolved_spans
+            .saturating_add(1);
+        aggregate.composite_scene_replay_gpu_ns = aggregate
+            .composite_scene_replay_gpu_ns
+            .saturating_add(duration_ns);
+        let (Some(work), Some(detail), Some(owner_pass_id), Some(owner_instance_id)) = (
+            metadata.composite_scene_replay_work,
+            metadata.composite_scene_replay_execution,
+            metadata.pass_id,
+            metadata.instance_id,
+        ) else {
+            aggregate.composite_scene_replay_timing_available = false;
+            return;
+        };
+        aggregate.composite_scene_replay_host_cpu_ns = aggregate
+            .composite_scene_replay_host_cpu_ns
+            .saturating_add(detail.host_cpu_ns);
+        aggregate.composite_scene_replay_scene_scan_pairs = aggregate
+            .composite_scene_replay_scene_scan_pairs
+            .saturating_add(work.scene_scan_pairs);
+        aggregate.composite_scene_replay_commands_executed = aggregate
+            .composite_scene_replay_commands_executed
+            .saturating_add(detail.commands_executed);
+        aggregate.composite_scene_replay_draw_calls = aggregate
+            .composite_scene_replay_draw_calls
+            .saturating_add(detail.draw_calls);
+        aggregate.composite_scene_replay_texture_binds = aggregate
+            .composite_scene_replay_texture_binds
+            .saturating_add(detail.texture_binds);
+        let candidate = MaxCompositeSceneReplayTiming {
+            duration_ns,
+            owner_pass_id,
+            owner_instance_id,
+            command_start: work.command_start,
+            command_end: work.command_end,
+            command_count: work.command_count,
+            scene_commands_total: work.scene_commands_total,
+            active_work_rects: work.active_work_rects,
+            active_work_pixels: work.active_work_pixels,
+            command_region_pairs: work.command_region_pairs,
+            scene_scan_pairs: work.scene_scan_pairs,
+            pending_checkpoint_requirements: work.pending_checkpoint_requirements,
+            host_cpu_ns: detail.host_cpu_ns,
+            commands_considered: detail.commands_considered,
+            commands_executed: detail.commands_executed,
+            draw_calls: detail.draw_calls,
+            texture_binds: detail.texture_binds,
+            scene_vbo_uploads: detail.scene_vbo_uploads,
+            scene_vbo_upload_bytes: detail.scene_vbo_upload_bytes,
+        };
+        if aggregate
+            .max_composite_scene_replay
+            .is_none_or(|current| candidate.duration_ns > current.duration_ns)
+        {
+            aggregate.max_composite_scene_replay = Some(candidate);
         }
     }
 
@@ -1181,9 +1420,22 @@ impl TimingState {
             replay_capture_draw_submit_cpu_ns: aggregate
                 .capture_execution
                 .map_or(0, |summary| summary.replay_capture_draw_submit_cpu_ns),
+            composite_scene_replay_timing_available: aggregate
+                .composite_scene_replay_timing_available,
+            composite_scene_replay_expected_spans: aggregate.composite_scene_replay_expected_spans,
+            composite_scene_replay_resolved_spans: aggregate.composite_scene_replay_resolved_spans,
+            composite_scene_replay_gpu_ns: aggregate.composite_scene_replay_gpu_ns,
+            composite_scene_replay_host_cpu_ns: aggregate.composite_scene_replay_host_cpu_ns,
+            composite_scene_replay_scene_scan_pairs: aggregate
+                .composite_scene_replay_scene_scan_pairs,
+            composite_scene_replay_commands_executed: aggregate
+                .composite_scene_replay_commands_executed,
+            composite_scene_replay_draw_calls: aggregate.composite_scene_replay_draw_calls,
+            composite_scene_replay_texture_binds: aggregate.composite_scene_replay_texture_binds,
             capture_execution_summary_available: aggregate.capture_execution.is_some(),
             max_capture_pass: aggregate.max_capture_pass,
             max_effect_pass: aggregate.max_effect_pass,
+            max_composite_scene_replay: aggregate.max_composite_scene_replay,
             graph_gap_attribution_available,
             max_graph_gap,
         })
@@ -1396,6 +1648,11 @@ pub(crate) struct PassTimingSpan {
     token: SpanToken,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompositeSceneReplayTimingSpan {
+    token: SpanToken,
+}
+
 fn timestamp_path(
     gl: &glow::Context,
     functions: QueryTargetFunctions,
@@ -1570,6 +1827,63 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
     };
     let graph_gap_after = graph_gap.after;
     let graph_gap_before = graph_gap.before;
+    let max_composite_scene_replay_gpu_ns = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.duration_ns);
+    let max_composite_scene_replay_pass_id = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.owner_pass_id);
+    let max_composite_scene_replay_instance_id = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.owner_instance_id);
+    let max_composite_scene_replay_command_start = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.command_start);
+    let max_composite_scene_replay_command_end = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.command_end);
+    let max_composite_scene_replay_command_count = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.command_count);
+    let max_composite_scene_replay_scene_commands = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.scene_commands_total);
+    let max_composite_scene_replay_active_work_rects = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.active_work_rects);
+    let max_composite_scene_replay_active_work_pixels = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.active_work_pixels);
+    let max_composite_scene_replay_command_region_pairs = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.command_region_pairs);
+    let max_composite_scene_replay_scene_scan_pairs = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.scene_scan_pairs);
+    let max_composite_scene_replay_pending_checkpoints = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.pending_checkpoint_requirements);
+    let max_composite_scene_replay_host_cpu_ns = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.host_cpu_ns);
+    let max_composite_scene_replay_commands_considered = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.commands_considered);
+    let max_composite_scene_replay_commands_executed = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.commands_executed);
+    let max_composite_scene_replay_draw_calls = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.draw_calls);
+    let max_composite_scene_replay_texture_binds = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.texture_binds);
+    let max_composite_scene_replay_scene_vbo_uploads = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.scene_vbo_uploads);
+    let max_composite_scene_replay_scene_vbo_upload_bytes = record
+        .max_composite_scene_replay
+        .map_or(0, |replay| replay.scene_vbo_upload_bytes);
     let line = format!(
         "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
@@ -1673,7 +1987,7 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_draw_submit_cpu_ns,
     );
     format!(
-        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={} graph_gap_attribution_available={} max_graph_gap_ns={} max_graph_gap_position={} max_graph_gap_after_pass_id={} max_graph_gap_after_instance_id={} max_graph_gap_after_kind={} max_graph_gap_after_capture_mode={} max_graph_gap_after_checkpoint_count={} max_graph_gap_before_pass_id={} max_graph_gap_before_instance_id={} max_graph_gap_before_kind={} max_graph_gap_before_capture_mode={} max_graph_gap_before_checkpoint_count={}",
+        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={} graph_gap_attribution_available={} max_graph_gap_ns={} max_graph_gap_position={} max_graph_gap_after_pass_id={} max_graph_gap_after_instance_id={} max_graph_gap_after_kind={} max_graph_gap_after_capture_mode={} max_graph_gap_after_checkpoint_count={} max_graph_gap_before_pass_id={} max_graph_gap_before_instance_id={} max_graph_gap_before_kind={} max_graph_gap_before_capture_mode={} max_graph_gap_before_checkpoint_count={} composite_scene_replay_timing_available={} composite_scene_replay_expected_spans={} composite_scene_replay_resolved_spans={} composite_scene_replay_gpu_ns={} composite_scene_replay_host_cpu_ns={} composite_scene_replay_scene_scan_pairs={} composite_scene_replay_commands_executed={} composite_scene_replay_draw_calls={} composite_scene_replay_texture_binds={} max_composite_scene_replay_gpu_ns={} max_composite_scene_replay_pass_id={} max_composite_scene_replay_instance_id={} max_composite_scene_replay_command_start={} max_composite_scene_replay_command_end={} max_composite_scene_replay_command_count={} max_composite_scene_replay_scene_commands={} max_composite_scene_replay_active_work_rects={} max_composite_scene_replay_active_work_pixels={} max_composite_scene_replay_command_region_pairs={} max_composite_scene_replay_scene_scan_pairs={} max_composite_scene_replay_pending_checkpoints={} max_composite_scene_replay_host_cpu_ns={} max_composite_scene_replay_commands_considered={} max_composite_scene_replay_commands_executed={} max_composite_scene_replay_draw_calls={} max_composite_scene_replay_texture_binds={} max_composite_scene_replay_scene_vbo_uploads={} max_composite_scene_replay_scene_vbo_upload_bytes={}",
         usize::from(max_capture_replay_detail_available(record)),
         record.pass_timed_ns(),
         record.graph_unattributed_ns(),
@@ -1704,6 +2018,34 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
             .and_then(|boundary| boundary.capture_mode)
             .map_or("none", CaptureTimingMode::as_str),
         graph_gap_before.map_or(0, |boundary| boundary.checkpoint_count),
+        usize::from(record.composite_scene_replay_timing_available),
+        record.composite_scene_replay_expected_spans,
+        record.composite_scene_replay_resolved_spans,
+        record.composite_scene_replay_gpu_ns,
+        record.composite_scene_replay_host_cpu_ns,
+        record.composite_scene_replay_scene_scan_pairs,
+        record.composite_scene_replay_commands_executed,
+        record.composite_scene_replay_draw_calls,
+        record.composite_scene_replay_texture_binds,
+        max_composite_scene_replay_gpu_ns,
+        max_composite_scene_replay_pass_id,
+        max_composite_scene_replay_instance_id,
+        max_composite_scene_replay_command_start,
+        max_composite_scene_replay_command_end,
+        max_composite_scene_replay_command_count,
+        max_composite_scene_replay_scene_commands,
+        max_composite_scene_replay_active_work_rects,
+        max_composite_scene_replay_active_work_pixels,
+        max_composite_scene_replay_command_region_pairs,
+        max_composite_scene_replay_scene_scan_pairs,
+        max_composite_scene_replay_pending_checkpoints,
+        max_composite_scene_replay_host_cpu_ns,
+        max_composite_scene_replay_commands_considered,
+        max_composite_scene_replay_commands_executed,
+        max_composite_scene_replay_draw_calls,
+        max_composite_scene_replay_texture_binds,
+        max_composite_scene_replay_scene_vbo_uploads,
+        max_composite_scene_replay_scene_vbo_upload_bytes,
     )
 }
 
@@ -1865,11 +2207,13 @@ impl EffectGpuProfiler {
             frame_id: scope.frame_id,
             pass_id: Some(pass_id),
             instance_id: Some(instance_id),
+            purpose: TimingSpanPurpose::Pass,
             kind: Some(kind),
             work,
             capture,
             replay_execution: None,
-            is_total: false,
+            composite_scene_replay_work: None,
+            composite_scene_replay_execution: None,
         };
         let token = active.timing.begin_pass(scope, metadata)?;
         let query = active.queries[token.slot].start;
@@ -1896,6 +2240,57 @@ impl EffectGpuProfiler {
                 .timing
                 .attach_replay_execution_detail(span.token, replay_execution);
         }
+    }
+
+    pub(crate) fn begin_composite_scene_replay(
+        &mut self,
+        gl: &glow::Context,
+        scope: GraphTimingScope,
+        owner_pass_id: u64,
+        owner_instance_id: u64,
+        work: CompositeSceneReplayWork,
+    ) -> Option<CompositeSceneReplayTimingSpan> {
+        let ProfilerState::Active(active) = &mut self.state else {
+            return None;
+        };
+        let token = active.timing.begin_composite_scene_replay(
+            scope,
+            owner_pass_id,
+            owner_instance_id,
+            work,
+        )?;
+        let query = active.queries[token.slot].start;
+        unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+        Some(CompositeSceneReplayTimingSpan { token })
+    }
+
+    pub(crate) fn end_composite_scene_replay(
+        &mut self,
+        gl: &glow::Context,
+        span: CompositeSceneReplayTimingSpan,
+    ) -> bool {
+        let ProfilerState::Active(active) = &mut self.state else {
+            return false;
+        };
+        if !active.timing.finish(span.token) {
+            return false;
+        }
+        let query = active.queries[span.token.slot].end;
+        unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+        true
+    }
+
+    pub(crate) fn attach_composite_scene_replay_execution_detail(
+        &mut self,
+        span: CompositeSceneReplayTimingSpan,
+        detail: CompositeSceneReplayExecutionDetail,
+    ) -> bool {
+        let ProfilerState::Active(active) = &mut self.state else {
+            return false;
+        };
+        active
+            .timing
+            .attach_composite_scene_replay_execution_detail(span.token, Some(detail))
     }
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
@@ -2041,6 +2436,7 @@ mod tests {
             frame_id: Some(120),
             pass_id: Some(pass_id),
             instance_id: Some(1),
+            purpose: TimingSpanPurpose::Pass,
             kind: Some(kind),
             work: PassTimingWork {
                 effect_pixels: pixels,
@@ -2048,7 +2444,8 @@ mod tests {
             },
             capture,
             replay_execution: None,
-            is_total: false,
+            composite_scene_replay_work: None,
+            composite_scene_replay_execution: None,
         }
     }
 
@@ -2061,6 +2458,64 @@ mod tests {
     ) {
         let pass = state.begin_pass(scope, metadata).expect("pass slot");
         assert!(state.finish(pass));
+        assert!(matches!(
+            state.poll_front(true, Some((start_ns, end_ns))),
+            PollOutcome::Ready {
+                duration_ns: Some(_),
+                record: None,
+            }
+        ));
+    }
+
+    fn composite_scene_replay_work(seed: usize) -> CompositeSceneReplayWork {
+        let command_start = seed;
+        let command_end = seed.saturating_add(3);
+        let active_work_rects = seed.saturating_add(2);
+        CompositeSceneReplayWork {
+            command_start,
+            command_end,
+            command_count: command_end.saturating_sub(command_start),
+            scene_commands_total: seed.saturating_add(10),
+            active_work_rects,
+            active_work_pixels: seed as u64 + 20,
+            command_region_pairs: command_end
+                .saturating_sub(command_start)
+                .saturating_mul(active_work_rects),
+            scene_scan_pairs: seed.saturating_add(10).saturating_mul(active_work_rects),
+            pending_checkpoint_requirements: seed.saturating_add(1),
+        }
+    }
+
+    fn composite_scene_replay_detail(seed: usize) -> CompositeSceneReplayExecutionDetail {
+        CompositeSceneReplayExecutionDetail {
+            host_cpu_ns: seed as u64 + 11,
+            commands_considered: seed.saturating_add(12),
+            commands_executed: seed.saturating_add(13),
+            draw_calls: seed.saturating_add(14),
+            texture_binds: seed.saturating_add(15),
+            scene_vbo_uploads: seed.saturating_add(16),
+            scene_vbo_upload_bytes: seed.saturating_add(17),
+        }
+    }
+
+    fn resolve_test_composite_scene_replay(
+        state: &mut TimingState,
+        scope: GraphTimingScope,
+        pass_id: u64,
+        instance_id: u64,
+        work: CompositeSceneReplayWork,
+        detail: Option<CompositeSceneReplayExecutionDetail>,
+        start_ns: u64,
+        end_ns: u64,
+    ) {
+        let replay = state
+            .begin_composite_scene_replay(scope, pass_id, instance_id, work)
+            .expect("composite scene replay slot");
+        assert!(state.finish(replay));
+        assert_eq!(
+            state.attach_composite_scene_replay_execution_detail(replay, detail),
+            detail.is_some()
+        );
         assert!(matches!(
             state.poll_front(true, Some((start_ns, end_ns))),
             PollOutcome::Ready {
@@ -2119,6 +2574,528 @@ mod tests {
         assert!(line.contains("max_graph_gap_after_kind=composite"));
         assert!(line.contains("max_graph_gap_before_pass_id=8"));
         assert!(line.contains("max_graph_gap_before_kind=fragment"));
+    }
+
+    #[test]
+    fn composite_scene_replay_is_not_an_effect_pass_or_graph_gap_boundary() {
+        let mut state = TimingState::active_for_test(6);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(1, RenderPassKind::Fragment, 64, None),
+            100,
+            200,
+        );
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            2,
+            22,
+            composite_scene_replay_work(1),
+            Some(composite_scene_replay_detail(1)),
+            220,
+            520,
+        );
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(3, RenderPassKind::Composite, 128, None),
+            600,
+            700,
+        );
+
+        let record = resolve_test_total(&mut state, scope, 50, 1_000);
+
+        assert_eq!(record.composite_scene_replay_gpu_ns, 300);
+        assert_eq!(record.timed_passes, 2);
+        assert_eq!(record.pass_timed_ns(), 200);
+        assert_eq!(record.durations_ns[TimingCategory::Composite.index()], 100);
+        assert_eq!(record.max_effect_pass.expect("effect max").pass_id, 1);
+        assert_eq!(record.max_capture_pass, None);
+        assert_eq!(record.graph_unattributed_ns(), 750);
+        assert!(record.graph_gap_attribution_available);
+        assert_eq!(record.max_graph_gap.duration_ns, 400);
+        assert_eq!(record.max_graph_gap.after.expect("gap after").pass_id, 1);
+        assert_eq!(record.max_graph_gap.before.expect("gap before").pass_id, 3);
+    }
+
+    #[test]
+    fn composite_scene_replay_max_keeps_exact_static_work_from_slowest_span() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let first_work = composite_scene_replay_work(1);
+        let second_work = composite_scene_replay_work(20);
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            7,
+            70,
+            first_work,
+            Some(composite_scene_replay_detail(1)),
+            100,
+            140,
+        );
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            8,
+            80,
+            second_work,
+            Some(composite_scene_replay_detail(20)),
+            200,
+            400,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        let max = record
+            .max_composite_scene_replay
+            .expect("max composite scene replay");
+
+        assert_eq!(max.owner_pass_id, 8);
+        assert_eq!(max.owner_instance_id, 80);
+        assert_eq!(max.command_start, second_work.command_start);
+        assert_eq!(max.command_end, second_work.command_end);
+        assert_eq!(max.command_count, second_work.command_count);
+        assert_eq!(max.scene_commands_total, second_work.scene_commands_total);
+        assert_eq!(max.active_work_rects, second_work.active_work_rects);
+        assert_eq!(max.active_work_pixels, second_work.active_work_pixels);
+        assert_eq!(max.command_region_pairs, second_work.command_region_pairs);
+        assert_eq!(max.scene_scan_pairs, second_work.scene_scan_pairs);
+        assert_eq!(
+            max.pending_checkpoint_requirements,
+            second_work.pending_checkpoint_requirements
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_max_keeps_exact_execution_detail_from_slowest_span() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let first_detail = composite_scene_replay_detail(1);
+        let second_detail = composite_scene_replay_detail(20);
+        let first = state
+            .begin_composite_scene_replay(scope, 7, 70, composite_scene_replay_work(1))
+            .expect("first replay slot");
+        assert!(state.finish(first));
+        let second = state
+            .begin_composite_scene_replay(scope, 8, 80, composite_scene_replay_work(20))
+            .expect("second replay slot");
+        assert!(state.finish(second));
+
+        assert!(state.attach_composite_scene_replay_execution_detail(first, Some(first_detail)));
+        assert!(state.attach_composite_scene_replay_execution_detail(second, Some(second_detail)));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((200, 400))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        let max = record
+            .max_composite_scene_replay
+            .expect("max composite scene replay");
+        assert_eq!(max.host_cpu_ns, second_detail.host_cpu_ns);
+        assert_eq!(max.commands_considered, second_detail.commands_considered);
+        assert_eq!(max.commands_executed, second_detail.commands_executed);
+        assert_eq!(max.draw_calls, second_detail.draw_calls);
+        assert_eq!(max.texture_binds, second_detail.texture_binds);
+        assert_eq!(max.scene_vbo_uploads, second_detail.scene_vbo_uploads);
+        assert_eq!(
+            max.scene_vbo_upload_bytes,
+            second_detail.scene_vbo_upload_bytes
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_slot_reuse_rejects_stale_generation_detail() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let first = state
+            .begin_composite_scene_replay(scope, 7, 70, composite_scene_replay_work(1))
+            .expect("first replay slot");
+        assert!(state.finish(first));
+        assert_eq!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready {
+                duration_ns: Some(40),
+                record: None,
+            }
+        );
+        let second = state
+            .begin_composite_scene_replay(scope, 8, 80, composite_scene_replay_work(20))
+            .expect("recycled replay slot");
+        assert_ne!(first, second);
+        assert!(state.finish(second));
+        assert!(!state.attach_composite_scene_replay_execution_detail(
+            first,
+            Some(composite_scene_replay_detail(1))
+        ));
+        assert!(state.attach_composite_scene_replay_execution_detail(
+            second,
+            Some(composite_scene_replay_detail(20))
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((200, 400))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 2);
+        assert!(!record.composite_scene_replay_timing_available);
+    }
+
+    #[test]
+    fn composite_scene_replay_scopes_with_same_frame_id_stay_separate() {
+        let mut state = TimingState::active_for_test(4);
+        let first_scope = state.begin_scope(Some(120)).expect("first scope");
+        let first_replay = state
+            .begin_composite_scene_replay(first_scope, 7, 70, composite_scene_replay_work(1))
+            .expect("first replay");
+        assert!(state.finish(first_replay));
+        let second_scope = state.begin_scope(Some(120)).expect("second scope");
+        let second_replay = state
+            .begin_composite_scene_replay(second_scope, 8, 80, composite_scene_replay_work(20))
+            .expect("second replay");
+        assert!(state.finish(second_replay));
+        assert!(state.attach_composite_scene_replay_execution_detail(
+            first_replay,
+            Some(composite_scene_replay_detail(1))
+        ));
+        assert!(state.attach_composite_scene_replay_execution_detail(
+            second_replay,
+            Some(composite_scene_replay_detail(20))
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((200, 400))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        assert!(state.finish(first_scope.total));
+        assert!(state.finish(second_scope.total));
+        let first_record = match state.poll_front(true, Some((50, 500))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected first scope outcome: {outcome:?}"),
+        };
+        let second_record = match state.poll_front(true, Some((60, 600))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected second scope outcome: {outcome:?}"),
+        };
+        assert_ne!(first_record.scope_id, second_record.scope_id);
+        assert_eq!(
+            first_record
+                .max_composite_scene_replay
+                .expect("first max")
+                .owner_pass_id,
+            7
+        );
+        assert_eq!(
+            second_record
+                .max_composite_scene_replay
+                .expect("second max")
+                .owner_pass_id,
+            8
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_drop_makes_only_replay_summary_unavailable() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let pass = state
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
+            .expect("pass slot");
+        assert!(
+            state
+                .begin_composite_scene_replay(scope, 8, 80, composite_scene_replay_work(1))
+                .is_none()
+        );
+        assert!(state.finish(pass));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+
+        assert_eq!(record.composite_scene_replay_expected_spans, 1);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 0);
+        assert!(!record.composite_scene_replay_timing_available);
+        assert_eq!(record.timed_passes, 1);
+        assert_eq!(record.durations_ns[TimingCategory::Composite.index()], 40);
+        assert!(record.graph_gap_attribution_available);
+    }
+
+    #[test]
+    fn composite_scene_replay_invalid_timestamp_does_not_corrupt_passes() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let pass = state
+            .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
+            .expect("pass slot");
+        assert!(state.finish(pass));
+        let replay = state
+            .begin_composite_scene_replay(scope, 8, 80, composite_scene_replay_work(1))
+            .expect("replay slot");
+        assert!(state.finish(replay));
+        assert!(state.attach_composite_scene_replay_execution_detail(
+            replay,
+            Some(composite_scene_replay_detail(1))
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert_eq!(
+            state.poll_front(true, Some((300, 200))),
+            PollOutcome::Invalid
+        );
+        assert!(state.finish(scope.total));
+        let record = match state.poll_front(true, Some((50, 500))) {
+            PollOutcome::Ready {
+                record: Some(record),
+                ..
+            } => record,
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        };
+
+        assert_eq!(record.composite_scene_replay_expected_spans, 1);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 0);
+        assert!(!record.composite_scene_replay_timing_available);
+        assert_eq!(record.timed_passes, 1);
+        assert_eq!(record.pass_timed_ns(), 40);
+        assert_eq!(record.dropped_passes, 0);
+        assert!(record.graph_gap_attribution_available);
+    }
+
+    #[test]
+    fn composite_scene_replay_missing_detail_is_not_complete_evidence() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            7,
+            70,
+            composite_scene_replay_work(1),
+            None,
+            100,
+            140,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+
+        assert_eq!(record.composite_scene_replay_expected_spans, 1);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 1);
+        assert!(!record.composite_scene_replay_timing_available);
+        assert_eq!(record.composite_scene_replay_gpu_ns, 40);
+        assert_eq!(record.composite_scene_replay_host_cpu_ns, 0);
+        assert_eq!(record.max_composite_scene_replay, None);
+    }
+
+    #[test]
+    fn composite_scene_replay_no_work_is_complete_with_zero_totals() {
+        let mut state = TimingState::active_for_test(1);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+
+        assert!(record.composite_scene_replay_timing_available);
+        assert_eq!(record.composite_scene_replay_expected_spans, 0);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 0);
+        assert_eq!(record.composite_scene_replay_gpu_ns, 0);
+        assert_eq!(
+            record
+                .max_composite_scene_replay
+                .map_or(0, |replay| replay.duration_ns),
+            0
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_aggregates_saturating_totals() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            7,
+            70,
+            composite_scene_replay_work(1),
+            Some(composite_scene_replay_detail(1)),
+            100,
+            140,
+        );
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            8,
+            80,
+            composite_scene_replay_work(20),
+            Some(composite_scene_replay_detail(20)),
+            200,
+            400,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        let first_work = composite_scene_replay_work(1);
+        let second_work = composite_scene_replay_work(20);
+        let first_detail = composite_scene_replay_detail(1);
+        let second_detail = composite_scene_replay_detail(20);
+
+        assert_eq!(record.composite_scene_replay_gpu_ns, 240);
+        assert_eq!(
+            record.composite_scene_replay_host_cpu_ns,
+            first_detail.host_cpu_ns + second_detail.host_cpu_ns
+        );
+        assert_eq!(
+            record.composite_scene_replay_scene_scan_pairs,
+            first_work.scene_scan_pairs + second_work.scene_scan_pairs
+        );
+        assert_eq!(
+            record.composite_scene_replay_commands_executed,
+            first_detail.commands_executed + second_detail.commands_executed
+        );
+        assert_eq!(
+            record.composite_scene_replay_draw_calls,
+            first_detail.draw_calls + second_detail.draw_calls
+        );
+        assert_eq!(
+            record.composite_scene_replay_texture_binds,
+            first_detail.texture_binds + second_detail.texture_binds
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_equal_duration_keeps_first_resolved_winner() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            7,
+            70,
+            composite_scene_replay_work(1),
+            Some(composite_scene_replay_detail(1)),
+            100,
+            200,
+        );
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            8,
+            80,
+            composite_scene_replay_work(20),
+            Some(composite_scene_replay_detail(20)),
+            300,
+            400,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+
+        assert_eq!(
+            record
+                .max_composite_scene_replay
+                .expect("max replay")
+                .owner_pass_id,
+            7
+        );
+    }
+
+    #[test]
+    fn composite_scene_replay_formatter_emits_each_key_once() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            7,
+            70,
+            composite_scene_replay_work(1),
+            Some(composite_scene_replay_detail(1)),
+            100,
+            140,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        let line = format_gpu_timing_line(&record);
+        for key in [
+            "composite_scene_replay_timing_available",
+            "composite_scene_replay_expected_spans",
+            "composite_scene_replay_resolved_spans",
+            "composite_scene_replay_gpu_ns",
+            "composite_scene_replay_host_cpu_ns",
+            "composite_scene_replay_scene_scan_pairs",
+            "composite_scene_replay_commands_executed",
+            "composite_scene_replay_draw_calls",
+            "composite_scene_replay_texture_binds",
+            "max_composite_scene_replay_gpu_ns",
+            "max_composite_scene_replay_pass_id",
+            "max_composite_scene_replay_instance_id",
+            "max_composite_scene_replay_command_start",
+            "max_composite_scene_replay_command_end",
+            "max_composite_scene_replay_command_count",
+            "max_composite_scene_replay_scene_commands",
+            "max_composite_scene_replay_active_work_rects",
+            "max_composite_scene_replay_active_work_pixels",
+            "max_composite_scene_replay_command_region_pairs",
+            "max_composite_scene_replay_scene_scan_pairs",
+            "max_composite_scene_replay_pending_checkpoints",
+            "max_composite_scene_replay_host_cpu_ns",
+            "max_composite_scene_replay_commands_considered",
+            "max_composite_scene_replay_commands_executed",
+            "max_composite_scene_replay_draw_calls",
+            "max_composite_scene_replay_texture_binds",
+            "max_composite_scene_replay_scene_vbo_uploads",
+            "max_composite_scene_replay_scene_vbo_upload_bytes",
+        ] {
+            assert_eq!(
+                line.split_whitespace()
+                    .filter(|field| field.starts_with(&format!("{key}=")))
+                    .count(),
+                1,
+                "{key}"
+            );
+        }
+        assert!(line.contains("composite_scene_replay_timing_available=1"));
+        assert!(line.contains("max_composite_scene_replay_pass_id=7"));
+    }
+
+    #[test]
+    fn composite_scene_replay_disabled_timing_does_not_allocate() {
+        let mut state = TimingState::disabled();
+        let scope = GraphTimingScope {
+            scope_id: 1,
+            total: SpanToken {
+                slot: 0,
+                generation: 1,
+            },
+            frame_id: Some(120),
+        };
+
+        assert!(
+            state
+                .begin_composite_scene_replay(scope, 7, 70, composite_scene_replay_work(1))
+                .is_none()
+        );
+        assert_eq!(state.pending_span_count(), 0);
+        assert_eq!(state.dropped_spans(), 0);
+    }
+
+    #[test]
+    fn composite_scene_replay_capacity_proof_includes_total_and_replay_spans() {
+        assert_eq!(CURRENT_PASSES_PER_BLUR_INSTANCE, 6);
+        assert_eq!(EXPECTED_TIMING_SPANS_PER_GRAPH_SCOPE, 1 + 128 * 7);
+        assert_eq!(EXPECTED_TIMING_SPANS, 2 * (1 + 128 * 7));
+        assert_eq!(EXPECTED_TIMING_SPANS, 1_794);
+        assert!(EXPECTED_TIMING_SPANS <= TIMING_SPAN_POOL_CAPACITY);
+        assert_eq!(TIMING_SPAN_POOL_CAPACITY, 2_048);
+        assert_eq!(TIMING_QUERY_OBJECT_CAPACITY, 4_096);
     }
 
     #[test]
@@ -3674,9 +4651,19 @@ mod tests {
             replay_capture_selection_cpu_ns: 0,
             replay_capture_visibility_cpu_ns: 0,
             replay_capture_draw_submit_cpu_ns: 0,
+            composite_scene_replay_timing_available: true,
+            composite_scene_replay_expected_spans: 0,
+            composite_scene_replay_resolved_spans: 0,
+            composite_scene_replay_gpu_ns: 0,
+            composite_scene_replay_host_cpu_ns: 0,
+            composite_scene_replay_scene_scan_pairs: 0,
+            composite_scene_replay_commands_executed: 0,
+            composite_scene_replay_draw_calls: 0,
+            composite_scene_replay_texture_binds: 0,
             capture_execution_summary_available: false,
             max_capture_pass: None,
             max_effect_pass: None,
+            max_composite_scene_replay: None,
             graph_gap_attribution_available: false,
             max_graph_gap: GraphGapTiming::unavailable(),
         };
@@ -3712,8 +4699,43 @@ mod tests {
             "max_graph_gap_before_kind",
             "max_graph_gap_before_capture_mode",
             "max_graph_gap_before_checkpoint_count",
+            "composite_scene_replay_timing_available",
+            "composite_scene_replay_expected_spans",
+            "composite_scene_replay_resolved_spans",
+            "composite_scene_replay_gpu_ns",
+            "composite_scene_replay_host_cpu_ns",
+            "composite_scene_replay_scene_scan_pairs",
+            "composite_scene_replay_commands_executed",
+            "composite_scene_replay_draw_calls",
+            "composite_scene_replay_texture_binds",
+            "max_composite_scene_replay_gpu_ns",
+            "max_composite_scene_replay_pass_id",
+            "max_composite_scene_replay_instance_id",
+            "max_composite_scene_replay_command_start",
+            "max_composite_scene_replay_command_end",
+            "max_composite_scene_replay_command_count",
+            "max_composite_scene_replay_scene_commands",
+            "max_composite_scene_replay_active_work_rects",
+            "max_composite_scene_replay_active_work_pixels",
+            "max_composite_scene_replay_command_region_pairs",
+            "max_composite_scene_replay_scene_scan_pairs",
+            "max_composite_scene_replay_pending_checkpoints",
+            "max_composite_scene_replay_host_cpu_ns",
+            "max_composite_scene_replay_commands_considered",
+            "max_composite_scene_replay_commands_executed",
+            "max_composite_scene_replay_draw_calls",
+            "max_composite_scene_replay_texture_binds",
+            "max_composite_scene_replay_scene_vbo_uploads",
+            "max_composite_scene_replay_scene_vbo_upload_bytes",
         ] {
-            assert_eq!(line.matches(&format!("{key}=")).count(), 1, "{key}");
+            assert_eq!(
+                line.split_whitespace()
+                    .filter_map(|field| field.split_once('='))
+                    .filter(|(field_key, _)| *field_key == key)
+                    .count(),
+                1,
+                "{key}"
+            );
         }
         assert!(line.contains("pass_timed_ns=281400"));
         assert!(line.contains("graph_unattributed_ns=0"));
@@ -3740,6 +4762,11 @@ mod tests {
         assert!(line.contains("max_graph_gap_before_kind=none"));
         assert!(line.contains("max_graph_gap_before_capture_mode=none"));
         assert!(line.contains("max_graph_gap_before_checkpoint_count=0"));
+        assert!(line.contains("composite_scene_replay_timing_available=1"));
+        assert!(line.contains("composite_scene_replay_expected_spans=0"));
+        assert!(line.contains("composite_scene_replay_resolved_spans=0"));
+        assert!(line.contains("composite_scene_replay_gpu_ns=0"));
+        assert!(line.contains("max_composite_scene_replay_gpu_ns=0"));
         let mut category_sum_exceeds_total = record;
         category_sum_exceeds_total.total_ns = 100;
         let saturated_line = format_gpu_timing_line(&category_sum_exceeds_total);
@@ -3747,7 +4774,7 @@ mod tests {
         assert!(line.contains("checkpoint_capture_passes=3"));
         assert!(line.contains("checkpoint_capture_execution_passes=2"));
         assert_eq!(
-            line.strip_suffix(" max_capture_replay_detail_available=0 pass_timed_ns=281400 graph_unattributed_ns=0 max_effect_pass_ns=0 max_effect_pass_id=0 max_effect_instance_id=0 max_effect_kind=none max_effect_capture_mode=none max_effect_pixels=0 max_effect_damage_rects=0 max_effect_damage_bbox_pixels=0 max_effect_target_width=0 max_effect_target_height=0 graph_gap_attribution_available=0 max_graph_gap_ns=0 max_graph_gap_position=none max_graph_gap_after_pass_id=0 max_graph_gap_after_instance_id=0 max_graph_gap_after_kind=none max_graph_gap_after_capture_mode=none max_graph_gap_after_checkpoint_count=0 max_graph_gap_before_pass_id=0 max_graph_gap_before_instance_id=0 max_graph_gap_before_kind=none max_graph_gap_before_capture_mode=none max_graph_gap_before_checkpoint_count=0")
+            line.strip_suffix(" max_capture_replay_detail_available=0 pass_timed_ns=281400 graph_unattributed_ns=0 max_effect_pass_ns=0 max_effect_pass_id=0 max_effect_instance_id=0 max_effect_kind=none max_effect_capture_mode=none max_effect_pixels=0 max_effect_damage_rects=0 max_effect_damage_bbox_pixels=0 max_effect_target_width=0 max_effect_target_height=0 graph_gap_attribution_available=0 max_graph_gap_ns=0 max_graph_gap_position=none max_graph_gap_after_pass_id=0 max_graph_gap_after_instance_id=0 max_graph_gap_after_kind=none max_graph_gap_after_capture_mode=none max_graph_gap_after_checkpoint_count=0 max_graph_gap_before_pass_id=0 max_graph_gap_before_instance_id=0 max_graph_gap_before_kind=none max_graph_gap_before_capture_mode=none max_graph_gap_before_checkpoint_count=0 composite_scene_replay_timing_available=1 composite_scene_replay_expected_spans=0 composite_scene_replay_resolved_spans=0 composite_scene_replay_gpu_ns=0 composite_scene_replay_host_cpu_ns=0 composite_scene_replay_scene_scan_pairs=0 composite_scene_replay_commands_executed=0 composite_scene_replay_draw_calls=0 composite_scene_replay_texture_binds=0 max_composite_scene_replay_gpu_ns=0 max_composite_scene_replay_pass_id=0 max_composite_scene_replay_instance_id=0 max_composite_scene_replay_command_start=0 max_composite_scene_replay_command_end=0 max_composite_scene_replay_command_count=0 max_composite_scene_replay_scene_commands=0 max_composite_scene_replay_active_work_rects=0 max_composite_scene_replay_active_work_pixels=0 max_composite_scene_replay_command_region_pairs=0 max_composite_scene_replay_scene_scan_pairs=0 max_composite_scene_replay_pending_checkpoints=0 max_composite_scene_replay_host_cpu_ns=0 max_composite_scene_replay_commands_considered=0 max_composite_scene_replay_commands_executed=0 max_composite_scene_replay_draw_calls=0 max_composite_scene_replay_texture_binds=0 max_composite_scene_replay_scene_vbo_uploads=0 max_composite_scene_replay_scene_vbo_upload_bytes=0")
                 .expect("appended timing coverage and max-effect fields"),
             "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 framebuffer_blit_capture_ns=0 framebuffer_shader_copy_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 framebuffer_blit_capture_passes=0 framebuffer_shader_copy_capture_passes=0 checkpoint_capture_passes=3 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 framebuffer_blit_capture_pixels=0 framebuffer_shader_copy_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 framebuffer_shader_copy_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=2 replay_capture_commands=0 checkpoint_dependency_edges=0 replay_capture_materialization_rects=0 replay_capture_execution_regions=0 replay_capture_disjoint_overflows=0 replay_capture_command_region_pairs=0 replay_capture_scene_scan_pairs=0 replay_capture_planner_commands_visited=0 replay_capture_planner_commands_drawable=0 replay_capture_commands_executed=0 replay_capture_draw_calls=0 replay_capture_host_cpu_ns=0 replay_capture_selection_cpu_ns=0 replay_capture_visibility_cpu_ns=0 replay_capture_draw_submit_cpu_ns=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0 max_capture_execution_pixels=0 max_capture_materialization_rects=0 max_capture_execution_regions=0 max_capture_disjoint_overflow=0 max_capture_replay_commands=0 max_capture_command_region_pairs=0 max_capture_scene_commands=0 max_capture_scene_scan_pairs=0 max_capture_planner_commands_visited=0 max_capture_planner_commands_drawable=0 max_capture_commands_executed=0 max_capture_draw_calls=0 max_capture_host_cpu_ns=0 max_capture_selection_cpu_ns=0 max_capture_visibility_cpu_ns=0 max_capture_draw_submit_cpu_ns=0",
         );

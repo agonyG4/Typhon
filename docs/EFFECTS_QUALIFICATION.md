@@ -256,6 +256,111 @@ six-pass built-in blur instance shape, and two expected in-flight graph
 scopes. Pool exhaustion drops only timing spans; it never changes effect
 execution or rendering. No query is allocated in the per-pass path.
 
+### Composite Scene Replay Attribution v1
+
+Composite Scene Replay Attribution measures only the ordinary scene replay
+immediately associated with `reason=composite_advance` for a
+`RenderPassKind::Composite` pass. A replay span is eligible only when a GPU
+graph timing scope exists, `draw_end > scene_cursor`, the authoritative
+`SceneReplayWorkState::active_work()` region is non-empty, and capture is not in
+progress. Empty command ranges, empty active work, `OutputPostProcess`,
+`checkpoint_dependency`, `framebuffer_capture`, `final_scene_replay`, and
+capture-in-progress paths are not measured by this span.
+
+The aggregate fields appended to the same `event=effect_gpu_timing` line are:
+
+```text
+composite_scene_replay_timing_available
+composite_scene_replay_expected_spans composite_scene_replay_resolved_spans
+composite_scene_replay_gpu_ns composite_scene_replay_host_cpu_ns
+composite_scene_replay_scene_scan_pairs
+composite_scene_replay_commands_executed
+composite_scene_replay_draw_calls composite_scene_replay_texture_binds
+```
+
+The bounded max fields are:
+
+```text
+max_composite_scene_replay_gpu_ns
+max_composite_scene_replay_pass_id max_composite_scene_replay_instance_id
+max_composite_scene_replay_command_start max_composite_scene_replay_command_end
+max_composite_scene_replay_command_count
+max_composite_scene_replay_scene_commands
+max_composite_scene_replay_active_work_rects
+max_composite_scene_replay_active_work_pixels
+max_composite_scene_replay_command_region_pairs
+max_composite_scene_replay_scene_scan_pairs
+max_composite_scene_replay_pending_checkpoints
+max_composite_scene_replay_host_cpu_ns
+max_composite_scene_replay_commands_considered
+max_composite_scene_replay_commands_executed
+max_composite_scene_replay_draw_calls
+max_composite_scene_replay_texture_binds
+max_composite_scene_replay_scene_vbo_uploads
+max_composite_scene_replay_scene_vbo_upload_bytes
+```
+
+`command_start`, `command_end`, and `command_count` describe the logical
+command range supplied to the scene replay. In particular,
+`command_count = command_end - command_start` is not a count of physical
+draws. `scene_commands_total` is the complete scene command-vector population.
+The current `draw_command_batch_range()` implementation scans that complete
+vector once for each active work rectangle, so `scene_scan_pairs` describes
+`scene_commands_total * active_work_rects`. It is a workload metric for the
+current full-vector scan and must not be interpreted as executed draws.
+
+`command_region_pairs` describes the logical command range multiplied by the
+active work-rectangle count. `active_work_rects`, `active_work_pixels`, and
+`pending_checkpoint_requirements` are copied from the same normalized
+`SceneReplayWorkState` region used by `draw_effect_scene_range()`; they are not
+reconstructed by the profiler. `commands_considered`, `commands_executed`,
+`draw_calls`, `texture_binds`, `scene_vbo_uploads`, and
+`scene_vbo_upload_bytes` are physical execution counters derived from the
+existing `GlesSceneFrameStats` counters. The profiler does not add duplicate
+counting to the GL rendering loop.
+
+`composite_scene_replay_gpu_ns` is the saturating sum of valid GPU timestamp
+spans. `composite_scene_replay_host_cpu_ns` is the saturating sum of host time
+around only `draw_effect_scene_range()`, with the required frame-stat snapshots
+outside the draw boundary. Host CPU time is measured only after the replay span
+is successfully allocated, and no host clock or profiler-only stats snapshot is
+taken when GPU timing is disabled. The GPU END timestamp is issued immediately
+after the draw returns and before execution-detail construction, so detail
+building, aggregation, trace formatting, validation, and scene-validity updates
+are outside the replay GPU interval.
+
+CPU and GPU durations are independent measurements. CPU command submission and
+GPU execution may overlap; the two durations must not be added together as a
+decomposition of wall-clock frame time.
+
+Availability is graph-scoped and complete only when every eligible replay span
+has a valid timestamp result and exact execution detail. A graph with no
+eligible replay reports `composite_scene_replay_timing_available=1` with
+`expected_spans=0`, `resolved_spans=0`, and zero replay totals/max fields. Pool
+exhaustion increments the expected count but leaves the span unresolved and
+sets availability to zero. An invalid timestamp or missing execution detail
+also sets availability to zero. Partial raw values may remain visible for
+diagnostics, but native qualification must filter on availability before using
+the attribution as complete evidence. The max replay record is selected with
+strict `>` duration comparison, so equal-duration spans keep the first
+resolved physical winner and all static/execution metadata comes from that
+same span.
+
+Each eligible replay costs one additional timestamp pair from the existing
+2,048-span/4,096-query pool. The compile-time bound now proves two expected
+in-flight graph scopes times one graph-total span plus 128 instances times the
+current six built-in blur pass spans plus one Composite Scene Replay span per
+instance: `2 * (1 + 128 * 7) = 1,794`, which remains within the unchanged
+2,048-span pool. No second profiler or query pool is created.
+
+Composite Scene Replay spans have their own timing purpose and never enter
+effect-pass category durations, `timed_passes`, `max_effect_*`,
+`max_capture_*`, `TimedPassBoundary`, or `record_pass_interval()`. Consequently
+`pass_timed_ns`, `graph_unattributed_ns`, and existing Graph Gap Attribution
+retain their prior meanings. In particular, the graph gap remains the largest
+space between existing individually timed effect-pass boundaries; replay timing
+is compared with that remainder and does not subtract from or redefine it.
+
 ### Pass-level tail attribution and graph coverage
 
 The same one-line record appends `pass_timed_ns` and
