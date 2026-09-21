@@ -57,10 +57,6 @@ impl WindowDecorationState {
         self.preference
     }
 
-    pub(in crate::compositor) const fn effective_mode(self, fullscreen: bool) -> DecorationMode {
-        self.preference.effective_mode(true, fullscreen)
-    }
-
     pub(in crate::compositor) const fn requested_mode(self, fullscreen: bool) -> DecorationMode {
         self.preference
             .effective_mode(self.object_present, fullscreen)
@@ -349,9 +345,7 @@ impl super::super::CompositorState {
         let fullscreen = mode == ToplevelMode::Fullscreen;
         let decoration_mode =
             if let Some(decoration_state) = self.xdg_decoration_states.get(&root_surface_id) {
-                decoration_state
-                    .preference()
-                    .effective_mode(true, fullscreen)
+                decoration_state.applied_mode(fullscreen)
             } else if matches!(window.backend, WindowBackend::X11(_)) {
                 effective_x11_decoration_mode(window, mode)
             } else {
