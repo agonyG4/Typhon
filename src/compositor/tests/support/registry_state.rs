@@ -1942,6 +1942,7 @@ impl Dispatch<client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()>
             let mode = match mode {
                 WEnum::Value(client_zxdg_toplevel_decoration_v1::Mode::ClientSide) => 1,
                 WEnum::Value(client_zxdg_toplevel_decoration_v1::Mode::ServerSide) => 2,
+                WEnum::Value(_) => 0,
                 WEnum::Unknown(mode) => mode,
             };
             state.decoration_configure_count += 1;
