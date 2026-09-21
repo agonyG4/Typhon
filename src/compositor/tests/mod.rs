@@ -169,6 +169,7 @@ mod subsurface;
 mod surface_frames;
 mod toplevel_management;
 mod windows;
+mod xdg_decoration;
 mod windows_geometry;
 mod windows_resize_liveness;
 mod workspace;
