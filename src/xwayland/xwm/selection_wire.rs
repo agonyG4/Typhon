@@ -17,6 +17,13 @@ use x11rb::{
     },
 };
 
+use super::super::{
+    XwaylandGeneration,
+    selection_metadata::{
+        XwaylandSelectionEvent, XwaylandSelectionKind, XwaylandSelectionOffer,
+        XwaylandSelectionOfferId,
+    },
+};
 use super::{
     Xwm, XwmError,
     atoms::XwmAtomName,
@@ -31,6 +38,8 @@ use super::{
 
 const MAX_PENDING_SELECTION_REPLIES: usize = 4;
 const MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL: usize = 4_096;
+const MAX_SELECTION_MIME_TYPES: usize = super::data_bridge::selection::MAX_SELECTION_TARGETS;
+const MAX_MIME_TYPE_LEN: usize = 4_096;
 const TARGETS_PROPERTY_ITEMS: u32 =
     (super::data_bridge::selection::MAX_SELECTION_TARGETS + 1) as u32;
 
@@ -38,6 +47,33 @@ const TARGETS_PROPERTY_ITEMS: u32 =
 enum RequestorSafety {
     Clean,
     Poisoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionTargetBinding {
+    mime_type: String,
+    target: Atom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionTargetCatalog {
+    identity: SelectionIdentity,
+    bindings: Vec<SelectionTargetBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetNameResolution {
+    Complete(Option<String>),
+    Pending,
+    InFlight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetCatalogResolution {
+    identity: SelectionIdentity,
+    targets: Vec<Atom>,
+    names: Vec<TargetNameResolution>,
+    next_ordinal: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +94,11 @@ enum PendingReplyKind {
         requestor: Window,
         property: Atom,
     },
+    TargetAtomName {
+        identity: SelectionIdentity,
+        target: Atom,
+        ordinal: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +114,11 @@ pub(crate) struct SelectionWireState {
     windows: HashMap<SelectionKind, SelectionWindows>,
     internal_windows: HashSet<Window>,
     pending: BTreeMap<SequenceNumber, PendingSelectionReply>,
+    target_catalogs: HashMap<SelectionKind, SelectionTargetCatalog>,
+    target_resolutions: HashMap<SelectionKind, TargetCatalogResolution>,
+    pending_selection_events: HashMap<SelectionKind, XwaylandSelectionEvent>,
+    current_offers: HashMap<SelectionKind, XwaylandSelectionOfferId>,
+    catalog_turn: Option<SelectionKind>,
 }
 
 impl SelectionWireState {
@@ -116,6 +162,123 @@ impl SelectionWireState {
         self.debug_assert_invariants();
     }
 
+    fn invalidate_selection(&mut self, kind: SelectionKind, generation: XwaylandGeneration) {
+        self.target_resolutions.remove(&kind);
+        self.target_catalogs.remove(&kind);
+        if self.current_offers.remove(&kind).is_some() {
+            self.queue_selection_event(XwaylandSelectionEvent::Cleared {
+                kind: public_selection_kind(kind),
+                generation,
+            });
+        }
+        self.debug_assert_invariants();
+    }
+
+    fn queue_selection_event(&mut self, event: XwaylandSelectionEvent) {
+        let kind = match event.kind() {
+            XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+            XwaylandSelectionKind::Primary => SelectionKind::Primary,
+        };
+        self.pending_selection_events.insert(kind, event);
+        debug_assert!(self.pending_selection_events.len() <= 2);
+    }
+
+    pub(crate) fn take_selection_events(&mut self) -> Vec<XwaylandSelectionEvent> {
+        [SelectionKind::Clipboard, SelectionKind::Primary]
+            .into_iter()
+            .filter_map(|kind| self.pending_selection_events.remove(&kind))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_target_atom_name_sequence_for_test(
+        &self,
+        kind: SelectionKind,
+        target: Atom,
+    ) -> Option<SequenceNumber> {
+        self.pending.iter().find_map(|(sequence, pending)| {
+            matches!(
+                pending.kind,
+                PendingReplyKind::TargetAtomName {
+                    identity,
+                    target: pending_target,
+                    ..
+                } if pending.selection == kind
+                    && identity.kind == kind
+                    && pending_target == target
+            )
+            .then_some(*sequence)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_for_mime_for_test(
+        &self,
+        kind: SelectionKind,
+        id: XwaylandSelectionOfferId,
+        mime_type: &str,
+    ) -> Option<Atom> {
+        self.target_catalogs.get(&kind).and_then(|catalog| {
+            (catalog.identity.kind == kind
+                && catalog.identity.generation == BridgeGeneration::from(id.generation)
+                && catalog.identity.revision.get() == id.revision)
+                .then(|| {
+                    catalog
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.mime_type == mime_type)
+                        .map(|binding| binding.target)
+                })
+                .flatten()
+        })
+    }
+
+    fn next_target_name_request(
+        &mut self,
+    ) -> Option<(SelectionKind, SelectionIdentity, Atom, usize)> {
+        let first = self.catalog_turn.unwrap_or(SelectionKind::Clipboard);
+        let kinds = [first, other_selection_kind(first)];
+        for kind in kinds {
+            let Some(resolution) = self.target_resolutions.get_mut(&kind) else {
+                continue;
+            };
+            while resolution.next_ordinal < resolution.targets.len() {
+                let ordinal = resolution.next_ordinal;
+                resolution.next_ordinal += 1;
+                if resolution.names[ordinal] != TargetNameResolution::Pending {
+                    continue;
+                }
+                resolution.names[ordinal] = TargetNameResolution::InFlight;
+                self.catalog_turn = Some(other_selection_kind(kind));
+                return Some((
+                    kind,
+                    resolution.identity,
+                    resolution.targets[ordinal],
+                    ordinal,
+                ));
+            }
+        }
+        None
+    }
+
+    fn complete_target_name(
+        &mut self,
+        identity: SelectionIdentity,
+        target: Atom,
+        ordinal: usize,
+        name: Option<String>,
+    ) {
+        let Some(resolution) = self.target_resolutions.get_mut(&identity.kind) else {
+            return;
+        };
+        if resolution.identity != identity
+            || resolution.targets.get(ordinal).copied() != Some(target)
+        {
+            return;
+        }
+        resolution.names[ordinal] = TargetNameResolution::Complete(name);
+    }
+
     pub(crate) fn clear_generation(&mut self, generation: BridgeGeneration) -> Vec<SequenceNumber> {
         let sequences = self
             .pending
@@ -131,6 +294,11 @@ impl SelectionWireState {
             self.active_generation = None;
             self.windows.clear();
             self.internal_windows.clear();
+            self.target_catalogs.clear();
+            self.target_resolutions.clear();
+            self.pending_selection_events.clear();
+            self.current_offers.clear();
+            self.catalog_turn = None;
         }
         self.debug_assert_invariants();
         sequences
@@ -212,6 +380,16 @@ impl SelectionWireState {
         debug_assert!(self.windows.values().all(|windows| {
             windows.requestor_windows_created <= MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
         }));
+        debug_assert!(
+            self.target_catalogs
+                .values()
+                .all(|catalog| { catalog.bindings.len() <= MAX_SELECTION_MIME_TYPES })
+        );
+        debug_assert!(self.target_resolutions.values().all(|resolution| {
+            resolution.targets.len() <= super::data_bridge::selection::MAX_SELECTION_TARGETS
+                && resolution.targets.len() == resolution.names.len()
+        }));
+        debug_assert!(self.pending_selection_events.len() <= 2);
     }
 }
 
@@ -342,6 +520,20 @@ fn selection_atom(xwm: &Xwm, kind: SelectionKind) -> Atom {
     match kind {
         SelectionKind::Clipboard => xwm.atoms.get(XwmAtomName::Clipboard),
         SelectionKind::Primary => u32::from(xproto::AtomEnum::PRIMARY),
+    }
+}
+
+fn public_selection_kind(kind: SelectionKind) -> XwaylandSelectionKind {
+    match kind {
+        SelectionKind::Clipboard => XwaylandSelectionKind::Clipboard,
+        SelectionKind::Primary => XwaylandSelectionKind::Primary,
+    }
+}
+
+fn other_selection_kind(kind: SelectionKind) -> SelectionKind {
+    match kind {
+        SelectionKind::Clipboard => SelectionKind::Primary,
+        SelectionKind::Primary => SelectionKind::Clipboard,
     }
 }
 
@@ -577,6 +769,219 @@ fn request_targets_property(
     xwm.connection.flush().map_err(XwmError::Connection)
 }
 
+fn begin_target_catalog_resolution(
+    xwm: &mut Xwm,
+    identity: SelectionIdentity,
+    targets: &[Atom],
+) -> Result<(), XwmError> {
+    let mut unique_targets = Vec::with_capacity(targets.len());
+    let mut seen = HashSet::with_capacity(targets.len());
+    for target in targets.iter().copied() {
+        if seen.insert(target) {
+            unique_targets.push(target);
+        }
+    }
+    debug_assert!(unique_targets.len() <= super::data_bridge::selection::MAX_SELECTION_TARGETS);
+
+    let names = unique_targets
+        .iter()
+        .copied()
+        .map(|target| {
+            if is_control_target(xwm, target) || is_compatibility_alias(xwm, target) {
+                TargetNameResolution::Complete(None)
+            } else {
+                TargetNameResolution::Pending
+            }
+        })
+        .collect();
+    xwm.data_bridge.selection_wire.target_resolutions.insert(
+        identity.kind,
+        TargetCatalogResolution {
+            identity,
+            targets: unique_targets,
+            names,
+            next_ordinal: 0,
+        },
+    );
+    schedule_target_name_queries(xwm)
+}
+
+fn schedule_target_name_queries(xwm: &mut Xwm) -> Result<(), XwmError> {
+    finalize_ready_target_catalogs(xwm);
+    while xwm.data_bridge.selection_wire.pending.len() < MAX_PENDING_SELECTION_REPLIES {
+        let Some((_kind, identity, target, ordinal)) =
+            xwm.data_bridge.selection_wire.next_target_name_request()
+        else {
+            break;
+        };
+        let cookie = xwm
+            .connection
+            .get_atom_name(target)
+            .map_err(XwmError::Connection)?;
+        let sequence = cookie.sequence_number();
+        std::mem::forget(cookie);
+        insert_pending(
+            xwm,
+            sequence,
+            PendingSelectionReply {
+                generation: identity.generation,
+                selection: identity.kind,
+                kind: PendingReplyKind::TargetAtomName {
+                    identity,
+                    target,
+                    ordinal,
+                },
+            },
+        );
+    }
+    finalize_ready_target_catalogs(xwm);
+    xwm.connection.flush().map_err(XwmError::Connection)
+}
+
+fn finalize_ready_target_catalogs(xwm: &mut Xwm) {
+    let ready = xwm
+        .data_bridge
+        .selection_wire
+        .target_resolutions
+        .iter()
+        .filter(|(_, resolution)| {
+            resolution.next_ordinal == resolution.targets.len()
+                && resolution
+                    .names
+                    .iter()
+                    .all(|name| matches!(name, TargetNameResolution::Complete(_)))
+        })
+        .map(|(kind, resolution)| (*kind, resolution.clone()))
+        .collect::<Vec<_>>();
+
+    for (kind, resolution) in ready {
+        let current = xwm
+            .data_bridge
+            .selections
+            .current(kind)
+            .is_some_and(|state| {
+                state.identity() == Some(resolution.identity)
+                    && state.generation == resolution.identity.generation
+                    && state.origin == Some(SelectionOrigin::X11)
+                    && state.targets_state == TargetsDiscoveryState::Resolved
+            });
+        if !current {
+            xwm.data_bridge
+                .selection_wire
+                .target_resolutions
+                .remove(&kind);
+            continue;
+        }
+
+        let mut bindings = Vec::new();
+        for (target, name) in resolution.targets.iter().copied().zip(&resolution.names) {
+            let TargetNameResolution::Complete(Some(name)) = name else {
+                continue;
+            };
+            let Some(name) = valid_mime_name(name.as_bytes()) else {
+                continue;
+            };
+            if !bindings
+                .iter()
+                .any(|binding: &SelectionTargetBinding| binding.mime_type == name)
+            {
+                bindings.push(SelectionTargetBinding {
+                    mime_type: name,
+                    target,
+                });
+            }
+        }
+        for (target, _name) in resolution.targets.iter().copied().zip(&resolution.names) {
+            let mime_type = if name_is_alias(xwm, target, XwmAtomName::Utf8String) {
+                Some("text/plain;charset=utf-8")
+            } else if name_is_alias(xwm, target, XwmAtomName::Text) {
+                Some("text/plain")
+            } else {
+                None
+            };
+            let Some(mime_type) = mime_type else {
+                continue;
+            };
+            if !bindings
+                .iter()
+                .any(|binding: &SelectionTargetBinding| binding.mime_type == mime_type)
+            {
+                bindings.push(SelectionTargetBinding {
+                    mime_type: mime_type.to_owned(),
+                    target,
+                });
+            }
+        }
+
+        let catalog = SelectionTargetCatalog {
+            identity: resolution.identity,
+            bindings,
+        };
+        let offer_id = XwaylandSelectionOfferId {
+            generation: xwm.generation,
+            kind: public_selection_kind(kind),
+            revision: resolution.identity.revision.get(),
+        };
+        let mime_types = catalog
+            .bindings
+            .iter()
+            .map(|binding| binding.mime_type.clone())
+            .collect::<Vec<_>>();
+        xwm.data_bridge
+            .selection_wire
+            .target_resolutions
+            .remove(&kind);
+        xwm.data_bridge
+            .selection_wire
+            .target_catalogs
+            .insert(kind, catalog);
+        if !mime_types.is_empty() {
+            xwm.data_bridge
+                .selection_wire
+                .current_offers
+                .insert(kind, offer_id);
+            xwm.data_bridge.selection_wire.queue_selection_event(
+                XwaylandSelectionEvent::OfferChanged {
+                    kind: public_selection_kind(kind),
+                    offer: XwaylandSelectionOffer {
+                        id: offer_id,
+                        mime_types,
+                    },
+                },
+            );
+        }
+    }
+}
+
+fn valid_mime_name(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_MIME_TYPE_LEN || bytes.contains(&0) {
+        return None;
+    }
+    let name = String::from_utf8(bytes.to_vec()).ok()?;
+    (!name.is_empty() && name.contains('/')).then_some(name)
+}
+
+fn is_control_target(xwm: &Xwm, target: Atom) -> bool {
+    [
+        XwmAtomName::Targets,
+        XwmAtomName::Timestamp,
+        XwmAtomName::Multiple,
+        XwmAtomName::Incr,
+        XwmAtomName::SelectionTargets,
+    ]
+    .into_iter()
+    .any(|name| xwm.atoms.get(name) == target)
+}
+
+fn is_compatibility_alias(xwm: &Xwm, target: Atom) -> bool {
+    name_is_alias(xwm, target, XwmAtomName::Utf8String)
+        || name_is_alias(xwm, target, XwmAtomName::Text)
+}
+
+fn name_is_alias(xwm: &Xwm, target: Atom, alias: XwmAtomName) -> bool {
+    xwm.atoms.get(alias) == target
+}
+
 fn insert_pending(xwm: &mut Xwm, sequence: SequenceNumber, pending: PendingSelectionReply) {
     let tracker = &mut xwm.data_bridge.selection_wire.pending;
     debug_assert!(tracker.len() < MAX_PENDING_SELECTION_REPLIES);
@@ -705,13 +1110,41 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<SelectionRepl
                         .resolve_targets(identity, &targets)
                     {
                         mark_failed_if_current(xwm, identity);
+                    } else {
+                        begin_target_catalog_resolution(xwm, identity, &targets)?;
                     }
                 } else {
                     mark_failed_if_current(xwm, identity);
                 }
             }
+            PendingReplyKind::TargetAtomName {
+                identity,
+                target,
+                ordinal,
+            } => {
+                let cookie = Cookie::<X11Connection, xproto::GetAtomNameReply>::new(
+                    &xwm.connection,
+                    sequence,
+                );
+                let reply = match cookie.reply_unchecked() {
+                    Ok(reply) => reply,
+                    Err(x11rb::errors::ConnectionError::IoError(error))
+                        if error.kind() == io::ErrorKind::WouldBlock =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(XwmError::Connection(error)),
+                };
+                xwm.data_bridge.selection_wire.pending.remove(&sequence);
+                processed += 1;
+                let name = reply.and_then(|reply| valid_mime_name(&reply.name));
+                xwm.data_bridge
+                    .selection_wire
+                    .complete_target_name(identity, target, ordinal, name);
+            }
         }
     }
+    schedule_target_name_queries(xwm)?;
     Ok(SelectionReplyDrain {
         processed,
         budget_exhausted,
@@ -760,6 +1193,9 @@ fn apply_owner_transition(
     else {
         return Ok(());
     };
+    xwm.data_bridge
+        .selection_wire
+        .invalidate_selection(kind, xwm.generation);
     cancel_channel_replies(xwm, generation, kind);
     let current_requestor = xwm.data_bridge.selection_wire.requestor(kind);
     let owner_is_requestor = owner.is_some() && owner == current_requestor;
@@ -842,6 +1278,29 @@ pub(crate) fn pending_sequence_for_test(
     xwm.data_bridge
         .selection_wire
         .pending_sequence_for_test(kind, targets_property)
+}
+
+#[cfg(test)]
+pub(crate) fn pending_target_atom_name_sequence_for_test(
+    xwm: &Xwm,
+    kind: SelectionKind,
+    target: Atom,
+) -> Option<SequenceNumber> {
+    xwm.data_bridge
+        .selection_wire
+        .pending_target_atom_name_sequence_for_test(kind, target)
+}
+
+#[cfg(test)]
+pub(crate) fn target_for_mime_for_test(
+    xwm: &Xwm,
+    kind: SelectionKind,
+    id: XwaylandSelectionOfferId,
+    mime_type: &str,
+) -> Option<Atom> {
+    xwm.data_bridge
+        .selection_wire
+        .target_for_mime_for_test(kind, id, mime_type)
 }
 
 #[cfg(test)]

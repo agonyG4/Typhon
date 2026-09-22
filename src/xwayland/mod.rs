@@ -12,6 +12,7 @@ mod launch;
 mod metrics;
 mod protocol;
 mod readiness;
+pub mod selection_metadata;
 mod service;
 pub mod trace;
 pub mod xwm;
@@ -26,6 +27,9 @@ pub use association::{
 pub use config::{XwaylandConfig, XwaylandMode, XwaylandProfile, XwaylandStartPolicy};
 pub use generation::XwaylandGeneration;
 pub use readiness::XwaylandReadinessSnapshot;
+pub use selection_metadata::{
+    XwaylandSelectionEvent, XwaylandSelectionKind, XwaylandSelectionOffer, XwaylandSelectionOfferId,
+};
 pub use service::{
     XwaylandReactorPurpose, XwaylandReactorRegistration, XwaylandService, XwaylandStateKind,
 };

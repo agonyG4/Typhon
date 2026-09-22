@@ -1272,6 +1272,13 @@ impl XwaylandService {
         events
     }
 
+    pub fn take_managed_selection_events(&mut self) -> Vec<super::XwaylandSelectionEvent> {
+        match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.take_selection_events(),
+            _ => Vec::new(),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn resize_sync_snapshot(&self, handle: super::X11WindowHandle) -> Option<(u64, bool)> {
         match &self.state {
