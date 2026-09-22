@@ -8,6 +8,7 @@ use oblivion_one::effects::{
 /// Immutable renderer-independent effect damage evidence for one resolved frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NativeEffectDamageFrameSnapshot {
+    pub(crate) registry_generation: u64,
     pub(crate) instances: Vec<NativeEffectDamageInstanceSnapshot>,
     pub(crate) frame_local_dirty: EffectRegion,
     pub(crate) conservative_full: bool,
@@ -21,8 +22,12 @@ pub(crate) struct NativeEffectDamageInstanceSnapshot {
 }
 
 impl NativeEffectDamageFrameSnapshot {
-    pub(crate) fn conservative_full(frame_local_dirty: EffectRegion) -> Self {
+    pub(crate) fn conservative_full(
+        registry_generation: u64,
+        frame_local_dirty: EffectRegion,
+    ) -> Self {
         Self {
+            registry_generation,
             instances: Vec::new(),
             frame_local_dirty,
             conservative_full: true,
@@ -36,6 +41,7 @@ pub(crate) fn freeze_native_effect_damage(
     _output_bounds: EffectRect,
 ) -> NativeEffectDamageFrameSnapshot {
     let mut snapshot = NativeEffectDamageFrameSnapshot {
+        registry_generation: registry_generation.generation,
         instances: Vec::new(),
         frame_local_dirty: effects.frame_demand_snapshot().dirty_region,
         conservative_full: false,
@@ -77,6 +83,14 @@ pub(crate) fn expand_physical_effect_damage(
     let output_height = output_bounds.height;
     if base_damage.kind == NativeDamageKind::FullOutput {
         return base_damage;
+    }
+    if previous.registry_generation != current.registry_generation
+        && (previous.conservative_full
+            || current.conservative_full
+            || !previous.instances.is_empty()
+            || !current.instances.is_empty())
+    {
+        return NativeOutputDamage::full_output(output_width, output_height);
     }
 
     let mut source_damage = effect_region_from_native_damage(&base_damage);
@@ -202,6 +216,7 @@ mod tests {
 
         let snapshot = freeze_native_effect_damage(&effects, &generation, output_bounds);
 
+        assert_eq!(snapshot.registry_generation, generation.generation);
         assert_eq!(snapshot.instances.len(), 4);
         assert!(!snapshot.conservative_full);
         assert!(
@@ -234,6 +249,7 @@ mod tests {
             EffectRect::new(0, 0, 100, 80).unwrap(),
         );
 
+        assert_eq!(snapshot.registry_generation, generation.generation);
         assert!(snapshot.conservative_full);
         assert_eq!(snapshot.instances.len(), 1);
         assert_eq!(snapshot.instances[0].instance_id.get(), 8);

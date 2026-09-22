@@ -112,6 +112,7 @@ fn snapshot_with_clip(frame_id: u64, clip: PresentationClip) -> NativeFrameScene
     );
 
     scene.physical_effect_damage = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
             instance_id: EffectInstanceId::new(1).expect("foreign effect instance"),
             region: EffectRegion::from_rect(foreign_effect_output),
@@ -138,10 +139,21 @@ fn snapshot_with_effect_recipe(
     effect_rect: EffectRect,
     sample_radius: u32,
 ) -> NativeFrameSceneSnapshot {
+    snapshot_with_effect_recipe_at_generation(frame_id, source_rect, effect_rect, sample_radius, 0)
+}
+
+fn snapshot_with_effect_recipe_at_generation(
+    frame_id: u64,
+    source_rect: EffectRect,
+    effect_rect: EffectRect,
+    sample_radius: u32,
+    registry_generation: u64,
+) -> NativeFrameSceneSnapshot {
     let mut snapshot = snapshot_with_clip(frame_id, PresentationClip::Unbounded);
     snapshot.scene.effect_damage = EffectRegion::from_rect(source_rect);
     snapshot.scene.effect_identity_signature = frame_id;
     snapshot.scene.physical_effect_damage = NativeEffectDamageFrameSnapshot {
+        registry_generation,
         instances: vec![NativeEffectDamageInstanceSnapshot {
             instance_id: EffectInstanceId::new(frame_id).expect("effect instance"),
             region: EffectRegion::from_rect(effect_rect),
@@ -253,11 +265,13 @@ fn physical_effect_expansion_keeps_old_and_new_influence_regions() {
         aggregate_footprint: EffectFootprint::ZERO,
     };
     let previous = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![old_instance],
         frame_local_dirty: EffectRegion::empty(),
         conservative_full: false,
     };
     let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![new_instance],
         frame_local_dirty: EffectRegion::empty(),
         conservative_full: false,
@@ -304,6 +318,7 @@ fn removed_and_introduced_effects_cover_frozen_sample_and_output_footprints() {
         },
     };
     let previous = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
             instance_id: EffectInstanceId::new(13).expect("removed effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(18, 18, 14, 14).unwrap()),
@@ -334,6 +349,7 @@ fn removed_and_introduced_effects_cover_frozen_sample_and_output_footprints() {
     ));
 
     let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
             instance_id: EffectInstanceId::new(14).expect("introduced effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(58, 18, 14, 14).unwrap()),
@@ -374,6 +390,7 @@ fn output_postprocess_and_continuous_dirty_use_frozen_recipe() {
     };
     let previous = NativeEffectDamageFrameSnapshot::default();
     let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![postprocess],
         frame_local_dirty: EffectRegion::from_rect(EffectRect::new(40, 40, 1, 1).unwrap()),
         conservative_full: false,
@@ -446,6 +463,7 @@ fn continuous_dirty_region_survives_physical_promotion_into_age_history() {
 fn incomplete_recipe_uses_bounded_full_output_fallback() {
     let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
     let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: Vec::new(),
         frame_local_dirty: EffectRegion::empty(),
         conservative_full: true,
@@ -492,6 +510,277 @@ fn empty_and_full_physical_paths_remain_stable() {
         .prepare_pageflip_transition(2, 100, 80)
         .expect("empty physical transition");
     assert_eq!(transition.damage, OutputDamage::Empty);
+}
+
+#[test]
+fn registry_generation_transition_for_visible_effect_is_full_output_without_source_damage() {
+    let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
+    let previous = NativeEffectDamageFrameSnapshot {
+        registry_generation: 7,
+        instances: vec![NativeEffectDamageInstanceSnapshot {
+            instance_id: EffectInstanceId::new(40).expect("effect instance"),
+            region: EffectRegion::from_rect(EffectRect::new(20, 20, 10, 10).unwrap()),
+            aggregate_footprint: EffectFootprint::symmetric(2),
+        }],
+        frame_local_dirty: EffectRegion::empty(),
+        conservative_full: false,
+    };
+    let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 8,
+        ..previous.clone()
+    };
+
+    let expanded = expand_physical_effect_damage(
+        NativeOutputDamage::empty(),
+        &previous,
+        &current,
+        output_bounds,
+    );
+
+    assert_eq!(expanded.kind, NativeDamageKind::FullOutput);
+}
+
+#[test]
+fn same_registry_generation_with_visible_effect_preserves_empty_physical_damage() {
+    let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
+    let snapshot = NativeEffectDamageFrameSnapshot {
+        registry_generation: 7,
+        instances: vec![NativeEffectDamageInstanceSnapshot {
+            instance_id: EffectInstanceId::new(41).expect("effect instance"),
+            region: EffectRegion::from_rect(EffectRect::new(20, 20, 10, 10).unwrap()),
+            aggregate_footprint: EffectFootprint::symmetric(2),
+        }],
+        frame_local_dirty: EffectRegion::empty(),
+        conservative_full: false,
+    };
+
+    let expanded = expand_physical_effect_damage(
+        NativeOutputDamage::empty(),
+        &snapshot,
+        &snapshot,
+        output_bounds,
+    );
+
+    assert_eq!(expanded.kind, NativeDamageKind::Empty);
+}
+
+#[test]
+fn registry_generation_transition_without_visible_effects_stays_empty() {
+    let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
+    let previous = NativeEffectDamageFrameSnapshot {
+        registry_generation: 7,
+        ..NativeEffectDamageFrameSnapshot::default()
+    };
+    let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 8,
+        ..NativeEffectDamageFrameSnapshot::default()
+    };
+
+    let expanded = expand_physical_effect_damage(
+        NativeOutputDamage::empty(),
+        &previous,
+        &current,
+        output_bounds,
+    );
+
+    assert_eq!(expanded.kind, NativeDamageKind::Empty);
+}
+
+#[test]
+fn removed_visible_effect_across_registry_reload_is_full_output() {
+    let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
+    let previous = snapshot_with_effect_recipe_at_generation(
+        1,
+        EffectRect::new(20, 20, 10, 10).unwrap(),
+        EffectRect::new(20, 20, 10, 10).unwrap(),
+        0,
+        7,
+    )
+    .scene
+    .physical_effect_damage;
+    let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 8,
+        ..NativeEffectDamageFrameSnapshot::default()
+    };
+
+    let expanded = expand_physical_effect_damage(
+        NativeOutputDamage::empty(),
+        &previous,
+        &current,
+        output_bounds,
+    );
+
+    assert_eq!(expanded.kind, NativeDamageKind::FullOutput);
+}
+
+#[test]
+fn introduced_visible_effect_across_registry_reload_is_full_output() {
+    let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
+    let previous = NativeEffectDamageFrameSnapshot {
+        registry_generation: 7,
+        ..NativeEffectDamageFrameSnapshot::default()
+    };
+    let current = snapshot_with_effect_recipe_at_generation(
+        2,
+        EffectRect::new(20, 20, 10, 10).unwrap(),
+        EffectRect::new(20, 20, 10, 10).unwrap(),
+        0,
+        8,
+    )
+    .scene
+    .physical_effect_damage;
+
+    let expanded = expand_physical_effect_damage(
+        NativeOutputDamage::empty(),
+        &previous,
+        &current,
+        output_bounds,
+    );
+
+    assert_eq!(expanded.kind, NativeDamageKind::FullOutput);
+}
+
+#[test]
+fn delayed_old_generation_submission_survives_registry_reload() {
+    let mut presented = snapshot_with_clip(1, PresentationClip::Unbounded);
+    presented.scene.physical_effect_damage.registry_generation = 1;
+    let mut submitted = presented.clone();
+    submitted.frame_id = 2;
+    let mut ready_after_reload = submitted.clone();
+    ready_after_reload.frame_id = 3;
+    ready_after_reload
+        .scene
+        .physical_effect_damage
+        .registry_generation = 2;
+
+    let mut history = NativeSceneHistory::new(presented);
+    history.replace_ready(submitted);
+    assert!(history.queue_submission(20));
+    history.replace_ready(ready_after_reload);
+
+    let old_generation_transition = history
+        .prepare_pageflip_transition(20, 100, 80)
+        .expect("old-generation submission");
+    assert_eq!(old_generation_transition.previous_frame_id, Some(1));
+    assert_eq!(old_generation_transition.current_frame_id, 2);
+    assert_ne!(old_generation_transition.damage, OutputDamage::Full);
+
+    assert!(history.promote_pageflip(20));
+    assert!(history.queue_submission(30));
+    let reload_transition = history
+        .prepare_pageflip_transition(30, 100, 80)
+        .expect("post-reload submission");
+    assert_eq!(reload_transition.previous_frame_id, Some(2));
+    assert_eq!(reload_transition.current_frame_id, 3);
+    assert_eq!(reload_transition.damage, OutputDamage::Full);
+}
+
+#[test]
+fn rejected_registry_generation_candidate_does_not_become_physical_authority() {
+    let mut presented = snapshot_with_clip(1, PresentationClip::Unbounded);
+    presented.scene.physical_effect_damage.registry_generation = 1;
+    let mut rejected = presented.clone();
+    rejected.frame_id = 2;
+    rejected.scene.physical_effect_damage.registry_generation = 2;
+    let mut current = presented.clone();
+    current.frame_id = 3;
+
+    let mut history = NativeSceneHistory::new(presented);
+    history.replace_ready(rejected);
+    assert!(history.queue_submission(20));
+    assert!(history.discard_submission(20));
+    history.replace_ready(current);
+    assert!(history.queue_submission(30));
+
+    let transition = history
+        .prepare_pageflip_transition(30, 100, 80)
+        .expect("current generation-1 submission");
+    assert_eq!(transition.previous_frame_id, Some(1));
+    assert_eq!(transition.current_frame_id, 3);
+    assert_eq!(transition.damage, OutputDamage::Empty);
+}
+
+#[test]
+fn registry_reload_discontinuity_enters_physical_age_two_repair_history() {
+    let mut presented = snapshot_with_clip(1, PresentationClip::Unbounded);
+    presented.scene.physical_effect_damage.registry_generation = 1;
+    let mut reloaded = presented.clone();
+    reloaded.frame_id = 2;
+    reloaded.scene.physical_effect_damage.registry_generation = 2;
+
+    let mut history = NativeSceneHistory::new(presented);
+    history.replace_ready(reloaded);
+    assert!(history.queue_submission(20));
+    let transition = history
+        .prepare_pageflip_transition(20, 100, 80)
+        .expect("registry reload transition");
+    assert_eq!(transition.damage, OutputDamage::Full);
+
+    let mut planner = PartialRepaintPlanner::new(
+        (100, 80),
+        EglPartialRepaintCapabilities {
+            buffer_age: true,
+            partial_render_repair: true,
+            swap_buffers_with_damage: true,
+        },
+    );
+    let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+    planner.commit_presented_transition(first.render_damage);
+    planner.commit_presented_transition(transition.damage);
+
+    let repair = planner.plan(
+        OutputDamage::Rects(vec![OutputRect::new(1, 1, 1, 1)]),
+        BufferAge::Value(2),
+    );
+    assert_eq!(repair.repair_damage, OutputDamage::Full);
+}
+
+#[test]
+fn integrated_registry_reload_transition_participates_in_physical_age_three_repair() {
+    let mut presented = snapshot_with_clip(1, PresentationClip::Unbounded);
+    presented.scene.physical_effect_damage.registry_generation = 1;
+    let mut reloaded = presented.clone();
+    reloaded.frame_id = 2;
+    reloaded.scene.physical_effect_damage.registry_generation = 2;
+    let mut later = reloaded.clone();
+    later.frame_id = 3;
+    later.scene.physical_effect_damage.frame_local_dirty =
+        EffectRegion::from_rect(EffectRect::new(30, 30, 6, 6).unwrap());
+
+    let mut history = NativeSceneHistory::new(presented);
+    history.replace_ready(reloaded);
+    assert!(history.queue_submission(20));
+    let reload_transition = history
+        .prepare_pageflip_transition(20, 100, 80)
+        .expect("registry reload transition");
+    assert_eq!(reload_transition.damage, OutputDamage::Full);
+    assert!(history.promote_pageflip(20));
+
+    history.replace_ready(later);
+    assert!(history.queue_submission(30));
+    let later_transition = history
+        .prepare_pageflip_transition(30, 100, 80)
+        .expect("later physical transition");
+    assert!(later_transition.damage != OutputDamage::Empty);
+
+    let mut planner = PartialRepaintPlanner::new(
+        (100, 80),
+        EglPartialRepaintCapabilities {
+            buffer_age: true,
+            partial_render_repair: true,
+            swap_buffers_with_damage: true,
+        },
+    );
+    let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+    planner.commit_presented_transition(first.render_damage);
+    planner.commit_presented_transition(reload_transition.damage);
+    planner.commit_presented_transition(later_transition.damage);
+
+    let repair = planner.plan(
+        OutputDamage::Rects(vec![OutputRect::new(1, 1, 1, 1)]),
+        BufferAge::Value(3),
+    );
+    assert_eq!(repair.repair_damage, OutputDamage::Full);
 }
 
 #[test]
@@ -583,6 +872,7 @@ fn physical_expansion_matches_renderer_plan_for_frozen_footprint() {
         height: 10,
     }]);
     let snapshot = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
             instance_id: EffectInstanceId::new(30).expect("renderer parity instance"),
             region: visible_region,
@@ -605,6 +895,7 @@ fn physical_expansion_matches_renderer_plan_for_frozen_footprint() {
 fn unrelated_effect_domain_stays_out_of_physical_expansion() {
     let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
     let current = NativeEffectDamageFrameSnapshot {
+        registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
             instance_id: EffectInstanceId::new(31).expect("unrelated effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(60, 10, 10, 10).unwrap()),
