@@ -18,6 +18,7 @@ use super::{
         PendingViewportChange,
     },
 };
+use crate::compositor::decoration::types::CapturedXdgDecorationCommit;
 use crate::compositor::layer_shell::CapturedLayerSurfaceCommitState;
 
 pub(super) const MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE: usize = 8;
@@ -336,6 +337,7 @@ pub(super) struct CapturedSubsurfaceParentState {
 pub(super) struct CapturedSurfaceCommitContext {
     pub(super) subsurface_parent: CapturedSubsurfaceParentState,
     pub(super) layer_surface: Option<CapturedLayerSurfaceCommitState>,
+    pub(super) xdg_decoration: Option<CapturedXdgDecorationCommit>,
 }
 
 impl CapturedSurfaceCommitContext {
@@ -374,6 +376,12 @@ impl CapturedSurfaceCommitContext {
             (Some(older), None) => Some(older),
             (None, None) => None,
         };
+        // Decoration transitions are commit obligations. A later coalesced
+        // commit with no transition leaves the older state in force; a newer
+        // captured transition replaces it chronologically.
+        if newer.xdg_decoration.is_some() {
+            self.xdg_decoration = newer.xdg_decoration;
+        }
     }
 }
 
@@ -656,6 +664,10 @@ where
 #[cfg(test)]
 mod commit_context_tests {
     use super::*;
+    use crate::compositor::decoration::types::{
+        CapturedXdgDecorationCommitState, ConfiguredXdgDecorationState, DecorationMode,
+        DecorationObjectGeneration,
+    };
 
     fn relationship(surface_id: u32, relationship_id: u64) -> CapturedSubsurfaceRelationship {
         CapturedSubsurfaceRelationship {
@@ -663,6 +675,45 @@ mod commit_context_tests {
             parent_id: 1,
             relationship_id: SubsurfaceRelationshipId(relationship_id),
         }
+    }
+
+    fn configured(generation: u64, mode: DecorationMode) -> CapturedXdgDecorationCommit {
+        CapturedXdgDecorationCommit {
+            state: CapturedXdgDecorationCommitState::Configured(ConfiguredXdgDecorationState {
+                generation: DecorationObjectGeneration(generation),
+                mode,
+            }),
+            commit_sequence: SurfaceCommitSequence(generation),
+        }
+    }
+
+    #[test]
+    fn captured_context_merge_preserves_older_decoration_when_newer_has_none() {
+        let mut older = CapturedSurfaceCommitContext {
+            xdg_decoration: Some(configured(1, DecorationMode::ServerSide)),
+            ..CapturedSurfaceCommitContext::default()
+        };
+        older.merge(CapturedSurfaceCommitContext::default());
+        assert_eq!(
+            older.xdg_decoration,
+            Some(configured(1, DecorationMode::ServerSide))
+        );
+    }
+
+    #[test]
+    fn captured_context_merge_uses_newer_decoration_transition() {
+        let mut older = CapturedSurfaceCommitContext {
+            xdg_decoration: Some(configured(1, DecorationMode::ServerSide)),
+            ..CapturedSurfaceCommitContext::default()
+        };
+        older.merge(CapturedSurfaceCommitContext {
+            xdg_decoration: Some(configured(2, DecorationMode::ClientSide)),
+            ..CapturedSurfaceCommitContext::default()
+        });
+        assert_eq!(
+            older.xdg_decoration,
+            Some(configured(2, DecorationMode::ClientSide))
+        );
     }
 
     #[test]
@@ -689,6 +740,7 @@ mod commit_context_tests {
                 ]),
             },
             layer_surface: None,
+            xdg_decoration: None,
         };
         let newer = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
@@ -705,6 +757,7 @@ mod commit_context_tests {
                 ]),
             },
             layer_surface: None,
+            xdg_decoration: None,
         };
 
         older.merge(newer);
@@ -746,6 +799,7 @@ mod commit_context_tests {
                 ..CapturedSubsurfaceParentState::default()
             },
             layer_surface: None,
+            xdg_decoration: None,
         };
         let newer = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
@@ -753,6 +807,7 @@ mod commit_context_tests {
                 ..CapturedSubsurfaceParentState::default()
             },
             layer_surface: None,
+            xdg_decoration: None,
         };
 
         older.merge(newer);
@@ -779,6 +834,7 @@ mod commit_context_tests {
                 ]),
             },
             layer_surface: None,
+            xdg_decoration: None,
         };
         let newer = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
@@ -794,6 +850,7 @@ mod commit_context_tests {
                 ]),
             },
             layer_surface: None,
+            xdg_decoration: None,
         };
 
         older.merge(newer);

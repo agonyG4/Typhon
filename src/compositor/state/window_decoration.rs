@@ -4,8 +4,9 @@ use super::super::decoration::{
     layout::DecorationLayout,
     render_plan::{DecorationRenderState, build_render_plan},
     types::{
-        DecorationButtonKind, DecorationHit, DecorationMode, DecorationPreference,
-        DecorationResizeEdge,
+        CapturedXdgDecorationCommit, CapturedXdgDecorationCommitState,
+        ConfiguredXdgDecorationState, DecorationButtonKind, DecorationHit, DecorationMode,
+        DecorationObjectGeneration, DecorationPreference, DecorationResizeEdge,
     },
 };
 use super::super::{
@@ -16,21 +17,17 @@ use super::super::{
 use super::hit_testing::PointerSceneHit;
 use super::surface_focus::WindowFocusReason;
 use crate::compositor::render;
+use crate::compositor::runtime_files::compositor_debug_surface_logging_enabled;
 use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
 use wayland_server::Resource;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::compositor) enum DecorationObjectLifetime {
-    Present,
-    DestroyedBeforeSurfaceCommit,
-    DestroyedAfterSurfaceCommit,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct WindowDecorationState {
     preference: DecorationPreference,
     applied_mode: DecorationMode,
-    object_lifetime: DecorationObjectLifetime,
+    current_generation: Option<DecorationObjectGeneration>,
+    next_generation: u64,
+    destruction_pending_commit: Option<DecorationObjectGeneration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +43,9 @@ impl Default for WindowDecorationState {
         Self {
             preference: DecorationPreference::Unset,
             applied_mode: DecorationMode::ClientSide,
-            object_lifetime: DecorationObjectLifetime::Present,
+            current_generation: Some(DecorationObjectGeneration(1)),
+            next_generation: 2,
+            destruction_pending_commit: None,
         }
     }
 }
@@ -56,7 +55,9 @@ impl WindowDecorationState {
         Self {
             preference: DecorationPreference::Unset,
             applied_mode: DecorationMode::ClientSide,
-            object_lifetime: DecorationObjectLifetime::Present,
+            current_generation: Some(DecorationObjectGeneration(1)),
+            next_generation: 2,
+            destruction_pending_commit: None,
         }
     }
 
@@ -64,15 +65,15 @@ impl WindowDecorationState {
         Self {
             preference: DecorationPreference::ClientSide,
             applied_mode: DecorationMode::ClientSide,
-            object_lifetime: DecorationObjectLifetime::Present,
+            current_generation: Some(DecorationObjectGeneration(1)),
+            next_generation: 2,
+            destruction_pending_commit: None,
         }
     }
 
-    pub(in crate::compositor) const fn requested_mode(self, fullscreen: bool) -> DecorationMode {
-        self.preference.effective_mode(
-            matches!(self.object_lifetime, DecorationObjectLifetime::Present),
-            fullscreen,
-        )
+    pub(in crate::compositor) fn requested_mode(self, fullscreen: bool) -> DecorationMode {
+        self.preference
+            .effective_mode(self.current_generation.is_some(), fullscreen)
     }
 
     pub(in crate::compositor) const fn applied_mode(self) -> DecorationMode {
@@ -90,6 +91,17 @@ impl WindowDecorationState {
         true
     }
 
+    pub(in crate::compositor) fn set_preference_for_generation(
+        &mut self,
+        generation: DecorationObjectGeneration,
+        preference: DecorationPreference,
+    ) -> bool {
+        if self.current_generation != Some(generation) {
+            return false;
+        }
+        self.set_preference(preference)
+    }
+
     pub(in crate::compositor) fn apply_configured_mode(&mut self, mode: DecorationMode) -> bool {
         if self.applied_mode == mode {
             return false;
@@ -98,24 +110,60 @@ impl WindowDecorationState {
         true
     }
 
-    pub(in crate::compositor) fn destroy_object(&mut self) {
-        self.object_lifetime = DecorationObjectLifetime::DestroyedBeforeSurfaceCommit;
+    pub(in crate::compositor) const fn current_generation(
+        self,
+    ) -> Option<DecorationObjectGeneration> {
+        self.current_generation
     }
 
-    pub(in crate::compositor) fn recreate_object(&mut self) {
-        if self.object_lifetime == DecorationObjectLifetime::DestroyedAfterSurfaceCommit {
-            self.preference = DecorationPreference::ClientSide;
+    pub(in crate::compositor) fn destroy_object(
+        &mut self,
+        generation: DecorationObjectGeneration,
+    ) -> bool {
+        if self.current_generation != Some(generation) {
+            return false;
         }
-        self.object_lifetime = DecorationObjectLifetime::Present;
+        self.current_generation = None;
+        self.destruction_pending_commit = Some(generation);
+        true
     }
 
-    pub(in crate::compositor) fn note_surface_commit_after_destroy(&mut self) -> Option<bool> {
-        if self.object_lifetime != DecorationObjectLifetime::DestroyedBeforeSurfaceCommit {
-            return None;
+    pub(in crate::compositor) fn recreate_object(&mut self) -> DecorationObjectGeneration {
+        if let Some(generation) = self.current_generation {
+            return generation;
         }
-        self.preference = DecorationPreference::ClientSide;
-        self.object_lifetime = DecorationObjectLifetime::DestroyedAfterSurfaceCommit;
-        Some(self.apply_configured_mode(DecorationMode::ClientSide))
+        let generation = DecorationObjectGeneration(self.next_generation);
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("XDG decoration generation exhausted");
+        self.current_generation = Some(generation);
+        self.preference = DecorationPreference::Unset;
+        generation
+    }
+
+    pub(in crate::compositor) fn capture_surface_commit_decoration(
+        &mut self,
+        acknowledged: Option<ConfiguredXdgDecorationState>,
+    ) -> (
+        Option<CapturedXdgDecorationCommitState>,
+        Option<DecorationObjectGeneration>,
+    ) {
+        let stale_generation = acknowledged
+            .filter(|configured| self.current_generation != Some(configured.generation))
+            .map(|configured| configured.generation);
+        let configured = acknowledged
+            .filter(|configured| self.current_generation == Some(configured.generation))
+            .map(CapturedXdgDecorationCommitState::Configured);
+
+        let captured = if let Some(generation) = self.destruction_pending_commit.take()
+            && self.current_generation.is_none()
+        {
+            Some(CapturedXdgDecorationCommitState::DecorationDestroyed { generation })
+        } else {
+            configured
+        };
+        (captured, stale_generation)
     }
 }
 
@@ -265,37 +313,49 @@ impl super::super::CompositorState {
     pub(in crate::compositor) fn xdg_decoration_mode_for_configure(
         &self,
         surface_id: u32,
-    ) -> Option<DecorationMode> {
+    ) -> Option<ConfiguredXdgDecorationState> {
         let decoration_state = self.xdg_decoration_states.get(&surface_id)?;
+        let generation = decoration_state.current_generation()?;
         let fullscreen = self
             .window_id_for_surface(surface_id)
             .and_then(|window_id| self.window(window_id))
             .is_some_and(|window| window.state.mode() == ToplevelMode::Fullscreen);
-        Some(decoration_state.requested_mode(fullscreen))
+        Some(ConfiguredXdgDecorationState {
+            generation,
+            mode: decoration_state.requested_mode(fullscreen),
+        })
     }
 
     pub(in crate::compositor) fn xdg_decoration_configure_event_needed(
         &self,
         surface_id: u32,
-        mode: DecorationMode,
+        decoration: ConfiguredXdgDecorationState,
         force: bool,
     ) -> bool {
         force
             || self
                 .xdg_surface_lifecycle(surface_id)
-                .and_then(|lifecycle| lifecycle.last_configured_decoration_mode)
-                != Some(mode)
+                .and_then(|lifecycle| lifecycle.last_configured_decoration)
+                != Some(decoration)
     }
 
     pub(in crate::compositor) fn send_xdg_decoration_configure(
         &self,
         surface_id: u32,
-        mode: DecorationMode,
+        decoration_state: ConfiguredXdgDecorationState,
     ) {
+        if self
+            .xdg_decoration_states
+            .get(&surface_id)
+            .and_then(|state| state.current_generation())
+            != Some(decoration_state.generation)
+        {
+            return;
+        }
         let Some(decoration) = self.xdg_decoration_resources.get(&surface_id) else {
             return;
         };
-        let wire_mode = match mode {
+        let wire_mode = match decoration_state.mode {
             DecorationMode::ServerSide | DecorationMode::None => {
                 zxdg_toplevel_decoration_v1::Mode::ServerSide
             }
@@ -304,40 +364,103 @@ impl super::super::CompositorState {
         let _ = decoration.send_event(zxdg_toplevel_decoration_v1::Event::Configure {
             mode: WEnum::Value(wire_mode),
         });
-    }
-
-    pub(in crate::compositor) fn apply_acked_xdg_decoration(&mut self, surface_id: u32) -> bool {
-        let Some(mode) = self.take_acked_xdg_decoration_mode(surface_id) else {
-            return false;
-        };
-        let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) else {
-            return false;
-        };
-        if !decoration_state.apply_configured_mode(mode) {
-            return false;
-        }
-        if let Some(window_id) = self.window_id_for_surface(surface_id) {
-            self.reconcile_native_decoration_transition(window_id, surface_id, mode);
-        }
-        true
-    }
-
-    pub(in crate::compositor) fn note_xdg_decoration_surface_commit(
-        &mut self,
-        surface_id: u32,
-    ) -> Option<bool> {
-        let visible_changed = self
-            .xdg_decoration_states
-            .get_mut(&surface_id)
-            .and_then(WindowDecorationState::note_surface_commit_after_destroy)?;
-        if visible_changed && let Some(window_id) = self.window_id_for_surface(surface_id) {
-            self.reconcile_native_decoration_transition(
-                window_id,
-                surface_id,
-                DecorationMode::ClientSide,
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=xdg_decoration_configure surface={surface_id} generation={} mode={:?}",
+                decoration_state.generation.0, decoration_state.mode,
             );
         }
-        Some(visible_changed)
+    }
+
+    pub(in crate::compositor) fn capture_xdg_decoration_commit_state(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: super::super::SurfaceCommitSequence,
+    ) -> Option<CapturedXdgDecorationCommit> {
+        let acknowledged = self.take_acked_xdg_decoration(surface_id);
+        let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) else {
+            if let Some(acknowledged) = acknowledged
+                && compositor_debug_surface_logging_enabled()
+            {
+                eprintln!(
+                    "oblivion-one compositor: event=xdg_decoration_stale_ack surface={surface_id} commit_sequence={} generation={} current_generation=none",
+                    commit_sequence.0, acknowledged.generation.0,
+                );
+            }
+            return None;
+        };
+        let current_generation = decoration_state.current_generation();
+        let (captured, stale_generation) =
+            decoration_state.capture_surface_commit_decoration(acknowledged);
+        if let Some(generation) = stale_generation
+            && compositor_debug_surface_logging_enabled()
+        {
+            eprintln!(
+                "oblivion-one compositor: event=xdg_decoration_stale_ack surface={surface_id} commit_sequence={} generation={} current_generation={:?}",
+                commit_sequence.0,
+                generation.0,
+                current_generation.map(|generation| generation.0),
+            );
+        }
+        let captured = captured.map(|state| CapturedXdgDecorationCommit {
+            state,
+            commit_sequence,
+        });
+        if compositor_debug_surface_logging_enabled()
+            && let Some(captured) = captured
+        {
+            match captured.state {
+                CapturedXdgDecorationCommitState::Configured(configured) => eprintln!(
+                    "oblivion-one compositor: event=xdg_decoration_commit_capture surface={surface_id} commit_sequence={} generation={} mode={:?}",
+                    captured.commit_sequence.0, configured.generation.0, configured.mode,
+                ),
+                CapturedXdgDecorationCommitState::DecorationDestroyed { generation } => eprintln!(
+                    "oblivion-one compositor: event=xdg_decoration_commit_capture surface={surface_id} commit_sequence={} generation={} destroyed=true mode=ClientSide",
+                    captured.commit_sequence.0, generation.0,
+                ),
+            }
+        }
+        captured
+    }
+
+    pub(in crate::compositor) fn apply_captured_xdg_decoration(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: super::super::SurfaceCommitSequence,
+        captured: Option<CapturedXdgDecorationCommit>,
+    ) -> bool {
+        let Some(captured) = captured else {
+            return false;
+        };
+        let captured_commit_sequence = captured.commit_sequence;
+        let (generation, mode) = match captured.state {
+            CapturedXdgDecorationCommitState::Configured(configured) => {
+                (configured.generation, configured.mode)
+            }
+            CapturedXdgDecorationCommitState::DecorationDestroyed { generation } => {
+                (generation, DecorationMode::ClientSide)
+            }
+        };
+        let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) else {
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: event=xdg_decoration_publish_dropped surface={surface_id} commit_sequence={} captured_commit_sequence={} generation={} reason=decoration_state_retired",
+                    commit_sequence.0, captured_commit_sequence.0, generation.0,
+                );
+            }
+            return false;
+        };
+        let changed = decoration_state.apply_configured_mode(mode);
+        if changed && let Some(window_id) = self.window_id_for_surface(surface_id) {
+            self.reconcile_native_decoration_transition(window_id, surface_id, mode);
+        }
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=xdg_decoration_publish surface={surface_id} commit_sequence={} captured_commit_sequence={} generation={} mode={mode:?} applied={changed}",
+                commit_sequence.0, captured_commit_sequence.0, generation.0,
+            );
+        }
+        changed
     }
 
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {

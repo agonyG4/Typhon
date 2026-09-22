@@ -1,5 +1,11 @@
 use super::super::*;
-use crate::compositor::decoration::types::DecorationPreference;
+use crate::compositor::decoration::types::{DecorationObjectGeneration, DecorationPreference};
+
+#[derive(Debug, Clone)]
+struct XdgToplevelDecorationData {
+    surface: wl_surface::WlSurface,
+    generation: DecorationObjectGeneration,
+}
 
 fn xdg_surface_role_error(error: SurfaceRoleError) -> xdg_surface::Error {
     match error {
@@ -199,6 +205,21 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                         .renderable_surfaces
                         .iter()
                         .any(|surface| surface.surface_id == surface_id);
+                if state.xdg_decoration_resources.contains_key(&surface_id)
+                    || state
+                        .xdg_decoration_states
+                        .get(&surface_id)
+                        .and_then(|decoration_state| decoration_state.current_generation())
+                        .is_some()
+                {
+                    state.post_protocol_error(
+                        _client,
+                        resource,
+                        zxdg_toplevel_decoration_v1::Error::AlreadyConstructed,
+                        "xdg_toplevel already has a decoration object".to_string(),
+                    );
+                    return;
+                }
                 if resource.version() < 2 && surface_has_content {
                     state.post_protocol_error(
                         _client,
@@ -208,36 +229,41 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                     );
                     return;
                 }
-                if state.xdg_decoration_resources.contains_key(&surface_id) {
-                    state.post_protocol_error(
-                        _client,
-                        resource,
-                        zxdg_toplevel_decoration_v1::Error::AlreadyConstructed,
-                        "xdg_toplevel already has a decoration object".to_string(),
-                    );
-                    return;
-                }
+                let generation = if let Some(decoration_state) =
+                    state.xdg_decoration_states.get_mut(&surface_id)
+                {
+                    decoration_state.recreate_object()
+                } else {
+                    let decoration_state = if surface_has_content {
+                        WindowDecorationState::new_client_side_object()
+                    } else {
+                        WindowDecorationState::new()
+                    };
+                    let generation = decoration_state
+                        .current_generation()
+                        .expect("new decoration state has an object generation");
+                    state
+                        .xdg_decoration_states
+                        .insert(surface_id, decoration_state);
+                    generation
+                };
                 let decoration = data_init.init(
                     id,
-                    XdgToplevelData {
+                    XdgToplevelDecorationData {
                         surface: data.surface.clone(),
+                        generation,
                     },
                 );
-                if let Some(decoration_state) = state.xdg_decoration_states.get_mut(&surface_id) {
-                    decoration_state.recreate_object();
-                } else {
-                    state.xdg_decoration_states.insert(
-                        surface_id,
-                        if surface_has_content {
-                            WindowDecorationState::new_client_side_object()
-                        } else {
-                            WindowDecorationState::new()
-                        },
-                    );
-                }
                 state
                     .xdg_decoration_resources
                     .insert(surface_id, decoration.clone());
+                if compositor_debug_surface_logging_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_create surface={surface_id} generation={} version={}",
+                        generation.0,
+                        resource.version(),
+                    );
+                }
                 state.configure_xdg_surface_for_decoration(surface_id);
             }
             zxdg_decoration_manager_v1::Request::Destroy => {}
@@ -253,7 +279,7 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
     }
 }
 
-impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevelData>
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevelDecorationData>
     for CompositorState
 {
     fn request(
@@ -261,7 +287,7 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
         client: &Client,
         resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
         request: zxdg_toplevel_decoration_v1::Request,
-        data: &XdgToplevelData,
+        data: &XdgToplevelDecorationData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
@@ -294,32 +320,95 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
                     }
                 };
                 let surface_id = compositor_surface_id(&data.surface);
-                let changed = state
-                    .xdg_decoration_states
-                    .get_mut(&surface_id)
-                    .is_some_and(|decoration_state| decoration_state.set_preference(preference));
+                if compositor_debug_surface_logging_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_set_mode surface={surface_id} generation={} preference={preference:?}",
+                        data.generation.0,
+                    );
+                }
+                let resource_matches = state
+                    .xdg_decoration_resources
+                    .get(&surface_id)
+                    .and_then(|resource| resource.data::<XdgToplevelDecorationData>())
+                    .is_some_and(|current| current.generation == data.generation);
+                let changed = resource_matches
+                    && state
+                        .xdg_decoration_states
+                        .get_mut(&surface_id)
+                        .is_some_and(|decoration_state| {
+                            decoration_state
+                                .set_preference_for_generation(data.generation, preference)
+                        });
                 if changed {
                     state.configure_xdg_surface_for_decoration(surface_id);
+                } else if !resource_matches && compositor_debug_surface_logging_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_stale_request surface={surface_id} generation={} request=set_mode",
+                        data.generation.0,
+                    );
                 }
             }
             zxdg_toplevel_decoration_v1::Request::UnsetMode => {
                 let surface_id = compositor_surface_id(&data.surface);
-                let changed = state
-                    .xdg_decoration_states
-                    .get_mut(&surface_id)
-                    .is_some_and(|decoration_state| {
-                        decoration_state.set_preference(DecorationPreference::Unset)
-                    });
+                if compositor_debug_surface_logging_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_unset_mode surface={surface_id} generation={}",
+                        data.generation.0,
+                    );
+                }
+                let resource_matches = state
+                    .xdg_decoration_resources
+                    .get(&surface_id)
+                    .and_then(|resource| resource.data::<XdgToplevelDecorationData>())
+                    .is_some_and(|current| current.generation == data.generation);
+                let changed = resource_matches
+                    && state
+                        .xdg_decoration_states
+                        .get_mut(&surface_id)
+                        .is_some_and(|decoration_state| {
+                            decoration_state.set_preference_for_generation(
+                                data.generation,
+                                DecorationPreference::Unset,
+                            )
+                        });
                 if changed {
                     state.configure_xdg_surface_for_decoration(surface_id);
+                } else if !resource_matches && compositor_debug_surface_logging_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_stale_request surface={surface_id} generation={} request=unset_mode",
+                        data.generation.0,
+                    );
                 }
             }
             zxdg_toplevel_decoration_v1::Request::Destroy => {
                 let surface_id = compositor_surface_id(&data.surface);
-                if let Some(decoration_state) = state.xdg_decoration_states.get_mut(&surface_id) {
-                    decoration_state.destroy_object();
+                let resource_matches = state
+                    .xdg_decoration_resources
+                    .get(&surface_id)
+                    .and_then(|resource| resource.data::<XdgToplevelDecorationData>())
+                    .is_some_and(|current| current.generation == data.generation);
+                let destroyed = resource_matches
+                    && state
+                        .xdg_decoration_states
+                        .get_mut(&surface_id)
+                        .is_some_and(|decoration_state| {
+                            decoration_state.destroy_object(data.generation)
+                        });
+                if destroyed {
+                    state.xdg_decoration_resources.remove(&surface_id);
                 }
-                state.xdg_decoration_resources.remove(&surface_id);
+                if compositor_debug_surface_logging_enabled() {
+                    if !destroyed {
+                        eprintln!(
+                            "oblivion-one compositor: event=xdg_decoration_stale_request surface={surface_id} generation={} request=destroy",
+                            data.generation.0,
+                        );
+                    }
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_destroy surface={surface_id} generation={} pending_commit={} accepted={destroyed}",
+                        data.generation.0, destroyed,
+                    );
+                }
             }
             other => {
                 let _ = other;
@@ -680,6 +769,20 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     eprintln!(
                         "oblivion-one fullscreen: event=xdg_configure_acked root_surface_id={surface_id} serial={serial} accepted={acknowledged}"
                     );
+                }
+                if acknowledged && compositor_debug_surface_logging_enabled() {
+                    let decoration = state
+                        .xdg_surface_lifecycle(surface_id)
+                        .and_then(|lifecycle| lifecycle.last_acked_decoration);
+                    match decoration {
+                        Some(decoration) => eprintln!(
+                            "oblivion-one compositor: event=xdg_decoration_ack surface={surface_id} serial={serial} generation={} mode={:?}",
+                            decoration.generation.0, decoration.mode,
+                        ),
+                        None => eprintln!(
+                            "oblivion-one compositor: event=xdg_decoration_ack surface={surface_id} serial={serial} generation=none"
+                        ),
+                    }
                 }
                 if !acknowledged {
                     state.post_protocol_error(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::compositor::decoration::types::DecorationMode;
+use crate::compositor::decoration::types::ConfiguredXdgDecorationState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum XdgConstructionState {
@@ -21,7 +21,7 @@ pub(in crate::compositor) struct XdgConfigureRecord {
     pub(in crate::compositor) serial: u32,
     pub(in crate::compositor) acknowledged: bool,
     pub(in crate::compositor) superseded: bool,
-    pub(in crate::compositor) decoration_mode: Option<DecorationMode>,
+    pub(in crate::compositor) decoration: Option<ConfiguredXdgDecorationState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +34,8 @@ pub(in crate::compositor) struct XdgSurfaceLifecycle {
     initial_empty_commit_received: bool,
     pub(in crate::compositor) configures: VecDeque<XdgConfigureRecord>,
     pub(in crate::compositor) last_acked_serial: Option<u32>,
-    pub(in crate::compositor) last_configured_decoration_mode: Option<DecorationMode>,
-    last_acked_decoration_mode: Option<DecorationMode>,
+    pub(in crate::compositor) last_configured_decoration: Option<ConfiguredXdgDecorationState>,
+    pub(in crate::compositor) last_acked_decoration: Option<ConfiguredXdgDecorationState>,
 }
 
 impl Default for XdgSurfaceLifecycle {
@@ -49,8 +49,8 @@ impl Default for XdgSurfaceLifecycle {
             initial_empty_commit_received: false,
             configures: VecDeque::new(),
             last_acked_serial: None,
-            last_configured_decoration_mode: None,
-            last_acked_decoration_mode: None,
+            last_configured_decoration: None,
+            last_acked_decoration: None,
         }
     }
 }
@@ -101,7 +101,7 @@ impl XdgSurfaceLifecycle {
     pub(in crate::compositor) fn record_configure_with_decoration(
         &mut self,
         serial: u32,
-        decoration_mode: Option<DecorationMode>,
+        decoration: Option<ConfiguredXdgDecorationState>,
     ) {
         for configure in &mut self.configures {
             configure.superseded = true;
@@ -110,10 +110,10 @@ impl XdgSurfaceLifecycle {
             serial,
             acknowledged: false,
             superseded: false,
-            decoration_mode,
+            decoration,
         });
-        if decoration_mode.is_some() {
-            self.last_configured_decoration_mode = decoration_mode;
+        if decoration.is_some() {
+            self.last_configured_decoration = decoration;
         }
         self.initial_configure_sent = true;
         if !self.initial_configure_acked {
@@ -139,7 +139,7 @@ impl XdgSurfaceLifecycle {
             configure.acknowledged = configure.serial == serial;
             if configure.serial == serial {
                 self.last_acked_serial = Some(serial);
-                self.last_acked_decoration_mode = configure.decoration_mode;
+                self.last_acked_decoration = configure.decoration;
             }
         }
         self.initial_configure_acked = true;
@@ -176,8 +176,8 @@ impl XdgSurfaceLifecycle {
         self.initial_empty_commit_received = true;
         self.configures.clear();
         self.last_acked_serial = None;
-        self.last_configured_decoration_mode = None;
-        self.last_acked_decoration_mode = None;
+        self.last_configured_decoration = None;
+        self.last_acked_decoration = None;
         self.map_state = XdgMapState::AwaitingInitialEmptyCommit;
     }
 
@@ -197,8 +197,10 @@ impl XdgSurfaceLifecycle {
         self.initial_empty_commit_received || self.currently_mapped
     }
 
-    pub(in crate::compositor) fn take_acked_decoration_mode(&mut self) -> Option<DecorationMode> {
-        self.last_acked_decoration_mode.take()
+    pub(in crate::compositor) fn take_acked_decoration(
+        &mut self,
+    ) -> Option<ConfiguredXdgDecorationState> {
+        self.last_acked_decoration.take()
     }
 }
 
@@ -304,19 +306,19 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         serial: u32,
-        decoration_mode: Option<DecorationMode>,
+        decoration: Option<ConfiguredXdgDecorationState>,
     ) {
         if let Some(lifecycle) = self.xdg_surface_lifecycle_mut(surface_id) {
-            lifecycle.record_configure_with_decoration(serial, decoration_mode);
+            lifecycle.record_configure_with_decoration(serial, decoration);
         }
     }
 
-    pub(in crate::compositor) fn take_acked_xdg_decoration_mode(
+    pub(in crate::compositor) fn take_acked_xdg_decoration(
         &mut self,
         surface_id: u32,
-    ) -> Option<DecorationMode> {
+    ) -> Option<ConfiguredXdgDecorationState> {
         self.xdg_surface_lifecycle_mut(surface_id)
-            .and_then(XdgSurfaceLifecycle::take_acked_decoration_mode)
+            .and_then(XdgSurfaceLifecycle::take_acked_decoration)
     }
 
     pub(in crate::compositor) fn acknowledge_xdg_configure(
@@ -383,6 +385,17 @@ impl CompositorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::decoration::types::{DecorationMode, DecorationObjectGeneration};
+
+    fn configured_decoration(
+        generation: u64,
+        mode: DecorationMode,
+    ) -> ConfiguredXdgDecorationState {
+        ConfiguredXdgDecorationState {
+            generation: DecorationObjectGeneration(generation),
+            mode,
+        }
+    }
 
     fn initialized_lifecycle() -> XdgSurfaceLifecycle {
         let mut lifecycle = XdgSurfaceLifecycle::default();
@@ -428,33 +441,45 @@ mod tests {
     #[test]
     fn decoration_mode_stays_bound_to_the_acknowledged_serial() {
         let mut lifecycle = initialized_lifecycle();
-        lifecycle.record_configure_with_decoration(2, Some(DecorationMode::ServerSide));
-        lifecycle.record_configure_with_decoration(3, Some(DecorationMode::ClientSide));
+        lifecycle.record_configure_with_decoration(
+            2,
+            Some(configured_decoration(4, DecorationMode::ServerSide)),
+        );
+        lifecycle.record_configure_with_decoration(
+            3,
+            Some(configured_decoration(5, DecorationMode::ClientSide)),
+        );
 
         assert!(lifecycle.acknowledge(3).is_ok());
         assert_eq!(
-            lifecycle.take_acked_decoration_mode(),
-            Some(DecorationMode::ClientSide)
+            lifecycle.take_acked_decoration(),
+            Some(configured_decoration(5, DecorationMode::ClientSide))
         );
-        assert_eq!(lifecycle.take_acked_decoration_mode(), None);
+        assert_eq!(lifecycle.take_acked_decoration(), None);
     }
 
     #[test]
     fn acknowledging_an_older_decoration_configure_preserves_newer_pending_state() {
         let mut lifecycle = initialized_lifecycle();
-        lifecycle.record_configure_with_decoration(2, Some(DecorationMode::ServerSide));
-        lifecycle.record_configure_with_decoration(3, Some(DecorationMode::ClientSide));
+        lifecycle.record_configure_with_decoration(
+            2,
+            Some(configured_decoration(4, DecorationMode::ServerSide)),
+        );
+        lifecycle.record_configure_with_decoration(
+            3,
+            Some(configured_decoration(5, DecorationMode::ClientSide)),
+        );
 
         assert!(lifecycle.acknowledge(2).is_ok());
         assert_eq!(
-            lifecycle.take_acked_decoration_mode(),
-            Some(DecorationMode::ServerSide)
+            lifecycle.take_acked_decoration(),
+            Some(configured_decoration(4, DecorationMode::ServerSide))
         );
         assert!(lifecycle.has_outstanding_configure());
         assert!(lifecycle.acknowledge(3).is_ok());
         assert_eq!(
-            lifecycle.take_acked_decoration_mode(),
-            Some(DecorationMode::ClientSide)
+            lifecycle.take_acked_decoration(),
+            Some(configured_decoration(5, DecorationMode::ClientSide))
         );
     }
 

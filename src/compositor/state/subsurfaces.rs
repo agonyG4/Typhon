@@ -3613,8 +3613,10 @@ impl CompositorState {
     fn capture_surface_commit_context(
         &mut self,
         surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
     ) -> Result<CapturedSurfaceCommitContext, ()> {
         let layer_surface = self.capture_layer_surface_commit_state(surface_id)?;
+        let xdg_decoration = self.capture_xdg_decoration_commit_state(surface_id, commit_sequence);
         let activations = self
             .subsurface_transactions
             .take_pending_relationship_activations_for_parent(surface_id);
@@ -3637,6 +3639,7 @@ impl CompositorState {
                 stack,
             },
             layer_surface,
+            xdg_decoration,
         })
     }
 
@@ -3645,13 +3648,14 @@ impl CompositorState {
         surface_id: u32,
         mut commit: CachedSubsurfaceCommit,
     ) {
-        let commit_context = match self.capture_surface_commit_context(surface_id) {
-            Ok(context) => context,
-            Err(()) => {
-                self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
-                return;
-            }
-        };
+        let commit_context =
+            match self.capture_surface_commit_context(surface_id, commit.commit_sequence) {
+                Ok(context) => context,
+                Err(()) => {
+                    self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
+                    return;
+                }
+            };
         commit.commit_context = commit_context;
         if !self.normalize_explicit_sync_commit(&mut commit) {
             self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);

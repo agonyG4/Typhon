@@ -307,6 +307,11 @@ impl CompositorState {
             pointer_constraint_state,
             commit_context,
         } = commit;
+        let CapturedSurfaceCommitContext {
+            subsurface_parent: captured_subsurface_parent,
+            layer_surface: captured_layer_surface,
+            xdg_decoration: captured_xdg_decoration,
+        } = commit_context;
         self.apply_captured_surface_pacing(surface_id, commit_sequence, pacing);
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
             return;
@@ -415,11 +420,11 @@ impl CompositorState {
                     std::mem::take(&mut presentation_feedbacks),
                     explicit_sync,
                     window_geometry,
-                    commit_context.layer_surface,
+                    captured_layer_surface,
                 );
             }
             Some(PendingSurfaceAttachment::RemoveContent) => {
-                if let Some(captured) = commit_context.layer_surface
+                if let Some(captured) = captured_layer_surface
                     && !self.apply_layer_surface_commit(surface_id, captured)
                 {
                     self.complete_frame_callbacks(frame_callbacks);
@@ -465,7 +470,7 @@ impl CompositorState {
                         resize_capture_finalized,
                         window_geometry,
                     },
-                    commit_context.layer_surface,
+                    captured_layer_surface,
                 );
                 if activated {
                     let current = self.current_surface_buffers.get(&surface_id);
@@ -502,10 +507,7 @@ impl CompositorState {
             }
         }
         if parent_commit_applied {
-            self.apply_captured_subsurface_parent_state(
-                surface_id,
-                commit_context.subsurface_parent,
-            );
+            self.apply_captured_subsurface_parent_state(surface_id, captured_subsurface_parent);
         }
         self.apply_captured_pointer_constraint_surface_state(surface_id, pointer_constraint_state);
         if input_region_changed
@@ -521,15 +523,11 @@ impl CompositorState {
             self.refresh_effect_scene_summary();
         }
         if parent_commit_applied {
-            let decoration_changed = match self.note_xdg_decoration_surface_commit(surface_id) {
-                Some(visible_changed) => {
-                    // Destruction is latched by this commit, so an acknowledged
-                    // decoration mode from the destroyed object must not be applied.
-                    let _ = self.take_acked_xdg_decoration_mode(surface_id);
-                    visible_changed
-                }
-                None => self.apply_acked_xdg_decoration(surface_id),
-            };
+            let decoration_changed = self.apply_captured_xdg_decoration(
+                surface_id,
+                commit_sequence,
+                captured_xdg_decoration,
+            );
             if decoration_changed && self.render_generation == render_generation_before_publication
             {
                 self.advance_render_generation(RenderGenerationCause::WindowDecoration);

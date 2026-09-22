@@ -2,7 +2,7 @@ use super::hit_testing::PointerSceneHit;
 use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
 use crate::animation_control::AnimationEffect;
-use crate::compositor::decoration::types::DecorationMode;
+use crate::compositor::decoration::types::ConfiguredXdgDecorationState;
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleVisualGroup, canonical_visual_rect,
 };
@@ -1104,7 +1104,7 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         xdg_surface: &xdg_surface::XdgSurface,
-        decoration_mode: Option<DecorationMode>,
+        decoration_mode: Option<ConfiguredXdgDecorationState>,
     ) -> u32 {
         let serial = self.next_configure_serial();
         if let Err(error) = xdg_surface.send_event(xdg_surface::Event::Configure { serial })
@@ -1119,6 +1119,14 @@ impl CompositorState {
             .or_default()
             .latest_sent = serial;
         self.record_xdg_configure_with_decoration(surface_id, serial, decoration_mode);
+        if compositor_debug_surface_logging_enabled()
+            && let Some(decoration) = decoration_mode
+        {
+            eprintln!(
+                "oblivion-one compositor: event=xdg_decoration_configure_serial surface={surface_id} generation={} serial={serial} mode={:?}",
+                decoration.generation.0, decoration.mode,
+            );
+        }
         debug_assert!(
             self.xdg_surface_lifecycle(surface_id)
                 .is_some_and(|lifecycle| {

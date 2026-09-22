@@ -13,6 +13,29 @@ pub(crate) enum DecorationPreference {
     ServerSide,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::compositor) struct DecorationObjectGeneration(pub(in crate::compositor) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct ConfiguredXdgDecorationState {
+    pub(in crate::compositor) generation: DecorationObjectGeneration,
+    pub(in crate::compositor) mode: DecorationMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum CapturedXdgDecorationCommitState {
+    Configured(ConfiguredXdgDecorationState),
+    DecorationDestroyed {
+        generation: DecorationObjectGeneration,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct CapturedXdgDecorationCommit {
+    pub(in crate::compositor) state: CapturedXdgDecorationCommitState,
+    pub(in crate::compositor) commit_sequence: super::super::SurfaceCommitSequence,
+}
+
 impl DecorationPreference {
     pub(crate) const fn effective_mode(
         self,

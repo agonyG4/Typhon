@@ -2,7 +2,9 @@ use super::*;
 use crate::compositor::decoration::{
     layout::DecorationLayout,
     render_plan::DecorationRenderPrimitive,
-    types::{DecorationHit, DecorationMode, DecorationPreference},
+    types::{
+        CapturedXdgDecorationCommitState, DecorationHit, DecorationMode, DecorationPreference,
+    },
 };
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use crate::xwayland::xwm::{X11FrameExtents, X11MotifDecorationHint};
@@ -1004,21 +1006,31 @@ fn uncommitted_preference_does_not_render_or_invalidate_ssd() {
 fn v2_recreation_before_surface_commit_retains_previous_preference() {
     let mut state = WindowDecorationState::new();
     state.set_preference(DecorationPreference::ServerSide);
-    state.destroy_object();
-    state.recreate_object();
+    let first_generation = state.current_generation().expect("first generation");
+    assert!(state.destroy_object(first_generation));
+    let second_generation = state.recreate_object();
+    assert_ne!(first_generation, second_generation);
     assert_eq!(state.requested_mode(false), DecorationMode::ServerSide);
 }
 
 #[test]
-fn v2_recreation_after_surface_commit_starts_client_side() {
+fn v2_recreation_after_surface_commit_keeps_normal_unset_configure_policy() {
     let mut state = WindowDecorationState::new();
     state.set_preference(DecorationPreference::ServerSide);
     assert!(state.apply_configured_mode(DecorationMode::ServerSide));
-    state.destroy_object();
-    assert_eq!(state.note_surface_commit_after_destroy(), Some(true));
-    assert_eq!(state.applied_mode(), DecorationMode::ClientSide);
+    let first_generation = state.current_generation().expect("first generation");
+    assert!(state.destroy_object(first_generation));
+    let (captured, stale) = state.capture_surface_commit_decoration(None);
+    assert_eq!(stale, None);
+    assert_eq!(
+        captured,
+        Some(CapturedXdgDecorationCommitState::DecorationDestroyed {
+            generation: first_generation,
+        })
+    );
+    assert_eq!(state.applied_mode(), DecorationMode::ServerSide);
     state.recreate_object();
-    assert_eq!(state.requested_mode(false), DecorationMode::ClientSide);
+    assert_eq!(state.requested_mode(false), DecorationMode::ServerSide);
 }
 
 #[test]
@@ -1044,16 +1056,22 @@ fn v2_destroy_surface_commit_disables_rendering_and_hit_testing() {
         Some(DecorationHit::Titlebar)
     ));
 
-    state
+    let generation = state
         .xdg_decoration_states
-        .get_mut(&surface_id)
-        .expect("test decoration state")
-        .destroy_object();
-    assert_eq!(state.scene_render_generation, generation_before);
-    assert_eq!(
-        state.note_xdg_decoration_surface_commit(surface_id),
-        Some(true)
+        .get(&surface_id)
+        .and_then(|decoration_state| decoration_state.current_generation())
+        .expect("test decoration generation");
+    assert!(
+        state
+            .xdg_decoration_states
+            .get_mut(&surface_id)
+            .expect("test decoration state")
+            .destroy_object(generation)
     );
+    assert_eq!(state.scene_render_generation, generation_before);
+    let commit_sequence = SurfaceCommitSequence::initial();
+    let captured = state.capture_xdg_decoration_commit_state(surface_id, commit_sequence);
+    assert!(state.apply_captured_xdg_decoration(surface_id, commit_sequence, captured));
     assert_eq!(
         state
             .xdg_decoration_states
@@ -1068,7 +1086,8 @@ fn v2_destroy_surface_commit_disables_rendering_and_hit_testing() {
             .decoration_hit_for_root_at(surface_id, (0, 0), 100.0, -10.0)
             .is_none()
     );
-    assert_eq!(state.note_xdg_decoration_surface_commit(surface_id), None);
+    let captured = state.capture_xdg_decoration_commit_state(surface_id, commit_sequence);
+    assert!(!state.apply_captured_xdg_decoration(surface_id, commit_sequence, captured));
     assert_eq!(
         state
             .xdg_decoration_states
