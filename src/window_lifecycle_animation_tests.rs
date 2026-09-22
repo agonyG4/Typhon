@@ -8,10 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEST_PRESENTATION_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
-fn scene_node(window_id: WindowId) -> SceneNodeId {
-    SceneNodeId::from_raw(window_id.get()).expect("test scene node")
-}
-
 fn test_identity(window_id: WindowId) -> PresentationRetainedVisualIdentity {
     let value = NEXT_TEST_PRESENTATION_ID.fetch_add(1, Ordering::Relaxed);
     retained_identity(window_id.get(), value, value)
@@ -98,6 +94,7 @@ fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identi
     assert_eq!(
         animator.start_or_reverse(
             make_request(first_identity, LifecycleDirection::Minimize, visual_group,),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         ),
@@ -105,7 +102,7 @@ fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identi
     );
     let reverse_at = AnimationTime::from_nanos(120_400_000);
     let before = animator
-        .sample(scene_node_id, reverse_at)
+        .sample(first_identity, reverse_at)
         .expect("sample before");
     let second = animator
         .start_or_reverse(
@@ -122,13 +119,12 @@ fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identi
                 )
                 .expect("replacement request visual"),
             ),
+            Some(first_identity),
             reverse_at,
             1.0,
         )
         .expect("restore reverse");
-    let after = animator
-        .sample(scene_node_id, reverse_at)
-        .expect("sample after");
+    let after = animator.sample(second, reverse_at).expect("sample after");
 
     assert_eq!(before.progress, after.progress);
     assert!((after.progress - 0.43).abs() < 1e-9);
@@ -155,6 +151,85 @@ fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identi
         visual_sources: Vec::new(),
     });
     assert_ne!(first_frame.signature, second_frame.signature);
+}
+
+#[test]
+fn sampling_uses_only_explicit_exact_owner_identities() {
+    let window = WindowId::from_raw(701).expect("window");
+    let source = rect(20.0, 30.0, 400.0, 300.0);
+    let anchor = rect(700.0, 500.0, 40.0, 40.0);
+    let mut animator = WindowLifecycleAnimator::new(true);
+    let first_request = request(window, 801, source, anchor, LifecycleDirection::Minimize);
+    let orphan = first_request.presentation_identity;
+    animator
+        .start_or_reverse(first_request, None, AnimationTime::from_nanos(0), 1.0)
+        .expect("first execution installed");
+
+    let current_request = request(window, 801, source, anchor, LifecycleDirection::Restore);
+    let current = current_request.presentation_identity;
+    animator
+        .start_or_reverse(current_request, None, AnimationTime::from_nanos(1), 1.0)
+        .expect("second exact execution installed");
+
+    assert!(
+        animator
+            .sample(orphan, AnimationTime::from_nanos(10))
+            .is_some()
+    );
+    let empty = animator.sample_scene(&[], AnimationTime::from_nanos(10));
+    assert!(empty.lamps.is_empty());
+    assert!(empty.visual_sources.is_empty());
+    let active = animator.sample_scene(&[current], AnimationTime::from_nanos(10));
+    assert_eq!(active.lamps.len(), 1);
+    assert_eq!(active.lamps[0].presentation_identity, current);
+    assert_eq!(active.visual_sources.len(), 1);
+    assert_eq!(active.visual_sources[0].presentation_identity, current);
+    assert!(
+        animator
+            .sample(current, AnimationTime::from_nanos(10))
+            .is_some()
+    );
+}
+
+#[test]
+fn failed_exact_reversal_leaves_old_execution_unchanged() {
+    let window = WindowId::from_raw(702).expect("window");
+    let source = rect(20.0, 30.0, 400.0, 300.0);
+    let anchor = rect(700.0, 500.0, 40.0, 40.0);
+    let mut animator = WindowLifecycleAnimator::new(true);
+    let old_request = request(window, 802, source, anchor, LifecycleDirection::Minimize);
+    let old = old_request.presentation_identity;
+    animator
+        .start_or_reverse(old_request, None, AnimationTime::from_nanos(0), 1.0)
+        .expect("old execution installed");
+    let before = animator
+        .sample(old, AnimationTime::from_nanos(100_000_000))
+        .expect("old execution sample");
+
+    let new_request = request(window, 802, source, anchor, LifecycleDirection::Restore);
+    let new = new_request.presentation_identity;
+    let missing_previous = retained_identity(window.get(), 990_001, 990_002);
+    assert!(
+        animator
+            .start_or_reverse(
+                new_request,
+                Some(missing_previous),
+                AnimationTime::from_nanos(100_000_000),
+                1.0,
+            )
+            .is_none()
+    );
+
+    assert_eq!(
+        animator.sample(old, AnimationTime::from_nanos(100_000_000)),
+        Some(before)
+    );
+    assert!(
+        animator
+            .sample(new, AnimationTime::from_nanos(100_000_000))
+            .is_none()
+    );
+    assert_eq!(animator.active_count(), 1);
 }
 use crate::presentation_animation::PresentationRect;
 
@@ -453,22 +528,24 @@ fn active_transition_ignores_live_visual_mutations_on_reversal() {
     let first = animator
         .start_or_reverse(
             request_with_group(window, 18, first_group, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
         .expect("minimize starts");
     let before = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(100_000_000))
+        .sample(first, AnimationTime::from_nanos(100_000_000))
         .expect("sample before reversal");
     let second = animator
         .start_or_reverse(
             request_with_group(window, 18, changed_group, LifecycleDirection::Restore),
+            Some(first),
             AnimationTime::from_nanos(100_000_000),
             1.0,
         )
         .expect("restore reverses");
     let after = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(100_000_000))
+        .sample(second, AnimationTime::from_nanos(100_000_000))
         .expect("sample after reversal");
 
     assert_ne!(first, second);
@@ -504,21 +581,23 @@ fn settled_new_transition_captures_new_visual_bounds() {
     let first = animator
         .start_or_reverse(
             request_with_group(window, 19, first_group, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
         .expect("minimize starts");
     assert!(animator.snap_to_endpoint(first, AnimationTime::from_nanos(280_000_000),));
     assert_eq!(animator.acknowledge(first, true), Some(first));
-    animator
+    let second = animator
         .start_or_reverse(
             request_with_group(window, 19, second_group, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(300_000_000),
             1.0,
         )
         .expect("new transition starts");
     let sample = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(300_000_000))
+        .sample(second, AnimationTime::from_nanos(300_000_000))
         .expect("new transition sample");
     assert_eq!(sample.visual_group.canonical_visual_rect.y(), 20.0);
 }
@@ -1140,22 +1219,24 @@ fn reversal_preserves_progress_and_rejects_stale_ack() {
     let first = animator
         .start_or_reverse(
             request(window, 7, source, anchor, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
         .expect("minimize starts");
     let before = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(103_600_000))
+        .sample(first, AnimationTime::from_nanos(103_600_000))
         .expect("active sample");
     let second = animator
         .start_or_reverse(
             request(window, 7, source, anchor, LifecycleDirection::Restore),
+            Some(first),
             AnimationTime::from_nanos(103_600_000),
             1.0,
         )
         .expect("restore reverses");
     let after = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(103_600_000))
+        .sample(second, AnimationTime::from_nanos(103_600_000))
         .expect("reversed sample");
 
     assert!((before.progress - 0.37).abs() < 1e-9);
@@ -1164,7 +1245,7 @@ fn reversal_preserves_progress_and_rejects_stale_ack() {
     assert_eq!(animator.acknowledge(first, true), None);
     assert!(
         animator
-            .sample(scene_node(window), AnimationTime::from_nanos(103_600_000))
+            .sample(second, AnimationTime::from_nanos(103_600_000))
             .is_some()
     );
 }
@@ -1178,11 +1259,12 @@ fn exact_endpoint_stays_owned_until_matching_ack() {
     let transition = animator
         .start_or_reverse(
             request(window, 9, source, anchor, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
         .expect("minimize starts");
-    let endpoint = animator.sample_scene(AnimationTime::from_nanos(280_000_000));
+    let endpoint = animator.sample_scene(&[transition], AnimationTime::from_nanos(280_000_000));
     assert!(endpoint.lamps[0].mathematically_settled);
     assert_eq!(animator.active_count(), 1);
     assert_eq!(animator.acknowledge(transition, true), Some(transition));
@@ -1198,6 +1280,7 @@ fn policy_endpoint_snap_preserves_exact_transition_ownership() {
     let transition = animator
         .start_or_reverse(
             request(window, 10, source, anchor, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -1205,7 +1288,7 @@ fn policy_endpoint_snap_preserves_exact_transition_ownership() {
 
     assert!(animator.snap_to_endpoint(transition, AnimationTime::from_nanos(100_000_000),));
     let endpoint = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(100_000_000))
+        .sample(transition, AnimationTime::from_nanos(100_000_000))
         .expect("snapped transition remains active");
     assert_eq!(endpoint.presentation_identity, transition);
     assert_eq!(endpoint.progress, 1.0);
@@ -1234,6 +1317,7 @@ fn render_evidence_qualifies_only_consumed_transition_identities() {
                 anchor,
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -1247,6 +1331,7 @@ fn render_evidence_qualifies_only_consumed_transition_identities() {
                 second_anchor,
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -1270,7 +1355,7 @@ fn render_evidence_qualifies_only_consumed_transition_identities() {
         800,
         600,
     ));
-    let sample = animator.sample_scene(AnimationTime::from_nanos(100_000_000));
+    let sample = animator.sample_scene(&[first, second], AnimationTime::from_nanos(100_000_000));
     let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
         window_id: first_window,
         root_surface_id: 15,
@@ -1360,6 +1445,7 @@ fn backing_replacement_does_not_rewrite_a_frozen_transition_adapter() {
                 visual_group,
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -1372,12 +1458,13 @@ fn backing_replacement_does_not_rewrite_a_frozen_transition_adapter() {
                 visual_group,
                 LifecycleDirection::Restore,
             ),
+            Some(old_identity),
             AnimationTime::from_nanos(100_000_000),
             1.0,
         )
         .expect("reversed transition");
 
-    let sample = animator.sample_scene(AnimationTime::from_nanos(100_000_000));
+    let sample = animator.sample_scene(&[new_identity], AnimationTime::from_nanos(100_000_000));
     assert_eq!(old_identity.scene_node_id(), new_identity.scene_node_id());
     assert_ne!(old_identity, new_identity);
     assert_eq!(sample.lamps[0].root_surface_id, old_root_surface_id);
@@ -1413,6 +1500,7 @@ fn no_visual_change_settlement_is_separate_from_physical_ack() {
                 rect(500.0, 500.0, 10.0, 10.0),
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -1432,31 +1520,37 @@ fn reversal_keeps_the_original_anchor_frozen() {
     let first_anchor = rect(900.0, 700.0, 48.0, 48.0);
     let second_anchor = rect(-80.0, 400.0, 64.0, 64.0);
     let mut animator = WindowLifecycleAnimator::new(true);
-    animator.start_or_reverse(
-        request(
-            window,
-            11,
-            source,
-            first_anchor,
-            LifecycleDirection::Minimize,
-        ),
-        AnimationTime::from_nanos(0),
-        1.0,
-    );
-    let _ = animator.start_or_reverse(
-        request(
-            window,
-            11,
-            source,
-            second_anchor,
-            LifecycleDirection::Restore,
-        ),
-        AnimationTime::from_nanos(100_000_000),
-        1.0,
-    );
+    let first = animator
+        .start_or_reverse(
+            request(
+                window,
+                11,
+                source,
+                first_anchor,
+                LifecycleDirection::Minimize,
+            ),
+            None,
+            AnimationTime::from_nanos(0),
+            1.0,
+        )
+        .expect("first transition starts");
+    let second = animator
+        .start_or_reverse(
+            request(
+                window,
+                11,
+                source,
+                second_anchor,
+                LifecycleDirection::Restore,
+            ),
+            Some(first),
+            AnimationTime::from_nanos(100_000_000),
+            1.0,
+        )
+        .expect("reverse transition starts");
     assert_eq!(
         animator
-            .sample(scene_node(window), AnimationTime::from_nanos(100_000_000))
+            .sample(second, AnimationTime::from_nanos(100_000_000))
             .expect("reversed sample")
             .visual_group
             .anchor_rect,
@@ -1470,23 +1564,24 @@ fn speed_scales_the_linear_timeline_and_disable_snaps_to_target() {
     let source = rect(20.0, 20.0, 400.0, 300.0);
     let anchor = rect(900.0, 700.0, 48.0, 48.0);
     let mut animator = WindowLifecycleAnimator::new(true);
-    animator
+    let transition = animator
         .start_or_reverse(
             request(window, 13, source, anchor, LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             2.0,
         )
         .expect("minimize starts");
     assert_eq!(
         animator
-            .sample(scene_node(window), AnimationTime::from_nanos(70_000_000))
+            .sample(transition, AnimationTime::from_nanos(70_000_000))
             .expect("active sample")
             .progress,
         0.5
     );
-    animator.set_enabled(false, AnimationTime::from_nanos(70_000_000));
+    animator.set_enabled(false, &[transition], AnimationTime::from_nanos(70_000_000));
     let endpoint = animator
-        .sample(scene_node(window), AnimationTime::from_nanos(70_000_000))
+        .sample(transition, AnimationTime::from_nanos(70_000_000))
         .expect("disabled animation retains endpoint");
     assert_eq!(endpoint.progress, 1.0);
     assert!(endpoint.mathematically_settled);

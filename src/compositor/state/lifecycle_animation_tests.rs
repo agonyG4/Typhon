@@ -105,9 +105,10 @@ fn settle_lifecycle_transition(state: &mut CompositorState, window_id: WindowId)
     let now = AnimationTime::monotonic_now().expect("monotonic test time");
     let scene_node_id =
         crate::core::SceneNodeId::from_raw(window_id.get()).expect("test SceneNodeId");
+    let identity = active_lifecycle_identity(state, scene_node_id);
     let active = state
         .window_lifecycle_animator
-        .sample(scene_node_id, now)
+        .sample(identity, now)
         .expect("active lifecycle transition");
     assert!(
         state
@@ -122,6 +123,19 @@ fn settle_lifecycle_transition(state: &mut CompositorState, window_id: WindowId)
     }]);
     let snapshot = LifecycleFrameSnapshot::qualified_from_sample(&sample, &evidence);
     state.publish_presented_lifecycle(1, &snapshot);
+}
+
+fn active_lifecycle_identity(
+    state: &CompositorState,
+    scene_node_id: crate::core::SceneNodeId,
+) -> PresentationRetainedVisualIdentity {
+    state
+        .presentation_animator
+        .active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        )
+        .expect("active Presentation lifecycle owner")
 }
 
 fn lifecycle_request(
@@ -166,6 +180,9 @@ fn lifecycle_request_with_group(
             AnimationTime::from_nanos(0),
         )
         .expect("test retained identity");
+    presentation_engine
+        .activate_retained_visual_exact(presentation_identity)
+        .expect("activate test lifecycle owner");
     LifecycleTransitionRequest {
         presentation_identity,
         window_id,
@@ -206,10 +223,7 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
         ResolvedEffectScene::default(),
         Vec::new(),
     );
-    let identity = state
-        .window_lifecycle_animator
-        .identity(scene_node_id)
-        .expect("active lifecycle identity");
+    let identity = active_lifecycle_identity(&state, scene_node_id);
     assert_eq!(identity.scene_node_id(), scene_node_id);
     assert_eq!(
         identity.kind(),
@@ -245,7 +259,7 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     let active = state
         .window_lifecycle_animator
         .sample(
-            scene_node_id,
+            identity,
             AnimationTime::monotonic_now().expect("monotonic time"),
         )
         .expect("frozen lifecycle transition remains active");
@@ -367,14 +381,20 @@ fn unconsumed_endpoint_pageflip_does_not_retire_lifecycle_transition() {
                 anchor,
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
         .expect("Lamp transition starts");
-    let endpoint = state
-        .window_lifecycle_animator
-        .sample_scene(AnimationTime::from_nanos(280_000_000));
+    let endpoint = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(280_000_000));
     assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            transition_id.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        Some(transition_id)
+    );
 
     state.publish_presented_lifecycle(1, &LifecycleFrameSnapshot::default());
     assert_eq!(state.window_lifecycle_animator.active_count(), 1);
@@ -388,6 +408,13 @@ fn unconsumed_endpoint_pageflip_does_not_retire_lifecycle_transition() {
     state.publish_presented_lifecycle(2, &qualified);
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            transition_id.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
 }
 
 #[test]
@@ -409,6 +436,7 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
                 rect(500.0, 500.0, 20.0, 20.0),
                 LifecycleDirection::Restore,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -418,6 +446,13 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
     assert!(state.settle_lifecycle_no_visual_change());
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            transition_id.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
     assert_eq!(state.presented_lifecycle_frame_id(), 0);
     assert!(!state.lifecycle_render_suppressed_roots.contains(&302));
     assert!(!state.lifecycle_animation_has_pending_visible());
@@ -427,6 +462,198 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
             .acknowledge(transition_id, true)
             .is_none()
     );
+}
+
+#[test]
+fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor_work() {
+    let window_id = WindowId::from_raw(312).expect("window id");
+    let scene_node_id = crate::core::SceneNodeId::from_raw(912).expect("SceneNodeId");
+    let mut state = CompositorState {
+        output_size: OutputSize::new(100, 100),
+        lifecycle_animation_renderer_available: Some(true),
+        ..Default::default()
+    };
+    let identity = state
+        .presentation_animator
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(0),
+        )
+        .expect("ledger reservation");
+    let started_at = AnimationTime::monotonic_now().expect("monotonic clock");
+    let sample_time = AnimationTime::from_nanos(started_at.as_nanos() + 100_000_000);
+    assert!(
+        state
+            .presentation_animator
+            .transaction_record(identity.transaction_id())
+            .is_some()
+    );
+    let group = visual_group(rect(10.0, 10.0, 60.0, 60.0));
+    state
+        .window_lifecycle_animator
+        .start_or_reverse(
+            LifecycleTransitionRequest {
+                presentation_identity: identity,
+                window_id,
+                root_surface_id: 312,
+                visual_group: group,
+                direction: LifecycleDirection::Minimize,
+                resolved_effect_scene: ResolvedEffectScene::default(),
+            },
+            None,
+            started_at,
+            1.0,
+        )
+        .expect("orphan executor entry");
+
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
+    assert!(
+        state
+            .lifecycle_scene_sample_at(sample_time)
+            .lamps
+            .is_empty()
+    );
+    assert!(state.lifecycle_frame_snapshot_at(sample_time).is_empty());
+    assert!(!state.lifecycle_animation_has_pending_visible());
+    assert!(
+        !state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::LifecycleAnimation)
+    );
+    assert!(!state.has_unowned_frame_work());
+    assert!(!state.settle_lifecycle_no_visual_change());
+
+    assert_eq!(
+        state
+            .presentation_animator
+            .activate_retained_visual_exact(identity)
+            .expect("activate exact reservation"),
+        None
+    );
+    let active_sample = state.lifecycle_scene_sample_at(sample_time);
+    assert_eq!(active_sample.lamps.len(), 1);
+    assert_eq!(active_sample.lamps[0].presentation_identity, identity);
+    assert!(state.lifecycle_animation_has_pending_visible());
+    assert!(
+        state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::LifecycleAnimation)
+    );
+    assert!(state.has_unowned_frame_work());
+
+    assert!(
+        state
+            .presentation_animator
+            .retire_active_retained_visual_exact(identity)
+    );
+    assert!(
+        state
+            .lifecycle_scene_sample_at(sample_time)
+            .lamps
+            .is_empty()
+    );
+    assert!(!state.lifecycle_animation_has_pending_visible());
+    assert!(
+        !state
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::LifecycleAnimation)
+    );
+    assert!(!state.has_unowned_frame_work());
+
+    state.set_lifecycle_animation_enabled(false);
+    assert_eq!(
+        state
+            .window_lifecycle_animator
+            .sample(identity, sample_time)
+            .expect("orphan remains cached but inactive")
+            .progress,
+        100_000_000.0 / 280_000_000.0
+    );
+    assert!(state.window_lifecycle_animator.cancel(identity).is_some());
+}
+
+#[test]
+fn animation_policy_reconciliation_does_not_snap_an_orphan_executor() {
+    let directory = std::env::temp_dir().join(format!(
+        "typhon-lifecycle-owner-policy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).expect("create animation configuration directory");
+    let window_id = WindowId::from_raw(313).expect("window id");
+    let scene_node_id = crate::core::SceneNodeId::from_raw(913).expect("SceneNodeId");
+    let now = AnimationTime::monotonic_now().expect("monotonic time");
+    let mut state = CompositorState {
+        lifecycle_animation_renderer_available: Some(true),
+        ..Default::default()
+    };
+    state.animation_control = crate::animation_control::AnimationControlState::from_store(
+        crate::animation_control::AnimationConfigurationStore::new(directory.clone())
+            .expect("create animation configuration store"),
+    );
+    let identity = state
+        .presentation_animator
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            now,
+        )
+        .expect("retained reservation");
+    state
+        .window_lifecycle_animator
+        .start_or_reverse(
+            LifecycleTransitionRequest {
+                presentation_identity: identity,
+                window_id,
+                root_surface_id: 313,
+                visual_group: visual_group(rect(20.0, 20.0, 80.0, 80.0)),
+                direction: LifecycleDirection::Minimize,
+                resolved_effect_scene: ResolvedEffectScene::default(),
+            },
+            None,
+            now,
+            1.0,
+        )
+        .expect("orphan executor entry");
+
+    let mut candidate = state.animation_control.configuration().clone();
+    candidate
+        .overrides
+        .insert(AnimationSlot::WindowMinimize, AnimationEffect::None);
+    state
+        .set_animation_configuration(candidate)
+        .expect("runtime policy mutation persists");
+
+    let sample = state
+        .window_lifecycle_animator
+        .sample(
+            identity,
+            AnimationTime::from_nanos(now.as_nanos().saturating_add(1)),
+        )
+        .expect("orphan remains cached");
+    assert!(!sample.mathematically_settled);
+    assert!(sample.progress < 1.0);
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -448,6 +675,7 @@ fn exact_invisible_lamp_endpoint_can_settle_without_visual_change() {
                 rect(20.0, 20.0, 20.0, 20.0),
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -483,6 +711,7 @@ fn old_visible_physical_lamp_prevents_no_visual_settlement() {
                 rect(500.0, 500.0, 20.0, 20.0),
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -541,6 +770,7 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
                 rect(20.0, 20.0, 20.0, 20.0),
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -582,6 +812,13 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
         })
     );
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            transition_id.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
     assert!(
         state
             .presentation_animator
@@ -659,21 +896,19 @@ fn rendered_replacement_clears_absent_physical_lamp_without_acknowledging_active
                 rect(20.0, 20.0, 20.0, 20.0),
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
         .expect("Lamp transition starts");
-    let physical = state
-        .window_lifecycle_animator
-        .sample_scene(AnimationTime::from_nanos(100_000_000));
+    let physical = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(100_000_000));
     state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&physical);
     state.publish_presented_lifecycle_with_replacements(2, &Default::default(), &[], true);
     assert!(state.presented_lifecycle.lamps.is_empty());
     assert_eq!(state.window_lifecycle_animator.active_count(), 1);
     assert_eq!(
         state
-            .window_lifecycle_animator
-            .sample_scene(AnimationTime::from_nanos(100_000_000))
+            .lifecycle_scene_sample_at(AnimationTime::from_nanos(100_000_000))
             .lamps
             .len(),
         1
@@ -711,6 +946,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
                 rect(200.0, 200.0, 20.0, 20.0),
                 LifecycleDirection::Minimize,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -724,7 +960,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
         .expect("runtime policy mutation persists");
     let minimize = state
         .window_lifecycle_animator
-        .sample(minimize_id.scene_node_id(), AnimationTime::from_nanos(0))
+        .sample(minimize_id, AnimationTime::from_nanos(0))
         .expect("snapped minimize remains owned");
     assert_eq!(minimize.presentation_identity, minimize_id);
     assert_eq!(minimize.progress, 1.0);
@@ -752,6 +988,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
                 rect(200.0, 200.0, 20.0, 20.0),
                 LifecycleDirection::Restore,
             ),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -766,7 +1003,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
         .expect("restore policy mutation persists");
     let restore = state
         .window_lifecycle_animator
-        .sample(restore_id.scene_node_id(), AnimationTime::from_nanos(0))
+        .sample(restore_id, AnimationTime::from_nanos(0))
         .expect("snapped restore remains owned");
     assert_eq!(restore.presentation_identity, restore_id);
     assert_eq!(restore.progress, 0.0);
@@ -807,6 +1044,7 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
         .window_lifecycle_animator
         .start_or_reverse(
             request(LifecycleDirection::Minimize),
+            None,
             AnimationTime::from_nanos(0),
             1.0,
         )
@@ -815,6 +1053,7 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
         .window_lifecycle_animator
         .start_or_reverse(
             request(LifecycleDirection::Restore),
+            Some(old_id),
             AnimationTime::from_nanos(100_000_000),
             1.0,
         )
@@ -849,10 +1088,7 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
     assert_eq!(
         state
             .window_lifecycle_animator
-            .sample(
-                new_id.scene_node_id(),
-                AnimationTime::from_nanos(100_000_000)
-            )
+            .sample(new_id, AnimationTime::from_nanos(100_000_000))
             .expect("new transition survives")
             .presentation_identity,
         new_id
@@ -878,10 +1114,7 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
     let scene_node_id = state
         .scene_node_id_for_window_group(window_id)
         .expect("window group SceneNode");
-    let old_identity = state
-        .window_lifecycle_animator
-        .identity(scene_node_id)
-        .expect("active restore identity");
+    let old_identity = active_lifecycle_identity(&state, scene_node_id);
     let now = AnimationTime::monotonic_now().expect("test monotonic time");
     state
         .presentation_animator
@@ -922,7 +1155,10 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
 
     assert_eq!(state.window_lifecycle_animator.active_count(), 1);
     assert_eq!(
-        state.window_lifecycle_animator.identity(scene_node_id),
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
         Some(old_identity)
     );
     assert!(
@@ -1042,12 +1278,16 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     let cancelled_node = cancelled
         .scene_node_id_for_window_group(cancelled_window)
         .expect("window group SceneNode");
-    let cancelled_identity = cancelled
-        .window_lifecycle_animator
-        .identity(cancelled_node)
-        .expect("active restore");
+    let cancelled_identity = active_lifecycle_identity(&cancelled, cancelled_node);
     cancelled.lifecycle_cancel_window(cancelled_window);
     assert_eq!(cancelled.window_lifecycle_animator.active_count(), 0);
+    assert_eq!(
+        cancelled.presentation_animator.active_retained_visual(
+            cancelled_identity.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
     assert!(
         cancelled
             .presentation_animator
@@ -1067,12 +1307,16 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     let teardown_node = torn_down
         .scene_node_id_for_window_group(teardown_window)
         .expect("window group SceneNode");
-    let teardown_identity = torn_down
-        .window_lifecycle_animator
-        .identity(teardown_node)
-        .expect("active restore");
+    let teardown_identity = active_lifecycle_identity(&torn_down, teardown_node);
     assert!(torn_down.remove_desktop_window(teardown_window).is_some());
     assert_eq!(torn_down.window_lifecycle_animator.active_count(), 0);
+    assert_eq!(
+        torn_down.presentation_animator.active_retained_visual(
+            teardown_identity.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
     assert!(
         torn_down
             .presentation_animator
@@ -1092,18 +1336,78 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     let unavailable_node = unavailable
         .scene_node_id_for_window_group(unavailable_window)
         .expect("window group SceneNode");
-    let unavailable_identity = unavailable
+    let unavailable_identity = active_lifecycle_identity(&unavailable, unavailable_node);
+    let second_scene_node = crate::core::SceneNodeId::from_raw(9_411).expect("second SceneNode");
+    let second_window = WindowId::from_raw(4_112).expect("second window id");
+    let second_started_at = AnimationTime::monotonic_now().expect("monotonic test time");
+    let second_identity = unavailable
+        .presentation_animator
+        .begin_retained_visual(
+            second_scene_node,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            second_started_at,
+        )
+        .expect("second lifecycle reservation");
+    unavailable
+        .presentation_animator
+        .activate_retained_visual_exact(second_identity)
+        .expect("activate second lifecycle owner");
+    unavailable
         .window_lifecycle_animator
-        .identity(unavailable_node)
-        .expect("active restore");
+        .start_or_reverse(
+            LifecycleTransitionRequest {
+                presentation_identity: second_identity,
+                window_id: second_window,
+                root_surface_id: 412,
+                visual_group: visual_group(rect(300.0, 200.0, 80.0, 80.0)),
+                direction: LifecycleDirection::Minimize,
+                resolved_effect_scene: ResolvedEffectScene::default(),
+            },
+            None,
+            second_started_at,
+            1.0,
+        )
+        .expect("second lifecycle executor");
+    unavailable.lifecycle_render_suppressed_roots.insert(412);
+    unavailable
+        .lifecycle_decorations
+        .insert(412, lifecycle_decoration(second_window, 412, 0x74));
+    assert_eq!(
+        unavailable
+            .presentation_animator
+            .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle)
+            .len(),
+        2
+    );
     unavailable.set_lifecycle_animation_renderer_available(false);
     assert_eq!(unavailable.window_lifecycle_animator.active_count(), 0);
+    assert!(
+        unavailable
+            .presentation_animator
+            .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle)
+            .is_empty()
+    );
+    assert_eq!(
+        unavailable.presentation_animator.active_retained_visual(
+            unavailable_identity.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
     assert!(
         unavailable
             .presentation_animator
             .transaction_record(unavailable_identity.transaction_id())
             .is_none()
     );
+    assert!(
+        unavailable
+            .presentation_animator
+            .transaction_record(second_identity.transaction_id())
+            .is_none()
+    );
+    assert!(unavailable.lifecycle_render_suppressed_roots.is_empty());
+    assert!(unavailable.lifecycle_decorations.is_empty());
 }
 
 #[test]
@@ -1182,14 +1486,11 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
     let scene_node_id = state
         .scene_node_id_for_window_group(window_id)
         .expect("window group SceneNode");
-    let old_identity = state
-        .window_lifecycle_animator
-        .identity(scene_node_id)
-        .expect("minimize identity");
+    let old_identity = active_lifecycle_identity(&state, scene_node_id);
     let before = state
         .window_lifecycle_animator
         .sample(
-            scene_node_id,
+            old_identity,
             AnimationTime::monotonic_now().expect("monotonic time"),
         )
         .expect("minimize sample");
@@ -1203,14 +1504,11 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
         ResolvedEffectScene::default(),
         vec![decoration_b],
     );
-    let new_identity = state
-        .window_lifecycle_animator
-        .identity(scene_node_id)
-        .expect("reversed restore identity");
+    let new_identity = active_lifecycle_identity(&state, scene_node_id);
     let after = state
         .window_lifecycle_animator
         .sample(
-            scene_node_id,
+            new_identity,
             AnimationTime::monotonic_now().expect("monotonic time"),
         )
         .expect("restore sample");
@@ -1245,8 +1543,7 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
     );
     assert_eq!(
         state
-            .window_lifecycle_animator
-            .visual_group(scene_node_id)
+            .lifecycle_visual_group_for_scene_node(scene_node_id)
             .expect("reversed transition")
             .canonical_visual_rect,
         group_a.canonical_visual_rect

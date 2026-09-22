@@ -8,17 +8,17 @@ use std::{
 
 use crate::core::{OutputId, SceneNodeId};
 
+use super::retained::PresentationRetainedVisualRegistry;
 use super::{
     AnimationCurve, AnimationTime, PresentationClip, PresentationClipRect,
     PresentationClipTransitionEvidence, PresentationGeometryTransform, PresentationGroupClip,
     PresentationGroupOpacity, PresentationGroupTransform, PresentationOpacity,
     PresentationOpacityTransitionEvidence, PresentationPropertyKind, PresentationRect,
-    PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
-    PresentationSampleTimeSource, PresentationSceneSample, PresentationTransactionError,
-    PresentationTransactionId, PresentationTransactionMember, PresentationTransactionMemberKind,
-    PresentationTransactionRecord, PresentationTransactionRequest, PresentationVelocity,
-    PresentationWindowSample, PresentationWindowTarget, PresentedClipAck, PresentedGeometryAck,
-    PresentedOpacityAck,
+    PresentationRevisionId, PresentationSampleTimeSource, PresentationSceneSample,
+    PresentationTransactionError, PresentationTransactionId, PresentationTransactionMember,
+    PresentationTransactionMemberKind, PresentationTransactionRecord,
+    PresentationTransactionRequest, PresentationVelocity, PresentationWindowSample,
+    PresentationWindowTarget, PresentedClipAck, PresentedGeometryAck, PresentedOpacityAck,
 };
 
 #[cfg(test)]
@@ -297,7 +297,8 @@ pub struct PresentationEngine {
     geometry_tracks: BTreeMap<SceneNodeId, GeometryTrack>,
     opacity_tracks: BTreeMap<SceneNodeId, OpacityTrack>,
     clip_tracks: BTreeMap<SceneNodeId, ClipTrack>,
-    transactions: BTreeMap<PresentationTransactionId, PresentationTransactionRecord>,
+    pub(super) transactions: BTreeMap<PresentationTransactionId, PresentationTransactionRecord>,
+    pub(super) retained_visuals: PresentationRetainedVisualRegistry,
     next_transaction_id: NonZeroU64,
     next_revision_id: NonZeroU64,
     transaction_ids_exhausted: bool,
@@ -346,6 +347,7 @@ impl PresentationEngine {
             opacity_tracks: BTreeMap::new(),
             clip_tracks: BTreeMap::new(),
             transactions: BTreeMap::new(),
+            retained_visuals: PresentationRetainedVisualRegistry::default(),
             next_transaction_id: NonZeroU64::MIN,
             next_revision_id: NonZeroU64::MIN,
             transaction_ids_exhausted: false,
@@ -680,52 +682,6 @@ impl PresentationEngine {
             .saturating_add(record.members().len() as u64);
         self.metrics.active_tracks = self.active_count() as u64;
         Ok(record)
-    }
-
-    /// Allocate one retained visual identity in the shared transaction and
-    /// revision namespace, independent of property sampling policy.
-    pub fn begin_retained_visual(
-        &mut self,
-        scene_node_id: SceneNodeId,
-        kind: PresentationRetainedVisualKind,
-        started_at: AnimationTime,
-    ) -> Result<PresentationRetainedVisualIdentity, PresentationTransactionError> {
-        let (transaction_id, mut revision_ids) = self.allocate_transaction_and_revisions(1)?;
-        let revision_id = revision_ids.pop().expect("one revision was reserved");
-        let identity = PresentationRetainedVisualIdentity::new(
-            scene_node_id,
-            kind,
-            transaction_id,
-            revision_id,
-        );
-        let record = PresentationTransactionRecord::new(
-            transaction_id,
-            started_at,
-            vec![PresentationTransactionMember::retained_visual(identity)],
-        );
-        self.transactions.insert(transaction_id, record);
-        Ok(identity)
-    }
-
-    /// Retire one exact retained visual member without affecting property
-    /// members or a newer identity for the same SceneNode.
-    pub fn retire_retained_visual_exact(
-        &mut self,
-        identity: PresentationRetainedVisualIdentity,
-    ) -> bool {
-        let transaction_id = identity.transaction_id();
-        let Some(record) = self.transactions.get_mut(&transaction_id) else {
-            return false;
-        };
-        let removed = record.remove_member_exact(
-            identity.scene_node_id(),
-            PresentationTransactionMemberKind::RetainedVisual(identity.kind()),
-            identity.revision_id(),
-        );
-        if record.members().is_empty() {
-            self.transactions.remove(&transaction_id);
-        }
-        removed
     }
 
     pub fn transaction_record(
@@ -1285,7 +1241,7 @@ impl PresentationEngine {
         Ok(revisions)
     }
 
-    fn allocate_transaction_and_revisions(
+    pub(super) fn allocate_transaction_and_revisions(
         &mut self,
         revision_count: usize,
     ) -> Result<

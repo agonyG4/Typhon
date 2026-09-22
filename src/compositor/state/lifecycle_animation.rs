@@ -2,6 +2,8 @@ use super::*;
 use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot};
 #[cfg(test)]
 use crate::compositor::decoration::types::DecorationMode;
+use crate::presentation_animation::PresentationRetainedVisualKind;
+#[cfg(test)]
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleFrameSnapshot, LifecycleRenderFallbackEntry, LifecycleSceneSample,
@@ -187,10 +189,12 @@ impl CompositorState {
         };
         let speed = self.animation_control.configuration().speed;
         let has_active_transition = self
-            .window_lifecycle_animator
-            .visual_group(scene_node_id)
+            .presentation_animator
+            .active_retained_visual(
+                scene_node_id,
+                PresentationRetainedVisualKind::WindowLifecycle,
+            )
             .is_some();
-        let previous_identity = self.window_lifecycle_animator.identity(scene_node_id);
         let identity = match self.presentation_animator.begin_retained_visual(
             scene_node_id,
             crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
@@ -198,6 +202,17 @@ impl CompositorState {
         ) {
             Ok(identity) => identity,
             Err(_) => return,
+        };
+        let previous_identity = match self
+            .presentation_animator
+            .activate_retained_visual_exact(identity)
+        {
+            Ok(previous_identity) => previous_identity,
+            Err(_) => {
+                self.presentation_animator
+                    .retire_retained_visual_exact(identity);
+                return;
+            }
         };
         let started = self.window_lifecycle_animator.start_or_reverse(
             LifecycleTransitionRequest {
@@ -208,12 +223,20 @@ impl CompositorState {
                 direction: LifecycleDirection::Minimize,
                 resolved_effect_scene,
             },
+            previous_identity,
             now,
             speed,
         );
         if started != Some(identity) {
+            let restored = self
+                .presentation_animator
+                .restore_retained_visual_owner_exact(identity, previous_identity);
             self.presentation_animator
                 .retire_retained_visual_exact(identity);
+            debug_assert!(
+                restored,
+                "failed lifecycle start restores its previous owner"
+            );
             return;
         }
         if let Some(previous_identity) = previous_identity {
@@ -225,7 +248,7 @@ impl CompositorState {
         self.presentation_animator.cancel_geometry(scene_node_id);
         let active_root_surface_id = self
             .window_lifecycle_animator
-            .sample(scene_node_id, now)
+            .sample(identity, now)
             .map(|sample| sample.root_surface_id)
             .unwrap_or(root_surface_id);
         self.lifecycle_render_suppressed_roots
@@ -268,9 +291,12 @@ impl CompositorState {
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
             return;
         };
-        let visual_group = self
-            .window_lifecycle_animator
-            .visual_group(scene_node_id)
+        let previous_identity = self.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        );
+        let visual_group = previous_identity
+            .and_then(|identity| self.window_lifecycle_animator.visual_group(identity))
             .or(visual_group)
             .or_else(|| {
                 let full_window_rect = self.lifecycle_window_rect(root_surface_id)?;
@@ -298,11 +324,7 @@ impl CompositorState {
             return;
         };
         let speed = self.animation_control.configuration().speed;
-        let has_active_transition = self
-            .window_lifecycle_animator
-            .visual_group(scene_node_id)
-            .is_some();
-        let previous_identity = self.window_lifecycle_animator.identity(scene_node_id);
+        let has_active_transition = previous_identity.is_some();
         let identity = match self.presentation_animator.begin_retained_visual(
             scene_node_id,
             crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
@@ -311,6 +333,18 @@ impl CompositorState {
             Ok(identity) => identity,
             Err(_) => return,
         };
+        let activated_previous = match self
+            .presentation_animator
+            .activate_retained_visual_exact(identity)
+        {
+            Ok(previous_identity) => previous_identity,
+            Err(_) => {
+                self.presentation_animator
+                    .retire_retained_visual_exact(identity);
+                return;
+            }
+        };
+        debug_assert_eq!(activated_previous, previous_identity);
         let started = self.window_lifecycle_animator.start_or_reverse(
             LifecycleTransitionRequest {
                 presentation_identity: identity,
@@ -320,21 +354,29 @@ impl CompositorState {
                 direction: LifecycleDirection::Restore,
                 resolved_effect_scene,
             },
+            activated_previous,
             now,
             speed,
         );
         if started != Some(identity) {
+            let restored = self
+                .presentation_animator
+                .restore_retained_visual_owner_exact(identity, activated_previous);
             self.presentation_animator
                 .retire_retained_visual_exact(identity);
+            debug_assert!(
+                restored,
+                "failed lifecycle start restores its previous owner"
+            );
             return;
         }
-        if let Some(previous_identity) = previous_identity {
+        if let Some(previous_identity) = activated_previous {
             self.presentation_animator
                 .retire_retained_visual_exact(previous_identity);
         }
         let active_root_surface_id = self
             .window_lifecycle_animator
-            .sample(scene_node_id, now)
+            .sample(identity, now)
             .map(|sample| sample.root_surface_id)
             .unwrap_or(root_surface_id);
         if !has_active_transition {
@@ -351,7 +393,21 @@ impl CompositorState {
         &self,
         at: AnimationTime,
     ) -> LifecycleSceneSample {
-        self.window_lifecycle_animator.sample_scene(at)
+        let active = self
+            .presentation_animator
+            .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle);
+        self.window_lifecycle_animator.sample_scene(&active, at)
+    }
+
+    pub(in crate::compositor) fn lifecycle_visual_group_for_scene_node(
+        &self,
+        scene_node_id: crate::core::SceneNodeId,
+    ) -> Option<LifecycleVisualGroup> {
+        let identity = self.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        )?;
+        self.window_lifecycle_animator.visual_group(identity)
     }
 
     pub(in crate::compositor) fn lifecycle_renderable_surfaces(
@@ -446,8 +502,7 @@ impl CompositorState {
     pub(in crate::compositor) fn settle_lifecycle_no_visual_change(&mut self) -> bool {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
         let candidates = self
-            .window_lifecycle_animator
-            .sample_scene(now)
+            .lifecycle_scene_sample_at(now)
             .lamps
             .into_iter()
             .filter(|lamp| !self.lifecycle_lamp_has_visible_pixels(lamp))
@@ -468,12 +523,23 @@ impl CompositorState {
             .collect::<Vec<_>>();
         let mut settled = false;
         for (identity, root_surface_id) in candidates {
+            if self
+                .presentation_animator
+                .active_retained_visual(identity.scene_node_id(), identity.kind())
+                != Some(identity)
+            {
+                continue;
+            }
             if let Some(retired_identity) = self
                 .window_lifecycle_animator
                 .settle_no_visual_change(identity)
             {
-                self.presentation_animator
-                    .retire_retained_visual_exact(retired_identity);
+                if !self
+                    .presentation_animator
+                    .retire_active_retained_visual_exact(retired_identity)
+                {
+                    continue;
+                }
                 self.lifecycle_render_suppressed_roots
                     .remove(&root_surface_id);
                 self.lifecycle_decorations.remove(&root_surface_id);
@@ -485,8 +551,9 @@ impl CompositorState {
 
     pub(in crate::compositor) fn lifecycle_animation_has_pending_visible(&self) -> bool {
         let active_intersects = self
-            .window_lifecycle_animator
-            .sample_scene(AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)))
+            .lifecycle_scene_sample_at(
+                AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)),
+            )
             .lamps
             .iter()
             .any(|lamp| self.lifecycle_lamp_has_visible_pixels(lamp));
@@ -544,18 +611,25 @@ impl CompositorState {
         qualified.refresh_signature();
         self.presented_lifecycle = qualified;
         for lamp in &snapshot.lamps {
+            if self.presentation_animator.active_retained_visual(
+                lamp.presentation_identity.scene_node_id(),
+                lamp.presentation_identity.kind(),
+            ) != Some(lamp.presentation_identity)
+            {
+                continue;
+            }
             let acknowledged = self
                 .window_lifecycle_animator
                 .acknowledge(lamp.presentation_identity, lamp.mathematically_settled);
-            if let Some(identity) = acknowledged {
+            let retired = acknowledged.is_some_and(|identity| {
                 self.presentation_animator
-                    .retire_retained_visual_exact(identity);
-            }
-            if acknowledged.is_some() && matches!(lamp.direction, LifecycleDirection::Restore) {
+                    .retire_active_retained_visual_exact(identity)
+            });
+            if retired && matches!(lamp.direction, LifecycleDirection::Restore) {
                 self.lifecycle_render_suppressed_roots
                     .remove(&lamp.root_surface_id);
             }
-            if acknowledged.is_some() {
+            if retired {
                 self.lifecycle_decorations.remove(&lamp.root_surface_id);
             }
         }
@@ -564,12 +638,16 @@ impl CompositorState {
 
     pub(in crate::compositor) fn set_lifecycle_animation_enabled(&mut self, enabled: bool) {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-        self.window_lifecycle_animator.set_enabled(enabled, now);
+        let active = self
+            .presentation_animator
+            .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle);
+        self.window_lifecycle_animator
+            .set_enabled(enabled, &active, now);
     }
 
     pub(in crate::compositor) fn reconcile_lifecycle_animation_policy(&mut self) {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-        let active = self.window_lifecycle_animator.sample_scene(now).lamps;
+        let active = self.lifecycle_scene_sample_at(now).lamps;
         for lamp in active {
             if self.lifecycle_effect(lamp.direction) != AnimationEffect::MinimizeLamp {
                 self.window_lifecycle_animator
@@ -583,9 +661,16 @@ impl CompositorState {
         fallback: LifecycleRenderFallbackEntry,
     ) -> bool {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        if self.presentation_animator.active_retained_visual(
+            fallback.presentation_identity.scene_node_id(),
+            fallback.presentation_identity.kind(),
+        ) != Some(fallback.presentation_identity)
+        {
+            return false;
+        }
         let Some(current) = self
             .window_lifecycle_animator
-            .sample(fallback.presentation_identity.scene_node_id(), now)
+            .sample(fallback.presentation_identity, now)
         else {
             return false;
         };
@@ -601,8 +686,12 @@ impl CompositorState {
         else {
             return false;
         };
-        self.presentation_animator
-            .retire_retained_visual_exact(identity);
+        if !self
+            .presentation_animator
+            .retire_active_retained_visual_exact(identity)
+        {
+            return false;
+        }
         self.lifecycle_render_suppressed_roots
             .remove(&fallback.root_surface_id);
         self.lifecycle_decorations.remove(&fallback.root_surface_id);
@@ -615,10 +704,15 @@ impl CompositorState {
     ) {
         self.lifecycle_animation_renderer_available = Some(available);
         if !available {
-            for identity in self.window_lifecycle_animator.cancel_all() {
+            let active = self
+                .presentation_animator
+                .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle);
+            for identity in active {
+                self.window_lifecycle_animator.cancel(identity);
                 self.presentation_animator
-                    .retire_retained_visual_exact(identity);
+                    .retire_active_retained_visual_exact(identity);
             }
+            self.window_lifecycle_animator.cancel_all();
             self.lifecycle_render_suppressed_roots.clear();
             self.lifecycle_decorations.clear();
         }
@@ -628,18 +722,33 @@ impl CompositorState {
         let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
         let scene_node_id = self.scene_node_id_for_window_group(window_id);
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-        let frozen_root_surface_id = scene_node_id
-            .and_then(|scene_node_id| self.window_lifecycle_animator.sample(scene_node_id, now))
+        let active_identity = scene_node_id.and_then(|scene_node_id| {
+            self.presentation_animator.active_retained_visual(
+                scene_node_id,
+                PresentationRetainedVisualKind::WindowLifecycle,
+            )
+        });
+        let frozen_root_surface_id = active_identity
+            .and_then(|identity| self.window_lifecycle_animator.sample(identity, now))
             .map(|sample| sample.root_surface_id);
-        if let Some(scene_node_id) = scene_node_id
-            && let Some(identity) = self.window_lifecycle_animator.cancel(scene_node_id)
-        {
+        if let Some(identity) = active_identity {
+            self.window_lifecycle_animator.cancel(identity);
             self.presentation_animator
-                .retire_retained_visual_exact(identity);
+                .retire_active_retained_visual_exact(identity);
         }
+        let orphaned_roots = scene_node_id
+            .map(|scene_node_id| {
+                self.window_lifecycle_animator
+                    .cancel_scene_executions(scene_node_id)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, root_surface_id)| root_surface_id)
+            .collect::<Vec<_>>();
         for root_surface_id in [frozen_root_surface_id, root_surface_id]
             .into_iter()
             .flatten()
+            .chain(orphaned_roots)
         {
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);

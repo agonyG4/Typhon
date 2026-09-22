@@ -37,8 +37,8 @@ pub use ids::{
 };
 pub use opacity::PresentationOpacity;
 pub use retained::{
-    PresentationRetainedVisualIdentity, PresentationRetainedVisualKind,
-    PresentationTransactionMemberKind,
+    PresentationRetainedVisualActivationError, PresentationRetainedVisualIdentity,
+    PresentationRetainedVisualKind, PresentationTransactionMemberKind,
 };
 pub use time::AnimationTime;
 pub use transaction::{

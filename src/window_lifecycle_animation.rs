@@ -1,5 +1,5 @@
 use crate::compositor::ResolvedEffectScene;
-use crate::core::{SceneNodeId, WindowId};
+use crate::core::WindowId;
 use crate::presentation_animation::{
     AnimationTime, PresentationRect, PresentationRetainedVisualIdentity,
 };
@@ -497,7 +497,7 @@ struct LifecycleTransition {
 #[derive(Debug)]
 pub struct WindowLifecycleAnimator {
     enabled: bool,
-    transitions: BTreeMap<SceneNodeId, LifecycleTransition>,
+    transitions: BTreeMap<PresentationRetainedVisualIdentity, LifecycleTransition>,
     #[cfg(test)]
     fail_next_start: bool,
 }
@@ -522,14 +522,21 @@ impl WindowLifecycleAnimator {
         self.enabled
     }
 
-    pub fn set_enabled(&mut self, enabled: bool, now: AnimationTime) {
+    pub fn set_enabled(
+        &mut self,
+        enabled: bool,
+        active_identities: &[PresentationRetainedVisualIdentity],
+        now: AnimationTime,
+    ) {
         if self.enabled && !enabled {
-            for transition in self.transitions.values_mut() {
-                let current = transition_progress(transition, now);
-                transition.start_progress = current;
-                transition.target_progress = transition.direction.target_progress();
-                transition.started_at = now;
-                transition.duration_nanos = 0;
+            for identity in active_identities {
+                if let Some(transition) = self.transitions.get_mut(identity) {
+                    let current = transition_progress(transition, now);
+                    transition.start_progress = current;
+                    transition.target_progress = transition.direction.target_progress();
+                    transition.started_at = now;
+                    transition.duration_nanos = 0;
+                }
             }
         }
         self.enabled = enabled;
@@ -538,6 +545,7 @@ impl WindowLifecycleAnimator {
     pub fn start_or_reverse(
         &mut self,
         request: LifecycleTransitionRequest,
+        previous_identity: Option<PresentationRetainedVisualIdentity>,
         now: AnimationTime,
         speed: f64,
     ) -> Option<PresentationRetainedVisualIdentity> {
@@ -553,65 +561,91 @@ impl WindowLifecycleAnimator {
             direction,
             resolved_effect_scene,
         } = request;
-        let scene_node_id = presentation_identity.scene_node_id();
-
-        let existing = self.transitions.get(&scene_node_id).cloned();
-        if existing
-            .as_ref()
-            .is_some_and(|transition| transition.presentation_identity == presentation_identity)
+        if presentation_identity.kind()
+            != crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle
+            || self.transitions.contains_key(&presentation_identity)
         {
             return None;
         }
-        let start_progress = existing
+        let previous = if let Some(previous_identity) = previous_identity {
+            if previous_identity.scene_node_id() != presentation_identity.scene_node_id()
+                || previous_identity.kind() != presentation_identity.kind()
+            {
+                return None;
+            }
+            Some(self.transitions.get(&previous_identity)?.clone())
+        } else {
+            None
+        };
+        let start_progress = previous
             .as_ref()
             .map(|transition| transition_progress(transition, now))
             .unwrap_or_else(|| match direction {
                 LifecycleDirection::Minimize => 0.0,
                 LifecycleDirection::Restore => 1.0,
             });
-        let visual_group = existing
+        let visual_group = previous
             .as_ref()
             .map(|transition| transition.visual_group)
             .unwrap_or(visual_group);
         if !valid_visual_group(visual_group) {
             return None;
         }
-        let resolved_effect_scene = existing
+        let resolved_effect_scene = previous
             .as_ref()
             .map(|transition| Arc::clone(&transition.resolved_effect_scene))
             .unwrap_or_else(|| Arc::new(resolved_effect_scene));
-        let root_surface_id = existing
+        let root_surface_id = previous
             .as_ref()
             .map(|transition| transition.root_surface_id)
             .unwrap_or(root_surface_id);
         let base_duration_nanos = effective_duration_nanos(speed);
         let remaining = (direction.target_progress() - start_progress).abs();
         let duration_nanos = (base_duration_nanos as f64 * remaining).round() as u64;
-        self.transitions.insert(
-            scene_node_id,
-            LifecycleTransition {
-                window_id,
-                root_surface_id,
-                presentation_identity,
-                visual_group,
-                direction,
-                start_progress,
-                target_progress: direction.target_progress(),
-                started_at: now,
-                duration_nanos,
-                resolved_effect_scene,
-            },
-        );
+        let transition = LifecycleTransition {
+            window_id,
+            root_surface_id,
+            presentation_identity,
+            visual_group,
+            direction,
+            start_progress,
+            target_progress: direction.target_progress(),
+            started_at: now,
+            duration_nanos,
+            resolved_effect_scene,
+        };
+        if let Some(previous_identity) = previous_identity {
+            self.transitions.remove(&previous_identity);
+        }
+        self.transitions.insert(presentation_identity, transition);
         Some(presentation_identity)
     }
 
     pub fn cancel(
         &mut self,
-        scene_node_id: SceneNodeId,
+        presentation_identity: PresentationRetainedVisualIdentity,
     ) -> Option<PresentationRetainedVisualIdentity> {
         self.transitions
-            .remove(&scene_node_id)
+            .remove(&presentation_identity)
             .map(|transition| transition.presentation_identity)
+    }
+
+    /// Clear executor entries for an explicitly torn-down logical owner.
+    /// This is cache cleanup only; it does not identify the active owner.
+    pub(crate) fn cancel_scene_executions(
+        &mut self,
+        scene_node_id: crate::core::SceneNodeId,
+    ) -> Vec<(PresentationRetainedVisualIdentity, u32)> {
+        let identities = self
+            .transitions
+            .iter()
+            .filter(|(identity, _)| identity.scene_node_id() == scene_node_id)
+            .map(|(identity, transition)| (*identity, transition.root_surface_id))
+            .collect::<Vec<_>>();
+        for (identity, _) in &identities {
+            self.transitions.remove(identity);
+        }
+        identities
     }
 
     pub fn cancel_all(&mut self) -> Vec<PresentationRetainedVisualIdentity> {
@@ -626,42 +660,42 @@ impl WindowLifecycleAnimator {
 
     pub fn sample(
         &self,
-        scene_node_id: SceneNodeId,
+        presentation_identity: PresentationRetainedVisualIdentity,
         now: AnimationTime,
     ) -> Option<LampWindowSample> {
         self.transitions
-            .get(&scene_node_id)
+            .get(&presentation_identity)
             .cloned()
             .map(|transition| sample_transition(transition, now))
     }
 
-    pub fn visual_group(&self, scene_node_id: SceneNodeId) -> Option<LifecycleVisualGroup> {
+    pub fn visual_group(
+        &self,
+        presentation_identity: PresentationRetainedVisualIdentity,
+    ) -> Option<LifecycleVisualGroup> {
         self.transitions
-            .get(&scene_node_id)
+            .get(&presentation_identity)
             .map(|transition| transition.visual_group)
     }
 
-    pub fn identity(
+    pub fn sample_scene(
         &self,
-        scene_node_id: SceneNodeId,
-    ) -> Option<PresentationRetainedVisualIdentity> {
-        self.transitions
-            .get(&scene_node_id)
-            .map(|transition| transition.presentation_identity)
-    }
-
-    pub fn sample_scene(&self, now: AnimationTime) -> LifecycleSceneSample {
+        active_identities: &[PresentationRetainedVisualIdentity],
+        now: AnimationTime,
+    ) -> LifecycleSceneSample {
+        let transitions = active_identities
+            .iter()
+            .filter_map(|identity| self.transitions.get(identity).cloned())
+            .collect::<Vec<_>>();
         LifecycleSceneSample {
             sampled_at: now,
-            lamps: self
-                .transitions
-                .values()
+            lamps: transitions
+                .iter()
                 .cloned()
                 .map(|transition| sample_transition(transition, now))
                 .collect(),
-            visual_sources: self
-                .transitions
-                .values()
+            visual_sources: transitions
+                .iter()
                 .map(|transition| LifecycleVisualSource {
                     window_id: transition.window_id,
                     root_surface_id: transition.root_surface_id,
@@ -681,13 +715,8 @@ impl WindowLifecycleAnimator {
         if !mathematically_settled {
             return None;
         }
-        let scene_node_id = presentation_identity.scene_node_id();
-        let transition = self.transitions.get(&scene_node_id)?;
-        if transition.presentation_identity != presentation_identity {
-            return None;
-        }
         self.transitions
-            .remove(&scene_node_id)
+            .remove(&presentation_identity)
             .map(|transition| transition.presentation_identity)
     }
 
@@ -698,15 +727,9 @@ impl WindowLifecycleAnimator {
         presentation_identity: PresentationRetainedVisualIdentity,
         now: AnimationTime,
     ) -> bool {
-        let Some(transition) = self
-            .transitions
-            .get_mut(&presentation_identity.scene_node_id())
-        else {
+        let Some(transition) = self.transitions.get_mut(&presentation_identity) else {
             return false;
         };
-        if transition.presentation_identity != presentation_identity {
-            return false;
-        }
         transition.start_progress = transition.direction.target_progress();
         transition.target_progress = transition.direction.target_progress();
         transition.started_at = now;
@@ -721,13 +744,8 @@ impl WindowLifecycleAnimator {
         &mut self,
         presentation_identity: PresentationRetainedVisualIdentity,
     ) -> Option<PresentationRetainedVisualIdentity> {
-        let scene_node_id = presentation_identity.scene_node_id();
-        let transition = self.transitions.get(&scene_node_id)?;
-        if transition.presentation_identity != presentation_identity {
-            return None;
-        }
         self.transitions
-            .remove(&scene_node_id)
+            .remove(&presentation_identity)
             .map(|transition| transition.presentation_identity)
     }
 
@@ -737,18 +755,9 @@ impl WindowLifecycleAnimator {
         &mut self,
         presentation_identity: PresentationRetainedVisualIdentity,
     ) -> Option<PresentationRetainedVisualIdentity> {
-        let scene_node_id = presentation_identity.scene_node_id();
-        let transition = self.transitions.get(&scene_node_id)?;
-        if transition.presentation_identity != presentation_identity {
-            return None;
-        }
         self.transitions
-            .remove(&scene_node_id)
+            .remove(&presentation_identity)
             .map(|transition| transition.presentation_identity)
-    }
-
-    pub fn has_pending_visible(&self) -> bool {
-        !self.transitions.is_empty()
     }
 
     pub fn active_count(&self) -> usize {

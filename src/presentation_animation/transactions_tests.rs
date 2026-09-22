@@ -1287,6 +1287,127 @@ fn retained_identity_allocation_is_independent_of_property_sampling_policy() {
 }
 
 #[test]
+fn retained_reservation_is_not_active_until_exact_identity_is_activated() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(905);
+    let identity = engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(1),
+        )
+        .expect("retained lifecycle reservation");
+
+    assert_eq!(
+        engine.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
+    assert_eq!(
+        engine.active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle),
+        Vec::new()
+    );
+    assert_eq!(engine.activate_retained_visual_exact(identity), Ok(None));
+    assert_eq!(
+        engine.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        Some(identity)
+    );
+}
+
+#[test]
+fn retained_activation_replaces_one_owner_and_rejects_missing_members() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(906);
+    let kind = PresentationRetainedVisualKind::WindowLifecycle;
+    let first = engine
+        .begin_retained_visual(scene_node_id, kind, AnimationTime::from_nanos(1))
+        .expect("first identity");
+    let second = engine
+        .begin_retained_visual(scene_node_id, kind, AnimationTime::from_nanos(2))
+        .expect("second identity");
+    assert_eq!(engine.activate_retained_visual_exact(first), Ok(None));
+    assert_eq!(
+        engine.activate_retained_visual_exact(second),
+        Ok(Some(first))
+    );
+    assert_eq!(
+        engine.active_retained_visual(scene_node_id, kind),
+        Some(second)
+    );
+    assert_eq!(engine.active_retained_visuals(kind), vec![second]);
+    assert!(engine.transaction_record(first.transaction_id()).is_some());
+    assert!(!engine.retire_active_retained_visual_exact(first));
+    assert_eq!(
+        engine.active_retained_visual(scene_node_id, kind),
+        Some(second)
+    );
+
+    let fabricated = PresentationRetainedVisualIdentity::new(
+        scene_node_id,
+        kind,
+        PresentationTransactionId::from_raw(99_999).expect("transaction id"),
+        PresentationRevisionId::from_raw(99_999).expect("revision id"),
+    );
+    assert!(engine.activate_retained_visual_exact(fabricated).is_err());
+    assert_eq!(
+        engine.active_retained_visual(scene_node_id, kind),
+        Some(second)
+    );
+    assert!(!engine.restore_retained_visual_owner_exact(fabricated, Some(first)));
+    assert!(engine.restore_retained_visual_owner_exact(second, Some(first)));
+    assert_eq!(
+        engine.active_retained_visual(scene_node_id, kind),
+        Some(first)
+    );
+    assert_eq!(
+        engine.activate_retained_visual_exact(second),
+        Ok(Some(first))
+    );
+    assert_eq!(
+        engine.active_retained_visual(scene_node_id, kind),
+        Some(second)
+    );
+}
+
+#[test]
+fn active_retained_owner_survives_property_disable_and_cancel_all() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(907);
+    let kind = PresentationRetainedVisualKind::WindowLifecycle;
+    let identity = engine
+        .begin_retained_visual(scene_node_id, kind, AnimationTime::from_nanos(1))
+        .expect("retained identity");
+    engine
+        .activate_retained_visual_exact(identity)
+        .expect("activation");
+
+    engine.cancel_all(scene_node_id);
+    engine.set_enabled(false);
+
+    assert_eq!(
+        engine.active_retained_visual(scene_node_id, kind),
+        Some(identity)
+    );
+    assert!(
+        engine
+            .transaction_record(identity.transaction_id())
+            .is_some()
+    );
+    assert!(engine.retire_active_retained_visual_exact(identity));
+    assert_eq!(engine.active_retained_visual(scene_node_id, kind), None);
+    assert!(
+        engine
+            .transaction_record(identity.transaction_id())
+            .is_none()
+    );
+}
+
+#[test]
 fn property_cancel_all_leaves_retained_lifecycle_members_explicitly_owned() {
     let mut engine = PresentationEngine::enabled();
     let scene_node_id = node(903);
