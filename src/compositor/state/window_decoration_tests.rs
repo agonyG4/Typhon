@@ -1030,6 +1030,7 @@ fn v2_recreation_after_surface_commit_keeps_normal_unset_configure_policy() {
     );
     assert_eq!(state.applied_mode(), DecorationMode::ServerSide);
     state.recreate_object();
+    assert!(!state.set_preference(DecorationPreference::Unset));
     assert_eq!(state.requested_mode(false), DecorationMode::ServerSide);
 }
 
@@ -1099,9 +1100,13 @@ fn v2_destroy_surface_commit_disables_rendering_and_hit_testing() {
 }
 
 #[test]
-fn v2_mapped_creation_without_previous_object_starts_client_side() {
-    let state = WindowDecorationState::new_client_side_object();
-    assert_eq!(state.requested_mode(false), DecorationMode::ClientSide);
+fn v2_mapped_creation_has_client_side_baseline_and_unset_preference() {
+    let mut state = WindowDecorationState::new();
+
+    assert_eq!(state.applied_mode(), DecorationMode::ClientSide);
+    assert!(state.current_generation().is_some());
+    assert!(!state.set_preference(DecorationPreference::Unset));
+    assert_eq!(state.requested_mode(false), DecorationMode::ServerSide);
 }
 
 #[test]

@@ -234,11 +234,7 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                 {
                     decoration_state.recreate_object()
                 } else {
-                    let decoration_state = if surface_has_content {
-                        WindowDecorationState::new_client_side_object()
-                    } else {
-                        WindowDecorationState::new()
-                    };
+                    let decoration_state = WindowDecorationState::new();
                     let generation = decoration_state
                         .current_generation()
                         .expect("new decoration state has an object generation");
@@ -869,7 +865,31 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                 let _ = (seat, serial, x, y);
             }
             xdg_toplevel::Request::Destroy => {
-                state.unregister_toplevel_surface(compositor_surface_id(&data.surface));
+                let surface_id = compositor_surface_id(&data.surface);
+                let orphaned_decoration =
+                    state
+                        .xdg_decoration_resources
+                        .get(&surface_id)
+                        .and_then(|decoration| {
+                            let decoration_data = decoration.data::<XdgToplevelDecorationData>()?;
+                            let current_generation = state
+                                .xdg_decoration_states
+                                .get(&surface_id)?
+                                .current_generation()?;
+                            (decoration.is_alive()
+                                && decoration_data.generation == current_generation)
+                                .then(|| decoration.clone())
+                        });
+                if let Some(decoration) = orphaned_decoration {
+                    state.post_protocol_error(
+                        client,
+                        &decoration,
+                        zxdg_toplevel_decoration_v1::Error::Orphaned,
+                        "xdg_toplevel destroyed while its decoration object is alive".to_string(),
+                    );
+                    return;
+                }
+                state.unregister_toplevel_surface(surface_id);
             }
             xdg_toplevel::Request::Move { seat, serial } => {
                 if resource_belongs_to_surface_client(&seat, &data.surface) {

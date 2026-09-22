@@ -61,16 +61,6 @@ impl WindowDecorationState {
         }
     }
 
-    pub(in crate::compositor) const fn new_client_side_object() -> Self {
-        Self {
-            preference: DecorationPreference::ClientSide,
-            applied_mode: DecorationMode::ClientSide,
-            current_generation: Some(DecorationObjectGeneration(1)),
-            next_generation: 2,
-            destruction_pending_commit: None,
-        }
-    }
-
     pub(in crate::compositor) fn requested_mode(self, fullscreen: bool) -> DecorationMode {
         self.preference
             .effective_mode(self.current_generation.is_some(), fullscreen)

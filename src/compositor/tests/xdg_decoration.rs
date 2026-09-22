@@ -102,6 +102,7 @@ struct MappedDecorationClient {
     manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     advertised_manager_version: u32,
     shm: client_wl_shm::WlShm,
+    timing_manager: Option<client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1>,
     surface: client_wl_surface::WlSurface,
     xdg_surface: client_xdg_surface::XdgSurface,
     toplevel: client_xdg_toplevel::XdgToplevel,
@@ -135,6 +136,8 @@ impl MappedDecorationClient {
             globals.bind(&qh, 1..=1, ()).ok();
         let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
             globals.bind(&qh, 1..=manager_version, ())?;
+        let timing_manager: Option<client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
         let (surface, xdg_surface, toplevel) =
             create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
         surface.commit();
@@ -163,6 +166,7 @@ impl MappedDecorationClient {
             manager,
             advertised_manager_version,
             shm,
+            timing_manager,
             surface,
             xdg_surface,
             toplevel,
@@ -213,6 +217,20 @@ fn start_server() -> (
 
 fn stop_server(commands: Sender<ServerCommand>, server_thread: JoinHandle<OwnCompositorServer>) {
     stop_controllable_test_server(commands, server_thread);
+}
+
+fn expect_decoration_orphaned_error(connection: &Connection, decoration_id: u32) {
+    let error = match connection.roundtrip() {
+        Err(wayland_client::backend::WaylandError::Protocol(error)) => error,
+        Err(error) => panic!("expected a Wayland protocol error, got {error:?}"),
+        Ok(_) => panic!("destroying a toplevel with a live decoration must be fatal"),
+    };
+    assert_eq!(error.object_interface, "zxdg_toplevel_decoration_v1");
+    assert_eq!(
+        error.code,
+        client_zxdg_toplevel_decoration_v1::Error::Orphaned as u32
+    );
+    assert_eq!(error.object_id, decoration_id);
 }
 
 #[test]
@@ -597,7 +615,7 @@ fn second_live_decoration_object_reports_already_constructed() {
 }
 
 #[test]
-fn v2_decoration_creation_after_mapped_content_is_accepted() {
+fn v2_decoration_creation_after_mapped_content_keeps_client_side_until_commit() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = MappedDecorationClient::connect(&socket_path, &commands, 2)
         .expect("connect v2 decoration client");
@@ -619,18 +637,161 @@ fn v2_decoration_creation_after_mapped_content_is_accepted() {
         client.state.surface_configure_count,
         surface_configures_before + 1
     );
-    assert_eq!(client.state.decoration_configure_modes.last(), Some(&1));
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 0);
     assert!(decoration.is_alive());
 
-    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
-    client.connection.flush().unwrap();
-    client.pump(&commands).unwrap();
-    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
     assert_eq!(capture_native_decoration_count(&commands), 1);
     drop(client);
     stop_server(commands, server_thread);
+}
+
+#[test]
+fn destroying_toplevel_with_live_decoration_posts_orphaned() {
+    let (socket_path, commands, server_thread) = start_server();
+    let client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ServerSide,
+    )
+    .expect("connect decoration client");
+
+    let decoration_id = client.decoration.id().protocol_id();
+    client.toplevel.destroy();
+    client.connection.flush().unwrap();
+    expect_decoration_orphaned_error(&client.connection, decoration_id);
+
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn destroying_decoration_before_toplevel_allows_normal_teardown() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ServerSide,
+    )
+    .expect("connect decoration client");
+
+    client.decoration.destroy();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    client.toplevel.destroy();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert!(client.connection.protocol_error().is_none());
+    client.xdg_surface.destroy();
+    client.surface.destroy();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn destroying_toplevel_with_recreated_live_decoration_posts_orphaned() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 2)
+        .expect("connect v2 decoration client");
+    let first =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    first.destroy();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    let second =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+
+    let decoration_id = second.id().protocol_id();
+    client.toplevel.destroy();
+    client.connection.flush().unwrap();
+    expect_decoration_orphaned_error(&client.connection, decoration_id);
+
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn delayed_surface_commit_uses_captured_decoration_state_without_syncobj() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 2)
+        .expect("connect v2 decoration client");
+    let decoration =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    if client.state.decoration_configure_modes.last() != Some(&2) {
+        decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        client.connection.flush().unwrap();
+        client.pump(&commands).unwrap();
+    }
+    let serial_a = *client.state.surface_configure_serials.last().unwrap();
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    // ACK A, then hold C1 in the real surface-tree transaction queue using
+    // the compositor's commit-timing readiness path.
+    client.xdg_surface.ack_configure(serial_a);
+    let timer = client
+        .timing_manager
+        .as_ref()
+        .expect("commit timing manager global")
+        .get_timer(&client.surface, &client.queue.handle(), ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic).unwrap();
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    let target_seconds = seconds_lo.saturating_add(1);
+    timer.set_timestamp(seconds_hi, target_seconds, now.nanoseconds());
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+
+    let blocked = capture_xdg_role_snapshot(&commands, client.surface.id().protocol_id());
+    assert_eq!(blocked.pending_explicit_sync_commits, 0);
+    assert_eq!(blocked.pending_surface_tree_transactions, 1);
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    // ACK B without a surface commit. Publishing C1 must still apply A.
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    let serial_b = *client.state.surface_configure_serials.last().unwrap();
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&1));
+    client.xdg_surface.ack_configure(serial_b);
+    client.connection.flush().unwrap();
+    client.queue.roundtrip(&mut client.state).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    client.queue.roundtrip(&mut client.state).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    // C2 is the first surface commit after ACK B and therefore captures B.
+    client.commit_surface(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    drop(client);
+    stop_controllable_test_server(commands, server_thread);
 }
 
 #[test]
@@ -789,17 +950,9 @@ fn delayed_surface_commit_uses_decoration_state_captured_at_commit() {
             .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
-    let initial_decoration_serial = *client.state.surface_configure_serials.last().unwrap();
-    client
-        .commit_configure(&commands, initial_decoration_serial)
-        .unwrap();
-    assert_eq!(capture_native_decoration_count(&commands), 0);
-
-    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
-    client.connection.flush().unwrap();
-    client.pump(&commands).unwrap();
     let serial_a = *client.state.surface_configure_serials.last().unwrap();
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 0);
 
     // ACK A and commit C1. The unsignaled acquire point holds C1 after its
     // decoration context has been captured by wl_surface.commit.
