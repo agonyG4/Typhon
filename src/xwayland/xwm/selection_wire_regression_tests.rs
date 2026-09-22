@@ -449,7 +449,7 @@ fn xfixes_client_close_clears_current_selection_owner() {
 }
 
 #[test]
-fn different_timestamp_pending_conversion_reuses_requestor() {
+fn pending_selection_notify_rotates_requestor_even_when_timestamp_differs() {
     use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
 
     let (mut xwm, mut peer) = test_fixture(generation(123));
@@ -474,12 +474,7 @@ fn different_timestamp_pending_conversion_reuses_requestor() {
     let conversion_b = convert_selection_requests(&requests_b)
         .pop()
         .expect("owner B conversion");
-    assert_eq!(conversion_b.requestor, conversion_a.requestor);
-    assert!(
-        fixture_request_opcodes(&requests_b)
-            .iter()
-            .all(|(opcode, _)| !matches!(*opcode, 1 | 4))
-    );
+    assert_ne!(conversion_b.requestor, conversion_a.requestor);
 
     peer.write_all(&raw_selection_notify(
         conversion_a.requestor,
@@ -559,6 +554,11 @@ fn same_timestamp_pending_conversion_rotates_requestor() {
         .pop()
         .expect("owner B conversion");
     assert_ne!(conversion_a.requestor, conversion_b.requestor);
+    assert!(
+        !xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
 
     peer.write_all(&raw_selection_notify(
         conversion_a.requestor,
@@ -740,6 +740,11 @@ fn owner_clear_with_pending_notify_prevents_requestor_alias() {
         .pop()
         .expect("owner B conversion");
     assert_ne!(conversion_a.requestor, conversion_b.requestor);
+    assert!(
+        !xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
 
     peer.write_all(&raw_selection_notify(
         conversion_a.requestor,
@@ -780,6 +785,63 @@ fn owner_clear_with_pending_notify_prevents_requestor_alias() {
             true,
         )
         .is_some()
+    );
+}
+
+#[test]
+fn awaiting_property_allows_requestor_reuse() {
+    use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
+
+    let (mut xwm, mut peer) = test_fixture(generation(135));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+
+    peer.write_all(&raw_clipboard_owner_event(0x350, 40, 35, 0))
+        .expect("write owner A event");
+    xwm.drain_events(32).expect("start owner A conversion");
+    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner A conversion");
+    peer.write_all(&raw_selection_notify(
+        conversion_a.requestor,
+        conversion_a.selection,
+        conversion_a.target,
+        conversion_a.property,
+        conversion_a.time,
+        1,
+    ))
+    .expect("write owner A SelectionNotify");
+    xwm.drain_events(32).expect("start owner A property read");
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingProperty
+    );
+    let _ = read_fixture_requests(&mut peer);
+
+    peer.write_all(&raw_clipboard_owner_event(0x351, 41, 36, 2))
+        .expect("write owner B event during owner A property read");
+    xwm.drain_events(32)
+        .expect("reuse requestor for owner B after SelectionNotify consumption");
+    let conversion_b = convert_selection_requests(&read_fixture_requests(&mut peer))
+        .pop()
+        .expect("owner B conversion");
+    assert_eq!(conversion_b.requestor, conversion_a.requestor);
+    assert_eq!(
+        xwm.data_bridge
+            .selections
+            .current(SelectionKind::Clipboard)
+            .unwrap()
+            .targets_state,
+        TargetsDiscoveryState::AwaitingSelectionNotify
     );
 }
 
@@ -1274,7 +1336,7 @@ fn selection_owner_replacement_has_a_distinct_stale_reply_identity() {
 }
 
 #[test]
-fn timestamp_distinguished_owner_churn_does_not_exhaust_requestor_windows() {
+fn normal_completed_owner_churn_does_not_exhaust_requestor_windows() {
     let (mut xwm, mut peer) = test_fixture(generation(112));
     install_extension(
         &mut xwm,
@@ -1286,21 +1348,76 @@ fn timestamp_distinguished_owner_churn_does_not_exhaust_requestor_windows() {
 
     let mut created_windows = 0;
     let mut conversions = Vec::new();
-    for index in 0..5_000_u32 {
+    let mut requestor = None;
+    for index in 0..10_000_u32 {
         peer.write_all(&raw_clipboard_owner_event(
             0x400 + index,
             100 + index,
             50 + index,
-            index as u16,
+            (index * 2) as u16,
         ))
         .expect("write owner replacement event");
         xwm.drain_events(8)
-            .expect("process bounded owner replacement");
+            .expect("process completed owner replacement");
         let requests = read_fixture_requests(&mut peer);
         for (opcode, _) in fixture_request_opcodes(&requests) {
             created_windows += usize::from(opcode == 1);
         }
-        conversions.extend(convert_selection_requests(&requests));
+        let conversion = convert_selection_requests(&requests)
+            .pop()
+            .expect("owner TARGETS conversion");
+        if let Some(previous_requestor) = requestor {
+            assert_eq!(conversion.requestor, previous_requestor);
+        } else {
+            requestor = Some(conversion.requestor);
+        }
+
+        peer.write_all(&raw_selection_notify(
+            conversion.requestor,
+            conversion.selection,
+            conversion.target,
+            conversion.property,
+            conversion.time,
+            (index * 2 + 1) as u16,
+        ))
+        .expect("write matching SelectionNotify");
+        xwm.drain_events(8)
+            .expect("start completed TARGETS property read");
+        let property_sequence = super::super::selection_wire::pending_sequence_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+            true,
+        )
+        .expect("TARGETS property sequence");
+        let property_requests = read_fixture_requests(&mut peer);
+        assert!(
+            fixture_request_opcodes(&property_requests)
+                .iter()
+                .all(|(opcode, _)| !matches!(*opcode, 1 | 4))
+        );
+
+        peer.write_all(&raw_get_property_reply(
+            property_sequence as u16,
+            u32::from(xproto::AtomEnum::ATOM),
+            &[TEST_TARGETS_ATOM],
+        ))
+        .expect("write matching TARGETS property reply");
+        let drain = xwm
+            .drain_events(32)
+            .expect("resolve completed TARGETS property read");
+        assert!(
+            drain.selection_replies_processed > 0,
+            "matching property reply was not processed: {drain:?}"
+        );
+        assert_eq!(
+            xwm.data_bridge
+                .selections
+                .current(super::super::data_bridge::SelectionKind::Clipboard)
+                .expect("current CLIPBOARD state")
+                .targets_state,
+            super::super::data_bridge::selection::TargetsDiscoveryState::Resolved
+        );
+        conversions.push(conversion);
     }
 
     let selection = xwm
@@ -1309,16 +1426,16 @@ fn timestamp_distinguished_owner_churn_does_not_exhaust_requestor_windows() {
         .current(super::super::data_bridge::SelectionKind::Clipboard)
         .expect("current CLIPBOARD wire state");
     assert_eq!(created_windows, 0);
-    assert_eq!(conversions.len(), 5_000);
+    assert_eq!(conversions.len(), 10_000);
     assert!(
         conversions
             .iter()
             .all(|request| request.requestor == TEST_CLIPBOARD_REQUESTOR_WINDOW)
     );
-    assert_eq!(selection.owner, Some(0x400 + 4_999));
+    assert_eq!(selection.owner, Some(0x400 + 9_999));
     assert_eq!(
         selection.targets_state,
-        super::super::data_bridge::selection::TargetsDiscoveryState::AwaitingSelectionNotify
+        super::super::data_bridge::selection::TargetsDiscoveryState::Resolved
     );
     assert!(super::super::selection_wire::is_internal_window(
         TEST_CLIPBOARD_REQUESTOR_WINDOW,
@@ -1328,7 +1445,7 @@ fn timestamp_distinguished_owner_churn_does_not_exhaust_requestor_windows() {
 }
 
 #[test]
-fn rotation_bound_failure_recovers_on_distinguishable_timestamp() {
+fn rotation_bound_poison_blocks_distinguishable_timestamp_reuse() {
     use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
 
     let (mut xwm, mut peer) = test_fixture(generation(125));
@@ -1342,9 +1459,7 @@ fn rotation_bound_failure_recovers_on_distinguishable_timestamp() {
     peer.write_all(&raw_clipboard_owner_event(0x335, 40, 500, 0))
         .expect("write owner A event");
     xwm.drain_events(32).expect("start owner A conversion");
-    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
-        .pop()
-        .expect("owner A conversion");
+    let _ = convert_selection_requests(&read_fixture_requests(&mut peer));
     xwm.data_bridge
         .selection_wire
         .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
@@ -1371,65 +1486,25 @@ fn rotation_bound_failure_recovers_on_distinguishable_timestamp() {
     peer.write_all(&raw_clipboard_owner_event(0x337, 42, 501, 2))
         .expect("write owner C event with a distinguishable timestamp");
     xwm.drain_events(32)
-        .expect("recover using the existing requestor");
-    let conversion_c = convert_selection_requests(&read_fixture_requests(&mut peer))
-        .pop()
-        .expect("owner C conversion after bound exhaustion");
-    assert_eq!(conversion_c.requestor, conversion_a.requestor);
-    assert_eq!(conversion_c.time, 501);
+        .expect("keep the contaminated requestor blocked");
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
     assert_eq!(
         xwm.data_bridge
             .selections
             .current(SelectionKind::Clipboard)
             .unwrap()
             .targets_state,
-        TargetsDiscoveryState::AwaitingSelectionNotify
+        TargetsDiscoveryState::Failed
     );
-
-    peer.write_all(&raw_selection_notify(
-        conversion_a.requestor,
-        conversion_a.selection,
-        conversion_a.target,
-        conversion_a.property,
-        conversion_a.time,
-        3,
-    ))
-    .expect("write old owner A SelectionNotify");
-    xwm.drain_events(32)
-        .expect("reject owner A by timestamp after recovery");
-    assert!(read_fixture_requests(&mut peer).is_empty());
-    assert_eq!(
-        xwm.data_bridge
-            .selections
-            .current(SelectionKind::Clipboard)
-            .unwrap()
-            .targets_state,
-        TargetsDiscoveryState::AwaitingSelectionNotify
-    );
-
-    peer.write_all(&raw_selection_notify(
-        conversion_c.requestor,
-        conversion_c.selection,
-        conversion_c.target,
-        conversion_c.property,
-        conversion_c.time,
-        4,
-    ))
-    .expect("write matching owner C SelectionNotify");
-    xwm.drain_events(32)
-        .expect("continue owner C property discovery");
     assert!(
-        super::super::selection_wire::pending_sequence_for_test(
-            &xwm,
-            SelectionKind::Clipboard,
-            true,
-        )
-        .is_some()
+        xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
 }
 
 #[test]
-fn rotation_bound_same_timestamp_revision_remains_quarantined() {
+fn rotation_bound_poison_blocks_same_timestamp_reuse() {
     use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
     let (mut xwm, mut peer) = test_fixture(generation(128));
     install_extension(
@@ -1483,10 +1558,15 @@ fn rotation_bound_same_timestamp_revision_remains_quarantined() {
             .targets_state,
         TargetsDiscoveryState::Failed
     );
+    assert!(
+        xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
 }
 
 #[test]
-fn rotation_bound_owner_clear_preserves_requestor_hazard() {
+fn rotation_bound_poison_survives_owner_none() {
     use super::super::data_bridge::{SelectionKind, selection::TargetsDiscoveryState};
     let (mut xwm, mut peer) = test_fixture(generation(129));
     install_extension(
@@ -1556,10 +1636,15 @@ fn rotation_bound_owner_clear_preserves_requestor_hazard() {
             .targets_state,
         TargetsDiscoveryState::Failed
     );
+    assert!(
+        xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
 }
 
 #[test]
-fn rotation_bound_repeated_ambiguous_revisions_stay_bounded() {
+fn unresolved_owner_churn_is_bounded_after_poison() {
     use super::super::data_bridge::SelectionKind;
     let (mut xwm, mut peer) = test_fixture(generation(130));
     install_extension(
@@ -1593,16 +1678,15 @@ fn rotation_bound_repeated_ambiguous_revisions_stay_bounded() {
                 .all(|(opcode, _)| !matches!(*opcode, 1 | 4))
         );
     }
-    assert_eq!(
+    assert!(
         xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
-        Some(500)
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
 }
 
 #[test]
-fn rotation_bound_zero_timestamp_stays_quarantined_until_recovery() {
+fn rotation_bound_poison_blocks_zero_timestamp_reuse() {
     use super::super::data_bridge::SelectionKind;
     let (mut xwm, mut peer) = test_fixture(generation(131));
     install_extension(
@@ -1615,9 +1699,7 @@ fn rotation_bound_zero_timestamp_stays_quarantined_until_recovery() {
     peer.write_all(&raw_clipboard_owner_event(0x366, 40, 500, 0))
         .unwrap();
     xwm.drain_events(32).unwrap();
-    let conversion_a = convert_selection_requests(&read_fixture_requests(&mut peer))
-        .pop()
-        .unwrap();
+    let _ = convert_selection_requests(&read_fixture_requests(&mut peer));
     xwm.data_bridge
         .selection_wire
         .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
@@ -1625,24 +1707,19 @@ fn rotation_bound_zero_timestamp_stays_quarantined_until_recovery() {
         .unwrap();
     xwm.drain_events(32).unwrap();
     assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
-    peer.write_all(&raw_clipboard_owner_event(0x368, 42, 501, 2))
+    peer.write_all(&raw_clipboard_owner_event(0x368, 42, 0, 2))
         .unwrap();
     xwm.drain_events(32).unwrap();
-    let conversion_c = convert_selection_requests(&read_fixture_requests(&mut peer))
-        .pop()
-        .unwrap();
-    assert_eq!(conversion_c.requestor, conversion_a.requestor);
-    assert_eq!(conversion_c.time, 501);
-    assert_eq!(
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    assert!(
         xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
-        None
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
 }
 
 #[test]
-fn requestor_hazard_isolated_between_clipboard_and_primary() {
+fn poisoned_clipboard_does_not_block_primary() {
     use super::super::data_bridge::SelectionKind;
     let (mut xwm, mut peer) = test_fixture(generation(132));
     install_extension(
@@ -1678,22 +1755,20 @@ fn requestor_hazard_isolated_between_clipboard_and_primary() {
         .unwrap();
     assert_eq!(primary.selection, TEST_PRIMARY_ATOM);
     assert_eq!(primary.requestor, TEST_PRIMARY_REQUESTOR_WINDOW);
-    assert_eq!(
+    assert!(
         xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
-        Some(500)
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
-    assert_eq!(
-        xwm.data_bridge
+    assert!(
+        !xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Primary),
-        None
+            .requestor_poisoned_for_test(SelectionKind::Primary)
     );
 }
 
 #[test]
-fn internal_owner_does_not_erase_requestor_hazard() {
+fn internal_owner_does_not_erase_requestor_poison() {
     use super::super::data_bridge::{
         SelectionKind, SelectionOrigin, selection::TargetsDiscoveryState,
     };
@@ -1732,16 +1807,72 @@ fn internal_owner_does_not_erase_requestor_hazard() {
         .unwrap();
     assert_eq!(selection.origin, Some(SelectionOrigin::Wayland));
     assert_eq!(selection.targets_state, TargetsDiscoveryState::Inactive);
-    assert_eq!(
+    assert!(
         xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
-        Some(500)
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
 }
 
 #[test]
-fn generation_teardown_clears_requestor_hazard() {
+fn successful_requestor_replacement_clears_poison() {
+    use super::super::data_bridge::SelectionKind;
+
+    let (mut xwm, mut peer) = test_fixture(generation(138));
+    install_extension(
+        &mut xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x370, 40, 500, 0))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+
+    peer.write_all(&raw_clipboard_owner_event(
+        TEST_CLIPBOARD_REQUESTOR_WINDOW,
+        41,
+        501,
+        1,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    assert!(convert_selection_requests(&read_fixture_requests(&mut peer)).is_empty());
+    assert!(
+        xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
+
+    peer.write_all(&raw_xfixes_selection_event(
+        TEST_CLIPBOARD_ATOM,
+        TEST_CLIPBOARD_OBSERVER_WINDOW,
+        xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+        0,
+        42,
+        501,
+        2,
+    ))
+    .unwrap();
+    xwm.drain_events(32).unwrap();
+    xwm.flush().unwrap();
+    let requests = read_fixture_requests(&mut peer);
+    assert!(
+        fixture_request_opcodes(&requests)
+            .iter()
+            .any(|(opcode, _)| *opcode == 1)
+    );
+    assert!(
+        !xwm.data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
+}
+
+#[test]
+fn generation_teardown_clears_requestor_poison() {
     use super::super::data_bridge::SelectionKind;
     let generation = generation(134);
     let (mut xwm, mut peer) = test_fixture(generation);
@@ -1763,18 +1894,63 @@ fn generation_teardown_clears_requestor_hazard() {
         .unwrap();
     xwm.drain_events(32).unwrap();
     let _ = read_fixture_requests(&mut peer);
-    assert_eq!(
+    assert!(
         xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
-        Some(500)
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
     xwm.clear_generation(generation);
-    assert_eq!(
-        xwm.data_bridge
+    assert!(
+        !xwm.data_bridge
             .selection_wire
-            .stale_notify_hazard_for_test(SelectionKind::Clipboard),
-        None
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
     );
     assert!(!xwm.data_bridge.selection_wire.is_active());
+}
+
+#[test]
+fn new_generation_starts_with_clean_requestors() {
+    use super::super::data_bridge::SelectionKind;
+
+    let old_generation = generation(136);
+    let (mut old_xwm, mut peer) = test_fixture(old_generation);
+    install_extension(
+        &mut old_xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    peer.write_all(&raw_clipboard_owner_event(0x370, 40, 500, 0))
+        .unwrap();
+    old_xwm.drain_events(32).unwrap();
+    let _ = read_fixture_requests(&mut peer);
+    old_xwm
+        .data_bridge
+        .selection_wire
+        .exhaust_requestor_window_budget_for_test(SelectionKind::Clipboard);
+    peer.write_all(&raw_clipboard_owner_event(0x371, 41, 500, 1))
+        .unwrap();
+    old_xwm.drain_events(32).unwrap();
+    assert!(
+        old_xwm
+            .data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
+    old_xwm.clear_generation(old_generation);
+
+    let (new_xwm, _peer) = test_fixture(generation(137));
+    assert!(
+        !new_xwm
+            .data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Clipboard)
+    );
+    assert!(
+        !new_xwm
+            .data_bridge
+            .selection_wire
+            .requestor_poisoned_for_test(SelectionKind::Primary)
+    );
 }

@@ -35,8 +35,9 @@ const TARGETS_PROPERTY_ITEMS: u32 =
     (super::data_bridge::selection::MAX_SELECTION_TARGETS + 1) as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectionNotifyHazard {
-    timestamp: u32,
+enum RequestorSafety {
+    Clean,
+    Poisoned,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,7 +45,7 @@ struct SelectionWindows {
     observer: Window,
     requestor: Option<Window>,
     requestor_windows_created: usize,
-    stale_notify_hazard: Option<SelectionNotifyHazard>,
+    requestor_safety: RequestorSafety,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,7 +95,7 @@ impl SelectionWireState {
         if let Some(windows) = self.windows.get_mut(&kind) {
             windows.requestor = Some(requestor);
             windows.requestor_windows_created += 1;
-            windows.stale_notify_hazard = None;
+            windows.requestor_safety = RequestorSafety::Clean;
             debug_assert!(
                 windows.requestor_windows_created <= MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
             );
@@ -106,24 +107,12 @@ impl SelectionWireState {
         self.debug_assert_invariants();
     }
 
-    fn quarantine_requestor(&mut self, kind: SelectionKind, timestamp: u32) {
+    fn poison_requestor(&mut self, kind: SelectionKind) {
         let Some(windows) = self.windows.get_mut(&kind) else {
             return;
         };
         debug_assert!(windows.requestor.is_some());
-        debug_assert!(
-            windows
-                .stale_notify_hazard
-                .is_none_or(|hazard| hazard.timestamp == timestamp)
-        );
-        windows.stale_notify_hazard = Some(SelectionNotifyHazard { timestamp });
-        self.debug_assert_invariants();
-    }
-
-    fn clear_requestor_hazard(&mut self, kind: SelectionKind) {
-        if let Some(windows) = self.windows.get_mut(&kind) {
-            windows.stale_notify_hazard = None;
-        }
+        windows.requestor_safety = RequestorSafety::Poisoned;
         self.debug_assert_invariants();
     }
 
@@ -163,7 +152,7 @@ impl SelectionWireState {
                 observer: clipboard_observer,
                 requestor: Some(clipboard_requestor),
                 requestor_windows_created: 1,
-                stale_notify_hazard: None,
+                requestor_safety: RequestorSafety::Clean,
             },
         );
         for window in [clipboard_observer, clipboard_requestor] {
@@ -175,7 +164,7 @@ impl SelectionWireState {
                 observer: primary_observer,
                 requestor: Some(primary_requestor),
                 requestor_windows_created: 1,
-                stale_notify_hazard: None,
+                requestor_safety: RequestorSafety::Clean,
             },
         );
         for window in [primary_observer, primary_requestor] {
@@ -210,16 +199,18 @@ impl SelectionWireState {
     }
 
     #[cfg(test)]
-    pub(crate) fn stale_notify_hazard_for_test(&self, kind: SelectionKind) -> Option<u32> {
+    pub(crate) fn requestor_poisoned_for_test(&self, kind: SelectionKind) -> bool {
         self.windows
             .get(&kind)
-            .and_then(|windows| windows.stale_notify_hazard)
-            .map(|hazard| hazard.timestamp)
+            .is_some_and(|windows| windows.requestor_safety == RequestorSafety::Poisoned)
     }
 
     fn debug_assert_invariants(&self) {
         debug_assert!(self.windows.values().all(|windows| {
-            windows.stale_notify_hazard.is_none() || windows.requestor.is_some()
+            windows.requestor.is_some() || windows.requestor_safety == RequestorSafety::Clean
+        }));
+        debug_assert!(self.windows.values().all(|windows| {
+            windows.requestor_windows_created <= MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
         }));
     }
 }
@@ -267,7 +258,7 @@ pub(crate) fn initialize(xwm: &mut Xwm) -> Result<(), XwmError> {
                 observer,
                 requestor: Some(requestor),
                 requestor_windows_created: 1,
-                stale_notify_hazard: None,
+                requestor_safety: RequestorSafety::Clean,
             },
         );
         xwm.data_bridge
@@ -420,12 +411,30 @@ fn replace_requestor(xwm: &mut Xwm, kind: SelectionKind) -> Result<bool, XwmErro
 }
 
 fn start_targets_conversion(xwm: &mut Xwm, identity: SelectionIdentity) -> Result<(), XwmError> {
-    let Some(requestor) = xwm.data_bridge.selection_wire.requestor(identity.kind) else {
+    let Some(windows) = xwm
+        .data_bridge
+        .selection_wire
+        .windows
+        .get(&identity.kind)
+        .copied()
+    else {
         xwm.data_bridge
             .selections
             .mark_discovery_state(identity, TargetsDiscoveryState::Failed);
         return Ok(());
     };
+    let Some(requestor) = windows.requestor else {
+        xwm.data_bridge
+            .selections
+            .mark_discovery_state(identity, TargetsDiscoveryState::Failed);
+        return Ok(());
+    };
+    if windows.requestor_safety == RequestorSafety::Poisoned {
+        xwm.data_bridge
+            .selections
+            .mark_discovery_state(identity, TargetsDiscoveryState::Failed);
+        return Ok(());
+    }
     if !xwm
         .data_bridge
         .selections
@@ -460,21 +469,16 @@ enum RequestorPlan {
     Blocked,
 }
 
-fn requestor_rotation_required(
-    prior: Option<&SelectionSnapshot>,
-    hazard: Option<SelectionNotifyHazard>,
-    next_timestamp: u32,
-) -> bool {
-    prior.is_some_and(|prior| {
-        prior.targets_state == TargetsDiscoveryState::AwaitingSelectionNotify
-            && (next_timestamp == 0 || next_timestamp == prior.timestamp)
-    }) || hazard.is_some_and(|hazard| next_timestamp == 0 || next_timestamp == hazard.timestamp)
+fn requestor_rotation_required(prior: Option<&SelectionSnapshot>, safety: RequestorSafety) -> bool {
+    safety == RequestorSafety::Poisoned
+        || prior.is_some_and(|prior| {
+            prior.targets_state == TargetsDiscoveryState::AwaitingSelectionNotify
+        })
 }
 
 fn requestor_plan(
     windows: Option<SelectionWindows>,
     prior: Option<&SelectionSnapshot>,
-    next_timestamp: u32,
     owner_is_requestor: bool,
 ) -> RequestorPlan {
     let Some(windows) = windows else {
@@ -483,7 +487,7 @@ fn requestor_plan(
     if windows.requestor.is_none() {
         return RequestorPlan::Blocked;
     }
-    if !requestor_rotation_required(prior, windows.stale_notify_hazard, next_timestamp) {
+    if !requestor_rotation_required(prior, windows.requestor_safety) {
         return RequestorPlan::Reuse;
     }
     if owner_is_requestor {
@@ -491,12 +495,6 @@ fn requestor_plan(
     } else {
         RequestorPlan::Rotate
     }
-}
-
-fn prior_notify_timestamp(prior: Option<&SelectionSnapshot>) -> Option<u32> {
-    prior
-        .filter(|prior| prior.targets_state == TargetsDiscoveryState::AwaitingSelectionNotify)
-        .map(|prior| prior.timestamp)
 }
 
 pub(crate) fn selection_notify(
@@ -768,7 +766,6 @@ fn apply_owner_transition(
     let plan = requestor_plan(
         xwm.data_bridge.selection_wire.windows.get(&kind).copied(),
         prior.as_ref(),
-        timestamp,
         owner_is_requestor,
     );
     let requestor_ready = match plan {
@@ -776,20 +773,12 @@ fn apply_owner_transition(
         RequestorPlan::Rotate => {
             let replaced = replace_requestor(xwm, kind)?;
             if !replaced {
-                if let Some(timestamp) = prior_notify_timestamp(prior.as_ref()) {
-                    xwm.data_bridge
-                        .selection_wire
-                        .quarantine_requestor(kind, timestamp);
-                }
+                xwm.data_bridge.selection_wire.poison_requestor(kind);
             }
             replaced
         }
         RequestorPlan::Blocked => {
-            if let Some(timestamp) = prior_notify_timestamp(prior.as_ref()) {
-                xwm.data_bridge
-                    .selection_wire
-                    .quarantine_requestor(kind, timestamp);
-            }
+            xwm.data_bridge.selection_wire.poison_requestor(kind);
             false
         }
     };
@@ -815,9 +804,6 @@ fn apply_owner_transition(
             .selections
             .mark_discovery_state(identity, TargetsDiscoveryState::Failed);
         return Ok(());
-    }
-    if plan == RequestorPlan::Reuse {
-        xwm.data_bridge.selection_wire.clear_requestor_hazard(kind);
     }
     start_targets_conversion(xwm, identity)
 }
