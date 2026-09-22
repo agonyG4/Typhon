@@ -910,7 +910,11 @@ impl CompositorState {
         if self.x11_resize_interaction_active(handle) {
             return promoted;
         }
-        if local_resize_followup_pending {
+        if local_resize_followup_pending && !active.superseded_by_move {
+            // A queued local final keeps an ordinary resize epoch alive so
+            // that its strict finalization can still be translated. A move
+            // has superseded that final, so retire the old context and let
+            // the queued move fall back to ConfigureFrame.
             return promoted;
         }
         if fallback_geometry.is_some() && !active.superseded_by_move && !promoted {

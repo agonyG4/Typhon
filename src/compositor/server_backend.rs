@@ -13,6 +13,7 @@ fn trace_x11_resize_backend_command(
     current_resize_epoch: Option<u64>,
     geometry: X11Geometry,
     reason: &'static str,
+    translation: Option<&'static str>,
 ) {
     trace::emit("xwayland_resize_backend_command", || {
         TraceFields::new()
@@ -24,6 +25,7 @@ fn trace_x11_resize_backend_command(
             .optional("current_resize_epoch", current_resize_epoch)
             .field("geometry", format!("{geometry:?}"))
             .field("reason", reason)
+            .optional("translation", translation)
     });
 }
 
@@ -166,32 +168,24 @@ impl OwnCompositorServer {
                         height: geometry.height,
                     };
                     let current_resize_epoch = self.state.x11_resize_interaction_epoch(handle);
-                    if (resizing && resize_epoch.is_none())
-                        || resize_epoch.is_some_and(|epoch| {
-                            current_resize_epoch != Some(epoch)
-                        })
-                    {
-                        trace_x11_resize_backend_command(
-                            handle,
-                            if resizing {
-                                "intermediate_configure"
-                            } else {
-                                "position_only_configure"
-                            },
-                            "discarded",
-                            resize_epoch,
-                            current_resize_epoch,
-                            x11_geometry,
-                            if resize_epoch.is_none() {
-                                "missing_enqueue_epoch"
-                            } else {
-                                "resize_epoch_superseded"
-                            },
-                        );
-                        return None;
-                    }
-                    let position_only = !resizing && resize_epoch.is_some();
                     if resizing {
+                        if resize_epoch.is_none() || current_resize_epoch != resize_epoch {
+                            trace_x11_resize_backend_command(
+                                handle,
+                                "intermediate_configure",
+                                "discarded",
+                                resize_epoch,
+                                current_resize_epoch,
+                                x11_geometry,
+                                if resize_epoch.is_none() {
+                                    "missing_enqueue_epoch"
+                                } else {
+                                    "resize_epoch_superseded"
+                                },
+                                None,
+                            );
+                            return None;
+                        }
                         trace_x11_resize_backend_command(
                             handle,
                             "intermediate_configure",
@@ -200,43 +194,79 @@ impl OwnCompositorServer {
                             current_resize_epoch,
                             x11_geometry,
                             "resize_epoch_matches",
+                            Some("begin_resize_sync"),
                         );
-                        Some(XwmCommand::BeginResizeSync {
+                        return Some(XwmCommand::BeginResizeSync {
                             window: handle,
                             geometry: x11_geometry,
                             counter_value: 0,
                             deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                             final_pending: false,
                             resize_epoch,
-                        })
-                    } else if position_only {
-                        trace_x11_resize_backend_command(
-                            handle,
-                            "position_only_configure",
-                            "translated",
-                            resize_epoch,
-                            current_resize_epoch,
-                            x11_geometry,
-                            "resize_epoch_matches",
-                        );
-                        Some(XwmCommand::Configure {
-                            window: handle,
-                            geometry: x11_geometry,
-                            fields: crate::xwayland::xwm::X11ConfigureFlags {
-                                x: true,
-                                y: true,
-                                ..Default::default()
-                            },
-                            source: ConfigureSource::Compositor,
-                            border_width: 0,
-                            resize_epoch,
-                        })
-                    } else {
-                        Some(XwmCommand::ConfigureFrame {
+                        });
+                    }
+                    match (resize_epoch, current_resize_epoch) {
+                        (None, _) => Some(XwmCommand::ConfigureFrame {
                             window: handle,
                             geometry: x11_geometry,
                             frame_extents: self.state.x11_decoration_frame_extents(handle),
-                        })
+                        }),
+                        (Some(stored_epoch), Some(current_epoch))
+                            if stored_epoch == current_epoch =>
+                        {
+                            trace_x11_resize_backend_command(
+                                handle,
+                                "position_only_configure",
+                                "translated",
+                                Some(stored_epoch),
+                                Some(current_epoch),
+                                x11_geometry,
+                                "resize_epoch_matches",
+                                Some("configure"),
+                            );
+                            Some(XwmCommand::Configure {
+                                window: handle,
+                                geometry: x11_geometry,
+                                fields: crate::xwayland::xwm::X11ConfigureFlags {
+                                    x: true,
+                                    y: true,
+                                    ..Default::default()
+                                },
+                                source: ConfigureSource::Compositor,
+                                border_width: 0,
+                                resize_epoch: Some(stored_epoch),
+                            })
+                        }
+                        (Some(stored_epoch), None) => {
+                            trace_x11_resize_backend_command(
+                                handle,
+                                "position_only_configure",
+                                "translated",
+                                Some(stored_epoch),
+                                None,
+                                x11_geometry,
+                                "resize_context_retired",
+                                Some("configure_frame"),
+                            );
+                            Some(XwmCommand::ConfigureFrame {
+                                window: handle,
+                                geometry: x11_geometry,
+                                frame_extents: self.state.x11_decoration_frame_extents(handle),
+                            })
+                        }
+                        (Some(stored_epoch), Some(current_epoch)) => {
+                            trace_x11_resize_backend_command(
+                                handle,
+                                "position_only_configure",
+                                "discarded",
+                                Some(stored_epoch),
+                                Some(current_epoch),
+                                x11_geometry,
+                                "newer_resize_epoch_superseded",
+                                None,
+                            );
+                            None
+                        }
                     }
                 }
                 crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
@@ -271,6 +301,7 @@ impl OwnCompositorServer {
                             } else {
                                 "resize_epoch_superseded"
                             },
+                            None,
                         );
                         return None;
                     }
@@ -282,6 +313,7 @@ impl OwnCompositorServer {
                         current_resize_epoch,
                         x11_geometry,
                         "resize_epoch_matches",
+                        Some("begin_resize_sync"),
                     );
                     Some(XwmCommand::BeginResizeSync {
                         window: handle,
