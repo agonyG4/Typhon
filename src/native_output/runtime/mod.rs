@@ -105,6 +105,8 @@ mod presentation;
 mod presentation_cursor;
 mod presentation_cycle;
 #[cfg(test)]
+mod presented_frame_publication_tests;
+#[cfg(test)]
 pub(crate) use presentation_cycle::{admit_repaint_visual_work, primary_redraw_requested};
 #[cfg(test)]
 mod presentation_cycle_tests;

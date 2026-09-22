@@ -76,12 +76,13 @@ use super::{
     FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
     InteractionUpdateOutcome, OutputId, OutputPosition, OutputRect, PendingProcessLaunch,
     PointerAxisFrame, PointerConstraintTransitionSnapshot, PresentationClock,
-    PresentationProtocolCapabilities, ProtocolOnlyCompletion, RenderGenerationCause,
-    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
-    SubsurfaceTransactionMetrics, SurfaceDamagePresentation, SurfacePacingMetrics,
-    SurfacePipelineEvent, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
-    WindowFocusReason, WindowId, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
-    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
+    PresentationProtocolCapabilities, PresentedFramePublication, ProtocolOnlyCompletion,
+    RenderGenerationCause, RendererProtocolCapabilities, ResizeFlowMetrics,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
+    SurfacePacingMetrics, SurfacePipelineEvent, SurfacePresentationMetadata,
+    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowId,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
         ResolvedPointerConstraintBackendRequest,
@@ -1233,6 +1234,7 @@ impl OwnCompositorServer {
         self.state.lifecycle_frame_snapshot_at(at)
     }
 
+    #[cfg(test)]
     pub fn publish_presented_lifecycle(
         &mut self,
         frame_id: u64,
@@ -1241,6 +1243,11 @@ impl OwnCompositorServer {
         self.state.publish_presented_lifecycle(frame_id, snapshot);
     }
 
+    pub fn publish_presented_frame(&mut self, publication: PresentedFramePublication<'_>) {
+        self.state.publish_presented_frame(publication);
+    }
+
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn publish_presented_lifecycle_for_scene(
         &mut self,
@@ -1258,6 +1265,13 @@ impl OwnCompositorServer {
 
     pub fn presented_lifecycle_frame_id(&self) -> u64 {
         self.state.presented_lifecycle_frame_id()
+    }
+
+    #[doc(hidden)]
+    pub fn presented_lifecycle_snapshot_for_test(
+        &self,
+    ) -> &crate::window_lifecycle_animation::LifecycleFrameSnapshot {
+        &self.state.presented_lifecycle
     }
 
     pub fn set_lifecycle_animation_renderer_available(&mut self, available: bool) {
@@ -1346,8 +1360,12 @@ impl OwnCompositorServer {
                 &lifecycle_sample,
                 &evidence,
             );
-        self.publish_presented_presentation(frame_id, &snapshot);
-        self.publish_presented_lifecycle(frame_id, &lifecycle);
+        self.publish_presented_frame(PresentedFramePublication {
+            frame_id,
+            presentation: &snapshot,
+            lifecycle: &lifecycle,
+            lifecycle_scene: super::PresentedLifecycleScene::Initial,
+        });
     }
 
     pub fn presentation_scene_sample_at(&self, at: AnimationTime) -> PresentationSceneSample {
@@ -1461,6 +1479,12 @@ impl OwnCompositorServer {
         self.state.presented_presentation_frame_id()
     }
 
+    #[doc(hidden)]
+    pub fn presented_presentation_snapshot_for_test(&self) -> Option<&PresentationFrameSnapshot> {
+        self.state.presented_presentation.as_ref()
+    }
+
+    #[cfg(test)]
     pub fn publish_presented_presentation(
         &mut self,
         frame_id: u64,

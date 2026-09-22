@@ -19,7 +19,7 @@ use crate::native_output::kms_worker::{
 use crate::native_output::presentation::plane::{
     CursorRevision, CursorSource, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
 };
-use oblivion_one::compositor::AnimationTime;
+use oblivion_one::compositor::{AnimationTime, PresentedFramePublication, PresentedLifecycleScene};
 use oblivion_one::native::kms::FramebufferId;
 
 #[expect(
@@ -413,20 +413,7 @@ pub(super) fn promote_pageflip_and_publish(
     if !scene_history.promote_pageflip(token) {
         return false;
     }
-    if let Some(snapshot) = scene_history.presented_snapshot() {
-        server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
-        let canonical_root_surface_ids = snapshot
-            .scene
-            .surfaces
-            .iter()
-            .map(|surface| surface.visual_root_surface_id)
-            .collect::<Vec<_>>();
-        server.publish_presented_lifecycle_for_scene(
-            snapshot.frame_id,
-            &snapshot.lifecycle,
-            &canonical_root_surface_ids,
-        );
-    }
+    publish_promoted_frame(scene_history, server);
     true
 }
 
@@ -437,21 +424,28 @@ pub(super) fn promote_immediate_and_publish(
     if !scene_history.promote_immediate() {
         return false;
     }
-    if let Some(snapshot) = scene_history.presented_snapshot() {
-        server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
-        let canonical_root_surface_ids = snapshot
-            .scene
-            .surfaces
-            .iter()
-            .map(|surface| surface.visual_root_surface_id)
-            .collect::<Vec<_>>();
-        server.publish_presented_lifecycle_for_scene(
-            snapshot.frame_id,
-            &snapshot.lifecycle,
-            &canonical_root_surface_ids,
-        );
-    }
+    publish_promoted_frame(scene_history, server);
     true
+}
+
+fn publish_promoted_frame(scene_history: &NativeSceneHistory, server: &mut OwnCompositorServer) {
+    let Some(snapshot) = scene_history.presented_snapshot() else {
+        return;
+    };
+    let canonical_root_surface_ids = snapshot
+        .scene
+        .surfaces
+        .iter()
+        .map(|surface| surface.visual_root_surface_id)
+        .collect::<Vec<_>>();
+    server.publish_presented_frame(PresentedFramePublication {
+        frame_id: snapshot.frame_id,
+        presentation: &snapshot.presentation,
+        lifecycle: &snapshot.lifecycle,
+        lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
+            canonical_root_surface_ids: &canonical_root_surface_ids,
+        },
+    });
 }
 
 pub(super) fn can_queue_worker_primary(

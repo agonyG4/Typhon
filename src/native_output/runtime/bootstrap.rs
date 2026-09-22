@@ -1,9 +1,11 @@
 use super::kms_worker_startup::start_kms_commit_worker;
 use super::*;
 use crate::native_output::kms_worker::{KmsCommitWorkerHandle, KmsCommitWorkerPolicy};
-use oblivion_one::compositor::KeyboardConfig;
 use oblivion_one::compositor::gpu_protocol_capabilities::{
     GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
+};
+use oblivion_one::compositor::{
+    KeyboardConfig, PresentedFramePublication, PresentedLifecycleScene,
 };
 use oblivion_one::control_snapshots::KeyboardConfigurationPersistence;
 use oblivion_one::cursor_manager::{CursorThemeManager, SystemCursorThemeLoader};
@@ -578,14 +580,12 @@ impl NativeRuntime {
             .map_or(0, NativeAtomicCursor::desired_epoch);
         let last_primary_presented_at_ns = None;
         let cursor_output_arbitration = NativeCursorOutputArbitration::default();
-        server.publish_presented_presentation(
-            initial_presented_scene.frame_id,
-            &initial_presented_scene.presentation,
-        );
-        server.publish_presented_lifecycle(
-            initial_presented_scene.frame_id,
-            &initial_presented_scene.lifecycle,
-        );
+        server.publish_presented_frame(PresentedFramePublication {
+            frame_id: initial_presented_scene.frame_id,
+            presentation: &initial_presented_scene.presentation,
+            lifecycle: &initial_presented_scene.lifecycle,
+            lifecycle_scene: PresentedLifecycleScene::Initial,
+        });
         let scene_history = NativeSceneHistory::new(initial_presented_scene);
         let last_client_cursor_damage = None;
         let last_software_cursor_damage = None;

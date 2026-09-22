@@ -98,6 +98,7 @@ mod popup;
 mod presentation;
 mod presentation_coverage;
 mod presentation_modes;
+mod presented_frame;
 mod protocol_error_trace;
 mod protocols;
 mod surface_pipeline_trace;
@@ -1213,6 +1214,7 @@ mod clipboard_state;
 use clipboard_state::*;
 use clipboard_state::{DataDeviceData, DataSourceData};
 mod state;
+pub use presented_frame::{PresentedFramePublication, PresentedLifecycleScene};
 use state::*;
 #[cfg(test)]
 mod tests;
