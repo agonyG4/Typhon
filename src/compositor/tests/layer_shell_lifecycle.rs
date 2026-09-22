@@ -1,8 +1,21 @@
 use super::*;
-use crate::window_lifecycle_animation::{
-    LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
-    LifecycleVisualGroup,
+use crate::core::SceneNodeId;
+use crate::presentation_animation::{
+    PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
+    PresentationTransactionId,
 };
+use crate::window_lifecycle_animation::{
+    LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleVisualGroup,
+};
+
+fn identity_for_test(window_id: WindowId) -> PresentationRetainedVisualIdentity {
+    PresentationRetainedVisualIdentity::new(
+        SceneNodeId::from_raw(window_id.get()).expect("test scene node"),
+        PresentationRetainedVisualKind::WindowLifecycle,
+        PresentationTransactionId::from_raw(1).expect("test transaction id"),
+        PresentationRevisionId::from_raw(1).expect("test revision id"),
+    )
+}
 
 fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
     let visual_group = LifecycleVisualGroup::from_bounds(
@@ -19,7 +32,7 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
         lamps: vec![LampWindowSample {
             window_id: WindowId::from_raw(1).unwrap(),
             root_surface_id: 901,
-            transition_id: LifecycleTransitionId::new(1),
+            presentation_identity: identity_for_test(WindowId::from_raw(1).unwrap()),
             visual_group,
             progress: 0.4,
             opacity: 1.0,

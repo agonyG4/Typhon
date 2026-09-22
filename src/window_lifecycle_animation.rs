@@ -1,8 +1,9 @@
 use crate::compositor::ResolvedEffectScene;
-use crate::core::WindowId;
-use crate::presentation_animation::{AnimationTime, PresentationRect};
+use crate::core::{SceneNodeId, WindowId};
+use crate::presentation_animation::{
+    AnimationTime, PresentationRect, PresentationRetainedVisualIdentity,
+};
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// Keep the default in the existing short desktop-animation class; spatial
@@ -37,19 +38,6 @@ pub const ASTREA_LAMP_RAIL_C2_HIGH_SHAPE: f64 = 0.24;
 pub const ASTREA_LAMP_FINAL_OPACITY_START: f64 = 0.98;
 const MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES: usize = 65_536;
 const MAX_LIFECYCLE_RENDER_FALLBACK_ENTRIES: usize = 65_536;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LifecycleTransitionId(NonZeroU64);
-
-impl LifecycleTransitionId {
-    pub fn new(value: u64) -> Self {
-        Self(NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN))
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleDirection {
@@ -154,13 +142,14 @@ impl LifecycleVisualGroup {
 pub struct LifecycleVisualSource {
     pub window_id: WindowId,
     pub root_surface_id: u32,
-    pub transition_id: LifecycleTransitionId,
+    pub presentation_identity: PresentationRetainedVisualIdentity,
     pub kind: LifecycleVisualSourceKind,
     pub effect_scene: Arc<ResolvedEffectScene>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleTransitionRequest {
+    pub presentation_identity: PresentationRetainedVisualIdentity,
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub visual_group: LifecycleVisualGroup,
@@ -172,7 +161,7 @@ pub struct LifecycleTransitionRequest {
 pub struct LampWindowSample {
     pub window_id: WindowId,
     pub root_surface_id: u32,
-    pub transition_id: LifecycleTransitionId,
+    pub presentation_identity: PresentationRetainedVisualIdentity,
     pub visual_group: LifecycleVisualGroup,
     pub progress: f64,
     pub opacity: f64,
@@ -193,13 +182,22 @@ impl LifecycleSceneSample {
             .iter()
             .find(|source| source.window_id == window_id)
     }
+
+    pub fn visual_source_for_identity(
+        &self,
+        presentation_identity: PresentationRetainedVisualIdentity,
+    ) -> Option<&LifecycleVisualSource> {
+        self.visual_sources
+            .iter()
+            .find(|source| source.presentation_identity == presentation_identity)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LifecycleFrameLamp {
     pub window_id: WindowId,
     pub root_surface_id: u32,
-    pub transition_id: LifecycleTransitionId,
+    pub presentation_identity: PresentationRetainedVisualIdentity,
     pub visual_group: LifecycleVisualGroup,
     pub progress: f64,
     pub opacity: f64,
@@ -222,7 +220,7 @@ impl LifecycleFrameSnapshot {
             .map(|lamp| LifecycleFrameLamp {
                 window_id: lamp.window_id,
                 root_surface_id: lamp.root_surface_id,
-                transition_id: lamp.transition_id,
+                presentation_identity: lamp.presentation_identity,
                 visual_group: lamp.visual_group,
                 progress: lamp.progress,
                 opacity: lamp.opacity,
@@ -243,9 +241,9 @@ impl LifecycleFrameSnapshot {
         evidence: &LifecycleRenderEvidence,
     ) -> Self {
         let mut snapshot = Self::from_sample(sample);
-        snapshot.lamps.retain(|lamp| {
-            evidence.contains(lamp.window_id, lamp.root_surface_id, lamp.transition_id)
-        });
+        snapshot
+            .lamps
+            .retain(|lamp| evidence.contains(lamp.presentation_identity, lamp.root_surface_id));
         snapshot.refresh_signature();
         snapshot
     }
@@ -269,7 +267,7 @@ impl LifecycleFrameSnapshot {
 pub struct LifecycleRenderEvidenceEntry {
     pub window_id: WindowId,
     pub root_surface_id: u32,
-    pub transition_id: LifecycleTransitionId,
+    pub presentation_identity: PresentationRetainedVisualIdentity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -296,14 +294,12 @@ impl LifecycleRenderEvidence {
 
     pub fn contains(
         &self,
-        window_id: WindowId,
+        presentation_identity: PresentationRetainedVisualIdentity,
         root_surface_id: u32,
-        transition_id: LifecycleTransitionId,
     ) -> bool {
         self.consumed.iter().any(|entry| {
-            entry.window_id == window_id
+            entry.presentation_identity == presentation_identity
                 && entry.root_surface_id == root_surface_id
-                && entry.transition_id == transition_id
         })
     }
 }
@@ -322,7 +318,7 @@ pub enum LifecycleRenderFallbackReason {
 pub struct LifecycleRenderFallbackEntry {
     pub window_id: WindowId,
     pub root_surface_id: u32,
-    pub transition_id: LifecycleTransitionId,
+    pub presentation_identity: PresentationRetainedVisualIdentity,
     pub reason: LifecycleRenderFallbackReason,
 }
 
@@ -336,7 +332,7 @@ impl LifecycleRenderFallbacks {
         if !self.failed.iter().any(|existing| {
             existing.window_id == entry.window_id
                 && existing.root_surface_id == entry.root_surface_id
-                && existing.transition_id == entry.transition_id
+                && existing.presentation_identity == entry.presentation_identity
         }) && self.failed.len() < MAX_LIFECYCLE_RENDER_FALLBACK_ENTRIES
         {
             self.failed.push(entry);
@@ -415,7 +411,12 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
         for value in [
             lamp.window_id.get(),
             u64::from(lamp.root_surface_id),
-            lamp.transition_id.get(),
+            lamp.presentation_identity.scene_node_id().get(),
+            match lamp.presentation_identity.kind() {
+                crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle => 1,
+            },
+            lamp.presentation_identity.transaction_id().get(),
+            lamp.presentation_identity.revision_id().get(),
             lamp.visual_group.canonical_client_rect.x().to_bits(),
             lamp.visual_group.canonical_client_rect.y().to_bits(),
             lamp.visual_group.canonical_client_rect.width().to_bits(),
@@ -483,7 +484,7 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
 struct LifecycleTransition {
     window_id: WindowId,
     root_surface_id: u32,
-    transition_id: LifecycleTransitionId,
+    presentation_identity: PresentationRetainedVisualIdentity,
     visual_group: LifecycleVisualGroup,
     direction: LifecycleDirection,
     start_progress: f64,
@@ -496,8 +497,9 @@ struct LifecycleTransition {
 #[derive(Debug)]
 pub struct WindowLifecycleAnimator {
     enabled: bool,
-    next_transition_id: u64,
-    transitions: BTreeMap<WindowId, LifecycleTransition>,
+    transitions: BTreeMap<SceneNodeId, LifecycleTransition>,
+    #[cfg(test)]
+    fail_next_start: bool,
 }
 
 impl Default for WindowLifecycleAnimator {
@@ -510,8 +512,9 @@ impl WindowLifecycleAnimator {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            next_transition_id: 1,
             transitions: BTreeMap::new(),
+            #[cfg(test)]
+            fail_next_start: false,
         }
     }
 
@@ -537,16 +540,28 @@ impl WindowLifecycleAnimator {
         request: LifecycleTransitionRequest,
         now: AnimationTime,
         speed: f64,
-    ) -> Option<LifecycleTransitionId> {
+    ) -> Option<PresentationRetainedVisualIdentity> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_start) {
+            return None;
+        }
         let LifecycleTransitionRequest {
+            presentation_identity,
             window_id,
             root_surface_id,
             visual_group,
             direction,
             resolved_effect_scene,
         } = request;
+        let scene_node_id = presentation_identity.scene_node_id();
 
-        let existing = self.transitions.get(&window_id).cloned();
+        let existing = self.transitions.get(&scene_node_id).cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|transition| transition.presentation_identity == presentation_identity)
+        {
+            return None;
+        }
         let start_progress = existing
             .as_ref()
             .map(|transition| transition_progress(transition, now))
@@ -565,16 +580,19 @@ impl WindowLifecycleAnimator {
             .as_ref()
             .map(|transition| Arc::clone(&transition.resolved_effect_scene))
             .unwrap_or_else(|| Arc::new(resolved_effect_scene));
-        let transition_id = self.allocate_transition_id();
+        let root_surface_id = existing
+            .as_ref()
+            .map(|transition| transition.root_surface_id)
+            .unwrap_or(root_surface_id);
         let base_duration_nanos = effective_duration_nanos(speed);
         let remaining = (direction.target_progress() - start_progress).abs();
         let duration_nanos = (base_duration_nanos as f64 * remaining).round() as u64;
         self.transitions.insert(
-            window_id,
+            scene_node_id,
             LifecycleTransition {
                 window_id,
                 root_surface_id,
-                transition_id,
+                presentation_identity,
                 visual_group,
                 direction,
                 start_progress,
@@ -584,28 +602,52 @@ impl WindowLifecycleAnimator {
                 resolved_effect_scene,
             },
         );
-        Some(transition_id)
+        Some(presentation_identity)
     }
 
-    pub fn cancel(&mut self, window_id: WindowId) -> bool {
-        self.transitions.remove(&window_id).is_some()
-    }
-
-    pub fn cancel_all(&mut self) {
-        self.transitions.clear();
-    }
-
-    pub fn sample(&self, window_id: WindowId, now: AnimationTime) -> Option<LampWindowSample> {
+    pub fn cancel(
+        &mut self,
+        scene_node_id: SceneNodeId,
+    ) -> Option<PresentationRetainedVisualIdentity> {
         self.transitions
-            .get(&window_id)
+            .remove(&scene_node_id)
+            .map(|transition| transition.presentation_identity)
+    }
+
+    pub fn cancel_all(&mut self) -> Vec<PresentationRetainedVisualIdentity> {
+        let identities = self
+            .transitions
+            .values()
+            .map(|transition| transition.presentation_identity)
+            .collect();
+        self.transitions.clear();
+        identities
+    }
+
+    pub fn sample(
+        &self,
+        scene_node_id: SceneNodeId,
+        now: AnimationTime,
+    ) -> Option<LampWindowSample> {
+        self.transitions
+            .get(&scene_node_id)
             .cloned()
             .map(|transition| sample_transition(transition, now))
     }
 
-    pub fn visual_group(&self, window_id: WindowId) -> Option<LifecycleVisualGroup> {
+    pub fn visual_group(&self, scene_node_id: SceneNodeId) -> Option<LifecycleVisualGroup> {
         self.transitions
-            .get(&window_id)
+            .get(&scene_node_id)
             .map(|transition| transition.visual_group)
+    }
+
+    pub fn identity(
+        &self,
+        scene_node_id: SceneNodeId,
+    ) -> Option<PresentationRetainedVisualIdentity> {
+        self.transitions
+            .get(&scene_node_id)
+            .map(|transition| transition.presentation_identity)
     }
 
     pub fn sample_scene(&self, now: AnimationTime) -> LifecycleSceneSample {
@@ -623,7 +665,7 @@ impl WindowLifecycleAnimator {
                 .map(|transition| LifecycleVisualSource {
                     window_id: transition.window_id,
                     root_surface_id: transition.root_surface_id,
-                    transition_id: transition.transition_id,
+                    presentation_identity: transition.presentation_identity,
                     kind: lifecycle_visual_source_kind(&transition.resolved_effect_scene),
                     effect_scene: Arc::clone(&transition.resolved_effect_scene),
                 })
@@ -633,35 +675,36 @@ impl WindowLifecycleAnimator {
 
     pub fn acknowledge(
         &mut self,
-        window_id: WindowId,
-        transition_id: LifecycleTransitionId,
+        presentation_identity: PresentationRetainedVisualIdentity,
         mathematically_settled: bool,
-    ) -> bool {
+    ) -> Option<PresentationRetainedVisualIdentity> {
         if !mathematically_settled {
-            return false;
+            return None;
         }
-        let Some(transition) = self.transitions.get(&window_id) else {
-            return false;
-        };
-        if transition.transition_id != transition_id {
-            return false;
+        let scene_node_id = presentation_identity.scene_node_id();
+        let transition = self.transitions.get(&scene_node_id)?;
+        if transition.presentation_identity != presentation_identity {
+            return None;
         }
-        self.transitions.remove(&window_id);
-        true
+        self.transitions
+            .remove(&scene_node_id)
+            .map(|transition| transition.presentation_identity)
     }
 
     /// Snap one exact transition to its semantic endpoint while retaining
     /// lifecycle ownership until the endpoint is physically presented.
     pub fn snap_to_endpoint(
         &mut self,
-        window_id: WindowId,
-        transition_id: LifecycleTransitionId,
+        presentation_identity: PresentationRetainedVisualIdentity,
         now: AnimationTime,
     ) -> bool {
-        let Some(transition) = self.transitions.get_mut(&window_id) else {
+        let Some(transition) = self
+            .transitions
+            .get_mut(&presentation_identity.scene_node_id())
+        else {
             return false;
         };
-        if transition.transition_id != transition_id {
+        if transition.presentation_identity != presentation_identity {
             return false;
         }
         transition.start_progress = transition.direction.target_progress();
@@ -676,34 +719,32 @@ impl WindowLifecycleAnimator {
     /// acknowledgement and therefore does not affect any physical ledger.
     pub fn retire_render_fallback(
         &mut self,
-        window_id: WindowId,
-        transition_id: LifecycleTransitionId,
-    ) -> bool {
-        let Some(transition) = self.transitions.get(&window_id) else {
-            return false;
-        };
-        if transition.transition_id != transition_id {
-            return false;
+        presentation_identity: PresentationRetainedVisualIdentity,
+    ) -> Option<PresentationRetainedVisualIdentity> {
+        let scene_node_id = presentation_identity.scene_node_id();
+        let transition = self.transitions.get(&scene_node_id)?;
+        if transition.presentation_identity != presentation_identity {
+            return None;
         }
-        self.transitions.remove(&window_id);
-        true
+        self.transitions
+            .remove(&scene_node_id)
+            .map(|transition| transition.presentation_identity)
     }
 
     /// Retire a transition proven unable to change this output. This is a
     /// logical no-visual-change settlement, not physical presentation ACK.
     pub fn settle_no_visual_change(
         &mut self,
-        window_id: WindowId,
-        transition_id: LifecycleTransitionId,
-    ) -> bool {
-        let Some(transition) = self.transitions.get(&window_id) else {
-            return false;
-        };
-        if transition.transition_id != transition_id {
-            return false;
+        presentation_identity: PresentationRetainedVisualIdentity,
+    ) -> Option<PresentationRetainedVisualIdentity> {
+        let scene_node_id = presentation_identity.scene_node_id();
+        let transition = self.transitions.get(&scene_node_id)?;
+        if transition.presentation_identity != presentation_identity {
+            return None;
         }
-        self.transitions.remove(&window_id);
-        true
+        self.transitions
+            .remove(&scene_node_id)
+            .map(|transition| transition.presentation_identity)
     }
 
     pub fn has_pending_visible(&self) -> bool {
@@ -714,10 +755,9 @@ impl WindowLifecycleAnimator {
         self.transitions.len()
     }
 
-    fn allocate_transition_id(&mut self) -> LifecycleTransitionId {
-        let value = self.next_transition_id.max(1);
-        self.next_transition_id = value.wrapping_add(1).max(1);
-        LifecycleTransitionId::new(value)
+    #[cfg(test)]
+    pub(crate) fn fail_next_start_for_test(&mut self) {
+        self.fail_next_start = true;
     }
 }
 
@@ -726,7 +766,7 @@ fn sample_transition(transition: LifecycleTransition, now: AnimationTime) -> Lam
     LampWindowSample {
         window_id: transition.window_id,
         root_surface_id: transition.root_surface_id,
-        transition_id: transition.transition_id,
+        presentation_identity: transition.presentation_identity,
         visual_group: transition.visual_group,
         progress,
         opacity: lamp_opacity(progress),
@@ -1401,1283 +1441,5 @@ pub fn lamp_warp_window_point(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request(
-        window_id: WindowId,
-        root_surface_id: u32,
-        source_rect: PresentationRect,
-        anchor_rect: PresentationRect,
-        direction: LifecycleDirection,
-    ) -> LifecycleTransitionRequest {
-        request_with_group(
-            window_id,
-            root_surface_id,
-            LifecycleVisualGroup::from_bounds(
-                source_rect,
-                source_rect,
-                source_rect,
-                anchor_rect,
-                1920,
-                1080,
-            )
-            .expect("valid visual group"),
-            direction,
-        )
-    }
-
-    fn request_with_group(
-        window_id: WindowId,
-        root_surface_id: u32,
-        visual_group: LifecycleVisualGroup,
-        direction: LifecycleDirection,
-    ) -> LifecycleTransitionRequest {
-        LifecycleTransitionRequest {
-            window_id,
-            root_surface_id,
-            visual_group,
-            direction,
-            resolved_effect_scene: ResolvedEffectScene::default(),
-        }
-    }
-    use crate::presentation_animation::PresentationRect;
-
-    fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
-        PresentationRect::new(x, y, width, height).expect("valid rectangle")
-    }
-
-    #[test]
-    fn portal_rect_is_aspect_fit_centered_and_direction_aligned() {
-        let fixtures = [
-            rect(-960.0, 120.0, 1600.0, 900.0), // 16:9, negative global x
-            rect(80.0, -400.0, 400.0, 900.0),   // portrait, negative global y
-            rect(120.0, 120.0, 600.0, 600.0),   // square
-            rect(-0.01, -0.02, 0.01, 0.02),     // extremely small valid source
-        ];
-        for anchor in [
-            rect(-32.0, 900.0, 64.0, 64.0),
-            rect(0.001, 0.002, 0.003, 0.004), // extremely small valid anchor
-        ] {
-            for source in fixtures {
-                for direction in [
-                    LampDirection::Bottom,
-                    LampDirection::Top,
-                    LampDirection::Left,
-                    LampDirection::Right,
-                ] {
-                    let portal = lamp_portal_rect(source, anchor, direction).expect("valid portal");
-                    assert!(valid_rect(portal));
-                    assert!(rect_contains_rect(anchor, portal));
-                    assert!(
-                        (portal.width() / portal.height() - source.width() / source.height()).abs()
-                            < 1.0e-12
-                    );
-                    match direction {
-                        LampDirection::Bottom => {
-                            assert_eq!(portal.y(), anchor.y());
-                            assert_eq!(
-                                portal.x() + portal.width() * 0.5,
-                                anchor.x() + anchor.width() * 0.5
-                            );
-                        }
-                        LampDirection::Top => {
-                            assert_eq!(portal.y() + portal.height(), anchor.y() + anchor.height());
-                            assert_eq!(
-                                portal.x() + portal.width() * 0.5,
-                                anchor.x() + anchor.width() * 0.5
-                            );
-                        }
-                        LampDirection::Left => {
-                            assert_eq!(portal.x() + portal.width(), anchor.x() + anchor.width());
-                            assert_eq!(
-                                portal.y() + portal.height() * 0.5,
-                                anchor.y() + anchor.height() * 0.5
-                            );
-                        }
-                        LampDirection::Right => {
-                            assert_eq!(portal.x(), anchor.x());
-                            assert_eq!(
-                                portal.y() + portal.height() * 0.5,
-                                anchor.y() + anchor.height() * 0.5
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn sink_terminal_depth_is_source_aspect_independent() {
-        let anchor = rect(900.0, 900.0, 64.0, 64.0);
-        let sources = [
-            rect(100.0, 100.0, 1600.0, 900.0), // wide
-            rect(600.0, 100.0, 900.0, 1600.0), // portrait
-            rect(600.0, 100.0, 800.0, 800.0),  // square
-        ];
-        let terminal_depths = |source: PresentationRect| {
-            let group =
-                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
-                    .expect("valid visual group");
-            let center_x = source.x() + source.width() * 0.5;
-            let leading = lamp_warp_visual_point(group, [center_x, source.y()], 1.0);
-            let trailing =
-                lamp_warp_visual_point(group, [center_x, source.y() + source.height()], 1.0);
-            ((trailing[1] - leading[1]).abs(), group.portal_rect.height())
-        };
-
-        let depths = sources.map(terminal_depths);
-        let sink_depths = depths.map(|(sink_depth, _)| sink_depth);
-        let v23_portal_depths = depths.map(|(_, portal_depth)| portal_depth);
-        assert_eq!(v23_portal_depths, [36.0, 64.0, 64.0]);
-        assert!((v23_portal_depths[0] - v23_portal_depths[1]).abs() > 1.0e-12);
-        assert!(
-            sink_depths
-                .windows(2)
-                .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-12),
-            "sink depth must be source-aspect independent; measured depths were {sink_depths:?}"
-        );
-        assert_eq!(sink_depths, [ASTREA_LAMP_SINK_THICKNESS; 3]);
-    }
-
-    #[test]
-    fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
-        let anchor = rect(-32.0, 900.0, 64.0, 64.0);
-        let sources = [
-            rect(-960.0, 120.0, 1600.0, 900.0),
-            rect(80.0, -400.0, 400.0, 900.0),
-            rect(120.0, 120.0, 600.0, 600.0),
-        ];
-        let mut bottom_depths = Vec::new();
-        for source in sources {
-            let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom)
-                .expect("valid aspect-fit portal");
-            let sink = lamp_sink_rect(
-                anchor,
-                portal,
-                LampDirection::Bottom,
-                ASTREA_LAMP_ABSORB_DEPTH,
-                ASTREA_LAMP_SINK_THICKNESS,
-            )
-            .expect("valid sink");
-            assert!(rect_contains_rect(anchor, sink));
-            assert!(sink.x().is_finite() && sink.y().is_finite());
-            assert!(
-                (sink.y() + sink.height() * 0.5 - (anchor.y() + 0.6 * anchor.height())).abs()
-                    < 1.0e-12
-            );
-            assert_eq!(sink.x(), portal.x());
-            assert_eq!(sink.width(), portal.width());
-            assert_eq!(sink.height(), ASTREA_LAMP_SINK_THICKNESS);
-            bottom_depths.push(sink.height());
-        }
-        assert!(bottom_depths.windows(2).all(|pair| pair[0] == pair[1]));
-
-        let cases = [
-            (LampDirection::Bottom, rect(900.0, 900.0, 64.0, 64.0)),
-            (LampDirection::Top, rect(900.0, 12.0, 64.0, 64.0)),
-            (LampDirection::Right, rect(1840.0, 500.0, 64.0, 64.0)),
-            (LampDirection::Left, rect(12.0, 500.0, 64.0, 64.0)),
-        ];
-        let source = rect(400.0, 300.0, 800.0, 600.0);
-        for (direction, directional_anchor) in cases {
-            let portal = lamp_portal_rect(source, directional_anchor, direction)
-                .expect("valid directional portal");
-            let sink = lamp_sink_rect(
-                directional_anchor,
-                portal,
-                direction,
-                ASTREA_LAMP_ABSORB_DEPTH,
-                ASTREA_LAMP_SINK_THICKNESS,
-            )
-            .expect("valid directional sink");
-            assert!(rect_contains_rect(directional_anchor, sink));
-            assert_eq!(
-                match direction {
-                    LampDirection::Top | LampDirection::Bottom => sink.width(),
-                    LampDirection::Left | LampDirection::Right => sink.height(),
-                },
-                match direction {
-                    LampDirection::Top | LampDirection::Bottom => portal.width(),
-                    LampDirection::Left | LampDirection::Right => portal.height(),
-                }
-            );
-            let (anchor_start, anchor_end) = axis_bounds(directional_anchor, direction);
-            let center = match direction {
-                LampDirection::Top | LampDirection::Bottom => sink.y() + sink.height() * 0.5,
-                LampDirection::Left | LampDirection::Right => sink.x() + sink.width() * 0.5,
-            };
-            let expected_depth = match direction {
-                LampDirection::Bottom | LampDirection::Right => {
-                    (center - anchor_start) / (anchor_end - anchor_start)
-                }
-                LampDirection::Top | LampDirection::Left => {
-                    (anchor_end - center) / (anchor_end - anchor_start)
-                }
-            };
-            assert!((expected_depth - ASTREA_LAMP_ABSORB_DEPTH).abs() < 1.0e-12);
-        }
-
-        let tiny_anchor = rect(-0.003, -0.004, 0.003, 0.004);
-        let tiny_portal = lamp_portal_rect(source, tiny_anchor, LampDirection::Bottom)
-            .expect("valid tiny portal");
-        let tiny_sink = lamp_sink_rect(
-            tiny_anchor,
-            tiny_portal,
-            LampDirection::Bottom,
-            ASTREA_LAMP_ABSORB_DEPTH,
-            ASTREA_LAMP_SINK_THICKNESS,
-        )
-        .expect("valid tiny sink");
-        assert!(rect_contains_rect(tiny_anchor, tiny_sink));
-        assert!(tiny_sink.width() > 0.0 && tiny_sink.height() > 0.0);
-    }
-
-    #[test]
-    fn cubic_funnel_profile_is_bounded_monotonic_and_wider_than_linear_mid_funnel() {
-        let samples = [0.00, 0.10, 0.25, 0.50, 0.75, 0.90, 1.00];
-        let expected = [
-            [0.0, 0.04987, 0.15203125, 0.38375, 0.67359375, 0.86643, 1.0],
-            [
-                0.0,
-                0.033535,
-                0.109140625,
-                0.306875,
-                0.601171875,
-                0.827415,
-                1.0,
-            ],
-            [0.0, 0.0172, 0.06625, 0.23, 0.52875, 0.7884, 1.0],
-        ];
-        for (shape, expected_values) in [
-            (ASTREA_LAMP_INITIAL_SHAPE_FACTOR, expected[0]),
-            (0.50, expected[1]),
-            (ASTREA_LAMP_MAX_SHAPE_FACTOR, expected[2]),
-        ] {
-            let values = samples.map(|t| cubic_funnel_profile(t, shape));
-            assert_eq!(values[0], 0.0);
-            assert_eq!(values[6], 1.0);
-            assert!(
-                values
-                    .into_iter()
-                    .zip(expected_values)
-                    .all(|(value, expected)| {
-                        value.is_finite()
-                            && (0.0..=1.0).contains(&value)
-                            && (value - expected).abs() < 1.0e-12
-                    })
-            );
-            assert!(values.windows(2).all(|pair| pair[1] >= pair[0]));
-            assert!(cubic_funnel_profile(0.50, shape) < 0.50);
-        }
-    }
-
-    #[test]
-    fn lamp_footprint_covers_ssd_above_client_after_visual_group_fix() {
-        let client = rect(400.0, 100.0, 800.0, 600.0);
-        let ssd_outer = rect(384.0, 60.0, 832.0, 640.0);
-        let anchor = rect(900.0, 900.0, 64.0, 64.0);
-
-        let visual =
-            LifecycleVisualGroup::from_bounds(client, ssd_outer, client, anchor, 1920, 1080)
-                .expect("valid visual group");
-        let footprint = lamp_footprint(visual).expect("valid footprint");
-
-        assert!(footprint.y() <= ssd_outer.y());
-        assert!(footprint.y() + footprint.height() >= ssd_outer.y() + ssd_outer.height());
-    }
-
-    #[test]
-    fn canonical_visual_group_unions_client_subsurface_and_ssd_outer_bounds() {
-        let actual = canonical_visual_rect(
-            rect(400.0, 100.0, 800.0, 600.0),
-            [rect(360.0, 120.0, 32.0, 760.0)],
-            Some(rect(384.0, 60.0, 832.0, 640.0)),
-        );
-        assert_eq!(actual, Some(rect(360.0, 60.0, 856.0, 820.0)));
-    }
-
-    #[test]
-    fn canonical_visual_group_does_not_expand_csd_window() {
-        let actual = canonical_visual_rect(rect(400.0, 100.0, 800.0, 600.0), [], None);
-        assert_eq!(actual, Some(rect(400.0, 100.0, 800.0, 600.0)));
-    }
-
-    #[test]
-    fn presented_visual_group_reuses_canonical_to_presented_client_affine() {
-        let actual = presented_visual_rect(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(360.0, 60.0, 832.0, 640.0),
-            rect(200.0, 160.0, 960.0, 720.0),
-        );
-        assert_eq!(actual, Some(rect(152.0, 112.0, 998.4, 768.0)));
-    }
-
-    #[test]
-    fn active_transition_ignores_live_visual_mutations_on_reversal() {
-        let window = WindowId::from_raw(18).expect("valid window id");
-        let first_group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(384.0, 60.0, 832.0, 640.0),
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(900.0, 900.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        // These changed bounds model a relaid-out SSD/subsurface group and a
-        // newly reported Dock anchor while the first transition still owns
-        // physical presentation. The animator must ignore both snapshots.
-        let changed_group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(384.0, 20.0, 832.0, 680.0),
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(1000.0, 900.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let first = animator
-            .start_or_reverse(
-                request_with_group(window, 18, first_group, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("minimize starts");
-        let before = animator
-            .sample(window, AnimationTime::from_nanos(100_000_000))
-            .expect("sample before reversal");
-        let second = animator
-            .start_or_reverse(
-                request_with_group(window, 18, changed_group, LifecycleDirection::Restore),
-                AnimationTime::from_nanos(100_000_000),
-                1.0,
-            )
-            .expect("restore reverses");
-        let after = animator
-            .sample(window, AnimationTime::from_nanos(100_000_000))
-            .expect("sample after reversal");
-
-        assert_ne!(first, second);
-        assert_eq!(before.visual_group, after.visual_group);
-        assert_eq!(
-            before.visual_group.anchor_rect,
-            after.visual_group.anchor_rect
-        );
-    }
-
-    #[test]
-    fn settled_new_transition_captures_new_visual_bounds() {
-        let window = WindowId::from_raw(19).expect("valid window id");
-        let first_group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(384.0, 60.0, 832.0, 640.0),
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(900.0, 900.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        let second_group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(384.0, 20.0, 832.0, 680.0),
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(900.0, 900.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let first = animator
-            .start_or_reverse(
-                request_with_group(window, 19, first_group, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("minimize starts");
-        assert!(animator.snap_to_endpoint(window, first, AnimationTime::from_nanos(280_000_000),));
-        assert!(animator.acknowledge(window, first, true));
-        animator
-            .start_or_reverse(
-                request_with_group(window, 19, second_group, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(300_000_000),
-                1.0,
-            )
-            .expect("new transition starts");
-        let sample = animator
-            .sample(window, AnimationTime::from_nanos(300_000_000))
-            .expect("new transition sample");
-        assert_eq!(sample.visual_group.canonical_visual_rect.y(), 20.0);
-    }
-
-    #[test]
-    fn lifecycle_snapshot_signature_includes_sink_geometry() {
-        let window_id = WindowId::from_raw(20).expect("valid window id");
-        let visual_group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(384.0, 60.0, 832.0, 640.0),
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(900.0, 900.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        let sample = LifecycleSceneSample {
-            sampled_at: AnimationTime::from_nanos(1),
-            lamps: vec![LampWindowSample {
-                window_id,
-                root_surface_id: 20,
-                transition_id: LifecycleTransitionId::new(1),
-                visual_group,
-                progress: 0.5,
-                opacity: 1.0,
-                direction: LifecycleDirection::Minimize,
-                mathematically_settled: false,
-            }],
-            visual_sources: Vec::new(),
-        };
-        let mut snapshot = LifecycleFrameSnapshot::from_sample(&sample);
-        let original_signature = snapshot.signature;
-        snapshot.lamps[0].visual_group.sink_rect = PresentationRect::new(
-            visual_group.sink_rect.x(),
-            visual_group.sink_rect.y() + 1.0,
-            visual_group.sink_rect.width(),
-            visual_group.sink_rect.height(),
-        )
-        .expect("valid changed sink rectangle");
-        snapshot.refresh_signature();
-        assert_ne!(snapshot.signature, original_signature);
-    }
-
-    #[test]
-    fn lifecycle_footprint_covers_subsurface_outside_root_and_anchor() {
-        let visual_group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            canonical_visual_rect(
-                rect(400.0, 100.0, 800.0, 600.0),
-                [rect(360.0, 120.0, 32.0, 760.0)],
-                None,
-            )
-            .expect("valid visual bounds"),
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(1200.0, 900.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        let footprint = lamp_footprint(visual_group).expect("valid footprint");
-        assert!(footprint.x() <= 360.0);
-        assert!(footprint.y() <= 100.0);
-        assert!(footprint.x() + footprint.width() >= 1264.0);
-        assert!(footprint.y() + footprint.height() >= 964.0);
-    }
-
-    #[test]
-    fn lifecycle_footprint_includes_overlap_bump_excursion() {
-        let source = rect(400.0, 800.0, 800.0, 200.0);
-        let anchor = rect(900.0, 900.0, 64.0, 64.0);
-        let visual_group =
-            LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
-                .expect("valid visual group");
-        assert!(visual_group.bump_distance > 0.0);
-        let footprint = lamp_footprint(visual_group).expect("valid footprint");
-        assert!(footprint.y() < source.y());
-        assert!(footprint.y() + footprint.height() > source.y() + source.height());
-    }
-
-    #[test]
-    fn lifecycle_footprint_intersection_is_finite_at_every_output_edge() {
-        let cases = [
-            (
-                rect(-90.0, 100.0, 120.0, 120.0),
-                rect(-30.0, 110.0, 20.0, 20.0),
-            ),
-            (
-                rect(1870.0, 100.0, 120.0, 120.0),
-                rect(1900.0, 110.0, 20.0, 20.0),
-            ),
-            (
-                rect(100.0, -90.0, 120.0, 120.0),
-                rect(110.0, -30.0, 20.0, 20.0),
-            ),
-            (
-                rect(100.0, 1070.0, 120.0, 120.0),
-                rect(110.0, 1090.0, 20.0, 20.0),
-            ),
-        ];
-        for (source, anchor) in cases {
-            let visual_group =
-                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
-                    .expect("valid visual group");
-            assert!(
-                lamp_footprint(visual_group)
-                    .expect("finite footprint")
-                    .x()
-                    .is_finite()
-            );
-            assert!(lamp_footprint_intersects_output(visual_group, 1920, 1080));
-        }
-    }
-
-    #[test]
-    fn lamp_opacity_stays_full_until_narrow_endpoint_interval() {
-        assert_eq!(lamp_opacity(0.97), 1.0);
-        assert!(lamp_opacity(0.99) > 0.0);
-        assert_eq!(lamp_opacity(1.0), 0.0);
-    }
-
-    #[test]
-    fn lamp_continuous_funnel_has_no_internal_aggregate_stop() {
-        let source = rect(300.0, 200.0, 640.0, 480.0);
-        let anchor = rect(700.0, 900.0, 64.0, 64.0);
-        let direction = LampDirection::Bottom;
-        let shape_factor = 0.60;
-        let points = [
-            [620.0, 680.0], // near-edge center
-            [620.0, 440.0], // window center
-            [620.0, 200.0], // trailing-edge center
-            [300.0, 440.0], // left visual edge
-            [940.0, 440.0], // right visual edge
-        ];
-        let aggregate_velocity = |progress: f64, bump_distance: f64| {
-            let half_step = 1.0e-4;
-            let sum_squared_displacement = points
-                .into_iter()
-                .map(|point| {
-                    let before = lamp_warp_point_directional(
-                        source,
-                        anchor,
-                        direction,
-                        shape_factor,
-                        bump_distance,
-                        lamp_motion_channels(progress - half_step, bump_distance),
-                        point,
-                    );
-                    let after = lamp_warp_point_directional(
-                        source,
-                        anchor,
-                        direction,
-                        shape_factor,
-                        bump_distance,
-                        lamp_motion_channels(progress + half_step, bump_distance),
-                        point,
-                    );
-                    (after[0] - before[0]).powi(2) + (after[1] - before[1]).powi(2)
-                })
-                .sum::<f64>();
-            (sum_squared_displacement / points.len() as f64).sqrt() / (2.0 * half_step)
-        };
-
-        let sample_count = 512;
-        let velocities = (1..sample_count)
-            .map(|step| {
-                let progress = 0.08 + 0.84 * f64::from(step) / f64::from(sample_count);
-                aggregate_velocity(progress, 0.0)
-            })
-            .collect::<Vec<_>>();
-        let maximum = velocities.iter().copied().fold(0.0, f64::max);
-        let minimum = velocities.iter().copied().fold(f64::INFINITY, f64::min);
-        assert!(maximum > 1.0);
-        assert!(
-            minimum > 0.01,
-            "aggregate mesh velocity stopped internally: minimum={minimum}, maximum={maximum}"
-        );
-
-        for boundary in [0.29577464788732394, 0.07792207792207792] {
-            let bump_distance = if boundary < 0.1 { 48.0 } else { 0.0 };
-            let before = aggregate_velocity(boundary - 0.01, bump_distance);
-            let at_boundary = aggregate_velocity(boundary, bump_distance);
-            let after = aggregate_velocity(boundary + 0.01, bump_distance);
-            assert!(before > 1.0);
-            assert!(after > 1.0);
-            assert!(at_boundary > before.min(after) * 0.10);
-        }
-    }
-
-    #[test]
-    fn lamp_motion_channels_use_one_overlapping_timeline() {
-        let at_zero = lamp_motion_channels(0.0, 0.0);
-        assert_eq!(at_zero.temporal_progress, 0.0);
-        assert_eq!(at_zero.contraction_progress, 0.0);
-        assert_eq!(at_zero.translation_progress, 0.0);
-        assert_eq!(at_zero.retreat_progress, 0.0);
-
-        let representative = lamp_motion_channels(0.4, 0.0);
-        assert!((representative.temporal_progress - 0.256).abs() < 1.0e-12);
-        assert!(representative.contraction_progress > 0.0);
-        assert!(representative.translation_progress > 0.0);
-        assert_eq!(representative.retreat_progress, 0.0);
-
-        let overlap = lamp_motion_channels(0.4, 48.0);
-        assert!(overlap.contraction_progress > 0.0);
-        assert!(overlap.translation_progress > 0.0);
-        assert!(overlap.retreat_progress > 0.0);
-        assert!(overlap.retreat_progress <= 1.0);
-        assert_eq!(lamp_motion_channels(0.5, 0.0).retreat_progress, 0.0);
-        assert_eq!(lamp_motion_channels(1.0, 48.0).temporal_progress, 1.0);
-        assert_eq!(lamp_motion_channels(1.0, 48.0).translation_progress, 1.0);
-    }
-
-    #[test]
-    fn lamp_translation_soft_start_is_c1_at_its_internal_join() {
-        let start = ASTREA_LAMP_TRANSLATION_START;
-        let blend = ASTREA_LAMP_TRANSLATION_BLEND;
-        let join = start + (1.0 - start) * blend;
-        let step = 1.0e-6;
-        let left_slope =
-            (translation_soft_start(join) - translation_soft_start(join - step)) / step;
-        let right_slope =
-            (translation_soft_start(join + step) - translation_soft_start(join)) / step;
-        assert!((left_slope - right_slope).abs() < 1.0e-4);
-        assert_eq!(translation_soft_start(start), 0.0);
-        assert_eq!(translation_soft_start(1.0), 1.0);
-    }
-
-    #[test]
-    fn lamp_motion_channels_have_c1_boundaries_without_hidden_stages() {
-        let finite_difference_slope = |function: &dyn Fn(f64) -> f64, value: f64| {
-            let step = 1.0e-6;
-            (function(value + step) - function(value - step)) / (2.0 * step)
-        };
-
-        let translation_start = |value| translation_soft_start(value);
-        let translation_start_slope =
-            finite_difference_slope(&translation_start, ASTREA_LAMP_TRANSLATION_START);
-        assert!(translation_start_slope.abs() < 1.0e-4);
-
-        let translation_join = ASTREA_LAMP_TRANSLATION_START
-            + (1.0 - ASTREA_LAMP_TRANSLATION_START) * ASTREA_LAMP_TRANSLATION_BLEND;
-        let translation_join_left = {
-            let step = 1.0e-6;
-            (translation_soft_start(translation_join)
-                - translation_soft_start(translation_join - step))
-                / step
-        };
-        let translation_join_right = {
-            let step = 1.0e-6;
-            (translation_soft_start(translation_join + step)
-                - translation_soft_start(translation_join))
-                / step
-        };
-        assert!((translation_join_left - translation_join_right).abs() < 1.0e-4);
-
-        let contraction = |value| smoothstep01(value / ASTREA_LAMP_CONTRACTION_END);
-        let contraction_slope = finite_difference_slope(&contraction, ASTREA_LAMP_CONTRACTION_END);
-        assert!(contraction_slope.abs() < 1.0e-4);
-
-        let retreat = |value| smoothstep01(value / ASTREA_LAMP_RETREAT_END);
-        let retreat_slope = finite_difference_slope(&retreat, ASTREA_LAMP_RETREAT_END);
-        assert!(retreat_slope.abs() < 1.0e-4);
-    }
-
-    #[test]
-    fn lamp_reversal_samples_the_same_frozen_geometry_function() {
-        let group = LifecycleVisualGroup::from_bounds(
-            rect(400.0, 100.0, 800.0, 600.0),
-            rect(384.0, 60.0, 832.0, 640.0),
-            rect(440.0, 140.0, 720.0, 540.0),
-            rect(1500.0, 500.0, 64.0, 64.0),
-            1920,
-            1080,
-        )
-        .expect("valid frozen Lamp visual group");
-        let points = [
-            [
-                group.presented_source_visual_rect.x(),
-                group.presented_source_visual_rect.y(),
-            ],
-            [
-                group.presented_source_visual_rect.x()
-                    + group.presented_source_visual_rect.width() * 0.37,
-                group.presented_source_visual_rect.y()
-                    + group.presented_source_visual_rect.height() * 0.61,
-            ],
-            [
-                group.presented_source_visual_rect.x() + group.presented_source_visual_rect.width(),
-                group.presented_source_visual_rect.y()
-                    + group.presented_source_visual_rect.height(),
-            ],
-        ];
-        for progress in [0.01, 0.17, 0.37, 0.73, 0.99] {
-            for point in points {
-                let minimize_sample = lamp_warp_visual_point(group, point, progress);
-                let restore_sample = lamp_warp_visual_point(group, point, progress);
-                assert_eq!(minimize_sample, restore_sample);
-            }
-        }
-    }
-
-    #[test]
-    fn lamp_funnel_moves_near_edge_before_trailing_edge() {
-        let source = rect(300.0, 200.0, 640.0, 480.0);
-        let anchor = rect(700.0, 900.0, 64.0, 64.0);
-        let channels = lamp_motion_channels(0.4, 0.0);
-        let near_edge = lamp_warp_point_directional(
-            source,
-            anchor,
-            LampDirection::Bottom,
-            0.6,
-            0.0,
-            channels,
-            [620.0, 680.0],
-        );
-        let trailing_edge = lamp_warp_point_directional(
-            source,
-            anchor,
-            LampDirection::Bottom,
-            0.6,
-            0.0,
-            channels,
-            [620.0, 200.0],
-        );
-        let near_axis_fraction = (near_edge[1] - 680.0) / (964.0 - 680.0);
-        let trailing_axis_fraction = (trailing_edge[1] - 200.0) / (900.0 - 200.0);
-        assert!(near_axis_fraction > trailing_axis_fraction);
-
-        let near_cross_fraction = (near_edge[0] - 620.0) / (732.0 - 620.0);
-        let trailing_cross_fraction = (trailing_edge[0] - 620.0) / (732.0 - 620.0);
-        assert!(near_cross_fraction > trailing_cross_fraction);
-    }
-
-    #[test]
-    fn lamp_retreat_is_bounded_overlapping_and_disabled_without_overlap() {
-        let source = rect(100.0, 100.0, 200.0, 200.0);
-        let overlapping_anchor = rect(100.0, 250.0, 64.0, 64.0);
-        let bump_distance = lamp_bump_distance(source, overlapping_anchor, LampDirection::Bottom);
-        assert_eq!(bump_distance, 50.0);
-
-        let progress = 0.15;
-        let channels = lamp_motion_channels(progress, bump_distance);
-        assert!(channels.retreat_progress > 0.0 && channels.retreat_progress < 1.0);
-        let retreated = lamp_warp_point_directional(
-            source,
-            overlapping_anchor,
-            LampDirection::Bottom,
-            0.6,
-            bump_distance,
-            channels,
-            [200.0, 300.0],
-        );
-        let without_retreat = lamp_warp_point_directional(
-            source,
-            overlapping_anchor,
-            LampDirection::Bottom,
-            0.6,
-            0.0,
-            lamp_motion_channels(progress, 0.0),
-            [200.0, 300.0],
-        );
-        assert!(retreated[1] < without_retreat[1]);
-        assert!((without_retreat[1] - retreated[1]) <= bump_distance);
-
-        let separated_anchor = rect(100.0, 500.0, 64.0, 64.0);
-        assert_eq!(
-            lamp_bump_distance(source, separated_anchor, LampDirection::Bottom),
-            0.0
-        );
-        assert_eq!(lamp_motion_channels(progress, 0.0).retreat_progress, 0.0);
-    }
-
-    #[test]
-    fn lamp_no_retreat_main_axis_motion_is_monotonic() {
-        let source = rect(300.0, 200.0, 640.0, 480.0);
-        let anchor = rect(700.0, 900.0, 64.0, 64.0);
-        for point in [[300.0, 200.0], [620.0, 440.0], [940.0, 680.0]] {
-            let mut previous = lamp_warp_point(source, anchor, point, 0.0)[1];
-            for step in 1..=100 {
-                let progress = f64::from(step) / 100.0;
-                let current = lamp_warp_point(source, anchor, point, progress)[1];
-                assert!(
-                    current + 1.0e-9 >= previous,
-                    "point {point:?} moved away from the Bottom anchor at progress {progress}"
-                );
-                previous = current;
-            }
-        }
-    }
-
-    #[test]
-    fn lamp_directional_endpoints_are_exact_for_all_output_edges() {
-        let source = rect(700.0, 400.0, 200.0, 200.0);
-        let point = [760.0, 520.0];
-        for (anchor, expected_direction) in [
-            (rect(760.0, 12.0, 64.0, 32.0), LampDirection::Top),
-            (rect(1840.0, 520.0, 64.0, 64.0), LampDirection::Right),
-            (rect(760.0, 1036.0, 64.0, 32.0), LampDirection::Bottom),
-            (rect(12.0, 520.0, 64.0, 64.0), LampDirection::Left),
-        ] {
-            let group =
-                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
-                    .expect("valid directional visual group");
-            assert_eq!(group.lamp_direction, expected_direction);
-            assert_eq!(lamp_warp_visual_point(group, point, 0.0), point);
-            let endpoint = lamp_warp_visual_point(group, point, 1.0);
-            assert_eq!(
-                endpoint,
-                [
-                    group.sink_rect.x() + 0.3 * group.sink_rect.width(),
-                    group.sink_rect.y() + 0.6 * group.sink_rect.height(),
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn lamp_direction_selection_prefers_each_output_edge() {
-        let source = rect(700.0, 400.0, 200.0, 200.0);
-        let anchors = [
-            (rect(900.0, 12.0, 64.0, 32.0), LampDirection::Top),
-            (rect(1840.0, 480.0, 64.0, 64.0), LampDirection::Right),
-            (rect(900.0, 1036.0, 64.0, 32.0), LampDirection::Bottom),
-            (rect(12.0, 480.0, 64.0, 64.0), LampDirection::Left),
-        ];
-        for (anchor, expected) in anchors {
-            let group =
-                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
-                    .expect("valid visual group");
-            assert_eq!(group.lamp_direction, expected);
-        }
-    }
-
-    #[test]
-    fn directional_warp_has_exact_endpoints_and_finite_intermediates() {
-        let source = rect(300.0, 200.0, 640.0, 480.0);
-        let anchor = rect(700.0, 900.0, 64.0, 64.0);
-        let point = [620.0, 440.0];
-        let shape = 0.4;
-        let bump = 0.0;
-        let channels = lamp_motion_channels(0.5, bump);
-        let intermediate = lamp_warp_point_directional(
-            source,
-            anchor,
-            LampDirection::Bottom,
-            shape,
-            bump,
-            channels,
-            point,
-        );
-        assert!(intermediate.into_iter().all(f64::is_finite));
-        assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
-        let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom).expect("portal");
-        let sink = lamp_sink_rect(
-            anchor,
-            portal,
-            LampDirection::Bottom,
-            ASTREA_LAMP_ABSORB_DEPTH,
-            ASTREA_LAMP_SINK_THICKNESS,
-        )
-        .expect("sink");
-        assert_eq!(
-            lamp_warp_point(source, anchor, point, 1.0),
-            [
-                sink.x() + 0.5 * sink.width(),
-                sink.y() + 0.5 * sink.height()
-            ]
-        );
-    }
-
-    #[test]
-    fn directional_warp_is_equivalent_under_axis_rotation() {
-        let bottom_source = rect(0.0, 0.0, 100.0, 100.0);
-        let bottom_anchor = rect(20.0, 150.0, 40.0, 40.0);
-        let bottom_point = [30.0, 40.0];
-        let rotated_source = rect(0.0, 0.0, 100.0, 100.0);
-        let rotated_anchor = rect(150.0, 40.0, 40.0, 40.0);
-        let rotated_point = [40.0, 70.0];
-        let shape = lamp_shape_factor(bottom_source, bottom_anchor, LampDirection::Bottom);
-        let bump = lamp_bump_distance(bottom_source, bottom_anchor, LampDirection::Bottom);
-        let channels = lamp_motion_channels(0.55, bump);
-        let bottom = lamp_warp_point_directional(
-            bottom_source,
-            bottom_anchor,
-            LampDirection::Bottom,
-            shape,
-            bump,
-            channels,
-            bottom_point,
-        );
-        let rotated = lamp_warp_point_directional(
-            rotated_source,
-            rotated_anchor,
-            LampDirection::Right,
-            shape,
-            bump,
-            channels,
-            rotated_point,
-        );
-        assert!((rotated[0] - bottom[1]).abs() < 1e-9);
-        assert!((rotated[1] - (100.0 - bottom[0])).abs() < 1e-9);
-    }
-
-    #[test]
-    fn directional_warp_handles_tiny_and_huge_geometry_without_nonfinite_values() {
-        for (source, anchor, point) in [
-            (
-                rect(0.0, 0.0, 0.001, 0.001),
-                rect(0.002, 0.002, 0.001, 0.001),
-                [0.0, 0.0],
-            ),
-            (
-                rect(-1.0e6, -1.0e6, 2.0e6, 2.0e6),
-                rect(1.0e6, 1.0e6, 1.0, 1.0),
-                [0.0, 0.0],
-            ),
-        ] {
-            let group =
-                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
-                    .expect("valid extreme visual group");
-            let warped = lamp_warp_visual_point(group, point, 0.5);
-            assert!(warped.into_iter().all(f64::is_finite));
-        }
-    }
-
-    #[test]
-    fn lamp_is_identity_at_zero_and_reaches_sink_at_one() {
-        let source = rect(100.0, 80.0, 800.0, 600.0);
-        let anchor = rect(1200.0, 900.0, 64.0, 64.0);
-        let point = [500.0, 320.0];
-
-        assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
-        let warped = lamp_warp_point(source, anchor, point, 1.0);
-        let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom).expect("portal");
-        let sink = lamp_sink_rect(
-            anchor,
-            portal,
-            LampDirection::Bottom,
-            ASTREA_LAMP_ABSORB_DEPTH,
-            ASTREA_LAMP_SINK_THICKNESS,
-        )
-        .expect("sink");
-        let expected = [
-            sink.x() + 0.5 * sink.width(),
-            sink.y() + 0.4 * sink.height(),
-        ];
-        assert_eq!(warped, expected);
-        assert_eq!(lamp_opacity(0.0), 1.0);
-        assert_eq!(lamp_opacity(1.0), 0.0);
-    }
-
-    #[test]
-    fn full_window_reference_freezes_the_presented_affine_basis() {
-        let full = rect(100.0, 100.0, 800.0, 600.0);
-        let source = rect(200.0, 160.0, 960.0, 720.0);
-        let anchor = rect(1200.0, 900.0, 64.0, 64.0);
-        let point = [500.0, 400.0];
-        assert_eq!(
-            lamp_warp_window_point(full, source, anchor, point, 0.0),
-            [680.0, 520.0]
-        );
-        assert_eq!(
-            lamp_warp_window_point(full, source, anchor, point, 1.0),
-            [1232.0, 938.4]
-        );
-    }
-
-    #[test]
-    fn lamp_is_finite_and_direction_independent_for_anchor_positions() {
-        let source = rect(300.0, 200.0, 640.0, 480.0);
-        let points = [[300.0, 200.0], [620.0, 440.0], [940.0, 680.0]];
-        let anchors = [
-            rect(500.0, 800.0, 64.0, 64.0),
-            rect(-120.0, 300.0, 64.0, 64.0),
-            rect(1100.0, 300.0, 64.0, 64.0),
-            rect(500.0, -80.0, 64.0, 64.0),
-            rect(1100.0, 800.0, 64.0, 64.0),
-        ];
-
-        for anchor in anchors {
-            for point in points {
-                let warped = lamp_warp_point(source, anchor, point, 0.5);
-                assert!(warped.into_iter().all(f64::is_finite));
-            }
-        }
-    }
-
-    #[test]
-    fn lamp_progress_and_opacity_are_monotonic() {
-        let source = rect(0.0, 0.0, 1000.0, 700.0);
-        let anchor = rect(1200.0, 800.0, 48.0, 48.0);
-        let point = [1000.0, 700.0];
-        let mut previous_distance = f64::INFINITY;
-        let mut previous_opacity = 1.0;
-
-        for step in 0..=100 {
-            let t = f64::from(step) / 100.0;
-            let warped = lamp_warp_point(source, anchor, point, t);
-            let target = [anchor.x() + anchor.width(), anchor.y() + anchor.height()];
-            let distance = (target[0] - warped[0]).hypot(target[1] - warped[1]);
-            assert!(distance <= previous_distance + 1e-9);
-            let opacity = lamp_opacity(t);
-            assert!(opacity <= previous_opacity + 1e-9);
-            previous_distance = distance;
-            previous_opacity = opacity;
-        }
-    }
-
-    #[test]
-    fn lifecycle_transition_ids_are_fresh_for_reversal() {
-        let first = LifecycleTransitionId::new(1);
-        let second = LifecycleTransitionId::new(2);
-        assert_ne!(first, second);
-        assert_ne!(first.get(), second.get());
-    }
-
-    #[test]
-    fn reversal_preserves_progress_and_rejects_stale_ack() {
-        let window = WindowId::from_raw(7).expect("valid window id");
-        let source = rect(0.0, 0.0, 800.0, 600.0);
-        let anchor = rect(1000.0, 700.0, 64.0, 64.0);
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let first = animator
-            .start_or_reverse(
-                request(window, 7, source, anchor, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("minimize starts");
-        let before = animator
-            .sample(window, AnimationTime::from_nanos(103_600_000))
-            .expect("active sample");
-        let second = animator
-            .start_or_reverse(
-                request(window, 7, source, anchor, LifecycleDirection::Restore),
-                AnimationTime::from_nanos(103_600_000),
-                1.0,
-            )
-            .expect("restore reverses");
-        let after = animator
-            .sample(window, AnimationTime::from_nanos(103_600_000))
-            .expect("reversed sample");
-
-        assert!((before.progress - 0.37).abs() < 1e-9);
-        assert_eq!(before.progress, after.progress);
-        assert_ne!(first, second);
-        assert!(!animator.acknowledge(window, first, true));
-        assert!(
-            animator
-                .sample(window, AnimationTime::from_nanos(103_600_000))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn exact_endpoint_stays_owned_until_matching_ack() {
-        let window = WindowId::from_raw(9).expect("valid window id");
-        let source = rect(20.0, 20.0, 400.0, 300.0);
-        let anchor = rect(900.0, 700.0, 48.0, 48.0);
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let transition = animator
-            .start_or_reverse(
-                request(window, 9, source, anchor, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("minimize starts");
-        let endpoint = animator.sample_scene(AnimationTime::from_nanos(280_000_000));
-        assert!(endpoint.lamps[0].mathematically_settled);
-        assert_eq!(animator.active_count(), 1);
-        assert!(animator.acknowledge(window, transition, true));
-        assert_eq!(animator.active_count(), 0);
-    }
-
-    #[test]
-    fn policy_endpoint_snap_preserves_exact_transition_ownership() {
-        let window = WindowId::from_raw(10).expect("valid window id");
-        let source = rect(20.0, 20.0, 400.0, 300.0);
-        let anchor = rect(900.0, 700.0, 48.0, 48.0);
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let transition = animator
-            .start_or_reverse(
-                request(window, 10, source, anchor, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("minimize starts");
-
-        assert!(animator.snap_to_endpoint(
-            window,
-            transition,
-            AnimationTime::from_nanos(100_000_000),
-        ));
-        let endpoint = animator
-            .sample(window, AnimationTime::from_nanos(100_000_000))
-            .expect("snapped transition remains active");
-        assert_eq!(endpoint.transition_id, transition);
-        assert_eq!(endpoint.progress, 1.0);
-        assert_eq!(endpoint.visual_group.presented_source_client_rect, source);
-        assert_eq!(endpoint.visual_group.anchor_rect, anchor);
-        assert!(endpoint.mathematically_settled);
-        assert_eq!(animator.active_count(), 1);
-        assert!(animator.acknowledge(window, transition, true));
-    }
-
-    #[test]
-    fn render_evidence_qualifies_only_consumed_transition_identities() {
-        let first_window = WindowId::from_raw(15).expect("valid window id");
-        let second_window = WindowId::from_raw(16).expect("valid window id");
-        let source = rect(0.0, 0.0, 100.0, 100.0);
-        let second_source = rect(1000.0, 1000.0, 100.0, 100.0);
-        let anchor = rect(200.0, 200.0, 10.0, 10.0);
-        let second_anchor = rect(1200.0, 1200.0, 10.0, 10.0);
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let first = animator
-            .start_or_reverse(
-                request(
-                    first_window,
-                    15,
-                    source,
-                    anchor,
-                    LifecycleDirection::Minimize,
-                ),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("first transition starts");
-        let second = animator
-            .start_or_reverse(
-                request(
-                    second_window,
-                    16,
-                    second_source,
-                    second_anchor,
-                    LifecycleDirection::Minimize,
-                ),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("second transition starts");
-        assert!(lamp_footprint_intersects_output(
-            LifecycleVisualGroup::from_bounds(source, source, source, anchor, 800, 600)
-                .expect("valid visual group"),
-            800,
-            600,
-        ));
-        assert!(!lamp_footprint_intersects_output(
-            LifecycleVisualGroup::from_bounds(
-                second_source,
-                second_source,
-                second_source,
-                second_anchor,
-                800,
-                600,
-            )
-            .expect("valid visual group"),
-            800,
-            600,
-        ));
-        let sample = animator.sample_scene(AnimationTime::from_nanos(100_000_000));
-        let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
-            window_id: first_window,
-            root_surface_id: 15,
-            transition_id: first,
-        }]);
-        let qualified = LifecycleFrameSnapshot::qualified_from_sample(&sample, &evidence);
-        assert_eq!(qualified.lamps.len(), 1);
-        assert_eq!(qualified.lamps[0].window_id, first_window);
-        assert_eq!(qualified.lamps[0].transition_id, first);
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn lamp_footprint_intersection_is_conservative_and_output_aware() {
-        let source = rect(300.0, 300.0, 20.0, 20.0);
-        let full = rect(310.0, 310.0, 30.0, 30.0);
-        let anchor = rect(330.0, 330.0, 10.0, 10.0);
-        let visual_group =
-            LifecycleVisualGroup::from_bounds(source, full, source, anchor, 400, 400)
-                .expect("valid visual group");
-        assert!(!lamp_footprint_intersects_output(visual_group, 100, 100,));
-        assert!(lamp_footprint_intersects_output(visual_group, 400, 400,));
-    }
-
-    #[test]
-    fn no_visual_change_settlement_is_separate_from_physical_ack() {
-        let window = WindowId::from_raw(17).expect("valid window id");
-        let mut animator = WindowLifecycleAnimator::new(true);
-        let transition = animator
-            .start_or_reverse(
-                request(
-                    window,
-                    17,
-                    rect(300.0, 300.0, 100.0, 100.0),
-                    rect(500.0, 500.0, 10.0, 10.0),
-                    LifecycleDirection::Minimize,
-                ),
-                AnimationTime::from_nanos(0),
-                1.0,
-            )
-            .expect("transition starts");
-        assert!(animator.settle_no_visual_change(window, transition));
-        assert_eq!(animator.active_count(), 0);
-        assert!(!animator.acknowledge(window, transition, true));
-    }
-
-    #[test]
-    fn reversal_keeps_the_original_anchor_frozen() {
-        let window = WindowId::from_raw(11).expect("valid window id");
-        let source = rect(20.0, 20.0, 400.0, 300.0);
-        let first_anchor = rect(900.0, 700.0, 48.0, 48.0);
-        let second_anchor = rect(-80.0, 400.0, 64.0, 64.0);
-        let mut animator = WindowLifecycleAnimator::new(true);
-        animator.start_or_reverse(
-            request(
-                window,
-                11,
-                source,
-                first_anchor,
-                LifecycleDirection::Minimize,
-            ),
-            AnimationTime::from_nanos(0),
-            1.0,
-        );
-        let _ = animator.start_or_reverse(
-            request(
-                window,
-                11,
-                source,
-                second_anchor,
-                LifecycleDirection::Restore,
-            ),
-            AnimationTime::from_nanos(100_000_000),
-            1.0,
-        );
-        assert_eq!(
-            animator
-                .sample(window, AnimationTime::from_nanos(100_000_000))
-                .expect("reversed sample")
-                .visual_group
-                .anchor_rect,
-            first_anchor
-        );
-    }
-
-    #[test]
-    fn speed_scales_the_linear_timeline_and_disable_snaps_to_target() {
-        let window = WindowId::from_raw(13).expect("valid window id");
-        let source = rect(20.0, 20.0, 400.0, 300.0);
-        let anchor = rect(900.0, 700.0, 48.0, 48.0);
-        let mut animator = WindowLifecycleAnimator::new(true);
-        animator
-            .start_or_reverse(
-                request(window, 13, source, anchor, LifecycleDirection::Minimize),
-                AnimationTime::from_nanos(0),
-                2.0,
-            )
-            .expect("minimize starts");
-        assert_eq!(
-            animator
-                .sample(window, AnimationTime::from_nanos(70_000_000))
-                .expect("active sample")
-                .progress,
-            0.5
-        );
-        animator.set_enabled(false, AnimationTime::from_nanos(70_000_000));
-        let endpoint = animator
-            .sample(window, AnimationTime::from_nanos(70_000_000))
-            .expect("disabled animation retains endpoint");
-        assert_eq!(endpoint.progress, 1.0);
-        assert!(endpoint.mathematically_settled);
-    }
-}
+#[path = "window_lifecycle_animation_tests.rs"]
+mod tests;

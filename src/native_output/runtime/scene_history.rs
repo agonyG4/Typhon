@@ -413,10 +413,27 @@ fn lifecycle_damage_rects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oblivion_one::window_lifecycle_animation::{
-        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
-        LifecycleVisualGroup,
+    use oblivion_one::core::SceneNodeId;
+    use oblivion_one::presentation_animation::{
+        AnimationTime, PresentationEngine, PresentationRetainedVisualIdentity,
+        PresentationRetainedVisualKind,
     };
+    use oblivion_one::window_lifecycle_animation::{
+        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleVisualGroup,
+    };
+
+    fn retained_identity(
+        window_id: oblivion_one::compositor::WindowId,
+        raw: u64,
+    ) -> PresentationRetainedVisualIdentity {
+        PresentationEngine::enabled()
+            .begin_retained_visual(
+                SceneNodeId::from_raw(window_id.get()).expect("test scene node"),
+                PresentationRetainedVisualKind::WindowLifecycle,
+                AnimationTime::from_nanos(raw),
+            )
+            .expect("test retained lifecycle identity")
+    }
 
     fn snapshot(frame_id: u64) -> NativeFrameSceneSnapshot {
         let output_id = OutputId::from_raw(1).expect("nonzero output id");
@@ -532,7 +549,10 @@ mod tests {
                 window_id: oblivion_one::compositor::WindowId::from_raw(7)
                     .expect("valid window id"),
                 root_surface_id: 7,
-                transition_id: LifecycleTransitionId::new(1),
+                presentation_identity: retained_identity(
+                    oblivion_one::compositor::WindowId::from_raw(7).expect("valid window id"),
+                    1,
+                ),
                 visual_group: LifecycleVisualGroup::from_bounds(
                     source, source, source, anchor, 1920, 1080,
                 )
@@ -597,7 +617,10 @@ mod tests {
                 window_id: oblivion_one::compositor::WindowId::from_raw(8)
                     .expect("valid window id"),
                 root_surface_id: 8,
-                transition_id: LifecycleTransitionId::new(8),
+                presentation_identity: retained_identity(
+                    oblivion_one::compositor::WindowId::from_raw(8).expect("valid window id"),
+                    8,
+                ),
                 visual_group: group,
                 progress: 0.5,
                 opacity: 1.0,

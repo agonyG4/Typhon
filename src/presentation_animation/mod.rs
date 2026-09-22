@@ -11,6 +11,7 @@ mod frame;
 mod geometry;
 mod ids;
 mod opacity;
+mod retained;
 mod time;
 mod transaction;
 
@@ -35,6 +36,10 @@ pub use ids::{
     PresentationPropertyKind, PresentationRevisionId, PresentationTransactionId, TransitionId,
 };
 pub use opacity::PresentationOpacity;
+pub use retained::{
+    PresentationRetainedVisualIdentity, PresentationRetainedVisualKind,
+    PresentationTransactionMemberKind,
+};
 pub use time::AnimationTime;
 pub use transaction::{
     PresentationClipMutation, PresentationGeometryMutation, PresentationOpacityMutation,

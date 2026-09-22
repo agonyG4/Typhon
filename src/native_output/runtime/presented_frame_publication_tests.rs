@@ -7,16 +7,28 @@ use oblivion_one::compositor::{
     SurfaceCommitSequence, SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend, WindowId,
 };
 use oblivion_one::core::{OutputId, SceneNodeId};
+use oblivion_one::presentation_animation::{
+    PresentationEngine, PresentationRetainedVisualIdentity, PresentationRetainedVisualKind,
+};
 use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use oblivion_one::window_lifecycle_animation::{
-    LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleTransitionId,
-    LifecycleVisualGroup,
+    LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleVisualGroup,
 };
 use std::process;
 use wayland_server::protocol::wl_output;
 
 const FROZEN_ROOT: u32 = 415;
 const CURRENT_ROOT: u32 = 416;
+
+fn retained_identity(window_id: WindowId, raw: u64) -> PresentationRetainedVisualIdentity {
+    PresentationEngine::enabled()
+        .begin_retained_visual(
+            SceneNodeId::from_raw(window_id.get()).expect("test scene node"),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(raw),
+        )
+        .expect("test retained lifecycle identity")
+}
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
     PresentationRect::new(x, y, width, height).expect("valid test rectangle")
@@ -98,7 +110,7 @@ fn old_physical_lifecycle_lamp(root_surface_id: u32) -> LifecycleFrameSnapshot {
         lamps: vec![LifecycleFrameLamp {
             window_id,
             root_surface_id,
-            transition_id: LifecycleTransitionId::new(1),
+            presentation_identity: retained_identity(window_id, 1),
             visual_group,
             progress: 0.5,
             opacity: 1.0,

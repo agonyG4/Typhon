@@ -1351,7 +1351,7 @@ impl OwnCompositorServer {
                 crate::window_lifecycle_animation::LifecycleRenderEvidenceEntry {
                     window_id: lamp.window_id,
                     root_surface_id: lamp.root_surface_id,
-                    transition_id: lamp.transition_id,
+                    presentation_identity: lamp.presentation_identity,
                 }
             }),
         );

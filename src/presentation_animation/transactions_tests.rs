@@ -522,7 +522,7 @@ fn geometry_opacity_and_clip_share_one_transaction_and_ack_independently() {
         transaction
             .members()
             .iter()
-            .map(|member| member.property())
+            .map(|member| member.property().expect("property transaction member"))
             .collect::<Vec<_>>(),
         [
             PresentationPropertyKind::Geometry,
@@ -1163,22 +1163,212 @@ fn transaction_member_retirement_requires_exact_revision_evidence() {
 
     assert!(!record.remove_member_exact(
         node(47),
-        PresentationPropertyKind::Geometry,
+        PresentationTransactionMemberKind::Property(PresentationPropertyKind::Geometry),
         stale_revision,
     ));
     assert_eq!(record.members().len(), 2);
     assert!(record.remove_member_exact(
         node(47),
-        PresentationPropertyKind::Geometry,
+        PresentationTransactionMemberKind::Property(PresentationPropertyKind::Geometry),
         current_revision,
     ));
     assert_eq!(record.members().len(), 1);
     assert!(record.remove_member_exact(
         node(48),
-        PresentationPropertyKind::Geometry,
+        PresentationTransactionMemberKind::Property(PresentationPropertyKind::Geometry),
         final_revision,
     ));
     assert!(record.members().is_empty());
+}
+
+#[test]
+fn retained_visuals_share_property_ids_and_are_recorded_as_transaction_members() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(901);
+    let started_at = AnimationTime::from_nanos(10);
+    let geometry = engine
+        .commit(PresentationTransactionRequest::geometry(
+            started_at,
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(10.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("geometry transaction");
+    let geometry_revision = geometry.members()[0].revision_id();
+
+    let retained = engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(20),
+        )
+        .expect("retained lifecycle identity");
+
+    assert!(retained.transaction_id().get() > geometry.id().get());
+    assert!(retained.revision_id().get() > geometry_revision.get());
+    let record = engine
+        .transaction_record(retained.transaction_id())
+        .expect("retained transaction is visible in the ledger");
+    assert_eq!(record.id(), retained.transaction_id());
+    assert_eq!(record.members().len(), 1);
+    assert_eq!(
+        record.members()[0].kind(),
+        PresentationTransactionMemberKind::RetainedVisual(
+            PresentationRetainedVisualKind::WindowLifecycle
+        )
+    );
+    assert_eq!(record.members()[0].scene_node_id(), scene_node_id);
+    assert_eq!(record.members()[0].revision_id(), retained.revision_id());
+
+    let opacity = engine
+        .commit(PresentationTransactionRequest::opacity(
+            AnimationTime::from_nanos(30),
+            vec![PresentationOpacityMutation::new(
+                scene_node_id,
+                PresentationOpacity::OPAQUE,
+                PresentationOpacity::new(0.5).expect("opacity"),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("opacity transaction");
+    assert!(opacity.id().get() > retained.transaction_id().get());
+    assert!(opacity.members()[0].revision_id().get() > retained.revision_id().get());
+}
+
+#[test]
+fn stale_retained_identity_cannot_retire_a_newer_identity_for_the_same_node() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(902);
+    let old = engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(1),
+        )
+        .expect("old retained identity");
+    assert!(engine.retire_retained_visual_exact(old));
+
+    let current = engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(2),
+        )
+        .expect("new retained identity");
+    assert!(!engine.retire_retained_visual_exact(old));
+    assert_eq!(
+        engine
+            .transaction_record(current.transaction_id())
+            .expect("new record remains")
+            .members()[0]
+            .retained_visual_identity(),
+        Some(current)
+    );
+}
+
+#[test]
+fn retained_identity_allocation_is_independent_of_property_sampling_policy() {
+    let mut engine = PresentationEngine::disabled();
+    let identity = engine
+        .begin_retained_visual(
+            node(903),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(1),
+        )
+        .expect("retained identity while property sampling is disabled");
+    engine.set_enabled(true);
+    engine.set_enabled(false);
+    assert_eq!(engine.transaction_count(), 1);
+    assert!(engine.retire_retained_visual_exact(identity));
+    assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
+fn property_cancel_all_leaves_retained_lifecycle_members_explicitly_owned() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(903);
+    let property = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(10.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(10), EasingCurve::Linear),
+            )],
+        ))
+        .expect("geometry transaction");
+    let retained = engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(1),
+        )
+        .expect("retained lifecycle identity");
+
+    engine.cancel_all(scene_node_id);
+
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 1);
+    assert!(engine.transaction_record(property.id()).is_none());
+    assert_eq!(
+        engine
+            .transaction_record(retained.transaction_id())
+            .expect("retained member stays active")
+            .members()[0]
+            .retained_visual_identity(),
+        Some(retained)
+    );
+}
+
+#[test]
+fn retained_identity_exhaustion_does_not_insert_partial_members() {
+    let mut engine = PresentationEngine::enabled();
+    engine.set_next_ids_for_test(NonZeroU64::MAX, NonZeroU64::MIN);
+    let final_transaction = engine
+        .begin_retained_visual(
+            node(904),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(1),
+        )
+        .expect("final transaction id is allocatable");
+    assert_eq!(final_transaction.transaction_id().get(), u64::MAX);
+    assert_eq!(engine.transaction_count(), 1);
+    assert_eq!(
+        engine.begin_retained_visual(
+            node(904),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(2),
+        ),
+        Err(PresentationTransactionError::TransactionIdExhausted)
+    );
+    assert_eq!(engine.transaction_count(), 1);
+
+    engine.set_next_ids_for_test(
+        NonZeroU64::new(50).expect("transaction id"),
+        NonZeroU64::MAX,
+    );
+    let final_revision = engine
+        .begin_retained_visual(
+            node(904),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(3),
+        )
+        .expect("final revision is allocatable");
+    assert_eq!(final_revision.revision_id().get(), u64::MAX);
+    assert_eq!(engine.transaction_count(), 2);
+    assert_eq!(
+        engine.begin_retained_visual(
+            node(905),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(4),
+        ),
+        Err(PresentationTransactionError::RevisionIdExhausted)
+    );
+    assert_eq!(engine.transaction_count(), 2);
 }
 
 #[test]

@@ -2,7 +2,8 @@ use crate::core::SceneNodeId;
 
 use super::{
     AnimationCurve, AnimationTime, PresentationClip, PresentationClipRect, PresentationOpacity,
-    PresentationPropertyKind, PresentationRect, PresentationRevisionId, PresentationTransactionId,
+    PresentationPropertyKind, PresentationRect, PresentationRetainedVisualIdentity,
+    PresentationRevisionId, PresentationTransactionId, PresentationTransactionMemberKind,
     PresentationVelocity,
 };
 
@@ -222,7 +223,7 @@ pub enum PresentationTransactionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentationTransactionMember {
     scene_node_id: SceneNodeId,
-    property: PresentationPropertyKind,
+    kind: PresentationTransactionMemberKind,
     transaction_id: PresentationTransactionId,
     revision_id: PresentationRevisionId,
 }
@@ -236,9 +237,18 @@ impl PresentationTransactionMember {
     ) -> Self {
         Self {
             scene_node_id,
-            property,
+            kind: PresentationTransactionMemberKind::Property(property),
             transaction_id,
             revision_id,
+        }
+    }
+
+    pub(crate) const fn retained_visual(identity: PresentationRetainedVisualIdentity) -> Self {
+        Self {
+            scene_node_id: identity.scene_node_id(),
+            kind: PresentationTransactionMemberKind::RetainedVisual(identity.kind()),
+            transaction_id: identity.transaction_id(),
+            revision_id: identity.revision_id(),
         }
     }
 
@@ -246,8 +256,29 @@ impl PresentationTransactionMember {
         self.scene_node_id
     }
 
-    pub const fn property(self) -> PresentationPropertyKind {
-        self.property
+    pub const fn kind(self) -> PresentationTransactionMemberKind {
+        self.kind
+    }
+
+    pub const fn property(self) -> Option<PresentationPropertyKind> {
+        match self.kind {
+            PresentationTransactionMemberKind::Property(property) => Some(property),
+            PresentationTransactionMemberKind::RetainedVisual(_) => None,
+        }
+    }
+
+    pub const fn retained_visual_identity(self) -> Option<PresentationRetainedVisualIdentity> {
+        match self.kind {
+            PresentationTransactionMemberKind::Property(_) => None,
+            PresentationTransactionMemberKind::RetainedVisual(kind) => {
+                Some(PresentationRetainedVisualIdentity::new(
+                    self.scene_node_id,
+                    kind,
+                    self.transaction_id,
+                    self.revision_id,
+                ))
+            }
+        }
     }
 
     pub const fn transaction_id(self) -> PresentationTransactionId {
@@ -294,16 +325,23 @@ impl PresentationTransactionRecord {
     pub(crate) fn remove_member_exact(
         &mut self,
         scene_node_id: SceneNodeId,
-        property: PresentationPropertyKind,
+        kind: PresentationTransactionMemberKind,
         revision_id: PresentationRevisionId,
     ) -> bool {
         let original_len = self.members.len();
         self.members.retain(|member| {
             !(member.scene_node_id == scene_node_id
-                && member.property == property
+                && member.kind == kind
                 && member.revision_id == revision_id)
         });
         self.members.len() != original_len
+    }
+
+    pub(crate) fn retain_members(
+        &mut self,
+        mut predicate: impl FnMut(&PresentationTransactionMember) -> bool,
+    ) {
+        self.members.retain(|member| predicate(member));
     }
 }
 

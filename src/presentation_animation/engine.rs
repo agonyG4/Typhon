@@ -13,8 +13,9 @@ use super::{
     PresentationClipTransitionEvidence, PresentationGeometryTransform, PresentationGroupClip,
     PresentationGroupOpacity, PresentationGroupTransform, PresentationOpacity,
     PresentationOpacityTransitionEvidence, PresentationPropertyKind, PresentationRect,
-    PresentationRevisionId, PresentationSampleTimeSource, PresentationSceneSample,
-    PresentationTransactionError, PresentationTransactionId, PresentationTransactionMember,
+    PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
+    PresentationSampleTimeSource, PresentationSceneSample, PresentationTransactionError,
+    PresentationTransactionId, PresentationTransactionMember, PresentationTransactionMemberKind,
     PresentationTransactionRecord, PresentationTransactionRequest, PresentationVelocity,
     PresentationWindowSample, PresentationWindowTarget, PresentedClipAck, PresentedGeometryAck,
     PresentedOpacityAck,
@@ -376,7 +377,16 @@ impl PresentationEngine {
             self.geometry_tracks.clear();
             self.opacity_tracks.clear();
             self.clip_tracks.clear();
-            self.transactions.clear();
+            for record in self.transactions.values_mut() {
+                record.retain_members(|member| {
+                    matches!(
+                        member.kind(),
+                        PresentationTransactionMemberKind::RetainedVisual(_)
+                    )
+                });
+            }
+            self.transactions
+                .retain(|_, record| !record.members().is_empty());
         }
     }
 
@@ -514,11 +524,11 @@ impl PresentationEngine {
             return Err(PresentationTransactionError::Empty);
         }
 
-        let transaction_id = self.peek_transaction_id()?;
         let geometry_count = prepared_geometry.len();
         let opacity_count = prepared_opacity.len();
         let member_count = geometry_count + opacity_count + prepared_clip.len();
-        let revision_ids = self.peek_revision_ids(member_count)?;
+        let (transaction_id, revision_ids) =
+            self.allocate_transaction_and_revisions(member_count)?;
         let mut revision_ids_iter = revision_ids.iter().copied();
         let mut members = Vec::with_capacity(member_count);
         for mutation in &prepared_geometry {
@@ -547,23 +557,6 @@ impl PresentationEngine {
         }
         let record =
             PresentationTransactionRecord::new(transaction_id, request.started_at, members);
-
-        if transaction_id.get() == u64::MAX {
-            self.transaction_ids_exhausted = true;
-        } else {
-            self.next_transaction_id =
-                NonZeroU64::new(transaction_id.get() + 1).expect("increment remains nonzero");
-        }
-        let last_revision = revision_ids
-            .last()
-            .expect("prepared transaction is nonempty")
-            .get();
-        if last_revision == u64::MAX {
-            self.revision_ids_exhausted = true;
-        } else {
-            self.next_revision_id =
-                NonZeroU64::new(last_revision + 1).expect("increment remains nonzero");
-        }
 
         for (mutation, revision_id) in prepared_geometry
             .into_iter()
@@ -687,6 +680,59 @@ impl PresentationEngine {
             .saturating_add(record.members().len() as u64);
         self.metrics.active_tracks = self.active_count() as u64;
         Ok(record)
+    }
+
+    /// Allocate one retained visual identity in the shared transaction and
+    /// revision namespace, independent of property sampling policy.
+    pub fn begin_retained_visual(
+        &mut self,
+        scene_node_id: SceneNodeId,
+        kind: PresentationRetainedVisualKind,
+        started_at: AnimationTime,
+    ) -> Result<PresentationRetainedVisualIdentity, PresentationTransactionError> {
+        let (transaction_id, mut revision_ids) = self.allocate_transaction_and_revisions(1)?;
+        let revision_id = revision_ids.pop().expect("one revision was reserved");
+        let identity = PresentationRetainedVisualIdentity::new(
+            scene_node_id,
+            kind,
+            transaction_id,
+            revision_id,
+        );
+        let record = PresentationTransactionRecord::new(
+            transaction_id,
+            started_at,
+            vec![PresentationTransactionMember::retained_visual(identity)],
+        );
+        self.transactions.insert(transaction_id, record);
+        Ok(identity)
+    }
+
+    /// Retire one exact retained visual member without affecting property
+    /// members or a newer identity for the same SceneNode.
+    pub fn retire_retained_visual_exact(
+        &mut self,
+        identity: PresentationRetainedVisualIdentity,
+    ) -> bool {
+        let transaction_id = identity.transaction_id();
+        let Some(record) = self.transactions.get_mut(&transaction_id) else {
+            return false;
+        };
+        let removed = record.remove_member_exact(
+            identity.scene_node_id(),
+            PresentationTransactionMemberKind::RetainedVisual(identity.kind()),
+            identity.revision_id(),
+        );
+        if record.members().is_empty() {
+            self.transactions.remove(&transaction_id);
+        }
+        removed
+    }
+
+    pub fn transaction_record(
+        &self,
+        transaction_id: PresentationTransactionId,
+    ) -> Option<&PresentationTransactionRecord> {
+        self.transactions.get(&transaction_id)
     }
 
     pub(crate) fn cancel_geometry(&mut self, scene_node_id: SceneNodeId) {
@@ -1239,6 +1285,35 @@ impl PresentationEngine {
         Ok(revisions)
     }
 
+    fn allocate_transaction_and_revisions(
+        &mut self,
+        revision_count: usize,
+    ) -> Result<
+        (PresentationTransactionId, Vec<PresentationRevisionId>),
+        PresentationTransactionError,
+    > {
+        debug_assert!(revision_count > 0);
+        let transaction_id = self.peek_transaction_id()?;
+        let revision_ids = self.peek_revision_ids(revision_count)?;
+        if transaction_id.get() == u64::MAX {
+            self.transaction_ids_exhausted = true;
+        } else {
+            self.next_transaction_id =
+                NonZeroU64::new(transaction_id.get() + 1).expect("increment remains nonzero");
+        }
+        let last_revision = revision_ids
+            .last()
+            .expect("at least one revision is reserved")
+            .get();
+        if last_revision == u64::MAX {
+            self.revision_ids_exhausted = true;
+        } else {
+            self.next_revision_id =
+                NonZeroU64::new(last_revision + 1).expect("increment remains nonzero");
+        }
+        Ok((transaction_id, revision_ids))
+    }
+
     fn remove_transaction_member(
         &mut self,
         transaction_id: PresentationTransactionId,
@@ -1247,7 +1322,11 @@ impl PresentationEngine {
         revision_id: PresentationRevisionId,
     ) {
         if let Some(record) = self.transactions.get_mut(&transaction_id) {
-            record.remove_member_exact(scene_node_id, property, revision_id);
+            record.remove_member_exact(
+                scene_node_id,
+                PresentationTransactionMemberKind::Property(property),
+                revision_id,
+            );
             if record.members().is_empty() {
                 self.transactions.remove(&transaction_id);
             }

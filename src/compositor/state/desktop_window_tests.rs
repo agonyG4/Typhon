@@ -21,7 +21,11 @@ use std::fs::File;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X11WindowSnapshot {
+pub(super) fn x11_snapshot(
+    generation: XwaylandGeneration,
+    xid: u32,
+    surface_id: u32,
+) -> X11WindowSnapshot {
     X11WindowSnapshot {
         handle: X11WindowHandle::new(generation, xid),
         surface_id,
@@ -55,7 +59,7 @@ fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X1
     }
 }
 
-fn insert_x11(state: &mut CompositorState, snapshot: X11WindowSnapshot) -> WindowId {
+pub(super) fn insert_x11(state: &mut CompositorState, snapshot: X11WindowSnapshot) -> WindowId {
     let id = state.allocate_window_id().expect("window id");
     state
         .insert_desktop_window(DesktopWindow::new_x11(id, snapshot))

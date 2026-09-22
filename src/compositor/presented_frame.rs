@@ -53,13 +53,15 @@ mod tests {
     use crate::core::{OutputId, SceneNodeId, WindowId};
     use crate::presentation_animation::{
         AnimationCurve, AnimationTime, EasingCurve, PresentationClip, PresentationClipMutation,
-        PresentationClipRect, PresentationFrameSnapshot, PresentationGeometryMutation,
-        PresentationOpacity, PresentationOpacityMutation, PresentationSampleTimeSource,
-        PresentationTransactionRequest, PresentationWindowTarget,
+        PresentationClipRect, PresentationEngine, PresentationFrameSnapshot,
+        PresentationGeometryMutation, PresentationOpacity, PresentationOpacityMutation,
+        PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
+        PresentationSampleTimeSource, PresentationTransactionId, PresentationTransactionRequest,
+        PresentationWindowTarget,
     };
     use crate::window_lifecycle_animation::{
-        LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleTransitionId,
-        LifecycleTransitionRequest, LifecycleVisualGroup,
+        LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleTransitionRequest,
+        LifecycleVisualGroup,
     };
     use std::time::Duration;
 
@@ -89,13 +91,13 @@ mod tests {
     fn lifecycle_snapshot(
         window_id: WindowId,
         root_surface_id: u32,
-        transition_id: LifecycleTransitionId,
+        presentation_identity: PresentationRetainedVisualIdentity,
         direction: LifecycleDirection,
     ) -> LifecycleFrameSnapshot {
         lifecycle_snapshot_with_settlement(
             window_id,
             root_surface_id,
-            transition_id,
+            presentation_identity,
             direction,
             true,
         )
@@ -104,7 +106,7 @@ mod tests {
     fn lifecycle_snapshot_with_settlement(
         window_id: WindowId,
         root_surface_id: u32,
-        transition_id: LifecycleTransitionId,
+        presentation_identity: PresentationRetainedVisualIdentity,
         direction: LifecycleDirection,
         mathematically_settled: bool,
     ) -> LifecycleFrameSnapshot {
@@ -113,7 +115,7 @@ mod tests {
             lamps: vec![LifecycleFrameLamp {
                 window_id,
                 root_surface_id,
-                transition_id,
+                presentation_identity,
                 visual_group: lifecycle_visual_group(),
                 progress: if direction == LifecycleDirection::Restore {
                     0.0
@@ -131,17 +133,36 @@ mod tests {
     }
 
     fn lifecycle_request(
+        presentation_engine: &mut PresentationEngine,
         window_id: WindowId,
         root_surface_id: u32,
         direction: LifecycleDirection,
     ) -> LifecycleTransitionRequest {
+        let scene_node_id = SceneNodeId::from_raw(window_id.get()).expect("test scene node");
+        let presentation_identity = presentation_engine
+            .begin_retained_visual(
+                scene_node_id,
+                PresentationRetainedVisualKind::WindowLifecycle,
+                AnimationTime::from_nanos(0),
+            )
+            .expect("test retained lifecycle identity");
         LifecycleTransitionRequest {
+            presentation_identity,
             window_id,
             root_surface_id,
             visual_group: lifecycle_visual_group(),
             direction,
             resolved_effect_scene: ResolvedEffectScene::default(),
         }
+    }
+
+    fn historical_identity(window_id: WindowId, raw: u64) -> PresentationRetainedVisualIdentity {
+        PresentationRetainedVisualIdentity::new(
+            SceneNodeId::from_raw(window_id.get()).expect("test scene node"),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            PresentationTransactionId::from_raw(raw).expect("test transaction id"),
+            PresentationRevisionId::from_raw(raw).expect("test revision id"),
+        )
     }
 
     fn presentation_request(
@@ -210,7 +231,10 @@ mod tests {
         let existing_lifecycle = lifecycle_snapshot(
             WindowId::from_raw(700).expect("existing physical window id"),
             700,
-            LifecycleTransitionId::new(70),
+            historical_identity(
+                WindowId::from_raw(700).expect("existing physical window id"),
+                70,
+            ),
             LifecycleDirection::Minimize,
         );
 
@@ -258,7 +282,12 @@ mod tests {
         let restore_id = state
             .window_lifecycle_animator
             .start_or_reverse(
-                lifecycle_request(restore_window, restore_root, LifecycleDirection::Restore),
+                lifecycle_request(
+                    &mut state.presentation_animator,
+                    restore_window,
+                    restore_root,
+                    LifecycleDirection::Restore,
+                ),
                 AnimationTime::from_nanos(0),
                 1.0,
             )
@@ -309,11 +338,14 @@ mod tests {
         );
         assert_eq!(state.presented_lifecycle, previous_lifecycle);
         assert_eq!(state.presentation_animator.active_count(), 3);
-        assert_eq!(state.presentation_animator.transaction_count(), 1);
+        assert_eq!(state.presentation_animator.transaction_count(), 2);
         assert!(
             state
                 .window_lifecycle_animator
-                .sample(restore_window, AnimationTime::from_nanos(280_000_000))
+                .sample(
+                    restore_id.scene_node_id(),
+                    AnimationTime::from_nanos(280_000_000)
+                )
                 .is_some()
         );
         assert!(
@@ -342,7 +374,7 @@ mod tests {
         let old_physical_lifecycle = lifecycle_snapshot_with_settlement(
             WindowId::from_raw(901).expect("old physical window id"),
             901,
-            LifecycleTransitionId::new(91),
+            historical_identity(WindowId::from_raw(901).expect("old physical window id"), 91),
             LifecycleDirection::Minimize,
             false,
         );
@@ -462,7 +494,12 @@ mod tests {
         let transition_id = state
             .window_lifecycle_animator
             .start_or_reverse(
-                lifecycle_request(window_id, root_surface_id, LifecycleDirection::Restore),
+                lifecycle_request(
+                    &mut state.presentation_animator,
+                    window_id,
+                    root_surface_id,
+                    LifecycleDirection::Restore,
+                ),
                 AnimationTime::from_nanos(0),
                 1.0,
             )
@@ -486,7 +523,7 @@ mod tests {
         let endpoint_time = AnimationTime::from_nanos(280_000_000);
         let endpoint = state
             .window_lifecycle_animator
-            .sample(window_id, endpoint_time)
+            .sample(transition_id.scene_node_id(), endpoint_time)
             .expect("mathematical restore endpoint");
         assert!(endpoint.mathematically_settled);
         assert!(
@@ -512,7 +549,7 @@ mod tests {
         assert!(
             state
                 .window_lifecycle_animator
-                .sample(window_id, endpoint_time)
+                .sample(transition_id.scene_node_id(), endpoint_time)
                 .is_none()
         );
         assert!(
@@ -524,7 +561,7 @@ mod tests {
         assert_eq!(state.presented_presentation_frame_id(), 12);
         assert_eq!(state.presented_lifecycle_frame_id(), 12);
         assert_eq!(
-            state.presented_lifecycle.lamps[0].transition_id,
+            state.presented_lifecycle.lamps[0].presentation_identity,
             transition_id
         );
     }
@@ -538,7 +575,12 @@ mod tests {
         let first = state
             .window_lifecycle_animator
             .start_or_reverse(
-                lifecycle_request(window_id, root_surface_id, LifecycleDirection::Minimize),
+                lifecycle_request(
+                    &mut state.presentation_animator,
+                    window_id,
+                    root_surface_id,
+                    LifecycleDirection::Minimize,
+                ),
                 AnimationTime::from_nanos(0),
                 1.0,
             )
@@ -546,12 +588,34 @@ mod tests {
         let active = state
             .window_lifecycle_animator
             .start_or_reverse(
-                lifecycle_request(window_id, root_surface_id, LifecycleDirection::Restore),
+                lifecycle_request(
+                    &mut state.presentation_animator,
+                    window_id,
+                    root_surface_id,
+                    LifecycleDirection::Restore,
+                ),
                 AnimationTime::from_nanos(1),
                 1.0,
             )
             .expect("reversal starts");
         assert_ne!(first, active);
+        assert!(
+            state
+                .presentation_animator
+                .retire_retained_visual_exact(first)
+        );
+        assert!(
+            state
+                .presentation_animator
+                .transaction_record(first.transaction_id())
+                .is_none()
+        );
+        assert!(
+            state
+                .presentation_animator
+                .transaction_record(active.transaction_id())
+                .is_some()
+        );
         let presentation = PresentationFrameSnapshot::empty_for_output(output_id);
         let stale = lifecycle_snapshot(
             window_id,
@@ -571,10 +635,19 @@ mod tests {
         assert_eq!(
             state
                 .window_lifecycle_animator
-                .sample(window_id, AnimationTime::from_nanos(280_000_000))
+                .sample(
+                    active.scene_node_id(),
+                    AnimationTime::from_nanos(280_000_000)
+                )
                 .expect("new reversal remains active")
-                .transition_id,
+                .presentation_identity,
             active
+        );
+        assert!(
+            state
+                .presentation_animator
+                .transaction_record(active.transaction_id())
+                .is_some()
         );
 
         let exact = lifecycle_snapshot(
@@ -594,7 +667,16 @@ mod tests {
         assert!(
             state
                 .window_lifecycle_animator
-                .sample(window_id, AnimationTime::from_nanos(280_000_000))
+                .sample(
+                    active.scene_node_id(),
+                    AnimationTime::from_nanos(280_000_000)
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .presentation_animator
+                .transaction_record(active.transaction_id())
                 .is_none()
         );
     }

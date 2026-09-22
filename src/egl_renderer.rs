@@ -601,7 +601,10 @@ pub(crate) struct GlesSceneRenderer {
     lifecycle_source_vertices: HashMap<compositor::WindowId, Vec<EglTexturedVertex>>,
     lifecycle_source_commands: HashMap<compositor::WindowId, Vec<EglDrawCommand>>,
     lifecycle_visual_resources: HashMap<compositor::WindowId, LifecycleResolvedVisualResource>,
-    lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
+    lifecycle_visual_sources: HashMap<
+        oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        LifecycleVisualSource,
+    >,
     lamp_samples: Vec<LampWindowSample>,
     lifecycle_render_evidence: LifecycleRenderEvidence,
     lifecycle_render_fallbacks: LifecycleRenderFallbacks,
@@ -668,7 +671,10 @@ struct CaptureRendererState {
     lifecycle_render_evidence: LifecycleRenderEvidence,
     lifecycle_render_fallbacks: LifecycleRenderFallbacks,
     lamp_samples: Vec<LampWindowSample>,
-    lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
+    lifecycle_visual_sources: HashMap<
+        oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        LifecycleVisualSource,
+    >,
     failed_surface_generations: HashMap<u32, u64>,
     active_output_framebuffer: Option<glow::Framebuffer>,
     active_output_texture: Option<glow::Texture>,
@@ -945,7 +951,12 @@ fn lamp_geometry_key(
         for value in [
             lamp.window_id.get(),
             u64::from(lamp.root_surface_id),
-            lamp.transition_id.get(),
+            lamp.presentation_identity.scene_node_id().get(),
+            match lamp.presentation_identity.kind() {
+                oblivion_one::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle => 1,
+            },
+            lamp.presentation_identity.transaction_id().get(),
+            lamp.presentation_identity.revision_id().get(),
             lamp.visual_group.canonical_client_rect.x().to_bits(),
             lamp.visual_group.canonical_client_rect.y().to_bits(),
             lamp.visual_group.canonical_client_rect.width().to_bits(),
@@ -997,7 +1008,10 @@ fn lamp_geometry_key(
         ] {
             mix(value);
         }
-        if let Some(source) = lifecycle.visual_source_for_window(lamp.window_id) {
+        if let Some(source) = lifecycle
+            .visual_source_for_identity(lamp.presentation_identity)
+            .filter(|source| source.root_surface_id == lamp.root_surface_id)
+        {
             mix(match source.kind {
                 LifecycleVisualSourceKind::NoOwnedEffects => 1,
                 LifecycleVisualSourceKind::ResolvedOwnedEffects => 2,
@@ -1859,7 +1873,7 @@ impl GlesSceneRenderer {
                 .visual_sources
                 .iter()
                 .cloned()
-                .map(|source| (source.window_id, source)),
+                .map(|source| (source.presentation_identity, source)),
         );
         let output_scale_key = compositor::output_scale_key(output_scale);
         let mut scaled_visual_state =
@@ -3474,7 +3488,8 @@ impl GlesSceneRenderer {
             compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
         for lamp in lifecycle.lamps.iter().copied() {
             let resolved_source = lifecycle
-                .visual_source_for_window(lamp.window_id)
+                .visual_source_for_identity(lamp.presentation_identity)
+                .filter(|source| source.root_surface_id == lamp.root_surface_id)
                 .filter(|source| source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects);
             if let Some(source) = resolved_source {
                 let mut vertices = Vec::new();
@@ -3690,7 +3705,10 @@ impl GlesSceneRenderer {
             let Some(lamp) = self
                 .lamp_samples
                 .iter()
-                .find(|sample| sample.window_id == source.window_id)
+                .find(|sample| {
+                    sample.presentation_identity == source.presentation_identity
+                        && sample.root_surface_id == source.root_surface_id
+                })
                 .copied()
             else {
                 continue;
@@ -3769,7 +3787,7 @@ impl GlesSceneRenderer {
             .record(LifecycleRenderFallbackEntry {
                 window_id: lamp.window_id,
                 root_surface_id: lamp.root_surface_id,
-                transition_id: lamp.transition_id,
+                presentation_identity: lamp.presentation_identity,
                 reason,
             });
     }
@@ -3881,12 +3899,10 @@ impl GlesSceneRenderer {
             .keys()
             .copied()
             .filter(|window_id| {
-                !self
-                    .lifecycle_visual_sources
-                    .get(window_id)
-                    .is_some_and(|source| {
-                        source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects
-                    })
+                !self.lifecycle_visual_sources.values().any(|source| {
+                    source.window_id == *window_id
+                        && source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects
+                })
             })
             .collect::<Vec<_>>();
         for window_id in stale {
@@ -4077,7 +4093,7 @@ impl GlesSceneRenderer {
                 .record(LifecycleRenderEvidenceEntry {
                     window_id: sample.window_id,
                     root_surface_id: sample.root_surface_id,
-                    transition_id: sample.transition_id,
+                    presentation_identity: sample.presentation_identity,
                 });
         }
         self.frame_stats.missing_required_decoration_resources = self
@@ -4109,11 +4125,9 @@ impl GlesSceneRenderer {
             .iter()
             .copied()
             .filter(|lamp| {
-                !self.lifecycle_render_evidence.contains(
-                    lamp.window_id,
-                    lamp.root_surface_id,
-                    lamp.transition_id,
-                )
+                !self
+                    .lifecycle_render_evidence
+                    .contains(lamp.presentation_identity, lamp.root_surface_id)
             })
             .filter(|lamp| self.lamp_intersects_current_output(lamp))
             .collect::<Vec<_>>();
@@ -6996,6 +7010,7 @@ mod tests {
         RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitCounter, SurfaceCommitSequence,
         SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
     };
+    use oblivion_one::core::SceneNodeId;
     use oblivion_one::effects::{
         CompiledFrameGraph, CompiledRenderPass, CustomFragmentSpec, DualKawaseBlurSpec,
         EffectAlphaMode, EffectColorConversion, EffectFailurePolicy, EffectFootprint,
@@ -7006,16 +7021,30 @@ mod tests {
         validate_effect_program,
     };
     use oblivion_one::presentation_animation::{
-        AnimationTime, PresentationGroupOpacity, PresentationOpacity, PresentationRect,
+        AnimationTime, PresentationEngine, PresentationGroupOpacity, PresentationOpacity,
+        PresentationRect, PresentationRetainedVisualIdentity, PresentationRetainedVisualKind,
     };
     use oblivion_one::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
         DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
     use oblivion_one::window_lifecycle_animation::{
-        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
-        LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind,
+        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleVisualGroup,
+        LifecycleVisualSource, LifecycleVisualSourceKind,
     };
+
+    fn test_lifecycle_identity(
+        window_id: oblivion_one::compositor::WindowId,
+        started_at: u64,
+    ) -> PresentationRetainedVisualIdentity {
+        PresentationEngine::enabled()
+            .begin_retained_visual(
+                SceneNodeId::from_raw(window_id.get()).expect("test scene node"),
+                PresentationRetainedVisualKind::WindowLifecycle,
+                AnimationTime::from_nanos(started_at),
+            )
+            .expect("test retained identity")
+    }
 
     mod presentation_clip;
 
@@ -12366,7 +12395,10 @@ mod tests {
                 window_id: oblivion_one::compositor::WindowId::from_raw(1)
                     .expect("valid window id"),
                 root_surface_id: 1,
-                transition_id: LifecycleTransitionId::new(1),
+                presentation_identity: test_lifecycle_identity(
+                    oblivion_one::compositor::WindowId::from_raw(1).expect("valid window id"),
+                    1,
+                ),
                 visual_group: LifecycleVisualGroup::from_bounds(
                     rect, rect, rect, anchor, 1920, 1080,
                 )
@@ -12623,7 +12655,10 @@ mod tests {
             window_id: oblivion_one::compositor::WindowId::from_raw(1)
                 .expect("valid lifecycle window ID"),
             root_surface_id: 1,
-            transition_id: LifecycleTransitionId::new(1),
+            presentation_identity: test_lifecycle_identity(
+                oblivion_one::compositor::WindowId::from_raw(1).expect("valid lifecycle window ID"),
+                1,
+            ),
             kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
             effect_scene: std::sync::Arc::new(
                 oblivion_one::compositor::ResolvedEffectScene::default(),
@@ -13178,7 +13213,7 @@ mod tests {
             lamps: vec![LampWindowSample {
                 window_id,
                 root_surface_id: 42,
-                transition_id: LifecycleTransitionId::new(1),
+                presentation_identity: test_lifecycle_identity(window_id, 1),
                 visual_group: group,
                 progress: 0.5,
                 opacity: 1.0,
