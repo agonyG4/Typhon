@@ -76,6 +76,28 @@ substantially less measured GPU time. With checkpoint blit removed, the
 remaining heavy frames were dominated by large Replay work, Kawase, and
 Composite.
 
+## Repaint provenance trace
+
+With `TYPHON_EFFECT_EXEC_TRACE=1`, each rendered frame emits one bounded
+`event=effect_repaint_provenance` record keyed by `frame_id`. It snapshots the
+sequential pipeline stages: input damage authority, resolved scene damage,
+effect graph merged damage, the initial repaint plan, and the final repaint
+plan after effect execution resolution. Damage kinds use `none`, `empty`,
+`rects`, and `full`; an unrepresentable pixel total uses the existing
+`u64::MAX` telemetry sentinel.
+
+`first_full_stage` names the first of those observed stages whose
+representation is full-output. It describes where full-output first appears
+in this pipeline and does not establish the ultimate source of the underlying
+damage. `promoted_to_full` records whether the initial plan was non-full and
+the final plan was full.
+
+Join this record with `effect_demand_plan_begin` and `effect_demand_plan_end`
+using `frame_id` for the existing detailed demand and repair evidence. Join with
+`effect_gpu_timing` by `frame_id` as well; GPU timing results are asynchronous
+and retain the source frame identifier. The provenance event does not duplicate
+demand-plan metrics or add GPU queries.
+
 ## GLES effect GPU timing
 
 GPU effect timing is a separate opt-in instrumentation capability. Enable it

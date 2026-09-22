@@ -50,8 +50,9 @@ pub(crate) use shader_cache::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
 };
 pub(crate) use trace::{
-    CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
-    EffectDebugKawaseMode, EffectExecutionTrace, FrameTraceSummary, PassTraceSummary,
+    CapturePathFallbackReason, CheckpointCapturePath, DamageTraceSnapshot, EffectDebugCaptureMode,
+    EffectDebugConfig, EffectDebugKawaseMode, EffectExecutionTrace,
+    EffectRepaintProvenanceSnapshot, FrameTraceSummary, PassTraceSummary, RepaintPlanTraceSnapshot,
     effect_debug_config,
 };
 #[cfg(test)]

@@ -3,6 +3,8 @@ use std::{collections::HashMap, ffi::OsStr, sync::OnceLock};
 #[cfg(test)]
 use std::cell::RefCell;
 
+use crate::egl_renderer::damage::{FullRepaintReason, OutputDamage, RepaintMode, RepaintPlan};
+
 use oblivion_one::effects::{
     CompiledFrameGraph, CompiledRenderPass, EffectDemandPlanStats, GraphTextureId,
     GraphTextureSource, RenderPassKind,
@@ -250,6 +252,208 @@ pub(crate) struct FrameTraceSummary {
     pub(crate) demand_plan: Option<EffectDemandPlanStats>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DamageTraceKind {
+    None,
+    Empty,
+    Rects,
+    Full,
+}
+
+impl DamageTraceKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Empty => "empty",
+            Self::Rects => "rects",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DamageTraceSnapshot {
+    pub(crate) kind: DamageTraceKind,
+    pub(crate) rects: usize,
+    pub(crate) pixels: u64,
+}
+
+impl DamageTraceSnapshot {
+    pub(crate) fn from_optional(
+        damage: Option<&OutputDamage>,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        damage.map_or(
+            Self {
+                kind: DamageTraceKind::None,
+                rects: 0,
+                pixels: 0,
+            },
+            |damage| Self::from_damage(damage, output_width, output_height),
+        )
+    }
+
+    pub(crate) fn from_damage(
+        damage: &OutputDamage,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        let kind = match damage {
+            OutputDamage::Empty => DamageTraceKind::Empty,
+            OutputDamage::Rects(_) => DamageTraceKind::Rects,
+            OutputDamage::Full => DamageTraceKind::Full,
+        };
+        Self {
+            kind,
+            rects: damage.rect_count(),
+            pixels: damage
+                .pixels(output_width, output_height)
+                .unwrap_or(u64::MAX),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RepaintPlanTraceSnapshot {
+    pub(crate) mode: RepaintMode,
+    pub(crate) fallback_reason: Option<FullRepaintReason>,
+    pub(crate) buffer_age: Option<u32>,
+    pub(crate) render_damage: DamageTraceSnapshot,
+    pub(crate) repair_damage: DamageTraceSnapshot,
+}
+
+impl RepaintPlanTraceSnapshot {
+    pub(crate) fn from_plan(plan: &RepaintPlan, output_width: u32, output_height: u32) -> Self {
+        Self {
+            mode: plan.mode,
+            fallback_reason: plan.fallback_reason,
+            buffer_age: plan.buffer_age,
+            render_damage: DamageTraceSnapshot::from_damage(
+                &plan.render_damage,
+                output_width,
+                output_height,
+            ),
+            repair_damage: DamageTraceSnapshot::from_damage(
+                &plan.repair_damage,
+                output_width,
+                output_height,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FirstFullRepaintStage {
+    None,
+    InputDamage,
+    SceneDamage,
+    EffectDamageMerge,
+    InitialRepaintPlan,
+    EffectExecution,
+}
+
+impl FirstFullRepaintStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::InputDamage => "input_damage",
+            Self::SceneDamage => "scene_damage",
+            Self::EffectDamageMerge => "effect_damage_merge",
+            Self::InitialRepaintPlan => "initial_repaint_plan",
+            Self::EffectExecution => "effect_execution",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectRepaintProvenanceSnapshot {
+    pub(crate) input_damage: DamageTraceSnapshot,
+    pub(crate) scene_damage: DamageTraceSnapshot,
+    pub(crate) merged_damage: DamageTraceSnapshot,
+    pub(crate) initial_plan: RepaintPlanTraceSnapshot,
+    pub(crate) final_plan: RepaintPlanTraceSnapshot,
+}
+
+impl EffectRepaintProvenanceSnapshot {
+    pub(crate) const fn new(
+        input_damage: DamageTraceSnapshot,
+        scene_damage: DamageTraceSnapshot,
+        merged_damage: DamageTraceSnapshot,
+        initial_plan: RepaintPlanTraceSnapshot,
+        final_plan: RepaintPlanTraceSnapshot,
+    ) -> Self {
+        Self {
+            input_damage,
+            scene_damage,
+            merged_damage,
+            initial_plan,
+            final_plan,
+        }
+    }
+
+    pub(crate) const fn first_full_stage(self) -> FirstFullRepaintStage {
+        if matches!(self.input_damage.kind, DamageTraceKind::Full) {
+            FirstFullRepaintStage::InputDamage
+        } else if matches!(self.scene_damage.kind, DamageTraceKind::Full) {
+            FirstFullRepaintStage::SceneDamage
+        } else if matches!(self.merged_damage.kind, DamageTraceKind::Full) {
+            FirstFullRepaintStage::EffectDamageMerge
+        } else if matches!(self.initial_plan.mode, RepaintMode::Full) {
+            FirstFullRepaintStage::InitialRepaintPlan
+        } else if matches!(self.final_plan.mode, RepaintMode::Full) {
+            FirstFullRepaintStage::EffectExecution
+        } else {
+            FirstFullRepaintStage::None
+        }
+    }
+
+    pub(crate) const fn promoted_to_full(self) -> bool {
+        !matches!(self.initial_plan.mode, RepaintMode::Full)
+            && matches!(self.final_plan.mode, RepaintMode::Full)
+    }
+
+    pub(crate) fn format_line(self, frame_id: Option<u64>) -> String {
+        format!(
+            "event=effect_repaint_provenance frame_id={} input_damage_kind={} input_damage_rects={} input_damage_pixels={} scene_damage_kind={} scene_damage_rects={} scene_damage_pixels={} merged_damage_kind={} merged_damage_rects={} merged_damage_pixels={} initial_repaint_mode={} initial_repaint_reason={} initial_buffer_age={} initial_render_damage_kind={} initial_render_damage_rects={} initial_render_damage_pixels={} initial_repair_damage_kind={} initial_repair_damage_rects={} initial_repair_damage_pixels={} final_repaint_mode={} final_repaint_reason={} final_buffer_age={} final_render_damage_kind={} final_render_damage_rects={} final_render_damage_pixels={} final_repair_damage_kind={} final_repair_damage_rects={} final_repair_damage_pixels={} first_full_stage={} promoted_to_full={}",
+            optional_u64(frame_id),
+            self.input_damage.kind.as_str(),
+            self.input_damage.rects,
+            self.input_damage.pixels,
+            self.scene_damage.kind.as_str(),
+            self.scene_damage.rects,
+            self.scene_damage.pixels,
+            self.merged_damage.kind.as_str(),
+            self.merged_damage.rects,
+            self.merged_damage.pixels,
+            self.initial_plan.mode.as_str(),
+            self.initial_plan
+                .fallback_reason
+                .map_or("none", FullRepaintReason::as_str),
+            optional_u32_none(self.initial_plan.buffer_age),
+            self.initial_plan.render_damage.kind.as_str(),
+            self.initial_plan.render_damage.rects,
+            self.initial_plan.render_damage.pixels,
+            self.initial_plan.repair_damage.kind.as_str(),
+            self.initial_plan.repair_damage.rects,
+            self.initial_plan.repair_damage.pixels,
+            self.final_plan.mode.as_str(),
+            self.final_plan
+                .fallback_reason
+                .map_or("none", FullRepaintReason::as_str),
+            optional_u32_none(self.final_plan.buffer_age),
+            self.final_plan.render_damage.kind.as_str(),
+            self.final_plan.render_damage.rects,
+            self.final_plan.render_damage.pixels,
+            self.final_plan.repair_damage.kind.as_str(),
+            self.final_plan.repair_damage.rects,
+            self.final_plan.repair_damage.pixels,
+            self.first_full_stage().as_str(),
+            if self.promoted_to_full() { "1" } else { "0" },
+        )
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PassTraceFields<'a> {
@@ -420,6 +624,13 @@ impl EffectExecutionTrace {
             TEST_EVENTS.with(|events| events.borrow_mut().push(line.clone()));
             eprintln!("typhon effect: {line}");
         }
+    }
+
+    pub(crate) fn effect_repaint_provenance<F>(&self, make_snapshot: F)
+    where
+        F: FnOnce() -> EffectRepaintProvenanceSnapshot,
+    {
+        self.event(|| make_snapshot().format_line(self.frame_id));
     }
 
     pub(crate) fn scene_work_preservation(
@@ -824,6 +1035,10 @@ fn optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
 }
 
+fn optional_u32_none(value: Option<u32>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+}
+
 fn optional_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
 }
@@ -833,6 +1048,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::egl_renderer::damage::{FullRepaintReason, OutputDamage, OutputRect, RepaintMode};
     use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
     use oblivion_one::effects::{
         EffectAlphaMode, EffectColorConversion, EffectInstanceId, EffectRegion, EffectWorkingSpace,
@@ -1279,5 +1495,277 @@ mod tests {
         assert!(line.contains("pending_checkpoint_requirements=1"));
         assert!(!line.contains("active_work="));
         assert!(!line.contains("baseline_work="));
+    }
+
+    fn damage_snapshot(kind: DamageTraceKind) -> DamageTraceSnapshot {
+        DamageTraceSnapshot {
+            kind,
+            rects: if kind == DamageTraceKind::Full { 1 } else { 0 },
+            pixels: 0,
+        }
+    }
+
+    fn repaint_snapshot(
+        mode: RepaintMode,
+        fallback_reason: Option<FullRepaintReason>,
+    ) -> RepaintPlanTraceSnapshot {
+        RepaintPlanTraceSnapshot {
+            mode,
+            fallback_reason,
+            buffer_age: None,
+            render_damage: damage_snapshot(DamageTraceKind::Rects),
+            repair_damage: damage_snapshot(DamageTraceKind::Rects),
+        }
+    }
+
+    fn provenance(
+        input: DamageTraceSnapshot,
+        scene: DamageTraceSnapshot,
+        merged: DamageTraceSnapshot,
+        initial: RepaintPlanTraceSnapshot,
+        final_plan: RepaintPlanTraceSnapshot,
+    ) -> EffectRepaintProvenanceSnapshot {
+        EffectRepaintProvenanceSnapshot::new(input, scene, merged, initial, final_plan)
+    }
+
+    #[test]
+    fn repaint_provenance_damage_snapshots_use_stable_names_counts_and_pixels() {
+        let absent = DamageTraceSnapshot::from_optional(None, 10, 20);
+        let empty = DamageTraceSnapshot::from_damage(&OutputDamage::Empty, 10, 20);
+        let rects = DamageTraceSnapshot::from_damage(
+            &OutputDamage::Rects(vec![OutputRect::new(2, 3, 4, 5)]),
+            10,
+            20,
+        );
+        let full = DamageTraceSnapshot::from_damage(&OutputDamage::Full, 10, 20);
+
+        assert_eq!(
+            (absent.kind.as_str(), absent.rects, absent.pixels),
+            ("none", 0, 0)
+        );
+        assert_eq!(
+            (empty.kind.as_str(), empty.rects, empty.pixels),
+            ("empty", 0, 0)
+        );
+        assert_eq!(
+            (rects.kind.as_str(), rects.rects, rects.pixels),
+            ("rects", 1, 20)
+        );
+        assert_eq!(
+            (full.kind.as_str(), full.rects, full.pixels),
+            ("full", 1, 200)
+        );
+
+        let overflowing = OutputDamage::Rects(vec![
+            OutputRect::new(0, 0, u32::MAX, u32::MAX),
+            OutputRect::new(0, 0, u32::MAX, u32::MAX),
+        ]);
+        let saturated = DamageTraceSnapshot::from_damage(&overflowing, u32::MAX, u32::MAX);
+        assert_eq!(saturated.pixels, u64::MAX);
+    }
+
+    #[test]
+    fn repaint_provenance_first_full_stage_prefers_input_damage() {
+        let full = damage_snapshot(DamageTraceKind::Full);
+        let full_plan = repaint_snapshot(RepaintMode::Full, None);
+        let evidence = provenance(full, full, full, full_plan, full_plan);
+
+        assert_eq!(evidence.first_full_stage().as_str(), "input_damage");
+    }
+
+    #[test]
+    fn repaint_provenance_first_full_stage_detects_scene_resolution() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let full = damage_snapshot(DamageTraceKind::Full);
+        let full_plan = repaint_snapshot(RepaintMode::Full, None);
+        let evidence = provenance(rects, full, full, full_plan, full_plan);
+
+        assert_eq!(evidence.first_full_stage().as_str(), "scene_damage");
+    }
+
+    #[test]
+    fn repaint_provenance_first_full_stage_detects_effect_damage_merge() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let full = damage_snapshot(DamageTraceKind::Full);
+        let full_plan = repaint_snapshot(RepaintMode::Full, None);
+        let evidence = provenance(rects, rects, full, full_plan, full_plan);
+
+        assert_eq!(evidence.first_full_stage().as_str(), "effect_damage_merge");
+    }
+
+    #[test]
+    fn repaint_provenance_initial_planner_fallback_reason_is_stable() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let initial = repaint_snapshot(
+            RepaintMode::Full,
+            Some(FullRepaintReason::DamageAreaThreshold),
+        );
+        let final_plan =
+            repaint_snapshot(RepaintMode::Full, Some(FullRepaintReason::BufferAgeZero));
+        let evidence = provenance(rects, rects, rects, initial, final_plan);
+
+        assert_eq!(evidence.first_full_stage().as_str(), "initial_repaint_plan");
+        assert!(!evidence.promoted_to_full());
+        let line = evidence.format_line(Some(7));
+        assert!(line.contains("initial_repaint_reason=damage_area_threshold"));
+        assert!(line.contains("final_repaint_reason=buffer_age_zero"));
+
+        let buffer_age_fallback = provenance(
+            rects,
+            rects,
+            rects,
+            repaint_snapshot(RepaintMode::Full, Some(FullRepaintReason::BufferAgeZero)),
+            repaint_snapshot(RepaintMode::Full, None),
+        );
+        assert!(
+            buffer_age_fallback
+                .format_line(Some(7))
+                .contains("initial_repaint_reason=buffer_age_zero")
+        );
+    }
+
+    #[test]
+    fn repaint_provenance_effect_execution_promotes_full_with_stable_reason() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let initial = repaint_snapshot(RepaintMode::Partial, None);
+        let final_plan = repaint_snapshot(
+            RepaintMode::Full,
+            Some(FullRepaintReason::EffectExecutionConservative),
+        );
+        let evidence = provenance(rects, rects, rects, initial, final_plan);
+
+        assert_eq!(evidence.first_full_stage().as_str(), "effect_execution");
+        assert!(evidence.promoted_to_full());
+        let line = evidence.format_line(Some(8));
+        assert!(line.contains("final_repaint_reason=effect_execution_conservative"));
+
+        let threshold = provenance(
+            rects,
+            rects,
+            rects,
+            initial,
+            repaint_snapshot(
+                RepaintMode::Full,
+                Some(FullRepaintReason::DamageAreaThreshold),
+            ),
+        );
+        assert_eq!(threshold.first_full_stage().as_str(), "effect_execution");
+        assert!(
+            threshold
+                .format_line(Some(9))
+                .contains("final_repaint_reason=damage_area_threshold")
+        );
+    }
+
+    #[test]
+    fn repaint_provenance_remains_regional_when_no_stage_is_full() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let plan = repaint_snapshot(RepaintMode::Partial, None);
+        let evidence = provenance(rects, rects, rects, plan, plan);
+
+        assert_eq!(evidence.first_full_stage().as_str(), "none");
+        assert!(!evidence.promoted_to_full());
+    }
+
+    #[test]
+    fn repaint_provenance_formatter_emits_each_contract_key_once() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let empty = damage_snapshot(DamageTraceKind::Empty);
+        let initial = repaint_snapshot(RepaintMode::Partial, None);
+        let mut final_plan = repaint_snapshot(
+            RepaintMode::Full,
+            Some(FullRepaintReason::EffectExecutionConservative),
+        );
+        final_plan.buffer_age = Some(3);
+        let evidence = provenance(rects, empty, rects, initial, final_plan);
+        let line = evidence.format_line(Some(42));
+        let keys = [
+            "event",
+            "frame_id",
+            "input_damage_kind",
+            "input_damage_rects",
+            "input_damage_pixels",
+            "scene_damage_kind",
+            "scene_damage_rects",
+            "scene_damage_pixels",
+            "merged_damage_kind",
+            "merged_damage_rects",
+            "merged_damage_pixels",
+            "initial_repaint_mode",
+            "initial_repaint_reason",
+            "initial_buffer_age",
+            "initial_render_damage_kind",
+            "initial_render_damage_rects",
+            "initial_render_damage_pixels",
+            "initial_repair_damage_kind",
+            "initial_repair_damage_rects",
+            "initial_repair_damage_pixels",
+            "final_repaint_mode",
+            "final_repaint_reason",
+            "final_buffer_age",
+            "final_render_damage_kind",
+            "final_render_damage_rects",
+            "final_render_damage_pixels",
+            "final_repair_damage_kind",
+            "final_repair_damage_rects",
+            "final_repair_damage_pixels",
+            "first_full_stage",
+            "promoted_to_full",
+        ];
+
+        for key in keys {
+            assert_eq!(
+                line.split_whitespace()
+                    .filter(|field| field.starts_with(&format!("{key}=")))
+                    .count(),
+                1,
+                "key {key} must appear exactly once in {line}"
+            );
+        }
+        assert!(line.starts_with("event=effect_repaint_provenance frame_id=42 "));
+        assert!(line.contains("input_damage_kind=rects"));
+        assert!(line.contains("scene_damage_kind=empty"));
+        assert!(line.contains("initial_repaint_mode=partial"));
+        assert!(line.contains("initial_repaint_reason=none"));
+        assert!(line.contains("initial_buffer_age=none"));
+        assert!(line.contains("final_repaint_mode=full"));
+        assert!(line.contains("final_repaint_reason=effect_execution_conservative"));
+        assert!(line.contains("final_buffer_age=3"));
+        assert!(line.contains("first_full_stage=effect_execution"));
+        assert!(line.contains("promoted_to_full=1"));
+        assert!(!line.contains("Some("));
+        assert!(!line.contains("FullRepaintReason"));
+        assert!(!line.contains("DamageTraceKind"));
+    }
+
+    #[test]
+    fn repaint_provenance_callback_is_not_run_when_trace_is_disabled() {
+        let trace = EffectExecutionTrace::disabled_for_test();
+        let callback_count = Cell::new(0);
+
+        clear_test_events();
+        trace.effect_repaint_provenance(|| {
+            callback_count.set(callback_count.get() + 1);
+            let damage = damage_snapshot(DamageTraceKind::Rects);
+            let plan = repaint_snapshot(RepaintMode::Partial, None);
+            provenance(damage, damage, damage, plan, plan)
+        });
+
+        assert_eq!(callback_count.get(), 0);
+        assert!(take_test_events().is_empty());
+    }
+
+    #[test]
+    fn repaint_provenance_trace_emits_one_event_for_a_resolved_snapshot() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let damage = damage_snapshot(DamageTraceKind::Rects);
+        let plan = repaint_snapshot(RepaintMode::Partial, None);
+
+        clear_test_events();
+        trace.effect_repaint_provenance(|| provenance(damage, damage, damage, plan, plan));
+        let events = take_test_events();
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("event=effect_repaint_provenance frame_id=unknown "));
     }
 }

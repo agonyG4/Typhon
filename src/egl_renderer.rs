@@ -51,8 +51,9 @@ use damage::{
     RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
 };
 use effects::{
-    EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache, EffectGpuProfiler,
-    EffectGraphMetrics, FrameTraceSummary, ReplayCaptureExecutionDetail, ShaderProgramCache,
+    DamageTraceSnapshot, EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache,
+    EffectGpuProfiler, EffectGraphMetrics, EffectRepaintProvenanceSnapshot, FrameTraceSummary,
+    RepaintPlanTraceSnapshot, ReplayCaptureExecutionDetail, ShaderProgramCache,
     builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
@@ -1838,6 +1839,15 @@ impl GlesSceneRenderer {
         );
         let width = width.max(1);
         let height = height.max(1);
+        let input_damage_trace = if self.effect_trace.enabled() {
+            Some(DamageTraceSnapshot::from_optional(
+                current_damage.as_ref(),
+                width,
+                height,
+            ))
+        } else {
+            None
+        };
         self.current_framebuffer_origin = framebuffer_origin;
         self.lamp_samples.clear();
         self.lamp_samples.extend_from_slice(&lifecycle.lamps);
@@ -1994,6 +2004,15 @@ impl GlesSceneRenderer {
             damage_authority_available,
             output_damage,
         );
+        let scene_damage_trace = if self.effect_trace.enabled() {
+            Some(DamageTraceSnapshot::from_damage(
+                &output_damage,
+                width,
+                height,
+            ))
+        } else {
+            None
+        };
         self.frame_stats.contradictory_empty_damage = contradictory_empty_damage;
         let damage_state = EglOutputDamageTracker::candidate_state(
             width,
@@ -2093,6 +2112,15 @@ impl GlesSceneRenderer {
                 merge_effect_damage(output_damage, &graph.final_damage, width, height)
             }
         };
+        let merged_damage_trace = if self.effect_trace.enabled() {
+            Some(DamageTraceSnapshot::from_damage(
+                &output_damage,
+                width,
+                height,
+            ))
+        } else {
+            None
+        };
         let mut plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
             self.frame_stats.surface_resource_candidates = surfaces.len();
@@ -2104,6 +2132,11 @@ impl GlesSceneRenderer {
                 stats: self.frame_stats,
             });
         }
+        let initial_repaint_trace = if self.effect_trace.enabled() {
+            Some(RepaintPlanTraceSnapshot::from_plan(&plan, width, height))
+        } else {
+            None
+        };
         let demand_trace_seed = if self.effect_trace.enabled() {
             compiled_graph.map(|graph| oblivion_one::effects::EffectDemandPlanStats {
                 repair_rect_count: plan.repair_damage.rect_count(),
@@ -2150,6 +2183,15 @@ impl GlesSceneRenderer {
         demand_trace_end_summary.demand_plan = demand_trace_stats;
         self.effect_trace
             .frame_boundary("effect_demand_plan", "end", demand_trace_end_summary);
+        self.effect_trace.effect_repaint_provenance(|| {
+            EffectRepaintProvenanceSnapshot::new(
+                input_damage_trace.expect("enabled effect trace must capture input damage"),
+                scene_damage_trace.expect("enabled effect trace must capture scene damage"),
+                merged_damage_trace.expect("enabled effect trace must capture merged damage"),
+                initial_repaint_trace.expect("enabled effect trace must capture initial repaint"),
+                RepaintPlanTraceSnapshot::from_plan(&plan, width, height),
+            )
+        });
         if let Some(demand) = &effect_execution_demand {
             self.frame_stats.effect_instances_pruned = self
                 .frame_stats
@@ -11239,9 +11281,16 @@ mod tests {
             effects::EffectDebugCaptureMode::Replay => "replay",
             effects::EffectDebugCaptureMode::Framebuffer => "framebuffer_blit",
         };
-        assert!(events[capture_execute_end].contains(&format!(
-            "capture_mode={expected_capture_mode} backdrop_capture_policy={} kawase_execution_policy={}",
+        let capture_execute_end_event = &events[capture_execute_end];
+        assert!(
+            capture_execute_end_event.contains(&format!("capture_mode={expected_capture_mode}"))
+        );
+        assert!(capture_execute_end_event.contains(&format!(
+            "backdrop_capture_policy={}",
             effects::effect_debug_config().capture_mode().as_str(),
+        )));
+        assert!(capture_execute_end_event.contains(&format!(
+            "kawase_execution_policy={}",
             effects::effect_debug_config().kawase_mode().as_str(),
         )));
         let composite_resources_end = trace_event_index(

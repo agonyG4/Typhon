@@ -117,7 +117,13 @@ fn real_gles_clip_intersects_frame_damage_scissor() {
     clear_pbuffer(&harness);
     harness
         .renderer
-        .draw_command_batch_with_visibility(true, Some(OutputRect::new(2, 0, 2, 1)), false)
+        .draw_command_batch_with_visibility_and_range(
+            true,
+            Some(OutputRect::new(2, 0, 2, 1)),
+            false,
+            None,
+            false,
+        )
         .expect("damage and Clip scissor draw succeeds");
     let pixels = read_effect_test_pixels(&harness.gl, 4, 1);
     assert_effect_test_pixel(&pixels, 4, 0, 0, [0, 0, 0, 0]);
