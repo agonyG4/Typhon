@@ -12,9 +12,9 @@ fn trace_x11_resize_backend_command(
     resize_epoch: Option<u64>,
     current_resize_epoch: Option<u64>,
     geometry: X11Geometry,
-    outcome: (&'static str, &'static str),
+    reason: &'static str,
+    translation: Option<&'static str>,
 ) {
-    let (reason, translation) = outcome;
     trace::emit("xwayland_resize_backend_command", || {
         TraceFields::new()
             .field("source", "compositor")
@@ -25,7 +25,7 @@ fn trace_x11_resize_backend_command(
             .optional("current_resize_epoch", current_resize_epoch)
             .field("geometry", format!("{geometry:?}"))
             .field("reason", reason)
-            .field("translation", translation)
+            .optional("translation", translation)
     });
 }
 
@@ -177,14 +177,12 @@ impl OwnCompositorServer {
                                 resize_epoch,
                                 current_resize_epoch,
                                 x11_geometry,
-                                (
-                                    if resize_epoch.is_none() {
-                                        "missing_enqueue_epoch"
-                                    } else {
-                                        "resize_epoch_superseded"
-                                    },
-                                    "none",
-                                ),
+                                if resize_epoch.is_none() {
+                                    "missing_enqueue_epoch"
+                                } else {
+                                    "resize_epoch_superseded"
+                                },
+                                None,
                             );
                             return None;
                         }
@@ -195,7 +193,8 @@ impl OwnCompositorServer {
                             resize_epoch,
                             current_resize_epoch,
                             x11_geometry,
-                            ("resize_epoch_matches", "begin_resize_sync"),
+                            "resize_epoch_matches",
+                            Some("begin_resize_sync"),
                         );
                         return Some(XwmCommand::BeginResizeSync {
                             window: handle,
@@ -204,7 +203,7 @@ impl OwnCompositorServer {
                             deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                             final_pending: false,
                             resize_epoch,
-                        })
+                        });
                     }
                     match (resize_epoch, current_resize_epoch) {
                         (None, _) => Some(XwmCommand::ConfigureFrame {
@@ -222,7 +221,8 @@ impl OwnCompositorServer {
                                 Some(stored_epoch),
                                 Some(current_epoch),
                                 x11_geometry,
-                                ("resize_epoch_matches", "configure"),
+                                "resize_epoch_matches",
+                                Some("configure"),
                             );
                             Some(XwmCommand::Configure {
                                 window: handle,
@@ -245,7 +245,8 @@ impl OwnCompositorServer {
                                 Some(stored_epoch),
                                 None,
                                 x11_geometry,
-                                ("resize_context_retired", "configure_frame"),
+                                "resize_context_retired",
+                                Some("configure_frame"),
                             );
                             Some(XwmCommand::ConfigureFrame {
                                 window: handle,
@@ -261,7 +262,8 @@ impl OwnCompositorServer {
                                 Some(stored_epoch),
                                 Some(current_epoch),
                                 x11_geometry,
-                                ("newer_resize_epoch_superseded", "none"),
+                                "newer_resize_epoch_superseded",
+                                None,
                             );
                             None
                         }
@@ -294,14 +296,12 @@ impl OwnCompositorServer {
                             resize_epoch,
                             current_resize_epoch,
                             x11_geometry,
-                            (
-                                if resize_epoch.is_none() {
-                                    "missing_enqueue_epoch"
-                                } else {
-                                    "resize_epoch_superseded"
-                                },
-                                "none",
-                            ),
+                            if resize_epoch.is_none() {
+                                "missing_enqueue_epoch"
+                            } else {
+                                "resize_epoch_superseded"
+                            },
+                            None,
                         );
                         return None;
                     }
@@ -312,7 +312,8 @@ impl OwnCompositorServer {
                         resize_epoch,
                         current_resize_epoch,
                         x11_geometry,
-                        ("resize_epoch_matches", "begin_resize_sync"),
+                        "resize_epoch_matches",
+                        Some("begin_resize_sync"),
                     );
                     Some(XwmCommand::BeginResizeSync {
                         window: handle,

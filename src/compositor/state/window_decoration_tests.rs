@@ -57,6 +57,8 @@ fn xdg_state(
         .expect("insert XDG window");
     let mut decoration_state = WindowDecorationState::new();
     decoration_state.set_preference(preference);
+    decoration_state
+        .apply_configured_mode(preference.effective_mode(true, mode == ToplevelMode::Fullscreen));
     state
         .xdg_decoration_states
         .insert(surface.surface_id, decoration_state);
@@ -358,11 +360,13 @@ fn pointer_scene_hit_returns_top_window_decoration_before_lower_client() {
         .expect("front window");
     let mut rear_decoration = WindowDecorationState::new();
     rear_decoration.set_preference(DecorationPreference::ServerSide);
+    rear_decoration.apply_configured_mode(DecorationMode::ServerSide);
     state
         .xdg_decoration_states
         .insert(rear.surface_id, rear_decoration);
     let mut front_decoration = WindowDecorationState::new();
     front_decoration.set_preference(DecorationPreference::ServerSide);
+    front_decoration.apply_configured_mode(DecorationMode::ServerSide);
     state
         .xdg_decoration_states
         .insert(front.surface_id, front_decoration);
@@ -974,6 +978,111 @@ fn csd_and_fullscreen_have_no_server_decoration_instance() {
         ToplevelMode::Fullscreen,
     );
     assert!(decoration_instances(&fullscreen).is_empty());
+}
+
+#[test]
+fn uncommitted_preference_does_not_render_or_invalidate_ssd() {
+    let surface_id = 52;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let generation_before = state.scene_render_generation;
+
+    state
+        .xdg_decoration_states
+        .get_mut(&surface_id)
+        .expect("test decoration state")
+        .set_preference(DecorationPreference::ServerSide);
+
+    assert!(decoration_instances(&state).is_empty());
+    assert_eq!(state.scene_render_generation, generation_before);
+}
+
+#[test]
+fn v2_recreation_before_surface_commit_retains_previous_preference() {
+    let mut state = WindowDecorationState::new();
+    state.set_preference(DecorationPreference::ServerSide);
+    state.destroy_object();
+    state.recreate_object();
+    assert_eq!(state.requested_mode(false), DecorationMode::ServerSide);
+}
+
+#[test]
+fn v2_recreation_after_surface_commit_starts_client_side() {
+    let mut state = WindowDecorationState::new();
+    state.set_preference(DecorationPreference::ServerSide);
+    assert!(state.apply_configured_mode(DecorationMode::ServerSide));
+    state.destroy_object();
+    assert_eq!(state.note_surface_commit_after_destroy(), Some(true));
+    assert_eq!(state.applied_mode(), DecorationMode::ClientSide);
+    state.recreate_object();
+    assert_eq!(state.requested_mode(false), DecorationMode::ClientSide);
+}
+
+#[test]
+fn v2_destroy_surface_commit_disables_rendering_and_hit_testing() {
+    let surface_id = 53;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    let generation_before = state.scene_render_generation;
+    assert_eq!(
+        state
+            .xdg_decoration_states
+            .get(&surface_id)
+            .expect("test decoration state")
+            .applied_mode(),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(decoration_instances(&state).len(), 1);
+    assert!(matches!(
+        state.decoration_hit_for_root_at(surface_id, (0, 0), 100.0, -10.0),
+        Some(DecorationHit::Titlebar)
+    ));
+
+    state
+        .xdg_decoration_states
+        .get_mut(&surface_id)
+        .expect("test decoration state")
+        .destroy_object();
+    assert_eq!(state.scene_render_generation, generation_before);
+    assert_eq!(
+        state.note_xdg_decoration_surface_commit(surface_id),
+        Some(true)
+    );
+    assert_eq!(
+        state
+            .xdg_decoration_states
+            .get(&surface_id)
+            .expect("test decoration state")
+            .applied_mode(),
+        DecorationMode::ClientSide
+    );
+    assert!(decoration_instances(&state).is_empty());
+    assert!(
+        state
+            .decoration_hit_for_root_at(surface_id, (0, 0), 100.0, -10.0)
+            .is_none()
+    );
+    assert_eq!(state.note_xdg_decoration_surface_commit(surface_id), None);
+    assert_eq!(
+        state
+            .xdg_decoration_states
+            .get(&surface_id)
+            .expect("test decoration state")
+            .applied_mode(),
+        DecorationMode::ClientSide
+    );
+}
+
+#[test]
+fn v2_mapped_creation_without_previous_object_starts_client_side() {
+    let state = WindowDecorationState::new_client_side_object();
+    assert_eq!(state.requested_mode(false), DecorationMode::ClientSide);
 }
 
 #[test]

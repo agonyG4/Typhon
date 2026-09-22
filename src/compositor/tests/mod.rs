@@ -173,4 +173,5 @@ mod windows_geometry;
 mod windows_resize_liveness;
 mod workspace;
 mod xdg;
+mod xdg_decoration;
 mod xwayland;

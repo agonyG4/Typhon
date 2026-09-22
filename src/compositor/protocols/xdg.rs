@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::compositor::decoration::types::{DecorationMode, DecorationPreference};
+use crate::compositor::decoration::types::DecorationPreference;
 
 fn xdg_surface_role_error(error: SurfaceRoleError) -> xdg_surface::Error {
     match error {
@@ -190,6 +190,24 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                     return;
                 };
                 let surface_id = compositor_surface_id(&data.surface);
+                let surface_has_content = data
+                    .surface
+                    .data::<SurfaceData>()
+                    .is_some_and(|surface_data| surface_data.has_pending_buffer())
+                    || state.current_surface_buffers.contains_key(&surface_id)
+                    || state
+                        .renderable_surfaces
+                        .iter()
+                        .any(|surface| surface.surface_id == surface_id);
+                if resource.version() < 2 && surface_has_content {
+                    state.post_protocol_error(
+                        _client,
+                        resource,
+                        zxdg_toplevel_decoration_v1::Error::UnconfiguredBuffer,
+                        "version 1 decoration object created after surface content".to_string(),
+                    );
+                    return;
+                }
                 if state.xdg_decoration_resources.contains_key(&surface_id) {
                     state.post_protocol_error(
                         _client,
@@ -205,13 +223,22 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                         surface: data.surface.clone(),
                     },
                 );
-                state
-                    .xdg_decoration_states
-                    .insert(surface_id, WindowDecorationState::new());
+                if let Some(decoration_state) = state.xdg_decoration_states.get_mut(&surface_id) {
+                    decoration_state.recreate_object();
+                } else {
+                    state.xdg_decoration_states.insert(
+                        surface_id,
+                        if surface_has_content {
+                            WindowDecorationState::new_client_side_object()
+                        } else {
+                            WindowDecorationState::new()
+                        },
+                    );
+                }
                 state
                     .xdg_decoration_resources
                     .insert(surface_id, decoration.clone());
-                send_decoration_configure(&decoration, DecorationMode::ServerSide);
+                state.configure_xdg_surface_for_decoration(surface_id);
             }
             zxdg_decoration_manager_v1::Request::Destroy => {}
             other => {
@@ -267,39 +294,32 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
                     }
                 };
                 let surface_id = compositor_surface_id(&data.surface);
-                let Some(mode) = state
+                let changed = state
                     .xdg_decoration_states
                     .get_mut(&surface_id)
-                    .map(|state| {
-                        state.set_preference(preference);
-                        state.effective_mode(false)
-                    })
-                else {
-                    return;
-                };
-                state.advance_render_generation(RenderGenerationCause::WindowDecoration);
-                send_decoration_configure(resource, mode);
+                    .is_some_and(|decoration_state| decoration_state.set_preference(preference));
+                if changed {
+                    state.configure_xdg_surface_for_decoration(surface_id);
+                }
             }
             zxdg_toplevel_decoration_v1::Request::UnsetMode => {
                 let surface_id = compositor_surface_id(&data.surface);
-                let Some(mode) = state
+                let changed = state
                     .xdg_decoration_states
                     .get_mut(&surface_id)
-                    .map(|state| {
-                        state.set_preference(DecorationPreference::Unset);
-                        state.effective_mode(false)
-                    })
-                else {
-                    return;
-                };
-                state.advance_render_generation(RenderGenerationCause::WindowDecoration);
-                send_decoration_configure(resource, mode);
+                    .is_some_and(|decoration_state| {
+                        decoration_state.set_preference(DecorationPreference::Unset)
+                    });
+                if changed {
+                    state.configure_xdg_surface_for_decoration(surface_id);
+                }
             }
             zxdg_toplevel_decoration_v1::Request::Destroy => {
                 let surface_id = compositor_surface_id(&data.surface);
-                state.xdg_decoration_states.remove(&surface_id);
+                if let Some(decoration_state) = state.xdg_decoration_states.get_mut(&surface_id) {
+                    decoration_state.destroy_object();
+                }
                 state.xdg_decoration_resources.remove(&surface_id);
-                state.advance_render_generation(RenderGenerationCause::WindowDecoration);
             }
             other => {
                 let _ = other;
@@ -311,20 +331,6 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
             }
         }
     }
-}
-
-fn send_decoration_configure(
-    decoration: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
-    mode: DecorationMode,
-) {
-    let _ = decoration.send_event(zxdg_toplevel_decoration_v1::Event::Configure {
-        mode: WEnum::Value(match mode {
-            DecorationMode::ServerSide => zxdg_toplevel_decoration_v1::Mode::ServerSide,
-            DecorationMode::ClientSide | DecorationMode::None => {
-                zxdg_toplevel_decoration_v1::Mode::ClientSide
-            }
-        }),
-    });
 }
 
 impl Dispatch<xdg_positioner::XdgPositioner, Arc<Mutex<XdgPositionerState>>> for CompositorState {

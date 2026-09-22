@@ -230,10 +230,7 @@ fn active_scene_projection_keeps_canonical_identity_across_visibility() {
     assert_eq!(state.scene_node_id_for_surface(surface_id), Some(node));
     state.rebuild_active_scene_view();
     assert_eq!(state.active_scene_node_for_surface(surface_id), Some(node));
-    assert_eq!(
-        state.active_scene_surface_scene_nodes_in_order(),
-        &[node]
-    );
+    assert_eq!(state.active_scene_surface_scene_nodes_in_order(), &[node]);
 
     assert_eq!(
         state.active_scene_surface_index_for_node(node),

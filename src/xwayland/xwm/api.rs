@@ -319,6 +319,10 @@ impl Xwm {
         self.outgoing_events.drain(..)
     }
 
+    pub fn take_selection_events(&mut self) -> Vec<crate::xwayland::XwaylandSelectionEvent> {
+        self.data_bridge.selection_wire.take_selection_events()
+    }
+
     pub(crate) fn next_adoption_deadline_ns(&self) -> Option<u64> {
         self.adoption.next_deadline_ns()
     }

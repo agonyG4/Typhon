@@ -14,35 +14,50 @@ pub(in crate::compositor) fn post_fatal_protocol_error<I: Resource>(
 ) -> bool {
     let code = code.into();
     let message = message.into();
+    let interface = ProtocolErrorInterface::for_resource::<I>();
     let Some(client) = resource.client() else {
         metrics.note_protocol_error();
         trace.record(ProtocolErrorRecord {
             timestamp_ns: protocol_error_timestamp_ns(),
             client_id: None,
             peer_pid: None,
-            interface: ProtocolErrorInterface::for_resource::<I>(),
+            interface,
             resource_id: Some(resource.id().protocol_id()),
             error_code: Some(code),
             surface_id,
             xwayland_generation,
             category: ProtocolErrorCategory::Unavailable,
+            reason: message.clone(),
         });
+        eprintln!(
+            "typhon_protocol_error client=<unavailable> pid=<unavailable> interface={interface:?} resource_id={} error_code={code} surface_id={surface_id:?} category={category:?} reason={message}",
+            resource.id().protocol_id(),
+        );
         return false;
     };
     let client_id = client.id();
+    let peer_pid = client
+        .get_data::<crate::compositor::server::TyphonClientData>()
+        .and_then(|data| data.client_pids.lock().ok()?.get(&client_id).copied());
     terminal_client_ids.insert(client_id);
     metrics.note_protocol_error();
     trace.record(ProtocolErrorRecord {
         timestamp_ns: protocol_error_timestamp_ns(),
         client_id: Some(client.id()),
-        peer_pid: None,
-        interface: ProtocolErrorInterface::for_resource::<I>(),
+        peer_pid,
+        interface,
         resource_id: Some(resource.id().protocol_id()),
         error_code: Some(code),
         surface_id,
         xwayland_generation,
         category,
+        reason: message.clone(),
     });
+    eprintln!(
+        "typhon_protocol_error client={:?} pid={peer_pid:?} interface={interface:?} resource_id={} error_code={code} surface_id={surface_id:?} category={category:?} reason={message}",
+        client.id(),
+        resource.id().protocol_id(),
+    );
     // This is the only raw fatal emitter in compositor source. The owning client
     // is terminal and diagnostics are recorded before the wire is killed.
     resource.post_error(code, message);
@@ -135,6 +150,7 @@ impl CompositorState {
             surface_id: None,
             xwayland_generation: None,
             category: ProtocolErrorCategory::Unavailable,
+            reason: "protocol error identity unavailable".to_string(),
         });
     }
 

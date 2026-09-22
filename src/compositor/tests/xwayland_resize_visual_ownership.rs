@@ -349,6 +349,14 @@ fn queued_position_only_configure_cannot_acquire_a_newer_resize_epoch() {
             geometry,
             resize_epoch: Some(command_epoch),
             ..
+        } if *geometry == stale_x11_geometry && *command_epoch == first_epoch
+    )));
+    assert!(!commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::Configure {
+            geometry,
+            resize_epoch: Some(command_epoch),
+            ..
         } if *geometry == stale_x11_geometry && *command_epoch == second_epoch
     )));
 }
@@ -575,12 +583,9 @@ fn move_after_resize_release_cannot_be_dropped_by_resize_timeout() {
     );
 
     let commands = fixture.server.take_xwayland_backend_commands(0);
-    assert!(
-        commands.iter().any(|command| matches!(
-            command,
-            XwmCommand::ConfigureFrame { geometry, .. }
-                if *geometry == expected_move_x11_geometry
-        )),
-        "a valid move must survive timeout retirement of its captured resize context"
-    );
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame { geometry, .. }
+            if *geometry == expected_move_x11_geometry
+    )));
 }

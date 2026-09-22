@@ -16,10 +16,21 @@ use super::super::{
 use super::hit_testing::PointerSceneHit;
 use super::surface_focus::WindowFocusReason;
 use crate::compositor::render;
+use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
+use wayland_server::Resource;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum DecorationObjectLifetime {
+    Present,
+    DestroyedBeforeSurfaceCommit,
+    DestroyedAfterSurfaceCommit,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct WindowDecorationState {
     preference: DecorationPreference,
+    applied_mode: DecorationMode,
+    object_lifetime: DecorationObjectLifetime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +45,8 @@ impl Default for WindowDecorationState {
     fn default() -> Self {
         Self {
             preference: DecorationPreference::Unset,
+            applied_mode: DecorationMode::ClientSide,
+            object_lifetime: DecorationObjectLifetime::Present,
         }
     }
 }
@@ -42,19 +55,67 @@ impl WindowDecorationState {
     pub(in crate::compositor) const fn new() -> Self {
         Self {
             preference: DecorationPreference::Unset,
+            applied_mode: DecorationMode::ClientSide,
+            object_lifetime: DecorationObjectLifetime::Present,
         }
     }
 
-    pub(in crate::compositor) const fn preference(self) -> DecorationPreference {
-        self.preference
+    pub(in crate::compositor) const fn new_client_side_object() -> Self {
+        Self {
+            preference: DecorationPreference::ClientSide,
+            applied_mode: DecorationMode::ClientSide,
+            object_lifetime: DecorationObjectLifetime::Present,
+        }
     }
 
-    pub(in crate::compositor) const fn effective_mode(self, fullscreen: bool) -> DecorationMode {
-        self.preference.effective_mode(true, fullscreen)
+    pub(in crate::compositor) const fn requested_mode(self, fullscreen: bool) -> DecorationMode {
+        self.preference.effective_mode(
+            matches!(self.object_lifetime, DecorationObjectLifetime::Present),
+            fullscreen,
+        )
     }
 
-    pub(in crate::compositor) fn set_preference(&mut self, preference: DecorationPreference) {
+    pub(in crate::compositor) const fn applied_mode(self) -> DecorationMode {
+        self.applied_mode
+    }
+
+    pub(in crate::compositor) fn set_preference(
+        &mut self,
+        preference: DecorationPreference,
+    ) -> bool {
+        if self.preference == preference {
+            return false;
+        }
         self.preference = preference;
+        true
+    }
+
+    pub(in crate::compositor) fn apply_configured_mode(&mut self, mode: DecorationMode) -> bool {
+        if self.applied_mode == mode {
+            return false;
+        }
+        self.applied_mode = mode;
+        true
+    }
+
+    pub(in crate::compositor) fn destroy_object(&mut self) {
+        self.object_lifetime = DecorationObjectLifetime::DestroyedBeforeSurfaceCommit;
+    }
+
+    pub(in crate::compositor) fn recreate_object(&mut self) {
+        if self.object_lifetime == DecorationObjectLifetime::DestroyedAfterSurfaceCommit {
+            self.preference = DecorationPreference::ClientSide;
+        }
+        self.object_lifetime = DecorationObjectLifetime::Present;
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_after_destroy(&mut self) -> Option<bool> {
+        if self.object_lifetime != DecorationObjectLifetime::DestroyedBeforeSurfaceCommit {
+            return None;
+        }
+        self.preference = DecorationPreference::ClientSide;
+        self.object_lifetime = DecorationObjectLifetime::DestroyedAfterSurfaceCommit;
+        Some(self.apply_configured_mode(DecorationMode::ClientSide))
     }
 }
 
@@ -149,9 +210,6 @@ impl super::super::CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
-        if mode == ToplevelMode::Fullscreen {
-            return false;
-        }
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
@@ -159,10 +217,127 @@ impl super::super::CompositorState {
             return false;
         };
         if let Some(decoration_state) = self.xdg_decoration_states.get(&surface_id) {
-            return decoration_state.preference().effective_mode(true, false)
-                == DecorationMode::ServerSide;
+            return decoration_state.applied_mode() == DecorationMode::ServerSide;
+        }
+        if mode == ToplevelMode::Fullscreen {
+            return false;
         }
         effective_x11_decoration_mode(window, mode) == DecorationMode::ServerSide
+    }
+
+    pub(in crate::compositor) fn reconcile_native_decoration_transition(
+        &mut self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        new_mode: DecorationMode,
+    ) {
+        self.decoration_button_capture = self
+            .decoration_button_capture
+            .filter(|capture| capture.root_surface_id != root_surface_id);
+        self.decoration_button_hover = self
+            .decoration_button_hover
+            .filter(|(hover_window_id, _)| *hover_window_id != window_id);
+        self.decoration_titlebar_click_capture = self
+            .decoration_titlebar_click_capture
+            .filter(|(captured_window_id, _)| *captured_window_id != window_id);
+        self.decoration_last_titlebar_click = self
+            .decoration_last_titlebar_click
+            .filter(|(clicked_window_id, _, _, _)| *clicked_window_id != window_id);
+
+        let interaction_is_decoration_owned =
+            self.window_interaction_debug_snapshot()
+                .is_some_and(|interaction| {
+                    interaction.root_surface_id == root_surface_id
+                        && interaction.source == WindowInteractionSource::NativeBinding
+                        && interaction.decoration_owned
+                        && matches!(
+                            interaction.kind,
+                            WindowInteractionKind::Move | WindowInteractionKind::Resize(_)
+                        )
+                });
+        if new_mode != DecorationMode::ServerSide && interaction_is_decoration_owned {
+            self.clear_window_interaction_state(
+                super::super::WindowInteractionEndReason::ModeTransition,
+            );
+        }
+    }
+
+    pub(in crate::compositor) fn xdg_decoration_mode_for_configure(
+        &self,
+        surface_id: u32,
+    ) -> Option<DecorationMode> {
+        let decoration_state = self.xdg_decoration_states.get(&surface_id)?;
+        let fullscreen = self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| window.state.mode() == ToplevelMode::Fullscreen);
+        Some(decoration_state.requested_mode(fullscreen))
+    }
+
+    pub(in crate::compositor) fn xdg_decoration_configure_event_needed(
+        &self,
+        surface_id: u32,
+        mode: DecorationMode,
+        force: bool,
+    ) -> bool {
+        force
+            || self
+                .xdg_surface_lifecycle(surface_id)
+                .and_then(|lifecycle| lifecycle.last_configured_decoration_mode)
+                != Some(mode)
+    }
+
+    pub(in crate::compositor) fn send_xdg_decoration_configure(
+        &self,
+        surface_id: u32,
+        mode: DecorationMode,
+    ) {
+        let Some(decoration) = self.xdg_decoration_resources.get(&surface_id) else {
+            return;
+        };
+        let wire_mode = match mode {
+            DecorationMode::ServerSide | DecorationMode::None => {
+                zxdg_toplevel_decoration_v1::Mode::ServerSide
+            }
+            DecorationMode::ClientSide => zxdg_toplevel_decoration_v1::Mode::ClientSide,
+        };
+        let _ = decoration.send_event(zxdg_toplevel_decoration_v1::Event::Configure {
+            mode: WEnum::Value(wire_mode),
+        });
+    }
+
+    pub(in crate::compositor) fn apply_acked_xdg_decoration(&mut self, surface_id: u32) -> bool {
+        let Some(mode) = self.take_acked_xdg_decoration_mode(surface_id) else {
+            return false;
+        };
+        let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) else {
+            return false;
+        };
+        if !decoration_state.apply_configured_mode(mode) {
+            return false;
+        }
+        if let Some(window_id) = self.window_id_for_surface(surface_id) {
+            self.reconcile_native_decoration_transition(window_id, surface_id, mode);
+        }
+        true
+    }
+
+    pub(in crate::compositor) fn note_xdg_decoration_surface_commit(
+        &mut self,
+        surface_id: u32,
+    ) -> Option<bool> {
+        let visible_changed = self
+            .xdg_decoration_states
+            .get_mut(&surface_id)
+            .and_then(WindowDecorationState::note_surface_commit_after_destroy)?;
+        if visible_changed && let Some(window_id) = self.window_id_for_surface(surface_id) {
+            self.reconcile_native_decoration_transition(
+                window_id,
+                surface_id,
+                DecorationMode::ClientSide,
+            );
+        }
+        Some(visible_changed)
     }
 
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {
@@ -203,14 +378,13 @@ impl super::super::CompositorState {
         let fullscreen = mode == ToplevelMode::Fullscreen;
         let decoration_mode =
             if let Some(decoration_state) = self.xdg_decoration_states.get(&root_surface_id) {
-                decoration_state
-                    .preference()
-                    .effective_mode(true, fullscreen)
+                decoration_state.applied_mode()
             } else if matches!(window.backend, WindowBackend::X11(_)) {
                 effective_x11_decoration_mode(window, mode)
             } else {
                 return None;
             };
+        let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
         let chrome_policy = window
             .management
             .map_or(crate::wm::WindowChromePolicy::Full, |management| {
@@ -221,7 +395,7 @@ impl super::super::CompositorState {
             visual_geometry.height,
             decoration_mode,
             mode == ToplevelMode::Maximized,
-            fullscreen,
+            decoration_fullscreen,
             chrome_policy,
             self.decoration_theme.metrics(),
         )?;
@@ -504,14 +678,13 @@ impl super::super::CompositorState {
                 let decoration_mode = if let Some(decoration_state) =
                     self.xdg_decoration_states.get(&surface.surface_id)
                 {
-                    decoration_state
-                        .preference()
-                        .effective_mode(true, fullscreen)
+                    decoration_state.applied_mode()
                 } else if matches!(window.backend, WindowBackend::X11(_)) {
                     effective_x11_decoration_mode(window, mode)
                 } else {
                     return None;
                 };
+                let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
                 if decoration_mode != DecorationMode::ServerSide {
                     return None;
                 }
@@ -527,7 +700,7 @@ impl super::super::CompositorState {
                     visual_geometry.height,
                     decoration_mode,
                     mode == ToplevelMode::Maximized,
-                    fullscreen,
+                    decoration_fullscreen,
                     chrome_policy,
                     metrics,
                 )?;

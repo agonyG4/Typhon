@@ -1,5 +1,7 @@
 use super::*;
 use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot};
+#[cfg(test)]
+use crate::compositor::decoration::types::DecorationMode;
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleFrameSnapshot, LifecycleRenderFallbackEntry, LifecycleSceneSample,
@@ -149,6 +151,7 @@ mod tests {
             .expect("test XDG window");
         let mut decoration_state = WindowDecorationState::new();
         decoration_state.set_preference(DecorationPreference::ServerSide);
+        decoration_state.apply_configured_mode(DecorationMode::ServerSide);
         state
             .xdg_decoration_states
             .insert(surface_id, decoration_state);

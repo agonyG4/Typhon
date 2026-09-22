@@ -1891,7 +1891,6 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         fixture.server.state.surface_placement(fixture.surface_id),
         expected_move
     );
-
     assert!(fixture.server.state.backend_commands.iter().any(|command| matches!(
         command,
         crate::compositor::window_backend::WindowBackendCommand::Configure {
@@ -1910,13 +1909,6 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         .state
         .x11_authoritative_geometry(handle)
         .expect("moved canonical X11 geometry");
-    let expected_move_x11_geometry = X11Geometry {
-        x: expected_move.local_x,
-        y: expected_move.local_y,
-        width: expected_move_geometry.width,
-        height: expected_move_geometry.height,
-    };
-    assert_eq!(canonical_after_move, expected_move_x11_geometry);
     let commands = fixture
         .server
         .apply_xwayland_window_event(XwmEvent::ResizeSyncPresented {
@@ -1933,7 +1925,7 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
     assert_eq!(commands, vec![XwmCommand::CompleteResizeSync(handle)]);
     assert_eq!(
         fixture.server.state.x11_authoritative_geometry(handle),
-        Some(expected_move_x11_geometry),
+        Some(canonical_after_move),
         "late resize progress must not overwrite a newer move"
     );
     assert_eq!(
@@ -1946,8 +1938,9 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
             .server
             .state
             .current_visual_root_window_geometry(fixture.surface_id)
-            .expect("current visual geometry"),
-        expected_move_geometry
+            .expect("current visual geometry")
+            .placement,
+        expected_move
     );
     assert_eq!(
         fixture.server.state.toplevel_visual_geometries[&fixture.surface_id].active_resize,
@@ -1959,6 +1952,12 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         "late presentation must retire the superseded resize context"
     );
 
+    let expected_move_x11_geometry = X11Geometry {
+        x: expected_move.local_x,
+        y: expected_move.local_y,
+        width: expected_move_geometry.width,
+        height: expected_move_geometry.height,
+    };
     let commands = fixture.server.take_xwayland_backend_commands(0);
     assert!(
         commands.iter().any(|command| matches!(

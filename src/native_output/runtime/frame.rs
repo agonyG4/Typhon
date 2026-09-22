@@ -322,6 +322,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             })
             .unwrap_or_else(|| {
                 NativeEffectDamageFrameSnapshot::conservative_full(
+                    effect_registry_generation.generation,
                     effects.frame_demand_snapshot().dirty_region,
                 )
             });

@@ -4,6 +4,16 @@ mod tests {
 
     use super::*;
     use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+    use wayland_protocols::xdg::{
+        decoration::zv1::server::{
+            zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+            zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        },
+        shell::server::{
+            xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
+            xdg_toplevel::XdgToplevel,
+        },
+    };
 
     fn collect_raw_fatal_emitters(path: &Path, root: &Path, emitters: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -46,6 +56,7 @@ mod tests {
             surface_id: Some(22),
             xwayland_generation: Some(3),
             category,
+            reason: "test reason".to_string(),
         }
     }
 
@@ -125,6 +136,34 @@ mod tests {
     }
 
     #[test]
+    fn xdg_protocol_interfaces_are_classified_precisely() {
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<XdgSurface>(),
+            ProtocolErrorInterface::XdgSurface
+        );
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<XdgToplevel>(),
+            ProtocolErrorInterface::XdgToplevel
+        );
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<XdgPopup>(),
+            ProtocolErrorInterface::XdgPopup
+        );
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<XdgPositioner>(),
+            ProtocolErrorInterface::XdgPositioner
+        );
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<ZxdgDecorationManagerV1>(),
+            ProtocolErrorInterface::XdgDecorationManager
+        );
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<ZxdgToplevelDecorationV1>(),
+            ProtocolErrorInterface::XdgToplevelDecoration
+        );
+    }
+
+    #[test]
     fn raw_fatal_protocol_emitters_are_centralized() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut emitters = Vec::new();
@@ -146,6 +185,12 @@ pub(crate) const PROTOCOL_ERROR_TRACE_CAPACITY: usize = 64;
 pub(crate) enum ProtocolErrorInterface {
     CoreSurface,
     PointerConstraints,
+    XdgSurface,
+    XdgToplevel,
+    XdgPopup,
+    XdgPositioner,
+    XdgDecorationManager,
+    XdgToplevelDecoration,
     XdgShell,
     XwaylandShell,
     Syncobj,
@@ -175,6 +220,19 @@ impl ProtocolErrorInterface {
             Self::LinuxDmabuf
         } else if name.contains("WlDrm") {
             Self::WlDrm
+        } else if name.contains("XdgSurface") {
+            Self::XdgSurface
+        } else if name.contains("XdgToplevelDecoration") || name.contains("ZxdgToplevelDecoration")
+        {
+            Self::XdgToplevelDecoration
+        } else if name.contains("XdgDecorationManager") || name.contains("ZxdgDecorationManager") {
+            Self::XdgDecorationManager
+        } else if name.contains("XdgToplevel") {
+            Self::XdgToplevel
+        } else if name.contains("XdgPopup") {
+            Self::XdgPopup
+        } else if name.contains("XdgPositioner") {
+            Self::XdgPositioner
         } else if name.contains("Xdg") {
             Self::XdgShell
         } else {
@@ -202,6 +260,7 @@ pub(crate) struct ProtocolErrorRecord {
     pub(crate) surface_id: Option<u32>,
     pub(crate) xwayland_generation: Option<u64>,
     pub(crate) category: ProtocolErrorCategory,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug)]
@@ -243,7 +302,7 @@ impl ProtocolErrorTrace {
     pub(crate) fn dump(&self) {
         for record in self.records() {
             eprintln!(
-                "typhon_protocol_error timestamp_ns={} client={:?} pid={:?} interface={:?} resource_id={:?} error_code={:?} surface_id={:?} xwayland_generation={:?} category={:?}",
+                "typhon_protocol_error timestamp_ns={} client={:?} pid={:?} interface={:?} resource_id={:?} error_code={:?} surface_id={:?} xwayland_generation={:?} category={:?} reason={}",
                 record.timestamp_ns,
                 record.client_id,
                 record.peer_pid,
@@ -253,6 +312,7 @@ impl ProtocolErrorTrace {
                 record.surface_id,
                 record.xwayland_generation,
                 record.category,
+                record.reason,
             );
         }
     }

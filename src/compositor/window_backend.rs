@@ -9,14 +9,14 @@ pub(crate) enum WindowBackendCommand {
         geometry: WindowGeometry,
         mode: ToplevelMode,
         resizing: bool,
-        // Strict ownership for resize work; enqueue-time context for a
-        // position-only configure.
+        // Strict ownership for resize work; enqueue-time context for moves.
         resize_epoch: Option<u64>,
     },
     FinalizeResize {
         window: WindowId,
         geometry: WindowGeometry,
         mode: ToplevelMode,
+        // Finalization is always strictly owned by this enqueue-time epoch.
         resize_epoch: Option<u64>,
     },
     Close {

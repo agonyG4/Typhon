@@ -74,6 +74,74 @@ fn wayland_client_receives_xdg_toplevel_and_surface_configure() {
 }
 
 #[test]
+fn xdg_popup_keyboard_grab_completes_a_normal_popup_transaction() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+
+    let parent_surface = compositor.create_surface(&qh, ());
+    let parent_xdg_surface = wm_base.get_xdg_surface(&parent_surface, &qh, ());
+    let _parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
+    parent_surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&parent_surface, &shm, &qh, 120, 90).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands
+        .send(ServerCommand::KeyboardKey {
+            key: 30,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .keyboard_key_serial
+        .expect("keyboard press serial was not delivered");
+
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+    let positioner = wm_base.create_positioner(&qh, ());
+    positioner.set_size(80, 50);
+    positioner.set_anchor_rect(10, 20, 30, 10);
+    positioner.set_anchor(client_xdg_positioner::Anchor::BottomRight);
+    positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
+    let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+    popup.grab(&seat, serial);
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        80,
+        50,
+    )
+    .unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.popup_configure_count, 1);
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn invalid_activation_serial_still_completes_gtk_toplevel_startup() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
