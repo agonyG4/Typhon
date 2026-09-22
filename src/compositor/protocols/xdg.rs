@@ -190,15 +190,16 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                     return;
                 };
                 let surface_id = compositor_surface_id(&data.surface);
-                if resource.version() < 2
-                    && let Some(surface_data) = data.surface.data::<SurfaceData>()
-                    && (surface_data.has_pending_buffer()
-                        || state.current_surface_buffers.contains_key(&surface_id)
-                        || state
-                            .renderable_surfaces
-                            .iter()
-                            .any(|surface| surface.surface_id == surface_id))
-                {
+                let surface_has_content = data
+                    .surface
+                    .data::<SurfaceData>()
+                    .is_some_and(|surface_data| surface_data.has_pending_buffer())
+                    || state.current_surface_buffers.contains_key(&surface_id)
+                    || state
+                        .renderable_surfaces
+                        .iter()
+                        .any(|surface| surface.surface_id == surface_id);
+                if resource.version() < 2 && surface_has_content {
                     state.post_protocol_error(
                         _client,
                         resource,
@@ -225,9 +226,14 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                 if let Some(decoration_state) = state.xdg_decoration_states.get_mut(&surface_id) {
                     decoration_state.recreate_object();
                 } else {
-                    state
-                        .xdg_decoration_states
-                        .insert(surface_id, WindowDecorationState::new());
+                    state.xdg_decoration_states.insert(
+                        surface_id,
+                        if surface_has_content {
+                            WindowDecorationState::new_client_side_object()
+                        } else {
+                            WindowDecorationState::new()
+                        },
+                    );
                 }
                 state
                     .xdg_decoration_resources

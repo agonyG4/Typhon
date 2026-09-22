@@ -20,10 +20,17 @@ use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
 use wayland_server::Resource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum DecorationObjectLifetime {
+    Present,
+    DestroyedBeforeSurfaceCommit,
+    DestroyedAfterSurfaceCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct WindowDecorationState {
     preference: DecorationPreference,
     applied_mode: DecorationMode,
-    object_present: bool,
+    object_lifetime: DecorationObjectLifetime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +46,7 @@ impl Default for WindowDecorationState {
         Self {
             preference: DecorationPreference::Unset,
             applied_mode: DecorationMode::ClientSide,
-            object_present: true,
+            object_lifetime: DecorationObjectLifetime::Present,
         }
     }
 }
@@ -49,13 +56,23 @@ impl WindowDecorationState {
         Self {
             preference: DecorationPreference::Unset,
             applied_mode: DecorationMode::ClientSide,
-            object_present: true,
+            object_lifetime: DecorationObjectLifetime::Present,
+        }
+    }
+
+    pub(in crate::compositor) const fn new_client_side_object() -> Self {
+        Self {
+            preference: DecorationPreference::ClientSide,
+            applied_mode: DecorationMode::ClientSide,
+            object_lifetime: DecorationObjectLifetime::Present,
         }
     }
 
     pub(in crate::compositor) const fn requested_mode(self, fullscreen: bool) -> DecorationMode {
-        self.preference
-            .effective_mode(self.object_present, fullscreen)
+        self.preference.effective_mode(
+            matches!(self.object_lifetime, DecorationObjectLifetime::Present),
+            fullscreen,
+        )
     }
 
     pub(in crate::compositor) const fn applied_mode(self) -> DecorationMode {
@@ -82,13 +99,21 @@ impl WindowDecorationState {
     }
 
     pub(in crate::compositor) fn destroy_object(&mut self) {
-        self.object_present = false;
-        self.preference = DecorationPreference::Unset;
+        self.object_lifetime = DecorationObjectLifetime::DestroyedBeforeSurfaceCommit;
     }
 
     pub(in crate::compositor) fn recreate_object(&mut self) {
-        self.object_present = true;
-        self.preference = DecorationPreference::Unset;
+        if self.object_lifetime == DecorationObjectLifetime::DestroyedAfterSurfaceCommit {
+            self.preference = DecorationPreference::ClientSide;
+        }
+        self.object_lifetime = DecorationObjectLifetime::Present;
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_after_destroy(&mut self) {
+        if self.object_lifetime == DecorationObjectLifetime::DestroyedBeforeSurfaceCommit {
+            self.preference = DecorationPreference::ClientSide;
+            self.object_lifetime = DecorationObjectLifetime::DestroyedAfterSurfaceCommit;
+        }
     }
 }
 
@@ -293,6 +318,12 @@ impl super::super::CompositorState {
             self.reconcile_native_decoration_transition(window_id, surface_id, mode);
         }
         true
+    }
+
+    pub(in crate::compositor) fn note_xdg_decoration_surface_commit(&mut self, surface_id: u32) {
+        if let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) {
+            decoration_state.note_surface_commit_after_destroy();
+        }
     }
 
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {

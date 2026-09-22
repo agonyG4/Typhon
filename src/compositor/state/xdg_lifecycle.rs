@@ -93,6 +93,7 @@ impl XdgSurfaceLifecycle {
             .any(|configure| !configure.acknowledged)
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn record_configure(&mut self, serial: u32) {
         self.record_configure_with_decoration(serial, None);
     }
@@ -176,6 +177,7 @@ impl XdgSurfaceLifecycle {
         self.configures.clear();
         self.last_acked_serial = None;
         self.last_configured_decoration_mode = None;
+        self.last_acked_decoration_mode = None;
         self.map_state = XdgMapState::AwaitingInitialEmptyCommit;
     }
 
@@ -296,12 +298,6 @@ impl CompositorState {
     pub(in crate::compositor) fn xdg_surface_is_constructed(&self, surface_id: u32) -> bool {
         self.xdg_surface_lifecycle(surface_id)
             .is_some_and(XdgSurfaceLifecycle::is_constructed)
-    }
-
-    pub(in crate::compositor) fn record_xdg_configure(&mut self, surface_id: u32, serial: u32) {
-        if let Some(lifecycle) = self.xdg_surface_lifecycle_mut(surface_id) {
-            lifecycle.record_configure(serial);
-        }
     }
 
     pub(in crate::compositor) fn record_xdg_configure_with_decoration(

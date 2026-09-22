@@ -520,11 +520,13 @@ impl CompositorState {
             );
             self.refresh_effect_scene_summary();
         }
-        if parent_commit_applied
-            && self.apply_acked_xdg_decoration(surface_id)
-            && self.render_generation == render_generation_before_publication
-        {
-            self.advance_render_generation(RenderGenerationCause::WindowDecoration);
+        if parent_commit_applied {
+            let decoration_changed = self.apply_acked_xdg_decoration(surface_id);
+            self.note_xdg_decoration_surface_commit(surface_id);
+            if decoration_changed && self.render_generation == render_generation_before_publication
+            {
+                self.advance_render_generation(RenderGenerationCause::WindowDecoration);
+            }
         }
     }
 }

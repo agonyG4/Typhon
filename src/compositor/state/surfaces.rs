@@ -1,4 +1,33 @@
 use super::*;
+
+fn popup_grab_input_kind_is_legal(kind: InputSerialKind) -> bool {
+    matches!(
+        kind,
+        InputSerialKind::PointerButtonPress { .. }
+            | InputSerialKind::KeyboardKeyPress { .. }
+            | InputSerialKind::TouchDown { .. }
+    )
+}
+
+struct PopupGrabSerialMetadata<'a> {
+    input_serial: u32,
+    serial: u32,
+    kind: InputSerialKind,
+    input_root_surface_id: u32,
+    expected_root_surface_id: u32,
+    input_client_id: &'a Option<ClientId>,
+    expected_client_id: &'a Option<ClientId>,
+    input_focus_generation: u64,
+    focus_generation: u64,
+}
+
+fn popup_grab_serial_metadata_matches(metadata: PopupGrabSerialMetadata<'_>) -> bool {
+    metadata.input_serial == metadata.serial
+        && popup_grab_input_kind_is_legal(metadata.kind)
+        && metadata.input_root_surface_id == metadata.expected_root_surface_id
+        && metadata.input_client_id == metadata.expected_client_id
+        && metadata.input_focus_generation == metadata.focus_generation
+}
 use crate::xwayland::trace::{self, TraceFields};
 impl CompositorState {
     pub(in crate::compositor) fn renderable_surface_index(&self, surface_id: u32) -> Option<usize> {
@@ -1214,12 +1243,19 @@ impl CompositorState {
             .get(&surface_id)
             .map(|node| node.owner_root_id)
             .unwrap_or_else(|| self.root_surface_id_for_surface(surface_id));
+        let expected_client_id = surface.client().map(|client| client.id());
         self.recent_input_serials.iter().any(|input| {
-            input.serial == serial
-                && matches!(input.kind, InputSerialKind::PointerButtonPress { .. })
-                && input.root_surface_id == expected_root_surface_id
-                && input.client_id == surface.client().map(|client| client.id())
-                && input.focus_generation == self.focus_generation
+            popup_grab_serial_metadata_matches(PopupGrabSerialMetadata {
+                input_serial: input.serial,
+                serial,
+                kind: input.kind,
+                input_root_surface_id: input.root_surface_id,
+                expected_root_surface_id,
+                input_client_id: &input.client_id,
+                expected_client_id: &expected_client_id,
+                input_focus_generation: input.focus_generation,
+                focus_generation: self.focus_generation,
+            })
         })
     }
 
@@ -1228,7 +1264,30 @@ impl CompositorState {
         serial: u32,
         surface: &wl_surface::WlSurface,
     ) -> bool {
-        self.validate_popup_grab_serial(serial, surface)
+        let surface_id = compositor_surface_id(surface);
+        let expected_root_surface_id = self
+            .popup_nodes
+            .get(&surface_id)
+            .map(|node| node.owner_root_id)
+            .unwrap_or_else(|| self.root_surface_id_for_surface(surface_id));
+        let expected_client_id = surface.client().map(|client| client.id());
+        self.recent_input_serials.iter().any(|input| {
+            let kind = match input.kind {
+                InputSerialKind::PointerButtonPress { .. } => input.kind,
+                _ => InputSerialKind::PointerEnter,
+            };
+            popup_grab_serial_metadata_matches(PopupGrabSerialMetadata {
+                input_serial: input.serial,
+                serial,
+                kind,
+                input_root_surface_id: input.root_surface_id,
+                expected_root_surface_id,
+                input_client_id: &input.client_id,
+                expected_client_id: &expected_client_id,
+                input_focus_generation: input.focus_generation,
+                focus_generation: self.focus_generation,
+            })
+        })
     }
 
     pub(in crate::compositor) fn selection_input_epoch(
@@ -1561,6 +1620,99 @@ mod ordered_publication_tests {
             .insert_client(stream, Arc::new(()))
             .expect("test client")
             .id()
+    }
+
+    #[test]
+    fn popup_grab_accepts_only_user_action_serial_kinds() {
+        assert!(popup_grab_input_kind_is_legal(
+            InputSerialKind::PointerButtonPress { button: 1 }
+        ));
+        assert!(popup_grab_input_kind_is_legal(
+            InputSerialKind::KeyboardKeyPress { key: 30 }
+        ));
+        assert!(popup_grab_input_kind_is_legal(InputSerialKind::TouchDown {
+            touch_id: 0,
+        }));
+        assert!(!popup_grab_input_kind_is_legal(
+            InputSerialKind::PointerEnter
+        ));
+    }
+
+    #[test]
+    fn popup_grab_serial_validation_preserves_ownership_and_focus_checks() {
+        let client_a = test_client_id();
+        let client_b = test_client_id();
+        let expected_client = Some(client_a.clone());
+        let matching = |serial, kind, root, client, focus| {
+            popup_grab_serial_metadata_matches(PopupGrabSerialMetadata {
+                input_serial: serial,
+                serial: 77,
+                kind,
+                input_root_surface_id: root,
+                expected_root_surface_id: 11,
+                input_client_id: &client,
+                expected_client_id: &expected_client,
+                input_focus_generation: focus,
+                focus_generation: 9,
+            })
+        };
+
+        assert!(matching(
+            77,
+            InputSerialKind::PointerButtonPress { button: 1 },
+            11,
+            Some(client_a.clone()),
+            9
+        ));
+        assert!(matching(
+            77,
+            InputSerialKind::KeyboardKeyPress { key: 30 },
+            11,
+            Some(client_a.clone()),
+            9
+        ));
+        assert!(matching(
+            77,
+            InputSerialKind::TouchDown { touch_id: 0 },
+            11,
+            Some(client_a.clone()),
+            9
+        ));
+        assert!(!matching(
+            77,
+            InputSerialKind::PointerEnter,
+            11,
+            Some(client_a.clone()),
+            9
+        ));
+        assert!(!matching(
+            77,
+            InputSerialKind::PointerButtonPress { button: 1 },
+            11,
+            Some(client_b),
+            9
+        ));
+        assert!(!matching(
+            77,
+            InputSerialKind::PointerButtonPress { button: 1 },
+            12,
+            Some(client_a.clone()),
+            9
+        ));
+        assert!(!matching(
+            77,
+            InputSerialKind::PointerButtonPress { button: 1 },
+            11,
+            Some(client_a.clone()),
+            8
+        ));
+        assert!(!matching(
+            78,
+            InputSerialKind::PointerButtonPress { button: 1 },
+            11,
+            Some(client_a),
+            9
+        ));
     }
 
     fn test_cursor_surface(

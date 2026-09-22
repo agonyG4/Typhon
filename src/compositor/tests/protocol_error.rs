@@ -725,6 +725,8 @@ fn invalid_scale_is_a_wire_error_and_does_not_disconnect_another_client() {
         .expect("wl_surface protocol error should be attributed");
     assert_eq!(record.interface, ProtocolErrorInterface::CoreSurface);
     assert_eq!(record.category, ProtocolErrorCategory::Wire);
+    assert!(!record.reason.is_empty());
+    assert!(record.peer_pid.is_some());
     assert_eq!(
         record.error_code,
         Some(client_wl_surface::Error::InvalidScale as u32)

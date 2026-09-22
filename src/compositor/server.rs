@@ -117,9 +117,9 @@ pub(in crate::compositor) struct XwaylandShellGlobalData {
     pub(in crate::compositor) bind_events: Arc<Mutex<Vec<XwaylandClientIdentity>>>,
 }
 #[derive(Debug)]
-struct TyphonClientData {
+pub(in crate::compositor) struct TyphonClientData {
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
-    client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
+    pub(in crate::compositor) client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
 }
 #[derive(Debug, Clone)]
 struct DisconnectedClient {

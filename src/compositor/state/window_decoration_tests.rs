@@ -1001,6 +1001,31 @@ fn uncommitted_preference_does_not_render_or_invalidate_ssd() {
 }
 
 #[test]
+fn v2_recreation_before_surface_commit_retains_previous_preference() {
+    let mut state = WindowDecorationState::new();
+    state.set_preference(DecorationPreference::ServerSide);
+    state.destroy_object();
+    state.recreate_object();
+    assert_eq!(state.requested_mode(false), DecorationMode::ServerSide);
+}
+
+#[test]
+fn v2_recreation_after_surface_commit_starts_client_side() {
+    let mut state = WindowDecorationState::new();
+    state.set_preference(DecorationPreference::ServerSide);
+    state.destroy_object();
+    state.note_surface_commit_after_destroy();
+    state.recreate_object();
+    assert_eq!(state.requested_mode(false), DecorationMode::ClientSide);
+}
+
+#[test]
+fn v2_mapped_creation_without_previous_object_starts_client_side() {
+    let state = WindowDecorationState::new_client_side_object();
+    assert_eq!(state.requested_mode(false), DecorationMode::ClientSide);
+}
+
+#[test]
 fn maximized_ssd_outer_frame_matches_usable_output_across_repeated_cycles() {
     let mut state = xdg_state(
         test_surface(47),

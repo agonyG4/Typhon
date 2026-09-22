@@ -149,7 +149,7 @@ The target contract is:
 | `wp_fractional_scale_manager_v1` | 1 | always |
 | `wp_presentation` | 2 | always |
 | `zwlr_layer_shell_v1` | 4 | always |
-| `zxdg_decoration_manager_v1` | 1 | always |
+| `zxdg_decoration_manager_v1` | 2 | always |
 | `xdg_activation_v1` | 1 | always |
 | `astrea_shell_auth_manager_v1` | 1 | always |
 | `astrea_shortcuts_manager_v1` | 1 | always |

@@ -2,6 +2,7 @@ use super::hit_testing::PointerSceneHit;
 use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
 use crate::animation_control::AnimationEffect;
+use crate::compositor::decoration::types::DecorationMode;
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleVisualGroup, canonical_visual_rect,
 };
@@ -914,17 +915,7 @@ impl CompositorState {
         {
             eprintln!("oblivion-one compositor: failed to send popup configure: {error:?}");
         }
-        let serial = self.next_configure_serial();
-        if let Err(error) = popup_surface
-            .xdg_surface
-            .send_event(xdg_surface::Event::Configure { serial })
-            && compositor_debug_surface_logging_enabled()
-        {
-            eprintln!(
-                "oblivion-one compositor: failed to send popup xdg_surface configure serial={serial}: {error:?}"
-            );
-        }
-        self.record_xdg_configure(surface_id, serial);
+        self.send_xdg_surface_configure(surface_id, &popup_surface.xdg_surface, None);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: popup surface {surface_id} configured xdg={}x{}+{},{} placement={},{} parent={:?}",
@@ -1104,14 +1095,23 @@ impl CompositorState {
             eprintln!("oblivion-one compositor: failed to send toplevel configure: {error:?}");
         }
 
+        let serial =
+            self.send_xdg_surface_configure(surface_id, &toplevel.xdg_surface, decoration_mode);
+        Some(serial)
+    }
+
+    fn send_xdg_surface_configure(
+        &mut self,
+        surface_id: u32,
+        xdg_surface: &xdg_surface::XdgSurface,
+        decoration_mode: Option<DecorationMode>,
+    ) -> u32 {
         let serial = self.next_configure_serial();
-        if let Err(error) = toplevel
-            .xdg_surface
-            .send_event(xdg_surface::Event::Configure { serial })
+        if let Err(error) = xdg_surface.send_event(xdg_surface::Event::Configure { serial })
             && compositor_debug_surface_logging_enabled()
         {
             eprintln!(
-                "oblivion-one compositor: failed to send toplevel xdg_surface configure serial={serial}: {error:?}"
+                "oblivion-one compositor: failed to send xdg_surface configure serial={serial}: {error:?}"
             );
         }
         self.xdg_configure_serials
@@ -1119,7 +1119,17 @@ impl CompositorState {
             .or_default()
             .latest_sent = serial;
         self.record_xdg_configure_with_decoration(surface_id, serial, decoration_mode);
-        Some(serial)
+        debug_assert!(
+            self.xdg_surface_lifecycle(surface_id)
+                .is_some_and(|lifecycle| {
+                    lifecycle
+                        .configures
+                        .iter()
+                        .any(|configure| configure.serial == serial)
+                }),
+            "every emitted xdg_surface.configure must have a lifecycle record"
+        );
+        serial
     }
 
     pub(in crate::compositor) fn send_wm_capabilities_if_needed(&mut self, surface_id: u32) {
