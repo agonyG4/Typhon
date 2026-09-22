@@ -3,7 +3,9 @@ use std::{collections::HashMap, ffi::OsStr, sync::OnceLock};
 #[cfg(test)]
 use std::cell::RefCell;
 
-use crate::egl_renderer::damage::{FullRepaintReason, OutputDamage, RepaintMode, RepaintPlan};
+use crate::egl_renderer::damage::{
+    DamageComplexityShadow, FullRepaintReason, OutputDamage, RepaintMode, RepaintPlan,
+};
 
 use oblivion_one::effects::{
     CompiledFrameGraph, CompiledRenderPass, EffectDemandPlanStats, GraphTextureId,
@@ -373,6 +375,7 @@ pub(crate) struct EffectRepaintProvenanceSnapshot {
     pub(crate) merged_damage: DamageTraceSnapshot,
     pub(crate) initial_plan: RepaintPlanTraceSnapshot,
     pub(crate) final_plan: RepaintPlanTraceSnapshot,
+    pub(crate) damage_complexity_shadow: DamageComplexityShadow,
 }
 
 impl EffectRepaintProvenanceSnapshot {
@@ -382,6 +385,7 @@ impl EffectRepaintProvenanceSnapshot {
         merged_damage: DamageTraceSnapshot,
         initial_plan: RepaintPlanTraceSnapshot,
         final_plan: RepaintPlanTraceSnapshot,
+        damage_complexity_shadow: DamageComplexityShadow,
     ) -> Self {
         Self {
             input_damage,
@@ -389,6 +393,7 @@ impl EffectRepaintProvenanceSnapshot {
             merged_damage,
             initial_plan,
             final_plan,
+            damage_complexity_shadow,
         }
     }
 
@@ -414,8 +419,14 @@ impl EffectRepaintProvenanceSnapshot {
     }
 
     pub(crate) fn format_line(self, frame_id: Option<u64>) -> String {
+        let (bbox_x, bbox_y, bbox_width, bbox_height) = self
+            .damage_complexity_shadow
+            .bbox
+            .map_or((0, 0, 0, 0), |bbox| {
+                (bbox.x, bbox.y, bbox.width, bbox.height)
+            });
         format!(
-            "event=effect_repaint_provenance frame_id={} input_damage_kind={} input_damage_rects={} input_damage_pixels={} scene_damage_kind={} scene_damage_rects={} scene_damage_pixels={} merged_damage_kind={} merged_damage_rects={} merged_damage_pixels={} initial_repaint_mode={} initial_repaint_reason={} initial_buffer_age={} initial_render_damage_kind={} initial_render_damage_rects={} initial_render_damage_pixels={} initial_repair_damage_kind={} initial_repair_damage_rects={} initial_repair_damage_pixels={} final_repaint_mode={} final_repaint_reason={} final_buffer_age={} final_render_damage_kind={} final_render_damage_rects={} final_render_damage_pixels={} final_repair_damage_kind={} final_repair_damage_rects={} final_repair_damage_pixels={} first_full_stage={} promoted_to_full={}",
+            "event=effect_repaint_provenance frame_id={} input_damage_kind={} input_damage_rects={} input_damage_pixels={} scene_damage_kind={} scene_damage_rects={} scene_damage_pixels={} merged_damage_kind={} merged_damage_rects={} merged_damage_pixels={} initial_repaint_mode={} initial_repaint_reason={} initial_buffer_age={} initial_render_damage_kind={} initial_render_damage_rects={} initial_render_damage_pixels={} initial_repair_damage_kind={} initial_repair_damage_rects={} initial_repair_damage_pixels={} final_repaint_mode={} final_repaint_reason={} final_buffer_age={} final_render_damage_kind={} final_render_damage_rects={} final_render_damage_pixels={} final_repair_damage_kind={} final_repair_damage_rects={} final_repair_damage_pixels={} first_full_stage={} promoted_to_full={} damage_complexity_shadow_applicable={} damage_complexity_original_rects={} damage_complexity_original_pixels={} damage_complexity_bbox_x={} damage_complexity_bbox_y={} damage_complexity_bbox_width={} damage_complexity_bbox_height={} damage_complexity_bbox_pixels={} damage_complexity_bbox_accepted={} damage_complexity_candidate_rects={} damage_complexity_candidate_pixels={} damage_complexity_added_pixels={} damage_complexity_outcome={} damage_complexity_would_avoid_full={}",
             optional_u64(frame_id),
             self.input_damage.kind.as_str(),
             self.input_damage.rects,
@@ -450,6 +461,32 @@ impl EffectRepaintProvenanceSnapshot {
             self.final_plan.repair_damage.pixels,
             self.first_full_stage().as_str(),
             if self.promoted_to_full() { "1" } else { "0" },
+            if self.damage_complexity_shadow.applicable {
+                "1"
+            } else {
+                "0"
+            },
+            self.damage_complexity_shadow.original_rects,
+            self.damage_complexity_shadow.original_pixels,
+            bbox_x,
+            bbox_y,
+            bbox_width,
+            bbox_height,
+            self.damage_complexity_shadow.bbox_pixels,
+            if self.damage_complexity_shadow.bbox_accepted {
+                "1"
+            } else {
+                "0"
+            },
+            self.damage_complexity_shadow.candidate_rects,
+            self.damage_complexity_shadow.candidate_pixels,
+            self.damage_complexity_shadow.added_pixels,
+            self.damage_complexity_shadow.outcome.as_str(),
+            if self.damage_complexity_shadow.would_avoid_full {
+                "1"
+            } else {
+                "0"
+            },
         )
     }
 }
@@ -1525,7 +1562,14 @@ mod tests {
         initial: RepaintPlanTraceSnapshot,
         final_plan: RepaintPlanTraceSnapshot,
     ) -> EffectRepaintProvenanceSnapshot {
-        EffectRepaintProvenanceSnapshot::new(input, scene, merged, initial, final_plan)
+        EffectRepaintProvenanceSnapshot::new(
+            input,
+            scene,
+            merged,
+            initial,
+            final_plan,
+            DamageComplexityShadow::not_applicable(),
+        )
     }
 
     #[test]
@@ -1711,6 +1755,20 @@ mod tests {
             "final_repair_damage_pixels",
             "first_full_stage",
             "promoted_to_full",
+            "damage_complexity_shadow_applicable",
+            "damage_complexity_original_rects",
+            "damage_complexity_original_pixels",
+            "damage_complexity_bbox_x",
+            "damage_complexity_bbox_y",
+            "damage_complexity_bbox_width",
+            "damage_complexity_bbox_height",
+            "damage_complexity_bbox_pixels",
+            "damage_complexity_bbox_accepted",
+            "damage_complexity_candidate_rects",
+            "damage_complexity_candidate_pixels",
+            "damage_complexity_added_pixels",
+            "damage_complexity_outcome",
+            "damage_complexity_would_avoid_full",
         ];
 
         for key in keys {
@@ -1733,9 +1791,62 @@ mod tests {
         assert!(line.contains("final_buffer_age=3"));
         assert!(line.contains("first_full_stage=effect_execution"));
         assert!(line.contains("promoted_to_full=1"));
+        assert!(line.contains("damage_complexity_shadow_applicable=0"));
+        assert!(line.contains("damage_complexity_original_rects=0"));
+        assert!(line.contains("damage_complexity_original_pixels=0"));
+        assert!(line.contains("damage_complexity_bbox_x=0"));
+        assert!(line.contains("damage_complexity_bbox_y=0"));
+        assert!(line.contains("damage_complexity_bbox_width=0"));
+        assert!(line.contains("damage_complexity_bbox_height=0"));
+        assert!(line.contains("damage_complexity_bbox_pixels=0"));
+        assert!(line.contains("damage_complexity_bbox_accepted=0"));
+        assert!(line.contains("damage_complexity_candidate_rects=0"));
+        assert!(line.contains("damage_complexity_candidate_pixels=0"));
+        assert!(line.contains("damage_complexity_added_pixels=0"));
+        assert!(line.contains("damage_complexity_outcome=not_applicable"));
+        assert!(line.contains("damage_complexity_would_avoid_full=0"));
         assert!(!line.contains("Some("));
         assert!(!line.contains("FullRepaintReason"));
         assert!(!line.contains("DamageTraceKind"));
+        assert!(!line.contains("DamageComplexityShadow"));
+    }
+
+    #[test]
+    fn repaint_provenance_formatter_emits_shadow_values_with_stable_names() {
+        let rects = damage_snapshot(DamageTraceKind::Rects);
+        let plan = repaint_snapshot(
+            RepaintMode::Full,
+            Some(FullRepaintReason::TooManyRectangles),
+        );
+        let candidate = OutputDamage::Rects(
+            (0..9)
+                .map(|index| crate::egl_renderer::damage::OutputRect::new(index * 11, 0, 10, 10))
+                .collect(),
+        );
+        let shadow = DamageComplexityShadow::for_candidate(
+            &candidate,
+            (100, 100),
+            Some(FullRepaintReason::TooManyRectangles),
+        );
+        let mut evidence = provenance(rects, rects, rects, plan, plan);
+        evidence.damage_complexity_shadow = shadow;
+        let line = evidence.format_line(Some(43));
+
+        assert!(line.contains("damage_complexity_shadow_applicable=1"));
+        assert!(line.contains("damage_complexity_original_rects=9"));
+        assert!(line.contains("damage_complexity_original_pixels=900"));
+        assert!(line.contains("damage_complexity_bbox_x=0"));
+        assert!(line.contains("damage_complexity_bbox_y=0"));
+        assert!(line.contains("damage_complexity_bbox_width=98"));
+        assert!(line.contains("damage_complexity_bbox_height=10"));
+        assert!(line.contains("damage_complexity_bbox_pixels=980"));
+        assert!(line.contains("damage_complexity_bbox_accepted=1"));
+        assert!(line.contains("damage_complexity_candidate_rects=1"));
+        assert!(line.contains("damage_complexity_candidate_pixels=980"));
+        assert!(line.contains("damage_complexity_added_pixels=80"));
+        assert!(line.contains("damage_complexity_outcome=partial_bbox"));
+        assert!(line.contains("damage_complexity_would_avoid_full=1"));
+        assert!(!line.contains("PartialBoundingBox"));
     }
 
     #[test]

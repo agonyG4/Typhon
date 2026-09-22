@@ -25,6 +25,342 @@ fn partial_planner(
     planner
 }
 
+fn dense_many_rect_damage() -> OutputDamage {
+    OutputDamage::rects(
+        100,
+        100,
+        [0, 11, 22]
+            .into_iter()
+            .flat_map(|y| [0, 11, 22].into_iter().map(move |x| rect(x, y, 10, 10))),
+    )
+}
+
+fn sparse_many_rect_damage() -> OutputDamage {
+    OutputDamage::rects(250, 10, (0..9).map(|index| rect(index * 30, 0, 10, 10)))
+}
+
+#[test]
+fn damage_complexity_shadow_is_not_applicable_to_simple_damage() {
+    let cases = [
+        OutputDamage::Empty,
+        OutputDamage::Full,
+        OutputDamage::rects(100, 100, (0..8).map(|index| rect(index * 10, 0, 5, 5))),
+    ];
+
+    for candidate in cases {
+        let shadow = DamageComplexityShadow::for_candidate(
+            &candidate,
+            (100, 100),
+            Some(FullRepaintReason::TooManyRectangles),
+        );
+        assert_eq!(shadow.outcome, DamageComplexityShadowOutcome::NotApplicable);
+        assert!(!shadow.applicable);
+        assert_eq!(shadow, DamageComplexityShadow::not_applicable());
+    }
+}
+
+#[test]
+fn damage_complexity_shadow_outcomes_have_stable_names() {
+    assert_eq!(
+        DamageComplexityShadowOutcome::NotApplicable.as_str(),
+        "not_applicable"
+    );
+    assert_eq!(
+        DamageComplexityShadowOutcome::PartialBoundingBox.as_str(),
+        "partial_bbox"
+    );
+    assert_eq!(
+        DamageComplexityShadowOutcome::PartialManyRectangles.as_str(),
+        "partial_many_rects"
+    );
+    assert_eq!(
+        DamageComplexityShadowOutcome::FullAreaThreshold.as_str(),
+        "full_area_threshold"
+    );
+    assert_eq!(
+        DamageComplexityShadowOutcome::Unavailable.as_str(),
+        "unavailable"
+    );
+}
+
+#[test]
+fn damage_complexity_shadow_accepts_dense_bounding_box_at_two_x_factor() {
+    let candidate = dense_many_rect_damage();
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (100, 100),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert_eq!(candidate.rect_count(), 9);
+    assert!(shadow.applicable);
+    assert_eq!(shadow.original_rects, 9);
+    assert_eq!(shadow.original_pixels, 900);
+    assert_eq!(shadow.bbox, Some(rect(0, 0, 32, 32)));
+    assert_eq!(shadow.bbox_pixels, 1024);
+    assert!(shadow.bbox_accepted);
+    assert_eq!(shadow.candidate_rects, 1);
+    assert_eq!(shadow.candidate_pixels, 1024);
+    assert_eq!(shadow.added_pixels, 124);
+    assert_eq!(
+        shadow.outcome,
+        DamageComplexityShadowOutcome::PartialBoundingBox
+    );
+    assert!(shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_keeps_sparse_many_rectangles() {
+    let candidate = sparse_many_rect_damage();
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (250, 10),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert_eq!(shadow.original_rects, 9);
+    assert_eq!(shadow.original_pixels, 900);
+    assert_eq!(shadow.bbox, Some(rect(0, 0, 250, 10)));
+    assert_eq!(shadow.bbox_pixels, 2500);
+    assert!(!shadow.bbox_accepted);
+    assert_eq!(shadow.candidate_rects, 9);
+    assert_eq!(shadow.candidate_pixels, 900);
+    assert_eq!(shadow.added_pixels, 0);
+    assert_eq!(
+        shadow.outcome,
+        DamageComplexityShadowOutcome::PartialManyRectangles
+    );
+    assert!(shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_is_scoped_to_rectangle_fallback_reason() {
+    let shadow = DamageComplexityShadow::for_candidate(
+        &dense_many_rect_damage(),
+        (100, 100),
+        Some(FullRepaintReason::DamageAreaThreshold),
+    );
+
+    assert_eq!(shadow.outcome, DamageComplexityShadowOutcome::NotApplicable);
+    assert!(!shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_preserves_area_threshold_for_bbox_candidate() {
+    let candidate = OutputDamage::rects(
+        100,
+        100,
+        [0, 34, 68]
+            .into_iter()
+            .flat_map(|y| [0, 34, 68].into_iter().map(move |x| rect(x, y, 30, 30))),
+    );
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (100, 100),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert!(shadow.bbox_accepted);
+    assert_eq!(shadow.candidate_pixels, 98 * 98);
+    assert_eq!(
+        shadow.outcome,
+        DamageComplexityShadowOutcome::FullAreaThreshold
+    );
+    assert!(!shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_keeps_full_area_outcome_for_rejected_bbox() {
+    // The planner receives clipped, coalesced damage, so this combination is
+    // not reachable for an in-output region. Exercise the outcome precedence
+    // directly with synthetic metrics to keep the area safeguard explicit.
+    let shadow = DamageComplexityShadow::from_metrics_for_test(
+        9,
+        8_000,
+        Some(rect(0, 0, 200, 100)),
+        20_000,
+        100,
+    );
+
+    assert!(!shadow.bbox_accepted);
+    assert_eq!(shadow.candidate_pixels, 8_000);
+    assert_eq!(
+        shadow.outcome,
+        DamageComplexityShadowOutcome::FullAreaThreshold
+    );
+    assert!(!shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_requires_more_than_eight_rectangles() {
+    let candidate = OutputDamage::rects(100, 100, (0..8).map(|index| rect(index * 10, 0, 5, 5)));
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (100, 100),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert_eq!(candidate.rect_count(), MAX_PARTIAL_REPAINT_RECTS);
+    assert_eq!(shadow.outcome, DamageComplexityShadowOutcome::NotApplicable);
+}
+
+#[test]
+fn damage_complexity_shadow_accepts_exactly_two_times_area() {
+    let candidate = OutputDamage::rects(
+        100,
+        100,
+        [
+            rect(0, 0, 1, 100),
+            rect(2, 0, 1, 100),
+            rect(4, 0, 1, 100),
+            rect(6, 0, 1, 100),
+            rect(8, 0, 1, 100),
+            rect(10, 0, 1, 100),
+            rect(12, 0, 1, 100),
+            rect(14, 0, 1, 100),
+            rect(18, 0, 2, 100),
+        ],
+    );
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (100, 100),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert_eq!(candidate.rect_count(), 9);
+    assert_eq!(shadow.original_pixels, 1_000);
+    assert_eq!(shadow.bbox_pixels, 2_000);
+    assert_eq!(
+        shadow.original_pixels * DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR,
+        2_000
+    );
+    assert!(shadow.bbox_accepted);
+    assert_eq!(
+        shadow.outcome,
+        DamageComplexityShadowOutcome::PartialBoundingBox
+    );
+}
+
+#[test]
+fn damage_complexity_shadow_reports_unavailable_on_pixel_overflow() {
+    let candidate = OutputDamage::Rects(vec![
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+        rect(0, 0, u32::MAX, u32::MAX),
+    ]);
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (u32::MAX, u32::MAX),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert_eq!(shadow.outcome, DamageComplexityShadowOutcome::Unavailable);
+    assert!(shadow.applicable);
+    assert_eq!(shadow.original_rects, 9);
+    assert_eq!(shadow.original_pixels, u64::MAX);
+    assert_eq!(shadow.bbox, Some(rect(0, 0, u32::MAX, u32::MAX)));
+    assert_eq!(
+        shadow.bbox_pixels,
+        u64::from(u32::MAX) * u64::from(u32::MAX)
+    );
+    assert!(!shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_reports_unavailable_when_bbox_cannot_be_represented() {
+    let mut rects: Vec<_> = (0..8).map(|index| rect(index * 2, 0, 1, 1)).collect();
+    rects.push(rect(i32::MAX, 0, u32::MAX, 1));
+    let candidate = OutputDamage::Rects(rects);
+    let shadow = DamageComplexityShadow::for_candidate(
+        &candidate,
+        (u32::MAX, u32::MAX),
+        Some(FullRepaintReason::TooManyRectangles),
+    );
+
+    assert_eq!(shadow.outcome, DamageComplexityShadowOutcome::Unavailable);
+    assert!(shadow.applicable);
+    assert_eq!(shadow.bbox, None);
+    assert!(!shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_rejects_unrepresentable_factor_arithmetic() {
+    let shadow = DamageComplexityShadow::from_metrics_for_test(
+        9,
+        u64::MAX / DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR + 1,
+        Some(rect(0, 0, 10, 10)),
+        100,
+        u64::MAX,
+    );
+
+    assert_eq!(shadow.outcome, DamageComplexityShadowOutcome::Unavailable);
+    assert!(!shadow.bbox_accepted);
+    assert!(!shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_added_pixels_use_saturating_subtraction() {
+    let shadow =
+        DamageComplexityShadow::from_metrics_for_test(9, 100, Some(rect(0, 0, 9, 10)), 90, 1_000);
+
+    assert!(shadow.bbox_accepted);
+    assert_eq!(shadow.added_pixels, 0);
+}
+
+#[test]
+fn damage_complexity_shadow_output_area_uses_checked_u64_dimensions() {
+    assert_eq!(
+        super::output_pixel_count((u32::MAX, u32::MAX)),
+        Some(u64::from(u32::MAX) * u64::from(u32::MAX))
+    );
+}
+
+#[test]
+fn damage_complexity_shadow_does_not_change_actual_full_plan() {
+    let mut planner = partial_planner((100, 100), partial_capabilities());
+    planner.commit_presented_transition(OutputDamage::Empty);
+    let candidate = dense_many_rect_damage();
+    let expected = planner.plan(candidate.clone(), BufferAge::Value(1));
+    let (actual, shadow) =
+        planner.plan_with_damage_complexity_shadow(candidate, BufferAge::Value(1));
+
+    assert_eq!(expected, actual);
+    assert_eq!(actual.mode, RepaintMode::Full);
+    assert_eq!(
+        actual.fallback_reason,
+        Some(FullRepaintReason::TooManyRectangles)
+    );
+    assert_eq!(actual.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        shadow.outcome,
+        DamageComplexityShadowOutcome::PartialBoundingBox
+    );
+    assert!(shadow.would_avoid_full);
+}
+
+#[test]
+fn damage_complexity_shadow_analysis_is_skipped_by_normal_planning() {
+    super::DAMAGE_COMPLEXITY_SHADOW_ANALYSIS_COUNT.with(|count| count.set(0));
+    let mut planner = partial_planner((100, 100), partial_capabilities());
+    planner.commit_presented_transition(OutputDamage::Empty);
+    let candidate = dense_many_rect_damage();
+
+    let actual = planner.plan(candidate, BufferAge::Value(1));
+
+    assert_eq!(actual.mode, RepaintMode::Full);
+    assert_eq!(
+        actual.fallback_reason,
+        Some(FullRepaintReason::TooManyRectangles)
+    );
+    super::DAMAGE_COMPLEXITY_SHADOW_ANALYSIS_COUNT.with(|count| assert_eq!(count.get(), 0));
+}
+
 fn graph_for_effect_region(
     id: u64,
     output_influence_region: oblivion_one::effects::EffectRegion,

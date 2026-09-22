@@ -98,6 +98,33 @@ using `frame_id` for the existing detailed demand and repair evidence. Join with
 and retain the source frame identifier. The provenance event does not duplicate
 demand-plan metrics or add GPU queries.
 
+### Damage complexity shadow policy
+
+The same record includes a diagnostic-only Damage Complexity Shadow Policy for
+the initial planner's pre-fallback repair candidate. It applies only when the
+current planner reason is `too_many_rectangles` and the candidate has more than
+eight rectangles. Its reference algorithm is:
+
+```text
+more than 8 rects
+    ↓
+bbox area <= actual area × 2?
+    YES → simulate one bbox rectangle
+    NO  → simulate retaining the original rectangles
+    ↓
+apply Typhon's existing 75% output-area threshold
+```
+
+The record preserves original, bbox, and selected-candidate counts and pixel
+totals, along with the bbox coordinates, acceptance flag, outcome, and
+`damage_complexity_would_avoid_full`. A value of
+`damage_complexity_would_avoid_full=1` means the reference complexity rule
+would avoid the rectangle-count-triggered Full fallback while still applying
+Typhon's 75% area threshold. It is an area-based counterfactual, not a measured
+performance improvement. In particular, `partial_many_rects` means the
+simulation keeps the original multi-rectangle region; it does not establish
+that rendering an arbitrary number of rectangles is faster.
+
 ## GLES effect GPU timing
 
 GPU effect timing is a separate opt-in instrumentation capability. Enable it

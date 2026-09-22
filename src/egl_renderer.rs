@@ -2135,7 +2135,14 @@ impl GlesSceneRenderer {
         } else {
             None
         };
-        let mut plan = self.repaint_planner.plan(output_damage, buffer_age);
+        let (mut plan, damage_complexity_shadow_trace) = if self.effect_trace.enabled() {
+            let (plan, shadow) = self
+                .repaint_planner
+                .plan_with_damage_complexity_shadow(output_damage, buffer_age);
+            (plan, Some(shadow))
+        } else {
+            (self.repaint_planner.plan(output_damage, buffer_age), None)
+        };
         if plan.mode == RepaintMode::Skip {
             self.frame_stats.surface_resource_candidates = surfaces.len();
             self.frame_stats.surface_resource_deferred = surfaces.len();
@@ -2204,6 +2211,8 @@ impl GlesSceneRenderer {
                 merged_damage_trace.expect("enabled effect trace must capture merged damage"),
                 initial_repaint_trace.expect("enabled effect trace must capture initial repaint"),
                 RepaintPlanTraceSnapshot::from_plan(&plan, width, height),
+                damage_complexity_shadow_trace
+                    .expect("enabled effect trace must capture damage complexity shadow"),
             )
         });
         if let Some(demand) = &effect_execution_demand {

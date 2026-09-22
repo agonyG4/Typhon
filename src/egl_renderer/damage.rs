@@ -1,5 +1,8 @@
 use std::{collections::VecDeque, sync::Arc};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use khronos_egl as egl;
 use oblivion_one::{
     compositor::{DesktopVisualState, SurfaceDamageRect, cursor_damage_rect},
@@ -13,6 +16,12 @@ pub(crate) const MAX_PARTIAL_REPAINT_RECTS: usize = 8;
 pub(crate) const MAX_DAMAGE_HISTORY_FRAMES: usize = 8;
 const MAX_EXPLICIT_OUTPUT_BUFFER_AGE: u32 = 3;
 const MAX_PARTIAL_REPAINT_PERCENT: u64 = 75;
+pub(crate) const DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR: u64 = 2;
+
+#[cfg(test)]
+thread_local! {
+    static DAMAGE_COMPLEXITY_SHADOW_ANALYSIS_COUNT: Cell<u32> = const { Cell::new(0) };
+}
 
 /// A half-open rectangle in output physical pixels with a top-left origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,13 +592,221 @@ fn partial_repaint_fallback_reason(
     let Some(repair_pixels) = repair_damage.pixels(output_size.0, output_size.1) else {
         return Some(FullRepaintReason::DamageAreaThreshold);
     };
-    let Some(output_pixels) = u64::from(output_size.0).checked_mul(u64::from(output_size.1)) else {
+    let Some(output_pixels) = output_pixel_count(output_size) else {
         return Some(FullRepaintReason::DamageAreaThreshold);
     };
-    (output_pixels == 0
+    partial_repaint_area_threshold_reached(repair_pixels, output_pixels)
+        .then_some(FullRepaintReason::DamageAreaThreshold)
+}
+
+fn output_pixel_count(output_size: (u32, u32)) -> Option<u64> {
+    u64::from(output_size.0).checked_mul(u64::from(output_size.1))
+}
+
+fn partial_repaint_area_threshold_reached(repair_pixels: u64, output_pixels: u64) -> bool {
+    output_pixels == 0
         || repair_pixels.saturating_mul(100)
-            >= output_pixels.saturating_mul(MAX_PARTIAL_REPAINT_PERCENT))
-    .then_some(FullRepaintReason::DamageAreaThreshold)
+            >= output_pixels.saturating_mul(MAX_PARTIAL_REPAINT_PERCENT)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DamageComplexityShadowOutcome {
+    NotApplicable,
+    PartialBoundingBox,
+    PartialManyRectangles,
+    FullAreaThreshold,
+    Unavailable,
+}
+
+impl DamageComplexityShadowOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::PartialBoundingBox => "partial_bbox",
+            Self::PartialManyRectangles => "partial_many_rects",
+            Self::FullAreaThreshold => "full_area_threshold",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Diagnostic-only simulation of the reference damage-complexity policy.
+/// This is deliberately separate from `RepaintPlan` and is never used to
+/// choose production repaint behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DamageComplexityShadow {
+    pub(crate) applicable: bool,
+    pub(crate) original_rects: usize,
+    pub(crate) original_pixels: u64,
+    pub(crate) bbox: Option<OutputRect>,
+    pub(crate) bbox_pixels: u64,
+    pub(crate) bbox_accepted: bool,
+    pub(crate) candidate_rects: usize,
+    pub(crate) candidate_pixels: u64,
+    pub(crate) added_pixels: u64,
+    pub(crate) outcome: DamageComplexityShadowOutcome,
+    pub(crate) would_avoid_full: bool,
+}
+
+impl DamageComplexityShadow {
+    pub(crate) const fn not_applicable() -> Self {
+        Self {
+            applicable: false,
+            original_rects: 0,
+            original_pixels: 0,
+            bbox: None,
+            bbox_pixels: 0,
+            bbox_accepted: false,
+            candidate_rects: 0,
+            candidate_pixels: 0,
+            added_pixels: 0,
+            outcome: DamageComplexityShadowOutcome::NotApplicable,
+            would_avoid_full: false,
+        }
+    }
+
+    fn unavailable(
+        original_rects: usize,
+        original_pixels: u64,
+        bbox: Option<OutputRect>,
+        bbox_pixels: u64,
+    ) -> Self {
+        Self {
+            applicable: true,
+            original_rects,
+            original_pixels,
+            bbox,
+            bbox_pixels,
+            bbox_accepted: false,
+            candidate_rects: 0,
+            candidate_pixels: 0,
+            added_pixels: 0,
+            outcome: DamageComplexityShadowOutcome::Unavailable,
+            would_avoid_full: false,
+        }
+    }
+
+    pub(crate) fn for_candidate(
+        repair_damage: &OutputDamage,
+        output_size: (u32, u32),
+        current_reason: Option<FullRepaintReason>,
+    ) -> Self {
+        #[cfg(test)]
+        DAMAGE_COMPLEXITY_SHADOW_ANALYSIS_COUNT
+            .with(|count| count.set(count.get().saturating_add(1)));
+
+        if current_reason != Some(FullRepaintReason::TooManyRectangles) {
+            return Self::not_applicable();
+        }
+        let OutputDamage::Rects(rects) = repair_damage else {
+            return Self::not_applicable();
+        };
+        if rects.len() <= MAX_PARTIAL_REPAINT_RECTS {
+            return Self::not_applicable();
+        }
+
+        let original_rects = rects.len();
+        let original_pixels = repair_damage.pixels(output_size.0, output_size.1);
+        let original_pixels_trace = original_pixels.unwrap_or(u64::MAX);
+        let Some(first_rect) = rects.first().copied() else {
+            return Self::unavailable(original_rects, original_pixels_trace, None, 0);
+        };
+        let Some(bbox) = rects
+            .iter()
+            .skip(1)
+            .try_fold(first_rect, |bbox, rect| bbox.union(*rect))
+        else {
+            return Self::unavailable(original_rects, original_pixels_trace, None, 0);
+        };
+        let bbox_pixels = bbox.pixels();
+        let Some(output_pixels) = output_pixel_count(output_size) else {
+            return Self::unavailable(
+                original_rects,
+                original_pixels_trace,
+                Some(bbox),
+                bbox_pixels,
+            );
+        };
+        let Some(original_pixels) = original_pixels else {
+            return Self::unavailable(
+                original_rects,
+                original_pixels_trace,
+                Some(bbox),
+                bbox_pixels,
+            );
+        };
+        Self::from_metrics(
+            original_rects,
+            original_pixels,
+            Some(bbox),
+            bbox_pixels,
+            output_pixels,
+        )
+    }
+
+    fn from_metrics(
+        original_rects: usize,
+        original_pixels: u64,
+        bbox: Option<OutputRect>,
+        bbox_pixels: u64,
+        output_pixels: u64,
+    ) -> Self {
+        let Some(original_extents_limit) =
+            original_pixels.checked_mul(DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR)
+        else {
+            return Self::unavailable(original_rects, original_pixels, bbox, bbox_pixels);
+        };
+        let Some(bbox) = bbox else {
+            return Self::unavailable(original_rects, original_pixels, None, bbox_pixels);
+        };
+        let bbox_accepted = bbox_pixels <= original_extents_limit;
+        let (candidate_rects, candidate_pixels, added_pixels) = if bbox_accepted {
+            (1, bbox_pixels, bbox_pixels.saturating_sub(original_pixels))
+        } else {
+            (original_rects, original_pixels, 0)
+        };
+        let outcome = if partial_repaint_area_threshold_reached(candidate_pixels, output_pixels) {
+            DamageComplexityShadowOutcome::FullAreaThreshold
+        } else if bbox_accepted {
+            DamageComplexityShadowOutcome::PartialBoundingBox
+        } else {
+            DamageComplexityShadowOutcome::PartialManyRectangles
+        };
+        Self {
+            applicable: true,
+            original_rects,
+            original_pixels,
+            bbox: Some(bbox),
+            bbox_pixels,
+            bbox_accepted,
+            candidate_rects,
+            candidate_pixels,
+            added_pixels,
+            outcome,
+            would_avoid_full: matches!(
+                outcome,
+                DamageComplexityShadowOutcome::PartialBoundingBox
+                    | DamageComplexityShadowOutcome::PartialManyRectangles
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_metrics_for_test(
+        original_rects: usize,
+        original_pixels: u64,
+        bbox: Option<OutputRect>,
+        bbox_pixels: u64,
+        output_pixels: u64,
+    ) -> Self {
+        Self::from_metrics(
+            original_rects,
+            original_pixels,
+            bbox,
+            bbox_pixels,
+            output_pixels,
+        )
+    }
 }
 
 impl PartialRepaintPlanner {
@@ -608,6 +825,35 @@ impl PartialRepaintPlanner {
     }
 
     pub(crate) fn plan(&mut self, current_damage: OutputDamage, age: BufferAge) -> RepaintPlan {
+        self.plan_inner(current_damage, age, None)
+    }
+
+    /// Trace-only planner entry point that observes the repair candidate at
+    /// the exact point where the ordinary planner would otherwise replace it
+    /// with `OutputDamage::Full`.
+    pub(crate) fn plan_with_damage_complexity_shadow(
+        &mut self,
+        current_damage: OutputDamage,
+        age: BufferAge,
+    ) -> (RepaintPlan, DamageComplexityShadow) {
+        let mut shadow = DamageComplexityShadow::not_applicable();
+        let output_size = self.output_size;
+        let mut observe_candidate = |repair_damage: &OutputDamage, reason: FullRepaintReason| {
+            if reason == FullRepaintReason::TooManyRectangles {
+                shadow =
+                    DamageComplexityShadow::for_candidate(repair_damage, output_size, Some(reason));
+            }
+        };
+        let plan = self.plan_inner(current_damage, age, Some(&mut observe_candidate));
+        (plan, shadow)
+    }
+
+    fn plan_inner(
+        &mut self,
+        current_damage: OutputDamage,
+        age: BufferAge,
+        mut observe_complexity_fallback: Option<&mut dyn FnMut(&OutputDamage, FullRepaintReason)>,
+    ) -> RepaintPlan {
         if current_damage == OutputDamage::Empty {
             if !self.history_valid {
                 return self.full_plan(
@@ -722,6 +968,9 @@ impl PartialRepaintPlanner {
             };
         }
         if let Some(reason) = partial_repaint_fallback_reason(&repair_damage, self.output_size) {
+            if let Some(observe) = observe_complexity_fallback.as_deref_mut() {
+                observe(&repair_damage, reason);
+            }
             return self.full_plan(current_damage, Some(age), reason);
         }
         RepaintPlan {
