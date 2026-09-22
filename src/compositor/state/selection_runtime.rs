@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_PENDING_XWAYLAND_SELECTION_REQUESTS: usize = 64;
+
 impl CompositorState {
     pub(in crate::compositor) fn register_data_source(
         &mut self,
@@ -200,6 +202,120 @@ impl CompositorState {
         self.retire_clipboard_selection_offers();
         self.publish_clipboard_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Clipboard);
+    }
+
+    pub(in crate::compositor) fn apply_xwayland_selection_event(
+        &mut self,
+        event: crate::xwayland::XwaylandSelectionEvent,
+    ) {
+        use crate::xwayland::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+        match event {
+            XwaylandSelectionEvent::OfferChanged { kind, offer } => {
+                if kind != offer.id.kind {
+                    return;
+                }
+                let selection_kind = match kind {
+                    XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+                    XwaylandSelectionKind::Primary => SelectionKind::Primary,
+                };
+                let mime_types = normalize_selection_mime_types(offer.mime_types);
+                if mime_types.is_empty() {
+                    self.clear_xwayland_selection(selection_kind, offer.id.generation, kind);
+                    return;
+                }
+
+                let mutation_epoch = self.selection_state.allocate_mutation_epoch();
+                let source_key = self.allocate_selection_source_key();
+                self.selection_state.register_source(
+                    source_key,
+                    SelectionSourceKind::Xwayland,
+                    None,
+                );
+                self.selection_state.set_source_backend(
+                    source_key,
+                    SelectionSourceBackend::Xwayland { offer_id: offer.id },
+                );
+                for mime_type in &mime_types {
+                    self.selection_state
+                        .offer_source_mime_type_for_key(source_key, mime_type.clone());
+                }
+                let Some(commit) = self.selection_state.commit_selection(
+                    selection_kind,
+                    source_key,
+                    mutation_epoch,
+                ) else {
+                    self.selection_state
+                        .remove_source_key(source_key, mutation_epoch);
+                    return;
+                };
+                if let Some(previous_source) = commit.replaced_source {
+                    self.cancel_selection_source(selection_kind, previous_source);
+                    if previous_source != source_key {
+                        self.selection_state
+                            .remove_source_key(previous_source, mutation_epoch);
+                    }
+                }
+                self.selection_state.mark_source_used(source_key);
+                self.publish_xwayland_selection(selection_kind);
+            }
+            XwaylandSelectionEvent::Cleared { kind, generation } => {
+                let selection_kind = match kind {
+                    XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+                    XwaylandSelectionKind::Primary => SelectionKind::Primary,
+                };
+                self.clear_xwayland_selection(selection_kind, generation, kind);
+            }
+        }
+    }
+
+    fn publish_xwayland_selection(&mut self, kind: SelectionKind) {
+        match kind {
+            SelectionKind::Clipboard => {
+                self.retire_clipboard_selection_offers();
+                self.publish_clipboard_to_keyboard_focused_client();
+            }
+            SelectionKind::Primary => self.publish_primary_to_keyboard_focused_client(),
+        }
+        self.publish_data_control_selection(kind);
+    }
+
+    fn clear_xwayland_selection(
+        &mut self,
+        selection_kind: SelectionKind,
+        generation: crate::xwayland::XwaylandGeneration,
+        event_kind: crate::xwayland::XwaylandSelectionKind,
+    ) {
+        let Some(active) = self
+            .selection_state
+            .active_selection(selection_kind)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(SelectionSourceBackend::Xwayland { offer_id }) =
+            self.selection_state.source_backend(active.source_key)
+        else {
+            return;
+        };
+        if offer_id.generation != generation || offer_id.kind != event_kind {
+            return;
+        }
+        let source_key = active.source_key;
+        let mutation_epoch = self.selection_state.allocate_mutation_epoch();
+        let Some(clear) = self
+            .selection_state
+            .clear_selection(selection_kind, mutation_epoch)
+        else {
+            return;
+        };
+        if let Some(source_key) = clear.cleared_source {
+            self.cancel_selection_source(selection_kind, source_key);
+            self.selection_state
+                .remove_source_key(source_key, mutation_epoch);
+        }
+        let _ = source_key;
+        self.publish_xwayland_selection(selection_kind);
     }
 
     pub(in crate::compositor) fn poll_clipboard_bridge(&mut self) {
@@ -415,6 +531,19 @@ impl CompositorState {
             SelectionSourceBackend::HostClipboardBridge { offer_id } => {
                 if let Some(bridge) = self.clipboard_bridge.as_mut() {
                     let _ = bridge.request_host_data(offer_id, mime_type, fd);
+                }
+            }
+            SelectionSourceBackend::Xwayland { offer_id } => {
+                if self.xwayland_selection_data_requests.len()
+                    < MAX_PENDING_XWAYLAND_SELECTION_REQUESTS
+                {
+                    self.xwayland_selection_data_requests.push_back(
+                        crate::xwayland::XwaylandSelectionDataRequest {
+                            offer_id,
+                            mime_type,
+                            sink: fd,
+                        },
+                    );
                 }
             }
         }

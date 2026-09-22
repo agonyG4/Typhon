@@ -75,6 +75,7 @@ pub(in crate::compositor::tests) fn stop_test_server(
 
 #[derive(Clone)]
 pub(in crate::compositor::tests) enum ServerCommand {
+    ApplyXwaylandSelectionEvent(crate::xwayland::XwaylandSelectionEvent),
     KeyboardKey {
         key: u32,
         pressed: bool,
@@ -495,6 +496,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
             let mut barriers = Vec::new();
             while let Ok(command) = receiver.try_recv() {
                 match command {
+                    ServerCommand::ApplyXwaylandSelectionEvent(event) => {
+                        server.apply_xwayland_selection_event(event);
+                    }
                     ServerCommand::KeyboardKey { key, pressed } => {
                         server.send_keyboard_key(key, pressed);
                     }

@@ -355,8 +355,10 @@ the transfer tests below.
 Rejected receives validate target, kind, generation, source key, and MIME
 before the single source-key dispatcher. The dispatcher borrows the supplied
 FD only for the source event; rejected requests drop the owned FD without
-emitting source data. XWayland selection bridging and native toolkit smoke
-coverage remain outside this deterministic matrix.
+emitting source data. The B2 XWM fixture regressions exercise exact target
+resolution, direct-property and incoming INCR transfers, bounded reply reads,
+and real nonblocking FD backpressure. Native toolkit smoke coverage remains
+environment-dependent.
 
 ## Deterministic model evidence
 

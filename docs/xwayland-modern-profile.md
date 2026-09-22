@@ -41,8 +41,10 @@ their adapter/model foundations are not advertised as end-to-end application
 support. Old generations cannot satisfy a newer readiness barrier.
 
 Surface association uses committed `WL_SURFACE_SERIAL` values only. There is
-no `WL_SURFACE_ID` fallback. Clipboard, primary selection, and drag-and-drop
-bridges are intentionally deferred.
+no `WL_SURFACE_ID` fallback. External X11 CLIPBOARD and PRIMARY offers are
+published to Wayland clients and data-control consumers, including direct
+properties and incoming INCR payloads. Wayland → X11 selection serving and
+drag-and-drop remain inactive.
 
 ## Application testing
 
@@ -53,7 +55,7 @@ documented override in the diagnostic launch environment, for example
 `GDK_BACKEND=x11`, `QT_QPA_PLATFORM=xcb`, or `SDL_VIDEODRIVER=x11`.
 
 The current implementation is a modern profile: legacy rootful/TCP clients,
-clipboard and primary selection, Xdnd, XEmbed, mixed-DPI scaling, and
+Wayland → X11 selection serving, Xdnd, XEmbed, mixed-DPI scaling, and
 application-specific compatibility workarounds are not supported.
 
 ## Diagnostics

@@ -928,6 +928,7 @@ pub struct CompositorState {
     syncobj_device: Option<DrmSyncobjDevice>,
     clipboard_bridge: Option<Box<dyn ClipboardBridge>>,
     selection_state: SelectionState,
+    xwayland_selection_data_requests: VecDeque<crate::xwayland::XwaylandSelectionDataRequest>,
     next_selection_source_key: u64,
     data_sources: HashMap<ObjectId, ClipboardDataSource>,
     data_devices: Vec<ClipboardDataDevice>,

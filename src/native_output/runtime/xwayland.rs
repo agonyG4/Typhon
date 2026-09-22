@@ -182,6 +182,22 @@ fn prune_destroyed_handles(
 }
 
 impl NativeRuntime {
+    pub(super) fn sync_xwayland_selection_metadata(&mut self) {
+        for event in self.xwayland.take_managed_selection_events() {
+            self.server.apply_xwayland_selection_event(event);
+        }
+    }
+
+    pub(super) fn submit_xwayland_selection_data_requests(&mut self) -> NativeResult<()> {
+        let requests = self.server.take_xwayland_selection_data_requests();
+        if requests.is_empty() {
+            return Ok(());
+        }
+        self.xwayland
+            .submit_managed_selection_data_requests(requests, &mut self.process_supervisor)?;
+        self.sync_xwayland_reactor_sources()
+    }
+
     pub(super) fn initialize_managed_xwayland(&mut self) -> NativeResult<()> {
         if !self.xwayland.is_managed()
             || self.xwayland.state_kind() != oblivion_one::xwayland::XwaylandStateKind::Starting

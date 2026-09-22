@@ -7,6 +7,7 @@ impl Xwm {
             .into_iter()
             .chain(self.next_focus_deadline_ns())
             .chain(self.next_adoption_deadline_ns())
+            .chain(self.data_bridge.selection_payloads.next_deadline_ns())
             .min()
     }
 
@@ -20,6 +21,13 @@ impl Xwm {
 
     pub(crate) fn handle_deadlines(&mut self, now_ns: u64) -> XwmDeadlineOutcome {
         let adoption_timeout_summary = self.collect_adoption_expirations(now_ns);
+        for sequence in self.data_bridge.selection_payloads.expire_deadlines(now_ns) {
+            self.connection.discard_reply(
+                sequence,
+                RequestKind::HasResponse,
+                DiscardMode::DiscardReply,
+            );
+        }
         let resize_error = self.handle_resize_sync_deadline(now_ns).err();
         let focus_error = self.handle_focus_deadline(now_ns).err();
         XwmDeadlineOutcome {
@@ -238,6 +246,7 @@ impl Xwm {
         let mut events_quiescent = budget != 0;
         let mut property_replies_quiescent = budget != 0;
         let mut selection_replies_quiescent = budget != 0;
+        let mut payload_replies_quiescent = budget != 0;
         let mut budget_exhausted = false;
         loop {
             let event_budget = budget.saturating_sub(events_processed);
@@ -278,15 +287,35 @@ impl Xwm {
                 budget_exhausted |= drain.budget_exhausted;
                 Some(drain)
             };
+            let payload_budget = budget.saturating_sub(selection_replies_processed);
+            let payload_reply_drain = if payload_budget == 0 {
+                payload_replies_quiescent = false;
+                budget_exhausted = budget_exhausted || budget != 0;
+                None
+            } else {
+                let drain = super::selection_payload::poll_replies(
+                    self,
+                    payload_budget,
+                    crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+                )?;
+                selection_replies_processed =
+                    selection_replies_processed.saturating_add(drain.processed);
+                payload_replies_quiescent &= drain.quiescent;
+                budget_exhausted |= drain.budget_exhausted;
+                Some(drain)
+            };
             if event_drain.is_none_or(|drain| drain.processed == 0)
                 && reply_drain.is_none_or(|drain| drain.processed == 0)
                 && selection_reply_drain.is_none_or(|drain| drain.processed == 0)
+                && payload_reply_drain.is_none_or(|drain| drain.processed == 0)
             {
                 break;
             }
         }
-        let quiescent =
-            events_quiescent && property_replies_quiescent && selection_replies_quiescent;
+        let quiescent = events_quiescent
+            && property_replies_quiescent
+            && selection_replies_quiescent
+            && payload_replies_quiescent;
         if quiescent {
             self.reconcile_override_redirect_stack()?;
         }

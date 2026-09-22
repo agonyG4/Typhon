@@ -111,6 +111,7 @@ struct PendingSelectionReply {
 #[derive(Debug, Default)]
 pub(crate) struct SelectionWireState {
     active_generation: Option<BridgeGeneration>,
+    last_convert_selection_sequence: Option<SequenceNumber>,
     windows: HashMap<SelectionKind, SelectionWindows>,
     internal_windows: HashSet<Window>,
     pending: BTreeMap<SequenceNumber, PendingSelectionReply>,
@@ -131,6 +132,15 @@ impl SelectionWireState {
         self.internal_windows.contains(&window)
     }
 
+    pub(crate) fn register_payload_requestor_window(&mut self, window: Window) {
+        self.internal_windows.insert(window);
+        debug_assert!(
+            self.internal_windows.len()
+                <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                    + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
+        );
+    }
+
     fn requestor(&self, kind: SelectionKind) -> Option<Window> {
         self.windows
             .get(&kind)
@@ -148,7 +158,9 @@ impl SelectionWireState {
         }
         self.internal_windows.insert(requestor);
         debug_assert!(
-            self.internal_windows.len() <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+            self.internal_windows.len()
+                <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                    + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
         );
         self.debug_assert_invariants();
     }
@@ -285,19 +297,9 @@ impl SelectionWireState {
         id: XwaylandSelectionOfferId,
         mime_type: &str,
     ) -> Option<Atom> {
-        self.target_catalogs.get(&kind).and_then(|catalog| {
-            (catalog.identity.kind == kind
-                && catalog.identity.generation == BridgeGeneration::from(id.generation)
-                && catalog.identity.revision.get() == id.revision)
-                .then(|| {
-                    catalog
-                        .bindings
-                        .iter()
-                        .find(|binding| binding.mime_type == mime_type)
-                        .map(|binding| binding.target)
-                })
-                .flatten()
-        })
+        resolve_payload_target(self, id, mime_type)
+            .filter(|(resolved_kind, _)| *resolved_kind == kind)
+            .map(|(_, target)| target)
     }
 
     fn next_target_name_request(
@@ -359,6 +361,7 @@ impl SelectionWireState {
         }
         if self.active_generation == Some(generation) {
             self.active_generation = None;
+            self.last_convert_selection_sequence = None;
             self.windows.clear();
             self.internal_windows.clear();
             self.target_catalogs.clear();
@@ -415,6 +418,11 @@ impl SelectionWireState {
     }
 
     #[cfg(test)]
+    pub(crate) fn last_convert_selection_sequence_for_test(&self) -> Option<SequenceNumber> {
+        self.last_convert_selection_sequence
+    }
+
+    #[cfg(test)]
     pub(crate) fn pending_sequence_for_test(
         &self,
         kind: SelectionKind,
@@ -460,6 +468,36 @@ impl SelectionWireState {
     }
 }
 
+pub(crate) fn resolve_payload_target(
+    wire: &SelectionWireState,
+    offer_id: XwaylandSelectionOfferId,
+    mime_type: &str,
+) -> Option<(SelectionKind, Atom)> {
+    let kind = match offer_id.kind {
+        XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+        XwaylandSelectionKind::Primary => SelectionKind::Primary,
+    };
+    let generation = BridgeGeneration::from(offer_id.generation);
+    if wire.active_generation != Some(generation)
+        || wire.current_offers.get(&kind) != Some(&offer_id)
+    {
+        return None;
+    }
+    let catalog = wire.target_catalogs.get(&kind)?;
+    if catalog.identity.kind != kind
+        || catalog.identity.generation != generation
+        || catalog.identity.revision.get() != offer_id.revision
+    {
+        return None;
+    }
+    let target = catalog
+        .bindings
+        .iter()
+        .find(|binding| binding.mime_type == mime_type)?
+        .target;
+    Some((kind, target))
+}
+
 pub(crate) fn is_internal_window(
     xid: Window,
     supporting_wm_check: Option<Window>,
@@ -485,6 +523,9 @@ pub(crate) fn initialize(xwm: &mut Xwm) -> Result<(), XwmError> {
 
     let generation = BridgeGeneration::from(xwm.generation);
     xwm.data_bridge.selections.initialize_generation(generation);
+    xwm.data_bridge
+        .selection_payloads
+        .initialize_generation(generation);
     let mut channels = HashMap::new();
     for kind in [SelectionKind::Clipboard, SelectionKind::Primary] {
         let observer = xwm
@@ -513,6 +554,7 @@ pub(crate) fn initialize(xwm: &mut Xwm) -> Result<(), XwmError> {
         debug_assert!(
             xwm.data_bridge.selection_wire.internal_windows.len()
                 <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                    + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
         );
     }
     xwm.data_bridge.selection_wire.active_generation = Some(generation);
@@ -717,6 +759,9 @@ fn start_targets_conversion(xwm: &mut Xwm, identity: SelectionIdentity) -> Resul
             timestamp,
         )
         .map_err(XwmError::Connection)?;
+    xwm.data_bridge
+        .selection_wire
+        .last_convert_selection_sequence = Some(cookie.sequence_number());
     std::mem::forget(cookie);
     xwm.connection.flush().map_err(XwmError::Connection)
 }

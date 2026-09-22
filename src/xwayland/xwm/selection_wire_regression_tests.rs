@@ -133,6 +133,16 @@ const TEST_PRIMARY_ATOM: u32 = 1;
 const TEST_PRIMARY_OBSERVER_WINDOW: u32 = 0xa012;
 const TEST_PRIMARY_REQUESTOR_WINDOW: u32 = 0xa013;
 
+#[derive(Clone, Copy)]
+struct SelectionOwnerFixture {
+    selection: u32,
+    observer: u32,
+    owner: u32,
+    timestamp: u32,
+    selection_timestamp: u32,
+    sequence: u16,
+}
+
 fn raw_clipboard_owner_event(
     owner: u32,
     timestamp: u32,
@@ -395,11 +405,44 @@ fn resolve_targets_for_kind_for_test(
     owner: u32,
     targets: &[u32],
 ) {
+    resolve_targets_for_kind_with_event_for_test(
+        xwm,
+        peer,
+        kind,
+        SelectionOwnerFixture {
+            selection,
+            observer,
+            owner,
+            timestamp: 40,
+            selection_timestamp: 35,
+            sequence: 0,
+        },
+        targets,
+    );
+}
+
+fn resolve_targets_for_kind_with_event_for_test(
+    xwm: &mut super::super::Xwm,
+    peer: &mut UnixStream,
+    kind: super::super::data_bridge::SelectionKind,
+    owner_event: SelectionOwnerFixture,
+    targets: &[u32],
+) {
     peer.write_all(&raw_selection_owner_event(
-        selection, observer, owner, 40, 35, 0,
+        owner_event.selection,
+        owner_event.observer,
+        owner_event.owner,
+        owner_event.timestamp,
+        owner_event.selection_timestamp,
+        owner_event.sequence,
     ))
     .expect("write serialized XFixes owner event");
     xwm.drain_events(32).expect("start TARGETS conversion");
+    let notify_sequence = xwm
+        .data_bridge
+        .selection_wire
+        .last_convert_selection_sequence_for_test()
+        .expect("TARGETS ConvertSelection sequence") as u16;
     let conversion = convert_selection_requests(&read_fixture_requests(peer))
         .pop()
         .expect("owner TARGETS conversion");
@@ -409,7 +452,7 @@ fn resolve_targets_for_kind_for_test(
         conversion.target,
         conversion.property,
         conversion.time,
-        1,
+        notify_sequence,
     ))
     .expect("write serialized SelectionNotify");
     xwm.drain_events(32).expect("start TARGETS property read");
@@ -2777,3 +2820,6 @@ fn new_generation_starts_with_clean_requestors() {
             .requestor_poisoned_for_test(SelectionKind::Primary)
     );
 }
+
+#[path = "selection_payload_regression_tests.rs"]
+mod selection_payload_regression_tests;

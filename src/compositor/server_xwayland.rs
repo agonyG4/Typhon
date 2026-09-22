@@ -3,6 +3,22 @@ use crate::xwayland::trace::{self, TraceCategory, TraceFields};
 use crate::xwayland::xwm::XwmAssociationEvent;
 
 impl OwnCompositorServer {
+    pub fn apply_xwayland_selection_event(
+        &mut self,
+        event: crate::xwayland::XwaylandSelectionEvent,
+    ) {
+        self.state.apply_xwayland_selection_event(event);
+    }
+
+    pub fn take_xwayland_selection_data_requests(
+        &mut self,
+    ) -> Vec<crate::xwayland::XwaylandSelectionDataRequest> {
+        self.state
+            .xwayland_selection_data_requests
+            .drain(..)
+            .collect()
+    }
+
     pub fn insert_xwayland_client(
         &mut self,
         stream: std::os::unix::net::UnixStream,

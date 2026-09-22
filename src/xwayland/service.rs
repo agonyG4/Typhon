@@ -15,6 +15,7 @@ use crate::process::{
 use super::trace::{self, TraceFields};
 use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
+    XwaylandSelectionDataRequest,
     config::{XwaylandConfig, xwm_reactor_hot_path_logging_enabled},
     diagnostics::{StderrRing, XwaylandFailure, XwaylandFailureStage},
     display::DisplayLease,
@@ -22,7 +23,7 @@ use super::{
     launch::{ChildFdTarget, build_command},
     metrics::XwaylandMetrics,
     readiness::XwaylandReadinessSnapshot,
-    xwm::{Xwm, XwmCommand, XwmCommandOutcome, startup::XwmStartup},
+    xwm::{SelectionPayloadTransferId, Xwm, XwmCommand, XwmCommandOutcome, startup::XwmStartup},
 };
 use crate::compositor::{SurfaceCommitSequence, XwaylandSurfaceCommitObserved};
 
@@ -59,6 +60,7 @@ pub enum XwaylandReactorPurpose {
     ListenAbstract,
     DisplayReady,
     Xwm,
+    SelectionSink(SelectionPayloadTransferId),
     Stderr,
 }
 
@@ -760,6 +762,46 @@ impl XwaylandService {
                 }
                 return Ok(continuation);
             }
+            XwaylandReactorPurpose::SelectionSink(transfer_id) => {
+                let Some(generation) = generation else {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                };
+                if Some(generation) != self.generation() {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                }
+                let now = now_ns()?;
+                let outcome = match &mut self.state {
+                    ServiceState::Running(resources) => {
+                        super::xwm::selection_payload::handle_sink_ready(
+                            &mut resources.xwm,
+                            transfer_id,
+                            super::xwm::data_bridge::BridgeGeneration::from(generation),
+                            reactor_token,
+                            flags,
+                            now,
+                        )
+                    }
+                    _ => return Ok(false),
+                };
+                match outcome {
+                    Ok(changed) => {
+                        if changed {
+                            self.bump_reactor_registration_generation();
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        self.fail_managed_xwm(
+                            supervisor,
+                            XwaylandFailureStage::Reactor,
+                            io::Error::other(error),
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             XwaylandReactorPurpose::Stderr => {
                 let Some(generation) = generation else {
                     self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
@@ -1307,6 +1349,60 @@ impl XwaylandService {
     pub fn take_managed_selection_events(&mut self) -> Vec<super::XwaylandSelectionEvent> {
         self.harvest_running_selection_metadata();
         self.selection_metadata_mailbox.take()
+    }
+
+    /// Start queued Wayland reads against their exact generation-bound X11
+    /// offers. Rejected requests simply drop their owned sink descriptors.
+    pub fn submit_managed_selection_data_requests(
+        &mut self,
+        requests: Vec<XwaylandSelectionDataRequest>,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<()> {
+        let Some(generation) = self.generation() else {
+            drop(requests);
+            return Ok(());
+        };
+        if !matches!(self.state, ServiceState::Running(_)) {
+            drop(requests);
+            return Ok(());
+        }
+        let now = now_ns()?;
+        let mut started = false;
+        let mut failure = None;
+        if let ServiceState::Running(resources) = &mut self.state {
+            for request in requests {
+                if request.offer_id.generation != generation {
+                    continue;
+                }
+                match super::xwm::selection_payload::start_request(&mut resources.xwm, request, now)
+                {
+                    Ok(Some(_)) => started = true,
+                    Ok(None) => {}
+                    Err(error) => {
+                        failure = Some(io::Error::other(error));
+                        break;
+                    }
+                }
+            }
+            if failure.is_none()
+                && started
+                && let Err(error) = resources.xwm.flush()
+            {
+                failure = Some(io::Error::other(error));
+            }
+        }
+        if let Some(error) = failure {
+            self.fail_managed_xwm(
+                supervisor,
+                XwaylandFailureStage::CommandFlush,
+                io::Error::new(error.kind(), error.to_string()),
+            );
+            return Ok(());
+        }
+        if started {
+            self.bump_reactor_registration_generation();
+        }
+        Ok(())
     }
 
     fn harvest_running_selection_metadata(&mut self) {

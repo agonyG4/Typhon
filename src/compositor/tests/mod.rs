@@ -175,3 +175,4 @@ mod workspace;
 mod xdg;
 mod xdg_decoration;
 mod xwayland;
+mod xwayland_selection;

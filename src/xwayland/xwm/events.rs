@@ -62,12 +62,25 @@ fn normalized_window_event_target(event: &Event) -> Option<u32> {
 
 fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     trace_raw_event(&event);
+    let event = match event {
+        Event::PropertyNotify(property)
+            if super::selection_payload::owns_window(xwm, property.window) =>
+        {
+            super::selection_payload::property_notify(
+                xwm,
+                property,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )?;
+            return Ok(());
+        }
+        event => event,
+    };
     if normalized_window_event_target(&event).is_some_and(|window| {
         super::selection_wire::is_internal_window(
             window,
             Some(xwm.supporting_wm_check),
             Some(&xwm.data_bridge.selection_wire),
-        )
+        ) || super::selection_payload::owns_window(xwm, window)
     }) {
         return Ok(());
     }
@@ -367,10 +380,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::ClientMessage(event) if event.format == 32 => {
             normalize_client_message(xwm, event)?;
         }
-        Event::PropertyNotify(event) => {
-            normalize_property_change(xwm, event)?;
+        Event::PropertyNotify(event) => normalize_property_change(xwm, event)?,
+        Event::SelectionNotify(event) => {
+            let now_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
+            if !super::selection_payload::selection_notify(xwm, event, now_ns)? {
+                super::selection_wire::selection_notify(xwm, event)?;
+            }
         }
-        Event::SelectionNotify(event) => super::selection_wire::selection_notify(xwm, event)?,
         Event::XfixesSelectionNotify(event) if xwm.capabilities.xfixes => {
             super::selection_wire::observe_xfixes(xwm, event)?;
         }

@@ -45,6 +45,7 @@ impl From<XwaylandGeneration> for BridgeGeneration {
 pub struct DataBridge {
     pub selections: selection::SelectionBridge,
     pub(crate) selection_wire: super::selection_wire::SelectionWireState,
+    pub(crate) selection_payloads: super::selection_payload::SelectionPayloadManager,
     pub transfers: transfer::TransferManager,
     pub dnd: dnd::DndManager,
 }
@@ -52,7 +53,8 @@ pub struct DataBridge {
 impl DataBridge {
     pub fn clear_generation(&mut self, generation: BridgeGeneration) -> Vec<SequenceNumber> {
         self.selections.clear_generation(generation);
-        let pending_selection_replies = self.selection_wire.clear_generation(generation);
+        let mut pending_selection_replies = self.selection_wire.clear_generation(generation);
+        pending_selection_replies.extend(self.selection_payloads.clear_generation(generation));
         self.transfers.clear_generation(generation);
         self.dnd.clear_generation(generation);
         pending_selection_replies

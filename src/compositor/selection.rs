@@ -30,6 +30,7 @@ pub enum SelectionSourceKind {
     WaylandPrimary,
     DataControl,
     HostClipboardBridge,
+    Xwayland,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,9 @@ pub enum SelectionSourceBackend {
     },
     HostClipboardBridge {
         offer_id: HostClipboardOfferId,
+    },
+    Xwayland {
+        offer_id: crate::xwayland::XwaylandSelectionOfferId,
     },
 }
 

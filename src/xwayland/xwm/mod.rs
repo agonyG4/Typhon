@@ -37,7 +37,9 @@ mod reactor;
 mod resize_runtime;
 mod resize_sync;
 mod root_stack;
+pub(crate) mod selection_payload;
 mod selection_wire;
+pub use selection_payload::SelectionPayloadTransferId;
 #[allow(dead_code)]
 pub(crate) mod shape;
 pub(crate) mod startup;

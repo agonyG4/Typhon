@@ -5,6 +5,7 @@
 //! the compositor only after it can serve selection bytes.
 
 use super::XwaylandGeneration;
+use std::os::fd::OwnedFd;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum XwaylandSelectionKind {
@@ -23,6 +24,15 @@ pub struct XwaylandSelectionOfferId {
 pub struct XwaylandSelectionOffer {
     pub id: XwaylandSelectionOfferId,
     pub mime_types: Vec<String>,
+}
+
+/// Move-only X11 selection payload request handed from the compositor to the
+/// XWayland service.  The descriptor is the Wayland client's receiving end.
+#[derive(Debug)]
+pub struct XwaylandSelectionDataRequest {
+    pub offer_id: XwaylandSelectionOfferId,
+    pub mime_type: String,
+    pub sink: OwnedFd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

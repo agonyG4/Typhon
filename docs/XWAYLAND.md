@@ -20,21 +20,26 @@ The supported X11 window contract is:
   does not prevent XWM from reaching `Running`;
 - one global X11 DPI policy is used. Mixed per-monitor DPI is not advertised.
 
-The following are present only as generation-bound adapter/model foundations;
-they are not connected end to end and must not be treated as compatibility
-support:
+The current selection bridge supports this direction:
 
-- XFixes CLIPBOARD ownership and bounded TARGETS discovery exist as an
-  internal XWM wire foundation; cross-protocol transfer remains inactive;
-- PRIMARY ownership and bounded TARGETS discovery use an independent internal
-  XWM wire foundation; cross-protocol transfer remains inactive;
-- Xdnd ClientMessage bridge: inactive foundation;
+- X11 external CLIPBOARD → Wayland selection/data-control offers and payloads;
+- X11 external PRIMARY → Wayland primary-selection/data-control offers and
+  payloads.
+
+Both channels use generation-bound XFixes ownership, bounded TARGETS/MIME
+catalogs, and direct-property or incoming INCR payload reads through bounded
+nonblocking sinks. Wayland → X11 ownership and payload serving remain inactive;
+outgoing INCR, MULTIPLE, and XDND remain inactive.
+
+The following remain adapter/model foundations rather than end-to-end support:
+
+- Xdnd ClientMessage bridge;
 - runtime RandR publication: inactive foundation; no live output publication;
 - X11 cursor ownership integration: inactive foundation.
 
-The Wayland data-device authority remains the intended future owner for
-CLIPBOARD, PRIMARY, and Xdnd. Until the bridges are connected and tested,
-Typhon does not advertise or report them as working.
+The compositor's canonical Wayland selection state remains authoritative for
+publication to Wayland clients. The active X11 → Wayland direction does not
+mirror Wayland sources back into X11.
 
 Diagnostics are available through `TYPHON_XWAYLAND_LOG=1` for forwarding the
 bounded stderr ring and through `bin/check-xwayland-session` for a session
