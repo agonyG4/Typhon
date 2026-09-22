@@ -323,6 +323,35 @@ impl Xwm {
         self.data_bridge.selection_wire.take_selection_events()
     }
 
+    pub(crate) fn take_selection_events_for_retirement(
+        &mut self,
+    ) -> Vec<crate::xwayland::XwaylandSelectionEvent> {
+        self.data_bridge
+            .selection_wire
+            .take_selection_events_for_retirement()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_external_selection_offer_for_tests(
+        &mut self,
+        kind: crate::xwayland::XwaylandSelectionKind,
+        revision: u64,
+    ) -> crate::xwayland::XwaylandSelectionOffer {
+        self.data_bridge
+            .selection_wire
+            .seed_external_offer_for_tests(self.generation, kind, revision)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_external_selection_offer_for_tests(
+        &mut self,
+        kind: crate::xwayland::XwaylandSelectionKind,
+    ) {
+        self.data_bridge
+            .selection_wire
+            .clear_external_offer_for_tests(self.generation, kind);
+    }
+
     pub(crate) fn next_adoption_deadline_ns(&self) -> Option<u64> {
         self.adoption.next_deadline_ns()
     }

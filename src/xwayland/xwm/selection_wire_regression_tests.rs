@@ -1085,6 +1085,38 @@ fn metadata_updates_are_coalesced_per_selection_kind() {
 }
 
 #[test]
+fn retirement_snapshot_clears_only_current_offers_and_is_idempotent() {
+    use crate::xwayland::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let current_offer_generation = generation(157);
+    let (mut xwm, _peer) = test_fixture(current_offer_generation);
+    let offer = xwm.seed_external_selection_offer_for_tests(XwaylandSelectionKind::Clipboard, 1);
+
+    assert_eq!(
+        xwm.take_selection_events_for_retirement(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Clipboard,
+            generation: offer.id.generation,
+        }]
+    );
+    assert!(xwm.take_selection_events_for_retirement().is_empty());
+
+    let cleared_generation = generation(158);
+    let (mut xwm, _peer) = test_fixture(cleared_generation);
+    let _ = xwm.seed_external_selection_offer_for_tests(XwaylandSelectionKind::Primary, 1);
+    let _ = xwm.take_selection_events();
+    xwm.clear_external_selection_offer_for_tests(XwaylandSelectionKind::Primary);
+    assert_eq!(
+        xwm.take_selection_events_for_retirement(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Primary,
+            generation: cleared_generation,
+        }]
+    );
+    assert!(xwm.take_selection_events_for_retirement().is_empty());
+}
+
+#[test]
 fn internal_owner_does_not_publish_external_offer() {
     use crate::xwayland::XwaylandSelectionEvent;
 

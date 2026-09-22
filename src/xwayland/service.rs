@@ -143,6 +143,36 @@ enum ServiceState {
     Failed,
 }
 
+/// Latest outward metadata snapshot per XWayland selection kind.
+/// A newer generation's offer can replace an undrained clear from an older
+/// generation because each offer is a complete replacement state.
+#[derive(Debug, Default)]
+struct SelectionMetadataMailbox {
+    clipboard: Option<super::XwaylandSelectionEvent>,
+    primary: Option<super::XwaylandSelectionEvent>,
+}
+
+impl SelectionMetadataMailbox {
+    fn push(&mut self, event: super::XwaylandSelectionEvent) {
+        match event.kind() {
+            super::XwaylandSelectionKind::Clipboard => self.clipboard = Some(event),
+            super::XwaylandSelectionKind::Primary => self.primary = Some(event),
+        }
+    }
+
+    fn take(&mut self) -> Vec<super::XwaylandSelectionEvent> {
+        [self.clipboard.take(), self.primary.take()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        usize::from(self.clipboard.is_some()) + usize::from(self.primary.is_some())
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum RetiredResources {
@@ -161,6 +191,7 @@ pub struct XwaylandService {
     app_environment: Option<XwaylandAppEnvironment>,
     reactor_registration_generation: u64,
     state: ServiceState,
+    selection_metadata_mailbox: SelectionMetadataMailbox,
     crash_times_ns: VecDeque<u64>,
     backoff_level: usize,
     private_client: Option<(XwaylandGeneration, ClientId)>,
@@ -223,6 +254,7 @@ impl XwaylandService {
             app_environment,
             reactor_registration_generation: 1,
             state,
+            selection_metadata_mailbox: SelectionMetadataMailbox::default(),
             crash_times_ns: VecDeque::new(),
             backoff_level: 0,
             private_client: None,
@@ -1273,10 +1305,56 @@ impl XwaylandService {
     }
 
     pub fn take_managed_selection_events(&mut self) -> Vec<super::XwaylandSelectionEvent> {
-        match &mut self.state {
+        self.harvest_running_selection_metadata();
+        self.selection_metadata_mailbox.take()
+    }
+
+    fn harvest_running_selection_metadata(&mut self) {
+        let events = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.take_selection_events(),
-            _ => Vec::new(),
+            _ => return,
+        };
+        for event in events {
+            self.selection_metadata_mailbox.push(event);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_running_selection_offer_for_tests(
+        &mut self,
+        kind: super::XwaylandSelectionKind,
+        revision: u64,
+    ) -> Option<super::XwaylandSelectionOffer> {
+        match &mut self.state {
+            ServiceState::Running(resources) => Some(
+                resources
+                    .xwm
+                    .seed_external_selection_offer_for_tests(kind, revision),
+            ),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_running_selection_offer_for_tests(
+        &mut self,
+        kind: super::XwaylandSelectionKind,
+    ) -> bool {
+        let ServiceState::Running(resources) = &mut self.state else {
+            return false;
+        };
+        resources.xwm.clear_external_selection_offer_for_tests(kind);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn harvest_selection_metadata_for_tests(&mut self) {
+        self.harvest_running_selection_metadata();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_selection_metadata_count_for_tests(&self) -> usize {
+        self.selection_metadata_mailbox.len()
     }
 
     #[allow(dead_code)]
@@ -1578,7 +1656,12 @@ impl XwaylandService {
 
     fn replace_state(&mut self, next: ServiceState) {
         self.bump_reactor_registration_generation();
-        let previous = std::mem::replace(&mut self.state, next);
+        let mut previous = std::mem::replace(&mut self.state, next);
+        if let ServiceState::Running(resources) = &mut previous {
+            for event in resources.xwm.take_selection_events_for_retirement() {
+                self.selection_metadata_mailbox.push(event);
+            }
+        }
         match previous {
             ServiceState::Starting(resources) => {
                 self.retired_resources

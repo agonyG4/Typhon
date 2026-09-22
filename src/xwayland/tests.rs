@@ -529,6 +529,360 @@ fn reap_one(supervisor: &mut ChildSupervisor) -> crate::process::ChildExit {
     }
 }
 
+fn running_service_with_selection_offer(
+    label: &str,
+    binary: &str,
+    kind: super::XwaylandSelectionKind,
+) -> (
+    PathBuf,
+    XwaylandService,
+    ChildSupervisor,
+    super::XwaylandGeneration,
+    UnixStream,
+) {
+    let root = test_root(label);
+    let binary = if binary == "sleep" {
+        let binary = root.join("xwayland-test-binary");
+        fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 30\n")
+            .expect("write sleeping XWayland test binary");
+        let mut permissions = fs::metadata(&binary)
+            .expect("stat sleeping XWayland test binary")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&binary, permissions)
+            .expect("make sleeping XWayland test binary executable");
+        binary
+    } else {
+        PathBuf::from(binary)
+    };
+    let mut config =
+        XwaylandConfig::for_tests_at_root(XwaylandMode::ManagedLazy, binary, root.clone());
+    config.display_min = 1;
+    let mut service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    let mut supervisor = ChildSupervisor::new();
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start managed XWayland generation");
+    let generation = service.generation().expect("starting generation");
+    let peer = service
+        .install_running_xwm_focus_fixture_for_tests(generation, 0xfeed, 0)
+        .expect("install running XWM fixture");
+    service
+        .seed_running_selection_offer_for_tests(kind, 1)
+        .expect("seed resolved external selection offer");
+    (root, service, supervisor, generation, peer)
+}
+
+#[test]
+fn managed_selection_offer_is_cleared_after_running_generation_exits() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-exit-consumed",
+            "/bin/false",
+            XwaylandSelectionKind::Clipboard,
+        );
+    let offer_events = service.take_managed_selection_events();
+    assert!(matches!(
+        offer_events.as_slice(),
+        [XwaylandSelectionEvent::OfferChanged {
+            kind: XwaylandSelectionKind::Clipboard,
+            offer,
+        }] if offer.id.generation == generation
+    ));
+    assert!(service.take_managed_selection_events().is_empty());
+
+    let exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&exit)
+            .expect("handle XWayland exit")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Clipboard,
+            generation,
+        }]
+    );
+    assert!(service.take_managed_selection_events().is_empty());
+
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn unconsumed_offer_is_coalesced_to_clear_on_generation_retirement() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-exit-pending",
+            "/bin/false",
+            XwaylandSelectionKind::Clipboard,
+        );
+    let exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&exit)
+            .expect("handle XWayland exit")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Clipboard,
+            generation,
+        }]
+    );
+    assert!(service.take_managed_selection_events().is_empty());
+
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn managed_xwm_failure_clears_selection_metadata_before_child_exit() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-xwm-failure",
+            "sleep",
+            XwaylandSelectionKind::Clipboard,
+        );
+    service.inject_xwm_failure_for_tests(
+        &mut supervisor,
+        XwaylandFailureStage::Reactor,
+        "injected managed XWM reactor failure",
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert!(supervisor.active_count() > 0, "child has not yet exited");
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Clipboard,
+            generation,
+        }]
+    );
+    assert!(service.take_managed_selection_events().is_empty());
+
+    let _ = reap_one(&mut supervisor);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn shutdown_clears_current_selection_metadata() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-shutdown",
+            "sleep",
+            XwaylandSelectionKind::Clipboard,
+        );
+    assert!(matches!(
+        service.take_managed_selection_events().as_slice(),
+        [XwaylandSelectionEvent::OfferChanged { offer, .. }]
+            if offer.id.generation == generation
+    ));
+
+    service
+        .begin_shutdown(&mut supervisor)
+        .expect("shutdown service");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Disabled);
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Clipboard,
+            generation,
+        }]
+    );
+    assert!(service.take_managed_selection_events().is_empty());
+
+    let _ = reap_one(&mut supervisor);
+    finish_reactor_teardown_bounded(&mut service, &mut supervisor);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn generation_retirement_clears_primary_without_clearing_clipboard() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-primary-exit",
+            "/bin/false",
+            XwaylandSelectionKind::Primary,
+        );
+    let exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&exit)
+            .expect("handle XWayland exit")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Primary,
+            generation,
+        }]
+    );
+
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn already_cleared_selection_is_not_cleared_again_on_retirement() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-cleared-before-exit",
+            "/bin/false",
+            XwaylandSelectionKind::Clipboard,
+        );
+    assert!(service.clear_running_selection_offer_for_tests(XwaylandSelectionKind::Clipboard));
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [XwaylandSelectionEvent::Cleared {
+            kind: XwaylandSelectionKind::Clipboard,
+            generation,
+        }]
+    );
+
+    let exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&exit)
+            .expect("handle XWayland exit")
+    );
+    assert!(service.take_managed_selection_events().is_empty());
+
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn selection_metadata_mailbox_stays_bounded_under_owner_churn() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, _generation, _peer) =
+        running_service_with_selection_offer(
+            "selection-mailbox-churn",
+            "sleep",
+            XwaylandSelectionKind::Clipboard,
+        );
+    for revision in 2..=128 {
+        for kind in [
+            XwaylandSelectionKind::Clipboard,
+            XwaylandSelectionKind::Primary,
+        ] {
+            assert!(
+                service
+                    .seed_running_selection_offer_for_tests(kind, revision)
+                    .is_some()
+            );
+            service.harvest_selection_metadata_for_tests();
+            assert!(service.pending_selection_metadata_count_for_tests() <= 2);
+
+            assert!(service.clear_running_selection_offer_for_tests(kind));
+            service.harvest_selection_metadata_for_tests();
+            assert!(service.pending_selection_metadata_count_for_tests() <= 2);
+        }
+    }
+    assert_eq!(
+        service.take_managed_selection_events(),
+        [
+            XwaylandSelectionEvent::Cleared {
+                kind: XwaylandSelectionKind::Clipboard,
+                generation: service.generation().expect("running generation"),
+            },
+            XwaylandSelectionEvent::Cleared {
+                kind: XwaylandSelectionKind::Primary,
+                generation: service.generation().expect("running generation"),
+            },
+        ]
+    );
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    let _ = reap_one(&mut supervisor);
+    finish_reactor_teardown_bounded(&mut service, &mut supervisor);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn newer_generation_offer_replaces_pending_retirement_clear() {
+    use super::{XwaylandSelectionEvent, XwaylandSelectionKind};
+
+    let (root, mut service, mut supervisor, first_generation, _first_peer) =
+        running_service_with_selection_offer(
+            "selection-cross-generation",
+            "/bin/false",
+            XwaylandSelectionKind::Clipboard,
+        );
+    assert!(matches!(
+        service.take_managed_selection_events().as_slice(),
+        [XwaylandSelectionEvent::OfferChanged { offer, .. }]
+            if offer.id.generation == first_generation
+    ));
+    let first_exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&first_exit)
+            .expect("retire first generation")
+    );
+    assert_eq!(service.pending_selection_metadata_count_for_tests(), 1);
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("rearm after generation retirement");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start second generation");
+    let second_generation = service.generation().expect("second generation");
+    assert_ne!(first_generation, second_generation);
+    let _second_peer = service
+        .install_running_xwm_focus_fixture_for_tests(second_generation, 0xbeef, 0)
+        .expect("install second running XWM fixture");
+    service
+        .seed_running_selection_offer_for_tests(XwaylandSelectionKind::Clipboard, 2)
+        .expect("seed second-generation offer");
+
+    assert!(matches!(
+        service.take_managed_selection_events().as_slice(),
+        [XwaylandSelectionEvent::OfferChanged {
+            kind: XwaylandSelectionKind::Clipboard,
+            offer,
+        }] if offer.id.generation == second_generation && offer.id.revision == 2
+    ));
+
+    let second_exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&second_exit)
+            .expect("retire second generation")
+    );
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
 fn finish_reactor_teardown_bounded(
     service: &mut XwaylandService,
     supervisor: &mut ChildSupervisor,

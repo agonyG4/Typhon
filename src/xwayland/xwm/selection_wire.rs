@@ -190,6 +190,73 @@ impl SelectionWireState {
             .collect()
     }
 
+    pub(crate) fn take_selection_events_for_retirement(&mut self) -> Vec<XwaylandSelectionEvent> {
+        let mut clipboard = None;
+        let mut primary = None;
+        for event in self.take_selection_events() {
+            match event.kind() {
+                XwaylandSelectionKind::Clipboard => clipboard = Some(event),
+                XwaylandSelectionKind::Primary => primary = Some(event),
+            }
+        }
+
+        for kind in [SelectionKind::Clipboard, SelectionKind::Primary] {
+            let Some(offer) = self.current_offers.remove(&kind) else {
+                continue;
+            };
+            let clear = XwaylandSelectionEvent::Cleared {
+                kind: public_selection_kind(kind),
+                generation: offer.generation,
+            };
+            match kind {
+                SelectionKind::Clipboard => clipboard = Some(clear),
+                SelectionKind::Primary => primary = Some(clear),
+            }
+        }
+
+        [clipboard, primary].into_iter().flatten().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_external_offer_for_tests(
+        &mut self,
+        generation: XwaylandGeneration,
+        kind: XwaylandSelectionKind,
+        revision: u64,
+    ) -> XwaylandSelectionOffer {
+        let selection_kind = match kind {
+            XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+            XwaylandSelectionKind::Primary => SelectionKind::Primary,
+        };
+        let offer = XwaylandSelectionOffer {
+            id: XwaylandSelectionOfferId {
+                generation,
+                kind,
+                revision,
+            },
+            mime_types: vec!["text/plain".to_owned()],
+        };
+        self.current_offers.insert(selection_kind, offer.id);
+        self.queue_selection_event(XwaylandSelectionEvent::OfferChanged {
+            kind,
+            offer: offer.clone(),
+        });
+        offer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_external_offer_for_tests(
+        &mut self,
+        generation: XwaylandGeneration,
+        kind: XwaylandSelectionKind,
+    ) {
+        let selection_kind = match kind {
+            XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+            XwaylandSelectionKind::Primary => SelectionKind::Primary,
+        };
+        self.invalidate_selection(selection_kind, generation);
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_target_atom_name_sequence_for_test(
         &self,
