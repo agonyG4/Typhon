@@ -1375,12 +1375,14 @@ fn execute_graph_passes_inner(
                     );
                 }
                 let active_work = scene_work_state.active_work();
-                let composite_scene_replay = if pass.kind == RenderPassKind::Composite
-                    && graph_scope.is_some()
-                    && draw_end > scene_cursor
-                    && !active_work.is_empty()
-                    && !renderer.capture_in_progress
-                {
+                let composite_scene_replay = if should_time_composite_scene_replay(
+                    pass.kind,
+                    graph_scope.is_some(),
+                    scene_cursor,
+                    draw_end,
+                    !active_work.is_empty(),
+                    renderer.capture_in_progress,
+                ) {
                     let work = composite_scene_replay_work(
                         scene_cursor,
                         draw_end,
@@ -1855,6 +1857,21 @@ fn composite_scene_replay_work(
         scene_scan_pairs: scene_commands_total.saturating_mul(active_work_rects),
         pending_checkpoint_requirements,
     }
+}
+
+fn should_time_composite_scene_replay(
+    pass_kind: RenderPassKind,
+    graph_timing_active: bool,
+    scene_cursor: usize,
+    draw_end: usize,
+    has_active_work: bool,
+    capture_in_progress: bool,
+) -> bool {
+    pass_kind == RenderPassKind::Composite
+        && graph_timing_active
+        && draw_end > scene_cursor
+        && has_active_work
+        && !capture_in_progress
 }
 
 fn monotonic_elapsed_ns(start: Option<Instant>) -> u64 {
@@ -7453,6 +7470,107 @@ mod tests {
             || panic!("disabled profiler must not build execution detail"),
         );
         assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn composite_scene_replay_eligibility_matches_contract() {
+        let cases = [
+            (
+                "valid Composite replay",
+                RenderPassKind::Composite,
+                true,
+                10,
+                20,
+                true,
+                false,
+                true,
+            ),
+            (
+                "non-Composite pass",
+                RenderPassKind::OutputPostProcess,
+                true,
+                10,
+                20,
+                true,
+                false,
+                false,
+            ),
+            (
+                "no graph timing scope",
+                RenderPassKind::Composite,
+                false,
+                10,
+                20,
+                true,
+                false,
+                false,
+            ),
+            (
+                "empty command range",
+                RenderPassKind::Composite,
+                true,
+                10,
+                10,
+                true,
+                false,
+                false,
+            ),
+            (
+                "reversed command range",
+                RenderPassKind::Composite,
+                true,
+                10,
+                9,
+                true,
+                false,
+                false,
+            ),
+            (
+                "empty active work",
+                RenderPassKind::Composite,
+                true,
+                10,
+                20,
+                false,
+                false,
+                false,
+            ),
+            (
+                "capture in progress",
+                RenderPassKind::Composite,
+                true,
+                10,
+                20,
+                true,
+                true,
+                false,
+            ),
+        ];
+
+        for (
+            name,
+            pass_kind,
+            graph_timing_active,
+            scene_cursor,
+            draw_end,
+            has_active_work,
+            capture_in_progress,
+            expected,
+        ) in cases
+        {
+            assert_eq!(
+                should_time_composite_scene_replay(
+                    pass_kind,
+                    graph_timing_active,
+                    scene_cursor,
+                    draw_end,
+                    has_active_work,
+                    capture_in_progress,
+                ),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -30,6 +30,14 @@ fn gpu_timing_requested(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
 }
 
+fn composite_scene_replay_summary_is_complete(
+    evidence_available: bool,
+    expected_spans: usize,
+    resolved_spans: usize,
+) -> bool {
+    evidence_available && expected_spans == resolved_spans
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProfilerStateKind {
@@ -1420,8 +1428,11 @@ impl TimingState {
             replay_capture_draw_submit_cpu_ns: aggregate
                 .capture_execution
                 .map_or(0, |summary| summary.replay_capture_draw_submit_cpu_ns),
-            composite_scene_replay_timing_available: aggregate
-                .composite_scene_replay_timing_available,
+            composite_scene_replay_timing_available: composite_scene_replay_summary_is_complete(
+                aggregate.composite_scene_replay_timing_available,
+                aggregate.composite_scene_replay_expected_spans,
+                aggregate.composite_scene_replay_resolved_spans,
+            ),
             composite_scene_replay_expected_spans: aggregate.composite_scene_replay_expected_spans,
             composite_scene_replay_resolved_spans: aggregate.composite_scene_replay_resolved_spans,
             composite_scene_replay_gpu_ns: aggregate.composite_scene_replay_gpu_ns,
@@ -2918,6 +2929,54 @@ mod tests {
                 .map_or(0, |replay| replay.duration_ns),
             0
         );
+    }
+
+    #[test]
+    fn composite_scene_replay_availability_requires_complete_span_coverage() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        assert!(record.composite_scene_replay_timing_available);
+        assert_eq!(record.composite_scene_replay_expected_spans, 0);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 0);
+
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        resolve_test_composite_scene_replay(
+            &mut state,
+            scope,
+            7,
+            70,
+            composite_scene_replay_work(1),
+            Some(composite_scene_replay_detail(1)),
+            100,
+            140,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        assert!(record.composite_scene_replay_timing_available);
+        assert_eq!(record.composite_scene_replay_expected_spans, 1);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 1);
+
+        let mut state = TimingState::active_for_test(1);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let aggregate = state.aggregates.first_mut().expect("scope aggregate");
+        aggregate.composite_scene_replay_expected_spans = 2;
+        aggregate.composite_scene_replay_resolved_spans = 1;
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        assert!(!record.composite_scene_replay_timing_available);
+        assert_eq!(record.composite_scene_replay_expected_spans, 2);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 1);
+
+        let mut state = TimingState::active_for_test(1);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        let aggregate = state.aggregates.first_mut().expect("scope aggregate");
+        aggregate.composite_scene_replay_timing_available = false;
+        aggregate.composite_scene_replay_expected_spans = 2;
+        aggregate.composite_scene_replay_resolved_spans = 2;
+        let record = resolve_test_total(&mut state, scope, 50, 500);
+        assert!(!record.composite_scene_replay_timing_available);
+        assert_eq!(record.composite_scene_replay_expected_spans, 2);
+        assert_eq!(record.composite_scene_replay_resolved_spans, 2);
     }
 
     #[test]
