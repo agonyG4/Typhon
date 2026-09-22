@@ -78,6 +78,15 @@ impl DecorationClient {
         self.pump(commands)
     }
 
+    fn commit_surface(
+        &mut self,
+        commands: &Sender<ServerCommand>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.surface.commit();
+        self.connection.flush()?;
+        self.pump(commands)
+    }
+
     fn decoration_count(&self, commands: &Sender<ServerCommand>) -> usize {
         capture_native_decoration_count(commands)
     }
@@ -147,6 +156,26 @@ impl MappedDecorationClient {
         self.queue.roundtrip(&mut self.state)?;
         Ok(())
     }
+
+    fn commit_configure(
+        &mut self,
+        commands: &Sender<ServerCommand>,
+        serial: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.xdg_surface.ack_configure(serial);
+        self.surface.commit();
+        self.connection.flush()?;
+        self.pump(commands)
+    }
+
+    fn commit_surface(
+        &mut self,
+        commands: &Sender<ServerCommand>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.surface.commit();
+        self.connection.flush()?;
+        self.pump(commands)
+    }
 }
 
 fn start_server() -> (
@@ -203,6 +232,11 @@ fn dynamic_client_to_server_waits_for_ack_and_commit() {
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
     assert_eq!(client.decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before + 1
+    );
+    client.commit_surface(&commands).unwrap();
     assert_eq!(
         capture_scene_render_generation(&commands),
         generation_before + 1
@@ -392,7 +426,7 @@ fn initial_map_has_one_coherent_decoration_transaction() {
 }
 
 #[test]
-fn destroy_waits_for_commit() {
+fn destroy_plain_commit_latches_client_side_decoration() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = DecorationClient::connect(
         &socket_path,
@@ -402,6 +436,7 @@ fn destroy_waits_for_commit() {
     .expect("connect decoration client");
     let generation_before = capture_scene_render_generation(&commands);
     let decoration_events_before = client.state.decoration_configure_count;
+    let surface_configures_before = client.state.surface_configure_count;
 
     client.decoration.destroy();
     client.connection.flush().unwrap();
@@ -412,12 +447,47 @@ fn destroy_waits_for_commit() {
         decoration_events_before
     );
     assert_eq!(
+        client.state.surface_configure_count,
+        surface_configures_before
+    );
+    assert_eq!(
         capture_scene_render_generation(&commands),
         generation_before
     );
 
-    let serial = *client.state.surface_configure_serials.last().unwrap();
-    client.commit_configure(&commands, serial).unwrap();
+    client.commit_surface(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 0);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before + 1
+    );
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn stale_server_side_decoration_ack_cannot_override_destroy_commit() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ClientSide,
+    )
+    .expect("connect decoration client");
+    client
+        .decoration
+        .set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    let pending_server_side_serial = *client.state.surface_configure_serials.last().unwrap();
+
+    client.decoration.destroy();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    client
+        .commit_configure(&commands, pending_server_side_serial)
+        .unwrap();
+
     assert_eq!(client.decoration_count(&commands), 0);
     drop(client);
     stop_server(commands, server_thread);
@@ -507,6 +577,10 @@ fn v2_destroy_and_recreate_before_commit_retains_previous_mode() {
     decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    let generation_before = capture_scene_render_generation(&commands);
     decoration.destroy();
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
@@ -517,6 +591,11 @@ fn v2_destroy_and_recreate_before_commit_retains_previous_mode() {
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
     assert!(recreated.is_alive());
     drop(client);
     stop_server(commands, server_thread);
@@ -534,21 +613,14 @@ fn v2_destroy_commit_and_recreate_starts_client_side() {
     decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
     decoration.destroy();
     client.connection.flush().unwrap();
     client.pump(&commands).unwrap();
-    let serial = *client.state.surface_configure_serials.last().unwrap();
-    client.xdg_surface.ack_configure(serial);
-    commit_test_buffered_surface(
-        &client.surface,
-        &client.shm,
-        &client.queue.handle(),
-        300,
-        200,
-    )
-    .unwrap();
-    client.connection.flush().unwrap();
-    client.pump(&commands).unwrap();
+    client.commit_surface(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
     let recreated =
         client
             .manager

@@ -320,7 +320,6 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
                     decoration_state.destroy_object();
                 }
                 state.xdg_decoration_resources.remove(&surface_id);
-                state.configure_xdg_surface_for_decoration(surface_id);
             }
             other => {
                 let _ = other;

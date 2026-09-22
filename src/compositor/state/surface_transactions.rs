@@ -521,8 +521,15 @@ impl CompositorState {
             self.refresh_effect_scene_summary();
         }
         if parent_commit_applied {
-            let decoration_changed = self.apply_acked_xdg_decoration(surface_id);
-            self.note_xdg_decoration_surface_commit(surface_id);
+            let decoration_changed = match self.note_xdg_decoration_surface_commit(surface_id) {
+                Some(visible_changed) => {
+                    // Destruction is latched by this commit, so an acknowledged
+                    // decoration mode from the destroyed object must not be applied.
+                    let _ = self.take_acked_xdg_decoration_mode(surface_id);
+                    visible_changed
+                }
+                None => self.apply_acked_xdg_decoration(surface_id),
+            };
             if decoration_changed && self.render_generation == render_generation_before_publication
             {
                 self.advance_render_generation(RenderGenerationCause::WindowDecoration);

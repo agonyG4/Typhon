@@ -109,11 +109,13 @@ impl WindowDecorationState {
         self.object_lifetime = DecorationObjectLifetime::Present;
     }
 
-    pub(in crate::compositor) fn note_surface_commit_after_destroy(&mut self) {
-        if self.object_lifetime == DecorationObjectLifetime::DestroyedBeforeSurfaceCommit {
-            self.preference = DecorationPreference::ClientSide;
-            self.object_lifetime = DecorationObjectLifetime::DestroyedAfterSurfaceCommit;
+    pub(in crate::compositor) fn note_surface_commit_after_destroy(&mut self) -> Option<bool> {
+        if self.object_lifetime != DecorationObjectLifetime::DestroyedBeforeSurfaceCommit {
+            return None;
         }
+        self.preference = DecorationPreference::ClientSide;
+        self.object_lifetime = DecorationObjectLifetime::DestroyedAfterSurfaceCommit;
+        Some(self.apply_configured_mode(DecorationMode::ClientSide))
     }
 }
 
@@ -320,10 +322,22 @@ impl super::super::CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn note_xdg_decoration_surface_commit(&mut self, surface_id: u32) {
-        if let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) {
-            decoration_state.note_surface_commit_after_destroy();
+    pub(in crate::compositor) fn note_xdg_decoration_surface_commit(
+        &mut self,
+        surface_id: u32,
+    ) -> Option<bool> {
+        let visible_changed = self
+            .xdg_decoration_states
+            .get_mut(&surface_id)
+            .and_then(WindowDecorationState::note_surface_commit_after_destroy)?;
+        if visible_changed && let Some(window_id) = self.window_id_for_surface(surface_id) {
+            self.reconcile_native_decoration_transition(
+                window_id,
+                surface_id,
+                DecorationMode::ClientSide,
+            );
         }
+        Some(visible_changed)
     }
 
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {
