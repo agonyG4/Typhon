@@ -162,6 +162,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ToggleMaximizeFocused,
     ToggleFocusedWindowLayout,
     ToggleFullscreenFocused,
+    RestoreRootWindowForInteraction {
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+        reply: Sender<bool>,
+    },
     ActivateWorkspace {
         workspace: u32,
     },
@@ -230,6 +235,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRootWindowGeometry {
         root_surface_id: u32,
         reply: Sender<Option<WindowGeometry>>,
+    },
+    CaptureXdgRootPlacementAuthority {
+        root_surface_id: u32,
+        reply: Sender<Option<XdgRootPlacementAuthoritySnapshot>>,
     },
     CaptureMinimizeAnchor {
         window_id: WindowId,
@@ -633,6 +642,17 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::ToggleFullscreenFocused => {
                         server.toggle_fullscreen_focused_window();
+                    }
+                    ServerCommand::RestoreRootWindowForInteraction {
+                        root_surface_id,
+                        geometry,
+                        reply,
+                    } => {
+                        let configured = server
+                            .state
+                            .restore_root_window_for_interaction(root_surface_id, geometry);
+                        server.publish_astrea_toplevel_updates();
+                        let _ = reply.send(configured);
                     }
                     ServerCommand::ActivateWorkspace { workspace } => {
                         if let Some(workspace) = WorkspaceId::new(workspace) {
@@ -1045,6 +1065,62 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .current_visual_root_window_geometry(root_surface_id)
                             .or_else(|| server.state.current_root_window_geometry(root_surface_id));
                         let _ = reply.send(geometry);
+                    }
+                    ServerCommand::CaptureXdgRootPlacementAuthority {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let surfaces = server.renderable_surfaces();
+                        let origins = render::surface_origins(surfaces);
+                        let active_surfaces = server.state.active_scene_surfaces();
+                        let active_origins = server.state.active_scene_surface_origins();
+                        let authority = surfaces
+                            .iter()
+                            .position(|surface| surface.surface_id == root_surface_id)
+                            .and_then(|index| {
+                                let surface = &surfaces[index];
+                                let visual_geometry = server
+                                    .state
+                                    .toplevel_visual_geometries
+                                    .get(&root_surface_id)
+                                    .map(|visual| XdgRootVisualGeometrySnapshot {
+                                        placement: visual.placement,
+                                        width: visual.width,
+                                        height: visual.height,
+                                        active_resize: visual.active_resize.is_some(),
+                                        mode_transition: visual.mode_transition,
+                                    });
+                                Some(XdgRootPlacementAuthoritySnapshot {
+                                    root_surface_id,
+                                    canonical_surface_placement: server
+                                        .state
+                                        .surface_placement(root_surface_id),
+                                    logical_window_geometry: server
+                                        .state
+                                        .current_root_window_geometry(root_surface_id),
+                                    logical_frame_origin: server
+                                        .state
+                                        .window_id_for_surface(root_surface_id)
+                                        .and_then(|window_id| {
+                                            server.state.desktop_window_frame(window_id)
+                                        })
+                                        .map(|(x, y, _, _)| (x, y)),
+                                    visual_geometry,
+                                    committed_window_geometry: server
+                                        .state
+                                        .surface_window_geometries
+                                        .get(&root_surface_id)
+                                        .copied(),
+                                    renderable_placement: surface.placement,
+                                    render_placement: surface.render_placement,
+                                    resolved_render_origin: origins[index],
+                                    active_scene_origin: active_surfaces
+                                        .iter()
+                                        .position(|active| active.surface_id == root_surface_id)
+                                        .and_then(|index| active_origins.get(index).copied()),
+                                })
+                            });
+                        let _ = reply.send(authority);
                     }
                     ServerCommand::CaptureMinimizeAnchor { window_id, reply } => {
                         let _ = reply.send(
@@ -2334,6 +2410,22 @@ pub(in crate::compositor::tests) fn capture_root_window_geometry(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report root window geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_xdg_root_placement_authority(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> Option<XdgRootPlacementAuthoritySnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureXdgRootPlacementAuthority {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report XDG root placement authority")
 }
 
 pub(in crate::compositor::tests) fn capture_minimize_anchor(

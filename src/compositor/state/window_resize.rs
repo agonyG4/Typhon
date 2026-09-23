@@ -383,7 +383,9 @@ impl CompositorState {
                 )
             })
             .or_else(|| {
-                (authoritative.root_mode == RootPlacementMode::Absolute).then(|| {
+                (authoritative.root_mode == RootPlacementMode::Absolute
+                    || self.toplevel_surfaces.contains_key(&root_surface_id))
+                .then(|| {
                     let surface = self
                         .renderable_surfaces
                         .iter()
@@ -410,9 +412,6 @@ impl CompositorState {
             self.reconcile_surface_tree_output_memberships(root_surface_id);
             return;
         };
-        if visual_width == 0 || visual_height == 0 {
-            return;
-        }
         let root_render_placement = derive_root_render_placement(visual_placement, geometry);
         if crate::compositor::state::roles::surface_tree_debug_enabled() {
             let window_geometry = geometry.map_or_else(
@@ -440,6 +439,9 @@ impl CompositorState {
             visual_width,
             visual_height,
         );
+        // A mode-transition visual can have no usable aperture before the
+        // first matching client configure, while its frame origin is valid.
+        let has_visual_frame = visual_width > 0 && visual_height > 0;
         let content_pending = self
             .pending_xwayland_visual_content
             .contains(&root_surface_id);
@@ -448,19 +450,20 @@ impl CompositorState {
             .iter()
             .find(|surface| surface.surface_id == root_surface_id)
             .map(RenderableSurface::buffer_size);
-        let visual_clip = (active_resize.is_some() || content_pending).then(|| {
-            if active_resize.is_some()
-                && let (Some(geometry), Some(root_buffer)) = (geometry, root_surface_info)
-            {
-                // The aperture is resolved in the root render-placement
-                // coordinate space. `surface_render_space_assignments` adds
-                // the committed surface origin exactly once when it maps the
-                // aperture to output coordinates.
-                resolve_root_visual_aperture_for_preview(root_buffer, geometry, clip)
-            } else {
-                SurfaceVisualAperture::logical_only(clip)
-            }
-        });
+        let visual_clip =
+            (has_visual_frame && (active_resize.is_some() || content_pending)).then(|| {
+                if active_resize.is_some()
+                    && let (Some(geometry), Some(root_buffer)) = (geometry, root_surface_info)
+                {
+                    // The aperture is resolved in the root render-placement
+                    // coordinate space. `surface_render_space_assignments` adds
+                    // the committed surface origin exactly once when it maps the
+                    // aperture to output coordinates.
+                    resolve_root_visual_aperture_for_preview(root_buffer, geometry, clip)
+                } else {
+                    SurfaceVisualAperture::logical_only(clip)
+                }
+            });
         let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
             if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
@@ -469,7 +472,9 @@ impl CompositorState {
                 continue;
             }
             if surface.surface_id == root_surface_id {
-                surface.visual_clip = visual_clip.clone();
+                if has_visual_frame {
+                    surface.visual_clip = visual_clip.clone();
+                }
                 surface.render_placement = Some(root_render_placement);
             } else {
                 surface.visual_clip = None;

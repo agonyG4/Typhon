@@ -421,7 +421,7 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
                 .find(|surface| surface.parent_surface_id.is_some())
                 .expect("stage zero should activate the content child");
             commands.send(ServerCommand::PointerMotion {
-                x: f64::from(child_snapshot.origin_x + 1037),
+                x: f64::from(child_snapshot.origin_x + 837),
                 y: f64::from(child_snapshot.origin_y + 519),
             })?;
             wait_for_server_commands(commands);
@@ -432,7 +432,7 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
             );
 
             let region = compositor.create_region(&qh, ());
-            region.add(1000, 500, 120, 40);
+            region.add(800, 500, 120, 40);
             let confined = constraints.confine_pointer(
                 &child,
                 &pointer,
@@ -466,6 +466,171 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
     }
 
     Ok(snapshots)
+}
+
+pub(in crate::compositor::tests) fn capture_gecko_mode_transition_geometry_evolution(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<GeckoModeTransitionGeometryEvolutionSnapshot, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut state = RegistryTestState::default();
+
+    commands.send(ServerCommand::SetOutputSize {
+        width: 1920,
+        height: 1080,
+    })?;
+    wait_for_server_commands(commands);
+
+    let child = compositor.create_surface(&qh, ());
+    let _initial_child_buffer = attach_test_buffered_surface(&child, &shm, &qh, 1, 1)?;
+    child.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    xdg_surface.set_window_geometry(0, 0, 1920, 1080);
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    commit_test_buffered_surface(&parent, &shm, &qh, 1920, 1080)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+
+    let viewport = viewporter.get_viewport(&child, &qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_desync();
+    subsurface.set_position(0, 0);
+    viewport.set_destination(1920, 1080);
+    commit_test_buffered_surface(&child, &shm, &qh, 1920, 1080)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+
+    let initial_tree = capture_renderable_surface_snapshot(commands);
+    let root_surface_id = initial_tree
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .map(|surface| surface.surface_id)
+        .expect("mapped XDG toplevel should have one root surface");
+
+    let (restore_reply, restore_receiver) = mpsc::channel();
+    commands.send(ServerCommand::RestoreRootWindowForInteraction {
+        root_surface_id,
+        geometry: WindowGeometry::new(SurfacePlacement::root(), 1920, 1080),
+        reply: restore_reply,
+    })?;
+    wait_for_server_commands(commands);
+    if !restore_receiver.recv_timeout(Duration::from_secs(1))? {
+        return Err("compositor should install the cascaded floating frame".into());
+    }
+    queue.roundtrip(&mut state)?;
+    xdg_surface.set_window_geometry(0, 0, 1920, 1080);
+    commit_test_buffered_surface(&parent, &shm, &qh, 1920, 1080)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+
+    commands.send(ServerCommand::ToggleFullscreenFocused)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let fullscreen_committed = state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen);
+    xdg_surface.set_window_geometry(0, 0, 1920, 1080);
+    commit_test_buffered_surface(&parent, &shm, &qh, 1920, 1080)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+
+    let fullscreen_authority = capture_xdg_root_placement_authority(commands, root_surface_id);
+
+    commands.send(ServerCommand::ToggleFullscreenFocused)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let floating_transition_authority =
+        capture_xdg_root_placement_authority(commands, root_surface_id);
+    let floating_committed = !state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen);
+    xdg_surface.set_window_geometry(0, 0, 1920, 1080);
+    commit_test_buffered_surface(&parent, &shm, &qh, 1920, 1080)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    let floating_authority = capture_xdg_root_placement_authority(commands, root_surface_id);
+
+    let mut stages = Vec::with_capacity(6);
+    let stage_zero_geometry = XdgWindowGeometry::new(0, 0, 1920, 1080);
+    stages.push(GeckoModeTransitionGeometryStageSnapshot {
+        expected_geometry: stage_zero_geometry,
+        requested_position: (0, 0),
+        committed_geometry: capture_committed_window_geometry(commands),
+        root_authority: capture_xdg_root_placement_authority(commands, root_surface_id),
+        tree: capture_renderable_surface_snapshot(commands),
+    });
+
+    let stages_to_commit = [
+        (XdgWindowGeometry::new(10, 10, 520, 515), (540, 535)),
+        (XdgWindowGeometry::new(27, 18, 520, 515), (574, 553)),
+        (XdgWindowGeometry::new(39, 26, 520, 515), (598, 567)),
+        (XdgWindowGeometry::new(44, 29, 520, 515), (608, 573)),
+        (XdgWindowGeometry::new(45, 29, 520, 515), (610, 573)),
+    ];
+    for (geometry, root_buffer) in stages_to_commit {
+        xdg_surface.set_window_geometry(geometry.x, geometry.y, geometry.width, geometry.height);
+        subsurface.set_position(geometry.x, geometry.y);
+        viewport.set_destination(geometry.width, geometry.height);
+        commit_test_buffered_surface(
+            &child,
+            &shm,
+            &qh,
+            geometry.width as usize,
+            geometry.height as usize,
+        )?;
+        connection.flush()?;
+        queue.roundtrip(&mut state)?;
+        wait_for_server_commands(commands);
+
+        commit_test_buffered_surface(
+            &parent,
+            &shm,
+            &qh,
+            root_buffer.0 as usize,
+            root_buffer.1 as usize,
+        )?;
+        connection.flush()?;
+        queue.roundtrip(&mut state)?;
+        wait_for_server_commands(commands);
+
+        stages.push(GeckoModeTransitionGeometryStageSnapshot {
+            expected_geometry: geometry,
+            requested_position: (geometry.x, geometry.y),
+            committed_geometry: capture_committed_window_geometry(commands),
+            root_authority: capture_xdg_root_placement_authority(commands, root_surface_id),
+            tree: capture_renderable_surface_snapshot(commands),
+        });
+    }
+
+    Ok(GeckoModeTransitionGeometryEvolutionSnapshot {
+        fullscreen_committed,
+        fullscreen_authority,
+        floating_transition_authority,
+        floating_committed,
+        floating_authority,
+        stages,
+    })
 }
 
 pub(in crate::compositor::tests) fn capture_roleless_parent_subsurface_mapping(

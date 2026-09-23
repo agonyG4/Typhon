@@ -166,6 +166,7 @@ mod protocol_buffers;
 mod protocol_contract;
 mod protocol_error;
 mod subsurface;
+mod subsurface_geometry_convergence;
 mod surface_frames;
 mod toplevel_management;
 mod windows;

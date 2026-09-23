@@ -403,6 +403,27 @@ pub(in crate::compositor::tests) struct GeckoGeometryPublicationSnapshot {
     pub(in crate::compositor::tests) logical_frame_origin: Option<(i32, i32)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct GeckoModeTransitionGeometryStageSnapshot {
+    pub(in crate::compositor::tests) expected_geometry: XdgWindowGeometry,
+    pub(in crate::compositor::tests) requested_position: (i32, i32),
+    pub(in crate::compositor::tests) committed_geometry: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) root_authority: Option<XdgRootPlacementAuthoritySnapshot>,
+    pub(in crate::compositor::tests) tree: Vec<RenderableSurfaceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct GeckoModeTransitionGeometryEvolutionSnapshot {
+    pub(in crate::compositor::tests) fullscreen_committed: bool,
+    pub(in crate::compositor::tests) fullscreen_authority:
+        Option<XdgRootPlacementAuthoritySnapshot>,
+    pub(in crate::compositor::tests) floating_transition_authority:
+        Option<XdgRootPlacementAuthoritySnapshot>,
+    pub(in crate::compositor::tests) floating_committed: bool,
+    pub(in crate::compositor::tests) floating_authority: Option<XdgRootPlacementAuthoritySnapshot>,
+    pub(in crate::compositor::tests) stages: Vec<GeckoModeTransitionGeometryStageSnapshot>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct ToplevelVisualGeometrySnapshot {
     pub(in crate::compositor::tests) local_x: i32,
@@ -410,6 +431,29 @@ pub(in crate::compositor::tests) struct ToplevelVisualGeometrySnapshot {
     pub(in crate::compositor::tests) width: u32,
     pub(in crate::compositor::tests) height: u32,
     pub(in crate::compositor::tests) active_resize: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct XdgRootVisualGeometrySnapshot {
+    pub(in crate::compositor::tests) placement: SurfacePlacement,
+    pub(in crate::compositor::tests) width: u32,
+    pub(in crate::compositor::tests) height: u32,
+    pub(in crate::compositor::tests) active_resize: bool,
+    pub(in crate::compositor::tests) mode_transition: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct XdgRootPlacementAuthoritySnapshot {
+    pub(in crate::compositor::tests) root_surface_id: u32,
+    pub(in crate::compositor::tests) canonical_surface_placement: SurfacePlacement,
+    pub(in crate::compositor::tests) logical_window_geometry: Option<WindowGeometry>,
+    pub(in crate::compositor::tests) logical_frame_origin: Option<(i32, i32)>,
+    pub(in crate::compositor::tests) visual_geometry: Option<XdgRootVisualGeometrySnapshot>,
+    pub(in crate::compositor::tests) committed_window_geometry: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) renderable_placement: SurfacePlacement,
+    pub(in crate::compositor::tests) render_placement: Option<SurfacePlacement>,
+    pub(in crate::compositor::tests) resolved_render_origin: (i32, i32),
+    pub(in crate::compositor::tests) active_scene_origin: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
