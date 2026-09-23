@@ -325,6 +325,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
         reply: Sender<Option<(LayoutMembership, WorkspaceLocation, bool)>>,
     },
     CaptureWindowInteractionDebugSnapshot(Sender<Option<WindowInteractionDebugSnapshot>>),
+    CaptureWindowInteractionStartSize(Sender<Option<(u32, u32)>>),
+    CaptureRootRestoreGeometry {
+        root_surface_id: u32,
+        reply: Sender<Option<WindowGeometry>>,
+    },
     CapturePointerOwnershipIsClear(Sender<bool>),
     CaptureWindowInteractionReleaseMetrics(Sender<WindowInteractionReleaseMetrics>),
     CaptureUsableOutputGeometry(Sender<OutputRect>),
@@ -1639,6 +1644,24 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureWindowInteractionDebugSnapshot(reply) => {
                         let _ = reply.send(server.window_interaction_debug_snapshot());
                     }
+                    ServerCommand::CaptureWindowInteractionStartSize(reply) => {
+                        let start_size = server
+                            .state
+                            .window_interaction
+                            .map(|interaction| (interaction.start_width, interaction.start_height));
+                        let _ = reply.send(start_size);
+                    }
+                    ServerCommand::CaptureRootRestoreGeometry {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let geometry = server
+                            .state
+                            .window_id_for_surface(root_surface_id)
+                            .and_then(|window_id| server.state.window(window_id))
+                            .and_then(|window| window.state.restore_geometry());
+                        let _ = reply.send(geometry);
+                    }
                     ServerCommand::CapturePointerOwnershipIsClear(reply) => {
                         let _ = reply.send(server.pointer_ownership_is_clear());
                     }
@@ -2334,6 +2357,34 @@ pub(in crate::compositor::tests) fn capture_window_interaction_debug_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report window interaction snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_window_interaction_start_size(
+    commands: &Sender<ServerCommand>,
+) -> Option<(u32, u32)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureWindowInteractionStartSize(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report window interaction start size")
+}
+
+pub(in crate::compositor::tests) fn capture_root_restore_geometry(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> Option<WindowGeometry> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureRootRestoreGeometry {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report root restore geometry")
 }
 
 pub(in crate::compositor::tests) fn capture_pointer_ownership_is_clear(

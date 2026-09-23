@@ -358,9 +358,13 @@ impl CompositorState {
             .copied()
             .filter(|visual| visual.mode_transition && visual.active_resize.is_none())
             .and_then(|visual| {
-                (self.current_root_window_geometry(root_surface_id)
-                    == Some(visual.window_geometry()))
-                .then_some(visual)
+                self.current_root_window_geometry(root_surface_id)
+                    .filter(|canonical| {
+                        canonical.placement == visual.placement
+                            && (visual.width == 0 || visual.width == canonical.width)
+                            && (visual.height == 0 || visual.height == canonical.height)
+                    })
+                    .map(|_| visual)
             });
         if converged_mode_geometry.is_some() {
             self.toplevel_visual_geometries.remove(&root_surface_id);

@@ -334,6 +334,7 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
 
     let authority = capture_xdg_root_placement_authority(&commands, root_surface_id)
         .expect("root placement authority");
+    let current_visual_geometry = capture_root_window_geometry(&commands, root_surface_id);
     let tree = capture_renderable_surface_snapshot(&commands);
     let root = tree
         .iter()
@@ -343,6 +344,21 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
         .iter()
         .find(|surface| surface.parent_surface_id.is_some())
         .expect("renderable content child");
+    commands
+        .send(ServerCommand::BeginResize {
+            x: 72.0 + 518.0,
+            y: 72.0 + 513.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let resize_interaction = capture_window_interaction_debug_snapshot(&commands);
+    let resize_start_size = capture_window_interaction_start_size(&commands);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let next_mode_source_geometry = capture_root_restore_geometry(&commands, root_surface_id);
     let expected_render_placement = SurfacePlacement {
         local_x: authority
             .canonical_surface_placement
@@ -357,11 +373,36 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
     let _server = stop_controllable_test_server(commands, server_thread);
     assert_eq!(authority.committed_window_geometry, Some(geometry));
     assert_eq!(authority.logical_frame_origin, Some((72, 72)));
-    assert!(
-        authority
-            .visual_geometry
-            .is_some_and(|visual| visual.width == 0 || visual.height == 0)
+    assert_eq!(
+        authority.visual_geometry, None,
+        "a matching non-zero client geometry must retire the zero-sized mode visual"
     );
+    assert_eq!(
+        authority
+            .logical_window_geometry
+            .map(|geometry| (geometry.width, geometry.height)),
+        Some((520, 515))
+    );
+    assert_eq!(current_visual_geometry, authority.logical_window_geometry);
+    assert_eq!(
+        current_visual_geometry.map(|geometry| (geometry.width, geometry.height)),
+        Some((520, 515))
+    );
+    assert_eq!(
+        resize_interaction.is_some_and(|interaction| matches!(
+            interaction.kind,
+            crate::compositor::WindowInteractionKind::Resize(_)
+        )),
+        true,
+        "normal resize path should begin after zero-sized mode visual retirement"
+    );
+    assert_eq!(resize_start_size, Some((520, 515)));
+    assert_eq!(
+        next_mode_source_geometry.map(|geometry| (geometry.width, geometry.height)),
+        Some((520, 515)),
+        "the next mode transition must capture canonical non-zero dimensions"
+    );
+    assert_eq!(next_mode_source_geometry, authority.logical_window_geometry);
     assert_eq!((root.origin_x, root.origin_y), (62, 62));
     assert_eq!((child.origin_x, child.origin_y), (72, 72));
     assert_eq!(authority.active_scene_origin, Some((62, 62)));
