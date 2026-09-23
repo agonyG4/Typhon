@@ -421,7 +421,7 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
                 .find(|surface| surface.parent_surface_id.is_some())
                 .expect("stage zero should activate the content child");
             commands.send(ServerCommand::PointerMotion {
-                x: f64::from(child_snapshot.origin_x + 837),
+                x: f64::from(child_snapshot.origin_x + 1037),
                 y: f64::from(child_snapshot.origin_y + 519),
             })?;
             wait_for_server_commands(commands);
@@ -432,7 +432,7 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
             );
 
             let region = compositor.create_region(&qh, ());
-            region.add(800, 500, 120, 40);
+            region.add(1000, 500, 120, 40);
             let confined = constraints.confine_pointer(
                 &child,
                 &pointer,
