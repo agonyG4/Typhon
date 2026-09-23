@@ -50,6 +50,7 @@ impl CompositorState {
 mod tests {
     use super::super::*;
     use crate::compositor::DecorationRenderInstance;
+    use crate::compositor::PresentationRetainedVisualPayloadId;
     use crate::core::{OutputId, SceneNodeId, WindowId};
     use crate::presentation_animation::{
         AnimationCurve, AnimationTime, EasingCurve, PresentationClip, PresentationClipMutation,
@@ -60,7 +61,7 @@ mod tests {
         PresentationWindowTarget,
     };
     use crate::window_lifecycle_animation::{
-        LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleTransitionRequest,
+        LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleMotionRequest,
         LifecycleVisualGroup,
     };
     use std::time::Duration;
@@ -116,6 +117,9 @@ mod tests {
                 window_id,
                 root_surface_id,
                 presentation_identity,
+                payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                    presentation_identity,
+                ),
                 visual_group: lifecycle_visual_group(),
                 progress: if direction == LifecycleDirection::Restore {
                     0.0
@@ -134,11 +138,16 @@ mod tests {
 
     fn lifecycle_request(
         presentation_engine: &mut PresentationEngine,
+        payload_store: &mut super::super::state::lifecycle_retained::RetainedLifecyclePayloadStore,
         window_id: WindowId,
-        root_surface_id: u32,
+        _root_surface_id: u32,
         direction: LifecycleDirection,
-    ) -> LifecycleTransitionRequest {
+    ) -> LifecycleMotionRequest {
         let scene_node_id = SceneNodeId::from_raw(window_id.get()).expect("test scene node");
+        let previous_identity = presentation_engine.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        );
         let presentation_identity = presentation_engine
             .begin_retained_visual(
                 scene_node_id,
@@ -146,16 +155,36 @@ mod tests {
                 AnimationTime::from_nanos(0),
             )
             .expect("test retained lifecycle identity");
-        presentation_engine
+        let activated_previous = presentation_engine
             .activate_retained_visual_exact(presentation_identity)
             .expect("activate lifecycle identity");
-        LifecycleTransitionRequest {
+        assert_eq!(activated_previous, previous_identity);
+        if let Some(previous_identity) = previous_identity {
+            let payload = std::sync::Arc::clone(
+                payload_store
+                    .get_exact(previous_identity)
+                    .expect("reversal keeps its exact retained payload"),
+            );
+            assert!(payload_store.transfer_exact(
+                previous_identity,
+                presentation_identity,
+                &payload
+            ));
+        } else {
+            let payload =
+                super::super::state::lifecycle_retained::RetainedLifecyclePayload::capture(
+                    presentation_identity,
+                    window_id,
+                    _root_surface_id,
+                    lifecycle_visual_group(),
+                    ResolvedEffectScene::default(),
+                )
+                .expect("valid test lifecycle payload");
+            assert!(payload_store.publish_exact(presentation_identity, payload));
+        }
+        LifecycleMotionRequest {
             presentation_identity,
-            window_id,
-            root_surface_id,
-            visual_group: lifecycle_visual_group(),
             direction,
-            resolved_effect_scene: ResolvedEffectScene::default(),
         }
     }
 
@@ -287,6 +316,7 @@ mod tests {
             .start_or_reverse(
                 lifecycle_request(
                     &mut state.presentation_animator,
+                    &mut state.retained_lifecycle_payloads,
                     restore_window,
                     restore_root,
                     LifecycleDirection::Restore,
@@ -497,6 +527,7 @@ mod tests {
             .start_or_reverse(
                 lifecycle_request(
                     &mut state.presentation_animator,
+                    &mut state.retained_lifecycle_payloads,
                     window_id,
                     root_surface_id,
                     LifecycleDirection::Restore,
@@ -535,9 +566,12 @@ mod tests {
         );
         assert!(state.lifecycle_decorations.contains_key(&root_surface_id));
 
-        let lifecycle_sample = state
-            .window_lifecycle_animator
-            .sample_scene(&[transition_id], endpoint_time);
+        let lifecycle_sample = state.lifecycle_scene_sample_at(endpoint_time);
+        assert_eq!(lifecycle_sample.lamps.len(), 1);
+        assert_eq!(
+            lifecycle_sample.lamps[0].payload_id,
+            PresentationRetainedVisualPayloadId::from_origin_identity(transition_id)
+        );
         let lifecycle = LifecycleFrameSnapshot::from_sample(&lifecycle_sample);
         assert!(lifecycle.lamps[0].mathematically_settled);
         let presentation = PresentationFrameSnapshot::empty_for_output(output_id);
@@ -581,6 +615,7 @@ mod tests {
             .start_or_reverse(
                 lifecycle_request(
                     &mut state.presentation_animator,
+                    &mut state.retained_lifecycle_payloads,
                     window_id,
                     root_surface_id,
                     LifecycleDirection::Minimize,
@@ -595,6 +630,7 @@ mod tests {
             .start_or_reverse(
                 lifecycle_request(
                     &mut state.presentation_animator,
+                    &mut state.retained_lifecycle_payloads,
                     window_id,
                     root_surface_id,
                     LifecycleDirection::Restore,
@@ -653,12 +689,18 @@ mod tests {
                 .is_some()
         );
 
-        let exact = lifecycle_snapshot(
+        let mut exact = lifecycle_snapshot(
             window_id,
             root_surface_id,
             active,
             LifecycleDirection::Restore,
         );
+        exact.lamps[0].payload_id = state
+            .retained_lifecycle_payloads
+            .get_exact(active)
+            .expect("reversal retains first payload")
+            .payload_id;
+        exact.refresh_signature();
         state.publish_presented_frame(PresentedFramePublication {
             frame_id: 14,
             presentation: &presentation,

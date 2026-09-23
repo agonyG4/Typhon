@@ -33,6 +33,10 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
             window_id: WindowId::from_raw(1).unwrap(),
             root_surface_id: 901,
             presentation_identity: identity_for_test(WindowId::from_raw(1).unwrap()),
+            payload_id:
+                crate::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    identity_for_test(WindowId::from_raw(1).unwrap()),
+                ),
             visual_group,
             progress: 0.4,
             opacity: 1.0,

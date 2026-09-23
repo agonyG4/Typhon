@@ -543,15 +543,16 @@ mod tests {
             .expect("valid source rectangle");
         let anchor = oblivion_one::compositor::PresentationRect::new(1200.0, 800.0, 48.0, 48.0)
             .expect("valid anchor rectangle");
+        let window_id = oblivion_one::compositor::WindowId::from_raw(7).expect("valid window id");
+        let presentation_identity = retained_identity(window_id, 1);
         LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
             sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
             lamps: vec![LampWindowSample {
-                window_id: oblivion_one::compositor::WindowId::from_raw(7)
-                    .expect("valid window id"),
+                window_id,
                 root_surface_id: 7,
-                presentation_identity: retained_identity(
-                    oblivion_one::compositor::WindowId::from_raw(7).expect("valid window id"),
-                    1,
+                presentation_identity,
+                payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    presentation_identity,
                 ),
                 visual_group: LifecycleVisualGroup::from_bounds(
                     source, source, source, anchor, 1920, 1080,
@@ -611,15 +612,16 @@ mod tests {
         let group =
             LifecycleVisualGroup::from_bounds(client, ssd_outer, client, anchor, 1920, 1080)
                 .expect("valid visual group");
+        let window_id = oblivion_one::compositor::WindowId::from_raw(8).expect("valid window id");
+        let presentation_identity = retained_identity(window_id, 8);
         let snapshot = LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
             sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
             lamps: vec![LampWindowSample {
-                window_id: oblivion_one::compositor::WindowId::from_raw(8)
-                    .expect("valid window id"),
+                window_id,
                 root_surface_id: 8,
-                presentation_identity: retained_identity(
-                    oblivion_one::compositor::WindowId::from_raw(8).expect("valid window id"),
-                    8,
+                presentation_identity,
+                payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    presentation_identity,
                 ),
                 visual_group: group,
                 progress: 0.5,

@@ -6,8 +6,9 @@ use crate::presentation_animation::PresentationRetainedVisualKind;
 #[cfg(test)]
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
-    LifecycleDirection, LifecycleFrameSnapshot, LifecycleRenderFallbackEntry, LifecycleSceneSample,
-    LifecycleTransitionRequest, LifecycleVisualGroup,
+    LampWindowSample, LifecycleDirection, LifecycleFrameSnapshot, LifecycleMotionRequest,
+    LifecycleRenderFallbackEntry, LifecycleSceneSample, LifecycleVisualGroup,
+    LifecycleVisualSource, LifecycleVisualSourceKind,
 };
 use std::num::NonZeroU64;
 
@@ -149,22 +150,79 @@ impl CompositorState {
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
             return;
         };
-        let Some(presented_source_client_rect) = presented_source_client_rect
-            .or_else(|| self.lifecycle_minimize_source_rect(root_surface_id))
-        else {
+        let Some(now) = AnimationTime::monotonic_now() else {
             return;
         };
-        let Some(canonical_client_rect) =
-            canonical_client_rect.or_else(|| self.lifecycle_window_rect(root_surface_id))
-        else {
+        let speed = self.animation_control.configuration().speed;
+        let Some((_identity, payload, was_reversal)) = self.install_lifecycle_motion(
+            scene_node_id,
+            window_id,
+            root_surface_id,
+            presented_source_client_rect,
+            canonical_client_rect,
+            visual_group,
+            LifecycleDirection::Minimize,
+            resolved_effect_scene,
+            now,
+            speed,
+        ) else {
             return;
         };
-        let visual_group = if let Some(visual_group) = visual_group {
-            Some(visual_group)
+        // Lamp takes over Group Geometry only after the retained transaction
+        // and lifecycle executor have both accepted the same identity.
+        self.presentation_animator.cancel_geometry(scene_node_id);
+        let active_root_surface_id = payload.root_surface_id;
+        self.lifecycle_render_suppressed_roots
+            .remove(&active_root_surface_id);
+        if !was_reversal {
+            self.replace_lifecycle_decoration_snapshot(
+                active_root_surface_id,
+                lifecycle_decorations,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_lifecycle_motion(
+        &mut self,
+        scene_node_id: crate::core::SceneNodeId,
+        window_id: WindowId,
+        root_surface_id: u32,
+        presented_source_client_rect: Option<PresentationRect>,
+        canonical_client_rect: Option<PresentationRect>,
+        visual_group: Option<LifecycleVisualGroup>,
+        direction: LifecycleDirection,
+        resolved_effect_scene: ResolvedEffectScene,
+        now: AnimationTime,
+        speed: f64,
+    ) -> Option<(
+        crate::presentation_animation::PresentationRetainedVisualIdentity,
+        std::sync::Arc<super::lifecycle_retained::RetainedLifecyclePayload>,
+        bool,
+    )> {
+        let previous_identity = self.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        );
+        let previous_payload = match previous_identity {
+            Some(identity) => Some(std::sync::Arc::clone(
+                self.retained_lifecycle_payloads.get_exact(identity)?,
+            )),
+            None => None,
+        };
+        let visual_group = if let Some(payload) = previous_payload.as_ref() {
+            payload.visual_group
+        } else if let Some(visual_group) = visual_group {
+            visual_group
         } else {
-            let Some(anchor_rect) = self.lifecycle_anchor_rect(window_id) else {
-                return;
+            let canonical_client_rect =
+                canonical_client_rect.or_else(|| self.lifecycle_window_rect(root_surface_id))?;
+            let presented_source_client_rect = match direction {
+                LifecycleDirection::Minimize => presented_source_client_rect
+                    .or_else(|| self.lifecycle_minimize_source_rect(root_surface_id))?,
+                LifecycleDirection::Restore => canonical_client_rect,
             };
+            let anchor_rect = self.lifecycle_anchor_rect(window_id)?;
             LifecycleVisualGroup::from_bounds(
                 canonical_client_rect,
                 canonical_client_rect,
@@ -172,93 +230,128 @@ impl CompositorState {
                 anchor_rect,
                 self.output_size.width,
                 self.output_size.height,
-            )
-        };
-        let Some(visual_group) = visual_group else {
-            return;
+            )?
         };
         if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
             visual_group,
             self.output_size.width,
             self.output_size.height,
         ) {
-            return;
+            return None;
         }
-        let Some(now) = AnimationTime::monotonic_now() else {
-            return;
-        };
-        let speed = self.animation_control.configuration().speed;
-        let has_active_transition = self
+
+        let identity = self
             .presentation_animator
-            .active_retained_visual(
+            .begin_retained_visual(
                 scene_node_id,
                 PresentationRetainedVisualKind::WindowLifecycle,
+                now,
             )
-            .is_some();
-        let identity = match self.presentation_animator.begin_retained_visual(
-            scene_node_id,
-            crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
-            now,
-        ) {
-            Ok(identity) => identity,
-            Err(_) => return,
-        };
-        let previous_identity = match self
+            .ok()?;
+        let activated_previous = match self
             .presentation_animator
             .activate_retained_visual_exact(identity)
         {
-            Ok(previous_identity) => previous_identity,
+            Ok(previous) => previous,
             Err(_) => {
                 self.presentation_animator
                     .retire_retained_visual_exact(identity);
-                return;
+                return None;
             }
         };
-        let started = self.window_lifecycle_animator.start_or_reverse(
-            LifecycleTransitionRequest {
-                presentation_identity: identity,
+        if activated_previous != previous_identity {
+            let restored = self
+                .presentation_animator
+                .restore_retained_visual_owner_exact(identity, activated_previous);
+            let retired = self
+                .presentation_animator
+                .retire_retained_visual_exact(identity);
+            debug_assert!(
+                restored && retired,
+                "unexpected lifecycle owner changed during start"
+            );
+            return None;
+        }
+
+        let payload = if let Some(payload) = previous_payload {
+            payload
+        } else {
+            let Some(payload) = super::lifecycle_retained::RetainedLifecyclePayload::capture(
+                identity,
                 window_id,
                 root_surface_id,
                 visual_group,
-                direction: LifecycleDirection::Minimize,
                 resolved_effect_scene,
+            ) else {
+                self.rollback_lifecycle_reservation(identity, previous_identity);
+                return None;
+            };
+            payload
+        };
+        let mapping_can_commit = if let Some(previous_identity) = previous_identity {
+            self.retained_lifecycle_payloads.can_transfer_exact(
+                previous_identity,
+                identity,
+                &payload,
+            )
+        } else {
+            self.retained_lifecycle_payloads.can_publish_exact(identity)
+        };
+        if !mapping_can_commit {
+            self.rollback_lifecycle_reservation(identity, previous_identity);
+            return None;
+        }
+        let started = self.window_lifecycle_animator.start_or_reverse(
+            LifecycleMotionRequest {
+                presentation_identity: identity,
+                direction,
             },
             previous_identity,
             now,
             speed,
         );
         if started != Some(identity) {
-            let restored = self
-                .presentation_animator
-                .restore_retained_visual_owner_exact(identity, previous_identity);
-            self.presentation_animator
-                .retire_retained_visual_exact(identity);
-            debug_assert!(
-                restored,
-                "failed lifecycle start restores its previous owner"
-            );
-            return;
+            self.rollback_lifecycle_reservation(identity, previous_identity);
+            return None;
         }
+
+        let published = if let Some(previous_identity) = previous_identity {
+            self.retained_lifecycle_payloads
+                .transfer_exact(previous_identity, identity, &payload)
+        } else {
+            self.retained_lifecycle_payloads
+                .publish_exact(identity, std::sync::Arc::clone(&payload))
+        };
+        debug_assert!(
+            published,
+            "lifecycle payload mapping must commit with motion"
+        );
         if let Some(previous_identity) = previous_identity {
-            self.presentation_animator
-                .retire_retained_visual_exact(previous_identity);
-        }
-        // Lamp takes over Group Geometry only after the retained transaction
-        // and lifecycle executor have both accepted the same identity.
-        self.presentation_animator.cancel_geometry(scene_node_id);
-        let active_root_surface_id = self
-            .window_lifecycle_animator
-            .sample(identity, now)
-            .map(|sample| sample.root_surface_id)
-            .unwrap_or(root_surface_id);
-        self.lifecycle_render_suppressed_roots
-            .remove(&active_root_surface_id);
-        if !has_active_transition {
-            self.replace_lifecycle_decoration_snapshot(
-                active_root_surface_id,
-                lifecycle_decorations,
+            debug_assert!(
+                self.presentation_animator
+                    .retire_retained_visual_exact(previous_identity)
             );
         }
+        Some((identity, payload, previous_identity.is_some()))
+    }
+
+    fn rollback_lifecycle_reservation(
+        &mut self,
+        identity: crate::presentation_animation::PresentationRetainedVisualIdentity,
+        previous_identity: Option<
+            crate::presentation_animation::PresentationRetainedVisualIdentity,
+        >,
+    ) {
+        let restored = self
+            .presentation_animator
+            .restore_retained_visual_owner_exact(identity, previous_identity);
+        let retired = self
+            .presentation_animator
+            .retire_retained_visual_exact(identity);
+        debug_assert!(
+            restored && retired,
+            "failed lifecycle start restores its previous owner"
+        );
     }
 
     fn replace_lifecycle_decoration_snapshot(
@@ -291,95 +384,26 @@ impl CompositorState {
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
             return;
         };
-        let previous_identity = self.presentation_animator.active_retained_visual(
-            scene_node_id,
-            PresentationRetainedVisualKind::WindowLifecycle,
-        );
-        let visual_group = previous_identity
-            .and_then(|identity| self.window_lifecycle_animator.visual_group(identity))
-            .or(visual_group)
-            .or_else(|| {
-                let full_window_rect = self.lifecycle_window_rect(root_surface_id)?;
-                let anchor_rect = self.lifecycle_anchor_rect(window_id)?;
-                LifecycleVisualGroup::from_bounds(
-                    full_window_rect,
-                    full_window_rect,
-                    full_window_rect,
-                    anchor_rect,
-                    self.output_size.width,
-                    self.output_size.height,
-                )
-            });
-        let Some(visual_group) = visual_group else {
-            return;
-        };
-        if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-            visual_group,
-            self.output_size.width,
-            self.output_size.height,
-        ) {
-            return;
-        }
         let Some(now) = AnimationTime::monotonic_now() else {
             return;
         };
         let speed = self.animation_control.configuration().speed;
-        let has_active_transition = previous_identity.is_some();
-        let identity = match self.presentation_animator.begin_retained_visual(
+        let Some((_identity, payload, was_reversal)) = self.install_lifecycle_motion(
             scene_node_id,
-            crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
-            now,
-        ) {
-            Ok(identity) => identity,
-            Err(_) => return,
-        };
-        let activated_previous = match self
-            .presentation_animator
-            .activate_retained_visual_exact(identity)
-        {
-            Ok(previous_identity) => previous_identity,
-            Err(_) => {
-                self.presentation_animator
-                    .retire_retained_visual_exact(identity);
-                return;
-            }
-        };
-        debug_assert_eq!(activated_previous, previous_identity);
-        let started = self.window_lifecycle_animator.start_or_reverse(
-            LifecycleTransitionRequest {
-                presentation_identity: identity,
-                window_id,
-                root_surface_id,
-                visual_group,
-                direction: LifecycleDirection::Restore,
-                resolved_effect_scene,
-            },
-            activated_previous,
+            window_id,
+            root_surface_id,
+            None,
+            None,
+            visual_group,
+            LifecycleDirection::Restore,
+            resolved_effect_scene,
             now,
             speed,
-        );
-        if started != Some(identity) {
-            let restored = self
-                .presentation_animator
-                .restore_retained_visual_owner_exact(identity, activated_previous);
-            self.presentation_animator
-                .retire_retained_visual_exact(identity);
-            debug_assert!(
-                restored,
-                "failed lifecycle start restores its previous owner"
-            );
+        ) else {
             return;
-        }
-        if let Some(previous_identity) = activated_previous {
-            self.presentation_animator
-                .retire_retained_visual_exact(previous_identity);
-        }
-        let active_root_surface_id = self
-            .window_lifecycle_animator
-            .sample(identity, now)
-            .map(|sample| sample.root_surface_id)
-            .unwrap_or(root_surface_id);
-        if !has_active_transition {
+        };
+        let active_root_surface_id = payload.root_surface_id;
+        if !was_reversal {
             self.replace_lifecycle_decoration_snapshot(
                 active_root_surface_id,
                 lifecycle_decorations,
@@ -393,10 +417,51 @@ impl CompositorState {
         &self,
         at: AnimationTime,
     ) -> LifecycleSceneSample {
-        let active = self
+        let active_identities = self
             .presentation_animator
             .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle);
-        self.window_lifecycle_animator.sample_scene(&active, at)
+        let mut lamps = Vec::with_capacity(active_identities.len());
+        let mut visual_sources = Vec::with_capacity(active_identities.len());
+        for identity in active_identities {
+            let Some(motion) = self.window_lifecycle_animator.sample(identity, at) else {
+                continue;
+            };
+            let Some(payload) = self.retained_lifecycle_payloads.get_exact(identity) else {
+                continue;
+            };
+            if motion.presentation_identity != identity {
+                continue;
+            }
+            let kind = if payload.effect_scene.is_empty() {
+                LifecycleVisualSourceKind::NoOwnedEffects
+            } else {
+                LifecycleVisualSourceKind::ResolvedOwnedEffects
+            };
+            lamps.push(LampWindowSample {
+                window_id: payload.window_id,
+                root_surface_id: payload.root_surface_id,
+                presentation_identity: identity,
+                payload_id: payload.payload_id,
+                visual_group: payload.visual_group,
+                progress: motion.progress,
+                opacity: motion.opacity,
+                direction: motion.direction,
+                mathematically_settled: motion.mathematically_settled,
+            });
+            visual_sources.push(LifecycleVisualSource {
+                window_id: payload.window_id,
+                root_surface_id: payload.root_surface_id,
+                presentation_identity: identity,
+                payload_id: payload.payload_id,
+                kind,
+                effect_scene: std::sync::Arc::clone(&payload.effect_scene),
+            });
+        }
+        LifecycleSceneSample {
+            sampled_at: at,
+            lamps,
+            visual_sources,
+        }
     }
 
     pub(in crate::compositor) fn lifecycle_visual_group_for_scene_node(
@@ -407,7 +472,9 @@ impl CompositorState {
             scene_node_id,
             PresentationRetainedVisualKind::WindowLifecycle,
         )?;
-        self.window_lifecycle_animator.visual_group(identity)
+        self.retained_lifecycle_payloads
+            .get_exact(identity)
+            .map(|payload| payload.visual_group)
     }
 
     pub(in crate::compositor) fn lifecycle_renderable_surfaces(
@@ -519,15 +586,27 @@ impl CompositorState {
                         )
                 })
             })
-            .map(|lamp| (lamp.presentation_identity, lamp.root_surface_id))
+            .map(|lamp| {
+                (
+                    lamp.presentation_identity,
+                    lamp.payload_id,
+                    lamp.root_surface_id,
+                )
+            })
             .collect::<Vec<_>>();
         let mut settled = false;
-        for (identity, root_surface_id) in candidates {
+        for (identity, payload_id, root_surface_id) in candidates {
             if self
                 .presentation_animator
                 .active_retained_visual(identity.scene_node_id(), identity.kind())
                 != Some(identity)
             {
+                continue;
+            }
+            let Some(payload) = self.retained_lifecycle_payloads.get_exact(identity) else {
+                continue;
+            };
+            if payload.payload_id != payload_id {
                 continue;
             }
             if let Some(retired_identity) = self
@@ -540,6 +619,7 @@ impl CompositorState {
                 {
                     continue;
                 }
+                self.retained_lifecycle_payloads.retire_exact(identity);
                 self.lifecycle_render_suppressed_roots
                     .remove(&root_surface_id);
                 self.lifecycle_decorations.remove(&root_surface_id);
@@ -618,6 +698,17 @@ impl CompositorState {
             {
                 continue;
             }
+            if !self
+                .retained_lifecycle_payloads
+                .get_exact(lamp.presentation_identity)
+                .is_some_and(|payload| {
+                    payload.payload_id == lamp.payload_id
+                        && payload.root_surface_id == lamp.root_surface_id
+                        && payload.window_id == lamp.window_id
+                })
+            {
+                continue;
+            }
             let acknowledged = self
                 .window_lifecycle_animator
                 .acknowledge(lamp.presentation_identity, lamp.mathematically_settled);
@@ -625,6 +716,10 @@ impl CompositorState {
                 self.presentation_animator
                     .retire_active_retained_visual_exact(identity)
             });
+            if retired {
+                self.retained_lifecycle_payloads
+                    .retire_exact(lamp.presentation_identity);
+            }
             if retired && matches!(lamp.direction, LifecycleDirection::Restore) {
                 self.lifecycle_render_suppressed_roots
                     .remove(&lamp.root_surface_id);
@@ -674,8 +769,15 @@ impl CompositorState {
         else {
             return false;
         };
-        if current.root_surface_id != fallback.root_surface_id
-            || current.window_id != fallback.window_id
+        let Some(payload) = self
+            .retained_lifecycle_payloads
+            .get_exact(fallback.presentation_identity)
+        else {
+            return false;
+        };
+        if payload.root_surface_id != fallback.root_surface_id
+            || payload.window_id != fallback.window_id
+            || payload.payload_id != fallback.payload_id
             || current.presentation_identity != fallback.presentation_identity
         {
             return false;
@@ -692,6 +794,8 @@ impl CompositorState {
         {
             return false;
         }
+        self.retained_lifecycle_payloads
+            .retire_exact(fallback.presentation_identity);
         self.lifecycle_render_suppressed_roots
             .remove(&fallback.root_surface_id);
         self.lifecycle_decorations.remove(&fallback.root_surface_id);
@@ -711,8 +815,18 @@ impl CompositorState {
                 self.window_lifecycle_animator.cancel(identity);
                 self.presentation_animator
                     .retire_active_retained_visual_exact(identity);
+                self.retained_lifecycle_payloads.retire_exact(identity);
             }
-            self.window_lifecycle_animator.cancel_all();
+            for identity in self.window_lifecycle_animator.cancel_all() {
+                self.presentation_animator
+                    .retire_retained_visual_exact(identity);
+                self.retained_lifecycle_payloads.retire_exact(identity);
+            }
+            for (identity, _) in self.retained_lifecycle_payloads.drain_all() {
+                self.presentation_animator
+                    .retire_retained_visual_exact(identity);
+                self.window_lifecycle_animator.cancel(identity);
+            }
             self.lifecycle_render_suppressed_roots.clear();
             self.lifecycle_decorations.clear();
         }
@@ -721,7 +835,6 @@ impl CompositorState {
     pub(in crate::compositor) fn lifecycle_cancel_window(&mut self, window_id: WindowId) {
         let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
         let scene_node_id = self.scene_node_id_for_window_group(window_id);
-        let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
         let active_identity = scene_node_id.and_then(|scene_node_id| {
             self.presentation_animator.active_retained_visual(
                 scene_node_id,
@@ -729,12 +842,13 @@ impl CompositorState {
             )
         });
         let frozen_root_surface_id = active_identity
-            .and_then(|identity| self.window_lifecycle_animator.sample(identity, now))
-            .map(|sample| sample.root_surface_id);
+            .and_then(|identity| self.retained_lifecycle_payloads.get_exact(identity))
+            .map(|payload| payload.root_surface_id);
         if let Some(identity) = active_identity {
             self.window_lifecycle_animator.cancel(identity);
             self.presentation_animator
                 .retire_active_retained_visual_exact(identity);
+            self.retained_lifecycle_payloads.retire_exact(identity);
         }
         let orphaned_roots = scene_node_id
             .map(|scene_node_id| {
@@ -743,8 +857,28 @@ impl CompositorState {
             })
             .unwrap_or_default()
             .into_iter()
-            .map(|(_, root_surface_id)| root_surface_id)
+            .filter_map(|identity| {
+                self.presentation_animator
+                    .retire_retained_visual_exact(identity);
+                self.retained_lifecycle_payloads
+                    .retire_exact(identity)
+                    .map(|payload| payload.root_surface_id)
+            })
             .collect::<Vec<_>>();
+        let orphaned_payloads = scene_node_id
+            .map(|scene_node_id| {
+                self.retained_lifecycle_payloads
+                    .remove_scene_node(scene_node_id)
+            })
+            .unwrap_or_default();
+        for (identity, payload) in orphaned_payloads {
+            self.presentation_animator
+                .retire_retained_visual_exact(identity);
+            self.window_lifecycle_animator.cancel(identity);
+            self.lifecycle_render_suppressed_roots
+                .remove(&payload.root_surface_id);
+            self.lifecycle_decorations.remove(&payload.root_surface_id);
+        }
         for root_surface_id in [frozen_root_surface_id, root_surface_id]
             .into_iter()
             .flatten()

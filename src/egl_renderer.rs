@@ -603,9 +603,12 @@ pub(crate) struct GlesSceneRenderer {
     lamp_geometry_key: Option<u64>,
     lamp_vertices: Vec<EglLampVertex>,
     lamp_commands: Vec<EglLampDrawCommand>,
-    lifecycle_source_vertices: HashMap<compositor::WindowId, Vec<EglTexturedVertex>>,
-    lifecycle_source_commands: HashMap<compositor::WindowId, Vec<EglDrawCommand>>,
-    lifecycle_visual_resources: HashMap<compositor::WindowId, LifecycleResolvedVisualResource>,
+    lifecycle_source_vertices:
+        HashMap<compositor::PresentationRetainedVisualPayloadId, Vec<EglTexturedVertex>>,
+    lifecycle_source_commands:
+        HashMap<compositor::PresentationRetainedVisualPayloadId, Vec<EglDrawCommand>>,
+    lifecycle_visual_resources:
+        HashMap<compositor::PresentationRetainedVisualPayloadId, LifecycleResolvedVisualResource>,
     lifecycle_visual_sources: HashMap<
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,
@@ -793,7 +796,7 @@ fn surface_root_for_lamp(
 
 struct LampGridSpec {
     layer: EglDrawLayer,
-    window_id: compositor::WindowId,
+    presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
     bounds: EglRect,
     uv: EglUvRect,
 }
@@ -877,7 +880,7 @@ fn append_lamp_grid(
 ) -> bool {
     let LampGridSpec {
         layer,
-        window_id,
+        presentation_identity,
         bounds,
         uv,
     } = spec;
@@ -930,7 +933,7 @@ fn append_lamp_grid(
         vertex_start,
         vertex_count: u32::try_from(required).unwrap_or(u32::MAX),
         sampling: SurfaceSampling::ScaledLinear,
-        window_id,
+        presentation_identity,
     });
     true
 }
@@ -962,6 +965,7 @@ fn lamp_geometry_key(
             },
             lamp.presentation_identity.transaction_id().get(),
             lamp.presentation_identity.revision_id().get(),
+            lamp.payload_id.get(),
             lamp.visual_group.canonical_client_rect.x().to_bits(),
             lamp.visual_group.canonical_client_rect.y().to_bits(),
             lamp.visual_group.canonical_client_rect.width().to_bits(),
@@ -1013,10 +1017,7 @@ fn lamp_geometry_key(
         ] {
             mix(value);
         }
-        if let Some(source) = lifecycle
-            .visual_source_for_identity(lamp.presentation_identity)
-            .filter(|source| source.root_surface_id == lamp.root_surface_id)
-        {
+        if let Some(source) = lifecycle_visual_source_for_lamp(lifecycle, *lamp) {
             mix(match source.kind {
                 LifecycleVisualSourceKind::NoOwnedEffects => 1,
                 LifecycleVisualSourceKind::ResolvedOwnedEffects => 2,
@@ -1087,6 +1088,35 @@ fn lifecycle_damage_for_samples(
         }
     }
     OutputDamage::rects(output_width, output_height, rects)
+}
+
+fn lifecycle_visual_source_for_lamp(
+    lifecycle: &LifecycleSceneSample,
+    lamp: LampWindowSample,
+) -> Option<&LifecycleVisualSource> {
+    lifecycle
+        .visual_source_for_identity(lamp.presentation_identity)
+        .filter(|source| {
+            source.root_surface_id == lamp.root_surface_id && source.payload_id == lamp.payload_id
+        })
+}
+
+fn lifecycle_draw_layer_matches_payload(
+    layer: EglDrawLayer,
+    payload_id: compositor::PresentationRetainedVisualPayloadId,
+    source_kind: LifecycleVisualSourceKind,
+) -> bool {
+    match (source_kind, layer) {
+        (
+            LifecycleVisualSourceKind::ResolvedOwnedEffects,
+            EglDrawLayer::LifecycleResolvedVisual(layer_payload_id),
+        ) => layer_payload_id == payload_id,
+        (LifecycleVisualSourceKind::ResolvedOwnedEffects, _) => false,
+        (LifecycleVisualSourceKind::NoOwnedEffects, EglDrawLayer::LifecycleResolvedVisual(_)) => {
+            false
+        }
+        (LifecycleVisualSourceKind::NoOwnedEffects, _) => true,
+    }
 }
 
 fn set_lamp_uniform_rect(
@@ -3495,8 +3525,6 @@ impl GlesSceneRenderer {
         self.lamp_geometry_dirty = true;
         self.lamp_vertices.clear();
         self.lamp_commands.clear();
-        self.lifecycle_source_vertices.clear();
-        self.lifecycle_source_commands.clear();
         if lifecycle.lamps.is_empty() {
             return;
         }
@@ -3505,69 +3533,88 @@ impl GlesSceneRenderer {
         let assignments =
             compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
         for lamp in lifecycle.lamps.iter().copied() {
-            let resolved_source = lifecycle
-                .visual_source_for_identity(lamp.presentation_identity)
-                .filter(|source| source.root_surface_id == lamp.root_surface_id)
-                .filter(|source| source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects);
-            if let Some(source) = resolved_source {
-                let mut vertices = Vec::new();
-                let mut commands = Vec::new();
-                let visual_group = source
-                    .effect_scene
-                    .instances
-                    .first()
-                    .and_then(|instance| instance.visual_group)
-                    .or_else(|| VisualGroupId::new(1));
-                for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
-                    if surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
-                        != lamp.root_surface_id
-                    {
-                        continue;
-                    }
-                    push_egl_surface_commands(
-                        &mut vertices,
-                        &mut commands,
-                        self.current_size.0,
-                        self.current_size.1,
-                        surface,
-                        assignment.clone(),
-                        self.current_framebuffer_origin,
-                        visual_group,
-                    );
-                }
-                for decoration in lifecycle_decorations
-                    .iter()
-                    .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
-                {
-                    push_egl_decoration_instance(
-                        &mut vertices,
-                        &mut commands,
-                        self.current_size.0,
-                        self.current_size.1,
-                        decoration,
-                        output_scale,
-                        self.current_framebuffer_origin,
-                        visual_group,
-                    );
-                }
-                reproject_lifecycle_source_commands(
-                    &mut vertices,
-                    &mut commands,
-                    lamp.visual_group.canonical_client_rect,
-                    lamp.visual_group.presented_source_client_rect,
-                    output_scale,
-                    self.current_size,
-                    self.current_framebuffer_origin,
+            let Some(source) = lifecycle_visual_source_for_lamp(lifecycle, lamp) else {
+                self.record_lifecycle_render_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::NoConsumedRepresentation,
                 );
-                self.lifecycle_source_vertices
-                    .insert(source.window_id, vertices);
-                self.lifecycle_source_commands
-                    .insert(source.window_id, commands);
+                continue;
+            };
+            if source.root_surface_id != lamp.root_surface_id
+                || source.payload_id != lamp.payload_id
+            {
+                self.record_lifecycle_render_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::NoConsumedRepresentation,
+                );
+                continue;
+            }
+            let resolved_source =
+                (source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects).then_some(source);
+            if let Some(source) = resolved_source {
+                if !self
+                    .lifecycle_source_vertices
+                    .contains_key(&source.payload_id)
+                {
+                    let mut vertices = Vec::new();
+                    let mut commands = Vec::new();
+                    let visual_group = source
+                        .effect_scene
+                        .instances
+                        .first()
+                        .and_then(|instance| instance.visual_group)
+                        .or_else(|| VisualGroupId::new(1));
+                    for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
+                        if surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
+                            != lamp.root_surface_id
+                        {
+                            continue;
+                        }
+                        push_egl_surface_commands(
+                            &mut vertices,
+                            &mut commands,
+                            self.current_size.0,
+                            self.current_size.1,
+                            surface,
+                            assignment.clone(),
+                            self.current_framebuffer_origin,
+                            visual_group,
+                        );
+                    }
+                    for decoration in lifecycle_decorations
+                        .iter()
+                        .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
+                    {
+                        push_egl_decoration_instance(
+                            &mut vertices,
+                            &mut commands,
+                            self.current_size.0,
+                            self.current_size.1,
+                            decoration,
+                            output_scale,
+                            self.current_framebuffer_origin,
+                            visual_group,
+                        );
+                    }
+                    reproject_lifecycle_source_commands(
+                        &mut vertices,
+                        &mut commands,
+                        lamp.visual_group.canonical_client_rect,
+                        lamp.visual_group.presented_source_client_rect,
+                        output_scale,
+                        self.current_size,
+                        self.current_framebuffer_origin,
+                    );
+                    self.lifecycle_source_vertices
+                        .insert(source.payload_id, vertices);
+                    self.lifecycle_source_commands
+                        .insert(source.payload_id, commands);
+                }
                 self.append_lamp_grid_for_transition(
                     lamp,
                     LampGridSpec {
-                        layer: EglDrawLayer::LifecycleResolvedVisual(source.window_id),
-                        window_id: source.window_id,
+                        layer: EglDrawLayer::LifecycleResolvedVisual(source.payload_id),
+                        presentation_identity: lamp.presentation_identity,
                         bounds: EglRect::new(
                             (lamp.visual_group.canonical_visual_rect.x() * output_scale) as f32,
                             (lamp.visual_group.canonical_visual_rect.y() * output_scale) as f32,
@@ -3602,7 +3649,7 @@ impl GlesSceneRenderer {
                         lamp,
                         LampGridSpec {
                             layer: EglDrawLayer::Surface(surface.surface_id),
-                            window_id: lamp.window_id,
+                            presentation_identity: lamp.presentation_identity,
                             bounds: EglRect::new(
                                 target.x() as f32,
                                 target.y() as f32,
@@ -3651,7 +3698,7 @@ impl GlesSceneRenderer {
                         lamp,
                         LampGridSpec {
                             layer,
-                            window_id: lamp.window_id,
+                            presentation_identity: lamp.presentation_identity,
                             bounds: EglRect::new(
                                 origin_x.saturating_add(rect.x) as f32 * scale,
                                 origin_y.saturating_add(rect.y) as f32 * scale,
@@ -3667,8 +3714,8 @@ impl GlesSceneRenderer {
             }
         }
         for lamp in &lifecycle.lamps {
-            if !transition_starts.contains_key(&lamp.window_id)
-                && !rejected_transitions.contains(&lamp.window_id)
+            if !transition_starts.contains_key(&lamp.presentation_identity)
+                && !rejected_transitions.contains(&lamp.presentation_identity)
             {
                 self.record_lifecycle_render_fallback(
                     *lamp,
@@ -3682,19 +3729,24 @@ impl GlesSceneRenderer {
         &mut self,
         lamp: LampWindowSample,
         spec: LampGridSpec,
-        transition_starts: &mut HashMap<compositor::WindowId, (usize, usize)>,
-        rejected_transitions: &mut HashSet<compositor::WindowId>,
+        transition_starts: &mut HashMap<
+            oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+            (usize, usize),
+        >,
+        rejected_transitions: &mut HashSet<
+            oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        >,
     ) {
-        if rejected_transitions.contains(&lamp.window_id) {
+        if rejected_transitions.contains(&lamp.presentation_identity) {
             return;
         }
         let start = *transition_starts
-            .entry(lamp.window_id)
+            .entry(lamp.presentation_identity)
             .or_insert((self.lamp_vertices.len(), self.lamp_commands.len()));
         if !append_lamp_grid(&mut self.lamp_vertices, &mut self.lamp_commands, spec) {
             self.lamp_vertices.truncate(start.0);
             self.lamp_commands.truncate(start.1);
-            rejected_transitions.insert(lamp.window_id);
+            rejected_transitions.insert(lamp.presentation_identity);
             self.record_lifecycle_render_fallback(lamp, LifecycleRenderFallbackReason::MeshBudget);
         }
     }
@@ -3726,6 +3778,7 @@ impl GlesSceneRenderer {
                 .find(|sample| {
                     sample.presentation_identity == source.presentation_identity
                         && sample.root_surface_id == source.root_surface_id
+                        && sample.payload_id == source.payload_id
                 })
                 .copied()
             else {
@@ -3745,7 +3798,7 @@ impl GlesSceneRenderer {
             let source_signature = lifecycle_visual_source_signature(&source, lamp, output_scale);
             let ready = self
                 .lifecycle_visual_resources
-                .get(&source.window_id)
+                .get(&source.payload_id)
                 .is_some_and(|resource| {
                     resource.source_signature == source_signature
                         && resource.source_visual_rect
@@ -3756,7 +3809,7 @@ impl GlesSceneRenderer {
                 continue;
             }
 
-            if let Some(previous) = self.lifecycle_visual_resources.remove(&source.window_id) {
+            if let Some(previous) = self.lifecycle_visual_resources.remove(&source.payload_id) {
                 let _ = self.effect_resources.release(previous.texture);
             }
             let texture_key = EffectTextureKey::new(
@@ -3785,7 +3838,7 @@ impl GlesSceneRenderer {
                 continue;
             }
             self.lifecycle_visual_resources.insert(
-                source.window_id,
+                source.payload_id,
                 LifecycleResolvedVisualResource {
                     texture,
                     source_signature,
@@ -3806,6 +3859,7 @@ impl GlesSceneRenderer {
                 window_id: lamp.window_id,
                 root_surface_id: lamp.root_surface_id,
                 presentation_identity: lamp.presentation_identity,
+                payload_id: lamp.payload_id,
                 reason,
             });
     }
@@ -3829,12 +3883,12 @@ impl GlesSceneRenderer {
 
             let source_vertices = self
                 .lifecycle_source_vertices
-                .get(&source.window_id)
+                .get(&source.payload_id)
                 .cloned()
                 .unwrap_or_default();
             let source_commands = self
                 .lifecycle_source_commands
-                .get(&source.window_id)
+                .get(&source.payload_id)
                 .cloned()
                 .unwrap_or_default();
             if source_vertices.is_empty() || source_commands.is_empty() {
@@ -3912,22 +3966,26 @@ impl GlesSceneRenderer {
     }
 
     fn release_stale_lifecycle_visual_resources(&mut self) {
+        let live_payload_ids = self
+            .lifecycle_visual_sources
+            .values()
+            .map(|source| source.payload_id)
+            .collect::<HashSet<_>>();
         let stale = self
             .lifecycle_visual_resources
             .keys()
             .copied()
-            .filter(|window_id| {
-                !self.lifecycle_visual_sources.values().any(|source| {
-                    source.window_id == *window_id
-                        && source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects
-                })
-            })
+            .filter(|payload_id| !live_payload_ids.contains(payload_id))
             .collect::<Vec<_>>();
-        for window_id in stale {
-            if let Some(resource) = self.lifecycle_visual_resources.remove(&window_id) {
+        for payload_id in stale {
+            if let Some(resource) = self.lifecycle_visual_resources.remove(&payload_id) {
                 let _ = self.effect_resources.release(resource.texture);
             }
         }
+        self.lifecycle_source_vertices
+            .retain(|payload_id, _| live_payload_ids.contains(payload_id));
+        self.lifecycle_source_commands
+            .retain(|payload_id, _| live_payload_ids.contains(payload_id));
     }
 
     fn release_all_lifecycle_visual_resources(&mut self) {
@@ -3970,13 +4028,26 @@ impl GlesSceneRenderer {
             .lamp_commands
             .iter()
             .filter_map(|command| {
-                if self.lifecycle_visual_source_is_ready(command.window_id)
+                let sample = self.lamp_geometry_sample(command.presentation_identity)?;
+                let source = self
+                    .lifecycle_visual_sources
+                    .get(&command.presentation_identity)?;
+                if source.root_surface_id != sample.root_surface_id
+                    || source.payload_id != sample.payload_id
+                    || !lifecycle_draw_layer_matches_payload(
+                        command.layer,
+                        sample.payload_id,
+                        source.kind,
+                    )
+                {
+                    return None;
+                }
+                if self.lifecycle_visual_source_is_ready(sample.payload_id)
                     && !matches!(command.layer, EglDrawLayer::LifecycleResolvedVisual(_))
                 {
                     return None;
                 }
-                self.lamp_geometry_sample(command.window_id)
-                    .map(|sample| (*command, sample))
+                Some((*command, sample))
             })
             .collect::<Vec<_>>();
         unsafe {
@@ -4112,6 +4183,7 @@ impl GlesSceneRenderer {
                     window_id: sample.window_id,
                     root_surface_id: sample.root_surface_id,
                     presentation_identity: sample.presentation_identity,
+                    payload_id: sample.payload_id,
                 });
         }
         self.frame_stats.missing_required_decoration_resources = self
@@ -4143,9 +4215,11 @@ impl GlesSceneRenderer {
             .iter()
             .copied()
             .filter(|lamp| {
-                !self
-                    .lifecycle_render_evidence
-                    .contains(lamp.presentation_identity, lamp.root_surface_id)
+                !self.lifecycle_render_evidence.contains(
+                    lamp.presentation_identity,
+                    lamp.payload_id,
+                    lamp.root_surface_id,
+                )
             })
             .filter(|lamp| self.lamp_intersects_current_output(lamp))
             .collect::<Vec<_>>();
@@ -4200,10 +4274,13 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
-    fn lamp_geometry_sample(&self, window_id: compositor::WindowId) -> Option<LampWindowSample> {
+    fn lamp_geometry_sample(
+        &self,
+        presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+    ) -> Option<LampWindowSample> {
         self.lamp_samples
             .iter()
-            .find(|sample| sample.window_id == window_id)
+            .find(|sample| sample.presentation_identity == presentation_identity)
             .copied()
     }
 
@@ -4855,9 +4932,9 @@ impl GlesSceneRenderer {
                 .surface_resources
                 .get(&surface_id)
                 .map(|resource| resource.image.texture),
-            EglDrawLayer::LifecycleResolvedVisual(window_id) => self
+            EglDrawLayer::LifecycleResolvedVisual(payload_id) => self
                 .lifecycle_visual_resources
-                .get(&window_id)
+                .get(&payload_id)
                 .and_then(|resource| self.effect_resources.texture(&resource.texture)),
             EglDrawLayer::Cursor => self
                 .cursor_resource
@@ -4866,9 +4943,12 @@ impl GlesSceneRenderer {
         }
     }
 
-    fn lifecycle_visual_source_is_ready(&self, window_id: compositor::WindowId) -> bool {
+    fn lifecycle_visual_source_is_ready(
+        &self,
+        payload_id: compositor::PresentationRetainedVisualPayloadId,
+    ) -> bool {
         self.lifecycle_visual_resources
-            .get(&window_id)
+            .get(&payload_id)
             .is_some_and(|resource| self.effect_resources.texture(&resource.texture).is_some())
     }
 
@@ -5764,7 +5844,7 @@ fn lifecycle_visual_source_signature(
     lamp: LampWindowSample,
     output_scale: f64,
 ) -> u64 {
-    let mut signature = source.effect_scene.signature;
+    let mut signature = source.effect_scene.signature ^ source.payload_id.get();
     for value in [
         lamp.visual_group.canonical_client_rect.x().to_bits(),
         lamp.visual_group.canonical_client_rect.y().to_bits(),
@@ -12475,26 +12555,35 @@ mod tests {
     fn lamp_test_sample(progress: f64) -> LifecycleSceneSample {
         let rect = PresentationRect::new(100.0, 80.0, 800.0, 600.0).expect("valid rectangle");
         let anchor = PresentationRect::new(1200.0, 900.0, 64.0, 64.0).expect("valid anchor");
+        let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("valid window id");
+        let presentation_identity = test_lifecycle_identity(window_id, 1);
+        let payload_id =
+            oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                presentation_identity,
+            );
+        let visual_group = LifecycleVisualGroup::from_bounds(rect, rect, rect, anchor, 1920, 1080)
+            .expect("valid visual group");
         LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(1),
             lamps: vec![LampWindowSample {
-                window_id: oblivion_one::compositor::WindowId::from_raw(1)
-                    .expect("valid window id"),
+                window_id,
                 root_surface_id: 1,
-                presentation_identity: test_lifecycle_identity(
-                    oblivion_one::compositor::WindowId::from_raw(1).expect("valid window id"),
-                    1,
-                ),
-                visual_group: LifecycleVisualGroup::from_bounds(
-                    rect, rect, rect, anchor, 1920, 1080,
-                )
-                .expect("valid visual group"),
+                presentation_identity,
+                payload_id,
+                visual_group,
                 progress,
                 opacity: 1.0,
                 direction: LifecycleDirection::Minimize,
                 mathematically_settled: false,
             }],
-            visual_sources: Vec::new(),
+            visual_sources: vec![LifecycleVisualSource {
+                window_id,
+                root_surface_id: 1,
+                presentation_identity,
+                payload_id,
+                kind: LifecycleVisualSourceKind::NoOwnedEffects,
+                effect_scene: Arc::new(compositor::ResolvedEffectScene::default()),
+            }],
         }
     }
 
@@ -12745,6 +12834,14 @@ mod tests {
                 oblivion_one::compositor::WindowId::from_raw(1).expect("valid lifecycle window ID"),
                 1,
             ),
+            payload_id:
+                oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    test_lifecycle_identity(
+                        oblivion_one::compositor::WindowId::from_raw(1)
+                            .expect("valid lifecycle window ID"),
+                        1,
+                    ),
+                ),
             kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
             effect_scene: std::sync::Arc::new(
                 oblivion_one::compositor::ResolvedEffectScene::default(),
@@ -12876,6 +12973,100 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_source_requires_exact_owner_payload_and_root() {
+        let sample = lamp_test_sample(0.5);
+        let first = sample.lamps[0];
+        let next_identity = test_lifecycle_identity(first.window_id, 2);
+        let mut reversed = sample.clone();
+        reversed.lamps[0].presentation_identity = next_identity;
+        reversed.visual_sources[0].presentation_identity = next_identity;
+
+        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed.lamps[0]).is_some());
+
+        let wrong_payload =
+            compositor::PresentationRetainedVisualPayloadId::from_origin_identity(next_identity);
+        assert_ne!(first.payload_id, wrong_payload);
+        assert!(lifecycle_draw_layer_matches_payload(
+            EglDrawLayer::LifecycleResolvedVisual(first.payload_id),
+            first.payload_id,
+            LifecycleVisualSourceKind::ResolvedOwnedEffects,
+        ));
+        assert!(!lifecycle_draw_layer_matches_payload(
+            EglDrawLayer::LifecycleResolvedVisual(wrong_payload),
+            first.payload_id,
+            LifecycleVisualSourceKind::ResolvedOwnedEffects,
+        ));
+        reversed.lamps[0].payload_id = wrong_payload;
+        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed.lamps[0]).is_none());
+
+        reversed.lamps[0].payload_id = first.payload_id;
+        reversed.lamps[0].root_surface_id = 2;
+        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed.lamps[0]).is_none());
+    }
+
+    #[test]
+    fn frozen_visual_signature_survives_reversal_but_changes_for_fresh_payload() {
+        let first_sample = lamp_test_sample(0.5);
+        let first_lamp = first_sample.lamps[0];
+        let first_source = &first_sample.visual_sources[0];
+        let next_identity = test_lifecycle_identity(first_lamp.window_id, 2);
+        let mut reversed_lamp = first_lamp;
+        reversed_lamp.presentation_identity = next_identity;
+        let reversed_source = LifecycleVisualSource {
+            presentation_identity: next_identity,
+            ..first_source.clone()
+        };
+        assert_eq!(
+            lifecycle_visual_source_signature(&reversed_source, reversed_lamp, 1.0),
+            lifecycle_visual_source_signature(first_source, first_lamp, 1.0),
+            "owner revisions do not invalidate the same immutable payload"
+        );
+
+        let fresh_payload =
+            compositor::PresentationRetainedVisualPayloadId::from_origin_identity(next_identity);
+        let fresh_lamp = LampWindowSample {
+            presentation_identity: next_identity,
+            payload_id: fresh_payload,
+            ..first_lamp
+        };
+        let fresh_source = LifecycleVisualSource {
+            presentation_identity: next_identity,
+            payload_id: fresh_payload,
+            ..first_source.clone()
+        };
+        assert_ne!(
+            lifecycle_visual_source_signature(&fresh_source, fresh_lamp, 1.0),
+            lifecycle_visual_source_signature(first_source, first_lamp, 1.0),
+            "a new lifecycle payload cannot alias the previous resolved visual"
+        );
+    }
+
+    #[test]
+    fn lamp_draw_commands_are_qualified_by_exact_presentation_identity() {
+        let window_id = compositor::WindowId::from_raw(901).expect("test window id");
+        let first = test_lifecycle_identity(window_id, 1);
+        let second = test_lifecycle_identity(window_id, 2);
+        assert_ne!(first, second);
+        let mut vertices = Vec::new();
+        let mut commands = Vec::new();
+        for presentation_identity in [first, second] {
+            assert!(append_lamp_grid(
+                &mut vertices,
+                &mut commands,
+                LampGridSpec {
+                    layer: EglDrawLayer::Surface(7),
+                    presentation_identity,
+                    bounds: EglRect::new(0.0, 0.0, 64.0, 64.0),
+                    uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                },
+            ));
+        }
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].presentation_identity, first);
+        assert_eq!(commands[1].presentation_identity, second);
+    }
+
+    #[test]
     fn every_visible_lamp_progress_sample_has_lifecycle_damage() {
         for progress in [0.01, 0.5, 0.97] {
             let sample = lamp_test_sample(progress);
@@ -12929,6 +13120,7 @@ mod tests {
     #[test]
     fn lamp_mesh_vertex_budget_is_bounded_for_concurrent_windows() {
         let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("valid window id");
+        let presentation_identity = test_lifecycle_identity(window_id, 1);
         let mut vertices = Vec::new();
         let mut commands = Vec::new();
         for _ in 0..32 {
@@ -12937,7 +13129,7 @@ mod tests {
                 &mut commands,
                 LampGridSpec {
                     layer: EglDrawLayer::Surface(1),
-                    window_id,
+                    presentation_identity,
                     bounds: EglRect::new(0.0, 0.0, 10_000.0, 10_000.0),
                     uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
                 },
@@ -12954,6 +13146,7 @@ mod tests {
     #[test]
     fn lamp_grid_admission_is_atomic_when_the_minimum_grid_does_not_fit() {
         let window_id = oblivion_one::compositor::WindowId::from_raw(2).expect("valid window id");
+        let presentation_identity = test_lifecycle_identity(window_id, 2);
         let vertex = EglLampVertex {
             position: [0.0, 0.0],
             uv: [0.0, 0.0],
@@ -12965,7 +13158,7 @@ mod tests {
             &mut commands,
             LampGridSpec {
                 layer: EglDrawLayer::Surface(2),
-                window_id,
+                presentation_identity,
                 bounds: EglRect::new(10_000.0, 10_000.0, 10_000.0, 10_000.0),
                 uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
             },
@@ -13300,6 +13493,9 @@ mod tests {
                 window_id,
                 root_surface_id: 42,
                 presentation_identity: test_lifecycle_identity(window_id, 1),
+                payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    test_lifecycle_identity(window_id, 1),
+                ),
                 visual_group: group,
                 progress: 0.5,
                 opacity: 1.0,

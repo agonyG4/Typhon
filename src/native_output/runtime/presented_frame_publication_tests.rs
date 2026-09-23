@@ -111,6 +111,10 @@ fn old_physical_lifecycle_lamp(root_surface_id: u32) -> LifecycleFrameSnapshot {
             window_id,
             root_surface_id,
             presentation_identity: retained_identity(window_id, 1),
+            payload_id:
+                oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    retained_identity(window_id, 1),
+                ),
             visual_group,
             progress: 0.5,
             opacity: 1.0,

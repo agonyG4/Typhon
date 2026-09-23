@@ -1,4 +1,4 @@
-use crate::compositor::ResolvedEffectScene;
+use crate::compositor::{PresentationRetainedVisualPayloadId, ResolvedEffectScene};
 use crate::core::WindowId;
 use crate::presentation_animation::{
     AnimationTime, PresentationRect, PresentationRetainedVisualIdentity,
@@ -143,18 +143,24 @@ pub struct LifecycleVisualSource {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
+    pub payload_id: PresentationRetainedVisualPayloadId,
     pub kind: LifecycleVisualSourceKind,
     pub effect_scene: Arc<ResolvedEffectScene>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct LifecycleTransitionRequest {
+pub struct LifecycleMotionRequest {
     pub presentation_identity: PresentationRetainedVisualIdentity,
-    pub window_id: WindowId,
-    pub root_surface_id: u32,
-    pub visual_group: LifecycleVisualGroup,
     pub direction: LifecycleDirection,
-    pub resolved_effect_scene: ResolvedEffectScene,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LifecycleMotionSample {
+    pub presentation_identity: PresentationRetainedVisualIdentity,
+    pub progress: f64,
+    pub opacity: f64,
+    pub direction: LifecycleDirection,
+    pub mathematically_settled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,6 +168,7 @@ pub struct LampWindowSample {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
+    pub payload_id: PresentationRetainedVisualPayloadId,
     pub visual_group: LifecycleVisualGroup,
     pub progress: f64,
     pub opacity: f64,
@@ -198,6 +205,7 @@ pub struct LifecycleFrameLamp {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
+    pub payload_id: PresentationRetainedVisualPayloadId,
     pub visual_group: LifecycleVisualGroup,
     pub progress: f64,
     pub opacity: f64,
@@ -221,6 +229,7 @@ impl LifecycleFrameSnapshot {
                 window_id: lamp.window_id,
                 root_surface_id: lamp.root_surface_id,
                 presentation_identity: lamp.presentation_identity,
+                payload_id: lamp.payload_id,
                 visual_group: lamp.visual_group,
                 progress: lamp.progress,
                 opacity: lamp.opacity,
@@ -241,9 +250,13 @@ impl LifecycleFrameSnapshot {
         evidence: &LifecycleRenderEvidence,
     ) -> Self {
         let mut snapshot = Self::from_sample(sample);
-        snapshot
-            .lamps
-            .retain(|lamp| evidence.contains(lamp.presentation_identity, lamp.root_surface_id));
+        snapshot.lamps.retain(|lamp| {
+            evidence.contains(
+                lamp.presentation_identity,
+                lamp.payload_id,
+                lamp.root_surface_id,
+            )
+        });
         snapshot.refresh_signature();
         snapshot
     }
@@ -268,6 +281,7 @@ pub struct LifecycleRenderEvidenceEntry {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
+    pub payload_id: PresentationRetainedVisualPayloadId,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -295,10 +309,12 @@ impl LifecycleRenderEvidence {
     pub fn contains(
         &self,
         presentation_identity: PresentationRetainedVisualIdentity,
+        payload_id: PresentationRetainedVisualPayloadId,
         root_surface_id: u32,
     ) -> bool {
         self.consumed.iter().any(|entry| {
             entry.presentation_identity == presentation_identity
+                && entry.payload_id == payload_id
                 && entry.root_surface_id == root_surface_id
         })
     }
@@ -319,6 +335,7 @@ pub struct LifecycleRenderFallbackEntry {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
+    pub payload_id: PresentationRetainedVisualPayloadId,
     pub reason: LifecycleRenderFallbackReason,
 }
 
@@ -333,6 +350,7 @@ impl LifecycleRenderFallbacks {
             existing.window_id == entry.window_id
                 && existing.root_surface_id == entry.root_surface_id
                 && existing.presentation_identity == entry.presentation_identity
+                && existing.payload_id == entry.payload_id
         }) && self.failed.len() < MAX_LIFECYCLE_RENDER_FALLBACK_ENTRIES
         {
             self.failed.push(entry);
@@ -417,6 +435,7 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
             },
             lamp.presentation_identity.transaction_id().get(),
             lamp.presentation_identity.revision_id().get(),
+            lamp.payload_id.get(),
             lamp.visual_group.canonical_client_rect.x().to_bits(),
             lamp.visual_group.canonical_client_rect.y().to_bits(),
             lamp.visual_group.canonical_client_rect.width().to_bits(),
@@ -480,24 +499,20 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
     signature
 }
 
-#[derive(Debug, Clone)]
-struct LifecycleTransition {
-    window_id: WindowId,
-    root_surface_id: u32,
+#[derive(Debug, Clone, Copy)]
+struct LifecycleMotionState {
     presentation_identity: PresentationRetainedVisualIdentity,
-    visual_group: LifecycleVisualGroup,
     direction: LifecycleDirection,
     start_progress: f64,
     target_progress: f64,
     started_at: AnimationTime,
     duration_nanos: u64,
-    resolved_effect_scene: Arc<ResolvedEffectScene>,
 }
 
 #[derive(Debug)]
 pub struct WindowLifecycleAnimator {
     enabled: bool,
-    transitions: BTreeMap<PresentationRetainedVisualIdentity, LifecycleTransition>,
+    transitions: BTreeMap<PresentationRetainedVisualIdentity, LifecycleMotionState>,
     #[cfg(test)]
     fail_next_start: bool,
 }
@@ -544,7 +559,7 @@ impl WindowLifecycleAnimator {
 
     pub fn start_or_reverse(
         &mut self,
-        request: LifecycleTransitionRequest,
+        request: LifecycleMotionRequest,
         previous_identity: Option<PresentationRetainedVisualIdentity>,
         now: AnimationTime,
         speed: f64,
@@ -553,13 +568,9 @@ impl WindowLifecycleAnimator {
         if std::mem::take(&mut self.fail_next_start) {
             return None;
         }
-        let LifecycleTransitionRequest {
+        let LifecycleMotionRequest {
             presentation_identity,
-            window_id,
-            root_surface_id,
-            visual_group,
             direction,
-            resolved_effect_scene,
         } = request;
         if presentation_identity.kind()
             != crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle
@@ -573,7 +584,7 @@ impl WindowLifecycleAnimator {
             {
                 return None;
             }
-            Some(self.transitions.get(&previous_identity)?.clone())
+            Some(*self.transitions.get(&previous_identity)?)
         } else {
             None
         };
@@ -584,35 +595,16 @@ impl WindowLifecycleAnimator {
                 LifecycleDirection::Minimize => 0.0,
                 LifecycleDirection::Restore => 1.0,
             });
-        let visual_group = previous
-            .as_ref()
-            .map(|transition| transition.visual_group)
-            .unwrap_or(visual_group);
-        if !valid_visual_group(visual_group) {
-            return None;
-        }
-        let resolved_effect_scene = previous
-            .as_ref()
-            .map(|transition| Arc::clone(&transition.resolved_effect_scene))
-            .unwrap_or_else(|| Arc::new(resolved_effect_scene));
-        let root_surface_id = previous
-            .as_ref()
-            .map(|transition| transition.root_surface_id)
-            .unwrap_or(root_surface_id);
         let base_duration_nanos = effective_duration_nanos(speed);
         let remaining = (direction.target_progress() - start_progress).abs();
         let duration_nanos = (base_duration_nanos as f64 * remaining).round() as u64;
-        let transition = LifecycleTransition {
-            window_id,
-            root_surface_id,
+        let transition = LifecycleMotionState {
             presentation_identity,
-            visual_group,
             direction,
             start_progress,
             target_progress: direction.target_progress(),
             started_at: now,
             duration_nanos,
-            resolved_effect_scene,
         };
         if let Some(previous_identity) = previous_identity {
             self.transitions.remove(&previous_identity);
@@ -635,25 +627,21 @@ impl WindowLifecycleAnimator {
     pub(crate) fn cancel_scene_executions(
         &mut self,
         scene_node_id: crate::core::SceneNodeId,
-    ) -> Vec<(PresentationRetainedVisualIdentity, u32)> {
+    ) -> Vec<PresentationRetainedVisualIdentity> {
         let identities = self
             .transitions
-            .iter()
-            .filter(|(identity, _)| identity.scene_node_id() == scene_node_id)
-            .map(|(identity, transition)| (*identity, transition.root_surface_id))
+            .keys()
+            .filter(|identity| identity.scene_node_id() == scene_node_id)
+            .copied()
             .collect::<Vec<_>>();
-        for (identity, _) in &identities {
+        for identity in &identities {
             self.transitions.remove(identity);
         }
         identities
     }
 
     pub fn cancel_all(&mut self) -> Vec<PresentationRetainedVisualIdentity> {
-        let identities = self
-            .transitions
-            .values()
-            .map(|transition| transition.presentation_identity)
-            .collect();
+        let identities = self.transitions.keys().copied().collect();
         self.transitions.clear();
         identities
     }
@@ -662,49 +650,10 @@ impl WindowLifecycleAnimator {
         &self,
         presentation_identity: PresentationRetainedVisualIdentity,
         now: AnimationTime,
-    ) -> Option<LampWindowSample> {
+    ) -> Option<LifecycleMotionSample> {
         self.transitions
             .get(&presentation_identity)
-            .cloned()
             .map(|transition| sample_transition(transition, now))
-    }
-
-    pub fn visual_group(
-        &self,
-        presentation_identity: PresentationRetainedVisualIdentity,
-    ) -> Option<LifecycleVisualGroup> {
-        self.transitions
-            .get(&presentation_identity)
-            .map(|transition| transition.visual_group)
-    }
-
-    pub fn sample_scene(
-        &self,
-        active_identities: &[PresentationRetainedVisualIdentity],
-        now: AnimationTime,
-    ) -> LifecycleSceneSample {
-        let transitions = active_identities
-            .iter()
-            .filter_map(|identity| self.transitions.get(identity).cloned())
-            .collect::<Vec<_>>();
-        LifecycleSceneSample {
-            sampled_at: now,
-            lamps: transitions
-                .iter()
-                .cloned()
-                .map(|transition| sample_transition(transition, now))
-                .collect(),
-            visual_sources: transitions
-                .iter()
-                .map(|transition| LifecycleVisualSource {
-                    window_id: transition.window_id,
-                    root_surface_id: transition.root_surface_id,
-                    presentation_identity: transition.presentation_identity,
-                    kind: lifecycle_visual_source_kind(&transition.resolved_effect_scene),
-                    effect_scene: Arc::clone(&transition.resolved_effect_scene),
-                })
-                .collect(),
-        }
     }
 
     pub fn acknowledge(
@@ -770,13 +719,13 @@ impl WindowLifecycleAnimator {
     }
 }
 
-fn sample_transition(transition: LifecycleTransition, now: AnimationTime) -> LampWindowSample {
-    let progress = transition_progress(&transition, now);
-    LampWindowSample {
-        window_id: transition.window_id,
-        root_surface_id: transition.root_surface_id,
+fn sample_transition(
+    transition: &LifecycleMotionState,
+    now: AnimationTime,
+) -> LifecycleMotionSample {
+    let progress = transition_progress(transition, now);
+    LifecycleMotionSample {
         presentation_identity: transition.presentation_identity,
-        visual_group: transition.visual_group,
         progress,
         opacity: lamp_opacity(progress),
         direction: transition.direction,
@@ -784,7 +733,7 @@ fn sample_transition(transition: LifecycleTransition, now: AnimationTime) -> Lam
     }
 }
 
-fn transition_progress(transition: &LifecycleTransition, now: AnimationTime) -> f64 {
+fn transition_progress(transition: &LifecycleMotionState, now: AnimationTime) -> f64 {
     if transition.duration_nanos == 0 {
         return transition.target_progress;
     }
@@ -795,14 +744,6 @@ fn transition_progress(transition: &LifecycleTransition, now: AnimationTime) -> 
     (transition.start_progress
         + (transition.target_progress - transition.start_progress) * timeline)
         .clamp(0.0, 1.0)
-}
-
-fn lifecycle_visual_source_kind(scene: &ResolvedEffectScene) -> LifecycleVisualSourceKind {
-    if scene.is_empty() {
-        LifecycleVisualSourceKind::NoOwnedEffects
-    } else {
-        LifecycleVisualSourceKind::ResolvedOwnedEffects
-    }
 }
 
 fn effective_duration_nanos(speed: f64) -> u64 {
@@ -976,6 +917,10 @@ fn valid_visual_group(group: LifecycleVisualGroup) -> bool {
         && group.shape_factor >= 0.0
         && group.bump_distance.is_finite()
         && group.bump_distance >= 0.0
+}
+
+pub(crate) fn valid_lifecycle_visual_group(group: LifecycleVisualGroup) -> bool {
+    valid_visual_group(group)
 }
 
 fn infer_lamp_direction(

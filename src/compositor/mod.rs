@@ -365,6 +365,7 @@ use shm::{
 };
 use state::ActiveSurfacePresentationCommit;
 pub(crate) use state::OverrideRedirectStackSnapshotResult;
+pub use state::PresentationRetainedVisualPayloadId;
 pub use state::{
     AstreaShortcutPhase, CommitTimingClockMappingMetadata, CommitTimingClockSample,
     CommitTimingConstraint, CommitTimingPlanningCandidate, CommitTimingReadiness,
@@ -685,6 +686,7 @@ pub struct CompositorState {
     presentation_animation_policy: PresentationAnimationPolicy,
     pub(in crate::compositor) animation_control: crate::animation_control::AnimationControlState,
     window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
+    retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,
     lifecycle_animation_renderer_available: Option<bool>,
     lifecycle_render_suppressed_roots: HashSet<u32>,
     lifecycle_decorations: HashMap<u32, crate::compositor::DecorationRenderInstance>,

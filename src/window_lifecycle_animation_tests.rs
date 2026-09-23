@@ -32,7 +32,7 @@ fn request(
     source_rect: PresentationRect,
     anchor_rect: PresentationRect,
     direction: LifecycleDirection,
-) -> LifecycleTransitionRequest {
+) -> LifecycleMotionRequest {
     request_with_group(
         window_id,
         root_surface_id,
@@ -51,25 +51,19 @@ fn request(
 
 fn request_with_group(
     window_id: WindowId,
-    root_surface_id: u32,
-    visual_group: LifecycleVisualGroup,
+    _root_surface_id: u32,
+    _visual_group: LifecycleVisualGroup,
     direction: LifecycleDirection,
-) -> LifecycleTransitionRequest {
-    LifecycleTransitionRequest {
+) -> LifecycleMotionRequest {
+    LifecycleMotionRequest {
         presentation_identity: test_identity(window_id),
-        window_id,
-        root_surface_id,
-        visual_group,
         direction,
-        resolved_effect_scene: ResolvedEffectScene::default(),
     }
 }
 
 #[test]
 fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identity() {
-    let window_id = WindowId::from_raw(601).expect("window");
     let scene_node_id = SceneNodeId::from_raw(701).expect("scene node");
-    let root_surface_id = 801;
     let visual_group = LifecycleVisualGroup::from_bounds(
         rect(20.0, 30.0, 400.0, 300.0),
         rect(20.0, 30.0, 400.0, 300.0),
@@ -81,15 +75,10 @@ fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identi
     .expect("visual group");
     let first_identity = retained_identity(701, 901, 1001);
     let second_identity = retained_identity(701, 902, 1002);
-    let make_request =
-        |presentation_identity, direction, visual_group| LifecycleTransitionRequest {
-            presentation_identity,
-            window_id,
-            root_surface_id,
-            visual_group,
-            direction,
-            resolved_effect_scene: ResolvedEffectScene::default(),
-        };
+    let make_request = |presentation_identity, direction, _visual_group| LifecycleMotionRequest {
+        presentation_identity,
+        direction,
+    };
     let mut animator = WindowLifecycleAnimator::new(true);
     assert_eq!(
         animator.start_or_reverse(
@@ -128,29 +117,13 @@ fn reversal_keeps_scene_owner_and_visual_sample_but_replaces_presentation_identi
 
     assert_eq!(before.progress, after.progress);
     assert!((after.progress - 0.43).abs() < 1e-9);
-    assert_eq!(after.visual_group, visual_group);
+    assert_eq!(after.presentation_identity, second_identity);
     assert_eq!(second.scene_node_id(), scene_node_id);
     assert_ne!(first_identity.transaction_id(), second.transaction_id());
     assert_ne!(first_identity.revision_id(), second.revision_id());
     assert_eq!(after.presentation_identity, second);
     assert!(animator.acknowledge(first_identity, true).is_none());
     assert_eq!(animator.active_count(), 1);
-
-    let old_identity_sample = LampWindowSample {
-        presentation_identity: first_identity,
-        ..after
-    };
-    let first_frame = LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
-        sampled_at: reverse_at,
-        lamps: vec![old_identity_sample],
-        visual_sources: Vec::new(),
-    });
-    let second_frame = LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
-        sampled_at: reverse_at,
-        lamps: vec![after],
-        visual_sources: Vec::new(),
-    });
-    assert_ne!(first_frame.signature, second_frame.signature);
 }
 
 #[test]
@@ -176,18 +149,17 @@ fn sampling_uses_only_explicit_exact_owner_identities() {
             .sample(orphan, AnimationTime::from_nanos(10))
             .is_some()
     );
-    let empty = animator.sample_scene(&[], AnimationTime::from_nanos(10));
-    assert!(empty.lamps.is_empty());
-    assert!(empty.visual_sources.is_empty());
-    let active = animator.sample_scene(&[current], AnimationTime::from_nanos(10));
-    assert_eq!(active.lamps.len(), 1);
-    assert_eq!(active.lamps[0].presentation_identity, current);
-    assert_eq!(active.visual_sources.len(), 1);
-    assert_eq!(active.visual_sources[0].presentation_identity, current);
     assert!(
         animator
             .sample(current, AnimationTime::from_nanos(10))
             .is_some()
+    );
+    assert_eq!(
+        animator
+            .sample(current, AnimationTime::from_nanos(10))
+            .unwrap()
+            .presentation_identity,
+        current
     );
 }
 
@@ -501,7 +473,7 @@ fn presented_visual_group_reuses_canonical_to_presented_client_affine() {
 }
 
 #[test]
-fn active_transition_ignores_live_visual_mutations_on_reversal() {
+fn reversal_motion_sample_keeps_progress_and_uses_the_new_exact_identity() {
     let window = WindowId::from_raw(18).expect("valid window id");
     let first_group = LifecycleVisualGroup::from_bounds(
         rect(400.0, 100.0, 800.0, 600.0),
@@ -512,9 +484,8 @@ fn active_transition_ignores_live_visual_mutations_on_reversal() {
         1080,
     )
     .expect("valid visual group");
-    // These changed bounds model a relaid-out SSD/subsurface group and a
-    // newly reported Dock anchor while the first transition still owns
-    // physical presentation. The animator must ignore both snapshots.
+    // The request carries motion fields only; frozen bounds live in the
+    // compositor payload store and cannot be replaced by this executor.
     let changed_group = LifecycleVisualGroup::from_bounds(
         rect(400.0, 100.0, 800.0, 600.0),
         rect(384.0, 20.0, 832.0, 680.0),
@@ -549,15 +520,12 @@ fn active_transition_ignores_live_visual_mutations_on_reversal() {
         .expect("sample after reversal");
 
     assert_ne!(first, second);
-    assert_eq!(before.visual_group, after.visual_group);
-    assert_eq!(
-        before.visual_group.anchor_rect,
-        after.visual_group.anchor_rect
-    );
+    assert_eq!(before.progress, after.progress);
+    assert_eq!(after.presentation_identity, second);
 }
 
 #[test]
-fn settled_new_transition_captures_new_visual_bounds() {
+fn independent_motion_starts_from_its_direction_endpoint() {
     let window = WindowId::from_raw(19).expect("valid window id");
     let first_group = LifecycleVisualGroup::from_bounds(
         rect(400.0, 100.0, 800.0, 600.0),
@@ -599,7 +567,8 @@ fn settled_new_transition_captures_new_visual_bounds() {
     let sample = animator
         .sample(second, AnimationTime::from_nanos(300_000_000))
         .expect("new transition sample");
-    assert_eq!(sample.visual_group.canonical_visual_rect.y(), 20.0);
+    assert_eq!(sample.progress, 0.0);
+    assert_eq!(sample.presentation_identity, second);
 }
 
 #[test]
@@ -614,12 +583,16 @@ fn lifecycle_snapshot_signature_includes_sink_geometry() {
         1080,
     )
     .expect("valid visual group");
+    let presentation_identity = test_identity(window_id);
     let sample = LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(1),
         lamps: vec![LampWindowSample {
             window_id,
             root_surface_id: 20,
-            presentation_identity: test_identity(window_id),
+            presentation_identity,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                presentation_identity,
+            ),
             visual_group,
             progress: 0.5,
             opacity: 1.0,
@@ -639,6 +612,48 @@ fn lifecycle_snapshot_signature_includes_sink_geometry() {
     .expect("valid changed sink rectangle");
     snapshot.refresh_signature();
     assert_ne!(snapshot.signature, original_signature);
+}
+
+#[test]
+fn lifecycle_snapshot_signature_includes_payload_identity() {
+    let window_id = WindowId::from_raw(21).expect("valid window id");
+    let presentation_identity = test_identity(window_id);
+    let mut sample = LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(1),
+        lamps: vec![LampWindowSample {
+            window_id,
+            root_surface_id: 21,
+            presentation_identity,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                presentation_identity,
+            ),
+            visual_group: LifecycleVisualGroup::from_bounds(
+                rect(400.0, 100.0, 800.0, 600.0),
+                rect(384.0, 60.0, 832.0, 640.0),
+                rect(400.0, 100.0, 800.0, 600.0),
+                rect(900.0, 900.0, 64.0, 64.0),
+                1920,
+                1080,
+            )
+            .expect("valid visual group"),
+            progress: 0.5,
+            opacity: 1.0,
+            direction: LifecycleDirection::Minimize,
+            mathematically_settled: false,
+        }],
+        visual_sources: Vec::new(),
+    };
+    let original = LifecycleFrameSnapshot::from_sample(&sample);
+    let other_payload_owner = test_identity(window_id);
+    sample.lamps[0].payload_id =
+        PresentationRetainedVisualPayloadId::from_origin_identity(other_payload_owner);
+    let changed = LifecycleFrameSnapshot::from_sample(&sample);
+    assert_eq!(
+        original.lamps[0].presentation_identity,
+        changed.lamps[0].presentation_identity
+    );
+    assert_ne!(original.lamps[0].payload_id, changed.lamps[0].payload_id);
+    assert_ne!(original.signature, changed.signature);
 }
 
 #[test]
@@ -1264,8 +1279,10 @@ fn exact_endpoint_stays_owned_until_matching_ack() {
             1.0,
         )
         .expect("minimize starts");
-    let endpoint = animator.sample_scene(&[transition], AnimationTime::from_nanos(280_000_000));
-    assert!(endpoint.lamps[0].mathematically_settled);
+    let endpoint = animator
+        .sample(transition, AnimationTime::from_nanos(280_000_000))
+        .expect("motion endpoint");
+    assert!(endpoint.mathematically_settled);
     assert_eq!(animator.active_count(), 1);
     assert_eq!(animator.acknowledge(transition, true), Some(transition));
     assert_eq!(animator.active_count(), 0);
@@ -1292,8 +1309,6 @@ fn policy_endpoint_snap_preserves_exact_transition_ownership() {
         .expect("snapped transition remains active");
     assert_eq!(endpoint.presentation_identity, transition);
     assert_eq!(endpoint.progress, 1.0);
-    assert_eq!(endpoint.visual_group.presented_source_client_rect, source);
-    assert_eq!(endpoint.visual_group.anchor_rect, anchor);
     assert!(endpoint.mathematically_settled);
     assert_eq!(animator.active_count(), 1);
     assert_eq!(animator.acknowledge(transition, true), Some(transition));
@@ -1355,11 +1370,52 @@ fn render_evidence_qualifies_only_consumed_transition_identities() {
         800,
         600,
     ));
-    let sample = animator.sample_scene(&[first, second], AnimationTime::from_nanos(100_000_000));
+    let first_group = LifecycleVisualGroup::from_bounds(source, source, source, anchor, 800, 600)
+        .expect("first visual group");
+    let second_group = LifecycleVisualGroup::from_bounds(
+        second_source,
+        second_source,
+        second_source,
+        second_anchor,
+        800,
+        600,
+    )
+    .expect("second visual group");
+    let first_payload = PresentationRetainedVisualPayloadId::from_origin_identity(first);
+    let second_payload = PresentationRetainedVisualPayloadId::from_origin_identity(second);
+    let sample = LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(100_000_000),
+        lamps: vec![
+            LampWindowSample {
+                window_id: first_window,
+                root_surface_id: 15,
+                presentation_identity: first,
+                payload_id: first_payload,
+                visual_group: first_group,
+                progress: 0.0,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            },
+            LampWindowSample {
+                window_id: second_window,
+                root_surface_id: 16,
+                presentation_identity: second,
+                payload_id: second_payload,
+                visual_group: second_group,
+                progress: 0.0,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            },
+        ],
+        visual_sources: Vec::new(),
+    };
     let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
         window_id: first_window,
         root_surface_id: 15,
         presentation_identity: first,
+        payload_id: first_payload,
     }]);
     let qualified = LifecycleFrameSnapshot::qualified_from_sample(&sample, &evidence);
     assert_eq!(qualified.lamps.len(), 1);
@@ -1390,6 +1446,7 @@ fn stale_render_evidence_does_not_qualify_a_reversed_identity() {
             window_id,
             root_surface_id,
             presentation_identity: current_identity,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(current_identity),
             visual_group,
             progress: 0.43,
             opacity: lamp_opacity(0.43),
@@ -1400,6 +1457,7 @@ fn stale_render_evidence_does_not_qualify_a_reversed_identity() {
             window_id,
             root_surface_id,
             presentation_identity: current_identity,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(current_identity),
             kind: LifecycleVisualSourceKind::NoOwnedEffects,
             effect_scene: Arc::new(ResolvedEffectScene::default()),
         }],
@@ -1409,6 +1467,7 @@ fn stale_render_evidence_does_not_qualify_a_reversed_identity() {
         window_id,
         root_surface_id,
         presentation_identity: old_identity,
+        payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(old_identity),
     }]);
 
     let qualified = LifecycleFrameSnapshot::qualified_from_sample(&sample, &old_evidence);
@@ -1420,6 +1479,80 @@ fn stale_render_evidence_does_not_qualify_a_reversed_identity() {
             .visual_source_for_identity(current_identity)
             .is_some()
     );
+}
+
+#[test]
+fn render_evidence_with_wrong_payload_does_not_qualify_exact_owner() {
+    let window_id = WindowId::from_raw(603).expect("valid window id");
+    let identity = retained_identity(703, 903, 1003);
+    let payload_id = PresentationRetainedVisualPayloadId::from_origin_identity(identity);
+    let sample = LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(10),
+        lamps: vec![LampWindowSample {
+            window_id,
+            root_surface_id: 803,
+            presentation_identity: identity,
+            payload_id,
+            visual_group: LifecycleVisualGroup::from_bounds(
+                rect(20.0, 30.0, 400.0, 300.0),
+                rect(20.0, 30.0, 400.0, 300.0),
+                rect(20.0, 30.0, 400.0, 300.0),
+                rect(700.0, 500.0, 40.0, 40.0),
+                1920,
+                1080,
+            )
+            .expect("visual group"),
+            progress: 0.43,
+            opacity: lamp_opacity(0.43),
+            direction: LifecycleDirection::Restore,
+            mathematically_settled: false,
+        }],
+        visual_sources: Vec::new(),
+    };
+    let wrong_payload = PresentationRetainedVisualPayloadId::from_origin_identity(
+        retained_identity(703, 904, 1004),
+    );
+    let wrong_evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+        window_id,
+        root_surface_id: 803,
+        presentation_identity: identity,
+        payload_id: wrong_payload,
+    }]);
+    assert!(LifecycleFrameSnapshot::qualified_from_sample(&sample, &wrong_evidence).is_empty());
+
+    let exact_evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+        window_id,
+        root_surface_id: 803,
+        presentation_identity: identity,
+        payload_id,
+    }]);
+    assert_eq!(
+        LifecycleFrameSnapshot::qualified_from_sample(&sample, &exact_evidence)
+            .lamps
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn fallback_deduplication_preserves_payload_identity() {
+    let window_id = WindowId::from_raw(604).expect("valid window id");
+    let identity = retained_identity(704, 904, 1004);
+    let payload_id = PresentationRetainedVisualPayloadId::from_origin_identity(identity);
+    let other_payload_id = PresentationRetainedVisualPayloadId::from_origin_identity(
+        retained_identity(704, 905, 1005),
+    );
+    let mut fallbacks = LifecycleRenderFallbacks::default();
+    for payload_id in [payload_id, other_payload_id] {
+        fallbacks.record(LifecycleRenderFallbackEntry {
+            window_id,
+            root_surface_id: 804,
+            presentation_identity: identity,
+            payload_id,
+            reason: LifecycleRenderFallbackReason::LifecycleResourceUnavailable,
+        });
+    }
+    assert_eq!(fallbacks.failed.len(), 2);
 }
 
 #[test]
@@ -1464,16 +1597,12 @@ fn backing_replacement_does_not_rewrite_a_frozen_transition_adapter() {
         )
         .expect("reversed transition");
 
-    let sample = animator.sample_scene(&[new_identity], AnimationTime::from_nanos(100_000_000));
+    let sample = animator
+        .sample(new_identity, AnimationTime::from_nanos(100_000_000))
+        .expect("reversed motion sample");
     assert_eq!(old_identity.scene_node_id(), new_identity.scene_node_id());
     assert_ne!(old_identity, new_identity);
-    assert_eq!(sample.lamps[0].root_surface_id, old_root_surface_id);
-    assert_eq!(sample.lamps[0].presentation_identity, new_identity);
-    assert_eq!(
-        sample.visual_sources[0].root_surface_id,
-        old_root_surface_id
-    );
-    assert_eq!(sample.visual_sources[0].presentation_identity, new_identity);
+    assert_eq!(sample.presentation_identity, new_identity);
 }
 
 #[test]
@@ -1514,7 +1643,7 @@ fn no_visual_change_settlement_is_separate_from_physical_ack() {
 }
 
 #[test]
-fn reversal_keeps_the_original_anchor_frozen() {
+fn reversal_preserves_exact_motion_progress() {
     let window = WindowId::from_raw(11).expect("valid window id");
     let source = rect(20.0, 20.0, 400.0, 300.0);
     let first_anchor = rect(900.0, 700.0, 48.0, 48.0);
@@ -1534,6 +1663,9 @@ fn reversal_keeps_the_original_anchor_frozen() {
             1.0,
         )
         .expect("first transition starts");
+    let before = animator
+        .sample(first, AnimationTime::from_nanos(100_000_000))
+        .expect("motion before reversal");
     let second = animator
         .start_or_reverse(
             request(
@@ -1548,14 +1680,11 @@ fn reversal_keeps_the_original_anchor_frozen() {
             1.0,
         )
         .expect("reverse transition starts");
-    assert_eq!(
-        animator
-            .sample(second, AnimationTime::from_nanos(100_000_000))
-            .expect("reversed sample")
-            .visual_group
-            .anchor_rect,
-        first_anchor
-    );
+    let reversed = animator
+        .sample(second, AnimationTime::from_nanos(100_000_000))
+        .expect("reversed motion sample");
+    assert_eq!(reversed.presentation_identity, second);
+    assert_eq!(reversed.progress, before.progress);
 }
 
 #[test]

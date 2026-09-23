@@ -1284,15 +1284,35 @@ impl CompositorState {
         else {
             return false;
         };
-        let presented_source_client_rect = self.lifecycle_minimize_source_rect(root_surface_id);
-        let canonical_client_rect = self.lifecycle_window_rect(root_surface_id);
-        let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
-        let lifecycle_effect_scene = match (presented_source_client_rect, canonical_client_rect) {
-            (Some(source), Some(full_window)) => {
-                Self::map_effect_scene_to_presentation(&lifecycle_effect_scene, full_window, source)
-            }
-            _ => lifecycle_effect_scene,
-        };
+        let lifecycle_scene_node_id = self.scene_node_id_for_window_group(window_id);
+        let has_active_lifecycle = lifecycle_scene_node_id
+            .and_then(|scene_node_id| {
+                self.presentation_animator.active_retained_visual(
+                    scene_node_id,
+                    crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
+                )
+            })
+            .is_some();
+        let (presented_source_client_rect, canonical_client_rect, lifecycle_effect_scene) =
+            if has_active_lifecycle {
+                (None, None, ResolvedEffectScene::default())
+            } else {
+                let presented_source_client_rect =
+                    self.lifecycle_minimize_source_rect(root_surface_id);
+                let canonical_client_rect = self.lifecycle_window_rect(root_surface_id);
+                let effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
+                let effect_scene = match (presented_source_client_rect, canonical_client_rect) {
+                    (Some(source), Some(full_window)) => {
+                        Self::map_effect_scene_to_presentation(&effect_scene, full_window, source)
+                    }
+                    _ => effect_scene,
+                };
+                (
+                    presented_source_client_rect,
+                    canonical_client_rect,
+                    effect_scene,
+                )
+            };
         let scene_effect = self.window_is_visible_in_active_scene(window_id);
         let tiled_location = self
             .window(window_id)
@@ -1345,14 +1365,16 @@ impl CompositorState {
         // Capture only the compositor-owned SSD plan while the minimized
         // window still has its pre-focus-change visual state. Client and
         // subsurface content remains live in the retained surface list.
-        let lifecycle_decorations = if self.lifecycle_effect(LifecycleDirection::Minimize)
-            == AnimationEffect::MinimizeLamp
+        let lifecycle_decorations = if !has_active_lifecycle
+            && self.lifecycle_effect(LifecycleDirection::Minimize) == AnimationEffect::MinimizeLamp
         {
             self.native_decoration_render_instances_for_scale(&minimized_surfaces, 1.0)
         } else {
             Vec::new()
         };
-        let lifecycle_visual_group = if self.lifecycle_effect(LifecycleDirection::Minimize)
+        let lifecycle_visual_group = if has_active_lifecycle {
+            None
+        } else if self.lifecycle_effect(LifecycleDirection::Minimize)
             == AnimationEffect::MinimizeLamp
         {
             presented_source_client_rect
@@ -1512,10 +1534,22 @@ impl CompositorState {
         if layout_batch {
             let _ = self.finish_layout_reflow_batch();
         }
-        let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
         let lifecycle_scene_node_id = self.scene_node_id_for_window_group(window_id);
-        let lifecycle_decorations = if self.lifecycle_effect(LifecycleDirection::Restore)
-            == AnimationEffect::MinimizeLamp
+        let has_active_lifecycle = lifecycle_scene_node_id
+            .and_then(|scene_node_id| {
+                self.presentation_animator.active_retained_visual(
+                    scene_node_id,
+                    crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
+                )
+            })
+            .is_some();
+        let lifecycle_effect_scene = if has_active_lifecycle {
+            ResolvedEffectScene::default()
+        } else {
+            self.resolved_effect_scene_for_lifecycle_root(root_surface_id)
+        };
+        let lifecycle_decorations = if !has_active_lifecycle
+            && self.lifecycle_effect(LifecycleDirection::Restore) == AnimationEffect::MinimizeLamp
             && lifecycle_scene_node_id
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
                 .is_none()
@@ -1524,58 +1558,55 @@ impl CompositorState {
         } else {
             Vec::new()
         };
-        let lifecycle_visual_group = self
-            .scene_node_id_for_window_group(window_id)
-            .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
-            .or_else(|| {
-                self.lifecycle_window_rect(root_surface_id)
-                    .zip(self.lifecycle_anchor_rect(window_id))
-                    .and_then(|(canonical_client, anchor)| {
-                        let owned_bounds = self
-                            .renderable_surfaces
-                            .iter()
-                            .filter(|surface| {
-                                root_surface_id_for_surface_in_placements(
-                                    &self.surface_placements,
-                                    surface.surface_id,
-                                ) == root_surface_id
-                            })
-                            .filter_map(|surface| {
-                                PresentationRect::new(
-                                    f64::from(surface.x),
-                                    f64::from(surface.y),
-                                    f64::from(surface.width),
-                                    f64::from(surface.height),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        let decoration_bounds = lifecycle_decorations
-                            .iter()
-                            .find(|decoration| decoration.root_surface_id() == root_surface_id)
-                            .and_then(|decoration| {
-                                let (x, y, width, height) = decoration.scene_snapshot().bounds();
-                                PresentationRect::new(
-                                    f64::from(x),
-                                    f64::from(y),
-                                    f64::from(width),
-                                    f64::from(height),
-                                )
-                            });
-                        let visual = canonical_visual_rect(
-                            canonical_client,
-                            owned_bounds,
-                            decoration_bounds,
-                        )?;
-                        LifecycleVisualGroup::from_bounds(
-                            canonical_client,
-                            visual,
-                            canonical_client,
-                            anchor,
-                            self.output_size.width,
-                            self.output_size.height,
-                        )
-                    })
-            });
+        let lifecycle_visual_group = if has_active_lifecycle {
+            lifecycle_scene_node_id
+                .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
+        } else {
+            self.lifecycle_window_rect(root_surface_id)
+                .zip(self.lifecycle_anchor_rect(window_id))
+                .and_then(|(canonical_client, anchor)| {
+                    let owned_bounds = self
+                        .renderable_surfaces
+                        .iter()
+                        .filter(|surface| {
+                            root_surface_id_for_surface_in_placements(
+                                &self.surface_placements,
+                                surface.surface_id,
+                            ) == root_surface_id
+                        })
+                        .filter_map(|surface| {
+                            PresentationRect::new(
+                                f64::from(surface.x),
+                                f64::from(surface.y),
+                                f64::from(surface.width),
+                                f64::from(surface.height),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let decoration_bounds = lifecycle_decorations
+                        .iter()
+                        .find(|decoration| decoration.root_surface_id() == root_surface_id)
+                        .and_then(|decoration| {
+                            let (x, y, width, height) = decoration.scene_snapshot().bounds();
+                            PresentationRect::new(
+                                f64::from(x),
+                                f64::from(y),
+                                f64::from(width),
+                                f64::from(height),
+                            )
+                        });
+                    let visual =
+                        canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
+                    LifecycleVisualGroup::from_bounds(
+                        canonical_client,
+                        visual,
+                        canonical_client,
+                        anchor,
+                        self.output_size.width,
+                        self.output_size.height,
+                    )
+                })
+        };
         self.begin_lifecycle_restore(
             window_id,
             root_surface_id,

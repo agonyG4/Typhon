@@ -1,5 +1,6 @@
 use super::*;
 use crate::compositor::DecorationRenderInstance;
+use crate::compositor::PresentationRetainedVisualPayloadId;
 use crate::compositor::decoration::types::DecorationPreference;
 use crate::presentation_animation::{
     PresentationRetainedVisualIdentity, PresentationRetainedVisualKind,
@@ -7,9 +8,9 @@ use crate::presentation_animation::{
 };
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use crate::window_lifecycle_animation::{
-    LampWindowSample, LifecycleFrameSnapshot, LifecycleRenderEvidence,
+    LampWindowSample, LifecycleFrameSnapshot, LifecycleMotionRequest, LifecycleRenderEvidence,
     LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
-    LifecycleTransitionRequest, LifecycleVisualGroup,
+    LifecycleVisualGroup,
 };
 
 fn lifecycle_decoration(
@@ -110,6 +111,10 @@ fn settle_lifecycle_transition(state: &mut CompositorState, window_id: WindowId)
         .window_lifecycle_animator
         .sample(identity, now)
         .expect("active lifecycle transition");
+    let payload = state
+        .retained_lifecycle_payloads
+        .get_exact(identity)
+        .expect("active retained lifecycle payload");
     assert!(
         state
             .window_lifecycle_animator
@@ -118,8 +123,9 @@ fn settle_lifecycle_transition(state: &mut CompositorState, window_id: WindowId)
     let sample = state.lifecycle_scene_sample_at(now);
     let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
         window_id,
-        root_surface_id: active.root_surface_id,
+        root_surface_id: payload.root_surface_id,
         presentation_identity: active.presentation_identity,
+        payload_id: payload.payload_id,
     }]);
     let snapshot = LifecycleFrameSnapshot::qualified_from_sample(&sample, &evidence);
     state.publish_presented_lifecycle(1, &snapshot);
@@ -140,12 +146,13 @@ fn active_lifecycle_identity(
 
 fn lifecycle_request(
     presentation_engine: &mut crate::presentation_animation::PresentationEngine,
+    payload_store: &mut super::super::lifecycle_retained::RetainedLifecyclePayloadStore,
     window_id: WindowId,
     root_surface_id: u32,
     source_rect: PresentationRect,
     anchor_rect: PresentationRect,
     direction: LifecycleDirection,
-) -> LifecycleTransitionRequest {
+) -> LifecycleMotionRequest {
     let visual_group = LifecycleVisualGroup::from_bounds(
         source_rect,
         source_rect,
@@ -157,6 +164,7 @@ fn lifecycle_request(
     .expect("valid test visual group");
     lifecycle_request_with_group(
         presentation_engine,
+        payload_store,
         window_id,
         root_surface_id,
         visual_group,
@@ -166,13 +174,18 @@ fn lifecycle_request(
 
 fn lifecycle_request_with_group(
     presentation_engine: &mut crate::presentation_animation::PresentationEngine,
+    payload_store: &mut super::super::lifecycle_retained::RetainedLifecyclePayloadStore,
     window_id: WindowId,
-    root_surface_id: u32,
-    visual_group: LifecycleVisualGroup,
+    _root_surface_id: u32,
+    _visual_group: LifecycleVisualGroup,
     direction: LifecycleDirection,
-) -> LifecycleTransitionRequest {
+) -> LifecycleMotionRequest {
     let scene_node_id =
         crate::core::SceneNodeId::from_raw(window_id.get()).expect("test SceneNodeId");
+    let previous_identity = presentation_engine.active_retained_visual(
+        scene_node_id,
+        PresentationRetainedVisualKind::WindowLifecycle,
+    );
     let presentation_identity = presentation_engine
         .begin_retained_visual(
             scene_node_id,
@@ -180,16 +193,31 @@ fn lifecycle_request_with_group(
             AnimationTime::from_nanos(0),
         )
         .expect("test retained identity");
-    presentation_engine
+    let activated_previous = presentation_engine
         .activate_retained_visual_exact(presentation_identity)
         .expect("activate test lifecycle owner");
-    LifecycleTransitionRequest {
+    assert_eq!(activated_previous, previous_identity);
+    if let Some(previous_identity) = previous_identity {
+        let payload = std::sync::Arc::clone(
+            payload_store
+                .get_exact(previous_identity)
+                .expect("reversal keeps its exact retained payload"),
+        );
+        assert!(payload_store.transfer_exact(previous_identity, presentation_identity, &payload));
+    } else {
+        let payload = super::super::lifecycle_retained::RetainedLifecyclePayload::capture(
+            presentation_identity,
+            window_id,
+            _root_surface_id,
+            _visual_group,
+            ResolvedEffectScene::default(),
+        )
+        .expect("valid test lifecycle payload");
+        assert!(payload_store.publish_exact(presentation_identity, payload));
+    }
+    LifecycleMotionRequest {
         presentation_identity,
-        window_id,
-        root_surface_id,
-        visual_group,
         direction,
-        resolved_effect_scene: ResolvedEffectScene::default(),
     }
 }
 
@@ -220,10 +248,16 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
         Some(source),
         Some(source),
         Some(visual_group),
-        ResolvedEffectScene::default(),
+        ResolvedEffectScene::new(38, Vec::new()),
         Vec::new(),
     );
     let identity = active_lifecycle_identity(&state, scene_node_id);
+    let frozen_payload = std::sync::Arc::clone(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(identity)
+            .expect("fresh retained payload"),
+    );
     assert_eq!(identity.scene_node_id(), scene_node_id);
     assert_eq!(
         identity.kind(),
@@ -256,15 +290,52 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
             .root_surface_id,
         root_b
     );
+    let replacement_group = LifecycleVisualGroup::from_bounds(
+        rect(800.0, 500.0, 400.0, 300.0),
+        rect(790.0, 480.0, 420.0, 330.0),
+        rect(800.0, 500.0, 400.0, 300.0),
+        rect(40.0, 40.0, 32.0, 32.0),
+        1920,
+        1080,
+    )
+    .expect("replacement live visual group");
+    state.begin_lifecycle_restore(
+        window_id,
+        root_b,
+        Some(replacement_group),
+        ResolvedEffectScene::new(39, Vec::new()),
+        Vec::new(),
+    );
+    let reversed_identity = active_lifecycle_identity(&state, scene_node_id);
+    let reversed_payload = state
+        .retained_lifecycle_payloads
+        .get_exact(reversed_identity)
+        .expect("reversal retains the frozen payload");
+    assert_ne!(reversed_identity, identity);
+    assert_eq!(reversed_payload.payload_id, frozen_payload.payload_id);
+    assert!(std::sync::Arc::ptr_eq(reversed_payload, &frozen_payload));
+    assert_eq!(reversed_payload.root_surface_id, root_a);
+    assert_eq!(reversed_payload.window_id, window_id);
+    assert!(std::sync::Arc::ptr_eq(
+        &reversed_payload.effect_scene,
+        &frozen_payload.effect_scene
+    ));
     let active = state
         .window_lifecycle_animator
         .sample(
-            identity,
+            reversed_identity,
             AnimationTime::monotonic_now().expect("monotonic time"),
         )
         .expect("frozen lifecycle transition remains active");
-    assert_eq!(active.presentation_identity, identity);
-    assert_eq!(active.root_surface_id, root_a);
+    assert_eq!(active.presentation_identity, reversed_identity);
+    assert_eq!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(reversed_identity)
+            .expect("frozen lifecycle payload")
+            .root_surface_id,
+        root_a
+    );
     assert_eq!(frozen.lamps[0].presentation_identity, identity);
     assert_eq!(frozen.lamps[0].root_surface_id, root_a);
     let current_sample = state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().unwrap());
@@ -273,12 +344,17 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
         &LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
             window_id,
             root_surface_id: root_a,
-            presentation_identity: identity,
+            presentation_identity: reversed_identity,
+            payload_id: state
+                .retained_lifecycle_payloads
+                .get_exact(reversed_identity)
+                .expect("frozen payload")
+                .payload_id,
         }]),
     );
     assert_eq!(qualified.lamps.len(), 1);
     assert_eq!(qualified.lamps[0].root_surface_id, root_a);
-    assert_eq!(qualified.lamps[0].presentation_identity, identity);
+    assert_eq!(qualified.lamps[0].presentation_identity, reversed_identity);
 
     state.lifecycle_render_suppressed_roots.insert(root_a);
     state.lifecycle_cancel_window(window_id);
@@ -286,7 +362,7 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     assert!(
         state
             .presentation_animator
-            .transaction_record(identity.transaction_id())
+            .transaction_record(reversed_identity.transaction_id())
             .is_none()
     );
 }
@@ -375,6 +451,7 @@ fn unconsumed_endpoint_pageflip_does_not_retire_lifecycle_transition() {
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 301,
                 source,
@@ -386,6 +463,18 @@ fn unconsumed_endpoint_pageflip_does_not_retire_lifecycle_transition() {
             1.0,
         )
         .expect("Lamp transition starts");
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(transition_id)
+            .is_some()
+    );
+    assert!(
+        state
+            .window_lifecycle_animator
+            .sample(transition_id, AnimationTime::from_nanos(0))
+            .is_some()
+    );
     let endpoint = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(280_000_000));
     assert_eq!(state.presentation_animator.transaction_count(), 1);
     assert_eq!(
@@ -403,10 +492,21 @@ fn unconsumed_endpoint_pageflip_does_not_retire_lifecycle_transition() {
         window_id,
         root_surface_id: 301,
         presentation_identity: transition_id,
+        payload_id: state
+            .retained_lifecycle_payloads
+            .get_exact(transition_id)
+            .expect("retained payload")
+            .payload_id,
     }]);
     let qualified = LifecycleFrameSnapshot::qualified_from_sample(&endpoint, &evidence);
     state.publish_presented_lifecycle(2, &qualified);
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(transition_id)
+            .is_none()
+    );
     assert_eq!(state.presentation_animator.transaction_count(), 0);
     assert_eq!(
         state.presentation_animator.active_retained_visual(
@@ -430,6 +530,7 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 302,
                 rect(300.0, 300.0, 100.0, 100.0),
@@ -481,6 +582,20 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
             AnimationTime::from_nanos(0),
         )
         .expect("ledger reservation");
+    let group = visual_group(rect(10.0, 10.0, 60.0, 60.0));
+    let payload = super::super::lifecycle_retained::RetainedLifecyclePayload::capture(
+        identity,
+        window_id,
+        312,
+        group,
+        ResolvedEffectScene::default(),
+    )
+    .expect("test payload");
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .publish_exact(identity, payload)
+    );
     let started_at = AnimationTime::monotonic_now().expect("monotonic clock");
     let sample_time = AnimationTime::from_nanos(started_at.as_nanos() + 100_000_000);
     assert!(
@@ -489,17 +604,12 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
             .transaction_record(identity.transaction_id())
             .is_some()
     );
-    let group = visual_group(rect(10.0, 10.0, 60.0, 60.0));
     state
         .window_lifecycle_animator
         .start_or_reverse(
-            LifecycleTransitionRequest {
+            LifecycleMotionRequest {
                 presentation_identity: identity,
-                window_id,
-                root_surface_id: 312,
-                visual_group: group,
                 direction: LifecycleDirection::Minimize,
-                resolved_effect_scene: ResolvedEffectScene::default(),
             },
             None,
             started_at,
@@ -593,7 +703,6 @@ fn animation_policy_reconciliation_does_not_snap_an_orphan_executor() {
             .as_nanos()
     ));
     std::fs::create_dir(&directory).expect("create animation configuration directory");
-    let window_id = WindowId::from_raw(313).expect("window id");
     let scene_node_id = crate::core::SceneNodeId::from_raw(913).expect("SceneNodeId");
     let now = AnimationTime::monotonic_now().expect("monotonic time");
     let mut state = CompositorState {
@@ -615,13 +724,9 @@ fn animation_policy_reconciliation_does_not_snap_an_orphan_executor() {
     state
         .window_lifecycle_animator
         .start_or_reverse(
-            LifecycleTransitionRequest {
+            LifecycleMotionRequest {
                 presentation_identity: identity,
-                window_id,
-                root_surface_id: 313,
-                visual_group: visual_group(rect(20.0, 20.0, 80.0, 80.0)),
                 direction: LifecycleDirection::Minimize,
-                resolved_effect_scene: ResolvedEffectScene::default(),
             },
             None,
             now,
@@ -669,6 +774,7 @@ fn exact_invisible_lamp_endpoint_can_settle_without_visual_change() {
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 309,
                 rect(10.0, 10.0, 60.0, 60.0),
@@ -689,6 +795,12 @@ fn exact_invisible_lamp_endpoint_can_settle_without_visual_change() {
     assert!(state.settle_lifecycle_no_visual_change());
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(transition_id)
+            .is_none()
+    );
     assert_eq!(state.presented_lifecycle_frame_id(), 0);
 }
 
@@ -705,6 +817,7 @@ fn old_visible_physical_lamp_prevents_no_visual_settlement() {
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 303,
                 rect(300.0, 300.0, 100.0, 100.0),
@@ -723,6 +836,9 @@ fn old_visible_physical_lamp_prevents_no_visual_settlement() {
             window_id,
             root_surface_id: 303,
             presentation_identity: historical_identity(window_id, 99),
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                historical_identity(window_id, 99),
+            ),
             visual_group: LifecycleVisualGroup::from_bounds(
                 rect(0.0, 0.0, 80.0, 80.0),
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -764,6 +880,7 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 root_surface_id,
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -781,6 +898,7 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
             window_id,
             root_surface_id,
             presentation_identity: transition_id,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(transition_id),
             visual_group: LifecycleVisualGroup::from_bounds(
                 rect(0.0, 0.0, 80.0, 80.0),
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -808,10 +926,17 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
             window_id,
             root_surface_id,
             presentation_identity: transition_id,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(transition_id),
             reason: LifecycleRenderFallbackReason::LampProgramUnavailable,
         })
     );
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(transition_id)
+            .is_none()
+    );
     assert_eq!(
         state.presentation_animator.active_retained_visual(
             transition_id.scene_node_id(),
@@ -856,6 +981,9 @@ fn canonical_presentation_replaces_old_physical_lamp_after_logical_cancel() {
             window_id,
             root_surface_id: 304,
             presentation_identity: historical_identity(window_id, 100),
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                historical_identity(window_id, 100),
+            ),
             visual_group: LifecycleVisualGroup::from_bounds(
                 rect(0.0, 0.0, 80.0, 80.0),
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -890,6 +1018,7 @@ fn rendered_replacement_clears_absent_physical_lamp_without_acknowledging_active
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 305,
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -940,6 +1069,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 306,
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -972,6 +1102,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
             window_id,
             root_surface_id: 306,
             presentation_identity: minimize_id,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(minimize_id),
         }]),
     );
     state.publish_presented_lifecycle(1, &minimize_frame);
@@ -982,6 +1113,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
         .start_or_reverse(
             lifecycle_request(
                 &mut state.presentation_animator,
+                &mut state.retained_lifecycle_payloads,
                 window_id,
                 306,
                 rect(0.0, 0.0, 80.0, 80.0),
@@ -1015,6 +1147,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
             window_id,
             root_surface_id: 306,
             presentation_identity: restore_id,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(restore_id),
         }]),
     );
     state.publish_presented_lifecycle(2, &restore_frame);
@@ -1033,6 +1166,7 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
     let mut request = |direction| {
         lifecycle_request(
             &mut state.presentation_animator,
+            &mut state.retained_lifecycle_payloads,
             window_id,
             307,
             rect(0.0, 0.0, 80.0, 80.0),
@@ -1059,6 +1193,15 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
         )
         .expect("restore reverses");
     assert_ne!(old_id, new_id);
+    let retained_payload = state
+        .retained_lifecycle_payloads
+        .get_exact(new_id)
+        .expect("reversal maps the old payload to the new owner")
+        .payload_id;
+    assert_eq!(
+        retained_payload,
+        PresentationRetainedVisualPayloadId::from_origin_identity(old_id)
+    );
     assert!(
         state
             .presentation_animator
@@ -1076,6 +1219,7 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
             window_id,
             root_surface_id: 307,
             presentation_identity: old_id,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(old_id),
             reason: LifecycleRenderFallbackReason::LampProgramUnavailable,
         })
     );
@@ -1092,6 +1236,34 @@ fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
             .expect("new transition survives")
             .presentation_identity,
         new_id
+    );
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(new_id)
+            .is_some_and(|payload| payload.payload_id == retained_payload)
+    );
+    assert!(
+        !state.apply_lifecycle_render_fallback(LifecycleRenderFallbackEntry {
+            window_id,
+            root_surface_id: 307,
+            presentation_identity: new_id,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(new_id),
+            reason: LifecycleRenderFallbackReason::LifecycleResourceUnavailable,
+        })
+    );
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            new_id.scene_node_id(),
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        Some(new_id)
+    );
+    assert!(
+        state
+            .window_lifecycle_animator
+            .sample(new_id, AnimationTime::from_nanos(100_000_000))
+            .is_some()
     );
 }
 
@@ -1115,6 +1287,12 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
         .scene_node_id_for_window_group(window_id)
         .expect("window group SceneNode");
     let old_identity = active_lifecycle_identity(&state, scene_node_id);
+    let old_payload = std::sync::Arc::clone(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .expect("previous payload"),
+    );
     let now = AnimationTime::monotonic_now().expect("test monotonic time");
     state
         .presentation_animator
@@ -1167,6 +1345,13 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
             .has_geometry_track(scene_node_id)
     );
     assert_eq!(state.presentation_animator.transaction_count(), 2);
+    assert!(std::sync::Arc::ptr_eq(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .expect("failed reversal leaves old payload mapped"),
+        &old_payload
+    ));
     assert!(
         state
             .presentation_animator
@@ -1294,6 +1479,12 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
             .transaction_record(cancelled_identity.transaction_id())
             .is_none()
     );
+    assert!(
+        cancelled
+            .retained_lifecycle_payloads
+            .get_exact(cancelled_identity)
+            .is_none()
+    );
 
     let (mut torn_down, teardown_window) = ssd_test_state(410);
     torn_down.lifecycle_animation_renderer_available = Some(true);
@@ -1321,6 +1512,12 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
         torn_down
             .presentation_animator
             .transaction_record(teardown_identity.transaction_id())
+            .is_none()
+    );
+    assert!(
+        torn_down
+            .retained_lifecycle_payloads
+            .get_exact(teardown_identity)
             .is_none()
     );
 
@@ -1355,13 +1552,9 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     unavailable
         .window_lifecycle_animator
         .start_or_reverse(
-            LifecycleTransitionRequest {
+            LifecycleMotionRequest {
                 presentation_identity: second_identity,
-                window_id: second_window,
-                root_surface_id: 412,
-                visual_group: visual_group(rect(300.0, 200.0, 80.0, 80.0)),
                 direction: LifecycleDirection::Minimize,
-                resolved_effect_scene: ResolvedEffectScene::default(),
             },
             None,
             second_started_at,
@@ -1402,8 +1595,20 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     );
     assert!(
         unavailable
+            .retained_lifecycle_payloads
+            .get_exact(unavailable_identity)
+            .is_none()
+    );
+    assert!(
+        unavailable
             .presentation_animator
             .transaction_record(second_identity.transaction_id())
+            .is_none()
+    );
+    assert!(
+        unavailable
+            .retained_lifecycle_payloads
+            .get_exact(second_identity)
             .is_none()
     );
     assert!(unavailable.lifecycle_render_suppressed_roots.is_empty());
@@ -1426,7 +1631,7 @@ fn fresh_restore_freezes_ssd_until_physical_settlement() {
         window_id,
         root_surface_id,
         Some(group),
-        ResolvedEffectScene::default(),
+        ResolvedEffectScene::new(41, Vec::new()),
         vec![decoration_a.clone()],
     );
 
@@ -1487,6 +1692,12 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
         .scene_node_id_for_window_group(window_id)
         .expect("window group SceneNode");
     let old_identity = active_lifecycle_identity(&state, scene_node_id);
+    let original_payload = std::sync::Arc::clone(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .expect("fresh immutable payload"),
+    );
     let before = state
         .window_lifecycle_animator
         .sample(
@@ -1501,7 +1712,7 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
         window_id,
         root_surface_id,
         Some(group_b),
-        ResolvedEffectScene::default(),
+        ResolvedEffectScene::new(42, Vec::new()),
         vec![decoration_b],
     );
     let new_identity = active_lifecycle_identity(&state, scene_node_id);
@@ -1518,7 +1729,19 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
     assert_ne!(new_identity.transaction_id(), old_identity.transaction_id());
     assert_ne!(new_identity.revision_id(), old_identity.revision_id());
     assert!((after.progress - before.progress).abs() < 0.01);
-    assert_eq!(after.visual_group, group_a);
+    let reversed_payload = state
+        .retained_lifecycle_payloads
+        .get_exact(new_identity)
+        .expect("reversed lifecycle payload");
+    assert_eq!(reversed_payload.payload_id, original_payload.payload_id);
+    assert!(std::sync::Arc::ptr_eq(reversed_payload, &original_payload));
+    assert_eq!(reversed_payload.visual_group, group_a);
+    assert_eq!(reversed_payload.root_surface_id, root_surface_id);
+    assert_eq!(reversed_payload.window_id, window_id);
+    assert!(std::sync::Arc::ptr_eq(
+        &reversed_payload.effect_scene,
+        &original_payload.effect_scene
+    ));
     assert!(
         state
             .presentation_animator
@@ -1551,6 +1774,94 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
 }
 
 #[test]
+fn missing_previous_payload_rejects_reversal_without_mutating_old_chain() {
+    let (mut state, window_id) = ssd_test_state(414);
+    state.lifecycle_animation_renderer_available = Some(true);
+    let root_surface_id = 414;
+    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+    state.begin_lifecycle_minimize(
+        window_id,
+        root_surface_id,
+        Some(rect(400.0, 100.0, 800.0, 600.0)),
+        Some(rect(400.0, 100.0, 800.0, 600.0)),
+        Some(group),
+        ResolvedEffectScene::new(414, Vec::new()),
+        vec![lifecycle_decoration(window_id, root_surface_id, 0x51)],
+    );
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group SceneNode");
+    let old_identity = active_lifecycle_identity(&state, scene_node_id);
+    let old_member = state
+        .presentation_animator
+        .transaction_record(old_identity.transaction_id())
+        .expect("old ledger member")
+        .members()[0];
+    let now = AnimationTime::monotonic_now().expect("monotonic test time");
+    let before = state
+        .window_lifecycle_animator
+        .sample(old_identity, now)
+        .expect("old motion state");
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .retire_exact(old_identity)
+            .is_some()
+    );
+    let sidecar_signature = state.lifecycle_decorations[&root_surface_id]
+        .scene_snapshot()
+        .visual_signature();
+    state
+        .lifecycle_render_suppressed_roots
+        .insert(root_surface_id);
+
+    state.begin_lifecycle_restore(
+        window_id,
+        root_surface_id,
+        Some(visual_group(rect(384.0, 20.0, 832.0, 680.0))),
+        ResolvedEffectScene::new(999, Vec::new()),
+        vec![lifecycle_decoration(window_id, root_surface_id, 0x52)],
+    );
+
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        Some(old_identity)
+    );
+    assert_eq!(
+        state.window_lifecycle_animator.sample(old_identity, now),
+        Some(before)
+    );
+    assert!(
+        state
+            .presentation_animator
+            .transaction_record(old_identity.transaction_id())
+            .is_some_and(|record| record.members()[0] == old_member)
+    );
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .is_none()
+    );
+    assert!(
+        state
+            .lifecycle_render_suppressed_roots
+            .contains(&root_surface_id)
+    );
+    assert_eq!(
+        state.lifecycle_decorations[&root_surface_id]
+            .scene_snapshot()
+            .visual_signature(),
+        sidecar_signature
+    );
+}
+
+#[test]
 fn later_independent_restore_replaces_settled_ssd_snapshot() {
     let (mut state, window_id) = ssd_test_state(403);
     state.lifecycle_animation_renderer_available = Some(true);
@@ -1566,8 +1877,25 @@ fn later_independent_restore_replaces_settled_ssd_snapshot() {
         ResolvedEffectScene::default(),
         vec![decoration_a],
     );
+    let old_identity = active_lifecycle_identity(
+        &state,
+        state
+            .scene_node_id_for_window_group(window_id)
+            .expect("window group SceneNode"),
+    );
+    let old_payload_id = state
+        .retained_lifecycle_payloads
+        .get_exact(old_identity)
+        .expect("first independent payload")
+        .payload_id;
     settle_lifecycle_transition(&mut state, window_id);
     assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .is_none()
+    );
 
     state.begin_lifecycle_restore(
         window_id,
@@ -1576,6 +1904,18 @@ fn later_independent_restore_replaces_settled_ssd_snapshot() {
         ResolvedEffectScene::default(),
         vec![decoration_b.clone()],
     );
+    let new_identity = active_lifecycle_identity(
+        &state,
+        state
+            .scene_node_id_for_window_group(window_id)
+            .expect("window group SceneNode"),
+    );
+    let new_payload_id = state
+        .retained_lifecycle_payloads
+        .get_exact(new_identity)
+        .expect("fresh independent payload")
+        .payload_id;
+    assert_ne!(old_payload_id, new_payload_id);
     assert_eq!(
         lifecycle_decoration_signature(
             &state,

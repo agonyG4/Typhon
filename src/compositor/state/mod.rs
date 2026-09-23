@@ -18,6 +18,7 @@ mod hit_testing;
 mod input_dispatch;
 mod input_resources;
 mod lifecycle_animation;
+pub(crate) mod lifecycle_retained;
 mod output_membership;
 mod output_state;
 mod override_redirect_stack;
@@ -59,6 +60,8 @@ mod xwayland_mode;
 mod xwayland_scene;
 mod xwayland_windows;
 
+pub use lifecycle_retained::PresentationRetainedVisualPayloadId;
+pub(crate) use lifecycle_retained::RetainedLifecyclePayloadStore;
 pub(crate) use override_redirect_stack::OverrideRedirectStackSnapshotResult;
 
 #[allow(unused_imports)]

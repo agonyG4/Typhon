@@ -1352,6 +1352,7 @@ impl OwnCompositorServer {
                     window_id: lamp.window_id,
                     root_surface_id: lamp.root_surface_id,
                     presentation_identity: lamp.presentation_identity,
+                    payload_id: lamp.payload_id,
                 }
             }),
         );

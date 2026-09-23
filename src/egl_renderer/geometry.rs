@@ -463,7 +463,7 @@ pub(super) enum EglDrawLayer {
     SolidRgba(u32),
     DecorationAsset(u64),
     Surface(u32),
-    LifecycleResolvedVisual(oblivion_one::compositor::WindowId),
+    LifecycleResolvedVisual(oblivion_one::compositor::PresentationRetainedVisualPayloadId),
     Cursor,
 }
 
@@ -519,7 +519,8 @@ pub(super) struct EglLampDrawCommand {
     pub(super) vertex_start: u32,
     pub(super) vertex_count: u32,
     pub(super) sampling: SurfaceSampling,
-    pub(super) window_id: oblivion_one::compositor::WindowId,
+    pub(super) presentation_identity:
+        oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
 }
 
 pub(super) fn push_draw_command(
