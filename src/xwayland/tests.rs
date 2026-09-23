@@ -92,6 +92,29 @@ fn off_bootstrap_is_disabled_without_lease_or_process() {
 }
 
 #[test]
+fn non_running_service_drops_proxy_snapshot_for_latest_state_resampling() {
+    let mut service = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests(
+        XwaylandMode::Off,
+        PathBuf::from("Xwayland"),
+    ))
+    .expect("bootstrap off mode");
+    let mut supervisor = ChildSupervisor::new();
+    let generation = super::XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = super::XwaylandProxySelectionSnapshot {
+        kind: super::XwaylandSelectionKind::Clipboard,
+        selection_generation: 7,
+        offer: None,
+    };
+
+    assert!(
+        !service
+            .submit_managed_proxy_selection_snapshots(generation, [snapshot], &mut supervisor)
+            .expect("non-running service drops metadata")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Disabled);
+}
+
+#[test]
 fn generation_allocator_returns_distinct_nonzero_values() {
     let root = test_root("generation");
     let mut service = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests_at_root(

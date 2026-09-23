@@ -133,6 +133,825 @@ const TEST_PRIMARY_ATOM: u32 = 1;
 const TEST_PRIMARY_OBSERVER_WINDOW: u32 = 0xa012;
 const TEST_PRIMARY_REQUESTOR_WINDOW: u32 = 0xa013;
 
+fn intern_atom_requests(bytes: &[u8]) -> Vec<(bool, String)> {
+    let mut requests = Vec::new();
+    let mut offset: usize = 0;
+    while offset.saturating_add(8) <= bytes.len() {
+        let length = usize::from(u16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]));
+        let request_bytes = length * 4;
+        assert!(request_bytes >= 8 && offset + request_bytes <= bytes.len());
+        if bytes[offset] == xproto::INTERN_ATOM_REQUEST {
+            let name_length =
+                usize::from(u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]));
+            let name = &bytes[offset + 8..offset + 8 + name_length];
+            requests.push((
+                bytes[offset + 1] != 0,
+                String::from_utf8(name.to_vec()).unwrap(),
+            ));
+        }
+        offset += request_bytes;
+    }
+    assert_eq!(offset, bytes.len(), "trailing bytes after X11 requests");
+    requests
+}
+
+fn raw_intern_atom_reply(sequence: u16, atom: u32) -> [u8; 32] {
+    let serialized = xproto::InternAtomReply {
+        sequence,
+        length: 0,
+        atom,
+    }
+    .serialize();
+    let mut reply = [0_u8; 32];
+    reply[..serialized.len()].copy_from_slice(&serialized);
+    reply
+}
+
+fn proxy_snapshot(
+    kind: crate::xwayland::XwaylandSelectionKind,
+    selection_generation: u64,
+    source_key: u64,
+    mime_types: &[&str],
+) -> crate::xwayland::XwaylandProxySelectionSnapshot {
+    use crate::xwayland::{
+        XwaylandProxySelectionId, XwaylandProxySelectionOffer, XwaylandProxySelectionSnapshot,
+    };
+
+    XwaylandProxySelectionSnapshot {
+        kind,
+        selection_generation,
+        offer: Some(XwaylandProxySelectionOffer {
+            id: XwaylandProxySelectionId {
+                kind,
+                selection_generation,
+                source_key: crate::compositor::SelectionSourceKey(source_key),
+            },
+            mime_types: mime_types.iter().map(|mime| (*mime).to_owned()).collect(),
+        }),
+    }
+}
+
+fn proxy_clear_snapshot(
+    kind: crate::xwayland::XwaylandSelectionKind,
+    selection_generation: u64,
+) -> crate::xwayland::XwaylandProxySelectionSnapshot {
+    crate::xwayland::XwaylandProxySelectionSnapshot {
+        kind,
+        selection_generation,
+        offer: None,
+    }
+}
+
+fn initialize_selection_wire(xwm: &mut super::super::Xwm, peer: &mut UnixStream) {
+    install_extension(
+        xwm,
+        xfixes::X11_EXTENSION_NAME,
+        201,
+        TEST_XFIXES_FIRST_EVENT,
+        151,
+    );
+    super::super::selection_wire::initialize(xwm).expect("initialize selection wire");
+    let _ = read_fixture_requests(peer);
+    for kind in [
+        super::super::data_bridge::SelectionKind::Clipboard,
+        super::super::data_bridge::SelectionKind::Primary,
+    ] {
+        let sequence = super::super::selection_wire::pending_sequence_for_test(xwm, kind, false)
+            .expect("initial owner probe");
+        peer.write_all(&raw_get_selection_owner_reply(sequence as u16, 0))
+            .expect("write serialized empty owner probe reply");
+    }
+    xwm.drain_events(32)
+        .expect("resolve initial owner probes before catalog fixture");
+    let _ = read_fixture_requests(peer);
+}
+
+fn finish_proxy_catalog(
+    xwm: &mut super::super::Xwm,
+    peer: &mut UnixStream,
+    id: crate::xwayland::XwaylandProxySelectionId,
+    mime_types: &[String],
+) {
+    use super::super::data_bridge::SelectionKind;
+    use super::super::selection_wire::prepared_proxy_selection_for_test;
+
+    let kind = match id.kind {
+        crate::xwayland::XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+        crate::xwayland::XwaylandSelectionKind::Primary => SelectionKind::Primary,
+    };
+    let mut complete = std::collections::HashSet::new();
+    while prepared_proxy_selection_for_test(xwm, kind).is_none() {
+        let mut progressed = false;
+        for (ordinal, mime_type) in mime_types.iter().enumerate() {
+            if complete.contains(mime_type) {
+                continue;
+            }
+            let Some(sequence) =
+                super::super::selection_wire::proxy_mime_atom_sequence_for_test(xwm, id, mime_type)
+            else {
+                continue;
+            };
+            let atom = 0xd200_u32.saturating_add(ordinal as u32);
+            peer.write_all(&raw_intern_atom_reply(sequence as u16, atom))
+                .expect("write serialized proxy InternAtom reply");
+            xwm.drain_events(32)
+                .expect("drain asynchronous proxy InternAtom reply");
+            complete.insert(mime_type.clone());
+            progressed = true;
+        }
+        assert!(progressed, "proxy catalog retains schedulable MIME work");
+    }
+}
+
+#[test]
+fn wayland_mime_is_interned_asynchronously_to_an_exact_x11_target() {
+    use crate::xwayland::{
+        XwaylandProxySelectionId, XwaylandProxySelectionOffer, XwaylandProxySelectionSnapshot,
+        XwaylandSelectionKind,
+    };
+
+    let (mut xwm, mut peer) = test_fixture(generation(201));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let id = XwaylandProxySelectionId {
+        kind: XwaylandSelectionKind::Clipboard,
+        selection_generation: 7,
+        source_key: crate::compositor::SelectionSourceKey(701),
+    };
+    let snapshot = XwaylandProxySelectionSnapshot {
+        kind: XwaylandSelectionKind::Clipboard,
+        selection_generation: 7,
+        offer: Some(XwaylandProxySelectionOffer {
+            id,
+            mime_types: vec!["image/png".to_owned()],
+        }),
+    };
+
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit current proxy snapshot");
+    let requests = read_fixture_requests(&mut peer);
+    assert_eq!(
+        intern_atom_requests(&requests),
+        [(false, "image/png".to_owned())]
+    );
+    assert!(
+        fixture_request_opcodes(&requests)
+            .iter()
+            .all(|(opcode, _)| *opcode == xproto::INTERN_ATOM_REQUEST)
+    );
+
+    let sequence =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, "image/png")
+            .expect("tracked InternAtom sequence");
+    peer.write_all(&raw_intern_atom_reply(sequence as u16, 0xd101))
+        .expect("write serialized InternAtom reply");
+    xwm.drain_events(32)
+        .expect("complete InternAtom without a blocking reply");
+    assert_eq!(
+        super::super::selection_wire::proxy_mime_for_target_for_test(&xwm, 0xd101),
+        Some("image/png".to_owned())
+    );
+    assert!(read_fixture_requests(&mut peer).is_empty());
+}
+
+#[test]
+fn utf8_string_alias_keeps_the_exact_mime_atom_binding() {
+    let (mut xwm, mut peer) = test_fixture(generation(202));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let mime_types = ["text/plain;charset=utf-8".to_owned()];
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        8,
+        702,
+        &["text/plain;charset=utf-8"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit Wayland clipboard snapshot");
+
+    let requests = read_fixture_requests(&mut peer);
+    assert_eq!(
+        intern_atom_requests(&requests),
+        [(false, "text/plain;charset=utf-8".to_owned())]
+    );
+    finish_proxy_catalog(&mut xwm, &mut peer, id, &mime_types);
+    let prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Clipboard,
+    )
+    .expect("UTF8_STRING-compatible catalog prepared");
+    let exact = prepared
+        .data_targets
+        .iter()
+        .find(|binding| binding.target == 0xd200)
+        .expect("exact MIME atom retained");
+    let alias = prepared
+        .data_targets
+        .iter()
+        .find(|binding| {
+            binding.target == xwm.atoms.get(super::super::atoms::XwmAtomName::Utf8String)
+        })
+        .expect("UTF8_STRING compatibility alias prepared");
+    assert_eq!(exact.mime_type, "text/plain;charset=utf-8");
+    assert_eq!(alias.mime_type, "text/plain;charset=utf-8");
+    assert_eq!(
+        super::super::selection_wire::proxy_mime_for_target_for_test(&xwm, 0xd200),
+        Some("text/plain;charset=utf-8".to_owned())
+    );
+    assert_eq!(
+        super::super::selection_wire::proxy_mime_for_target_for_test(
+            &xwm,
+            xwm.atoms.get(super::super::atoms::XwmAtomName::Utf8String),
+        ),
+        Some("text/plain;charset=utf-8".to_owned())
+    );
+    assert_eq!(
+        prepared.protocol_targets,
+        [
+            xwm.atoms.get(super::super::atoms::XwmAtomName::Targets),
+            xwm.atoms.get(super::super::atoms::XwmAtomName::Multiple),
+            xwm.atoms.get(super::super::atoms::XwmAtomName::Timestamp),
+        ]
+    );
+    assert!(prepared.data_targets.iter().all(|binding| {
+        !prepared.protocol_targets.contains(&binding.target)
+            && binding.target != xwm.atoms.get(super::super::atoms::XwmAtomName::Incr)
+    }));
+    assert_eq!(
+        prepared.target_order,
+        [
+            prepared.protocol_targets.as_slice(),
+            &[
+                0xd200,
+                xwm.atoms.get(super::super::atoms::XwmAtomName::Utf8String)
+            ],
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn text_alias_keeps_the_exact_plain_text_mime_atom() {
+    let (mut xwm, mut peer) = test_fixture(generation(203));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let mime_types = ["text/plain".to_owned()];
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Primary,
+        12,
+        703,
+        &["text/plain"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit Wayland primary snapshot");
+    assert_eq!(
+        intern_atom_requests(&read_fixture_requests(&mut peer)),
+        [(false, "text/plain".to_owned())]
+    );
+    finish_proxy_catalog(&mut xwm, &mut peer, id, &mime_types);
+    let prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Primary,
+    )
+    .expect("TEXT-compatible catalog prepared");
+    let text_atom = xwm.atoms.get(super::super::atoms::XwmAtomName::Text);
+    assert_eq!(
+        super::super::selection_wire::proxy_mime_for_target_for_test(&xwm, 0xd200),
+        Some("text/plain".to_owned())
+    );
+    assert_eq!(
+        super::super::selection_wire::proxy_mime_for_target_for_test(&xwm, text_atom),
+        Some("text/plain".to_owned())
+    );
+    assert_eq!(prepared.data_targets.len(), 2);
+    assert_eq!(prepared.target_order.last(), Some(&text_atom));
+}
+
+#[test]
+fn failed_exact_atom_is_omitted_without_discarding_other_mime_targets() {
+    let (mut xwm, mut peer) = test_fixture(generation(210));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let mime_types = ["image/png".to_owned(), "application/json".to_owned()];
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        100,
+        711,
+        &["image/png", "application/json"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit two MIME targets");
+    assert_eq!(
+        intern_atom_requests(&read_fixture_requests(&mut peer)),
+        [
+            (false, "image/png".to_owned()),
+            (false, "application/json".to_owned()),
+        ]
+    );
+    let failed =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, &mime_types[0])
+            .expect("first exact MIME atom query");
+    let resolved =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, &mime_types[1])
+            .expect("second exact MIME atom query");
+    let mut replies = raw_intern_atom_reply(failed as u16, 0).to_vec();
+    replies.extend_from_slice(&raw_intern_atom_reply(resolved as u16, 0xe101));
+    peer.write_all(&replies)
+        .expect("write serialized success and failed replies");
+    xwm.drain_events(32)
+        .expect("resolve failed and successful MIME atom replies");
+
+    let prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Clipboard,
+    )
+    .expect("remaining usable target prepares");
+    assert_eq!(prepared.data_targets.len(), 1);
+    assert_eq!(prepared.data_targets[0].target, 0xe101);
+    assert_eq!(prepared.data_targets[0].mime_type, "application/json");
+}
+
+#[test]
+fn failed_all_exact_atoms_leave_a_prepared_catalog_without_data_targets() {
+    let (mut xwm, mut peer) = test_fixture(generation(211));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Primary,
+        101,
+        712,
+        &["image/png"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit MIME target");
+    let sequence =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, "image/png")
+            .expect("MIME atom query pending");
+    peer.write_all(&raw_intern_atom_reply(sequence as u16, 0))
+        .expect("write failed InternAtom reply");
+    xwm.drain_events(32)
+        .expect("resolve failed MIME atom reply");
+
+    let prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Primary,
+    )
+    .expect("preparation completes with no usable MIME targets");
+    assert!(prepared.data_targets.is_empty());
+    assert_eq!(prepared.protocol_targets.len(), 3);
+}
+
+#[test]
+fn known_control_atoms_are_not_reinterned_or_exposed_as_mime_targets() {
+    let (mut xwm, mut peer) = test_fixture(generation(212));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        102,
+        713,
+        &["UTF8_STRING", "TARGETS", "image/png"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit snapshot including control spellings");
+    assert_eq!(
+        intern_atom_requests(&read_fixture_requests(&mut peer)),
+        [(false, "image/png".to_owned())]
+    );
+    let mime_types = ["UTF8_STRING", "TARGETS", "image/png"].map(str::to_owned);
+    finish_proxy_catalog(&mut xwm, &mut peer, id, &mime_types);
+    let prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Clipboard,
+    )
+    .expect("usable exact MIME atom prepared");
+    assert_eq!(prepared.data_targets.len(), 1);
+    assert_eq!(prepared.data_targets[0].mime_type, "image/png");
+}
+
+#[test]
+fn clipboard_and_primary_proxy_catalogs_progress_within_the_shared_reply_bound() {
+    use super::super::data_bridge::SelectionKind;
+    use crate::xwayland::XwaylandSelectionKind;
+
+    let (mut xwm, mut peer) = test_fixture(generation(204));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let clipboard_mimes = (0..128)
+        .map(|index| format!("application/x-clipboard-{index}"))
+        .collect::<Vec<_>>();
+    let primary_mimes = (0..128)
+        .map(|index| format!("application/x-primary-{index}"))
+        .collect::<Vec<_>>();
+    let clipboard_names = clipboard_mimes
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let primary_names = primary_mimes.iter().map(String::as_str).collect::<Vec<_>>();
+    let clipboard = proxy_snapshot(XwaylandSelectionKind::Clipboard, 40, 704, &clipboard_names);
+    let primary = proxy_snapshot(XwaylandSelectionKind::Primary, 50, 705, &primary_names);
+    let clipboard_id = clipboard.offer.as_ref().unwrap().id;
+    let primary_id = primary.offer.as_ref().unwrap().id;
+
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [clipboard, primary])
+        .expect("submit independent channel snapshots");
+
+    assert!(
+        super::super::selection_wire::pending_proxy_replies_for_test(&xwm)
+            <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
+    );
+    assert_eq!(
+        super::super::selection_wire::pending_selection_replies_for_test(&xwm),
+        super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
+    );
+    assert!(
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+            &xwm,
+            clipboard_id,
+            &clipboard_mimes[0]
+        )
+        .is_some()
+    );
+    assert!(
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+            &xwm,
+            primary_id,
+            &primary_mimes[0]
+        )
+        .is_some()
+    );
+
+    let mut resolved_clipboard = std::collections::HashSet::new();
+    let mut resolved_primary = std::collections::HashSet::new();
+    while resolved_clipboard.len() != clipboard_mimes.len()
+        || resolved_primary.len() != primary_mimes.len()
+    {
+        let mut next_reply = None;
+        for (id, mimes, resolved, base) in [
+            (
+                clipboard_id,
+                &clipboard_mimes,
+                &resolved_clipboard,
+                0xd200_u32,
+            ),
+            (primary_id, &primary_mimes, &resolved_primary, 0xe000_u32),
+        ] {
+            for (ordinal, mime_type) in mimes.iter().enumerate() {
+                if resolved.contains(mime_type) {
+                    continue;
+                }
+                let Some(sequence) =
+                    super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+                        &xwm, id, mime_type,
+                    )
+                else {
+                    continue;
+                };
+                let atom = base.saturating_add(ordinal as u32);
+                if next_reply
+                    .as_ref()
+                    .is_none_or(|(pending, _, _, _)| sequence < *pending)
+                {
+                    next_reply = Some((sequence, id, mime_type.clone(), atom));
+                }
+            }
+        }
+        let Some((sequence, id, mime_type, atom)) = next_reply else {
+            panic!("both proxy channels retain schedulable MIME work");
+        };
+        peer.write_all(&raw_intern_atom_reply(sequence as u16, atom))
+            .expect("write serialized channel InternAtom reply");
+        xwm.drain_events(32)
+            .expect("drain channel InternAtom reply");
+        match id.kind {
+            XwaylandSelectionKind::Clipboard => {
+                resolved_clipboard.insert(mime_type);
+            }
+            XwaylandSelectionKind::Primary => {
+                resolved_primary.insert(mime_type);
+            }
+        }
+        assert!(
+            super::super::selection_wire::pending_selection_replies_for_test(&xwm)
+                <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
+        );
+    }
+
+    let clipboard_prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        SelectionKind::Clipboard,
+    )
+    .expect("clipboard catalog completes");
+    let primary_prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        SelectionKind::Primary,
+    )
+    .expect("primary catalog completes");
+    assert_eq!(clipboard_prepared.id, clipboard_id);
+    assert_eq!(primary_prepared.id, primary_id);
+    assert_eq!(clipboard_prepared.data_targets.len(), 128);
+    assert_eq!(primary_prepared.data_targets.len(), 128);
+    assert_eq!(
+        clipboard_prepared
+            .data_targets
+            .iter()
+            .map(|binding| binding.mime_type.as_str())
+            .collect::<Vec<_>>(),
+        clipboard_mimes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        primary_prepared
+            .data_targets
+            .iter()
+            .map(|binding| binding.mime_type.as_str())
+            .collect::<Vec<_>>(),
+        primary_mimes.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn incoming_atom_names_and_outgoing_mime_atoms_share_fair_reply_slots() {
+    let (mut xwm, mut peer) = test_fixture(generation(205));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let targets = (0..8).map(|index| 0xd300 + index).collect::<Vec<_>>();
+    resolve_targets_for_test(&mut xwm, &mut peer, 0x3a0, &targets);
+    let first_incoming = super::super::selection_wire::pending_target_atom_name_sequence_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Clipboard,
+        targets[0],
+    )
+    .expect("B1 atom-name query is pending");
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        60,
+        706,
+        &["image/png"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [snapshot])
+        .expect("submit concurrent B3 metadata");
+    assert!(
+        super::super::selection_wire::pending_selection_replies_for_test(&xwm)
+            <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
+    );
+    assert!(
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, "image/png")
+            .is_none()
+    );
+
+    peer.write_all(&raw_get_atom_name_reply(
+        first_incoming as u16,
+        b"application/x-old",
+    ))
+    .expect("write B1 serialized GetAtomName reply");
+    xwm.drain_events(32)
+        .expect("complete B1 reply and schedule both directions fairly");
+
+    let proxy_sequence =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, "image/png")
+            .expect("B3 InternAtom gets a shared reply slot");
+    assert!(
+        super::super::selection_wire::pending_target_atom_name_sequence_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+            targets[1],
+        )
+        .is_some()
+    );
+    assert!(
+        super::super::selection_wire::pending_selection_replies_for_test(&xwm)
+            <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
+    );
+
+    for target in targets.iter().skip(1).take(4) {
+        complete_atom_name_for_test(
+            &mut xwm,
+            &mut peer,
+            super::super::data_bridge::SelectionKind::Clipboard,
+            *target,
+            b"application/x-incoming",
+        );
+        assert!(
+            super::super::selection_wire::pending_selection_replies_for_test(&xwm)
+                <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
+        );
+    }
+
+    peer.write_all(&raw_intern_atom_reply(proxy_sequence as u16, 0xd401))
+        .expect("write B3 serialized InternAtom reply");
+    xwm.drain_events(32)
+        .expect("complete B3 without blocking B1 progress");
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+        )
+        .is_some()
+    );
+    assert!(
+        super::super::selection_wire::pending_target_atom_name_sequence_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+            targets[1],
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn stale_mime_atom_reply_cannot_mutate_same_mime_replacement_source() {
+    let (mut xwm, mut peer) = test_fixture(generation(206));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let first = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        70,
+        707,
+        &["image/png"],
+    );
+    let first_id = first.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [first])
+        .expect("submit first source");
+    let first_sequence = super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+        &xwm,
+        first_id,
+        "image/png",
+    )
+    .expect("first source InternAtom is pending");
+
+    let replacement = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        71,
+        708,
+        &["image/png"],
+    );
+    let replacement_id = replacement.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [replacement])
+        .expect("replace source with identical MIME list");
+    let replacement_sequence = super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+        &xwm,
+        replacement_id,
+        "image/png",
+    )
+    .expect("replacement source InternAtom is pending");
+    assert_ne!(first_id, replacement_id);
+    assert_ne!(first_sequence, replacement_sequence);
+    assert!(
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+            &xwm,
+            first_id,
+            "image/png",
+        )
+        .is_none()
+    );
+
+    peer.write_all(&raw_intern_atom_reply(first_sequence as u16, 0xdf01))
+        .expect("write late first-source reply");
+    xwm.drain_events(32)
+        .expect("discard cancelled first-source reply");
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+        )
+        .is_none()
+    );
+    assert!(
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(
+            &xwm,
+            replacement_id,
+            "image/png",
+        )
+        .is_some()
+    );
+
+    peer.write_all(&raw_intern_atom_reply(replacement_sequence as u16, 0xdf02))
+        .expect("write replacement-source reply");
+    xwm.drain_events(32).expect("prepare replacement catalog");
+    let prepared = super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        super::super::data_bridge::SelectionKind::Clipboard,
+    )
+    .expect("replacement catalog is prepared");
+    assert_eq!(prepared.id, replacement_id);
+    assert_eq!(prepared.data_targets[0].target, 0xdf02);
+}
+
+#[test]
+fn clearing_during_mime_interning_cancels_partial_export() {
+    let (mut xwm, mut peer) = test_fixture(generation(207));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let first = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Clipboard,
+        80,
+        709,
+        &["image/png"],
+    );
+    let id = first.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut xwm, [first])
+        .expect("submit source before clear");
+    let sequence =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, "image/png")
+            .expect("source InternAtom is pending");
+
+    super::super::selection_wire::submit_proxy_selection_snapshots(
+        &mut xwm,
+        [proxy_clear_snapshot(
+            crate::xwayland::XwaylandSelectionKind::Clipboard,
+            81,
+        )],
+    )
+    .expect("submit latest clear snapshot");
+    assert_eq!(
+        super::super::selection_wire::pending_proxy_replies_for_test(&xwm),
+        0
+    );
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+        )
+        .is_none()
+    );
+
+    peer.write_all(&raw_intern_atom_reply(sequence as u16, 0xdf03))
+        .expect("write late reply after clear");
+    xwm.drain_events(32)
+        .expect("discard late reply after clear");
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &xwm,
+            super::super::data_bridge::SelectionKind::Clipboard,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn generation_teardown_discards_all_proxy_preparation_and_late_replies() {
+    let old_generation = generation(208);
+    let (mut old_xwm, mut old_peer) = test_fixture(old_generation);
+    initialize_selection_wire(&mut old_xwm, &mut old_peer);
+    let snapshot = proxy_snapshot(
+        crate::xwayland::XwaylandSelectionKind::Primary,
+        90,
+        710,
+        &["image/png"],
+    );
+    let id = snapshot.offer.as_ref().unwrap().id;
+    super::super::selection_wire::submit_proxy_selection_snapshots(&mut old_xwm, [snapshot])
+        .expect("submit G1 snapshot");
+    let sequence =
+        super::super::selection_wire::proxy_mime_atom_sequence_for_test(&old_xwm, id, "image/png")
+            .expect("G1 InternAtom is pending");
+    let _ = read_fixture_requests(&mut old_peer);
+
+    old_xwm.clear_generation(old_generation);
+    assert_eq!(
+        super::super::selection_wire::pending_selection_replies_for_test(&old_xwm),
+        0
+    );
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &old_xwm,
+            super::super::data_bridge::SelectionKind::Primary,
+        )
+        .is_none()
+    );
+    super::super::selection_wire::submit_proxy_selection_snapshots(
+        &mut old_xwm,
+        [proxy_snapshot(
+            crate::xwayland::XwaylandSelectionKind::Primary,
+            90,
+            710,
+            &["image/png"],
+        )],
+    )
+    .expect("retired XWM drops later submissions");
+    assert!(read_fixture_requests(&mut old_peer).is_empty());
+    old_peer
+        .write_all(&raw_intern_atom_reply(sequence as u16, 0xdf04))
+        .expect("write late G1 reply");
+    old_xwm.drain_events(32).expect("discard late G1 reply");
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &old_xwm,
+            super::super::data_bridge::SelectionKind::Primary,
+        )
+        .is_none()
+    );
+
+    let (mut new_xwm, mut new_peer) = test_fixture(generation(209));
+    initialize_selection_wire(&mut new_xwm, &mut new_peer);
+    assert!(
+        super::super::selection_wire::prepared_proxy_selection_for_test(
+            &new_xwm,
+            super::super::data_bridge::SelectionKind::Primary,
+        )
+        .is_none()
+    );
+}
+
 #[derive(Clone, Copy)]
 struct SelectionOwnerFixture {
     selection: u32,

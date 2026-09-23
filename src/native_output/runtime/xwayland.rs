@@ -5,6 +5,56 @@ use oblivion_one::xwayland::X11WindowHandle;
 use oblivion_one::xwayland::trace::{self, TraceFields};
 use oblivion_one::xwayland::xwm::{XwmCommand, XwmEvent};
 
+#[derive(Debug, Default)]
+pub(super) struct XwaylandProxySelectionSyncState {
+    stamps: [Option<XwaylandProxySyncStamp>; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XwaylandProxySyncStamp {
+    xwayland_generation: oblivion_one::xwayland::XwaylandGeneration,
+    selection_generation: u64,
+}
+
+impl XwaylandProxySelectionSyncState {
+    fn snapshots_to_submit(
+        &self,
+        xwayland_generation: oblivion_one::xwayland::XwaylandGeneration,
+        snapshots: impl IntoIterator<Item = oblivion_one::xwayland::XwaylandProxySelectionSnapshot>,
+    ) -> Vec<oblivion_one::xwayland::XwaylandProxySelectionSnapshot> {
+        snapshots
+            .into_iter()
+            .filter(|snapshot| {
+                let stamp = XwaylandProxySyncStamp {
+                    xwayland_generation,
+                    selection_generation: snapshot.selection_generation,
+                };
+                self.stamps[proxy_snapshot_index(snapshot.kind)] != Some(stamp)
+            })
+            .collect()
+    }
+
+    fn mark_submitted(
+        &mut self,
+        xwayland_generation: oblivion_one::xwayland::XwaylandGeneration,
+        snapshots: &[oblivion_one::xwayland::XwaylandProxySelectionSnapshot],
+    ) {
+        for snapshot in snapshots {
+            self.stamps[proxy_snapshot_index(snapshot.kind)] = Some(XwaylandProxySyncStamp {
+                xwayland_generation,
+                selection_generation: snapshot.selection_generation,
+            });
+        }
+    }
+}
+
+const fn proxy_snapshot_index(kind: oblivion_one::xwayland::XwaylandSelectionKind) -> usize {
+    match kind {
+        oblivion_one::xwayland::XwaylandSelectionKind::Clipboard => 0,
+        oblivion_one::xwayland::XwaylandSelectionKind::Primary => 1,
+    }
+}
+
 fn coalesce_client_list_sync(commands: Vec<XwmCommand>) -> Vec<XwmCommand> {
     let mut normalized = Vec::with_capacity(commands.len());
     let mut latest_snapshot = None;
@@ -182,10 +232,40 @@ fn prune_destroyed_handles(
 }
 
 impl NativeRuntime {
-    pub(super) fn sync_xwayland_selection_metadata(&mut self) {
+    pub(super) fn sync_xwayland_selection_metadata(&mut self) -> NativeResult<()> {
         for event in self.xwayland.take_managed_selection_events() {
             self.server.apply_xwayland_selection_event(event);
         }
+        if self.xwayland.state_kind() != oblivion_one::xwayland::XwaylandStateKind::Running {
+            return Ok(());
+        }
+        let Some(generation) = self.xwayland.generation() else {
+            return Ok(());
+        };
+        let snapshots = [
+            self.server.xwayland_proxy_selection_snapshot(
+                oblivion_one::xwayland::XwaylandSelectionKind::Clipboard,
+            ),
+            self.server.xwayland_proxy_selection_snapshot(
+                oblivion_one::xwayland::XwaylandSelectionKind::Primary,
+            ),
+        ];
+        let pending = self
+            .xwayland_proxy_selection_sync
+            .snapshots_to_submit(generation, snapshots);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let submitted = self.xwayland.submit_managed_proxy_selection_snapshots(
+            generation,
+            pending.iter().cloned(),
+            &mut self.process_supervisor,
+        )?;
+        if submitted {
+            self.xwayland_proxy_selection_sync
+                .mark_submitted(generation, &pending);
+        }
+        Ok(())
     }
 
     pub(super) fn submit_xwayland_selection_data_requests(&mut self) -> NativeResult<()> {
@@ -487,6 +567,10 @@ impl NativeRuntime {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "xwayland_proxy_selection_sync_tests.rs"]
+mod proxy_selection_sync_tests;
 
 #[cfg(test)]
 mod tests {

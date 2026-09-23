@@ -285,6 +285,46 @@ impl SelectionState {
         self.channel(kind).generation
     }
 
+    pub fn xwayland_proxy_selection_snapshot(
+        &self,
+        kind: SelectionKind,
+    ) -> crate::xwayland::XwaylandProxySelectionSnapshot {
+        use crate::xwayland::{
+            XwaylandProxySelectionId, XwaylandProxySelectionOffer, XwaylandProxySelectionSnapshot,
+            XwaylandSelectionKind,
+        };
+
+        let proxy_kind = match kind {
+            SelectionKind::Clipboard => XwaylandSelectionKind::Clipboard,
+            SelectionKind::Primary => XwaylandSelectionKind::Primary,
+        };
+        let selection_generation = self.current_generation(kind);
+        let offer = self.active_selection(kind).and_then(|selection| {
+            (selection.source_kind != SelectionSourceKind::Xwayland).then(|| {
+                debug_assert!(selection.mime_types.len() <= MAX_SOURCE_MIME_TYPES);
+                debug_assert!(
+                    selection
+                        .mime_types
+                        .iter()
+                        .all(|mime| { !mime.is_empty() && mime.len() <= MAX_MIME_TYPE_LEN })
+                );
+                XwaylandProxySelectionOffer {
+                    id: XwaylandProxySelectionId {
+                        kind: proxy_kind,
+                        selection_generation: selection.generation,
+                        source_key: selection.source_key,
+                    },
+                    mime_types: selection.mime_types.clone(),
+                }
+            })
+        });
+        XwaylandProxySelectionSnapshot {
+            kind: proxy_kind,
+            selection_generation,
+            offer,
+        }
+    }
+
     pub fn current_mutation_epoch(&self, kind: SelectionKind) -> SelectionMutationEpoch {
         self.channel(kind).mutation_watermark
     }

@@ -1405,6 +1405,34 @@ impl XwaylandService {
         Ok(())
     }
 
+    /// Submit the latest compositor-owned selection metadata to the exact
+    /// Running XWayland generation. Non-Running and retired generations drop
+    /// the batch so NativeRuntime can resample current canonical state later.
+    pub fn submit_managed_proxy_selection_snapshots(
+        &mut self,
+        generation: XwaylandGeneration,
+        snapshots: impl IntoIterator<Item = super::XwaylandProxySelectionSnapshot>,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<bool> {
+        let result = match &mut self.state {
+            ServiceState::Running(resources) if resources.generation == generation => {
+                resources.xwm.submit_proxy_selection_snapshots(snapshots)
+            }
+            _ => return Ok(false),
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.fail_managed_xwm(
+                    supervisor,
+                    XwaylandFailureStage::CommandFlush,
+                    io::Error::other(error),
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn harvest_running_selection_metadata(&mut self) {
         let events = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.take_selection_events(),

@@ -2,6 +2,13 @@ use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 
 impl Xwm {
+    pub(crate) fn submit_proxy_selection_snapshots(
+        &mut self,
+        snapshots: impl IntoIterator<Item = crate::xwayland::XwaylandProxySelectionSnapshot>,
+    ) -> Result<(), XwmError> {
+        selection_wire::submit_proxy_selection_snapshots(self, snapshots)
+    }
+
     pub(crate) fn next_deadline_ns(&self) -> Option<u64> {
         self.next_resize_sync_deadline_ns()
             .into_iter()

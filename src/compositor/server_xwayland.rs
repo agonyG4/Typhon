@@ -3,6 +3,23 @@ use crate::xwayland::trace::{self, TraceCategory, TraceFields};
 use crate::xwayland::xwm::XwmAssociationEvent;
 
 impl OwnCompositorServer {
+    pub fn xwayland_proxy_selection_snapshot(
+        &self,
+        kind: crate::xwayland::XwaylandSelectionKind,
+    ) -> crate::xwayland::XwaylandProxySelectionSnapshot {
+        let selection_kind = match kind {
+            crate::xwayland::XwaylandSelectionKind::Clipboard => {
+                crate::compositor::SelectionKind::Clipboard
+            }
+            crate::xwayland::XwaylandSelectionKind::Primary => {
+                crate::compositor::SelectionKind::Primary
+            }
+        };
+        self.state
+            .selection_state
+            .xwayland_proxy_selection_snapshot(selection_kind)
+    }
+
     pub fn apply_xwayland_selection_event(
         &mut self,
         event: crate::xwayland::XwaylandSelectionEvent,

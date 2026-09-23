@@ -685,6 +685,7 @@ impl NativeRuntime {
             xwayland,
             xwayland_reactor_tokens,
             xwayland_reactor_generation: 0,
+            xwayland_proxy_selection_sync: xwayland::XwaylandProxySelectionSyncState::default(),
             xwayland_client_identity: None,
             drm_reactor_token: Some(drm_reactor_token),
             output_render_fence_token: None,

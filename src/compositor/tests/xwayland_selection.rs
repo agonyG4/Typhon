@@ -5,8 +5,8 @@ use std::os::unix::net::UnixStream;
 
 use crate::compositor::{SelectionSourceBackend, SelectionSourceKind};
 use crate::xwayland::{
-    XwaylandGeneration, XwaylandSelectionEvent, XwaylandSelectionKind, XwaylandSelectionOffer,
-    XwaylandSelectionOfferId,
+    XwaylandGeneration, XwaylandProxySelectionId, XwaylandSelectionEvent, XwaylandSelectionKind,
+    XwaylandSelectionOffer, XwaylandSelectionOfferId,
 };
 
 fn offer(kind: XwaylandSelectionKind, generation: u64, revision: u64) -> XwaylandSelectionOffer {
@@ -42,6 +42,222 @@ fn xwayland_clipboard_offer_is_committed_to_canonical_selection_state() {
         server.state.selection_state.source_backend(active.source_key),
         Some(SelectionSourceBackend::Xwayland { offer_id }) if *offer_id == offer.id
     ));
+}
+
+#[test]
+fn wayland_clipboard_source_has_generation_qualified_proxy_snapshot() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let source_key = crate::compositor::SelectionSourceKey(701);
+    server.state.selection_state.register_source(
+        source_key,
+        SelectionSourceKind::WaylandClipboard,
+        None,
+    );
+    server
+        .state
+        .selection_state
+        .offer_source_mime_type_for_key(source_key, "image/png");
+    let epoch = server.state.selection_state.allocate_mutation_epoch();
+    let commit = server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, source_key, epoch)
+        .expect("canonical clipboard commit");
+
+    let snapshot = server.xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Clipboard);
+
+    assert_eq!(snapshot.kind, XwaylandSelectionKind::Clipboard);
+    assert_eq!(snapshot.selection_generation, commit.generation);
+    let offer = snapshot
+        .offer
+        .expect("Wayland clipboard is exportable metadata");
+    assert_eq!(
+        offer.id,
+        XwaylandProxySelectionId {
+            kind: XwaylandSelectionKind::Clipboard,
+            selection_generation: commit.generation,
+            source_key,
+        }
+    );
+    assert_eq!(offer.mime_types, ["image/png"]);
+}
+
+#[test]
+fn xwayland_canonical_source_is_not_exported_back_to_x11() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let external = offer(XwaylandSelectionKind::Clipboard, 6, 21);
+    server.apply_xwayland_selection_event(XwaylandSelectionEvent::OfferChanged {
+        kind: XwaylandSelectionKind::Clipboard,
+        offer: external,
+    });
+
+    let snapshot = server.xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Clipboard);
+
+    assert_eq!(snapshot.selection_generation, 1);
+    assert!(snapshot.offer.is_none());
+}
+
+#[test]
+fn clipboard_and_primary_proxy_snapshots_are_independent() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let clipboard = crate::compositor::SelectionSourceKey(711);
+    let primary = crate::compositor::SelectionSourceKey(712);
+    for (key, source_kind, mime_type) in [
+        (
+            clipboard,
+            SelectionSourceKind::WaylandClipboard,
+            "image/png",
+        ),
+        (primary, SelectionSourceKind::WaylandPrimary, "text/plain"),
+    ] {
+        server
+            .state
+            .selection_state
+            .register_source(key, source_kind, None);
+        server
+            .state
+            .selection_state
+            .offer_source_mime_type_for_key(key, mime_type);
+        let epoch = server.state.selection_state.allocate_mutation_epoch();
+        let kind = if key == clipboard {
+            SelectionKind::Clipboard
+        } else {
+            SelectionKind::Primary
+        };
+        server
+            .state
+            .selection_state
+            .commit_selection(kind, key, epoch)
+            .expect("canonical channel commit");
+    }
+    let before = server.xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Primary);
+
+    let replacement = crate::compositor::SelectionSourceKey(713);
+    server.state.selection_state.register_source(
+        replacement,
+        SelectionSourceKind::DataControl,
+        None,
+    );
+    server
+        .state
+        .selection_state
+        .offer_source_mime_type_for_key(replacement, "image/webp");
+    let epoch = server.state.selection_state.allocate_mutation_epoch();
+    server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, replacement, epoch)
+        .expect("replace clipboard only");
+    let after = server.xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Primary);
+
+    assert_eq!(before, after);
+    assert_eq!(
+        before.offer.as_ref().unwrap().id.kind,
+        XwaylandSelectionKind::Primary
+    );
+    assert_eq!(before.offer.as_ref().unwrap().mime_types, ["text/plain"]);
+}
+
+#[test]
+fn proxy_identity_changes_when_source_replaces_same_mime_list() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let first = crate::compositor::SelectionSourceKey(721);
+    let replacement = crate::compositor::SelectionSourceKey(722);
+    for key in [first, replacement] {
+        server.state.selection_state.register_source(
+            key,
+            SelectionSourceKind::WaylandClipboard,
+            None,
+        );
+        server
+            .state
+            .selection_state
+            .offer_source_mime_type_for_key(key, "text/plain");
+    }
+    let epoch = server.state.selection_state.allocate_mutation_epoch();
+    server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, first, epoch)
+        .unwrap();
+    let before = server
+        .xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Clipboard)
+        .offer
+        .unwrap();
+    let epoch = server.state.selection_state.allocate_mutation_epoch();
+    server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, replacement, epoch)
+        .unwrap();
+    let after = server
+        .xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Clipboard)
+        .offer
+        .unwrap();
+
+    assert_eq!(before.mime_types, after.mime_types);
+    assert_ne!(before.id, after.id);
+    assert_eq!(after.id.source_key, replacement);
+}
+
+#[test]
+fn host_clipboard_backend_is_exportable_with_canonical_mime_spelling() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.state.install_host_clipboard_selection(
+        crate::compositor::HostClipboardOfferId(45),
+        vec!["Text/Html;profile=stable".to_owned()],
+    );
+
+    let snapshot = server.xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Clipboard);
+
+    let offer = snapshot
+        .offer
+        .expect("host clipboard backend can supply bytes");
+    let active = server
+        .state
+        .selection_state
+        .active_selection(SelectionKind::Clipboard)
+        .unwrap();
+    assert_eq!(offer.id.source_key, active.source_key);
+    assert_eq!(offer.mime_types, ["Text/Html;profile=stable"]);
+}
+
+#[test]
+fn clear_advances_channel_generation_and_removes_the_export_offer() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let source_key = crate::compositor::SelectionSourceKey(731);
+    server.state.selection_state.register_source(
+        source_key,
+        SelectionSourceKind::WaylandClipboard,
+        None,
+    );
+    server
+        .state
+        .selection_state
+        .offer_source_mime_type_for_key(source_key, "image/png");
+    let epoch = server.state.selection_state.allocate_mutation_epoch();
+    let committed = server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, source_key, epoch)
+        .unwrap();
+    let clear_epoch = server.state.selection_state.allocate_mutation_epoch();
+    server
+        .state
+        .selection_state
+        .clear_selection(SelectionKind::Clipboard, clear_epoch)
+        .unwrap();
+
+    let snapshot = server.xwayland_proxy_selection_snapshot(XwaylandSelectionKind::Clipboard);
+
+    assert!(snapshot.selection_generation > committed.generation);
+    assert!(snapshot.offer.is_none());
 }
 
 #[test]

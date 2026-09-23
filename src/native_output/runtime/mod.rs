@@ -595,6 +595,7 @@ pub(crate) struct NativeRuntime {
     xwayland: XwaylandService,
     xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
     xwayland_reactor_generation: u64,
+    xwayland_proxy_selection_sync: xwayland::XwaylandProxySelectionSyncState,
     xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
     drm_reactor_token: Option<ReactorToken>,
     output_render_fence_token: Option<ReactorToken>,
