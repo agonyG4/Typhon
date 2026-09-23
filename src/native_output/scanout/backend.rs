@@ -237,6 +237,14 @@ impl NativePaintStats {
                     },
                 ),
                 NativePerfField::str("repaint_mode", repaint.repaint_mode.as_str()),
+                NativePerfField::str(
+                    "partial_repaint_complexity_policy",
+                    repaint.partial_repaint_complexity_policy.as_str(),
+                ),
+                NativePerfField::str(
+                    "partial_repaint_complexity_action",
+                    repaint.partial_repaint_complexity_action.as_str(),
+                ),
                 NativePerfField::usize("current_damage_rects", repaint.current_damage_rects),
                 NativePerfField::u64("current_damage_pixels", repaint.current_damage_pixels),
                 NativePerfField::usize("repair_damage_rects", repaint.repair_damage_rects),
@@ -278,6 +286,10 @@ impl NativePaintStats {
                 NativePerfField::usize(
                     "region_fragmentation_overflow_fallbacks",
                     repaint.region_fragmentation_overflow_fallbacks,
+                ),
+                NativePerfField::usize(
+                    "scene_replay_work_overflow_fallbacks",
+                    repaint.scene_replay_work_overflow_fallbacks,
                 ),
                 NativePerfField::usize("peak_region_piece_count", repaint.peak_region_piece_count),
                 NativePerfField::usize("texture_binds", repaint.texture_binds),

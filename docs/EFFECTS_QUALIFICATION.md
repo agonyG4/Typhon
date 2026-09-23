@@ -11,9 +11,11 @@ into hardware qualification.
 
 ## Deterministic gates
 
-Run from the Typhon checkout so Cargo reuses `target/`:
+Run from the Typhon checkout with Cargo artifacts directed to the stable Aether
+target directory:
 
 ```bash
+export CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target
 rtk cargo fmt --all -- --check
 rtk cargo check --locked --all-targets
 rtk cargo clippy --locked --all-targets -- -D warnings
@@ -124,6 +126,48 @@ Typhon's 75% area threshold. It is an area-based counterfactual, not a measured
 performance improvement. In particular, `partial_many_rects` means the
 simulation keeps the original multi-rectangle region; it does not establish
 that rendering an arbitrary number of rectangles is faster.
+
+### Partial repaint complexity experiment
+
+The native A/B switch is opt-in and is not production-certified. The unset
+default remains `legacy`; `legacy` keeps the current rectangle-count-first
+fallback behavior. Select the experiment with:
+
+```bash
+TYPHON_PARTIAL_REPAINT_COMPLEXITY_POLICY=structured-experimental
+```
+
+The renderer resolves this setting once per process. The only accepted values
+are `legacy` and `structured-experimental`; an unknown or non-Unicode value
+emits one startup warning and selects `legacy`.
+
+The structured policy uses the following decision order, after non-candidate
+repaint prerequisites have passed:
+
+```text
+OutputDamage::Full or unrepresentable required pixel arithmetic → Full
+original area >=75% of output → Full / DamageAreaThreshold
+<=8 rects → Partial using the original region
+>128 rects → conservative Full / TooManyRectangles
+9..128 rects → use one bbox only if bbox_pixels <= original_pixels × 2
+                and bbox area is strictly below 75% of output
+otherwise → Partial using the original structured region
+```
+
+The 8-rectangle limit, 75% threshold, and downstream 128-piece scene replay
+bound remain unchanged. Scene replay still falls back to full-output work if
+normalization exceeds 128 pieces. The native frame event reports
+`partial_repaint_complexity_policy`, `partial_repaint_complexity_action`, and
+`scene_replay_work_overflow_fallbacks`. The provenance record reports the
+selected policy and action separately from the existing `damage_complexity_*`
+reference-policy simulation. None of these diagnostics imply a performance
+improvement; only matched native sessions can qualify that trade-off.
+
+For semantic qualification, use `capture_mode=replay` and `kawase_mode=partial`
+with execution trace and GPU timing enabled. For performance comparison,
+disable execution trace and compare matched `legacy` and
+`structured-experimental` sessions with the same GPU timing, compositor
+settings, display mode, and workload.
 
 ## GLES effect GPU timing
 

@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    env::{self, VarError},
+    sync::{Arc, OnceLock},
+};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -17,6 +21,7 @@ pub(crate) const MAX_DAMAGE_HISTORY_FRAMES: usize = 8;
 const MAX_EXPLICIT_OUTPUT_BUFFER_AGE: u32 = 3;
 const MAX_PARTIAL_REPAINT_PERCENT: u64 = 75;
 pub(crate) const DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR: u64 = 2;
+const PARTIAL_REPAINT_COMPLEXITY_POLICY_ENV: &str = "TYPHON_PARTIAL_REPAINT_COMPLEXITY_POLICY";
 
 #[cfg(test)]
 thread_local! {
@@ -481,6 +486,46 @@ pub(crate) enum FullRepaintReason {
     EffectExecutionConservative,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PartialRepaintComplexityPolicy {
+    #[default]
+    Legacy,
+    StructuredExperimental,
+}
+
+impl PartialRepaintComplexityPolicy {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::StructuredExperimental => "structured-experimental",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PartialRepaintComplexityAction {
+    #[default]
+    NotApplicable,
+    LegacyFull,
+    StructuredBoundingBox,
+    StructuredManyRectangles,
+    StructuredAreaFull,
+    StructuredSafetyFull,
+}
+
+impl PartialRepaintComplexityAction {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::LegacyFull => "legacy_full",
+            Self::StructuredBoundingBox => "structured_bbox",
+            Self::StructuredManyRectangles => "structured_many_rects",
+            Self::StructuredAreaFull => "structured_area_full",
+            Self::StructuredSafetyFull => "structured_safety_full",
+        }
+    }
+}
+
 impl FullRepaintReason {
     pub(crate) const fn histogram_index(self) -> usize {
         match self {
@@ -532,6 +577,22 @@ pub(crate) struct RepaintPlan {
     pub(crate) buffer_age: Option<u32>,
     pub(crate) mode: RepaintMode,
     pub(crate) fallback_reason: Option<FullRepaintReason>,
+    pub(crate) complexity_policy: PartialRepaintComplexityPolicy,
+    pub(crate) complexity_action: PartialRepaintComplexityAction,
+}
+
+impl Default for RepaintPlan {
+    fn default() -> Self {
+        Self {
+            render_damage: OutputDamage::Empty,
+            repair_damage: OutputDamage::Empty,
+            buffer_age: None,
+            mode: RepaintMode::Skip,
+            fallback_reason: None,
+            complexity_policy: PartialRepaintComplexityPolicy::Legacy,
+            complexity_action: PartialRepaintComplexityAction::NotApplicable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -577,26 +638,153 @@ pub(crate) struct PartialRepaintPlanner {
     capabilities: EglPartialRepaintCapabilities,
     force_full: bool,
     partial_enabled: bool,
+    complexity_policy: PartialRepaintComplexityPolicy,
 }
 
-fn partial_repaint_fallback_reason(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartialRepaintCandidateDecision {
+    KeepOriginal {
+        action: PartialRepaintComplexityAction,
+    },
+    UseBoundingBox {
+        bbox: OutputRect,
+        action: PartialRepaintComplexityAction,
+    },
+    Full {
+        reason: FullRepaintReason,
+        action: PartialRepaintComplexityAction,
+    },
+}
+
+fn decide_partial_repaint_candidate(
     repair_damage: &OutputDamage,
     output_size: (u32, u32),
-) -> Option<FullRepaintReason> {
+    policy: PartialRepaintComplexityPolicy,
+) -> PartialRepaintCandidateDecision {
+    if policy == PartialRepaintComplexityPolicy::Legacy {
+        // Preserve the existing fallback order exactly. In particular, an
+        // over-complex candidate wins over unavailable pixel arithmetic.
+        if *repair_damage == OutputDamage::Full {
+            return PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::DamageAreaThreshold,
+                action: PartialRepaintComplexityAction::LegacyFull,
+            };
+        }
+        if repair_damage.rect_count() > MAX_PARTIAL_REPAINT_RECTS {
+            return PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::TooManyRectangles,
+                action: PartialRepaintComplexityAction::LegacyFull,
+            };
+        }
+        let Some(repair_pixels) = repair_damage.pixels(output_size.0, output_size.1) else {
+            return PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::DamageAreaThreshold,
+                action: PartialRepaintComplexityAction::LegacyFull,
+            };
+        };
+        let Some(output_pixels) = output_pixel_count(output_size) else {
+            return PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::DamageAreaThreshold,
+                action: PartialRepaintComplexityAction::LegacyFull,
+            };
+        };
+        return if partial_repaint_area_threshold_reached(repair_pixels, output_pixels) {
+            PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::DamageAreaThreshold,
+                action: PartialRepaintComplexityAction::LegacyFull,
+            }
+        } else {
+            PartialRepaintCandidateDecision::KeepOriginal {
+                action: PartialRepaintComplexityAction::NotApplicable,
+            }
+        };
+    }
+
     if *repair_damage == OutputDamage::Full {
-        return Some(FullRepaintReason::DamageAreaThreshold);
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
     }
-    if repair_damage.rect_count() > MAX_PARTIAL_REPAINT_RECTS {
-        return Some(FullRepaintReason::TooManyRectangles);
-    }
-    let Some(repair_pixels) = repair_damage.pixels(output_size.0, output_size.1) else {
-        return Some(FullRepaintReason::DamageAreaThreshold);
+    let Some(original_pixels) = repair_damage.pixels(output_size.0, output_size.1) else {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
     };
     let Some(output_pixels) = output_pixel_count(output_size) else {
-        return Some(FullRepaintReason::DamageAreaThreshold);
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
     };
-    partial_repaint_area_threshold_reached(repair_pixels, output_pixels)
-        .then_some(FullRepaintReason::DamageAreaThreshold)
+    if partial_repaint_area_threshold_reached(original_pixels, output_pixels) {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
+    }
+    if repair_damage.rect_count() <= MAX_PARTIAL_REPAINT_RECTS {
+        return PartialRepaintCandidateDecision::KeepOriginal {
+            action: PartialRepaintComplexityAction::NotApplicable,
+        };
+    }
+    if repair_damage.rect_count() > oblivion_one::effects::MAX_EFFECT_REGION_RECTS {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::TooManyRectangles,
+            action: PartialRepaintComplexityAction::StructuredSafetyFull,
+        };
+    }
+
+    let OutputDamage::Rects(rects) = repair_damage else {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
+    };
+    let Some(first_rect) = rects.first().copied() else {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
+    };
+    let Some(bbox) = rects
+        .iter()
+        .skip(1)
+        .try_fold(first_rect, |bbox, rect| bbox.union(*rect))
+    else {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
+    };
+    let bbox_damage = OutputDamage::Rects(vec![bbox]);
+    let Some(bbox_pixels) = bbox_damage.pixels(output_size.0, output_size.1) else {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
+    };
+    let Some(max_bbox_pixels) =
+        original_pixels.checked_mul(DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR)
+    else {
+        return PartialRepaintCandidateDecision::Full {
+            reason: FullRepaintReason::DamageAreaThreshold,
+            action: PartialRepaintComplexityAction::StructuredAreaFull,
+        };
+    };
+    if bbox_pixels <= max_bbox_pixels
+        && !partial_repaint_area_threshold_reached(bbox_pixels, output_pixels)
+    {
+        PartialRepaintCandidateDecision::UseBoundingBox {
+            bbox,
+            action: PartialRepaintComplexityAction::StructuredBoundingBox,
+        }
+    } else {
+        PartialRepaintCandidateDecision::KeepOriginal {
+            action: PartialRepaintComplexityAction::StructuredManyRectangles,
+        }
+    }
 }
 
 fn output_pixel_count(output_size: (u32, u32)) -> Option<u64> {
@@ -607,6 +795,33 @@ fn partial_repaint_area_threshold_reached(repair_pixels: u64, output_pixels: u64
     output_pixels == 0
         || repair_pixels.saturating_mul(100)
             >= output_pixels.saturating_mul(MAX_PARTIAL_REPAINT_PERCENT)
+}
+
+fn parse_partial_repaint_complexity_policy(
+    value: Result<String, VarError>,
+) -> (PartialRepaintComplexityPolicy, bool) {
+    match value {
+        Ok(value) if value == "legacy" => (PartialRepaintComplexityPolicy::Legacy, false),
+        Ok(value) if value == "structured-experimental" => (
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            false,
+        ),
+        Err(VarError::NotPresent) => (PartialRepaintComplexityPolicy::Legacy, false),
+        Ok(_) | Err(VarError::NotUnicode(_)) => (PartialRepaintComplexityPolicy::Legacy, true),
+    }
+}
+
+fn configured_partial_repaint_complexity_policy() -> PartialRepaintComplexityPolicy {
+    static POLICY: OnceLock<PartialRepaintComplexityPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let (policy, invalid) = parse_partial_repaint_complexity_policy(env::var(
+            PARTIAL_REPAINT_COMPLEXITY_POLICY_ENV,
+        ));
+        if invalid {
+            eprintln!("warning: invalid {PARTIAL_REPAINT_COMPLEXITY_POLICY_ENV}; using legacy");
+        }
+        policy
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -809,10 +1024,465 @@ impl DamageComplexityShadow {
     }
 }
 
+#[cfg(test)]
+mod partial_repaint_complexity_tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, width: u32, height: u32) -> OutputRect {
+        OutputRect::new(x, y, width, height)
+    }
+
+    fn capabilities() -> EglPartialRepaintCapabilities {
+        EglPartialRepaintCapabilities {
+            buffer_age: true,
+            partial_render_repair: true,
+            swap_buffers_with_damage: true,
+        }
+    }
+
+    fn planner_with_policy(
+        output_size: (u32, u32),
+        policy: PartialRepaintComplexityPolicy,
+    ) -> PartialRepaintPlanner {
+        let mut planner =
+            PartialRepaintPlanner::new_with_policy(output_size, capabilities(), policy);
+        planner.commit_presented_transition(OutputDamage::Empty);
+        planner
+    }
+
+    fn plan_candidate(
+        output_size: (u32, u32),
+        policy: PartialRepaintComplexityPolicy,
+        candidate: OutputDamage,
+    ) -> RepaintPlan {
+        planner_with_policy(output_size, policy).plan(candidate, BufferAge::Value(1))
+    }
+
+    fn dense_nine_rects_exactly_two_x() -> OutputDamage {
+        OutputDamage::rects(
+            200,
+            100,
+            [0, 20, 40, 60, 80, 100, 120, 140, 170]
+                .into_iter()
+                .map(|x| rect(x, 0, 10, 10)),
+        )
+    }
+
+    fn nine_rects_bbox_exactly_seventy_five_percent(last_x: i32) -> OutputDamage {
+        OutputDamage::rects(
+            200,
+            100,
+            [0, 60, last_x]
+                .into_iter()
+                .flat_map(|x| [0, 35, 70].into_iter().map(move |y| rect(x, y, 30, 30))),
+        )
+    }
+
+    #[test]
+    fn partial_repaint_complexity_policy_names_are_stable() {
+        assert_eq!(PartialRepaintComplexityPolicy::Legacy.as_str(), "legacy");
+        assert_eq!(
+            PartialRepaintComplexityPolicy::StructuredExperimental.as_str(),
+            "structured-experimental"
+        );
+        assert_eq!(
+            PartialRepaintComplexityAction::NotApplicable.as_str(),
+            "not_applicable"
+        );
+        assert_eq!(
+            PartialRepaintComplexityAction::LegacyFull.as_str(),
+            "legacy_full"
+        );
+        assert_eq!(
+            PartialRepaintComplexityAction::StructuredBoundingBox.as_str(),
+            "structured_bbox"
+        );
+        assert_eq!(
+            PartialRepaintComplexityAction::StructuredManyRectangles.as_str(),
+            "structured_many_rects"
+        );
+        assert_eq!(
+            PartialRepaintComplexityAction::StructuredAreaFull.as_str(),
+            "structured_area_full"
+        );
+        assert_eq!(
+            PartialRepaintComplexityAction::StructuredSafetyFull.as_str(),
+            "structured_safety_full"
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_policy_parsing_defaults_invalid_values_to_legacy() {
+        use std::env::VarError;
+
+        assert_eq!(
+            parse_partial_repaint_complexity_policy(Ok("legacy".to_owned())),
+            (PartialRepaintComplexityPolicy::Legacy, false)
+        );
+        assert_eq!(
+            parse_partial_repaint_complexity_policy(Ok("structured-experimental".to_owned())),
+            (
+                PartialRepaintComplexityPolicy::StructuredExperimental,
+                false
+            )
+        );
+        assert_eq!(
+            parse_partial_repaint_complexity_policy(Err(VarError::NotPresent)),
+            (PartialRepaintComplexityPolicy::Legacy, false)
+        );
+        assert_eq!(
+            parse_partial_repaint_complexity_policy(Ok("structured".to_owned())),
+            (PartialRepaintComplexityPolicy::Legacy, true)
+        );
+        assert_eq!(
+            parse_partial_repaint_complexity_policy(Err(VarError::NotUnicode("invalid".into()))),
+            (PartialRepaintComplexityPolicy::Legacy, true)
+        );
+        assert_eq!(
+            PartialRepaintPlanner::new((100, 100), capabilities()).complexity_policy(),
+            PartialRepaintComplexityPolicy::Legacy
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_legacy_keeps_the_current_fallback_order() {
+        let eight_rects = OutputDamage::rects(
+            200,
+            100,
+            (0..MAX_PARTIAL_REPAINT_RECTS).map(|index| rect(index * 20, 0, 10, 10)),
+        );
+        let eight_plan = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::Legacy,
+            eight_rects.clone(),
+        );
+        assert_eq!(eight_plan.mode, RepaintMode::Partial);
+        assert_eq!(eight_plan.repair_damage, eight_rects);
+
+        let nine_plan = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::Legacy,
+            dense_nine_rects_exactly_two_x(),
+        );
+        assert_eq!(nine_plan.mode, RepaintMode::Full);
+        assert_eq!(
+            nine_plan.fallback_reason,
+            Some(FullRepaintReason::TooManyRectangles)
+        );
+        assert_eq!(
+            nine_plan.complexity_action,
+            PartialRepaintComplexityAction::LegacyFull
+        );
+
+        let large_area = plan_candidate(
+            (100, 100),
+            PartialRepaintComplexityPolicy::Legacy,
+            OutputDamage::rects(100, 100, [rect(0, 0, 75, 100)]),
+        );
+        assert_eq!(large_area.mode, RepaintMode::Full);
+        assert_eq!(
+            large_area.fallback_reason,
+            Some(FullRepaintReason::DamageAreaThreshold)
+        );
+        assert_eq!(
+            large_area.complexity_action,
+            PartialRepaintComplexityAction::LegacyFull
+        );
+
+        let full_damage = plan_candidate(
+            (100, 100),
+            PartialRepaintComplexityPolicy::Legacy,
+            OutputDamage::Full,
+        );
+        assert_eq!(full_damage.mode, RepaintMode::Full);
+        assert_eq!(
+            full_damage.fallback_reason,
+            Some(FullRepaintReason::CurrentDamageFull)
+        );
+        assert_eq!(
+            full_damage.complexity_action,
+            PartialRepaintComplexityAction::NotApplicable
+        );
+
+        let unavailable_pixels = OutputDamage::Rects(vec![
+            rect(0, 0, u32::MAX, u32::MAX),
+            rect(0, 0, u32::MAX, u32::MAX),
+        ]);
+        assert_eq!(
+            decide_partial_repaint_candidate(
+                &unavailable_pixels,
+                (u32::MAX, u32::MAX),
+                PartialRepaintComplexityPolicy::Legacy,
+            ),
+            PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::DamageAreaThreshold,
+                action: PartialRepaintComplexityAction::LegacyFull,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_falls_back_on_unavailable_pixel_arithmetic() {
+        let unavailable_pixels = OutputDamage::Rects(vec![
+            rect(0, 0, u32::MAX, u32::MAX),
+            rect(0, 0, u32::MAX, u32::MAX),
+        ]);
+
+        assert_eq!(
+            decide_partial_repaint_candidate(
+                &unavailable_pixels,
+                (u32::MAX, u32::MAX),
+                PartialRepaintComplexityPolicy::StructuredExperimental,
+            ),
+            PartialRepaintCandidateDecision::Full {
+                reason: FullRepaintReason::DamageAreaThreshold,
+                action: PartialRepaintComplexityAction::StructuredAreaFull,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_keeps_simple_regions() {
+        let candidate = OutputDamage::rects(
+            200,
+            100,
+            (0..MAX_PARTIAL_REPAINT_RECTS).map(|index| rect(index * 20, 0, 10, 10)),
+        );
+        let plan = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            candidate.clone(),
+        );
+
+        assert_eq!(plan.mode, RepaintMode::Partial);
+        assert_eq!(plan.repair_damage, candidate);
+        assert_eq!(
+            plan.complexity_action,
+            PartialRepaintComplexityAction::NotApplicable
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_checks_original_area_before_bbox() {
+        let candidate = OutputDamage::rects(
+            300,
+            300,
+            [0, 105, 210]
+                .into_iter()
+                .flat_map(|x| [0, 105, 210].into_iter().map(move |y| rect(x, y, 90, 90))),
+        );
+        assert_eq!(candidate.rect_count(), 9);
+        let plan = plan_candidate(
+            (300, 300),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            candidate,
+        );
+
+        assert_eq!(plan.mode, RepaintMode::Full);
+        assert_eq!(
+            plan.fallback_reason,
+            Some(FullRepaintReason::DamageAreaThreshold)
+        );
+        assert_eq!(
+            plan.complexity_action,
+            PartialRepaintComplexityAction::StructuredAreaFull
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_uses_a_dense_bbox_at_exactly_two_x() {
+        let plan = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            dense_nine_rects_exactly_two_x(),
+        );
+
+        assert_eq!(plan.mode, RepaintMode::Partial);
+        assert_eq!(
+            plan.repair_damage,
+            OutputDamage::rects(200, 100, [rect(0, 0, 180, 10)])
+        );
+        assert_eq!(
+            plan.complexity_action,
+            PartialRepaintComplexityAction::StructuredBoundingBox
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_preserves_original_when_bbox_crosses_seventy_five_percent()
+     {
+        let candidate = nine_rects_bbox_exactly_seventy_five_percent(120);
+        assert_eq!(candidate.rect_count(), 9);
+        assert_eq!(candidate.pixels(200, 100), Some(8_100));
+        let plan = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            candidate.clone(),
+        );
+
+        assert_eq!(plan.mode, RepaintMode::Partial);
+        assert_eq!(plan.repair_damage, candidate);
+        assert_eq!(
+            plan.complexity_action,
+            PartialRepaintComplexityAction::StructuredManyRectangles
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_preserves_original_for_sparse_bbox() {
+        let candidate =
+            OutputDamage::rects(250, 10, (0..9).map(|index| rect(index * 30, 0, 10, 10)));
+        let plan = plan_candidate(
+            (250, 10),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            candidate.clone(),
+        );
+
+        assert_eq!(plan.mode, RepaintMode::Partial);
+        assert_eq!(plan.repair_damage, candidate);
+        assert_eq!(
+            plan.complexity_action,
+            PartialRepaintComplexityAction::StructuredManyRectangles
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_obeys_safety_and_area_boundaries() {
+        let at_safety_bound = OutputDamage::rects(
+            256,
+            100,
+            (0..oblivion_one::effects::MAX_EFFECT_REGION_RECTS)
+                .map(|index| rect((index * 2) as i32, 0, 1, 1)),
+        );
+        assert_eq!(at_safety_bound.rect_count(), 128);
+        let at_bound = plan_candidate(
+            (256, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            at_safety_bound,
+        );
+        assert_eq!(at_bound.mode, RepaintMode::Partial);
+
+        let above_safety_bound = OutputDamage::rects(
+            258,
+            100,
+            (0..=oblivion_one::effects::MAX_EFFECT_REGION_RECTS)
+                .map(|index| rect((index * 2) as i32, 0, 1, 1)),
+        );
+        assert_eq!(above_safety_bound.rect_count(), 129);
+        let over_bound = plan_candidate(
+            (258, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            above_safety_bound,
+        );
+        assert_eq!(over_bound.mode, RepaintMode::Full);
+        assert_eq!(
+            over_bound.fallback_reason,
+            Some(FullRepaintReason::TooManyRectangles)
+        );
+        assert_eq!(
+            over_bound.complexity_action,
+            PartialRepaintComplexityAction::StructuredSafetyFull
+        );
+
+        let just_below_area = plan_candidate(
+            (100, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            OutputDamage::rects(100, 100, [rect(0, 0, 74, 100)]),
+        );
+        assert_eq!(just_below_area.mode, RepaintMode::Partial);
+        assert_eq!(just_below_area.repair_damage.pixels(100, 100), Some(7_400));
+        let at_area = plan_candidate(
+            (100, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            OutputDamage::rects(100, 100, [rect(0, 0, 75, 100)]),
+        );
+        assert_eq!(at_area.mode, RepaintMode::Full);
+        assert_eq!(
+            at_area.complexity_action,
+            PartialRepaintComplexityAction::StructuredAreaFull
+        );
+    }
+
+    #[test]
+    fn partial_repaint_complexity_structured_checks_bbox_density_and_strict_area() {
+        let just_above_two_x = OutputDamage::rects(
+            200,
+            100,
+            [0, 20, 40, 60, 80, 100, 120, 140, 171]
+                .into_iter()
+                .map(|x| rect(x, 0, 10, 10)),
+        );
+        let density_rejected = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            just_above_two_x.clone(),
+        );
+        assert_eq!(density_rejected.mode, RepaintMode::Partial);
+        assert_eq!(density_rejected.repair_damage, just_above_two_x);
+        assert_eq!(
+            density_rejected.complexity_action,
+            PartialRepaintComplexityAction::StructuredManyRectangles
+        );
+
+        let bbox_just_below_seventy_five = nine_rects_bbox_exactly_seventy_five_percent(119);
+        let accepted = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            bbox_just_below_seventy_five,
+        );
+        assert_eq!(accepted.mode, RepaintMode::Partial);
+        assert_eq!(
+            accepted.repair_damage,
+            OutputDamage::rects(200, 100, [rect(0, 0, 149, 100)])
+        );
+        assert_eq!(
+            accepted.complexity_action,
+            PartialRepaintComplexityAction::StructuredBoundingBox
+        );
+
+        let bbox_exactly_seventy_five = nine_rects_bbox_exactly_seventy_five_percent(120);
+        assert_eq!(bbox_exactly_seventy_five.pixels(200, 100), Some(8_100));
+        let preserved = plan_candidate(
+            (200, 100),
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            bbox_exactly_seventy_five.clone(),
+        );
+        assert_eq!(preserved.mode, RepaintMode::Partial);
+        assert_eq!(preserved.repair_damage, bbox_exactly_seventy_five);
+        assert_eq!(
+            preserved.complexity_action,
+            PartialRepaintComplexityAction::StructuredManyRectangles
+        );
+    }
+}
+
 impl PartialRepaintPlanner {
     pub(crate) fn new(
         output_size: (u32, u32),
         capabilities: EglPartialRepaintCapabilities,
+    ) -> Self {
+        Self::new_with_policy(
+            output_size,
+            capabilities,
+            PartialRepaintComplexityPolicy::Legacy,
+        )
+    }
+
+    pub(crate) fn new_configured(
+        output_size: (u32, u32),
+        capabilities: EglPartialRepaintCapabilities,
+    ) -> Self {
+        Self::new_with_policy(
+            output_size,
+            capabilities,
+            configured_partial_repaint_complexity_policy(),
+        )
+    }
+
+    pub(crate) fn new_with_policy(
+        output_size: (u32, u32),
+        capabilities: EglPartialRepaintCapabilities,
+        complexity_policy: PartialRepaintComplexityPolicy,
     ) -> Self {
         Self {
             output_size,
@@ -821,7 +1491,12 @@ impl PartialRepaintPlanner {
             capabilities,
             force_full: force_full_repaint_enabled(),
             partial_enabled: true,
+            complexity_policy,
         }
+    }
+
+    pub(crate) const fn complexity_policy(&self) -> PartialRepaintComplexityPolicy {
+        self.complexity_policy
     }
 
     pub(crate) fn plan(&mut self, current_damage: OutputDamage, age: BufferAge) -> RepaintPlan {
@@ -829,8 +1504,8 @@ impl PartialRepaintPlanner {
     }
 
     /// Trace-only planner entry point that observes the repair candidate at
-    /// the exact point where the ordinary planner would otherwise replace it
-    /// with `OutputDamage::Full`.
+    /// the point where the legacy reference policy would replace it with
+    /// `OutputDamage::Full`, regardless of the selected actual policy.
     pub(crate) fn plan_with_damage_complexity_shadow(
         &mut self,
         current_damage: OutputDamage,
@@ -868,6 +1543,8 @@ impl PartialRepaintPlanner {
                 buffer_age: age_value(age),
                 mode: RepaintMode::Skip,
                 fallback_reason: None,
+                complexity_policy: self.complexity_policy,
+                complexity_action: PartialRepaintComplexityAction::NotApplicable,
             };
         }
         if current_damage == OutputDamage::Full {
@@ -965,20 +1642,53 @@ impl PartialRepaintPlanner {
                 buffer_age: Some(age),
                 mode: RepaintMode::Skip,
                 fallback_reason: None,
+                complexity_policy: self.complexity_policy,
+                complexity_action: PartialRepaintComplexityAction::NotApplicable,
             };
         }
-        if let Some(reason) = partial_repaint_fallback_reason(&repair_damage, self.output_size) {
-            if let Some(observe) = observe_complexity_fallback.as_deref_mut() {
-                observe(&repair_damage, reason);
-            }
-            return self.full_plan(current_damage, Some(age), reason);
+        if let Some(observe) = observe_complexity_fallback.as_deref_mut()
+            && matches!(
+                decide_partial_repaint_candidate(
+                    &repair_damage,
+                    self.output_size,
+                    PartialRepaintComplexityPolicy::Legacy,
+                ),
+                PartialRepaintCandidateDecision::Full {
+                    reason: FullRepaintReason::TooManyRectangles,
+                    ..
+                }
+            )
+        {
+            observe(&repair_damage, FullRepaintReason::TooManyRectangles);
         }
-        RepaintPlan {
-            render_damage: current_damage,
-            repair_damage,
-            buffer_age: Some(age),
-            mode: RepaintMode::Partial,
-            fallback_reason: None,
+        match decide_partial_repaint_candidate(
+            &repair_damage,
+            self.output_size,
+            self.complexity_policy,
+        ) {
+            PartialRepaintCandidateDecision::KeepOriginal { action } => RepaintPlan {
+                render_damage: current_damage,
+                repair_damage,
+                buffer_age: Some(age),
+                mode: RepaintMode::Partial,
+                fallback_reason: None,
+                complexity_policy: self.complexity_policy,
+                complexity_action: action,
+            },
+            PartialRepaintCandidateDecision::UseBoundingBox { bbox, action } => RepaintPlan {
+                render_damage: current_damage,
+                repair_damage: OutputDamage::Rects(vec![bbox]),
+                buffer_age: Some(age),
+                mode: RepaintMode::Partial,
+                fallback_reason: None,
+                complexity_policy: self.complexity_policy,
+                complexity_action: action,
+            },
+            PartialRepaintCandidateDecision::Full { reason, action } => {
+                let mut plan = self.full_plan(current_damage, Some(age), reason);
+                plan.complexity_action = action;
+                plan
+            }
         }
     }
 
@@ -987,13 +1697,31 @@ impl PartialRepaintPlanner {
         plan: &mut RepaintPlan,
         repair_damage: OutputDamage,
     ) {
-        if plan.mode == RepaintMode::Partial
-            && let Some(reason) = partial_repaint_fallback_reason(&repair_damage, self.output_size)
-        {
-            plan.repair_damage = OutputDamage::Full;
-            plan.mode = RepaintMode::Full;
-            plan.fallback_reason = Some(reason);
+        plan.complexity_policy = self.complexity_policy;
+        if plan.mode == RepaintMode::Partial {
+            match decide_partial_repaint_candidate(
+                &repair_damage,
+                self.output_size,
+                self.complexity_policy,
+            ) {
+                PartialRepaintCandidateDecision::KeepOriginal { action } => {
+                    plan.repair_damage = repair_damage;
+                    plan.complexity_action = action;
+                }
+                PartialRepaintCandidateDecision::UseBoundingBox { bbox, action } => {
+                    plan.repair_damage = OutputDamage::Rects(vec![bbox]);
+                    plan.complexity_action = action;
+                }
+                PartialRepaintCandidateDecision::Full { reason, action } => {
+                    plan.repair_damage = OutputDamage::Full;
+                    plan.mode = RepaintMode::Full;
+                    plan.fallback_reason = Some(reason);
+                    plan.complexity_action = action;
+                }
+            }
         } else {
+            // Preserve the existing behavior for callers that provide a
+            // non-partial plan: update the damage without reclassifying it.
             plan.repair_damage = repair_damage;
         }
     }
@@ -1010,6 +1738,8 @@ impl PartialRepaintPlanner {
             buffer_age,
             mode: RepaintMode::Full,
             fallback_reason: Some(reason),
+            complexity_policy: self.complexity_policy,
+            complexity_action: PartialRepaintComplexityAction::NotApplicable,
         }
     }
 

@@ -20,7 +20,19 @@ fn partial_planner(
     output_size: (u32, u32),
     capabilities: EglPartialRepaintCapabilities,
 ) -> PartialRepaintPlanner {
-    let mut planner = PartialRepaintPlanner::new(output_size, capabilities);
+    partial_planner_with_policy(
+        output_size,
+        capabilities,
+        PartialRepaintComplexityPolicy::Legacy,
+    )
+}
+
+fn partial_planner_with_policy(
+    output_size: (u32, u32),
+    capabilities: EglPartialRepaintCapabilities,
+    policy: PartialRepaintComplexityPolicy,
+) -> PartialRepaintPlanner {
+    let mut planner = PartialRepaintPlanner::new_with_policy(output_size, capabilities, policy);
     planner.partial_enabled = true;
     planner
 }
@@ -404,6 +416,16 @@ fn graph_for_effect_instances(
     ))
 }
 
+fn empty_effect_graph() -> oblivion_one::effects::CompiledFrameGraph {
+    oblivion_one::effects::CompiledFrameGraph {
+        passes: Vec::new(),
+        textures: Vec::new(),
+        instances: Vec::new(),
+        final_damage: oblivion_one::effects::EffectRegion::empty(),
+        stats: Default::default(),
+    }
+}
+
 fn graph_with_instance_regions(
     instances: impl IntoIterator<
         Item = (
@@ -598,6 +620,7 @@ fn effect_execution_repair_demand_converges_across_forward_consumers() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
@@ -641,6 +664,7 @@ fn effect_execution_repair_demand_converges_across_multiple_forward_hops() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
@@ -671,6 +695,7 @@ fn stable_effect_execution_demand_keeps_partial_repair_unchanged() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
@@ -692,6 +717,7 @@ fn conservative_effect_execution_metadata_forces_full_repair() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
@@ -737,6 +763,7 @@ fn threshold_full_recomputes_effect_demand_from_full_repair() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
@@ -892,6 +919,7 @@ fn execution_repair_preserves_partial_area_threshold() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     planner.apply_execution_repair(
@@ -904,6 +932,134 @@ fn execution_repair_preserves_partial_area_threshold() {
     assert_eq!(
         plan.fallback_reason,
         Some(FullRepaintReason::DamageAreaThreshold)
+    );
+}
+
+#[test]
+fn effect_execution_repair_keeps_structured_many_rectangle_plan_partial() {
+    let mut planner = partial_planner_with_policy(
+        (100, 100),
+        partial_capabilities(),
+        PartialRepaintComplexityPolicy::StructuredExperimental,
+    );
+    planner.commit_presented_transition(OutputDamage::Empty);
+    let candidate = OutputDamage::rects(
+        100,
+        100,
+        (0..6).flat_map(|y| (0..6).map(move |x| rect(x * 14, y * 14, 4, 4))),
+    );
+    let mut plan = planner.plan(candidate.clone(), BufferAge::Value(1));
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.repair_damage, candidate);
+    assert_eq!(plan.repair_damage.rect_count(), 36);
+
+    let graph = empty_effect_graph();
+    resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 100);
+
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.repair_damage.rect_count(), 36);
+    assert_eq!(
+        plan.complexity_action,
+        PartialRepaintComplexityAction::StructuredManyRectangles
+    );
+}
+
+#[test]
+fn effect_execution_repair_promotes_structured_plan_at_area_threshold() {
+    let mut planner = partial_planner_with_policy(
+        (100, 100),
+        partial_capabilities(),
+        PartialRepaintComplexityPolicy::StructuredExperimental,
+    );
+    planner.commit_presented_transition(OutputDamage::Empty);
+    let mut plan = planner.plan(
+        OutputDamage::rects(100, 100, [rect(1, 1, 2, 2)]),
+        BufferAge::Value(1),
+    );
+    assert_eq!(plan.mode, RepaintMode::Partial);
+
+    let graph = graph_for_effect_region(
+        1,
+        oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 90, 90)),
+    );
+    resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 100);
+
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::DamageAreaThreshold)
+    );
+    assert_eq!(
+        plan.complexity_action,
+        PartialRepaintComplexityAction::StructuredAreaFull
+    );
+}
+
+#[test]
+fn effect_execution_repair_promotes_structured_plan_above_safety_bound() {
+    let planner = partial_planner_with_policy(
+        (258, 100),
+        partial_capabilities(),
+        PartialRepaintComplexityPolicy::StructuredExperimental,
+    );
+    let initial = OutputDamage::rects(258, 100, [rect(0, 0, 1, 1)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(1),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        complexity_policy: PartialRepaintComplexityPolicy::StructuredExperimental,
+        complexity_action: PartialRepaintComplexityAction::NotApplicable,
+    };
+    let grew_beyond_bound = OutputDamage::Rects(
+        (0..=oblivion_one::effects::MAX_EFFECT_REGION_RECTS)
+            .map(|index| rect((index * 2) as i32, 0, 1, 1))
+            .collect(),
+    );
+
+    planner.apply_execution_repair(&mut plan, grew_beyond_bound);
+
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::TooManyRectangles)
+    );
+    assert_eq!(
+        plan.complexity_action,
+        PartialRepaintComplexityAction::StructuredSafetyFull
+    );
+}
+
+#[test]
+fn structured_policy_keeps_conservative_effect_execution_authoritative() {
+    let planner = partial_planner_with_policy(
+        (100, 80),
+        partial_capabilities(),
+        PartialRepaintComplexityPolicy::StructuredExperimental,
+    );
+    let render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: render_damage.clone(),
+        repair_damage: render_damage,
+        buffer_age: Some(1),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        complexity_policy: PartialRepaintComplexityPolicy::StructuredExperimental,
+        complexity_action: PartialRepaintComplexityAction::NotApplicable,
+    };
+    let graph = graph_for_effect_instances([(1, 30, 10, 10, 10, vec![99])]);
+
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+
+    assert!(demand.is_conservative_full());
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::EffectExecutionConservative)
     );
 }
 
@@ -1349,6 +1505,7 @@ fn render_execution_plan_clears_each_partial_scissor_and_restores_state() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     assert_eq!(
@@ -1370,6 +1527,7 @@ fn skipped_plan_has_no_gl_execution() {
         buffer_age: Some(1),
         mode: RepaintMode::Skip,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     assert_eq!(
@@ -1640,6 +1798,7 @@ fn partial_render_execution_uses_scanout_damage_rows() {
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
 
     assert_eq!(

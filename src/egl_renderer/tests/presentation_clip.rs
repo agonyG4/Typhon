@@ -260,6 +260,7 @@ fn real_gles_blur_effects_keep_kernel_source_and_clip_final_contribution() {
         buffer_age: None,
         mode: RepaintMode::Full,
         fallback_reason: None,
+        ..RepaintPlan::default()
     };
     for anchor in [
         oblivion_one::compositor::EffectAnchor::BeforeSurface(owner_root),

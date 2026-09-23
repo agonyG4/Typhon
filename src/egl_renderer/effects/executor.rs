@@ -421,6 +421,7 @@ pub(crate) struct EffectExecutionStats {
     pub replay_capture_materialization_rects: usize,
     pub replay_capture_execution_regions: usize,
     pub replay_capture_disjoint_overflows: usize,
+    pub scene_replay_work_overflow_fallbacks: usize,
     pub replay_capture_command_region_pairs: usize,
     pub replay_capture_scene_scan_pairs: usize,
     pub replay_capture_planner_commands_visited: usize,
@@ -1809,6 +1810,8 @@ fn execute_graph_passes_inner(
         }
         renderer.establish_ordinary_scene_state();
         stats.instances = selection.executed_instances.len();
+        stats.scene_replay_work_overflow_fallbacks =
+            scene_work_state.normalization_overflow_fallbacks;
         Ok(stats)
     })();
     let cleanup_result = if let Some(preservation) = scene_work_preservation.take() {
@@ -4527,6 +4530,7 @@ struct SceneReplayWorkPlan {
     extra_scene_work: Vec<OutputRect>,
     checkpoint_requirements: Vec<SceneCheckpointRequirement>,
     output_size: (u32, u32),
+    normalization_overflow_fallbacks: usize,
 }
 
 impl SceneReplayWorkPlan {
@@ -4538,8 +4542,10 @@ impl SceneReplayWorkPlan {
         let checkpoint_work = checkpoint_requirements
             .iter()
             .flat_map(|requirement| requirement.region.iter().copied());
-        let baseline_work =
+        let normalized =
             normalize_scene_replay_work(&presentation_work, checkpoint_work, output_size);
+        let baseline_work = normalized.rects;
+        let normalization_overflow_fallbacks = if normalized.overflow_fallback { 1 } else { 0 };
         let extra_scene_work = extra_scene_work(&baseline_work, &presentation_work);
         Self {
             presentation_work,
@@ -4547,6 +4553,7 @@ impl SceneReplayWorkPlan {
             extra_scene_work,
             checkpoint_requirements,
             output_size,
+            normalization_overflow_fallbacks,
         }
     }
 }
@@ -4556,6 +4563,7 @@ struct SceneReplayWorkState<'a> {
     mode: SceneReplayWorkMode,
     pending_capture_passes: Vec<GraphPassId>,
     active_work: Vec<OutputRect>,
+    normalization_overflow_fallbacks: usize,
 }
 
 impl<'a> SceneReplayWorkState<'a> {
@@ -4565,21 +4573,28 @@ impl<'a> SceneReplayWorkState<'a> {
             .iter()
             .map(|requirement| requirement.capture_pass)
             .collect::<Vec<_>>();
+        let mut normalization_overflow_fallbacks = plan.normalization_overflow_fallbacks;
         let active_work = match mode {
             SceneReplayWorkMode::GlobalBaseline => plan.baseline_work.clone(),
-            SceneReplayWorkMode::SuffixDemand => normalize_scene_replay_work(
-                &plan.presentation_work,
-                plan.checkpoint_requirements
-                    .iter()
-                    .flat_map(|requirement| requirement.region.iter().copied()),
-                output_size_for_work_plan(plan),
-            ),
+            SceneReplayWorkMode::SuffixDemand => {
+                let normalized = normalize_scene_replay_work(
+                    &plan.presentation_work,
+                    plan.checkpoint_requirements
+                        .iter()
+                        .flat_map(|requirement| requirement.region.iter().copied()),
+                    output_size_for_work_plan(plan),
+                );
+                normalization_overflow_fallbacks = normalization_overflow_fallbacks
+                    .saturating_add(if normalized.overflow_fallback { 1 } else { 0 });
+                normalized.rects
+            }
         };
         Self {
             plan,
             mode,
             pending_capture_passes,
             active_work,
+            normalization_overflow_fallbacks,
         }
     }
 
@@ -4602,7 +4617,7 @@ impl<'a> SceneReplayWorkState<'a> {
         let previous = self.active_work.clone();
         self.pending_capture_passes.remove(index);
         if self.mode == SceneReplayWorkMode::SuffixDemand {
-            self.active_work = normalize_scene_replay_work(
+            let normalized = normalize_scene_replay_work(
                 &self.plan.presentation_work,
                 self.plan
                     .checkpoint_requirements
@@ -4614,6 +4629,10 @@ impl<'a> SceneReplayWorkState<'a> {
                     .flat_map(|requirement| requirement.region.iter().copied()),
                 output_size_for_work_plan(self.plan),
             );
+            self.normalization_overflow_fallbacks = self
+                .normalization_overflow_fallbacks
+                .saturating_add(if normalized.overflow_fallback { 1 } else { 0 });
+            self.active_work = normalized.rects;
             debug_assert!(
                 output_rects_to_effect_region(&self.active_work)
                     .subtract(&output_rects_to_effect_region(&previous))
@@ -4659,11 +4678,16 @@ fn output_size_for_work_plan(plan: &SceneReplayWorkPlan) -> (u32, u32) {
     plan.output_size
 }
 
+struct NormalizedSceneReplayWork {
+    rects: Vec<OutputRect>,
+    overflow_fallback: bool,
+}
+
 fn normalize_scene_replay_work(
     presentation_work: &[OutputRect],
     checkpoint_work: impl IntoIterator<Item = OutputRect>,
     output_size: (u32, u32),
-) -> Vec<OutputRect> {
+) -> NormalizedSceneReplayWork {
     let mut rects = presentation_work.to_vec();
     rects.extend(checkpoint_work);
     let coalesced = OutputDamage::rects(output_size.0, output_size.1, rects);
@@ -4672,7 +4696,11 @@ fn normalize_scene_replay_work(
         OutputDamage::Full => vec![full_output_rect(output_size)],
         OutputDamage::Rects(rects) => rects,
     };
-    disjoint_output_rects(rects, output_size)
+    let (rects, overflow_fallback) = disjoint_output_rects_with_overflow(rects, output_size);
+    NormalizedSceneReplayWork {
+        rects,
+        overflow_fallback,
+    }
 }
 
 fn extra_scene_work(
@@ -4735,6 +4763,13 @@ fn scene_replay_work_plan(
 }
 
 fn disjoint_output_rects(rects: Vec<OutputRect>, output_size: (u32, u32)) -> Vec<OutputRect> {
+    disjoint_output_rects_with_overflow(rects, output_size).0
+}
+
+fn disjoint_output_rects_with_overflow(
+    rects: Vec<OutputRect>,
+    output_size: (u32, u32),
+) -> (Vec<OutputRect>, bool) {
     let mut disjoint = Vec::new();
     for source in rects {
         let mut fragments = vec![source];
@@ -4750,10 +4785,10 @@ fn disjoint_output_rects(rects: Vec<OutputRect>, output_size: (u32, u32)) -> Vec
         }
         disjoint.extend(fragments);
         if disjoint.len() > MAX_EFFECT_REGION_RECTS {
-            return vec![full_output_rect(output_size)];
+            return (vec![full_output_rect(output_size)], true);
         }
     }
-    disjoint
+    (disjoint, false)
 }
 
 fn subtract_output_rect(source: OutputRect, excluded: OutputRect) -> Vec<OutputRect> {
@@ -8110,6 +8145,7 @@ mod tests {
             buffer_age: Some(2),
             mode: RepaintMode::Partial,
             fallback_reason: None,
+            ..RepaintPlan::default()
         };
         let demand =
             resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut repaint_plan, 100, 80);
@@ -8141,6 +8177,96 @@ mod tests {
         requirements: &[SceneCheckpointRequirement],
     ) -> SceneReplayWorkPlan {
         SceneReplayWorkPlan::new(presentation.to_vec(), requirements.to_vec(), (100, 100))
+    }
+
+    #[test]
+    fn structured_repaint_36_and_60_rects_reach_scene_replay_state() {
+        use crate::egl_renderer::damage::{
+            BufferAge, EglPartialRepaintCapabilities, OutputDamage, PartialRepaintComplexityPolicy,
+            PartialRepaintPlanner, RepaintMode,
+        };
+
+        let output_size = (400, 300);
+        for rect_count in [36, 60] {
+            let candidate = OutputDamage::rects(
+                output_size.0,
+                output_size.1,
+                (0..rect_count).map(|index| {
+                    let x = (index % 10) * 30;
+                    let y = (index / 10) * 30;
+                    OutputRect::new(x as i32, y as i32, 2, 2)
+                }),
+            );
+            assert_eq!(candidate.rect_count(), rect_count);
+            let mut planner = PartialRepaintPlanner::new_with_policy(
+                output_size,
+                EglPartialRepaintCapabilities {
+                    buffer_age: true,
+                    partial_render_repair: true,
+                    swap_buffers_with_damage: true,
+                },
+                PartialRepaintComplexityPolicy::StructuredExperimental,
+            );
+            planner.commit_presented_transition(OutputDamage::Empty);
+            let plan = planner.plan(candidate, BufferAge::Value(1));
+            assert_eq!(plan.mode, RepaintMode::Partial);
+            assert_eq!(plan.repair_damage.rect_count(), rect_count);
+
+            let presentation =
+                super::super::super::repaint_plan_output_rects(&plan, output_size.0, output_size.1);
+            assert_eq!(presentation.len(), rect_count);
+            assert_ne!(presentation, vec![full_output_rect(output_size)]);
+
+            let work_plan = SceneReplayWorkPlan::new(presentation.clone(), Vec::new(), output_size);
+            assert_eq!(work_plan.baseline_work, presentation);
+            let work_state =
+                SceneReplayWorkState::new(&work_plan, SceneReplayWorkMode::SuffixDemand);
+            assert_eq!(work_state.active_work().len(), rect_count);
+            assert_eq!(work_state.normalization_overflow_fallbacks, 0);
+        }
+    }
+
+    #[test]
+    fn scene_replay_normalization_counts_fragmentation_overflow_fallbacks() {
+        use crate::egl_renderer::damage::{
+            BufferAge, EglPartialRepaintCapabilities, OutputDamage, PartialRepaintComplexityAction,
+            PartialRepaintComplexityPolicy, PartialRepaintPlanner, RepaintMode,
+        };
+
+        let output_size = (386, 2);
+        let candidate = OutputDamage::rects(
+            output_size.0,
+            output_size.1,
+            (0..MAX_EFFECT_REGION_RECTS).map(|index| OutputRect::new((index * 3) as i32, 0, 1, 1)),
+        );
+        let mut planner = PartialRepaintPlanner::new_with_policy(
+            output_size,
+            EglPartialRepaintCapabilities {
+                buffer_age: true,
+                partial_render_repair: true,
+                swap_buffers_with_damage: true,
+            },
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+        );
+        planner.commit_presented_transition(OutputDamage::Empty);
+        let plan = planner.plan(candidate, BufferAge::Value(1));
+        assert_eq!(plan.mode, RepaintMode::Partial);
+        assert_eq!(plan.repair_damage.rect_count(), MAX_EFFECT_REGION_RECTS);
+        assert_eq!(
+            plan.complexity_action,
+            PartialRepaintComplexityAction::StructuredManyRectangles
+        );
+
+        let presentation =
+            super::super::super::repaint_plan_output_rects(&plan, output_size.0, output_size.1);
+        let requirement = test_checkpoint_requirement(1, &[OutputRect::new(384, 0, 1, 1)]);
+        let work_plan = SceneReplayWorkPlan::new(presentation, vec![requirement], output_size);
+        assert_eq!(work_plan.baseline_work, vec![full_output_rect(output_size)]);
+        assert_eq!(work_plan.normalization_overflow_fallbacks, 1);
+
+        let work_state = SceneReplayWorkState::new(&work_plan, SceneReplayWorkMode::SuffixDemand);
+        assert_eq!(work_state.active_work(), &[full_output_rect(output_size)]);
+        assert_eq!(work_state.normalization_overflow_fallbacks, 2);
     }
 
     fn assert_same_output_region(actual: &[OutputRect], expected: &[OutputRect]) {

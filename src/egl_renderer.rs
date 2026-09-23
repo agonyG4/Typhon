@@ -44,7 +44,8 @@ mod program;
 
 pub(crate) use damage::{
     BufferAge, EglPartialRepaintCapabilities, FullRepaintReason, OutputDamage, OutputRect,
-    PartialRepaintPlanner, RepaintMode, render_target_buffer_age,
+    PartialRepaintComplexityAction, PartialRepaintComplexityPolicy, PartialRepaintPlanner,
+    RepaintMode, render_target_buffer_age,
 };
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
@@ -375,6 +376,8 @@ pub(crate) struct GlesSceneFrameStats {
     pub dmabuf_cache_max_entries_for_one_surface: usize,
     pub shm_full_resyncs: usize,
     pub repaint_mode: RepaintMode,
+    pub partial_repaint_complexity_policy: PartialRepaintComplexityPolicy,
+    pub partial_repaint_complexity_action: PartialRepaintComplexityAction,
     pub buffer_age: Option<u32>,
     pub current_damage_rects: usize,
     pub current_damage_pixels: u64,
@@ -395,6 +398,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub planner_early_terminations: usize,
     pub effect_fallbacks: usize,
     pub region_fragmentation_overflow_fallbacks: usize,
+    pub scene_replay_work_overflow_fallbacks: usize,
     pub peak_region_piece_count: usize,
     pub texture_binds: usize,
     pub draw_calls: usize,
@@ -501,6 +505,7 @@ impl EglSceneFrameCommit {
                 buffer_age: None,
                 mode: RepaintMode::Skip,
                 fallback_reason: None,
+                ..RepaintPlan::default()
             },
             damage_state: EglPresentedDamageState::empty_for_test(),
             scene_key: EglSceneCacheKey {
@@ -1340,7 +1345,7 @@ impl GlesSceneRenderer {
             decoration_resources: HashMap::new(),
             egl_image_target_texture_2d,
             damage_tracker: EglOutputDamageTracker::with_cursor_image(cursor_image),
-            repaint_planner: PartialRepaintPlanner::new(
+            repaint_planner: PartialRepaintPlanner::new_configured(
                 (width, height),
                 partial_repaint_capabilities,
             ),
@@ -2303,6 +2308,8 @@ impl GlesSceneRenderer {
                     Ok(execution_stats) => {
                         self.frame_stats.effect_instances_executed = execution_stats.instances;
                         self.frame_stats.effect_passes_executed = execution_stats.passes;
+                        self.frame_stats.scene_replay_work_overflow_fallbacks =
+                            execution_stats.scene_replay_work_overflow_fallbacks;
                         self.frame_stats.blur_downsample_passes = execution_stats.blur_downsamples;
                         self.frame_stats.blur_upsample_passes = execution_stats.blur_upsamples;
                         self.frame_stats.effect_capture_pixels_executed =
@@ -2392,6 +2399,8 @@ impl GlesSceneRenderer {
     fn record_repaint_stats(&mut self, plan: &RepaintPlan) {
         let (width, height) = self.current_size;
         self.frame_stats.repaint_mode = plan.mode;
+        self.frame_stats.partial_repaint_complexity_policy = plan.complexity_policy;
+        self.frame_stats.partial_repaint_complexity_action = plan.complexity_action;
         self.frame_stats.buffer_age = plan.buffer_age;
         self.frame_stats.current_damage_rects = plan.render_damage.rect_count();
         self.frame_stats.current_damage_pixels =
@@ -7278,6 +7287,69 @@ mod tests {
     }
 
     #[test]
+    fn structured_partial_repaint_updates_every_repair_scissor_only() {
+        let mut harness = GlesEffectTestHarness::new(8, 6);
+        harness.install_texture_backed_output();
+        let rects = [
+            OutputRect::new(0, 0, 1, 1),
+            OutputRect::new(3, 0, 1, 1),
+            OutputRect::new(6, 0, 1, 1),
+            OutputRect::new(0, 2, 1, 1),
+            OutputRect::new(3, 2, 1, 1),
+            OutputRect::new(6, 2, 1, 1),
+            OutputRect::new(0, 4, 1, 1),
+            OutputRect::new(3, 4, 1, 1),
+            OutputRect::new(6, 4, 1, 1),
+        ];
+        let repair_damage = OutputDamage::rects(8, 6, rects);
+        assert_eq!(repair_damage.rect_count(), 9);
+        unsafe {
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness.gl.clear_color(1.0, 0.0, 0.0, 1.0);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        let plan = RepaintPlan {
+            render_damage: repair_damage.clone(),
+            repair_damage,
+            buffer_age: Some(1),
+            mode: RepaintMode::Partial,
+            fallback_reason: None,
+            complexity_policy: PartialRepaintComplexityPolicy::StructuredExperimental,
+            complexity_action: PartialRepaintComplexityAction::StructuredManyRectangles,
+        };
+
+        let executed_rects = harness
+            .renderer
+            .begin_effect_repaint(&plan, OutputFramebufferOrigin::BottomLeft)
+            .expect("structured partial repaint clears each repair rect");
+        let pixels = read_effect_test_pixels(&harness.gl, 8, 6);
+
+        assert_eq!(executed_rects.len(), 9);
+        for gl_y in 0..6 {
+            let logical_y = 5 - gl_y;
+            for x in 0..8 {
+                let repaired = rects.iter().any(|rect| {
+                    x >= rect.x as u32
+                        && x < rect.x as u32 + rect.width
+                        && logical_y >= rect.y as u32
+                        && logical_y < rect.y as u32 + rect.height
+                });
+                assert_effect_test_pixel(
+                    &pixels,
+                    8,
+                    x,
+                    gl_y,
+                    if repaired {
+                        [0, 0, 0, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ordinary_egl_presentation_opacity_resolves_owner_values() {
         let scene_node_id =
             oblivion_one::core::SceneNodeId::from_raw(1).expect("presentation scene node");
@@ -8369,6 +8441,7 @@ mod tests {
                 RepaintMode::Partial
             },
             fallback_reason: None,
+            ..RepaintPlan::default()
         }
     }
 
@@ -10909,6 +10982,7 @@ mod tests {
             buffer_age: None,
             mode: RepaintMode::Full,
             fallback_reason: None,
+            ..RepaintPlan::default()
         };
         let mut first_dimensions = None;
         let mut first_cache_bytes = None;
@@ -11078,6 +11152,7 @@ mod tests {
             buffer_age: None,
             mode: RepaintMode::Full,
             fallback_reason: None,
+            ..RepaintPlan::default()
         };
         let visual_group = VisualGroupId::new(9).expect("visual group id");
         let (_, registry) = moving_blur_scene(output_bounds);
@@ -11286,6 +11361,7 @@ mod tests {
             buffer_age: None,
             mode: RepaintMode::Full,
             fallback_reason: None,
+            ..RepaintPlan::default()
         };
         let plan = oblivion_one::effects::compile_frame_execution_plan(
             &scene,
@@ -11483,6 +11559,7 @@ mod tests {
             buffer_age: None,
             mode: RepaintMode::Full,
             fallback_reason: None,
+            ..RepaintPlan::default()
         };
         let plan = oblivion_one::effects::compile_frame_execution_plan(
             &scene,

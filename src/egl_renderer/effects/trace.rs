@@ -4,7 +4,8 @@ use std::{collections::HashMap, ffi::OsStr, sync::OnceLock};
 use std::cell::RefCell;
 
 use crate::egl_renderer::damage::{
-    DamageComplexityShadow, FullRepaintReason, OutputDamage, RepaintMode, RepaintPlan,
+    DamageComplexityShadow, FullRepaintReason, OutputDamage, PartialRepaintComplexityAction,
+    PartialRepaintComplexityPolicy, RepaintMode, RepaintPlan,
 };
 
 use oblivion_one::effects::{
@@ -320,6 +321,8 @@ impl DamageTraceSnapshot {
 pub(crate) struct RepaintPlanTraceSnapshot {
     pub(crate) mode: RepaintMode,
     pub(crate) fallback_reason: Option<FullRepaintReason>,
+    pub(crate) complexity_policy: PartialRepaintComplexityPolicy,
+    pub(crate) complexity_action: PartialRepaintComplexityAction,
     pub(crate) buffer_age: Option<u32>,
     pub(crate) render_damage: DamageTraceSnapshot,
     pub(crate) repair_damage: DamageTraceSnapshot,
@@ -330,6 +333,8 @@ impl RepaintPlanTraceSnapshot {
         Self {
             mode: plan.mode,
             fallback_reason: plan.fallback_reason,
+            complexity_policy: plan.complexity_policy,
+            complexity_action: plan.complexity_action,
             buffer_age: plan.buffer_age,
             render_damage: DamageTraceSnapshot::from_damage(
                 &plan.render_damage,
@@ -426,7 +431,7 @@ impl EffectRepaintProvenanceSnapshot {
                 (bbox.x, bbox.y, bbox.width, bbox.height)
             });
         format!(
-            "event=effect_repaint_provenance frame_id={} input_damage_kind={} input_damage_rects={} input_damage_pixels={} scene_damage_kind={} scene_damage_rects={} scene_damage_pixels={} merged_damage_kind={} merged_damage_rects={} merged_damage_pixels={} initial_repaint_mode={} initial_repaint_reason={} initial_buffer_age={} initial_render_damage_kind={} initial_render_damage_rects={} initial_render_damage_pixels={} initial_repair_damage_kind={} initial_repair_damage_rects={} initial_repair_damage_pixels={} final_repaint_mode={} final_repaint_reason={} final_buffer_age={} final_render_damage_kind={} final_render_damage_rects={} final_render_damage_pixels={} final_repair_damage_kind={} final_repair_damage_rects={} final_repair_damage_pixels={} first_full_stage={} promoted_to_full={} damage_complexity_shadow_applicable={} damage_complexity_original_rects={} damage_complexity_original_pixels={} damage_complexity_bbox_x={} damage_complexity_bbox_y={} damage_complexity_bbox_width={} damage_complexity_bbox_height={} damage_complexity_bbox_pixels={} damage_complexity_bbox_accepted={} damage_complexity_candidate_rects={} damage_complexity_candidate_pixels={} damage_complexity_added_pixels={} damage_complexity_outcome={} damage_complexity_would_avoid_full={}",
+            "event=effect_repaint_provenance frame_id={} input_damage_kind={} input_damage_rects={} input_damage_pixels={} scene_damage_kind={} scene_damage_rects={} scene_damage_pixels={} merged_damage_kind={} merged_damage_rects={} merged_damage_pixels={} initial_repaint_mode={} initial_repaint_reason={} initial_buffer_age={} initial_render_damage_kind={} initial_render_damage_rects={} initial_render_damage_pixels={} initial_repair_damage_kind={} initial_repair_damage_rects={} initial_repair_damage_pixels={} final_repaint_mode={} final_repaint_reason={} final_buffer_age={} final_render_damage_kind={} final_render_damage_rects={} final_render_damage_pixels={} final_repair_damage_kind={} final_repair_damage_rects={} final_repair_damage_pixels={} first_full_stage={} promoted_to_full={} partial_repaint_complexity_policy={} partial_repaint_complexity_action={} damage_complexity_shadow_applicable={} damage_complexity_original_rects={} damage_complexity_original_pixels={} damage_complexity_bbox_x={} damage_complexity_bbox_y={} damage_complexity_bbox_width={} damage_complexity_bbox_height={} damage_complexity_bbox_pixels={} damage_complexity_bbox_accepted={} damage_complexity_candidate_rects={} damage_complexity_candidate_pixels={} damage_complexity_added_pixels={} damage_complexity_outcome={} damage_complexity_would_avoid_full={}",
             optional_u64(frame_id),
             self.input_damage.kind.as_str(),
             self.input_damage.rects,
@@ -461,6 +466,8 @@ impl EffectRepaintProvenanceSnapshot {
             self.final_plan.repair_damage.pixels,
             self.first_full_stage().as_str(),
             if self.promoted_to_full() { "1" } else { "0" },
+            self.final_plan.complexity_policy.as_str(),
+            self.final_plan.complexity_action.as_str(),
             if self.damage_complexity_shadow.applicable {
                 "1"
             } else {
@@ -1549,6 +1556,8 @@ mod tests {
         RepaintPlanTraceSnapshot {
             mode,
             fallback_reason,
+            complexity_policy: PartialRepaintComplexityPolicy::Legacy,
+            complexity_action: PartialRepaintComplexityAction::NotApplicable,
             buffer_age: None,
             render_damage: damage_snapshot(DamageTraceKind::Rects),
             repair_damage: damage_snapshot(DamageTraceKind::Rects),
@@ -1721,6 +1730,8 @@ mod tests {
             Some(FullRepaintReason::EffectExecutionConservative),
         );
         final_plan.buffer_age = Some(3);
+        final_plan.complexity_policy = PartialRepaintComplexityPolicy::StructuredExperimental;
+        final_plan.complexity_action = PartialRepaintComplexityAction::StructuredManyRectangles;
         let evidence = provenance(rects, empty, rects, initial, final_plan);
         let line = evidence.format_line(Some(42));
         let keys = [
@@ -1755,6 +1766,8 @@ mod tests {
             "final_repair_damage_pixels",
             "first_full_stage",
             "promoted_to_full",
+            "partial_repaint_complexity_policy",
+            "partial_repaint_complexity_action",
             "damage_complexity_shadow_applicable",
             "damage_complexity_original_rects",
             "damage_complexity_original_pixels",
@@ -1791,6 +1804,8 @@ mod tests {
         assert!(line.contains("final_buffer_age=3"));
         assert!(line.contains("first_full_stage=effect_execution"));
         assert!(line.contains("promoted_to_full=1"));
+        assert!(line.contains("partial_repaint_complexity_policy=structured-experimental"));
+        assert!(line.contains("partial_repaint_complexity_action=structured_many_rects"));
         assert!(line.contains("damage_complexity_shadow_applicable=0"));
         assert!(line.contains("damage_complexity_original_rects=0"));
         assert!(line.contains("damage_complexity_original_pixels=0"));
