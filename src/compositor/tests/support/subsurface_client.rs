@@ -4,6 +4,7 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, registry_state::*, server_runtime::*, window_ops::*,
 };
+use crate::compositor::popup::XdgWindowGeometry;
 pub(in crate::compositor::tests) fn create_min_size_toplevel_then_shrink_resize_before_client_commit(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -243,6 +244,228 @@ pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
         before_parent_commit,
         after_adoption,
     })
+}
+
+pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<Vec<GeckoGeometryPublicationSnapshot>, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let mut state = RegistryTestState::default();
+
+    let child = compositor.create_surface(&qh, ());
+    let _initial_child_buffer = attach_test_buffered_surface(&child, &shm, &qh, 1, 1)?;
+    child.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 1920, 955)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+
+    let viewport = viewporter.get_viewport(&child, &qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_desync();
+
+    let stages = [
+        (
+            XdgWindowGeometry::new(0, 0, 1920, 955),
+            (1920, 955),
+            (1920, 955),
+        ),
+        (
+            XdgWindowGeometry::new(10, 10, 1040, 1105),
+            (1060, 1125),
+            (1040, 1105),
+        ),
+        (
+            XdgWindowGeometry::new(35, 23, 1040, 1105),
+            (1110, 1176),
+            (1040, 1105),
+        ),
+        (
+            XdgWindowGeometry::new(43, 28, 1040, 1105),
+            (1126, 1192),
+            (1040, 1105),
+        ),
+        (
+            XdgWindowGeometry::new(45, 29, 1040, 1105),
+            (1130, 1195),
+            (1040, 1105),
+        ),
+    ];
+    let mut snapshots = Vec::with_capacity(stages.len());
+    let mut _confined_pointer = None;
+    let mut _constraint_region = None;
+
+    for (stage_index, (geometry, root_buffer, child_size)) in stages.into_iter().enumerate() {
+        if stage_index == 1 {
+            // Supersede both pending parent-owned values before either parent
+            // publication, as allowed by their double-buffered protocol state.
+            xdg_surface.set_window_geometry(7, 8, geometry.width, geometry.height);
+            subsurface.set_position(7, 8);
+        }
+        xdg_surface.set_window_geometry(geometry.x, geometry.y, geometry.width, geometry.height);
+        subsurface.set_position(geometry.x, geometry.y);
+        viewport.set_destination(child_size.0, child_size.1);
+        commit_test_buffered_surface(
+            &child,
+            &shm,
+            &qh,
+            child_size.0 as usize,
+            child_size.1 as usize,
+        )?;
+        connection.flush()?;
+        queue.roundtrip(&mut state)?;
+        wait_for_server_commands(commands);
+        let pointer_motion_count_before_parent_commit = state.pointer_motion_count;
+        let pointer_enter_count_before_parent_commit = state.pointer_enter_count;
+        let pointer_leave_count_before_parent_commit = state.pointer_leave_count;
+        let pointer_focus_before_parent_commit = capture_pointer_focus_surface_id(commands);
+        let pointer_requests_before_parent_commit =
+            capture_pointer_constraint_backend_requests(commands);
+        let confined_region_update_count_before_parent_commit =
+            pointer_requests_before_parent_commit
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        request,
+                        PointerConstraintBackendRequest::UpdateConfinedRegion { .. }
+                    )
+                })
+                .count();
+
+        let committed_geometry_before = capture_committed_window_geometry(commands);
+        let tree_before_parent_commit = capture_renderable_surface_snapshot(commands);
+
+        commit_test_buffered_surface(
+            &parent,
+            &shm,
+            &qh,
+            root_buffer.0 as usize,
+            root_buffer.1 as usize,
+        )?;
+        connection.flush()?;
+        queue.roundtrip(&mut state)?;
+        wait_for_server_commands(commands);
+        let pointer_motion_count_after_parent_commit = state.pointer_motion_count;
+        let pointer_enter_count_after_parent_commit = state.pointer_enter_count;
+        let pointer_leave_count_after_parent_commit = state.pointer_leave_count;
+        let pointer_focus_after_parent_commit = capture_pointer_focus_surface_id(commands);
+        let pointer_requests_after_parent_commit =
+            capture_pointer_constraint_backend_requests(commands);
+        let confined_region_update_count_after_parent_commit = pointer_requests_after_parent_commit
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request,
+                    PointerConstraintBackendRequest::UpdateConfinedRegion { .. }
+                )
+            })
+            .count();
+
+        let committed_geometry_after = capture_committed_window_geometry(commands);
+        let tree_after_parent_commit = capture_renderable_surface_snapshot(commands);
+        let root_surface_id = tree_after_parent_commit
+            .iter()
+            .find(|surface| surface.parent_surface_id.is_none())
+            .map(|surface| surface.surface_id);
+        let logical_frame_origin = root_surface_id
+            .and_then(|surface_id| capture_root_window_geometry(commands, surface_id))
+            .map(|geometry| (geometry.placement.local_x, geometry.placement.local_y));
+
+        snapshots.push(GeckoGeometryPublicationSnapshot {
+            expected_geometry: geometry,
+            requested_position: (geometry.x, geometry.y),
+            committed_geometry_before,
+            tree_before_parent_commit,
+            pointer_motion_count_before_parent_commit,
+            pointer_enter_count_before_parent_commit,
+            pointer_leave_count_before_parent_commit,
+            pointer_focus_before_parent_commit,
+            confined_region_update_count_before_parent_commit,
+            committed_geometry_after,
+            tree_after_parent_commit,
+            pointer_motion_count_after_parent_commit,
+            pointer_enter_count_after_parent_commit,
+            pointer_leave_count_after_parent_commit,
+            pointer_focus_after_parent_commit,
+            confined_region_update_count_after_parent_commit,
+            logical_frame_origin,
+        });
+
+        if stage_index == 0 {
+            let child_snapshot = snapshots[0]
+                .tree_after_parent_commit
+                .iter()
+                .find(|surface| surface.parent_surface_id.is_some())
+                .expect("stage zero should activate the content child");
+            commands.send(ServerCommand::PointerMotion {
+                x: f64::from(child_snapshot.origin_x + 1037),
+                y: f64::from(child_snapshot.origin_y + 519),
+            })?;
+            wait_for_server_commands(commands);
+            queue.roundtrip(&mut state)?;
+            assert_eq!(
+                state.pointer_enter_surface_id,
+                Some(child.id().protocol_id())
+            );
+
+            let region = compositor.create_region(&qh, ());
+            region.add(1000, 500, 120, 40);
+            let confined = constraints.confine_pointer(
+                &child,
+                &pointer,
+                Some(&region),
+                client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+                &qh,
+                (),
+            );
+            child.commit();
+            connection.flush()?;
+            wait_for_server_commands(commands);
+            queue.roundtrip(&mut state)?;
+            let requests = capture_pointer_constraint_backend_requests(commands);
+            let backend_id = requests
+                .iter()
+                .find_map(|request| match request {
+                    PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .expect("content child should activate its confined pointer constraint");
+            commands.send(ServerCommand::PointerConstraintBackendActivated(backend_id))?;
+            wait_for_server_commands(commands);
+            queue.roundtrip(&mut state)?;
+            let _ = capture_pointer_constraint_backend_requests(commands);
+            state.pointer_motion_count = 0;
+            state.pointer_enter_count = 0;
+            state.pointer_leave_count = 0;
+            _confined_pointer = Some(confined);
+            _constraint_region = Some(region);
+        }
+    }
+
+    Ok(snapshots)
 }
 
 pub(in crate::compositor::tests) fn capture_roleless_parent_subsurface_mapping(

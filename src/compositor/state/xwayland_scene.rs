@@ -245,6 +245,10 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn defer_pointer_focus_refresh(&mut self) -> bool {
+        if self.surface_tree_generation.is_some() {
+            self.surface_tree_pointer_focus_refresh_pending = true;
+            return true;
+        }
         if !self.xwayland_scene_batch_active() {
             return false;
         }

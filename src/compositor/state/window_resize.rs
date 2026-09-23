@@ -414,6 +414,26 @@ impl CompositorState {
             return;
         }
         let root_render_placement = derive_root_render_placement(visual_placement, geometry);
+        if crate::compositor::state::roles::surface_tree_debug_enabled() {
+            let window_geometry = geometry.map_or_else(
+                || "none".to_string(),
+                |geometry| {
+                    format!(
+                        "{},{},{},{}",
+                        geometry.x, geometry.y, geometry.width, geometry.height
+                    )
+                },
+            );
+            eprintln!(
+                "event=xdg_root_render_assignment root={} frame={},{} window_geometry={} render_placement={},{}",
+                root_surface_id,
+                visual_placement.local_x,
+                visual_placement.local_y,
+                window_geometry,
+                root_render_placement.local_x,
+                root_render_placement.local_y,
+            );
+        }
         let clip = render::SurfaceTargetRect::new(
             visual_placement.local_x,
             visual_placement.local_y,

@@ -35,6 +35,7 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 ..
             } => {
                 state.pointer_motion = true;
+                state.pointer_motion_count = state.pointer_motion_count.saturating_add(1);
                 state
                     .pointer_motion_resource_ids
                     .push(proxy.id().protocol_id());

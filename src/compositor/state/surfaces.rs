@@ -979,10 +979,14 @@ impl CompositorState {
     pub(in crate::compositor) fn begin_surface_tree_publication(&mut self) {
         debug_assert!(self.surface_tree_generation.is_none());
         self.surface_tree_generation = Some(self.render_generation.saturating_add(1));
+        self.surface_tree_pointer_focus_refresh_pending = false;
     }
 
     pub(in crate::compositor) fn finish_surface_tree_publication(&mut self) {
         self.surface_tree_generation = None;
+        if std::mem::take(&mut self.surface_tree_pointer_focus_refresh_pending) {
+            self.refresh_pointer_focus_at_last_position();
+        }
     }
 
     pub(in crate::compositor) fn set_render_generation(

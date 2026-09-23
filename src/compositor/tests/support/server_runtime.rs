@@ -849,22 +849,44 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureRenderableSurfaceSnapshot(reply) => {
                         let surfaces = server.renderable_surfaces();
                         let origins = render::surface_origins(surfaces);
+                        let active_surfaces = server.state.active_scene_surfaces();
+                        let active_origins = server.state.active_scene_surface_origins();
                         let _ = reply.send(
                             surfaces
                                 .iter()
                                 .zip(origins)
                                 .map(
                                     |(surface, (origin_x, origin_y))| RenderableSurfaceSnapshot {
+                                        relationship_id: server
+                                            .state
+                                            .subsurface_transactions
+                                            .captured_relationship(surface.surface_id)
+                                            .map(|relationship| relationship.relationship_id),
                                         surface_id: surface.surface_id,
                                         width: surface.width,
                                         height: surface.height,
                                         parent_surface_id: surface.placement.parent_surface_id,
                                         local_x: surface.placement.local_x,
                                         local_y: surface.placement.local_y,
+                                        render_x: surface
+                                            .render_placement
+                                            .unwrap_or(surface.placement)
+                                            .local_x,
+                                        render_y: surface
+                                            .render_placement
+                                            .unwrap_or(surface.placement)
+                                            .local_y,
                                         content_x: surface.x,
                                         content_y: surface.y,
                                         origin_x,
                                         origin_y,
+                                        active_scene_origin: active_surfaces
+                                            .iter()
+                                            .position(|active| {
+                                                active.surface_id == surface.surface_id
+                                            })
+                                            .and_then(|index| active_origins.get(index).copied()),
+                                        commit_sequence: surface.commit_sequence.get(),
                                         buffer_id: surface.buffer_id().get(),
                                         pixel_checksum: surface.cpu_pixels().map(|pixels| {
                                             pixels.iter().fold(0_u64, |checksum, pixel| {

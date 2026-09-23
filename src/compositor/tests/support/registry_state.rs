@@ -4,7 +4,8 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
-use crate::compositor::subsurface::SubsurfaceRelationshipPhase;
+use crate::compositor::popup::XdgWindowGeometry;
+use crate::compositor::subsurface::{SubsurfaceRelationshipId, SubsurfaceRelationshipPhase};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1 as client_ext_background_effect_manager_v1;
 use wayland_protocols::wp::content_type::v1::client::{
     wp_content_type_manager_v1 as client_wp_content_type_manager_v1,
@@ -66,6 +67,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) pointer_enter_serial: Option<u32>,
     pub(in crate::compositor::tests) pointer_enter_serials: Vec<(u32, u32)>,
     pub(in crate::compositor::tests) pointer_motion: bool,
+    pub(in crate::compositor::tests) pointer_motion_count: usize,
     pub(in crate::compositor::tests) pointer_button: bool,
     pub(in crate::compositor::tests) pointer_button_serial: Option<u32>,
     pub(in crate::compositor::tests) pointer_enter_surface_id: Option<u32>,
@@ -359,12 +361,17 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) width: u32,
     pub(in crate::compositor::tests) height: u32,
     pub(in crate::compositor::tests) parent_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) relationship_id: Option<SubsurfaceRelationshipId>,
     pub(in crate::compositor::tests) local_x: i32,
     pub(in crate::compositor::tests) local_y: i32,
+    pub(in crate::compositor::tests) render_x: i32,
+    pub(in crate::compositor::tests) render_y: i32,
     pub(in crate::compositor::tests) content_x: i32,
     pub(in crate::compositor::tests) content_y: i32,
     pub(in crate::compositor::tests) origin_x: i32,
     pub(in crate::compositor::tests) origin_y: i32,
+    pub(in crate::compositor::tests) active_scene_origin: Option<(i32, i32)>,
+    pub(in crate::compositor::tests) commit_sequence: u64,
     pub(in crate::compositor::tests) buffer_id: u64,
     pub(in crate::compositor::tests) pixel_checksum: Option<u64>,
     pub(in crate::compositor::tests) buffer_scale: u32,
@@ -374,6 +381,26 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) viewport_destination: Option<(u32, u32)>,
     pub(in crate::compositor::tests) generation: u64,
     pub(in crate::compositor::tests) resize_preview_active: bool,
+}
+
+pub(in crate::compositor::tests) struct GeckoGeometryPublicationSnapshot {
+    pub(in crate::compositor::tests) expected_geometry: XdgWindowGeometry,
+    pub(in crate::compositor::tests) requested_position: (i32, i32),
+    pub(in crate::compositor::tests) committed_geometry_before: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) tree_before_parent_commit: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) pointer_motion_count_before_parent_commit: usize,
+    pub(in crate::compositor::tests) pointer_enter_count_before_parent_commit: usize,
+    pub(in crate::compositor::tests) pointer_leave_count_before_parent_commit: usize,
+    pub(in crate::compositor::tests) pointer_focus_before_parent_commit: Option<u32>,
+    pub(in crate::compositor::tests) confined_region_update_count_before_parent_commit: usize,
+    pub(in crate::compositor::tests) committed_geometry_after: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) tree_after_parent_commit: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) pointer_motion_count_after_parent_commit: usize,
+    pub(in crate::compositor::tests) pointer_enter_count_after_parent_commit: usize,
+    pub(in crate::compositor::tests) pointer_leave_count_after_parent_commit: usize,
+    pub(in crate::compositor::tests) pointer_focus_after_parent_commit: Option<u32>,
+    pub(in crate::compositor::tests) confined_region_update_count_after_parent_commit: usize,
+    pub(in crate::compositor::tests) logical_frame_origin: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

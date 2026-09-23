@@ -507,7 +507,11 @@ impl CompositorState {
             }
         }
         if parent_commit_applied {
-            self.apply_captured_subsurface_parent_state(surface_id, captured_subsurface_parent);
+            self.apply_captured_subsurface_parent_state(
+                surface_id,
+                commit_sequence,
+                captured_subsurface_parent,
+            );
         }
         self.apply_captured_pointer_constraint_surface_state(surface_id, pointer_constraint_state);
         if input_region_changed

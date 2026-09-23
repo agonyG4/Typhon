@@ -3606,6 +3606,20 @@ impl CompositorState {
         x: i32,
         y: i32,
     ) {
+        if crate::compositor::state::roles::surface_tree_debug_enabled()
+            && let Some(relationship) = self
+                .subsurface_transactions
+                .captured_relationship(surface_id)
+        {
+            eprintln!(
+                "event=subsurface_position_requested child={} parent={} relationship={} x={} y={}",
+                relationship.surface_id,
+                relationship.parent_id,
+                relationship.relationship_id.get(),
+                x,
+                y,
+            );
+        }
         self.subsurface_transactions
             .set_pending_position(surface_id, x, y);
     }
@@ -3656,6 +3670,42 @@ impl CompositorState {
                     return;
                 }
             };
+        if crate::compositor::state::roles::surface_tree_debug_enabled()
+            && (commit.window_geometry.is_some()
+                || !commit_context.subsurface_parent.positions.is_empty())
+        {
+            let geometry = commit.window_geometry.map_or_else(
+                || "none".to_string(),
+                |geometry| {
+                    format!(
+                        "{},{},{},{}",
+                        geometry.x, geometry.y, geometry.width, geometry.height
+                    )
+                },
+            );
+            let positions = commit_context
+                .subsurface_parent
+                .positions
+                .iter()
+                .map(|position| {
+                    format!(
+                        "child={} relationship={} x={} y={}",
+                        position.relationship.surface_id,
+                        position.relationship.relationship_id.get(),
+                        position.x,
+                        position.y,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!(
+                "event=surface_parent_state_captured parent={} commit_sequence={} xdg_geometry={} positions=[{}]",
+                surface_id,
+                commit.commit_sequence.get(),
+                geometry,
+                positions,
+            );
+        }
         commit.commit_context = commit_context;
         if !self.normalize_explicit_sync_commit(&mut commit) {
             self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
@@ -5440,6 +5490,7 @@ impl CompositorState {
     pub(in crate::compositor) fn apply_captured_subsurface_parent_state(
         &mut self,
         parent_id: u32,
+        commit_sequence: SurfaceCommitSequence,
         captured: CapturedSubsurfaceParentState,
     ) -> bool {
         let CapturedSubsurfaceParentState {
@@ -5460,15 +5511,28 @@ impl CompositorState {
             {
                 continue;
             }
-            let position = positions
+            let captured_position = positions
                 .iter()
                 .position(|position| position.relationship == relationship)
                 .map(|index| positions.remove(index))
-                .map(|position| (position.x, position.y))
-                .unwrap_or((0, 0));
+                .map(|position| (position.x, position.y));
+            let position = captured_position.unwrap_or((0, 0));
             let placement = SurfacePlacement::subsurface(parent_id, position.0, position.1);
             changed |= self.surface_placement(relationship.surface_id) != placement;
             self.set_surface_placement(relationship.surface_id, placement);
+            if let Some((x, y)) = captured_position
+                && crate::compositor::state::roles::surface_tree_debug_enabled()
+            {
+                eprintln!(
+                    "event=subsurface_position_applied parent={} child={} relationship={} commit_sequence={} x={} y={}",
+                    parent_id,
+                    relationship.surface_id,
+                    relationship.relationship_id.get(),
+                    commit_sequence.get(),
+                    x,
+                    y,
+                );
+            }
         }
         for position in positions {
             if position.relationship.parent_id != parent_id
@@ -5481,6 +5545,17 @@ impl CompositorState {
             let placement = SurfacePlacement::subsurface(parent_id, position.x, position.y);
             changed |= self.surface_placement(position.relationship.surface_id) != placement;
             self.set_surface_placement(position.relationship.surface_id, placement);
+            if crate::compositor::state::roles::surface_tree_debug_enabled() {
+                eprintln!(
+                    "event=subsurface_position_applied parent={} child={} relationship={} commit_sequence={} x={} y={}",
+                    parent_id,
+                    position.relationship.surface_id,
+                    position.relationship.relationship_id.get(),
+                    commit_sequence.get(),
+                    position.x,
+                    position.y,
+                );
+            }
         }
         if let Some(stack) = stack {
             changed |= self.apply_captured_subsurface_stack_for_parent(parent_id, stack);
@@ -5532,6 +5607,73 @@ impl CompositorState {
             eprintln!(
                 "oblivion-one compositor: subsurface_tx root={root_id} decision=published changed_nodes={} tree_generation={}",
                 changed_nodes, self.render_generation,
+            );
+        }
+        if crate::compositor::state::roles::surface_tree_debug_enabled() {
+            let xdg_geometry = self
+                .surface_window_geometries
+                .get(&root_id)
+                .copied()
+                .map_or_else(
+                    || "none".to_string(),
+                    |geometry| {
+                        format!(
+                            "{},{},{},{}",
+                            geometry.x, geometry.y, geometry.width, geometry.height
+                        )
+                    },
+                );
+            let root_commit_sequence = self
+                .renderable_surfaces
+                .iter()
+                .find(|surface| surface.surface_id == root_id)
+                .map(|surface| surface.commit_sequence.get());
+            let origins = render::surface_origins(&self.renderable_surfaces);
+            let active_surfaces = self.active_scene_surfaces();
+            let active_origins = self.active_scene_surface_origins();
+            let mut nodes = Vec::new();
+            let mut omitted = 0usize;
+            for (surface, (origin_x, origin_y)) in self.renderable_surfaces.iter().zip(origins) {
+                if self.root_surface_id_for_surface(surface.surface_id) != root_id {
+                    continue;
+                }
+                if nodes.len() == 16 {
+                    omitted = omitted.saturating_add(1);
+                    continue;
+                }
+                let relationship = self
+                    .subsurface_transactions
+                    .captured_relationship(surface.surface_id)
+                    .map(|relationship| relationship.relationship_id.get().to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let active_origin = active_surfaces
+                    .iter()
+                    .position(|active| active.surface_id == surface.surface_id)
+                    .and_then(|index| active_origins.get(index).copied())
+                    .map_or_else(|| "none".to_string(), |(x, y)| format!("{x},{y}"));
+                nodes.push(format!(
+                    "surface={} parent={} relationship={} local={},{} origin={},{} active_origin={} commit_sequence={}",
+                    surface.surface_id,
+                    surface
+                        .placement
+                        .parent_surface_id
+                        .map_or_else(|| "none".to_string(), |parent| parent.to_string()),
+                    relationship,
+                    surface.placement.local_x,
+                    surface.placement.local_y,
+                    origin_x,
+                    origin_y,
+                    active_origin,
+                    surface.commit_sequence.get(),
+                ));
+            }
+            eprintln!(
+                "event=surface_tree_published root={} commit_sequence={} xdg_geometry={} nodes=[{}] omitted={}",
+                root_id,
+                root_commit_sequence.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                xdg_geometry,
+                nodes.join("; "),
+                omitted,
             );
         }
     }

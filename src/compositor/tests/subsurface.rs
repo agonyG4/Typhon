@@ -150,6 +150,16 @@ fn gecko_pre_role_surface_waits_for_parent_commit_before_adoption() {
         .collect::<Vec<_>>();
     assert_eq!(child_nodes.len(), 1);
     assert_eq!(child_nodes[0].parent_surface_id, Some(parent.surface_id));
+    assert_eq!(child_nodes[0].local_x, 10);
+    assert_eq!(child_nodes[0].local_y, 10);
+    assert_eq!(
+        child_nodes[0].origin_x,
+        parent.origin_x + child_nodes[0].local_x + child_nodes[0].content_x
+    );
+    assert_eq!(
+        child_nodes[0].origin_y,
+        parent.origin_y + child_nodes[0].local_y + child_nodes[0].content_y
+    );
     let parent_index = snapshots
         .after_adoption
         .iter()
@@ -161,6 +171,265 @@ fn gecko_pre_role_surface_waits_for_parent_commit_before_adoption() {
         .position(|surface| surface.surface_id == child_nodes[0].surface_id)
         .expect("child should be renderable");
     assert!(child_index > parent_index);
+}
+
+#[test]
+fn gecko_xdg_geometry_origin_tracks_matching_subsurface_positions_per_parent_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_input_capabilities(
+        &socket_name,
+        crate::compositor::plan::InputProtocolCapabilities {
+            pointer_constraints: true,
+            ..crate::compositor::plan::InputProtocolCapabilities::desktop_baseline()
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stages = capture_gecko_window_geometry_evolution(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(stages.len(), 5);
+    let mut previous_geometry = None;
+    let mut previous_position = None;
+    let mut root_surface_id = None;
+    let mut child_surface_id = None;
+    let mut relationship_id = None;
+    let mut logical_frame_origin = None;
+    let mut child_global_origin = None;
+    let mut root_render_origin = None;
+    let mut previous_root_commit_sequence = None;
+
+    for (stage_index, stage) in stages.iter().enumerate() {
+        assert_eq!(stage.committed_geometry_before, previous_geometry);
+        assert_eq!(
+            stage.pointer_motion_count_after_parent_commit,
+            stage.pointer_motion_count_before_parent_commit,
+            "stage {stage_index}: no pointer motion may observe the intermediate root/child placement"
+        );
+        assert_eq!(
+            stage.pointer_enter_count_after_parent_commit,
+            stage.pointer_enter_count_before_parent_commit,
+            "stage {stage_index}: no transient pointer enter may escape parent publication"
+        );
+        assert_eq!(
+            stage.pointer_leave_count_after_parent_commit,
+            stage.pointer_leave_count_before_parent_commit,
+            "stage {stage_index}: no transient pointer leave may escape parent publication"
+        );
+        assert_eq!(
+            stage.pointer_focus_after_parent_commit, stage.pointer_focus_before_parent_commit,
+            "stage {stage_index}: pointer focus stays on the same committed surface"
+        );
+        assert_eq!(
+            stage.confined_region_update_count_after_parent_commit,
+            stage.confined_region_update_count_before_parent_commit,
+            "stage {stage_index}: no transient confined-region geometry reaches the input backend"
+        );
+        let before_roots = stage
+            .tree_before_parent_commit
+            .iter()
+            .filter(|surface| surface.parent_surface_id.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before_roots.len(),
+            1,
+            "stage {stage_index}: one mapped root before parent commit"
+        );
+        let before_root = before_roots[0];
+        assert_eq!(
+            before_root.active_scene_origin,
+            Some((before_root.origin_x, before_root.origin_y)),
+            "stage {stage_index}: active scene root matches the committed tree before parent commit"
+        );
+        assert_eq!(
+            before_root.commit_sequence,
+            previous_root_commit_sequence.unwrap_or(before_root.commit_sequence)
+        );
+        assert_eq!(before_root.relationship_id, None);
+        if let Some(expected_origin) = root_render_origin {
+            assert_eq!(
+                (before_root.origin_x, before_root.origin_y),
+                expected_origin
+            );
+            assert_eq!(
+                (before_root.render_x, before_root.render_y),
+                expected_origin
+            );
+        }
+        if let Some(root_id) = root_surface_id {
+            assert_eq!(before_root.surface_id, root_id);
+        }
+
+        let before_children = stage
+            .tree_before_parent_commit
+            .iter()
+            .filter(|surface| surface.parent_surface_id.is_some())
+            .collect::<Vec<_>>();
+        if stage_index == 0 {
+            assert!(
+                before_children.is_empty(),
+                "pending relationship stays inactive until parent commit"
+            );
+        } else {
+            assert_eq!(before_children.len(), 1);
+            let child = before_children[0];
+            assert_eq!(child.parent_surface_id, root_surface_id);
+            assert_eq!(child.surface_id, child_surface_id.unwrap());
+            assert_eq!(child.relationship_id, relationship_id);
+            assert_eq!(
+                (child.local_x, child.local_y),
+                previous_position.expect("a prior parent publication sets child position")
+            );
+            assert_eq!(
+                child.active_scene_origin,
+                Some((child.origin_x, child.origin_y)),
+                "stage {stage_index}: active scene child matches the committed tree before parent commit"
+            );
+            assert_eq!(
+                (child.origin_x, child.origin_y),
+                child_global_origin.expect("prior parent publication anchors the child")
+            );
+            assert_eq!(
+                stage.pointer_focus_before_parent_commit,
+                Some(child.surface_id)
+            );
+        }
+
+        let committed_geometry = stage
+            .committed_geometry_after
+            .expect("one xdg_toplevel root should own committed geometry");
+        assert_eq!(committed_geometry, stage.expected_geometry);
+        assert_eq!(
+            stage.requested_position,
+            (committed_geometry.x, committed_geometry.y)
+        );
+
+        let roots = stage
+            .tree_after_parent_commit
+            .iter()
+            .filter(|surface| surface.parent_surface_id.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roots.len(),
+            1,
+            "stage {stage_index}: exactly one renderable root"
+        );
+        let root = roots[0];
+        let children = stage
+            .tree_after_parent_commit
+            .iter()
+            .filter(|surface| surface.parent_surface_id.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children.len(),
+            1,
+            "stage {stage_index}: exactly one content child"
+        );
+        let child = children[0];
+        assert_eq!(child.parent_surface_id, Some(root.surface_id));
+        assert_eq!((child.local_x, child.local_y), stage.requested_position);
+        assert_eq!(
+            (child.width, child.height),
+            if stage_index == 0 {
+                (1920, 955)
+            } else {
+                (1040, 1105)
+            }
+        );
+        assert_eq!((root.content_x, root.content_y), (0, 0));
+        assert_eq!((child.content_x, child.content_y), (0, 0));
+        assert_eq!(
+            root.active_scene_origin,
+            Some((root.origin_x, root.origin_y)),
+            "stage {stage_index}: active scene root publishes the final root placement"
+        );
+        assert_eq!(
+            child.active_scene_origin,
+            Some((child.origin_x, child.origin_y)),
+            "stage {stage_index}: active scene child publishes the final child placement"
+        );
+        if stage_index > 0 {
+            assert_eq!(
+                stage.pointer_focus_after_parent_commit,
+                Some(child.surface_id)
+            );
+        }
+
+        let frame_origin = stage
+            .logical_frame_origin
+            .expect("root frame placement should be available");
+        assert_eq!(
+            (root.render_x, root.render_y),
+            (
+                frame_origin.0 - committed_geometry.x,
+                frame_origin.1 - committed_geometry.y
+            ),
+            "root render placement is frame origin minus committed XDG origin"
+        );
+        assert_eq!(
+            (root.origin_x, root.origin_y),
+            (root.render_x, root.render_y)
+        );
+        let child_origin = (
+            root.origin_x + child.local_x + child.content_x,
+            root.origin_y + child.local_y + child.content_y,
+        );
+        assert_eq!((child.origin_x, child.origin_y), child_origin);
+        let frame_content_origin = (
+            root.origin_x + committed_geometry.x,
+            root.origin_y + committed_geometry.y,
+        );
+        assert_eq!(child_origin, frame_content_origin);
+
+        if let Some(expected_root_id) = root_surface_id {
+            assert_eq!(root.surface_id, expected_root_id);
+        } else {
+            root_surface_id = Some(root.surface_id);
+        }
+        if let Some(expected_child_id) = child_surface_id {
+            assert_eq!(child.surface_id, expected_child_id);
+        } else {
+            child_surface_id = Some(child.surface_id);
+        }
+        if let Some(expected_relationship_id) = relationship_id {
+            assert_eq!(child.relationship_id, Some(expected_relationship_id));
+        } else {
+            relationship_id = child.relationship_id;
+            assert!(
+                relationship_id.is_some(),
+                "applied content child keeps its relationship identity"
+            );
+        }
+        if let Some(expected_frame_origin) = logical_frame_origin {
+            assert_eq!(
+                frame_origin, expected_frame_origin,
+                "logical frame stays fixed during geometry evolution"
+            );
+        } else {
+            logical_frame_origin = Some(frame_origin);
+        }
+        if let Some(expected_content_origin) = child_global_origin {
+            assert_eq!(
+                child_origin, expected_content_origin,
+                "content remains anchored through geometry evolution"
+            );
+        } else {
+            child_global_origin = Some(child_origin);
+        }
+        root_render_origin = Some((root.origin_x, root.origin_y));
+        if let Some(previous_sequence) = previous_root_commit_sequence {
+            assert!(
+                root.commit_sequence > previous_sequence,
+                "each parent publication has a newer root commit sequence"
+            );
+        }
+
+        previous_geometry = Some(committed_geometry);
+        previous_position = Some(stage.requested_position);
+        previous_root_commit_sequence = Some(root.commit_sequence);
+    }
 }
 
 #[test]

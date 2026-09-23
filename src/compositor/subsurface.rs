@@ -50,6 +50,12 @@ pub(super) enum SubsurfaceRelationshipPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct SubsurfaceRelationshipId(u64);
 
+impl SubsurfaceRelationshipId {
+    pub(super) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ContentUpdateRef {
     pub(super) surface_id: u32,
