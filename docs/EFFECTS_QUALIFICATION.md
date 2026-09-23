@@ -100,6 +100,24 @@ using `frame_id` for the existing detailed demand and repair evidence. Join with
 and retain the source frame identifier. The provenance event does not duplicate
 demand-plan metrics or add GPU queries.
 
+### Effect execution resolution provenance
+
+With `TYPHON_EFFECT_EXEC_TRACE=1`, each resolved EffectGraph frame adds one
+bounded `event=effect_execution_resolution` line keyed by `frame_id`. `outcome`
+distinguishes `initial_full`, `converged`, `demand_conservative`,
+`repaint_policy_full`, and `iteration_exhausted`. A conservative demand includes
+`demand_conservative_cause`; graph metadata failures include the first failed
+`graph_metadata_issue` and the relevant instance, dependency, pass, or texture
+IDs. The event records the fixed-point iteration count and constant-size repair
+summaries for the initial repair and the last meaningful iteration. It does not
+emit per-iteration lines or rectangle lists.
+
+`FullRepaintReason::EffectExecutionConservative` remains the coarse repaint
+reason for demand conservatism and iteration exhaustion. The new event records
+their underlying diagnostic cause without changing the repaint reason or
+resolution policy. Its repair pixel totals use the same output-damage pixel
+authority as the existing provenance trace.
+
 ### Damage complexity shadow policy
 
 The same record includes a diagnostic-only Damage Complexity Shadow Policy for

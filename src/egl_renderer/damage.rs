@@ -26,6 +26,7 @@ const PARTIAL_REPAINT_COMPLEXITY_POLICY_ENV: &str = "TYPHON_PARTIAL_REPAINT_COMP
 #[cfg(test)]
 thread_local! {
     static DAMAGE_COMPLEXITY_SHADOW_ANALYSIS_COUNT: Cell<u32> = const { Cell::new(0) };
+    static EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A half-open rectangle in output physical pixels with a top-left origin.
@@ -319,12 +320,30 @@ pub(crate) fn effect_execution_demand_for_repaint_plan(
 ) -> oblivion_one::effects::EffectExecutionDemand {
     let repair_region =
         super::effect_region_from_output_damage(&plan.repair_damage, output_width, output_height);
-    let conservative_full = plan.mode == RepaintMode::Full
-        || (!repair_region.is_empty() && repair_region.bounding_rect().is_none());
+    let conservative_full = plan.mode == RepaintMode::Full;
     oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
         graph,
         &repair_region,
         conservative_full,
+        effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full,
+    )
+}
+
+fn effect_execution_demand_for_repaint_plan_with_diagnostics(
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &RepaintPlan,
+    output_width: u32,
+    output_height: u32,
+) -> (
+    oblivion_one::effects::EffectExecutionDemand,
+    oblivion_one::effects::EffectExecutionDemandDiagnostics,
+) {
+    let repair_region =
+        super::effect_region_from_output_damage(&plan.repair_damage, output_width, output_height);
+    oblivion_one::effects::plan_effect_execution_demand_with_diagnostics(
+        graph,
+        &repair_region,
+        plan.mode == RepaintMode::Full,
         effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full,
     )
 }
@@ -336,24 +355,154 @@ pub(crate) fn resolve_effect_execution_for_repaint_plan(
     output_width: u32,
     output_height: u32,
 ) -> oblivion_one::effects::EffectExecutionDemand {
-    if plan.mode == RepaintMode::Full {
-        return effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
-    }
+    resolve_effect_execution_for_repaint_plan_inner(
+        planner,
+        graph,
+        plan,
+        output_width,
+        output_height,
+        None,
+        None,
+    )
+}
 
+pub(crate) fn resolve_effect_execution_for_repaint_plan_with_diagnostics(
+    planner: &PartialRepaintPlanner,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &mut RepaintPlan,
+    output_width: u32,
+    output_height: u32,
+) -> (
+    oblivion_one::effects::EffectExecutionDemand,
+    EffectExecutionResolutionSnapshot,
+) {
     let max_iterations = graph.instances.len().saturating_add(1).max(1);
+    let mut snapshot = EffectExecutionResolutionSnapshot::for_plan(
+        graph,
+        plan,
+        (output_width, output_height),
+        max_iterations,
+    );
+    let demand = resolve_effect_execution_for_repaint_plan_inner(
+        planner,
+        graph,
+        plan,
+        output_width,
+        output_height,
+        Some(max_iterations),
+        Some(&mut snapshot),
+    );
+    (demand, snapshot)
+}
+
+#[cfg(test)]
+fn resolve_effect_execution_for_repaint_plan_with_iteration_budget(
+    planner: &PartialRepaintPlanner,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &mut RepaintPlan,
+    output_width: u32,
+    output_height: u32,
+    max_iterations: usize,
+) -> (
+    oblivion_one::effects::EffectExecutionDemand,
+    EffectExecutionResolutionSnapshot,
+) {
+    let mut snapshot = EffectExecutionResolutionSnapshot::for_plan(
+        graph,
+        plan,
+        (output_width, output_height),
+        max_iterations,
+    );
+    let demand = resolve_effect_execution_for_repaint_plan_inner(
+        planner,
+        graph,
+        plan,
+        output_width,
+        output_height,
+        Some(max_iterations),
+        Some(&mut snapshot),
+    );
+    (demand, snapshot)
+}
+
+fn resolve_effect_execution_for_repaint_plan_inner(
+    planner: &PartialRepaintPlanner,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &mut RepaintPlan,
+    output_width: u32,
+    output_height: u32,
+    iteration_budget: Option<usize>,
+    mut diagnostics: Option<&mut EffectExecutionResolutionSnapshot>,
+) -> oblivion_one::effects::EffectExecutionDemand {
+    let max_iterations =
+        iteration_budget.unwrap_or_else(|| graph.instances.len().saturating_add(1).max(1));
+    if plan.mode == RepaintMode::Full {
+        let demand = if let Some(snapshot) = diagnostics.as_deref_mut() {
+            let (demand, demand_diagnostics) =
+                effect_execution_demand_for_repaint_plan_with_diagnostics(
+                    graph,
+                    plan,
+                    output_width,
+                    output_height,
+                );
+            snapshot.demand_conservative_cause = demand_diagnostics.cause;
+            snapshot.graph_metadata_issue = demand_diagnostics.metadata_issue;
+            snapshot.outcome = EffectExecutionResolutionOutcome::InitialFull;
+            snapshot.finish_with_plan(plan);
+            demand
+        } else {
+            effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height)
+        };
+        return demand;
+    }
     for _ in 0..max_iterations {
-        let demand =
-            effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
+        if let Some(snapshot) = diagnostics.as_deref_mut() {
+            snapshot.iterations_attempted = snapshot.iterations_attempted.saturating_add(1);
+            snapshot.last_input_repair = EffectExecutionRepairSnapshot::from_damage(
+                &plan.repair_damage,
+                (output_width, output_height),
+            );
+        }
+        let demand = if let Some(snapshot) = diagnostics.as_deref_mut() {
+            let (demand, demand_diagnostics) =
+                effect_execution_demand_for_repaint_plan_with_diagnostics(
+                    graph,
+                    plan,
+                    output_width,
+                    output_height,
+                );
+            snapshot.demand_conservative_cause = demand_diagnostics.cause;
+            snapshot.graph_metadata_issue = demand_diagnostics.metadata_issue;
+            demand
+        } else {
+            effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height)
+        };
+        if let Some(snapshot) = diagnostics.as_deref_mut() {
+            snapshot.last_execution_region = EffectExecutionRepairSnapshot::from_effect_region(
+                &demand.execution_region,
+                (output_width, output_height),
+            );
+        }
         if demand.is_conservative_full() {
             plan.repair_damage = OutputDamage::Full;
             plan.mode = RepaintMode::Full;
             plan.fallback_reason = Some(FullRepaintReason::EffectExecutionConservative);
-            return effect_execution_demand_for_repaint_plan(
-                graph,
-                plan,
-                output_width,
-                output_height,
-            );
+            if let Some(snapshot) = diagnostics.as_deref_mut() {
+                snapshot.outcome = EffectExecutionResolutionOutcome::DemandConservative;
+                snapshot.last_merged_repair = snapshot.last_input_repair;
+                snapshot.last_applied_repair = EffectExecutionRepairSnapshot::from_damage(
+                    &plan.repair_damage,
+                    (output_width, output_height),
+                );
+                snapshot.last_repair_changed =
+                    snapshot.last_applied_repair != snapshot.last_input_repair;
+            }
+            let final_demand =
+                effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
+            if let Some(snapshot) = diagnostics.as_deref_mut() {
+                snapshot.finish_with_plan(plan);
+            }
+            return final_demand;
         }
 
         let previous_repair = plan.repair_damage.clone();
@@ -363,16 +512,36 @@ pub(crate) fn resolve_effect_execution_for_repaint_plan(
             output_width,
             output_height,
         );
-        planner.apply_execution_repair(plan, execution_repair);
-        if plan.mode == RepaintMode::Full {
-            return effect_execution_demand_for_repaint_plan(
-                graph,
-                plan,
-                output_width,
-                output_height,
+        if let Some(snapshot) = diagnostics.as_deref_mut() {
+            snapshot.last_merged_repair = EffectExecutionRepairSnapshot::from_damage(
+                &execution_repair,
+                (output_width, output_height),
             );
         }
+        planner.apply_execution_repair(plan, execution_repair);
+        if let Some(snapshot) = diagnostics.as_deref_mut() {
+            snapshot.last_applied_repair = EffectExecutionRepairSnapshot::from_damage(
+                &plan.repair_damage,
+                (output_width, output_height),
+            );
+            snapshot.last_repair_changed = plan.repair_damage != previous_repair;
+        }
+        if plan.mode == RepaintMode::Full {
+            if let Some(snapshot) = diagnostics.as_deref_mut() {
+                snapshot.outcome = EffectExecutionResolutionOutcome::RepaintPolicyFull;
+            }
+            let final_demand =
+                effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
+            if let Some(snapshot) = diagnostics.as_deref_mut() {
+                snapshot.finish_with_plan(plan);
+            }
+            return final_demand;
+        }
         if plan.repair_damage == previous_repair {
+            if let Some(snapshot) = diagnostics.as_deref_mut() {
+                snapshot.outcome = EffectExecutionResolutionOutcome::Converged;
+                snapshot.finish_with_plan(plan);
+            }
             return demand;
         }
     }
@@ -380,7 +549,15 @@ pub(crate) fn resolve_effect_execution_for_repaint_plan(
     plan.repair_damage = OutputDamage::Full;
     plan.mode = RepaintMode::Full;
     plan.fallback_reason = Some(FullRepaintReason::EffectExecutionConservative);
-    effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height)
+    if let Some(snapshot) = diagnostics.as_deref_mut() {
+        snapshot.outcome = EffectExecutionResolutionOutcome::IterationExhausted;
+    }
+    let final_demand =
+        effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
+    if let Some(snapshot) = diagnostics.as_deref_mut() {
+        snapshot.finish_with_plan(plan);
+    }
+    final_demand
 }
 
 fn coalesce_rects(mut rects: Vec<OutputRect>) -> Vec<OutputRect> {
@@ -579,6 +756,144 @@ pub(crate) struct RepaintPlan {
     pub(crate) fallback_reason: Option<FullRepaintReason>,
     pub(crate) complexity_policy: PartialRepaintComplexityPolicy,
     pub(crate) complexity_action: PartialRepaintComplexityAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectExecutionResolutionOutcome {
+    InitialFull,
+    Converged,
+    DemandConservative,
+    RepaintPolicyFull,
+    IterationExhausted,
+}
+
+impl EffectExecutionResolutionOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialFull => "initial_full",
+            Self::Converged => "converged",
+            Self::DemandConservative => "demand_conservative",
+            Self::RepaintPolicyFull => "repaint_policy_full",
+            Self::IterationExhausted => "iteration_exhausted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectExecutionRepairKind {
+    Empty,
+    Rects,
+    Full,
+}
+
+impl EffectExecutionRepairKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Rects => "rects",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectExecutionRepairSnapshot {
+    pub(crate) kind: EffectExecutionRepairKind,
+    pub(crate) rects: usize,
+    pub(crate) pixels: u64,
+}
+
+impl EffectExecutionRepairSnapshot {
+    const EMPTY: Self = Self {
+        kind: EffectExecutionRepairKind::Empty,
+        rects: 0,
+        pixels: 0,
+    };
+
+    fn from_damage(damage: &OutputDamage, output_size: (u32, u32)) -> Self {
+        #[cfg(test)]
+        EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS.with(|count| count.set(count.get() + 1));
+        let kind = match damage {
+            OutputDamage::Empty => EffectExecutionRepairKind::Empty,
+            OutputDamage::Rects(_) => EffectExecutionRepairKind::Rects,
+            OutputDamage::Full => EffectExecutionRepairKind::Full,
+        };
+        Self {
+            kind,
+            rects: damage.rect_count(),
+            pixels: damage
+                .pixels(output_size.0, output_size.1)
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    fn from_effect_region(
+        region: &oblivion_one::effects::EffectRegion,
+        output_size: (u32, u32),
+    ) -> Self {
+        Self::from_damage(
+            &output_damage_from_effect_region(region, output_size.0, output_size.1),
+            output_size,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectExecutionResolutionSnapshot {
+    pub(crate) outcome: EffectExecutionResolutionOutcome,
+    pub(crate) demand_conservative_cause: oblivion_one::effects::EffectDemandConservativeCause,
+    pub(crate) iterations_attempted: usize,
+    pub(crate) max_iterations: usize,
+    pub(crate) graph_instances: usize,
+    pub(crate) graph_passes: usize,
+    pub(crate) dependency_edges: usize,
+    pub(crate) initial_repair: EffectExecutionRepairSnapshot,
+    pub(crate) last_input_repair: EffectExecutionRepairSnapshot,
+    pub(crate) last_execution_region: EffectExecutionRepairSnapshot,
+    pub(crate) last_merged_repair: EffectExecutionRepairSnapshot,
+    pub(crate) last_applied_repair: EffectExecutionRepairSnapshot,
+    pub(crate) last_repair_changed: bool,
+    pub(crate) final_repaint_mode: RepaintMode,
+    pub(crate) final_repaint_reason: Option<FullRepaintReason>,
+    pub(crate) graph_metadata_issue: Option<oblivion_one::effects::GraphExecutionMetadataIssue>,
+}
+
+impl EffectExecutionResolutionSnapshot {
+    fn for_plan(
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        plan: &RepaintPlan,
+        output_size: (u32, u32),
+        max_iterations: usize,
+    ) -> Self {
+        Self {
+            outcome: EffectExecutionResolutionOutcome::InitialFull,
+            demand_conservative_cause: oblivion_one::effects::EffectDemandConservativeCause::None,
+            iterations_attempted: 0,
+            max_iterations,
+            graph_instances: graph.instances.len(),
+            graph_passes: graph.passes.len(),
+            dependency_edges: graph.instances.iter().fold(0, |count, instance| {
+                count.saturating_add(instance.dependencies.len())
+            }),
+            initial_repair: EffectExecutionRepairSnapshot::from_damage(
+                &plan.repair_damage,
+                output_size,
+            ),
+            last_input_repair: EffectExecutionRepairSnapshot::EMPTY,
+            last_execution_region: EffectExecutionRepairSnapshot::EMPTY,
+            last_merged_repair: EffectExecutionRepairSnapshot::EMPTY,
+            last_applied_repair: EffectExecutionRepairSnapshot::EMPTY,
+            last_repair_changed: false,
+            final_repaint_mode: plan.mode,
+            final_repaint_reason: plan.fallback_reason,
+            graph_metadata_issue: None,
+        }
+    }
+
+    fn finish_with_plan(&mut self, plan: &RepaintPlan) {
+        self.final_repaint_mode = plan.mode;
+        self.final_repaint_reason = plan.fallback_reason;
+    }
 }
 
 impl Default for RepaintPlan {
@@ -1149,7 +1464,7 @@ mod partial_repaint_complexity_tests {
         let eight_rects = OutputDamage::rects(
             200,
             100,
-            (0..MAX_PARTIAL_REPAINT_RECTS).map(|index| rect(index * 20, 0, 10, 10)),
+            (0..MAX_PARTIAL_REPAINT_RECTS).map(|index| rect(index as i32 * 20, 0, 10, 10)),
         );
         let eight_plan = plan_candidate(
             (200, 100),
@@ -1246,7 +1561,7 @@ mod partial_repaint_complexity_tests {
         let candidate = OutputDamage::rects(
             200,
             100,
-            (0..MAX_PARTIAL_REPAINT_RECTS).map(|index| rect(index * 20, 0, 10, 10)),
+            (0..MAX_PARTIAL_REPAINT_RECTS).map(|index| rect(index as i32 * 20, 0, 10, 10)),
         );
         let plan = plan_candidate(
             (200, 100),

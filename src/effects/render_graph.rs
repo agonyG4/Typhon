@@ -537,6 +537,75 @@ fn unique_instance_index(graph: &CompiledFrameGraph, id: EffectInstanceId) -> Op
     found
 }
 
+/// The decision that made effect execution demand conservative.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EffectDemandConservativeCause {
+    #[default]
+    None,
+    CallerConservativeFull,
+    RepairRegionUnrepresentable,
+    GraphMetadataIncomplete,
+    DependencyLookupFailed,
+}
+
+impl EffectDemandConservativeCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CallerConservativeFull => "caller_conservative_full",
+            Self::RepairRegionUnrepresentable => "repair_region_unrepresentable",
+            Self::GraphMetadataIncomplete => "graph_metadata_incomplete",
+            Self::DependencyLookupFailed => "dependency_lookup_failed",
+        }
+    }
+}
+
+/// The first incomplete execution-metadata invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphExecutionMetadataIssueKind {
+    InstanceIdNotUnique,
+    DependencyMissingOrNotUnique,
+    DependencyNotEarlier,
+    PassInstanceMissingOrNotUnique,
+    PassTextureMissing,
+}
+
+impl GraphExecutionMetadataIssueKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstanceIdNotUnique => "instance_id_not_unique",
+            Self::DependencyMissingOrNotUnique => "dependency_missing_or_not_unique",
+            Self::DependencyNotEarlier => "dependency_not_earlier",
+            Self::PassInstanceMissingOrNotUnique => "pass_instance_missing_or_not_unique",
+            Self::PassTextureMissing => "pass_texture_missing",
+        }
+    }
+}
+
+/// A bounded snapshot of the first incomplete execution-metadata invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphExecutionMetadataIssue {
+    /// The failed invariant kind.
+    pub kind: GraphExecutionMetadataIssueKind,
+    /// Effect instance associated with the failure, if any.
+    pub instance_id: Option<EffectInstanceId>,
+    /// Dependency associated with the failure, if any.
+    pub dependency_id: Option<EffectInstanceId>,
+    /// Render pass associated with the failure, if any.
+    pub pass_id: Option<GraphPassId>,
+    /// Texture associated with the failure, if any.
+    pub texture_id: Option<GraphTextureId>,
+}
+
+/// Optional diagnostic evidence for effect execution demand planning.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EffectExecutionDemandDiagnostics {
+    /// The conservative demand cause, or `None` when demand stayed selective.
+    pub cause: EffectDemandConservativeCause,
+    /// The first graph metadata issue when the graph failed preflight.
+    pub metadata_issue: Option<GraphExecutionMetadataIssue>,
+}
+
 fn dependency_edge_count(graph: &CompiledFrameGraph) -> usize {
     graph.instances.iter().fold(0, |count, instance| {
         count.saturating_add(instance.dependencies.len())
@@ -557,11 +626,58 @@ pub fn plan_effect_execution_demand_with_kawase_mode(
     conservative_full: bool,
     full_kawase: bool,
 ) -> EffectExecutionDemand {
+    plan_effect_execution_demand_with_kawase_mode_observing(
+        graph,
+        repair_region,
+        conservative_full,
+        full_kawase,
+        None,
+    )
+}
+
+/// Plans demand and returns the conservative cause without changing selection behavior.
+pub fn plan_effect_execution_demand_with_diagnostics(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+) -> (EffectExecutionDemand, EffectExecutionDemandDiagnostics) {
+    let mut diagnostics = EffectExecutionDemandDiagnostics::default();
+    let demand = plan_effect_execution_demand_with_kawase_mode_observing(
+        graph,
+        repair_region,
+        conservative_full,
+        full_kawase,
+        Some(&mut diagnostics),
+    );
+    (demand, diagnostics)
+}
+
+fn plan_effect_execution_demand_with_kawase_mode_observing(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+    mut diagnostics: Option<&mut EffectExecutionDemandDiagnostics>,
+) -> EffectExecutionDemand {
     let repair_rect_count = repair_region.rects().len();
-    if conservative_full
-        || (!repair_region.is_empty() && repair_region.bounding_rect().is_none())
-        || !graph_execution_metadata_is_complete(graph)
-    {
+    if conservative_full {
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.cause = EffectDemandConservativeCause::CallerConservativeFull;
+        }
+        return all_visible_instances_with_output_regions(graph, repair_rect_count);
+    }
+    if !repair_region.is_empty() && repair_region.bounding_rect().is_none() {
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.cause = EffectDemandConservativeCause::RepairRegionUnrepresentable;
+        }
+        return all_visible_instances_with_output_regions(graph, repair_rect_count);
+    }
+    if let Some(issue) = graph_execution_metadata_issue(graph) {
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.cause = EffectDemandConservativeCause::GraphMetadataIncomplete;
+            diagnostics.metadata_issue = Some(issue);
+        }
         return all_visible_instances_with_output_regions(graph, repair_rect_count);
     }
 
@@ -604,6 +720,9 @@ pub fn plan_effect_execution_demand_with_kawase_mode(
         }
         for dependency_id in &consumer.dependencies {
             let Some(dependency_index) = unique_instance_index(graph, *dependency_id) else {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.cause = EffectDemandConservativeCause::DependencyLookupFailed;
+                }
                 return all_visible_instances_with_output_regions(graph, repair_rect_count);
             };
             let dependency = &graph.instances[dependency_index];
@@ -1415,29 +1534,75 @@ fn plan_effect_pass_execution_demand(
     );
 }
 
-fn graph_execution_metadata_is_complete(graph: &CompiledFrameGraph) -> bool {
+fn graph_execution_metadata_issue(
+    graph: &CompiledFrameGraph,
+) -> Option<GraphExecutionMetadataIssue> {
     // The compiler records dependencies from checkpoints that precede the
     // current instance. Demand planning relies on that topological ordering,
     // so malformed metadata takes the conservative fallback below.
-    graph.instances.iter().enumerate().all(|(index, instance)| {
-        unique_instance_index(graph, instance.id) == Some(index)
-            && instance.dependencies.iter().all(|dependency_id| {
-                unique_instance_index(graph, *dependency_id)
-                    .is_some_and(|dependency_index| dependency_index < index)
-            })
-    }) && graph.passes.iter().all(|pass| {
-        unique_instance_index(graph, pass.instance).is_some()
-            && pass
-                .inputs
+    for (index, instance) in graph.instances.iter().enumerate() {
+        if unique_instance_index(graph, instance.id) != Some(index) {
+            return Some(GraphExecutionMetadataIssue {
+                kind: GraphExecutionMetadataIssueKind::InstanceIdNotUnique,
+                instance_id: Some(instance.id),
+                dependency_id: None,
+                pass_id: None,
+                texture_id: None,
+            });
+        }
+        for dependency_id in &instance.dependencies {
+            let Some(dependency_index) = unique_instance_index(graph, *dependency_id) else {
+                return Some(GraphExecutionMetadataIssue {
+                    kind: GraphExecutionMetadataIssueKind::DependencyMissingOrNotUnique,
+                    instance_id: Some(instance.id),
+                    dependency_id: Some(*dependency_id),
+                    pass_id: None,
+                    texture_id: None,
+                });
+            };
+            if dependency_index >= index {
+                return Some(GraphExecutionMetadataIssue {
+                    kind: GraphExecutionMetadataIssueKind::DependencyNotEarlier,
+                    instance_id: Some(instance.id),
+                    dependency_id: Some(*dependency_id),
+                    pass_id: None,
+                    texture_id: None,
+                });
+            }
+        }
+    }
+    for pass in &graph.passes {
+        if unique_instance_index(graph, pass.instance).is_none() {
+            return Some(GraphExecutionMetadataIssue {
+                kind: GraphExecutionMetadataIssueKind::PassInstanceMissingOrNotUnique,
+                instance_id: Some(pass.instance),
+                dependency_id: None,
+                pass_id: Some(pass.id),
+                texture_id: None,
+            });
+        }
+        for texture_id in pass.inputs.iter().chain(pass.output.iter()) {
+            if !graph
+                .textures
                 .iter()
-                .chain(pass.output.iter())
-                .all(|texture_id| {
-                    graph
-                        .textures
-                        .iter()
-                        .any(|texture| texture.id == *texture_id)
-                })
-    })
+                .any(|texture| texture.id == *texture_id)
+            {
+                return Some(GraphExecutionMetadataIssue {
+                    kind: GraphExecutionMetadataIssueKind::PassTextureMissing,
+                    instance_id: None,
+                    dependency_id: None,
+                    pass_id: Some(pass.id),
+                    texture_id: Some(*texture_id),
+                });
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn graph_execution_metadata_is_complete(graph: &CompiledFrameGraph) -> bool {
+    graph_execution_metadata_issue(graph).is_none()
 }
 
 impl CompiledFrameGraph {
@@ -3405,6 +3570,296 @@ mod tests {
             final_damage: EffectRegion::empty(),
             stats: RenderGraphCompileStats::default(),
         }
+    }
+
+    fn metadata_test_pass(
+        instance: EffectInstanceId,
+        inputs: Vec<GraphTextureId>,
+        output: Option<GraphTextureId>,
+    ) -> CompiledRenderPass {
+        CompiledRenderPass {
+            id: GraphPassId::new(1).unwrap(),
+            kind: RenderPassKind::SceneCapture,
+            inputs,
+            output,
+            damage: EffectRegion::empty(),
+            instance,
+            anchor: EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Opaque,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
+        }
+    }
+
+    fn assert_metadata_issue(
+        graph: &CompiledFrameGraph,
+        expected_kind: &str,
+        expected_instance: Option<u64>,
+        expected_dependency: Option<u64>,
+        expected_pass: Option<u16>,
+        expected_texture: Option<u16>,
+    ) {
+        let issue = graph_execution_metadata_issue(graph).expect("fixture is incomplete");
+        assert_eq!(issue.kind.as_str(), expected_kind);
+        assert_eq!(
+            issue.instance_id.map(EffectInstanceId::get),
+            expected_instance
+        );
+        assert_eq!(
+            issue.dependency_id.map(EffectInstanceId::get),
+            expected_dependency
+        );
+        assert_eq!(issue.pass_id.map(GraphPassId::get), expected_pass);
+        assert_eq!(issue.texture_id.map(GraphTextureId::get), expected_texture);
+        assert_eq!(
+            graph_execution_metadata_is_complete(graph),
+            graph_execution_metadata_issue(graph).is_none()
+        );
+    }
+
+    #[test]
+    fn graph_execution_metadata_reports_first_duplicate_instance_id() {
+        let duplicate = EffectInstanceId::new(1).unwrap();
+        let graph = demand_test_graph(vec![
+            demand_test_instance(1, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+            demand_test_instance(1, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+        ]);
+
+        assert_metadata_issue(
+            &graph,
+            "instance_id_not_unique",
+            Some(duplicate.get()),
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn graph_execution_metadata_accepts_complete_fixture() {
+        let graph = demand_test_graph(vec![demand_test_instance(
+            1,
+            EffectRegion::empty(),
+            EffectRegion::empty(),
+            Vec::new(),
+        )]);
+
+        let issue = graph_execution_metadata_issue(&graph);
+
+        assert_eq!(issue, None);
+        assert_eq!(
+            graph_execution_metadata_is_complete(&graph),
+            issue.is_none()
+        );
+    }
+
+    #[test]
+    fn graph_execution_metadata_reports_missing_or_non_unique_dependency() {
+        let missing = demand_test_graph(vec![demand_test_instance(
+            1,
+            EffectRegion::empty(),
+            EffectRegion::empty(),
+            vec![EffectInstanceId::new(9).unwrap()],
+        )]);
+        assert_metadata_issue(
+            &missing,
+            "dependency_missing_or_not_unique",
+            Some(1),
+            Some(9),
+            None,
+            None,
+        );
+
+        let ambiguous = demand_test_graph(vec![
+            demand_test_instance(
+                1,
+                EffectRegion::empty(),
+                EffectRegion::empty(),
+                vec![EffectInstanceId::new(7).unwrap()],
+            ),
+            demand_test_instance(7, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+            demand_test_instance(7, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+        ]);
+        assert_metadata_issue(
+            &ambiguous,
+            "dependency_missing_or_not_unique",
+            Some(1),
+            Some(7),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn graph_execution_metadata_reports_dependency_that_is_not_earlier() {
+        let graph = demand_test_graph(vec![
+            demand_test_instance(
+                1,
+                EffectRegion::empty(),
+                EffectRegion::empty(),
+                vec![EffectInstanceId::new(2).unwrap()],
+            ),
+            demand_test_instance(2, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+        ]);
+        assert_metadata_issue(
+            &graph,
+            "dependency_not_earlier",
+            Some(1),
+            Some(2),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn graph_execution_metadata_reports_missing_pass_instance() {
+        let mut graph = demand_test_graph(vec![demand_test_instance(
+            1,
+            EffectRegion::empty(),
+            EffectRegion::empty(),
+            Vec::new(),
+        )]);
+        graph.passes.push(metadata_test_pass(
+            EffectInstanceId::new(9).unwrap(),
+            Vec::new(),
+            None,
+        ));
+        assert_metadata_issue(
+            &graph,
+            "pass_instance_missing_or_not_unique",
+            None,
+            None,
+            Some(1),
+            None,
+        );
+    }
+
+    #[test]
+    fn graph_execution_metadata_rejects_non_unique_pass_instance_during_preflight() {
+        let repeated = EffectInstanceId::new(7).unwrap();
+        let mut graph = demand_test_graph(vec![
+            demand_test_instance(7, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+            demand_test_instance(7, EffectRegion::empty(), EffectRegion::empty(), Vec::new()),
+        ]);
+        graph
+            .passes
+            .push(metadata_test_pass(repeated, Vec::new(), None));
+
+        let issue = graph_execution_metadata_issue(&graph).expect("duplicate id is invalid");
+
+        assert_eq!(issue.kind.as_str(), "instance_id_not_unique");
+        assert_eq!(issue.instance_id, Some(repeated));
+        assert!(!graph_execution_metadata_is_complete(&graph));
+    }
+
+    #[test]
+    fn graph_execution_metadata_reports_missing_pass_texture() {
+        let mut graph = demand_test_graph(vec![demand_test_instance(
+            1,
+            EffectRegion::empty(),
+            EffectRegion::empty(),
+            Vec::new(),
+        )]);
+        graph.passes.push(metadata_test_pass(
+            EffectInstanceId::new(1).unwrap(),
+            vec![GraphTextureId::new(7).unwrap()],
+            None,
+        ));
+        assert_metadata_issue(&graph, "pass_texture_missing", None, None, Some(1), Some(7));
+
+        graph.passes[0].inputs.clear();
+        graph.passes[0].output = Some(GraphTextureId::new(8).unwrap());
+        assert_metadata_issue(&graph, "pass_texture_missing", None, None, Some(1), Some(8));
+    }
+
+    #[test]
+    fn effect_demand_diagnostics_classify_explicit_caller_full() {
+        let graph = demand_test_graph(Vec::new());
+        let repair = EffectRegion::from_rect(EffectRect::new(1, 1, 1, 1).unwrap());
+
+        let (demand, diagnostics) =
+            plan_effect_execution_demand_with_diagnostics(&graph, &repair, true, false);
+
+        assert!(demand.is_conservative_full());
+        assert_eq!(diagnostics.cause.as_str(), "caller_conservative_full");
+        assert_eq!(diagnostics.metadata_issue, None);
+    }
+
+    #[test]
+    fn effect_demand_conservative_cause_names_are_stable() {
+        assert_eq!(EffectDemandConservativeCause::None.as_str(), "none");
+        assert_eq!(
+            EffectDemandConservativeCause::CallerConservativeFull.as_str(),
+            "caller_conservative_full"
+        );
+        assert_eq!(
+            EffectDemandConservativeCause::RepairRegionUnrepresentable.as_str(),
+            "repair_region_unrepresentable"
+        );
+        assert_eq!(
+            EffectDemandConservativeCause::GraphMetadataIncomplete.as_str(),
+            "graph_metadata_incomplete"
+        );
+        assert_eq!(
+            EffectDemandConservativeCause::DependencyLookupFailed.as_str(),
+            "dependency_lookup_failed"
+        );
+    }
+
+    #[test]
+    fn effect_demand_diagnostics_classify_unrepresentable_repair_region() {
+        let graph = demand_test_graph(Vec::new());
+        let mut repair = EffectRegion::empty();
+        for y in 0..=MAX_EFFECT_REGION_RECTS {
+            repair.push(EffectRect {
+                x: 100,
+                y: y as i32,
+                width: u32::MAX,
+                height: 1,
+            });
+        }
+        assert!(!repair.is_empty());
+        assert!(repair.bounding_rect().is_none());
+
+        let (demand, diagnostics) =
+            plan_effect_execution_demand_with_diagnostics(&graph, &repair, false, false);
+
+        assert!(demand.is_conservative_full());
+        assert_eq!(diagnostics.cause.as_str(), "repair_region_unrepresentable");
+        assert_eq!(diagnostics.metadata_issue, None);
+    }
+
+    #[test]
+    fn effect_demand_diagnostics_classify_metadata_preflight_before_dependency_lookup() {
+        let graph = demand_test_graph(vec![demand_test_instance(
+            1,
+            EffectRegion::from_rect(EffectRect::new(0, 0, 5, 5).unwrap()),
+            EffectRegion::from_rect(EffectRect::new(0, 0, 5, 5).unwrap()),
+            vec![EffectInstanceId::new(99).unwrap()],
+        )]);
+        let repair = EffectRegion::from_rect(EffectRect::new(0, 0, 5, 5).unwrap());
+
+        let (demand, diagnostics) =
+            plan_effect_execution_demand_with_diagnostics(&graph, &repair, false, false);
+
+        assert!(demand.is_conservative_full());
+        assert_eq!(diagnostics.cause.as_str(), "graph_metadata_incomplete");
+        let issue = diagnostics
+            .metadata_issue
+            .expect("preflight issue is captured");
+        assert_eq!(issue.kind.as_str(), "dependency_missing_or_not_unique");
+        assert_eq!(issue.instance_id.map(EffectInstanceId::get), Some(1));
+        assert_eq!(issue.dependency_id.map(EffectInstanceId::get), Some(99));
+        // Every dependency is checked by the same preflight before reverse traversal,
+        // so the defensive lookup fallback cannot be reached for an immutable graph.
     }
 
     fn region_covers_region(container: &EffectRegion, required: &EffectRegion) -> bool {

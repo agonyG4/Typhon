@@ -667,10 +667,29 @@ fn effect_execution_repair_demand_converges_across_multiple_forward_hops() {
         ..RepaintPlan::default()
     };
 
-    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+    let (demand, resolution) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
 
     assert_eq!(plan.mode, RepaintMode::Partial);
     assert_eq!(plan.fallback_reason, None);
+    assert_eq!(resolution.outcome.as_str(), "converged");
+    assert!(resolution.iterations_attempted >= 2);
+    assert_eq!(resolution.initial_repair.pixels, 100);
+    assert!(resolution.last_input_repair.pixels > resolution.initial_repair.pixels);
+    assert!(resolution.last_execution_region.rects > 0);
+    assert_eq!(
+        resolution.last_merged_repair,
+        resolution.last_applied_repair
+    );
+    assert_eq!(
+        resolution.last_applied_repair,
+        EffectExecutionRepairSnapshot::from_damage(&plan.repair_damage, (100, 80))
+    );
+    assert!(plan.repair_damage.rects_slice().iter().any(|repair| {
+        repair.x <= 30 && repair.y <= 0 && repair.right() >= 40 && repair.bottom() >= 10
+    }));
+    assert!(!resolution.last_repair_changed);
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
@@ -706,6 +725,35 @@ fn stable_effect_execution_demand_keeps_partial_repair_unchanged() {
 }
 
 #[test]
+fn effect_execution_resolution_diagnostics_report_convergence_and_fixed_point_evidence() {
+    let graph = empty_effect_graph();
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert!(!demand.is_conservative_full());
+    assert_eq!(snapshot.outcome.as_str(), "converged");
+    assert_eq!(snapshot.demand_conservative_cause.as_str(), "none");
+    assert_eq!(snapshot.iterations_attempted, 1);
+    assert_eq!(snapshot.final_repaint_mode, RepaintMode::Partial);
+    assert_eq!(snapshot.last_input_repair, snapshot.initial_repair);
+    assert_eq!(snapshot.last_merged_repair, snapshot.last_input_repair);
+    assert_eq!(snapshot.last_applied_repair, snapshot.last_input_repair);
+    assert!(!snapshot.last_repair_changed);
+}
+
+#[test]
 fn conservative_effect_execution_metadata_forces_full_repair() {
     let graph =
         graph_for_effect_instances([(1, 30, 10, 30, 10, vec![99]), (2, 80, 10, 80, 10, vec![])]);
@@ -731,6 +779,169 @@ fn conservative_effect_execution_metadata_forces_full_repair() {
     assert!(demand.is_conservative_full());
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+}
+
+#[test]
+fn effect_execution_resolution_freezes_metadata_cause_before_full_demand_recompute() {
+    let graph =
+        graph_for_effect_instances([(1, 30, 10, 30, 10, vec![99]), (2, 80, 10, 80, 10, vec![])]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert!(demand.is_conservative_full());
+    assert_eq!(snapshot.outcome.as_str(), "demand_conservative");
+    assert_eq!(
+        snapshot.demand_conservative_cause.as_str(),
+        "graph_metadata_incomplete"
+    );
+    assert_eq!(
+        snapshot
+            .graph_metadata_issue
+            .map(|issue| issue.kind.as_str()),
+        Some("dependency_missing_or_not_unique")
+    );
+    assert_eq!(snapshot.final_repaint_mode, RepaintMode::Full);
+    assert_eq!(
+        snapshot.final_repaint_reason,
+        Some(FullRepaintReason::EffectExecutionConservative)
+    );
+    assert_eq!(snapshot.iterations_attempted, 1);
+}
+
+#[test]
+fn effect_execution_resolution_separates_repaint_policy_full_from_conservatism() {
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 0, 10, 10)),
+            vec![],
+        ),
+        (
+            2,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 80, 80)),
+            vec![1],
+        ),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert_eq!(snapshot.outcome.as_str(), "repaint_policy_full");
+    assert_eq!(snapshot.demand_conservative_cause.as_str(), "none");
+    assert_eq!(
+        snapshot.final_repaint_reason,
+        Some(FullRepaintReason::DamageAreaThreshold)
+    );
+    assert_eq!(snapshot.last_applied_repair.kind.as_str(), "full");
+    assert!(snapshot.last_merged_repair.pixels >= 6_000);
+}
+
+#[test]
+fn effect_execution_resolution_reports_budget_exhaustion_without_overwriting_cause() {
+    let graph = graph_for_effect_instances([
+        (1, 10, 10, 10, 10, vec![]),
+        (2, 30, 10, 10, 40, vec![1]),
+        (3, 45, 10, 45, 25, vec![2]),
+        (4, 65, 10, 65, 25, vec![]),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_iteration_budget(
+        &planner, &graph, &mut plan, 100, 80, 1,
+    );
+
+    assert_eq!(snapshot.outcome.as_str(), "iteration_exhausted");
+    assert_eq!(snapshot.demand_conservative_cause.as_str(), "none");
+    assert_eq!(snapshot.iterations_attempted, 1);
+    assert_eq!(snapshot.max_iterations, 1);
+    assert_eq!(
+        snapshot.final_repaint_reason,
+        Some(FullRepaintReason::EffectExecutionConservative)
+    );
+    assert!(snapshot.last_repair_changed);
+    assert_eq!(
+        snapshot.last_repair_changed,
+        snapshot.last_applied_repair != snapshot.last_input_repair
+    );
+    assert_eq!(snapshot.last_merged_repair, snapshot.last_applied_repair);
+    assert!(snapshot.last_merged_repair.pixels >= snapshot.last_input_repair.pixels);
+}
+
+#[test]
+fn initial_full_resolution_does_not_count_a_partial_iteration() {
+    let graph = empty_effect_graph();
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let mut plan = planner.full_plan(OutputDamage::Full, Some(2), FullRepaintReason::ForcedFull);
+
+    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert_eq!(snapshot.outcome.as_str(), "initial_full");
+    assert_eq!(
+        snapshot.demand_conservative_cause.as_str(),
+        "caller_conservative_full"
+    );
+    assert_eq!(snapshot.iterations_attempted, 0);
+    assert_eq!(
+        snapshot.final_repaint_reason,
+        Some(FullRepaintReason::ForcedFull)
+    );
+}
+
+#[test]
+fn ordinary_resolver_does_not_construct_trace_only_resolution_snapshots() {
+    let graph = empty_effect_graph();
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+    let before = EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS.with(Cell::get);
+
+    resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+
+    let after = EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS.with(Cell::get);
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -978,10 +1189,17 @@ fn effect_execution_repair_promotes_structured_plan_at_area_threshold() {
     );
     assert_eq!(plan.mode, RepaintMode::Partial);
 
-    let graph = graph_for_effect_region(
-        1,
-        oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 90, 90)),
-    );
+    let full_effect_region =
+        oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 90, 90));
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            full_effect_region.clone(),
+            full_effect_region.clone(),
+            vec![],
+        ),
+        (2, full_effect_region.clone(), full_effect_region, vec![1]),
+    ]);
     resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 100);
 
     assert_eq!(plan.mode, RepaintMode::Full);

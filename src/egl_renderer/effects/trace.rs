@@ -4,7 +4,8 @@ use std::{collections::HashMap, ffi::OsStr, sync::OnceLock};
 use std::cell::RefCell;
 
 use crate::egl_renderer::damage::{
-    DamageComplexityShadow, FullRepaintReason, OutputDamage, PartialRepaintComplexityAction,
+    DamageComplexityShadow, EffectExecutionRepairSnapshot, EffectExecutionResolutionSnapshot,
+    FullRepaintReason, OutputDamage, PartialRepaintComplexityAction,
     PartialRepaintComplexityPolicy, RepaintMode, RepaintPlan,
 };
 
@@ -383,6 +384,59 @@ pub(crate) struct EffectRepaintProvenanceSnapshot {
     pub(crate) damage_complexity_shadow: DamageComplexityShadow,
 }
 
+impl EffectExecutionResolutionSnapshot {
+    pub(crate) fn format_line(self, frame_id: Option<u64>) -> String {
+        let issue = self.graph_metadata_issue;
+        format!(
+            "event=effect_execution_resolution frame_id={} outcome={} demand_conservative_cause={} iterations_attempted={} max_iterations={} graph_instances={} graph_passes={} dependency_edges={} initial_repair_kind={} initial_repair_rects={} initial_repair_pixels={} last_input_repair_kind={} last_input_repair_rects={} last_input_repair_pixels={} last_execution_region_kind={} last_execution_region_rects={} last_execution_region_pixels={} last_merged_repair_kind={} last_merged_repair_rects={} last_merged_repair_pixels={} last_applied_repair_kind={} last_applied_repair_rects={} last_applied_repair_pixels={} last_repair_changed={} final_repaint_mode={} final_repaint_reason={} graph_metadata_issue={} graph_metadata_instance={} graph_metadata_dependency={} graph_metadata_pass={} graph_metadata_texture={}",
+            optional_u64(frame_id),
+            self.outcome.as_str(),
+            self.demand_conservative_cause.as_str(),
+            self.iterations_attempted,
+            self.max_iterations,
+            self.graph_instances,
+            self.graph_passes,
+            self.dependency_edges,
+            repair_kind(self.initial_repair),
+            self.initial_repair.rects,
+            self.initial_repair.pixels,
+            repair_kind(self.last_input_repair),
+            self.last_input_repair.rects,
+            self.last_input_repair.pixels,
+            repair_kind(self.last_execution_region),
+            self.last_execution_region.rects,
+            self.last_execution_region.pixels,
+            repair_kind(self.last_merged_repair),
+            self.last_merged_repair.rects,
+            self.last_merged_repair.pixels,
+            repair_kind(self.last_applied_repair),
+            self.last_applied_repair.rects,
+            self.last_applied_repair.pixels,
+            self.last_repair_changed,
+            self.final_repaint_mode.as_str(),
+            self.final_repaint_reason
+                .map_or("none", FullRepaintReason::as_str),
+            issue.map_or("none", |issue| issue.kind.as_str()),
+            issue
+                .and_then(|issue| issue.instance_id)
+                .map_or_else(|| "none".to_owned(), |id| id.get().to_string()),
+            issue
+                .and_then(|issue| issue.dependency_id)
+                .map_or_else(|| "none".to_owned(), |id| id.get().to_string()),
+            issue
+                .and_then(|issue| issue.pass_id)
+                .map_or_else(|| "none".to_owned(), |id| id.get().to_string()),
+            issue
+                .and_then(|issue| issue.texture_id)
+                .map_or_else(|| "none".to_owned(), |id| id.get().to_string()),
+        )
+    }
+}
+
+fn repair_kind(snapshot: EffectExecutionRepairSnapshot) -> &'static str {
+    snapshot.kind.as_str()
+}
+
 impl EffectRepaintProvenanceSnapshot {
     pub(crate) const fn new(
         input_damage: DamageTraceSnapshot,
@@ -673,6 +727,13 @@ impl EffectExecutionTrace {
     pub(crate) fn effect_repaint_provenance<F>(&self, make_snapshot: F)
     where
         F: FnOnce() -> EffectRepaintProvenanceSnapshot,
+    {
+        self.event(|| make_snapshot().format_line(self.frame_id));
+    }
+
+    pub(crate) fn effect_execution_resolution<F>(&self, make_snapshot: F)
+    where
+        F: FnOnce() -> EffectExecutionResolutionSnapshot,
     {
         self.event(|| make_snapshot().format_line(self.frame_id));
     }
@@ -1092,11 +1153,16 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::egl_renderer::damage::{
+        EffectExecutionRepairKind, EffectExecutionResolutionOutcome,
+    };
     use crate::egl_renderer::damage::{FullRepaintReason, OutputDamage, OutputRect, RepaintMode};
     use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
     use oblivion_one::effects::{
-        EffectAlphaMode, EffectColorConversion, EffectInstanceId, EffectRegion, EffectWorkingSpace,
-        GraphTextureOrigin, GraphTexturePlan, RenderGraphCompileStats, RenderPassKind,
+        EffectAlphaMode, EffectColorConversion, EffectDemandConservativeCause, EffectInstanceId,
+        EffectRegion, EffectWorkingSpace, GraphExecutionMetadataIssue,
+        GraphExecutionMetadataIssueKind, GraphTextureOrigin, GraphTexturePlan,
+        RenderGraphCompileStats, RenderPassKind,
     };
 
     #[test]
@@ -1893,5 +1959,115 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(events[0].starts_with("event=effect_repaint_provenance frame_id=unknown "));
+    }
+
+    #[test]
+    fn effect_execution_resolution_formatter_emits_each_stable_field_once() {
+        let repair = EffectExecutionRepairSnapshot {
+            kind: EffectExecutionRepairKind::Rects,
+            rects: 20,
+            pixels: 2_000,
+        };
+        let snapshot = EffectExecutionResolutionSnapshot {
+            outcome: EffectExecutionResolutionOutcome::IterationExhausted,
+            demand_conservative_cause: EffectDemandConservativeCause::GraphMetadataIncomplete,
+            iterations_attempted: 2,
+            max_iterations: 2,
+            graph_instances: 4,
+            graph_passes: 24,
+            dependency_edges: 1,
+            initial_repair: repair,
+            last_input_repair: repair,
+            last_execution_region: repair,
+            last_merged_repair: repair,
+            last_applied_repair: repair,
+            last_repair_changed: true,
+            final_repaint_mode: RepaintMode::Full,
+            final_repaint_reason: Some(FullRepaintReason::EffectExecutionConservative),
+            graph_metadata_issue: Some(GraphExecutionMetadataIssue {
+                kind: GraphExecutionMetadataIssueKind::DependencyNotEarlier,
+                instance_id: Some(oblivion_one::effects::EffectInstanceId::new(4).unwrap()),
+                dependency_id: Some(oblivion_one::effects::EffectInstanceId::new(3).unwrap()),
+                pass_id: None,
+                texture_id: None,
+            }),
+        };
+
+        let line = snapshot.format_line(Some(42));
+        let keys = [
+            "event",
+            "frame_id",
+            "outcome",
+            "demand_conservative_cause",
+            "iterations_attempted",
+            "max_iterations",
+            "graph_instances",
+            "graph_passes",
+            "dependency_edges",
+            "initial_repair_kind",
+            "initial_repair_rects",
+            "initial_repair_pixels",
+            "last_input_repair_kind",
+            "last_input_repair_rects",
+            "last_input_repair_pixels",
+            "last_execution_region_kind",
+            "last_execution_region_rects",
+            "last_execution_region_pixels",
+            "last_merged_repair_kind",
+            "last_merged_repair_rects",
+            "last_merged_repair_pixels",
+            "last_applied_repair_kind",
+            "last_applied_repair_rects",
+            "last_applied_repair_pixels",
+            "last_repair_changed",
+            "final_repaint_mode",
+            "final_repaint_reason",
+            "graph_metadata_issue",
+            "graph_metadata_instance",
+            "graph_metadata_dependency",
+            "graph_metadata_pass",
+            "graph_metadata_texture",
+        ];
+        for key in keys {
+            assert_eq!(
+                line.split_whitespace()
+                    .filter(|field| field.split_once('=').is_some_and(|(name, _)| name == key))
+                    .count(),
+                1,
+                "expected exactly one {key} field in {line}"
+            );
+        }
+        assert!(line.starts_with("event=effect_execution_resolution frame_id=42 "));
+        assert!(line.contains("outcome=iteration_exhausted"));
+        assert!(line.contains("demand_conservative_cause=graph_metadata_incomplete"));
+        assert!(line.contains("graph_metadata_issue=dependency_not_earlier"));
+        assert!(line.contains("graph_metadata_instance=4"));
+        assert!(line.contains("graph_metadata_dependency=3"));
+        assert!(line.contains("graph_metadata_pass=none"));
+        assert!(line.contains("graph_metadata_texture=none"));
+        assert!(!line.contains("EffectExecutionResolutionOutcome"));
+        assert!(!line.contains("GraphExecutionMetadataIssueKind"));
+
+        let trace = EffectExecutionTrace::enabled_for_test();
+        clear_test_events();
+        trace.effect_execution_resolution(|| snapshot);
+        let events = take_test_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("event=effect_execution_resolution frame_id=unknown "));
+    }
+
+    #[test]
+    fn disabled_effect_execution_resolution_trace_does_not_build_snapshot() {
+        let trace = EffectExecutionTrace::disabled_for_test();
+        let snapshot_built = Cell::new(false);
+
+        clear_test_events();
+        trace.effect_execution_resolution(|| {
+            snapshot_built.set(true);
+            unreachable!("disabled trace must not request a snapshot")
+        });
+
+        assert!(!snapshot_built.get());
+        assert!(take_test_events().is_empty());
     }
 }

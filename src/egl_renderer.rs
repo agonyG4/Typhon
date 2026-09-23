@@ -50,6 +50,7 @@ pub(crate) use damage::{
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
     RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
+    resolve_effect_execution_for_repaint_plan_with_diagnostics,
 };
 use effects::{
     DamageTraceSnapshot, EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache,
@@ -2214,15 +2215,25 @@ impl GlesSceneRenderer {
             .frame_boundary("effect_demand_plan", "begin", demand_trace_begin_summary);
         let effect_execution_demand = match &execution_plan {
             FrameExecutionPlan::LegacyScene => None,
-            FrameExecutionPlan::EffectGraph(graph) => {
-                Some(resolve_effect_execution_for_repaint_plan(
+            FrameExecutionPlan::EffectGraph(graph) => Some(if self.effect_trace.enabled() {
+                let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
                     &self.repaint_planner,
                     graph,
                     &mut plan,
                     width,
                     height,
-                ))
-            }
+                );
+                self.effect_trace.effect_execution_resolution(|| snapshot);
+                demand
+            } else {
+                resolve_effect_execution_for_repaint_plan(
+                    &self.repaint_planner,
+                    graph,
+                    &mut plan,
+                    width,
+                    height,
+                )
+            }),
         };
         let selected_effect_count = effect_execution_demand
             .as_ref()
