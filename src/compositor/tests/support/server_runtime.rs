@@ -1077,7 +1077,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let authority = surfaces
                             .iter()
                             .position(|surface| surface.surface_id == root_surface_id)
-                            .and_then(|index| {
+                            .map(|index| {
                                 let surface = &surfaces[index];
                                 let visual_geometry = server
                                     .state
@@ -1090,7 +1090,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         active_resize: visual.active_resize.is_some(),
                                         mode_transition: visual.mode_transition,
                                     });
-                                Some(XdgRootPlacementAuthoritySnapshot {
+                                XdgRootPlacementAuthoritySnapshot {
                                     root_surface_id,
                                     canonical_surface_placement: server
                                         .state
@@ -1118,7 +1118,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         .iter()
                                         .position(|active| active.surface_id == root_surface_id)
                                         .and_then(|index| active_origins.get(index).copied()),
-                                })
+                                }
                             });
                         let _ = reply.send(authority);
                     }
