@@ -890,6 +890,12 @@ pub(crate) fn submit_proxy_selection_snapshots(
             continue;
         }
 
+        super::selection_proxy::desired_proxy_selection_changed(
+            xwm,
+            kind,
+            offer.as_ref().map(|offer| offer.id),
+            crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+        )?;
         cancel_proxy_catalog_for_channel(xwm, generation, kind);
         let Some(offer) = offer else {
             continue;
@@ -1070,6 +1076,13 @@ pub(crate) fn observe_xfixes(
         | xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE => None,
         _ => return Ok(()),
     };
+    super::selection_proxy::observe_xfixes_owner_transition(
+        xwm,
+        kind,
+        owner,
+        event.selection_timestamp,
+        crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+    )?;
     apply_owner_transition(xwm, generation, kind, owner, event.selection_timestamp)
 }
 
@@ -1374,7 +1387,7 @@ pub(crate) fn complete_proxy_mime_atom_for_test(
 
 fn schedule_selection_resolution_queries(xwm: &mut Xwm) -> Result<(), XwmError> {
     finalize_ready_target_catalogs(xwm);
-    finalize_ready_proxy_catalogs(xwm);
+    finalize_ready_proxy_catalogs(xwm)?;
     while xwm.data_bridge.selection_wire.pending.len() < MAX_PENDING_SELECTION_REPLIES {
         let Some(request) = xwm.data_bridge.selection_wire.next_resolution_request() else {
             break;
@@ -1431,11 +1444,11 @@ fn schedule_selection_resolution_queries(xwm: &mut Xwm) -> Result<(), XwmError> 
         }
     }
     finalize_ready_target_catalogs(xwm);
-    finalize_ready_proxy_catalogs(xwm);
+    finalize_ready_proxy_catalogs(xwm)?;
     xwm.connection.flush().map_err(XwmError::Connection)
 }
 
-fn finalize_ready_proxy_catalogs(xwm: &mut Xwm) {
+fn finalize_ready_proxy_catalogs(xwm: &mut Xwm) -> Result<(), XwmError> {
     let ready = xwm
         .data_bridge
         .selection_wire
@@ -1528,7 +1541,13 @@ fn finalize_ready_proxy_catalogs(xwm: &mut Xwm) {
             .selection_wire
             .prepared_proxy_selections
             .insert(kind, prepared);
+        super::selection_proxy::prepared_catalog_changed(
+            xwm,
+            kind,
+            crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+        )?;
     }
+    Ok(())
 }
 
 fn finalize_ready_target_catalogs(xwm: &mut Xwm) {

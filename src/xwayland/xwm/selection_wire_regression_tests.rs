@@ -310,7 +310,30 @@ fn wayland_mime_is_interned_asynchronously_to_an_exact_x11_target() {
         super::super::selection_wire::proxy_mime_for_target_for_test(&xwm, 0xd101),
         Some("image/png".to_owned())
     );
-    assert!(read_fixture_requests(&mut peer).is_empty());
+    let ready_requests = read_fixture_requests(&mut peer);
+    assert_eq!(ready_requests.len(), 24, "one empty ChangeProperty request");
+    assert_eq!(ready_requests[0], xproto::CHANGE_PROPERTY_REQUEST);
+    assert_eq!(ready_requests[1], u8::from(xproto::PropMode::APPEND));
+    let word = |offset: usize| {
+        u32::from_le_bytes(
+            ready_requests[offset..offset + 4]
+                .try_into()
+                .expect("four byte request field"),
+        )
+    };
+    assert_eq!(
+        word(8),
+        xwm.atoms
+            .get(super::super::atoms::XwmAtomName::SelectionProxyTime)
+    );
+    assert_eq!(word(12), u32::from(xproto::AtomEnum::INTEGER));
+    assert_eq!(word(20), 0, "timestamp probe has no payload");
+    assert!(
+        !fixture_request_opcodes(&ready_requests)
+            .iter()
+            .any(|(opcode, _)| *opcode == xproto::SET_SELECTION_OWNER_REQUEST),
+        "catalog readiness starts only the timestamp probe"
+    );
 }
 
 #[test]

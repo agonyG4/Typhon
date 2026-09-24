@@ -696,6 +696,31 @@ pub(crate) fn cancel_owner(
     Ok(!ids.is_empty())
 }
 
+pub(crate) fn cancel_channel(
+    xwm: &mut Xwm,
+    kind: crate::xwayland::XwaylandSelectionKind,
+) -> Result<(), XwmError> {
+    let ids = xwm
+        .data_bridge
+        .selection_outgoing
+        .transfers
+        .values()
+        .filter(|transfer| transfer.kind == kind)
+        .map(|transfer| transfer.id)
+        .collect::<Vec<_>>();
+    for id in ids {
+        let Some(transfer) = xwm.data_bridge.selection_outgoing.transfers.remove(&id) else {
+            continue;
+        };
+        xwm.data_bridge
+            .selection_outgoing
+            .pending_requests
+            .retain(|request| request.transfer_id != id);
+        super::selection_proxy::release_requestor(xwm, transfer.requestor, false)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError> {
     let expired = xwm
         .data_bridge

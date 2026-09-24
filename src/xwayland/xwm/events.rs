@@ -89,6 +89,40 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             )?;
             return Ok(());
         }
+        Event::PropertyNotify(property)
+            if property.state == xproto::Property::NEW_VALUE
+                && super::selection_proxy::owns_timestamp_property(
+                    xwm,
+                    property.window,
+                    property.atom,
+                ) =>
+        {
+            super::selection_proxy::timestamp_property_notify(
+                xwm,
+                property,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )?;
+            return Ok(());
+        }
+        Event::SelectionClear(clear) => {
+            if super::selection_proxy::selection_clear(
+                xwm,
+                clear,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )? {
+                return Ok(());
+            }
+            Event::SelectionClear(clear)
+        }
+        Event::DestroyNotify(destroy)
+            if super::selection_proxy::proxy_owner_destroyed(
+                xwm,
+                destroy.window,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )? =>
+        {
+            return Ok(());
+        }
         event => event,
     };
     if normalized_window_event_target(&event).is_some_and(|window| {
@@ -104,6 +138,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         super::selection_proxy::requestor_destroyed(xwm, destroy.window)?;
     }
     match event {
+        Event::SelectionRequest(event) => {
+            super::selection_proxy::handle_selection_request(
+                xwm,
+                event,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )?;
+        }
         Event::CreateNotify(event) => {
             if event.window == xwm.root {
                 return Ok(());
