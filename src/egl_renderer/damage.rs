@@ -312,6 +312,17 @@ pub(crate) fn merge_effect_damage(
     )
 }
 
+fn effect_execution_region_is_covered_by_repair(
+    repair_damage: &OutputDamage,
+    execution_region: &oblivion_one::effects::EffectRegion,
+    output_width: u32,
+    output_height: u32,
+) -> bool {
+    let repair_region =
+        super::effect_region_from_output_damage(repair_damage, output_width, output_height);
+    execution_region.subtract(&repair_region).is_empty()
+}
+
 pub(crate) fn effect_execution_demand_for_repaint_plan(
     graph: &oblivion_one::effects::CompiledFrameGraph,
     plan: &RepaintPlan,
@@ -505,6 +516,22 @@ fn resolve_effect_execution_for_repaint_plan_inner(
             return final_demand;
         }
 
+        if effect_execution_region_is_covered_by_repair(
+            &plan.repair_damage,
+            &demand.execution_region,
+            output_width,
+            output_height,
+        ) {
+            if let Some(snapshot) = diagnostics.as_deref_mut() {
+                snapshot.last_merged_repair = snapshot.last_input_repair;
+                snapshot.last_applied_repair = snapshot.last_input_repair;
+                snapshot.last_repair_changed = false;
+                snapshot.outcome = EffectExecutionResolutionOutcome::Converged;
+                snapshot.finish_with_plan(plan);
+            }
+            return demand;
+        }
+
         let previous_repair = plan.repair_damage.clone();
         let execution_repair = merge_effect_damage(
             previous_repair.clone(),
@@ -537,6 +564,7 @@ fn resolve_effect_execution_for_repaint_plan_inner(
             }
             return final_demand;
         }
+
         if plan.repair_damage == previous_repair {
             if let Some(snapshot) = diagnostics.as_deref_mut() {
                 snapshot.outcome = EffectExecutionResolutionOutcome::Converged;

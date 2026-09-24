@@ -754,6 +754,44 @@ fn effect_execution_resolution_diagnostics_report_convergence_and_fixed_point_ev
 }
 
 #[test]
+fn effect_execution_resolution_converges_when_execution_region_is_already_covered() {
+    let initial_repair =
+        OutputDamage::rects(8, 8, [rect(0, 0, 1, 1), rect(0, 1, 2, 1), rect(0, 2, 1, 1)]);
+    let region = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 1, 1));
+    let graph = graph_with_instance_regions([(1, region.clone(), region, vec![])]);
+    let planner = partial_planner((8, 8), partial_capabilities());
+    let mut plan = RepaintPlan {
+        render_damage: initial_repair.clone(),
+        repair_damage: initial_repair.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 8, 8,
+    );
+
+    let instance_id = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+
+    assert!(demand.contains(instance_id));
+    assert_eq!(snapshot.graph_instances, 1);
+    assert_eq!(snapshot.dependency_edges, 0);
+    assert!(snapshot.last_execution_region.rects > 0);
+    assert!(snapshot.last_execution_region.pixels > 0);
+    assert_eq!(snapshot.outcome.as_str(), "converged");
+    assert_eq!(snapshot.iterations_attempted, 1);
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
+    assert!(!snapshot.last_repair_changed);
+    assert_eq!(snapshot.last_merged_repair, snapshot.last_input_repair);
+    assert_eq!(snapshot.last_applied_repair, snapshot.last_input_repair);
+    assert_eq!(snapshot.final_repaint_reason, None);
+    assert_eq!(plan.repair_damage, initial_repair);
+}
+
+#[test]
 fn conservative_effect_execution_metadata_forces_full_repair() {
     let graph =
         graph_for_effect_instances([(1, 30, 10, 30, 10, vec![99]), (2, 80, 10, 80, 10, vec![])]);
