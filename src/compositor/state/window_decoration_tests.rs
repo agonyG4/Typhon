@@ -69,6 +69,95 @@ fn xdg_state(
     state
 }
 
+fn zero_sized_xdg_mode_transition_state(surface_id: u32, configure_serial: u32) -> CompositorState {
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    let target = SurfacePlacement::absolute_root_at(120, 90);
+    state
+        .xdg_surface_lifecycles
+        .entry(surface_id)
+        .or_default()
+        .record_configure(configure_serial);
+    state.surface_window_geometries.insert(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.set_surface_placement(surface_id, target);
+    state.install_xdg_mode_transition_visual_geometry(
+        surface_id,
+        WindowGeometry::new(target, 0, 0),
+        VisualGeometryTransition::Immediate,
+        Some(configure_serial),
+    );
+    state
+}
+
+fn install_test_toplevel_role(
+    state: &mut CompositorState,
+    surface_id: u32,
+) -> (
+    wayland_server::Display<CompositorState>,
+    wayland_server::Client,
+) {
+    let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test socket");
+    let client = display_handle
+        .insert_client(server_end, std::sync::Arc::new(()))
+        .expect("test client");
+    let surface =
+        state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+    let xdg_surface = client
+        .create_resource::<
+            wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface,
+            XdgSurfaceData,
+            CompositorState,
+        >(
+            &display_handle,
+            20,
+            XdgSurfaceData {
+                surface: surface.clone(),
+                reservation: XdgAssociationReservation::Fresh,
+            },
+        )
+        .expect("test XDG surface");
+    let toplevel = client
+        .create_resource::<
+            wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+            XdgToplevelData,
+            CompositorState,
+        >(
+            &display_handle,
+            21,
+            XdgToplevelData { surface },
+        )
+        .expect("test XDG toplevel");
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    state.toplevel_surfaces.insert(
+        surface_id,
+        ToplevelSurface {
+            window_id,
+            xdg_surface,
+            toplevel,
+            pending_constraints: None,
+            wm_capabilities_sent: false,
+        },
+    );
+    (display, client)
+}
+
+fn acknowledge_test_xdg_configure(state: &mut CompositorState, surface_id: u32, serial: u32) {
+    let acknowledgement = state
+        .acknowledge_xdg_configure(surface_id, serial)
+        .expect("valid test configure ACK");
+    state.ack_xdg_surface_configure(surface_id, acknowledgement);
+}
+
 fn x11_state(surface: RenderableSurface) -> CompositorState {
     let mut state = CompositorState::new(None);
     let window_id = state.allocate_window_id().expect("window id");
@@ -921,6 +1010,186 @@ fn zero_sized_xdg_mode_visual_survives_animation_endpoint_without_client_respons
             .and_then(|fence| fence.ack_commit_sequence_floor),
         None,
         "presentation convergence does not create an XDG ACK-to-commit fence"
+    );
+}
+
+#[test]
+fn xdg_mode_transition_fence_requires_ack_then_a_later_root_commit() {
+    let surface_id = 54;
+    let configure_serial = 101;
+    let mut state = zero_sized_xdg_mode_transition_state(surface_id, configure_serial);
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    let pre_ack_commit = state.allocate_surface_commit_sequence();
+
+    acknowledge_test_xdg_configure(&mut state, surface_id, configure_serial);
+    let ack_floor = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .and_then(|fence| fence.ack_commit_sequence_floor)
+        .expect("the exact transition ACK establishes its commit boundary");
+    assert!(pre_ack_commit.get() <= ack_floor.get());
+
+    state.update_toplevel_visual_render_assignment(surface_id);
+    assert!(state.toplevel_visual_geometries.contains_key(&surface_id));
+
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, pre_ack_commit);
+    assert!(
+        state.toplevel_visual_geometries.contains_key(&surface_id),
+        "a root commit captured before ACK cannot satisfy the fence when published afterward"
+    );
+
+    let response_commit = state.allocate_surface_commit_sequence();
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, response_commit);
+    assert!(
+        !state.toplevel_visual_geometries.contains_key(&surface_id),
+        "a root commit received after the transition ACK can retire converged geometry"
+    );
+}
+
+#[test]
+fn xdg_mode_transition_without_an_emitted_configure_uses_generic_convergence() {
+    let surface_id = 57;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    let target = SurfacePlacement::absolute_root_at(120, 90);
+    state.surface_window_geometries.insert(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.set_surface_placement(surface_id, target);
+
+    state.install_xdg_mode_transition_visual_geometry(
+        surface_id,
+        WindowGeometry::new(target, 0, 0),
+        VisualGeometryTransition::Immediate,
+        None,
+    );
+
+    assert!(
+        !state.toplevel_visual_geometries.contains_key(&surface_id),
+        "without an emitted configure, the temporary visual uses generic convergence"
+    );
+}
+
+#[test]
+fn newer_xdg_ack_consumes_transition_configure_for_mode_visual_fence() {
+    let surface_id = 55;
+    let transition_serial = 201;
+    let newer_serial = 202;
+    let mut state = zero_sized_xdg_mode_transition_state(surface_id, transition_serial);
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state
+        .xdg_surface_lifecycles
+        .get_mut(&surface_id)
+        .expect("XDG lifecycle")
+        .record_configure(newer_serial);
+
+    acknowledge_test_xdg_configure(&mut state, surface_id, newer_serial);
+    let ack_floor = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .and_then(|fence| fence.ack_commit_sequence_floor);
+    assert!(
+        ack_floor.is_some(),
+        "ACK of the newer outstanding configure consumes the transition configure"
+    );
+    state.update_toplevel_visual_render_assignment(surface_id);
+    assert!(
+        state.toplevel_visual_geometries.contains_key(&surface_id),
+        "ACK alone does not retire the temporary visual"
+    );
+
+    let response_commit = state.allocate_surface_commit_sequence();
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, response_commit);
+    assert!(
+        !state.toplevel_visual_geometries.contains_key(&surface_id),
+        "the root commit after ACK of the newer configure retires the transition visual"
+    );
+}
+
+#[test]
+fn older_xdg_ack_cannot_satisfy_newer_mode_transition_visual() {
+    let surface_id = 58;
+    let older_serial = 401;
+    let transition_serial = 402;
+    let mut state = zero_sized_xdg_mode_transition_state(surface_id, transition_serial);
+    let lifecycle = state
+        .xdg_surface_lifecycles
+        .get_mut(&surface_id)
+        .expect("XDG lifecycle");
+    lifecycle.configures.clear();
+    lifecycle.record_configure(older_serial);
+    lifecycle.record_configure(transition_serial);
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+
+    acknowledge_test_xdg_configure(&mut state, surface_id, older_serial);
+    let old_ack_commit = state.allocate_surface_commit_sequence();
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, old_ack_commit);
+    assert!(
+        state.toplevel_visual_geometries.contains_key(&surface_id),
+        "an ACK that consumes only an older configure cannot satisfy this transition"
+    );
+    assert_eq!(
+        state
+            .toplevel_visual_geometries
+            .get(&surface_id)
+            .and_then(|visual| visual.xdg_mode_transition_fence)
+            .and_then(|fence| fence.ack_commit_sequence_floor),
+        None
+    );
+
+    acknowledge_test_xdg_configure(&mut state, surface_id, transition_serial);
+    let transition_response_commit = state.allocate_surface_commit_sequence();
+    state.update_toplevel_visual_render_assignment_after_root_commit(
+        surface_id,
+        transition_response_commit,
+    );
+    assert!(
+        !state.toplevel_visual_geometries.contains_key(&surface_id),
+        "the transition configure's own later ACK and commit retire its visual"
+    );
+}
+
+#[test]
+fn later_xdg_ack_does_not_strand_transition_after_exact_ack() {
+    let surface_id = 56;
+    let transition_serial = 301;
+    let newer_serial = 302;
+    let mut state = zero_sized_xdg_mode_transition_state(surface_id, transition_serial);
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    acknowledge_test_xdg_configure(&mut state, surface_id, transition_serial);
+    let first_ack_floor = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .and_then(|fence| fence.ack_commit_sequence_floor)
+        .expect("exact transition ACK establishes the first boundary");
+
+    state
+        .xdg_surface_lifecycles
+        .get_mut(&surface_id)
+        .expect("XDG lifecycle")
+        .record_configure(newer_serial);
+    acknowledge_test_xdg_configure(&mut state, surface_id, newer_serial);
+    let fence_floor_after_newer_ack = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .and_then(|fence| fence.ack_commit_sequence_floor);
+    assert_eq!(fence_floor_after_newer_ack, Some(first_ack_floor));
+
+    state.update_toplevel_visual_render_assignment(surface_id);
+    assert!(state.toplevel_visual_geometries.contains_key(&surface_id));
+    let response_commit = state.allocate_surface_commit_sequence();
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, response_commit);
+    assert!(
+        !state.toplevel_visual_geometries.contains_key(&surface_id),
+        "a newer accepted ACK cannot strand an already acknowledged transition configure"
     );
 }
 

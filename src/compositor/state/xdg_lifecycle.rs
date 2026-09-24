@@ -25,6 +25,18 @@ pub(in crate::compositor) struct XdgConfigureRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor) struct XdgConfigureAck {
+    pub(in crate::compositor) acknowledged_serial: u32,
+    consumed_serials: Vec<u32>,
+}
+
+impl XdgConfigureAck {
+    pub(in crate::compositor) fn consumed_configure(&self, serial: u32) -> bool {
+        self.consumed_serials.contains(&serial)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::compositor) struct XdgSurfaceLifecycle {
     pub(in crate::compositor) construction: XdgConstructionState,
     pub(in crate::compositor) map_state: XdgMapState,
@@ -121,7 +133,10 @@ impl XdgSurfaceLifecycle {
         }
     }
 
-    pub(in crate::compositor) fn acknowledge(&mut self, serial: u32) -> Result<(), ()> {
+    pub(in crate::compositor) fn acknowledge(
+        &mut self,
+        serial: u32,
+    ) -> Result<XdgConfigureAck, ()> {
         let Some(index) = self
             .configures
             .iter()
@@ -132,11 +147,13 @@ impl XdgSurfaceLifecycle {
         if self.configures[index].acknowledged {
             return Err(());
         }
+        let mut consumed_serials = Vec::with_capacity(index + 1);
         for _ in 0..=index {
             let Some(mut configure) = self.configures.pop_front() else {
                 return Err(());
             };
             configure.acknowledged = configure.serial == serial;
+            consumed_serials.push(configure.serial);
             if configure.serial == serial {
                 self.last_acked_serial = Some(serial);
                 self.last_acked_decoration = configure.decoration;
@@ -148,7 +165,10 @@ impl XdgSurfaceLifecycle {
         } else {
             XdgMapState::UnmappedConfigured
         };
-        Ok(())
+        Ok(XdgConfigureAck {
+            acknowledged_serial: serial,
+            consumed_serials,
+        })
     }
 
     pub(in crate::compositor) fn mark_initial_empty_commit(&mut self) -> bool {
@@ -325,9 +345,9 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         serial: u32,
-    ) -> bool {
+    ) -> Option<XdgConfigureAck> {
         self.xdg_surface_lifecycle_mut(surface_id)
-            .is_some_and(|lifecycle| lifecycle.acknowledge(serial).is_ok())
+            .and_then(|lifecycle| lifecycle.acknowledge(serial).ok())
     }
 
     pub(in crate::compositor) fn mark_xdg_empty_commit(&mut self, surface_id: u32) -> bool {
@@ -436,6 +456,21 @@ mod tests {
         assert!(!lifecycle.has_outstanding_configure());
         assert_eq!(lifecycle.last_acked_serial, Some(3));
         assert!(lifecycle.can_commit_buffer());
+    }
+
+    #[test]
+    fn configure_ack_reports_consumed_queue_prefix_across_serial_wrap() {
+        let mut lifecycle = initialized_lifecycle();
+        lifecycle.record_configure(u32::MAX);
+        lifecycle.record_configure(1);
+
+        let acknowledgement = lifecycle.acknowledge(1).expect("newest ACK is accepted");
+
+        assert_eq!(acknowledgement.acknowledged_serial, 1);
+        assert!(acknowledgement.consumed_configure(u32::MAX));
+        assert!(acknowledgement.consumed_configure(1));
+        assert_eq!(lifecycle.last_acked_serial, Some(1));
+        assert!(!lifecycle.has_outstanding_configure());
     }
 
     #[test]

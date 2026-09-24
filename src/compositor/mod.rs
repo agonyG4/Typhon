@@ -555,7 +555,7 @@ struct ToplevelVisualGeometry {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct XdgModeTransitionResponseFence {
-    configure_serial: Option<u32>,
+    configure_serial: u32,
     ack_commit_sequence_floor: Option<SurfaceCommitSequence>,
 }
 impl ToplevelVisualGeometry {

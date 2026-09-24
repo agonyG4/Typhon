@@ -760,7 +760,8 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
             }
             xdg_surface::Request::AckConfigure { serial } => {
                 let surface_id = compositor_surface_id(&data.surface);
-                let acknowledged = state.acknowledge_xdg_configure(surface_id, serial);
+                let acknowledgement = state.acknowledge_xdg_configure(surface_id, serial);
+                let acknowledged = acknowledgement.is_some();
                 if crate::compositor::fullscreen::fullscreen_trace_enabled() {
                     eprintln!(
                         "oblivion-one fullscreen: event=xdg_configure_acked root_surface_id={surface_id} serial={serial} accepted={acknowledged}"
@@ -790,7 +791,9 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     );
                     return;
                 }
-                state.ack_xdg_surface_configure(surface_id, serial);
+                if let Some(acknowledgement) = acknowledgement {
+                    state.ack_xdg_surface_configure(surface_id, acknowledgement);
+                }
             }
             xdg_surface::Request::Destroy => {
                 let surface_id = compositor_surface_id(&data.surface);

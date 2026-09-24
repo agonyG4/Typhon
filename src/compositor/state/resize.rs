@@ -40,8 +40,22 @@ impl CompositorState {
     pub(in crate::compositor) fn ack_xdg_surface_configure(
         &mut self,
         surface_id: u32,
-        serial: u32,
+        acknowledgement: XdgConfigureAck,
     ) {
+        let serial = acknowledgement.acknowledged_serial;
+        let transition_configure_consumed = self
+            .toplevel_visual_geometries
+            .get(&surface_id)
+            .and_then(|visual| visual.xdg_mode_transition_fence)
+            .is_some_and(|fence| acknowledgement.consumed_configure(fence.configure_serial));
+        if transition_configure_consumed
+            && let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
+            && let Some(fence) = visual.xdg_mode_transition_fence.as_mut()
+            && fence.ack_commit_sequence_floor.is_none()
+        {
+            fence.ack_commit_sequence_floor =
+                Some(SurfaceCommitSequence(self.next_surface_commit_sequence));
+        }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -79,13 +93,6 @@ impl CompositorState {
         };
         if matched_other || resize_decision == ResizeAckDecision::Matched {
             serial_state.latest_acked = serial_state.latest_acked.max(serial);
-        }
-        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
-            && let Some(fence) = visual.xdg_mode_transition_fence.as_mut()
-            && fence.configure_serial == Some(serial)
-        {
-            fence.ack_commit_sequence_floor =
-                Some(SurfaceCommitSequence(self.next_surface_commit_sequence));
         }
         match resize_decision {
             ResizeAckDecision::Matched => {

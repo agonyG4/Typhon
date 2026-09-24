@@ -388,12 +388,9 @@ impl CompositorState {
                 let client_response_committed =
                     visual.xdg_mode_transition_fence.is_none_or(|fence| {
                         fence
-                            .configure_serial
-                            .zip(fence.ack_commit_sequence_floor)
-                            .is_some_and(|(serial, ack_commit_floor)| {
-                                self.xdg_surface_lifecycle(root_surface_id).is_some_and(
-                                    |lifecycle| lifecycle.last_acked_serial == Some(serial),
-                                ) && root_commit_sequence.is_some_and(|commit_sequence| {
+                            .ack_commit_sequence_floor
+                            .is_some_and(|ack_commit_floor| {
+                                root_commit_sequence.is_some_and(|commit_sequence| {
                                     commit_sequence.get() > ack_commit_floor.get()
                                 })
                             })
@@ -563,14 +560,16 @@ impl CompositorState {
         transition: VisualGeometryTransition,
         configure_serial: Option<u32>,
     ) {
+        let xdg_mode_transition_fence =
+            configure_serial.map(|configure_serial| XdgModeTransitionResponseFence {
+                configure_serial,
+                ack_commit_sequence_floor: None,
+            });
         self.install_toplevel_visual_geometry_with_response_fence(
             root_surface_id,
             geometry,
             transition,
-            Some(XdgModeTransitionResponseFence {
-                configure_serial,
-                ack_commit_sequence_floor: None,
-            }),
+            xdg_mode_transition_fence,
         );
     }
 
