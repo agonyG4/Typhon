@@ -341,6 +341,16 @@ pub(in crate::compositor::tests) fn capture_pointer_constraint_backend_requests(
     receiver.recv().unwrap()
 }
 
+pub(in crate::compositor::tests) fn capture_active_confined_pointer_region(
+    commands: &Sender<ServerCommand>,
+) -> Option<crate::compositor::input::OutputRegion> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureActiveConfinedPointerRegion(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
 pub(in crate::compositor::tests) fn capture_pointer_constraint_snapshot(
     commands: &Sender<ServerCommand>,
     constraint_id: u64,

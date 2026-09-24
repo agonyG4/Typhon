@@ -986,10 +986,14 @@ impl CompositorState {
         debug_assert!(self.surface_tree_generation.is_none());
         self.surface_tree_generation = Some(self.render_generation.saturating_add(1));
         self.surface_tree_pointer_focus_refresh_pending = false;
+        self.surface_tree_confined_region_refresh_pending = false;
     }
 
     pub(in crate::compositor) fn finish_surface_tree_publication(&mut self) {
         self.surface_tree_generation = None;
+        if std::mem::take(&mut self.surface_tree_confined_region_refresh_pending) {
+            self.update_all_active_confined_pointer_regions("surface_tree_publication");
+        }
         if std::mem::take(&mut self.surface_tree_pointer_focus_refresh_pending) {
             self.refresh_pointer_focus_at_last_position();
         }
@@ -1039,6 +1043,7 @@ impl CompositorState {
             } else {
                 self.refresh_active_scene_surface(surface_id);
             }
+            self.reconcile_active_confined_pointer_regions(cause.as_str());
         }
     }
 
@@ -1060,8 +1065,16 @@ impl CompositorState {
         }
         let generation = self.next_render_generation_value();
         self.set_render_generation_with_scene_effect(generation, cause, scene_effect);
-        self.update_all_active_confined_pointer_regions(cause.as_str());
+        self.reconcile_active_confined_pointer_regions(cause.as_str());
         generation
+    }
+
+    fn reconcile_active_confined_pointer_regions(&mut self, reason: &'static str) {
+        if self.surface_tree_generation.is_some() {
+            self.surface_tree_confined_region_refresh_pending = true;
+        } else {
+            self.update_all_active_confined_pointer_regions(reason);
+        }
     }
 
     pub(in crate::compositor) fn begin_layout_reflow_batch(&mut self) {

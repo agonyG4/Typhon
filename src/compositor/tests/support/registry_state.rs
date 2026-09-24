@@ -371,6 +371,7 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) origin_x: i32,
     pub(in crate::compositor::tests) origin_y: i32,
     pub(in crate::compositor::tests) active_scene_origin: Option<(i32, i32)>,
+    pub(in crate::compositor::tests) active_scene_size: Option<(u32, u32)>,
     pub(in crate::compositor::tests) commit_sequence: u64,
     pub(in crate::compositor::tests) buffer_id: u64,
     pub(in crate::compositor::tests) pixel_checksum: Option<u64>,
@@ -393,6 +394,10 @@ pub(in crate::compositor::tests) struct GeckoGeometryPublicationSnapshot {
     pub(in crate::compositor::tests) pointer_leave_count_before_parent_commit: usize,
     pub(in crate::compositor::tests) pointer_focus_before_parent_commit: Option<u32>,
     pub(in crate::compositor::tests) confined_region_update_count_before_parent_commit: usize,
+    pub(in crate::compositor::tests) confined_region_updates_before_parent_commit:
+        Vec<crate::compositor::input::OutputRegion>,
+    pub(in crate::compositor::tests) active_confined_region_before_parent_commit:
+        Option<crate::compositor::input::OutputRegion>,
     pub(in crate::compositor::tests) committed_geometry_after: Option<XdgWindowGeometry>,
     pub(in crate::compositor::tests) tree_after_parent_commit: Vec<RenderableSurfaceSnapshot>,
     pub(in crate::compositor::tests) pointer_motion_count_after_parent_commit: usize,
@@ -400,6 +405,10 @@ pub(in crate::compositor::tests) struct GeckoGeometryPublicationSnapshot {
     pub(in crate::compositor::tests) pointer_leave_count_after_parent_commit: usize,
     pub(in crate::compositor::tests) pointer_focus_after_parent_commit: Option<u32>,
     pub(in crate::compositor::tests) confined_region_update_count_after_parent_commit: usize,
+    pub(in crate::compositor::tests) confined_region_updates_after_parent_commit:
+        Vec<crate::compositor::input::OutputRegion>,
+    pub(in crate::compositor::tests) active_confined_region_after_parent_commit:
+        Option<crate::compositor::input::OutputRegion>,
     pub(in crate::compositor::tests) logical_frame_origin: Option<(i32, i32)>,
 }
 

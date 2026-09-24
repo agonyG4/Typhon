@@ -896,6 +896,7 @@ pub struct CompositorState {
     cursor_generation: u64,
     surface_tree_generation: Option<u64>,
     surface_tree_pointer_focus_refresh_pending: bool,
+    surface_tree_confined_region_refresh_pending: bool,
     scene_render_generation: u64,
     effect_scene_summary: EffectSceneSummary,
     internal_surface_effects: HashMap<u32, ResolvedEffectInstance>,

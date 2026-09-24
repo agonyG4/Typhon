@@ -200,9 +200,65 @@ fn gecko_xdg_geometry_origin_tracks_matching_subsurface_positions_per_parent_com
     let mut child_global_origin = None;
     let mut root_render_origin = None;
     let mut previous_root_commit_sequence = None;
+    let shrunken_confined_region = crate::compositor::input::OutputRegion::from_rect(
+        crate::compositor::input::OutputRect::new(1072.0, 572.0, 40.0, 40.0)
+            .expect("clipped confined region"),
+    );
 
     for (stage_index, stage) in stages.iter().enumerate() {
         assert_eq!(stage.committed_geometry_before, previous_geometry);
+        if stage_index > 0 {
+            let child = stage
+                .tree_before_parent_commit
+                .iter()
+                .find(|surface| surface.parent_surface_id.is_some())
+                .expect("parent publication stages keep the content child active");
+            assert_eq!(
+                child.active_scene_size,
+                Some((1040, 1105)),
+                "stage {stage_index}: desynchronized child publication updates ActiveScene size"
+            );
+        }
+        if stage_index == 0 {
+            assert_eq!(stage.active_confined_region_before_parent_commit, None);
+            assert_eq!(stage.active_confined_region_after_parent_commit, None);
+        } else {
+            assert_eq!(
+                stage.active_confined_region_before_parent_commit,
+                Some(shrunken_confined_region.clone()),
+                "stage {stage_index}: child publication makes the active confined region match its committed size before parent commit"
+            );
+            assert_eq!(
+                stage.active_confined_region_after_parent_commit,
+                Some(shrunken_confined_region.clone()),
+                "stage {stage_index}: atomic parent publication preserves the output-space confined region"
+            );
+        }
+        if stage_index == 1 {
+            assert_eq!(
+                stage
+                    .confined_region_updates_before_parent_commit
+                    .as_slice(),
+                std::slice::from_ref(&shrunken_confined_region),
+                "the desynchronized child commit emits the clipped region update"
+            );
+            assert_eq!(stage.confined_region_update_count_before_parent_commit, 1);
+        } else {
+            assert!(
+                stage
+                    .confined_region_updates_before_parent_commit
+                    .is_empty()
+            );
+            assert_eq!(stage.confined_region_update_count_before_parent_commit, 0);
+        }
+        assert!(
+            stage.confined_region_updates_after_parent_commit.is_empty(),
+            "stage {stage_index}: parent publication emits no second confined-region update"
+        );
+        assert_eq!(
+            stage.confined_region_update_count_after_parent_commit, 0,
+            "stage {stage_index}: parent publication emits no transient confined-region geometry"
+        );
         assert_eq!(
             stage.pointer_motion_count_after_parent_commit,
             stage.pointer_motion_count_before_parent_commit,
@@ -221,11 +277,6 @@ fn gecko_xdg_geometry_origin_tracks_matching_subsurface_positions_per_parent_com
         assert_eq!(
             stage.pointer_focus_after_parent_commit, stage.pointer_focus_before_parent_commit,
             "stage {stage_index}: pointer focus stays on the same committed surface"
-        );
-        assert_eq!(
-            stage.confined_region_update_count_after_parent_commit,
-            stage.confined_region_update_count_before_parent_commit,
-            "stage {stage_index}: no transient confined-region geometry reaches the input backend"
         );
         let before_roots = stage
             .tree_before_parent_commit
@@ -278,6 +329,11 @@ fn gecko_xdg_geometry_origin_tracks_matching_subsurface_positions_per_parent_com
             assert_eq!(child.parent_surface_id, root_surface_id);
             assert_eq!(child.surface_id, child_surface_id.unwrap());
             assert_eq!(child.relationship_id, relationship_id);
+            assert_eq!(
+                child.active_scene_size,
+                Some((1040, 1105)),
+                "stage {stage_index}: the child size is current in ActiveScene before parent commit"
+            );
             assert_eq!(
                 (child.local_x, child.local_y),
                 previous_position.expect("a prior parent publication sets child position")

@@ -298,6 +298,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CompleteProtocolOnlyFrameTick(Sender<ProtocolOnlyCompletion>),
     CaptureIdleInhibited(Sender<bool>),
     CapturePointerConstraintBackendRequests(Sender<Vec<PointerConstraintBackendRequest>>),
+    CaptureActiveConfinedPointerRegion(Sender<Option<crate::compositor::input::OutputRegion>>),
     SettlePointerConstraintBackendRequests,
     CapturePendingLockedPointerReveal(Sender<bool>),
     CapturePendingLockedPointerRevealAndBackendRequests(
@@ -910,6 +911,10 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                                 active.surface_id == surface.surface_id
                                             })
                                             .and_then(|index| active_origins.get(index).copied()),
+                                        active_scene_size: active_surfaces
+                                            .iter()
+                                            .find(|active| active.surface_id == surface.surface_id)
+                                            .map(|active| (active.width, active.height)),
                                         commit_sequence: surface.commit_sequence.get(),
                                         buffer_id: surface.buffer_id().get(),
                                         pixel_checksum: surface.cpu_pixels().map(|pixels| {
@@ -1523,6 +1528,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CapturePointerConstraintBackendRequests(reply) => {
                         let _ = reply.send(server.take_pointer_constraint_backend_requests());
+                    }
+                    ServerCommand::CaptureActiveConfinedPointerRegion(reply) => {
+                        let region = server
+                            .state
+                            .active_confined_pointer_binding()
+                            .map(|active| active.region);
+                        let _ = reply.send(region);
                     }
                     ServerCommand::SettlePointerConstraintBackendRequests => {
                         let (x, y) = server.last_pointer_position();

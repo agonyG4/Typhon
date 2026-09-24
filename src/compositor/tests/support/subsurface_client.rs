@@ -342,18 +342,21 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
         let pointer_enter_count_before_parent_commit = state.pointer_enter_count;
         let pointer_leave_count_before_parent_commit = state.pointer_leave_count;
         let pointer_focus_before_parent_commit = capture_pointer_focus_surface_id(commands);
+        let active_confined_region_before_parent_commit =
+            capture_active_confined_pointer_region(commands);
         let pointer_requests_before_parent_commit =
             capture_pointer_constraint_backend_requests(commands);
+        let confined_region_updates_before_parent_commit = pointer_requests_before_parent_commit
+            .into_iter()
+            .filter_map(|request| match request {
+                PointerConstraintBackendRequest::UpdateConfinedRegion { region, .. } => {
+                    Some(region)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let confined_region_update_count_before_parent_commit =
-            pointer_requests_before_parent_commit
-                .iter()
-                .filter(|request| {
-                    matches!(
-                        request,
-                        PointerConstraintBackendRequest::UpdateConfinedRegion { .. }
-                    )
-                })
-                .count();
+            confined_region_updates_before_parent_commit.len();
 
         let committed_geometry_before = capture_committed_window_geometry(commands);
         let tree_before_parent_commit = capture_renderable_surface_snapshot(commands);
@@ -372,17 +375,21 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
         let pointer_enter_count_after_parent_commit = state.pointer_enter_count;
         let pointer_leave_count_after_parent_commit = state.pointer_leave_count;
         let pointer_focus_after_parent_commit = capture_pointer_focus_surface_id(commands);
+        let active_confined_region_after_parent_commit =
+            capture_active_confined_pointer_region(commands);
         let pointer_requests_after_parent_commit =
             capture_pointer_constraint_backend_requests(commands);
-        let confined_region_update_count_after_parent_commit = pointer_requests_after_parent_commit
-            .iter()
-            .filter(|request| {
-                matches!(
-                    request,
-                    PointerConstraintBackendRequest::UpdateConfinedRegion { .. }
-                )
+        let confined_region_updates_after_parent_commit = pointer_requests_after_parent_commit
+            .into_iter()
+            .filter_map(|request| match request {
+                PointerConstraintBackendRequest::UpdateConfinedRegion { region, .. } => {
+                    Some(region)
+                }
+                _ => None,
             })
-            .count();
+            .collect::<Vec<_>>();
+        let confined_region_update_count_after_parent_commit =
+            confined_region_updates_after_parent_commit.len();
 
         let committed_geometry_after = capture_committed_window_geometry(commands);
         let tree_after_parent_commit = capture_renderable_surface_snapshot(commands);
@@ -404,6 +411,8 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
             pointer_leave_count_before_parent_commit,
             pointer_focus_before_parent_commit,
             confined_region_update_count_before_parent_commit,
+            confined_region_updates_before_parent_commit,
+            active_confined_region_before_parent_commit,
             committed_geometry_after,
             tree_after_parent_commit,
             pointer_motion_count_after_parent_commit,
@@ -411,6 +420,8 @@ pub(in crate::compositor::tests) fn capture_gecko_window_geometry_evolution(
             pointer_leave_count_after_parent_commit,
             pointer_focus_after_parent_commit,
             confined_region_update_count_after_parent_commit,
+            confined_region_updates_after_parent_commit,
+            active_confined_region_after_parent_commit,
             logical_frame_origin,
         });
 
