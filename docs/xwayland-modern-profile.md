@@ -44,7 +44,9 @@ Surface association uses committed `WL_SURFACE_SERIAL` values only. There is
 no `WL_SURFACE_ID` fallback. External X11 CLIPBOARD and PRIMARY offers are
 published to Wayland clients and data-control consumers, including direct
 properties and incoming INCR payloads. Wayland → X11 selection serving and
-drag-and-drop remain inactive.
+drag-and-drop remain product-inactive. The Wayland → X11 serving engine is
+prepared, but it does not claim Clipboard or PRIMARY ownership and production
+SelectionRequest events are not routed to it.
 
 ## Application testing
 
@@ -54,9 +56,10 @@ Wayland-first toolkit settings. To test a toolkit's X11 path, use its own
 documented override in the diagnostic launch environment, for example
 `GDK_BACKEND=x11`, `QT_QPA_PLATFORM=xcb`, or `SDL_VIDEODRIVER=x11`.
 
-The current implementation is a modern profile: legacy rootful/TCP clients,
-Wayland → X11 selection serving, Xdnd, XEmbed, mixed-DPI scaling, and
-application-specific compatibility workarounds are not supported.
+The current implementation remains unidirectional: X11 → Wayland is active,
+while the prepared Wayland → X11 engine has no active ownership. Legacy
+rootful/TCP clients, Xdnd, XEmbed, mixed-DPI scaling, and application-specific
+compatibility workarounds are not supported.
 
 ## Diagnostics
 

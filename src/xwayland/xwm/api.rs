@@ -15,6 +15,8 @@ impl Xwm {
             .chain(self.next_focus_deadline_ns())
             .chain(self.next_adoption_deadline_ns())
             .chain(self.data_bridge.selection_payloads.next_deadline_ns())
+            .chain(selection_proxy::next_deadline_ns(self))
+            .chain(self.data_bridge.selection_outgoing.next_deadline_ns())
             .min()
     }
 
@@ -29,6 +31,30 @@ impl Xwm {
     pub(crate) fn handle_deadlines(&mut self, now_ns: u64) -> XwmDeadlineOutcome {
         let adoption_timeout_summary = self.collect_adoption_expirations(now_ns);
         for sequence in self.data_bridge.selection_payloads.expire_deadlines(now_ns) {
+            self.connection.discard_reply(
+                sequence,
+                RequestKind::HasResponse,
+                DiscardMode::DiscardReply,
+            );
+        }
+        if let Err(error) = selection_outgoing::expire_deadlines(self, now_ns) {
+            return XwmDeadlineOutcome {
+                adoption_timeout_summary,
+                adoption_metrics: self.adoption_metrics(),
+                error: Some(error),
+            };
+        }
+        let expired_proxy_replies = match selection_proxy::expire_deadlines(self, now_ns) {
+            Ok(sequences) => sequences,
+            Err(error) => {
+                return XwmDeadlineOutcome {
+                    adoption_timeout_summary,
+                    adoption_metrics: self.adoption_metrics(),
+                    error: Some(error),
+                };
+            }
+        };
+        for sequence in expired_proxy_replies {
             self.connection.discard_reply(
                 sequence,
                 RequestKind::HasResponse,
@@ -254,6 +280,7 @@ impl Xwm {
         let mut property_replies_quiescent = budget != 0;
         let mut selection_replies_quiescent = budget != 0;
         let mut payload_replies_quiescent = budget != 0;
+        let mut proxy_replies_quiescent = budget != 0;
         let mut budget_exhausted = false;
         loop {
             let event_budget = budget.saturating_sub(events_processed);
@@ -311,10 +338,28 @@ impl Xwm {
                 budget_exhausted |= drain.budget_exhausted;
                 Some(drain)
             };
+            let proxy_budget = budget.saturating_sub(selection_replies_processed);
+            let proxy_reply_drain = if proxy_budget == 0 {
+                proxy_replies_quiescent = false;
+                budget_exhausted = budget_exhausted || budget != 0;
+                None
+            } else {
+                let drain = selection_proxy::poll_replies(
+                    self,
+                    proxy_budget,
+                    crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+                )?;
+                selection_replies_processed =
+                    selection_replies_processed.saturating_add(drain.processed);
+                proxy_replies_quiescent &= drain.quiescent;
+                budget_exhausted |= drain.budget_exhausted;
+                Some(drain)
+            };
             if event_drain.is_none_or(|drain| drain.processed == 0)
                 && reply_drain.is_none_or(|drain| drain.processed == 0)
                 && selection_reply_drain.is_none_or(|drain| drain.processed == 0)
                 && payload_reply_drain.is_none_or(|drain| drain.processed == 0)
+                && proxy_reply_drain.is_none_or(|drain| drain.processed == 0)
             {
                 break;
             }
@@ -322,7 +367,8 @@ impl Xwm {
         let quiescent = events_quiescent
             && property_replies_quiescent
             && selection_replies_quiescent
-            && payload_replies_quiescent;
+            && payload_replies_quiescent
+            && proxy_replies_quiescent;
         if quiescent {
             self.reconcile_override_redirect_stack()?;
         }

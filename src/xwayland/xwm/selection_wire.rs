@@ -200,15 +200,29 @@ impl SelectionWireState {
         self.active_generation.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn observer_window_for_test(&self, kind: SelectionKind) -> Option<Window> {
+        self.windows.get(&kind).map(|windows| windows.observer)
+    }
+
     pub(crate) fn is_internal_window(&self, window: Window) -> bool {
         self.internal_windows.contains(&window)
+    }
+
+    pub(crate) fn register_internal_window(&mut self, window: Window) {
+        self.internal_windows.insert(window);
+        debug_assert!(
+            self.internal_windows.len()
+                <= 4 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                    + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
+        );
     }
 
     pub(crate) fn register_payload_requestor_window(&mut self, window: Window) {
         self.internal_windows.insert(window);
         debug_assert!(
             self.internal_windows.len()
-                <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                <= 4 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
                     + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
         );
     }
@@ -231,7 +245,7 @@ impl SelectionWireState {
         self.internal_windows.insert(requestor);
         debug_assert!(
             self.internal_windows.len()
-                <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                <= 4 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
                     + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
         );
         self.debug_assert_invariants();
@@ -742,6 +756,10 @@ pub(crate) struct SelectionReplyDrain {
 pub(crate) fn initialize(xwm: &mut Xwm) -> Result<(), XwmError> {
     let generation = BridgeGeneration::from(xwm.generation);
     xwm.data_bridge.selection_wire.proxy_generation = Some(generation);
+    xwm.data_bridge
+        .selection_outgoing
+        .initialize_generation(generation);
+    super::selection_proxy::initialize(xwm)?;
     if !xwm.capabilities.xfixes {
         return Ok(());
     }
@@ -777,7 +795,7 @@ pub(crate) fn initialize(xwm: &mut Xwm) -> Result<(), XwmError> {
             .extend([observer, requestor]);
         debug_assert!(
             xwm.data_bridge.selection_wire.internal_windows.len()
-                <= 2 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
+                <= 4 + 2 * MAX_SELECTION_REQUESTOR_WINDOWS_PER_CHANNEL
                     + 2 * super::selection_payload::MAX_SELECTION_PAYLOAD_SLOTS_PER_CHANNEL
         );
     }
@@ -959,6 +977,33 @@ fn create_private_window(xwm: &Xwm, window: Window) -> Result<(), XwmError> {
         .map_err(XwmError::Connection)?;
     std::mem::forget(cookie);
     Ok(())
+}
+
+pub(crate) fn prepared_proxy_selection(
+    xwm: &Xwm,
+    kind: SelectionKind,
+) -> Option<&PreparedProxySelection> {
+    xwm.data_bridge
+        .selection_wire
+        .prepared_proxy_selections
+        .get(&kind)
+}
+
+pub(crate) fn resolve_proxy_target(
+    xwm: &Xwm,
+    proxy_id: XwaylandProxySelectionId,
+    target: Atom,
+) -> Option<ProxyTargetBinding> {
+    let kind = internal_selection_kind(proxy_id.kind);
+    let prepared = prepared_proxy_selection(xwm, kind)?;
+    if prepared.id != proxy_id {
+        return None;
+    }
+    prepared
+        .data_targets
+        .iter()
+        .find(|binding| binding.target == target)
+        .cloned()
 }
 
 fn selection_atom(xwm: &Xwm, kind: SelectionKind) -> Atom {
@@ -1258,6 +1303,72 @@ fn begin_target_catalog_resolution(
             next_ordinal: 0,
         },
     );
+    schedule_selection_resolution_queries(xwm)
+}
+
+#[cfg(test)]
+pub(crate) fn begin_target_catalog_resolution_for_test(
+    xwm: &mut Xwm,
+    identity: SelectionIdentity,
+    targets: &[Atom],
+) -> Result<(), XwmError> {
+    begin_target_catalog_resolution(xwm, identity, targets)
+}
+
+#[cfg(test)]
+pub(crate) fn complete_target_name_for_test(
+    xwm: &mut Xwm,
+    sequence: SequenceNumber,
+    identity: SelectionIdentity,
+    target: Atom,
+    ordinal: usize,
+    name: Option<String>,
+) -> Result<(), XwmError> {
+    xwm.data_bridge.selection_wire.pending.remove(&sequence);
+    xwm.connection.discard_reply(
+        sequence,
+        RequestKind::HasResponse,
+        DiscardMode::DiscardReply,
+    );
+    xwm.data_bridge
+        .selection_wire
+        .complete_target_name(identity, target, ordinal, name);
+    schedule_selection_resolution_queries(xwm)
+}
+
+#[cfg(test)]
+pub(crate) fn complete_proxy_mime_atom_for_test(
+    xwm: &mut Xwm,
+    proxy_id: XwaylandProxySelectionId,
+    ordinal: usize,
+    atom: Option<Atom>,
+) -> Result<(), XwmError> {
+    let sequence = xwm
+        .data_bridge
+        .selection_wire
+        .pending
+        .iter()
+        .find_map(|(sequence, pending)| {
+            matches!(
+                pending.kind,
+                PendingReplyKind::ProxyMimeAtom {
+                    proxy_id: pending_id,
+                    ordinal: pending_ordinal,
+                } if pending_id == proxy_id && pending_ordinal == ordinal
+            )
+            .then_some(*sequence)
+        });
+    if let Some(sequence) = sequence {
+        xwm.data_bridge.selection_wire.pending.remove(&sequence);
+        xwm.connection.discard_reply(
+            sequence,
+            RequestKind::HasResponse,
+            DiscardMode::DiscardReply,
+        );
+    }
+    xwm.data_bridge
+        .selection_wire
+        .complete_proxy_mime_atom(proxy_id, ordinal, atom);
     schedule_selection_resolution_queries(xwm)
 }
 

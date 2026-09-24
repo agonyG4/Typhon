@@ -15,6 +15,7 @@ use crate::process::{
 use super::trace::{self, TraceFields};
 use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
+    XwaylandProxySelectionDataRequest, XwaylandProxySelectionTransferId,
     XwaylandSelectionDataRequest,
     config::{XwaylandConfig, xwm_reactor_hot_path_logging_enabled},
     diagnostics::{StderrRing, XwaylandFailure, XwaylandFailureStage},
@@ -61,6 +62,7 @@ pub enum XwaylandReactorPurpose {
     DisplayReady,
     Xwm,
     SelectionSink(SelectionPayloadTransferId),
+    SelectionSource(XwaylandProxySelectionTransferId),
     Stderr,
 }
 
@@ -374,12 +376,33 @@ impl XwaylandService {
 
     fn drain_managed_xwm(&mut self, supervisor: &mut ChildSupervisor) -> bool {
         let started = std::time::Instant::now();
+        let outgoing_sources_before = match &self.state {
+            ServiceState::Running(resources) => resources
+                .xwm
+                .data_bridge
+                .selection_outgoing
+                .source_interests()
+                .collect::<Vec<_>>(),
+            _ => return false,
+        };
         let drain = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.drain_events(256),
             _ => return false,
         };
         match drain {
             Ok(drain) => {
+                let outgoing_sources_after = match &self.state {
+                    ServiceState::Running(resources) => resources
+                        .xwm
+                        .data_bridge
+                        .selection_outgoing
+                        .source_interests()
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                if outgoing_sources_before != outgoing_sources_after {
+                    self.bump_reactor_registration_generation();
+                }
                 let (
                     property_metrics,
                     configure_metrics,
@@ -775,6 +798,46 @@ impl XwaylandService {
                 let outcome = match &mut self.state {
                     ServiceState::Running(resources) => {
                         super::xwm::selection_payload::handle_sink_ready(
+                            &mut resources.xwm,
+                            transfer_id,
+                            super::xwm::data_bridge::BridgeGeneration::from(generation),
+                            reactor_token,
+                            flags,
+                            now,
+                        )
+                    }
+                    _ => return Ok(false),
+                };
+                match outcome {
+                    Ok(changed) => {
+                        if changed {
+                            self.bump_reactor_registration_generation();
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        self.fail_managed_xwm(
+                            supervisor,
+                            XwaylandFailureStage::Reactor,
+                            io::Error::other(error),
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            XwaylandReactorPurpose::SelectionSource(transfer_id) => {
+                let Some(generation) = generation else {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                };
+                if Some(generation) != self.generation() {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                }
+                let now = now_ns()?;
+                let outcome = match &mut self.state {
+                    ServiceState::Running(resources) => {
+                        super::xwm::selection_outgoing::handle_source_ready(
                             &mut resources.xwm,
                             transfer_id,
                             super::xwm::data_bridge::BridgeGeneration::from(generation),
@@ -1431,6 +1494,53 @@ impl XwaylandService {
                 Ok(false)
             }
         }
+    }
+
+    /// Move the accepted service mailbox from the outgoing manager to the
+    /// runtime. No second queue is kept by the XWayland service.
+    pub fn take_managed_proxy_selection_data_requests(
+        &mut self,
+    ) -> Vec<XwaylandProxySelectionDataRequest> {
+        match &mut self.state {
+            ServiceState::Running(resources) => {
+                super::xwm::selection_proxy::take_managed_data_requests(&mut resources.xwm)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Return explicit compositor acceptance to the exact running transfer.
+    pub fn resolve_managed_proxy_selection_data_requests(
+        &mut self,
+        results: impl IntoIterator<Item = (XwaylandProxySelectionTransferId, bool)>,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<()> {
+        let now = now_ns()?;
+        let result = match &mut self.state {
+            ServiceState::Running(resources) => {
+                super::xwm::selection_proxy::resolve_managed_data_requests(
+                    &mut resources.xwm,
+                    results,
+                    now,
+                )
+            }
+            _ => return Ok(()),
+        };
+        match result {
+            Ok(changed) => {
+                if changed {
+                    self.bump_reactor_registration_generation();
+                }
+            }
+            Err(error) => {
+                self.fail_managed_xwm(
+                    supervisor,
+                    XwaylandFailureStage::CommandFlush,
+                    io::Error::other(error),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn harvest_running_selection_metadata(&mut self) {

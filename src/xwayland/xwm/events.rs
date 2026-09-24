@@ -64,6 +64,22 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     trace_raw_event(&event);
     let event = match event {
         Event::PropertyNotify(property)
+            if property.state == xproto::Property::DELETE
+                && super::selection_outgoing::owns_property(
+                    xwm,
+                    property.window,
+                    property.atom,
+                ) =>
+        {
+            super::selection_outgoing::property_deleted(
+                xwm,
+                property.window,
+                property.atom,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )?;
+            return Ok(());
+        }
+        Event::PropertyNotify(property)
             if super::selection_payload::owns_window(xwm, property.window) =>
         {
             super::selection_payload::property_notify(
@@ -83,6 +99,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         ) || super::selection_payload::owns_window(xwm, window)
     }) {
         return Ok(());
+    }
+    if let Event::DestroyNotify(destroy) = &event {
+        super::selection_proxy::requestor_destroyed(xwm, destroy.window)?;
     }
     match event {
         Event::CreateNotify(event) => {

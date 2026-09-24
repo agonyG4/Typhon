@@ -234,6 +234,7 @@ impl NativeRuntime {
             let xwm_drain_started = Instant::now();
             self.dispatch_xwayland_events(&cycle.wakeup)?;
             self.sync_xwayland_selection_metadata()?;
+            self.service_xwayland_proxy_selection_data_requests()?;
             self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
             if self.xwayland.generation().is_some() {
                 self.attach_xwayland_private_client()?;

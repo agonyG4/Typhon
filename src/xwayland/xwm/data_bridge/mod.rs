@@ -46,6 +46,8 @@ pub struct DataBridge {
     pub selections: selection::SelectionBridge,
     pub(crate) selection_wire: super::selection_wire::SelectionWireState,
     pub(crate) selection_payloads: super::selection_payload::SelectionPayloadManager,
+    pub(crate) selection_proxy: super::selection_proxy::SelectionProxyManager,
+    pub(crate) selection_outgoing: super::selection_outgoing::SelectionOutgoingManager,
     pub transfers: transfer::TransferManager,
     pub dnd: dnd::DndManager,
 }
@@ -55,6 +57,8 @@ impl DataBridge {
         self.selections.clear_generation(generation);
         let mut pending_selection_replies = self.selection_wire.clear_generation(generation);
         pending_selection_replies.extend(self.selection_payloads.clear_generation(generation));
+        pending_selection_replies.extend(self.selection_proxy.clear_generation(generation));
+        pending_selection_replies.extend(self.selection_outgoing.clear_generation(generation));
         self.transfers.clear_generation(generation);
         self.dnd.clear_generation(generation);
         pending_selection_replies

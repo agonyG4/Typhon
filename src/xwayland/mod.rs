@@ -28,9 +28,10 @@ pub use config::{XwaylandConfig, XwaylandMode, XwaylandProfile, XwaylandStartPol
 pub use generation::XwaylandGeneration;
 pub use readiness::XwaylandReadinessSnapshot;
 pub use selection_metadata::{
-    XwaylandProxySelectionId, XwaylandProxySelectionOffer, XwaylandProxySelectionSnapshot,
-    XwaylandSelectionDataRequest, XwaylandSelectionEvent, XwaylandSelectionKind,
-    XwaylandSelectionOffer, XwaylandSelectionOfferId,
+    XwaylandProxySelectionDataRequest, XwaylandProxySelectionId, XwaylandProxySelectionOffer,
+    XwaylandProxySelectionSnapshot, XwaylandProxySelectionTransferId, XwaylandSelectionDataRequest,
+    XwaylandSelectionEvent, XwaylandSelectionKind, XwaylandSelectionOffer,
+    XwaylandSelectionOfferId,
 };
 pub use service::{
     XwaylandReactorPurpose, XwaylandReactorRegistration, XwaylandService, XwaylandStateKind,

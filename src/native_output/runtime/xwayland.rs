@@ -278,6 +278,31 @@ impl NativeRuntime {
         self.sync_xwayland_reactor_sources()
     }
 
+    pub(super) fn service_xwayland_proxy_selection_data_requests(&mut self) -> NativeResult<()> {
+        let requests = self.xwayland.take_managed_proxy_selection_data_requests();
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let mut results = Vec::with_capacity(requests.len());
+        let mut accepted_any = false;
+        for request in requests {
+            let transfer_id = request.transfer_id;
+            let accepted = self.server.request_xwayland_proxy_selection_data(
+                request.proxy_id,
+                request.mime_type,
+                request.sink,
+            );
+            accepted_any |= accepted;
+            results.push((transfer_id, accepted));
+        }
+        if accepted_any {
+            self.server.flush_wayland_clients()?;
+        }
+        self.xwayland
+            .resolve_managed_proxy_selection_data_requests(results, &mut self.process_supervisor)?;
+        self.sync_xwayland_reactor_sources()
+    }
+
     pub(super) fn initialize_managed_xwayland(&mut self) -> NativeResult<()> {
         if !self.xwayland.is_managed()
             || self.xwayland.state_kind() != oblivion_one::xwayland::XwaylandStateKind::Starting

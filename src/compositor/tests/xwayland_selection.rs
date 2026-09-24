@@ -1,6 +1,6 @@
 use super::*;
 use std::num::NonZeroU64;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 
 use crate::compositor::{SelectionSourceBackend, SelectionSourceKind};
@@ -97,6 +97,71 @@ fn xwayland_canonical_source_is_not_exported_back_to_x11() {
 
     assert_eq!(snapshot.selection_generation, 1);
     assert!(snapshot.offer.is_none());
+}
+
+#[test]
+fn reverse_proxy_request_rejects_a_replaced_canonical_source_without_retargeting() {
+    use std::os::fd::OwnedFd;
+
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let first = crate::compositor::SelectionSourceKey(7901);
+    let replacement = crate::compositor::SelectionSourceKey(7902);
+    for key in [first, replacement] {
+        server.state.selection_state.register_source(
+            key,
+            SelectionSourceKind::WaylandClipboard,
+            None,
+        );
+        server
+            .state
+            .selection_state
+            .offer_source_mime_type_for_key(key, "image/png");
+        server.state.selection_state.set_source_backend(
+            key,
+            SelectionSourceBackend::HostClipboardBridge {
+                offer_id: crate::compositor::HostClipboardOfferId(key.0),
+            },
+        );
+    }
+    let epoch = server.state.selection_state.allocate_mutation_epoch();
+    let first_commit = server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, first, epoch)
+        .expect("install canonical source A");
+    let stale_proxy = XwaylandProxySelectionId {
+        kind: XwaylandSelectionKind::Clipboard,
+        selection_generation: first_commit.generation,
+        source_key: first,
+    };
+
+    let replacement_epoch = server.state.selection_state.allocate_mutation_epoch();
+    server
+        .state
+        .selection_state
+        .commit_selection(SelectionKind::Clipboard, replacement, replacement_epoch)
+        .expect("replace canonical source A with B");
+
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let accepted =
+        server.request_xwayland_proxy_selection_data(stale_proxy, "image/png".to_owned(), write);
+
+    assert!(
+        !accepted,
+        "stale proxy must be rejected rather than retargeted to B"
+    );
+    let mut byte = 0_u8;
+    assert_eq!(
+        unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+        0
+    );
 }
 
 #[test]

@@ -28,8 +28,11 @@ The current selection bridge supports this direction:
 
 Both channels use generation-bound XFixes ownership, bounded TARGETS/MIME
 catalogs, and direct-property or incoming INCR payload reads through bounded
-nonblocking sinks. Wayland → X11 ownership and payload serving remain inactive;
-outgoing INCR, MULTIPLE, and XDND remain inactive.
+nonblocking sinks. The Wayland → X11 serving engine is prepared, including
+TARGETS, TIMESTAMP, MULTIPLE, direct properties, and outgoing INCR, but proxy
+ownership remains inactive and production SelectionRequest events are not
+routed to it. Typhon makes no CLIPBOARD or PRIMARY ownership claim in that
+direction. XDND remains inactive.
 
 The following remain adapter/model foundations rather than end-to-end support:
 
@@ -38,8 +41,8 @@ The following remain adapter/model foundations rather than end-to-end support:
 - X11 cursor ownership integration: inactive foundation.
 
 The compositor's canonical Wayland selection state remains authoritative for
-publication to Wayland clients. The active X11 → Wayland direction does not
-mirror Wayland sources back into X11.
+publication to Wayland clients. X11 → Wayland is active; Wayland → X11 ownership
+and SelectionRequest routing remain inactive.
 
 Diagnostics are available through `TYPHON_XWAYLAND_LOG=1` for forwarding the
 bounded stderr ring and through `bin/check-xwayland-session` for a session

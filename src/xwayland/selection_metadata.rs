@@ -6,7 +6,7 @@
 
 use super::XwaylandGeneration;
 use crate::compositor::SelectionSourceKey;
-use std::os::fd::OwnedFd;
+use std::{num::NonZeroU64, os::fd::OwnedFd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum XwaylandSelectionKind {
@@ -30,6 +30,20 @@ pub struct XwaylandProxySelectionId {
     pub kind: XwaylandSelectionKind,
     pub selection_generation: u64,
     pub source_key: SelectionSourceKey,
+}
+
+/// Monotonic identity for one Wayland-source-to-X11 selection conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct XwaylandProxySelectionTransferId(NonZeroU64);
+
+impl XwaylandProxySelectionTransferId {
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
 }
 
 /// Bounded, metadata-only view of one canonical non-XWayland source.
@@ -60,6 +74,16 @@ pub struct XwaylandSelectionOffer {
 #[derive(Debug)]
 pub struct XwaylandSelectionDataRequest {
     pub offer_id: XwaylandSelectionOfferId,
+    pub mime_type: String,
+    pub sink: OwnedFd,
+}
+
+/// Move-only request to read bytes from the exact canonical Wayland source
+/// represented by `proxy_id`. `sink` is the blocking write end of a pipe.
+#[derive(Debug)]
+pub struct XwaylandProxySelectionDataRequest {
+    pub transfer_id: XwaylandProxySelectionTransferId,
+    pub proxy_id: XwaylandProxySelectionId,
     pub mime_type: String,
     pub sink: OwnedFd,
 }

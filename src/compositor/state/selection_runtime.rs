@@ -468,17 +468,17 @@ impl CompositorState {
         source_key: SelectionSourceKey,
         mime_type: String,
         fd: OwnedFd,
-    ) {
+    ) -> bool {
         let Some(active) = self.selection_state.active_selection(kind) else {
-            return;
+            return false;
         };
         if active.source_key != source_key
             || !active.mime_types.iter().any(|mime| mime == &mime_type)
         {
-            return;
+            return false;
         }
         let Some(backend) = self.selection_state.source_backend(source_key).cloned() else {
-            return;
+            return false;
         };
         match backend {
             SelectionSourceBackend::WaylandClipboard { source, client_id } => {
@@ -487,12 +487,14 @@ impl CompositorState {
                         && binding.client_id == client_id
                         && binding.source.is_alive()
                 }) {
-                    return;
+                    return false;
                 }
-                let _ = source.send_event(wl_data_source::Event::Send {
-                    mime_type,
-                    fd: fd.as_fd(),
-                });
+                source
+                    .send_event(wl_data_source::Event::Send {
+                        mime_type,
+                        fd: fd.as_fd(),
+                    })
+                    .is_ok()
             }
             SelectionSourceBackend::WaylandPrimary { source, client_id } => {
                 if !self
@@ -504,12 +506,14 @@ impl CompositorState {
                             && binding.source.is_alive()
                     })
                 {
-                    return;
+                    return false;
                 }
-                let _ = source.send_event(zwp_primary_selection_source_v1::Event::Send {
-                    mime_type,
-                    fd: fd.as_fd(),
-                });
+                source
+                    .send_event(zwp_primary_selection_source_v1::Event::Send {
+                        mime_type,
+                        fd: fd.as_fd(),
+                    })
+                    .is_ok()
             }
             SelectionSourceBackend::DataControl { source, client_id } => {
                 if !self
@@ -521,16 +525,20 @@ impl CompositorState {
                             && binding.source.is_alive()
                     })
                 {
-                    return;
+                    return false;
                 }
-                let _ = source.send_event(ext_data_control_source_v1::Event::Send {
-                    mime_type,
-                    fd: fd.as_fd(),
-                });
+                source
+                    .send_event(ext_data_control_source_v1::Event::Send {
+                        mime_type,
+                        fd: fd.as_fd(),
+                    })
+                    .is_ok()
             }
             SelectionSourceBackend::HostClipboardBridge { offer_id } => {
                 if let Some(bridge) = self.clipboard_bridge.as_mut() {
-                    let _ = bridge.request_host_data(offer_id, mime_type, fd);
+                    bridge.request_host_data(offer_id, mime_type, fd).is_ok()
+                } else {
+                    false
                 }
             }
             SelectionSourceBackend::Xwayland { offer_id } => {
@@ -544,9 +552,39 @@ impl CompositorState {
                             sink: fd,
                         },
                     );
+                    true
+                } else {
+                    false
                 }
             }
         }
+    }
+
+    pub(in crate::compositor) fn request_xwayland_proxy_selection_data(
+        &mut self,
+        proxy_id: crate::xwayland::XwaylandProxySelectionId,
+        mime_type: String,
+        fd: OwnedFd,
+    ) -> bool {
+        let kind = match proxy_id.kind {
+            crate::xwayland::XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+            crate::xwayland::XwaylandSelectionKind::Primary => SelectionKind::Primary,
+        };
+        let Some(active) = self.selection_state.active_selection(kind) else {
+            return false;
+        };
+        if active.generation != proxy_id.selection_generation
+            || active.source_key != proxy_id.source_key
+            || active.source_kind == SelectionSourceKind::Xwayland
+            || !active.mime_types.iter().any(|mime| mime == &mime_type)
+            || self
+                .selection_state
+                .source_backend(proxy_id.source_key)
+                .is_none()
+        {
+            return false;
+        }
+        self.request_selection_data(kind, proxy_id.source_key, mime_type, fd)
     }
 
     pub(in crate::compositor) fn publish_clipboard_to_keyboard_focused_client(&mut self) {

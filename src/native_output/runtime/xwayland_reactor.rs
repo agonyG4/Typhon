@@ -55,13 +55,22 @@ pub(crate) fn sync_xwayland_reactor_sources_with_generation(
             XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
             XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::SelectionSink(_) => NativeEventSource::XwaylandXwm,
+            XwaylandReactorPurpose::SelectionSource(_) => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
         };
         let events = if matches!(
             registration.purpose,
-            XwaylandReactorPurpose::SelectionSink(_)
+            XwaylandReactorPurpose::SelectionSink(_) | XwaylandReactorPurpose::SelectionSource(_)
         ) {
-            (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32
+            let direction = if matches!(
+                registration.purpose,
+                XwaylandReactorPurpose::SelectionSink(_)
+            ) {
+                libc::EPOLLOUT
+            } else {
+                libc::EPOLLIN
+            };
+            (direction | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32
         } else {
             (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32
                 | if registration.writable {

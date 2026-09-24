@@ -36,6 +36,18 @@ impl OwnCompositorServer {
             .collect()
     }
 
+    /// Revalidate a prepared proxy's exact canonical source before handing its
+    /// blocking destination FD to that source.
+    pub fn request_xwayland_proxy_selection_data(
+        &mut self,
+        proxy_id: crate::xwayland::XwaylandProxySelectionId,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+    ) -> bool {
+        self.state
+            .request_xwayland_proxy_selection_data(proxy_id, mime_type, fd)
+    }
+
     pub fn insert_xwayland_client(
         &mut self,
         stream: std::os::unix::net::UnixStream,

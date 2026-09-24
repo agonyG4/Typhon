@@ -675,7 +675,35 @@ fn incoming_atom_names_and_outgoing_mime_atoms_share_fair_reply_slots() {
     let (mut xwm, mut peer) = test_fixture(generation(205));
     initialize_selection_wire(&mut xwm, &mut peer);
     let targets = (0..8).map(|index| 0xd300 + index).collect::<Vec<_>>();
-    resolve_targets_for_test(&mut xwm, &mut peer, 0x3a0, &targets);
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(super::super::data_bridge::SelectionKind::Clipboard)
+        .expect("clipboard observer exists");
+    peer.write_all(&raw_selection_owner_event(
+        TEST_CLIPBOARD_ATOM,
+        observer,
+        0x3a0,
+        40,
+        35,
+        0,
+    ))
+    .expect("write serialized Clipboard owner event");
+    xwm.drain_events(32)
+        .expect("install canonical owner before catalog work");
+    let _ = read_fixture_requests(&mut peer);
+    let identity = xwm
+        .data_bridge
+        .selections
+        .current(super::super::data_bridge::SelectionKind::Clipboard)
+        .and_then(|state| state.identity())
+        .expect("current Clipboard source identity");
+    super::super::selection_wire::begin_target_catalog_resolution_for_test(
+        &mut xwm, identity, &targets,
+    )
+    .expect("start B1 atom-name catalog work");
+    xwm.drain_events(32).expect("issue B1 catalog requests");
+    let _ = read_fixture_requests(&mut peer);
     let first_incoming = super::super::selection_wire::pending_target_atom_name_sequence_for_test(
         &xwm,
         super::super::data_bridge::SelectionKind::Clipboard,
@@ -700,17 +728,22 @@ fn incoming_atom_names_and_outgoing_mime_atoms_share_fair_reply_slots() {
             .is_none()
     );
 
-    peer.write_all(&raw_get_atom_name_reply(
-        first_incoming as u16,
-        b"application/x-old",
-    ))
-    .expect("write B1 serialized GetAtomName reply");
-    xwm.drain_events(32)
-        .expect("complete B1 reply and schedule both directions fairly");
+    super::super::selection_wire::complete_target_name_for_test(
+        &mut xwm,
+        first_incoming,
+        identity,
+        targets[0],
+        0,
+        Some("application/x-old".to_owned()),
+    )
+    .expect("free a B1 slot and schedule both directions fairly");
+    let _ = read_fixture_requests(&mut peer);
 
-    let proxy_sequence =
+    assert!(
         super::super::selection_wire::proxy_mime_atom_sequence_for_test(&xwm, id, "image/png")
-            .expect("B3 InternAtom gets a shared reply slot");
+            .is_some(),
+        "B3 InternAtom gets a shared reply slot"
+    );
     assert!(
         super::super::selection_wire::pending_target_atom_name_sequence_for_test(
             &xwm,
@@ -724,23 +757,30 @@ fn incoming_atom_names_and_outgoing_mime_atoms_share_fair_reply_slots() {
             <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
     );
 
-    for target in targets.iter().skip(1).take(4) {
-        complete_atom_name_for_test(
-            &mut xwm,
-            &mut peer,
+    for (ordinal, target) in targets.iter().enumerate().skip(1).take(4) {
+        let sequence = super::super::selection_wire::pending_target_atom_name_sequence_for_test(
+            &xwm,
             super::super::data_bridge::SelectionKind::Clipboard,
             *target,
-            b"application/x-incoming",
-        );
+        )
+        .expect("next B1 atom-name query remains pending");
+        super::super::selection_wire::complete_target_name_for_test(
+            &mut xwm,
+            sequence,
+            identity,
+            *target,
+            ordinal,
+            Some("application/x-incoming".to_owned()),
+        )
+        .expect("complete B1 reply and schedule fairly");
+        let _ = read_fixture_requests(&mut peer);
         assert!(
             super::super::selection_wire::pending_selection_replies_for_test(&xwm)
                 <= super::super::selection_wire::MAX_PENDING_SELECTION_REPLIES
         );
     }
 
-    peer.write_all(&raw_intern_atom_reply(proxy_sequence as u16, 0xd401))
-        .expect("write B3 serialized InternAtom reply");
-    xwm.drain_events(32)
+    super::super::selection_wire::complete_proxy_mime_atom_for_test(&mut xwm, id, 0, Some(0xd401))
         .expect("complete B3 without blocking B1 progress");
     assert!(
         super::super::selection_wire::prepared_proxy_selection_for_test(
@@ -753,7 +793,7 @@ fn incoming_atom_names_and_outgoing_mime_atoms_share_fair_reply_slots() {
         super::super::selection_wire::pending_target_atom_name_sequence_for_test(
             &xwm,
             super::super::data_bridge::SelectionKind::Clipboard,
-            targets[1],
+            targets[5],
         )
         .is_some()
     );
@@ -1204,12 +1244,17 @@ fn resolve_targets_for_test(
     owner: u32,
     targets: &[u32],
 ) {
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(super::super::data_bridge::SelectionKind::Clipboard)
+        .unwrap_or(TEST_CLIPBOARD_OBSERVER_WINDOW);
     resolve_targets_for_kind_for_test(
         xwm,
         peer,
         super::super::data_bridge::SelectionKind::Clipboard,
         TEST_CLIPBOARD_ATOM,
-        TEST_CLIPBOARD_OBSERVER_WINDOW,
+        observer,
         owner,
         targets,
     );
@@ -1279,12 +1324,13 @@ fn resolve_targets_for_kind_with_event_for_test(
         super::super::selection_wire::pending_sequence_for_test(xwm, kind, true)
             .expect("TARGETS property sequence");
     let _ = read_fixture_requests(peer);
-    peer.write_all(&raw_get_property_reply(
+    let reply = raw_get_property_reply(
         property_sequence as u16,
         u32::from(xproto::AtomEnum::ATOM),
         targets,
-    ))
-    .expect("write serialized TARGETS property reply");
+    );
+    peer.write_all(&reply)
+        .expect("write serialized TARGETS property reply");
     xwm.drain_events(32).expect("resolve TARGETS property");
 }
 
@@ -3642,3 +3688,6 @@ fn new_generation_starts_with_clean_requestors() {
 
 #[path = "selection_payload_regression_tests.rs"]
 mod selection_payload_regression_tests;
+
+#[path = "selection_proxy_regression_tests.rs"]
+mod selection_proxy_regression_tests;
