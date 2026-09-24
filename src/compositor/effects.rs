@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::presentation_animation::{PresentationRect, PresentationSceneSample};
+use crate::presentation_animation::PresentationRect;
 
 use crate::effects::{
     EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectParameterDefinition,
@@ -8,8 +8,8 @@ use crate::effects::{
 };
 
 use super::{
-    BackgroundEffectRegion, FullscreenCompositionPlan, InputRegionOp, SurfaceData, VisualGroupId,
-    VisualStackGroup, visual_stack_groups,
+    BackgroundEffectRegion, InputRegionOp, SurfaceData, VisualGroupId, VisualStackGroup,
+    visual_stack_groups,
 };
 use wayland_server::Resource;
 
@@ -364,38 +364,6 @@ impl super::CompositorState {
         )
     }
 
-    pub(in crate::compositor) fn resolved_effect_scene_for_composition_plan(
-        &self,
-        fullscreen_plan: &FullscreenCompositionPlan,
-    ) -> ResolvedEffectScene {
-        let scene = self.resolved_effect_scene();
-        let instances = scene
-            .instances
-            .into_iter()
-            .filter(|instance| self.effect_instance_allows_presentation(instance, fullscreen_plan))
-            .collect();
-        ResolvedEffectScene::new(scene.generation, instances)
-    }
-
-    pub(in crate::compositor) fn effect_instance_allows_presentation(
-        &self,
-        instance: &ResolvedEffectInstance,
-        fullscreen_plan: &FullscreenCompositionPlan,
-    ) -> bool {
-        let root_surface_id = match instance.anchor {
-            EffectAnchor::BeforeSurface(surface_id)
-            | EffectAnchor::ReplaceSurface(surface_id)
-            | EffectAnchor::AfterSurface(surface_id) => {
-                Some(self.root_surface_id_for_surface(surface_id))
-            }
-            EffectAnchor::OutputPostProcess => None,
-        };
-        root_surface_id.is_none_or(|root| {
-            !self.lifecycle_surface_is_suppressed(root)
-                && fullscreen_plan.allows_presentation_root(root)
-        })
-    }
-
     fn scene_order_for_instance(&self, instance: &ResolvedEffectInstance) -> EffectSceneOrder {
         let phase = match instance.anchor {
             EffectAnchor::BeforeSurface(_) => 0,
@@ -432,42 +400,6 @@ impl super::CompositorState {
             surface_order,
             phase,
         }
-    }
-
-    pub(in crate::compositor) fn resolved_effect_scene_with_presentation(
-        &self,
-        presentation: &PresentationSceneSample,
-        fullscreen_plan: &FullscreenCompositionPlan,
-    ) -> ResolvedEffectScene {
-        let scene = self.resolved_effect_scene_for_composition_plan(fullscreen_plan);
-        let instances = scene
-            .instances
-            .into_iter()
-            .map(|mut instance| {
-                let surface_id = match instance.anchor {
-                    EffectAnchor::BeforeSurface(surface_id)
-                    | EffectAnchor::ReplaceSurface(surface_id)
-                    | EffectAnchor::AfterSurface(surface_id) => Some(surface_id),
-                    EffectAnchor::OutputPostProcess => None,
-                };
-                let Some(transform) = surface_id
-                    .map(|surface_id| self.root_surface_id_for_surface(surface_id))
-                    .and_then(|root| presentation.transform_for_root(root))
-                else {
-                    return instance;
-                };
-
-                instance.region =
-                    map_effect_region(transform, &instance.region, instance.target_bounds);
-                if let Some(target_bounds) = map_effect_rect(transform, instance.target_bounds) {
-                    instance.target_bounds = target_bounds;
-                }
-                instance.signature =
-                    instance.signature.wrapping_mul(0x0000_0100_0000_01b3) ^ transform.signature();
-                instance
-            })
-            .collect();
-        ResolvedEffectScene::new(scene.generation, instances)
     }
 
     pub(in crate::compositor) fn refresh_effect_scene_summary(&mut self) {

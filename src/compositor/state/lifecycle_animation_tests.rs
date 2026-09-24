@@ -8,9 +8,9 @@ use crate::presentation_animation::{
 };
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use crate::window_lifecycle_animation::{
-    LampWindowSample, LifecycleFrameSnapshot, LifecycleMotionRequest, LifecycleRenderEvidence,
-    LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
-    LifecycleVisualGroup,
+    LampWindowSample, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleMotionRequest,
+    LifecycleRenderEvidence, LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry,
+    LifecycleRenderFallbackReason, LifecycleVisualGroup,
 };
 
 fn lifecycle_decoration(
@@ -144,6 +144,72 @@ fn active_lifecycle_identity(
         .expect("active Presentation lifecycle owner")
 }
 
+#[test]
+fn restore_suppression_is_derived_from_the_authoritative_sample() {
+    let (mut state, window_id) = ssd_test_state(390);
+    let root_surface_id = 390;
+    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+    let request = lifecycle_request_with_group(
+        &mut state.presentation_animator,
+        &mut state.retained_lifecycle_payloads,
+        window_id,
+        root_surface_id,
+        group,
+        LifecycleDirection::Restore,
+    );
+    state
+        .window_lifecycle_animator
+        .start_or_reverse(request, None, AnimationTime::from_nanos(0), 1.0)
+        .expect("restore motion installs without compositor sidecar bookkeeping");
+
+    let sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+    assert!(sample.restore_suppresses_root(root_surface_id));
+}
+
+#[test]
+fn restore_suppression_tracks_both_reversal_directions() {
+    let (mut state, window_id) = ssd_test_state(391);
+    state.lifecycle_animation_renderer_available = Some(true);
+    let root_surface_id = 391;
+    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+
+    state.begin_lifecycle_restore(
+        window_id,
+        root_surface_id,
+        Some(group),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+    let restore_to_minimize =
+        state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample time"));
+    assert!(restore_to_minimize.restore_suppresses_root(root_surface_id));
+    state.begin_lifecycle_minimize(
+        window_id,
+        root_surface_id,
+        Some(rect(384.0, 60.0, 832.0, 640.0)),
+        Some(rect(384.0, 60.0, 832.0, 640.0)),
+        Some(group),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+    let minimize = state
+        .lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("reversed sample time"));
+    assert!(!minimize.restore_suppresses_root(root_surface_id));
+    assert_eq!(minimize.lamps[0].direction, LifecycleDirection::Minimize);
+
+    state.begin_lifecycle_restore(
+        window_id,
+        root_surface_id,
+        Some(group),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+    let restore =
+        state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("restored sample"));
+    assert!(restore.restore_suppresses_root(root_surface_id));
+    assert_eq!(restore.lamps[0].direction, LifecycleDirection::Restore);
+}
+
 fn lifecycle_request(
     presentation_engine: &mut crate::presentation_animation::PresentationEngine,
     payload_store: &mut super::super::lifecycle_retained::RetainedLifecyclePayloadStore,
@@ -211,6 +277,7 @@ fn lifecycle_request_with_group(
             _root_surface_id,
             _visual_group,
             ResolvedEffectScene::default(),
+            None,
         )
         .expect("valid test lifecycle payload");
         assert!(payload_store.publish_exact(presentation_identity, payload));
@@ -356,9 +423,9 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     assert_eq!(qualified.lamps[0].root_surface_id, root_a);
     assert_eq!(qualified.lamps[0].presentation_identity, reversed_identity);
 
-    state.lifecycle_render_suppressed_roots.insert(root_a);
+    assert!(state.lifecycle_root_restore_suppressed(root_a));
     state.lifecycle_cancel_window(window_id);
-    assert!(!state.lifecycle_render_suppressed_roots.contains(&root_a));
+    assert!(!state.lifecycle_root_restore_suppressed(root_a));
     assert!(
         state
             .presentation_animator
@@ -542,8 +609,12 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
             1.0,
         )
         .expect("Lamp transition starts");
-    state.lifecycle_render_suppressed_roots.insert(302);
     assert!(!state.lifecycle_animation_has_pending_visible());
+    assert!(
+        state
+            .lifecycle_scene_sample_at(AnimationTime::from_nanos(0))
+            .restore_suppresses_root(302)
+    );
     assert!(state.settle_lifecycle_no_visual_change());
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
@@ -555,7 +626,7 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
         None
     );
     assert_eq!(state.presented_lifecycle_frame_id(), 0);
-    assert!(!state.lifecycle_render_suppressed_roots.contains(&302));
+    assert!(!state.lifecycle_root_restore_suppressed(302));
     assert!(!state.lifecycle_animation_has_pending_visible());
     assert!(
         state
@@ -589,6 +660,7 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
         312,
         group,
         ResolvedEffectScene::default(),
+        None,
     )
     .expect("test payload");
     assert!(
@@ -630,7 +702,12 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
             .lamps
             .is_empty()
     );
-    assert!(state.lifecycle_frame_snapshot_at(sample_time).is_empty());
+    assert!(
+        state
+            .lifecycle_scene_sample_at(sample_time)
+            .lamps
+            .is_empty()
+    );
     assert!(!state.lifecycle_animation_has_pending_visible());
     assert!(
         !state
@@ -855,7 +932,9 @@ fn old_visible_physical_lamp_prevents_no_visual_settlement() {
         }],
         visual_sources: Vec::new(),
     };
-    state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&old);
+    state
+        .presented_lifecycle_physical
+        .seed_snapshot_for_test(LifecycleFrameSnapshot::from_sample(&old));
     assert!(!state.settle_lifecycle_no_visual_change());
     assert!(!state.settle_lifecycle_no_visual_change());
     assert_eq!(state.window_lifecycle_animator.active_count(), 1);
@@ -864,6 +943,16 @@ fn old_visible_physical_lamp_prevents_no_visual_settlement() {
         state.direct_scanout_scene_candidate().unwrap_err(),
         DirectScanoutSceneRejection::LifecycleAnimation
     );
+
+    state.publish_presented_lifecycle_with_replacements(
+        1,
+        &LifecycleFrameSnapshot::default(),
+        &[],
+        true,
+    );
+    assert!(!state.lifecycle_animation_has_pending_visible());
+    assert!(state.settle_lifecycle_no_visual_change());
+    assert_eq!(state.window_lifecycle_animator.active_count(), 0);
 }
 
 #[test]
@@ -916,10 +1005,10 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
         visual_sources: Vec::new(),
     };
     state.publish_presented_lifecycle(1, &LifecycleFrameSnapshot::from_sample(&physical));
-    let confirmed = state.presented_lifecycle.clone();
-    state
-        .lifecycle_render_suppressed_roots
-        .insert(root_surface_id);
+    let confirmed = state
+        .presented_lifecycle_physical
+        .snapshot_for_test()
+        .clone();
 
     assert!(
         state.apply_lifecycle_render_fallback(LifecycleRenderFallbackEntry {
@@ -951,8 +1040,11 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
             .is_none()
     );
     assert_eq!(state.presentation_animator.transaction_count(), 0);
-    assert_eq!(state.presented_lifecycle, confirmed);
-    assert_eq!(state.presented_lifecycle_frame_id, 1);
+    assert_eq!(
+        state.presented_lifecycle_physical.snapshot_for_test(),
+        &confirmed
+    );
+    assert_eq!(state.presented_lifecycle_physical.frame_id(), 1);
     assert!(state.lifecycle_animation_has_pending_visible());
     assert!(state.has_unowned_frame_work());
 
@@ -962,9 +1054,73 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
         &[root_surface_id],
         true,
     );
-    assert!(state.presented_lifecycle.lamps.is_empty());
-    assert_eq!(state.presented_lifecycle_frame_id, 2);
+    assert!(
+        state
+            .presented_lifecycle_physical
+            .snapshot_for_test()
+            .lamps
+            .is_empty()
+    );
+    assert_eq!(state.presented_lifecycle_physical.frame_id(), 2);
     assert!(!state.lifecycle_animation_has_pending_visible());
+}
+
+#[test]
+fn lifecycle_teardown_removes_only_that_windows_physical_evidence() {
+    let first_window = WindowId::from_raw(310).expect("first window id");
+    let second_window = WindowId::from_raw(311).expect("second window id");
+    let first_identity = historical_identity(first_window, 310);
+    let second_identity = historical_identity(second_window, 311);
+    let mut snapshot = LifecycleFrameSnapshot {
+        sampled_at: Some(AnimationTime::from_nanos(10)),
+        lamps: vec![
+            LifecycleFrameLamp {
+                window_id: first_window,
+                root_surface_id: 310,
+                presentation_identity: first_identity,
+                payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                    first_identity,
+                ),
+                visual_group: visual_group(rect(0.0, 0.0, 80.0, 80.0)),
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            },
+            LifecycleFrameLamp {
+                window_id: second_window,
+                root_surface_id: 311,
+                presentation_identity: second_identity,
+                payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                    second_identity,
+                ),
+                visual_group: visual_group(rect(0.0, 0.0, 80.0, 80.0)),
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            },
+        ],
+        signature: 0,
+    };
+    snapshot.refresh_signature();
+    let mut state = CompositorState {
+        output_size: OutputSize::new(100, 100),
+        ..Default::default()
+    };
+    state.publish_presented_lifecycle(44, &snapshot);
+    let signature_before = state
+        .presented_lifecycle_physical
+        .snapshot_for_test()
+        .signature;
+
+    state.lifecycle_teardown_window(first_window);
+
+    let physical = state.presented_lifecycle_physical.snapshot_for_test();
+    assert_eq!(state.presented_lifecycle_physical.frame_id(), 44);
+    assert_ne!(physical.signature, signature_before);
+    assert_eq!(physical.lamps.len(), 1);
+    assert_eq!(physical.lamps[0].window_id, second_window);
 }
 
 #[test]
@@ -1000,9 +1156,17 @@ fn canonical_presentation_replaces_old_physical_lamp_after_logical_cancel() {
         }],
         visual_sources: Vec::new(),
     };
-    state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&old);
+    state
+        .presented_lifecycle_physical
+        .seed_snapshot_for_test(LifecycleFrameSnapshot::from_sample(&old));
     state.publish_presented_lifecycle_with_replacements(2, &Default::default(), &[304], true);
-    assert!(state.presented_lifecycle.lamps.is_empty());
+    assert!(
+        state
+            .presented_lifecycle_physical
+            .snapshot_for_test()
+            .lamps
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1031,9 +1195,17 @@ fn rendered_replacement_clears_absent_physical_lamp_without_acknowledging_active
         )
         .expect("Lamp transition starts");
     let physical = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(100_000_000));
-    state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&physical);
+    state
+        .presented_lifecycle_physical
+        .seed_snapshot_for_test(LifecycleFrameSnapshot::from_sample(&physical));
     state.publish_presented_lifecycle_with_replacements(2, &Default::default(), &[], true);
-    assert!(state.presented_lifecycle.lamps.is_empty());
+    assert!(
+        state
+            .presented_lifecycle_physical
+            .snapshot_for_test()
+            .lamps
+            .is_empty()
+    );
     assert_eq!(state.window_lifecycle_animator.active_count(), 1);
     assert_eq!(
         state
@@ -1125,7 +1297,6 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
             1.0,
         )
         .expect("restore starts");
-    state.lifecycle_render_suppressed_roots.insert(306);
     let mut candidate = state.animation_control.configuration().clone();
     candidate
         .overrides
@@ -1139,8 +1310,8 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
         .expect("snapped restore remains owned");
     assert_eq!(restore.presentation_identity, restore_id);
     assert_eq!(restore.progress, 0.0);
-    assert!(state.lifecycle_render_suppressed_roots.contains(&306));
     let restore_sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+    assert!(restore_sample.restore_suppresses_root(306));
     let restore_frame = LifecycleFrameSnapshot::qualified_from_sample(
         &restore_sample,
         &LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
@@ -1152,7 +1323,7 @@ fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership
     );
     state.publish_presented_lifecycle(2, &restore_frame);
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
-    assert!(!state.lifecycle_render_suppressed_roots.contains(&306));
+    assert!(!state.lifecycle_root_restore_suppressed(306));
     let _ = std::fs::remove_dir_all(directory);
 }
 
@@ -1313,12 +1484,17 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
             ),
         )
         .expect("active Geometry transaction");
-    state
-        .lifecycle_render_suppressed_roots
-        .insert(root_surface_id);
-    state
-        .lifecycle_decorations
-        .insert(root_surface_id, retained_decoration.clone());
+    let restore_sample = state.lifecycle_scene_sample_at(now);
+    assert!(restore_sample.restore_suppresses_root(root_surface_id));
+    assert_eq!(
+        old_payload
+            .frozen_decoration
+            .as_ref()
+            .expect("retained frozen SSD")
+            .scene_snapshot()
+            .visual_signature(),
+        retained_decoration.scene_snapshot().visual_signature()
+    );
     state.window_lifecycle_animator.fail_next_start_for_test();
 
     state.begin_lifecycle_minimize(
@@ -1358,16 +1534,22 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
             .transaction_record(old_identity.transaction_id())
             .is_some()
     );
-    assert!(
-        state
-            .lifecycle_render_suppressed_roots
-            .contains(&root_surface_id)
-    );
     assert_eq!(
-        state.lifecycle_decorations[&root_surface_id]
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .expect("failed reversal preserves exact payload")
+            .frozen_decoration
+            .as_ref()
+            .expect("failed reversal preserves frozen SSD")
             .scene_snapshot()
             .visual_signature(),
         retained_decoration.scene_snapshot().visual_signature()
+    );
+    assert!(
+        state
+            .lifecycle_scene_sample_at(now)
+            .restore_suppresses_root(root_surface_id)
     );
 }
 
@@ -1403,11 +1585,11 @@ fn exhausted_identity_namespace_does_not_cancel_geometry_or_add_lifecycle_state(
                 .has_geometry_track(scene_node_id)
         );
         assert!(
-            !state
-                .lifecycle_render_suppressed_roots
-                .contains(&surface_id)
+            state
+                .lifecycle_scene_sample_at(AnimationTime::monotonic_now().unwrap())
+                .lamps
+                .is_empty()
         );
-        assert!(!state.lifecycle_decorations.contains_key(&surface_id));
     }
 }
 
@@ -1441,11 +1623,11 @@ fn missing_window_group_scene_node_does_not_create_lifecycle_identity_or_side_ef
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
     assert!(
-        !state
-            .lifecycle_render_suppressed_roots
-            .contains(&root_surface_id)
+        state
+            .lifecycle_scene_sample_at(AnimationTime::monotonic_now().unwrap())
+            .lamps
+            .is_empty()
     );
-    assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
 }
 
 #[test]
@@ -1466,6 +1648,7 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     let cancelled_identity = active_lifecycle_identity(&cancelled, cancelled_node);
     cancelled.lifecycle_cancel_window(cancelled_window);
     assert_eq!(cancelled.window_lifecycle_animator.active_count(), 0);
+    assert!(!cancelled.lifecycle_root_restore_suppressed(root_surface_id));
     assert_eq!(
         cancelled.presentation_animator.active_retained_visual(
             cancelled_identity.scene_node_id(),
@@ -1535,7 +1718,6 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
         .expect("window group SceneNode");
     let unavailable_identity = active_lifecycle_identity(&unavailable, unavailable_node);
     let second_scene_node = crate::core::SceneNodeId::from_raw(9_411).expect("second SceneNode");
-    let second_window = WindowId::from_raw(4_112).expect("second window id");
     let second_started_at = AnimationTime::monotonic_now().expect("monotonic test time");
     let second_identity = unavailable
         .presentation_animator
@@ -1561,10 +1743,14 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
             1.0,
         )
         .expect("second lifecycle executor");
-    unavailable.lifecycle_render_suppressed_roots.insert(412);
-    unavailable
-        .lifecycle_decorations
-        .insert(412, lifecycle_decoration(second_window, 412, 0x74));
+    let physical_at = AnimationTime::monotonic_now().expect("physical sample time");
+    let physical =
+        LifecycleFrameSnapshot::from_sample(&unavailable.lifecycle_scene_sample_at(physical_at));
+    unavailable.publish_presented_lifecycle(23, &physical);
+    let confirmed_physical = unavailable
+        .presented_lifecycle_physical
+        .snapshot_for_test()
+        .clone();
     assert_eq!(
         unavailable
             .presentation_animator
@@ -1611,345 +1797,13 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
             .get_exact(second_identity)
             .is_none()
     );
-    assert!(unavailable.lifecycle_render_suppressed_roots.is_empty());
-    assert!(unavailable.lifecycle_decorations.is_empty());
+    assert_eq!(
+        unavailable.presented_lifecycle_physical.snapshot_for_test(),
+        &confirmed_physical
+    );
+    assert_eq!(unavailable.presented_lifecycle_physical.frame_id(), 23);
+    assert!(unavailable.lifecycle_animation_has_pending_visible());
 }
 
-#[test]
-fn fresh_restore_freezes_ssd_until_physical_settlement() {
-    let (mut state, window_id) = ssd_test_state(401);
-    state.lifecycle_animation_renderer_available = Some(true);
-    let root_surface_id = 401;
-    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
-    let decoration_a = state
-        .native_decoration_render_instances_for_scale(&state.renderable_surfaces, 1.0)
-        .into_iter()
-        .next()
-        .expect("authoritative SSD snapshot A");
-
-    state.begin_lifecycle_restore(
-        window_id,
-        root_surface_id,
-        Some(group),
-        ResolvedEffectScene::new(41, Vec::new()),
-        vec![decoration_a.clone()],
-    );
-
-    assert_eq!(
-        lifecycle_decoration_signature(
-            &state,
-            root_surface_id,
-            &state.renderable_surfaces,
-            AnimationTime::monotonic_now().unwrap(),
-        ),
-        Some(decoration_a.scene_snapshot().visual_signature())
-    );
-
-    state.focused_window_id = Some(window_id);
-    let decoration_b = state
-        .native_decoration_render_instances_for_scale(&state.renderable_surfaces, 1.0)
-        .into_iter()
-        .next()
-        .expect("live SSD snapshot B");
-    assert_ne!(
-        decoration_a.scene_snapshot().visual_signature(),
-        decoration_b.scene_snapshot().visual_signature()
-    );
-    assert_eq!(
-        lifecycle_decoration_signature(
-            &state,
-            root_surface_id,
-            &state.renderable_surfaces,
-            AnimationTime::monotonic_now().unwrap(),
-        ),
-        Some(decoration_a.scene_snapshot().visual_signature())
-    );
-
-    settle_lifecycle_transition(&mut state, window_id);
-    assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
-}
-
-#[test]
-fn reversal_preserves_existing_frozen_ssd_snapshot() {
-    let (mut state, window_id) = ssd_test_state(402);
-    state.lifecycle_animation_renderer_available = Some(true);
-    let root_surface_id = 402;
-    let group_a = visual_group(rect(384.0, 60.0, 832.0, 640.0));
-    let group_b = visual_group(rect(384.0, 20.0, 832.0, 680.0));
-    let decoration_a = lifecycle_decoration(window_id, root_surface_id, 0x31);
-    let decoration_b = lifecycle_decoration(window_id, root_surface_id, 0x32);
-
-    state.begin_lifecycle_minimize(
-        window_id,
-        root_surface_id,
-        Some(rect(400.0, 100.0, 800.0, 600.0)),
-        Some(rect(400.0, 100.0, 800.0, 600.0)),
-        Some(group_a),
-        ResolvedEffectScene::default(),
-        vec![decoration_a.clone()],
-    );
-    let scene_node_id = state
-        .scene_node_id_for_window_group(window_id)
-        .expect("window group SceneNode");
-    let old_identity = active_lifecycle_identity(&state, scene_node_id);
-    let original_payload = std::sync::Arc::clone(
-        state
-            .retained_lifecycle_payloads
-            .get_exact(old_identity)
-            .expect("fresh immutable payload"),
-    );
-    let before = state
-        .window_lifecycle_animator
-        .sample(
-            old_identity,
-            AnimationTime::monotonic_now().expect("monotonic time"),
-        )
-        .expect("minimize sample");
-    state
-        .lifecycle_decorations
-        .insert(root_surface_id, decoration_a.clone());
-    state.begin_lifecycle_restore(
-        window_id,
-        root_surface_id,
-        Some(group_b),
-        ResolvedEffectScene::new(42, Vec::new()),
-        vec![decoration_b],
-    );
-    let new_identity = active_lifecycle_identity(&state, scene_node_id);
-    let after = state
-        .window_lifecycle_animator
-        .sample(
-            new_identity,
-            AnimationTime::monotonic_now().expect("monotonic time"),
-        )
-        .expect("restore sample");
-
-    assert_eq!(after.presentation_identity, new_identity);
-    assert_eq!(new_identity.scene_node_id(), scene_node_id);
-    assert_ne!(new_identity.transaction_id(), old_identity.transaction_id());
-    assert_ne!(new_identity.revision_id(), old_identity.revision_id());
-    assert!((after.progress - before.progress).abs() < 0.01);
-    let reversed_payload = state
-        .retained_lifecycle_payloads
-        .get_exact(new_identity)
-        .expect("reversed lifecycle payload");
-    assert_eq!(reversed_payload.payload_id, original_payload.payload_id);
-    assert!(std::sync::Arc::ptr_eq(reversed_payload, &original_payload));
-    assert_eq!(reversed_payload.visual_group, group_a);
-    assert_eq!(reversed_payload.root_surface_id, root_surface_id);
-    assert_eq!(reversed_payload.window_id, window_id);
-    assert!(std::sync::Arc::ptr_eq(
-        &reversed_payload.effect_scene,
-        &original_payload.effect_scene
-    ));
-    assert!(
-        state
-            .presentation_animator
-            .transaction_record(old_identity.transaction_id())
-            .is_none()
-    );
-    assert!(
-        state
-            .presentation_animator
-            .transaction_record(new_identity.transaction_id())
-            .is_some()
-    );
-
-    assert_eq!(
-        lifecycle_decoration_signature(
-            &state,
-            root_surface_id,
-            &[],
-            AnimationTime::monotonic_now().unwrap(),
-        ),
-        Some(decoration_a.scene_snapshot().visual_signature())
-    );
-    assert_eq!(
-        state
-            .lifecycle_visual_group_for_scene_node(scene_node_id)
-            .expect("reversed transition")
-            .canonical_visual_rect,
-        group_a.canonical_visual_rect
-    );
-}
-
-#[test]
-fn missing_previous_payload_rejects_reversal_without_mutating_old_chain() {
-    let (mut state, window_id) = ssd_test_state(414);
-    state.lifecycle_animation_renderer_available = Some(true);
-    let root_surface_id = 414;
-    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
-    state.begin_lifecycle_minimize(
-        window_id,
-        root_surface_id,
-        Some(rect(400.0, 100.0, 800.0, 600.0)),
-        Some(rect(400.0, 100.0, 800.0, 600.0)),
-        Some(group),
-        ResolvedEffectScene::new(414, Vec::new()),
-        vec![lifecycle_decoration(window_id, root_surface_id, 0x51)],
-    );
-    let scene_node_id = state
-        .scene_node_id_for_window_group(window_id)
-        .expect("window group SceneNode");
-    let old_identity = active_lifecycle_identity(&state, scene_node_id);
-    let old_member = state
-        .presentation_animator
-        .transaction_record(old_identity.transaction_id())
-        .expect("old ledger member")
-        .members()[0];
-    let now = AnimationTime::monotonic_now().expect("monotonic test time");
-    let before = state
-        .window_lifecycle_animator
-        .sample(old_identity, now)
-        .expect("old motion state");
-    assert!(
-        state
-            .retained_lifecycle_payloads
-            .retire_exact(old_identity)
-            .is_some()
-    );
-    let sidecar_signature = state.lifecycle_decorations[&root_surface_id]
-        .scene_snapshot()
-        .visual_signature();
-    state
-        .lifecycle_render_suppressed_roots
-        .insert(root_surface_id);
-
-    state.begin_lifecycle_restore(
-        window_id,
-        root_surface_id,
-        Some(visual_group(rect(384.0, 20.0, 832.0, 680.0))),
-        ResolvedEffectScene::new(999, Vec::new()),
-        vec![lifecycle_decoration(window_id, root_surface_id, 0x52)],
-    );
-
-    assert_eq!(
-        state.presentation_animator.active_retained_visual(
-            scene_node_id,
-            PresentationRetainedVisualKind::WindowLifecycle
-        ),
-        Some(old_identity)
-    );
-    assert_eq!(
-        state.window_lifecycle_animator.sample(old_identity, now),
-        Some(before)
-    );
-    assert!(
-        state
-            .presentation_animator
-            .transaction_record(old_identity.transaction_id())
-            .is_some_and(|record| record.members()[0] == old_member)
-    );
-    assert_eq!(state.presentation_animator.transaction_count(), 1);
-    assert_eq!(state.window_lifecycle_animator.active_count(), 1);
-    assert!(
-        state
-            .retained_lifecycle_payloads
-            .get_exact(old_identity)
-            .is_none()
-    );
-    assert!(
-        state
-            .lifecycle_render_suppressed_roots
-            .contains(&root_surface_id)
-    );
-    assert_eq!(
-        state.lifecycle_decorations[&root_surface_id]
-            .scene_snapshot()
-            .visual_signature(),
-        sidecar_signature
-    );
-}
-
-#[test]
-fn later_independent_restore_replaces_settled_ssd_snapshot() {
-    let (mut state, window_id) = ssd_test_state(403);
-    state.lifecycle_animation_renderer_available = Some(true);
-    let root_surface_id = 403;
-    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
-    let decoration_a = lifecycle_decoration(window_id, root_surface_id, 0x41);
-    let decoration_b = lifecycle_decoration(window_id, root_surface_id, 0x42);
-
-    state.begin_lifecycle_restore(
-        window_id,
-        root_surface_id,
-        Some(group),
-        ResolvedEffectScene::default(),
-        vec![decoration_a],
-    );
-    let old_identity = active_lifecycle_identity(
-        &state,
-        state
-            .scene_node_id_for_window_group(window_id)
-            .expect("window group SceneNode"),
-    );
-    let old_payload_id = state
-        .retained_lifecycle_payloads
-        .get_exact(old_identity)
-        .expect("first independent payload")
-        .payload_id;
-    settle_lifecycle_transition(&mut state, window_id);
-    assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
-    assert!(
-        state
-            .retained_lifecycle_payloads
-            .get_exact(old_identity)
-            .is_none()
-    );
-
-    state.begin_lifecycle_restore(
-        window_id,
-        root_surface_id,
-        Some(group),
-        ResolvedEffectScene::default(),
-        vec![decoration_b.clone()],
-    );
-    let new_identity = active_lifecycle_identity(
-        &state,
-        state
-            .scene_node_id_for_window_group(window_id)
-            .expect("window group SceneNode"),
-    );
-    let new_payload_id = state
-        .retained_lifecycle_payloads
-        .get_exact(new_identity)
-        .expect("fresh independent payload")
-        .payload_id;
-    assert_ne!(old_payload_id, new_payload_id);
-    assert_eq!(
-        lifecycle_decoration_signature(
-            &state,
-            root_surface_id,
-            &[],
-            AnimationTime::monotonic_now().unwrap(),
-        ),
-        Some(decoration_b.scene_snapshot().visual_signature())
-    );
-}
-
-#[test]
-fn fresh_csd_restore_does_not_synthesize_frozen_ssd() {
-    let (mut state, window_id) = ssd_test_state(404);
-    state.lifecycle_animation_renderer_available = Some(true);
-    let root_surface_id = 404;
-    let stale_ssd = lifecycle_decoration(window_id, root_surface_id, 0x51);
-    state
-        .lifecycle_decorations
-        .insert(root_surface_id, stale_ssd);
-
-    state.begin_lifecycle_restore(
-        window_id,
-        root_surface_id,
-        Some(visual_group(rect(400.0, 100.0, 800.0, 600.0))),
-        ResolvedEffectScene::default(),
-        Vec::new(),
-    );
-
-    assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
-    let sample = state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().unwrap());
-    assert!(
-        state
-            .lifecycle_decoration_render_instances(&sample, &[])
-            .is_empty()
-    );
-}
+#[path = "lifecycle_payload_tests.rs"]
+mod payload_tests;

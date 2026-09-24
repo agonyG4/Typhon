@@ -7,9 +7,10 @@ use crate::native_output::runtime::frame_scene_identity::{
 };
 use crate::native_output::runtime::{NativeInputState, NativeSceneSnapshot};
 use oblivion_one::compositor::{
-    AnimationTime, FullscreenRenderPlanMetrics, PresentationRect, RenderableSurface,
-    RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitSequence, SurfaceOpaqueRegion,
-    SurfacePlacement, SurfaceRenderBackend, WindowId,
+    AnimationTime, FullscreenRenderPlanMetrics, PresentationRect,
+    PresentationRetainedVisualPayloadId, RenderableSurface, RenderableSurfaceDamage,
+    ResolvedEffectScene, SurfaceCommitSequence, SurfaceOpaqueRegion, SurfacePlacement,
+    SurfaceRenderBackend, WindowId,
 };
 use oblivion_one::compositor::{
     EffectAnchor, EffectAnchorScope, EffectSceneOrder, OwnCompositorServer, ResolvedEffectInstance,
@@ -19,8 +20,12 @@ use oblivion_one::effects::{
     EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect,
     EffectRegion,
 };
+use oblivion_one::presentation_animation::{PresentationEngine, PresentationRetainedVisualKind};
 use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
-use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
+use oblivion_one::window_lifecycle_animation::{
+    LampWindowSample, LifecycleDirection, LifecycleFrameSnapshot, LifecycleSceneSample,
+    LifecycleVisualGroup,
+};
 use std::borrow::Cow;
 use std::process;
 use wayland_server::protocol::wl_output;
@@ -100,6 +105,72 @@ fn resolved_native_frame_scene_excludes_culled_transition_owner() {
             .map(|window| window.root_surface_id())
             .collect::<Vec<_>>(),
         [602]
+    );
+}
+
+#[test]
+fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
+    let socket_name = format!("typhon-frame-restore-suppression-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for Restore suppression regression");
+    let root_surface_id = 621;
+    let window_id = WindowId::from_raw(621).expect("restore window id");
+    server.install_native_frame_test_scene(
+        vec![test_surface(
+            root_surface_id,
+            320,
+            200,
+            SurfacePlacement::root_at(30, 40),
+        )],
+        &[(root_surface_id, window_id)],
+        None,
+    );
+    let visual = PresentationRect::new(30.0, 40.0, 320.0, 200.0).unwrap();
+    let anchor = PresentationRect::new(600.0, 400.0, 32.0, 32.0).unwrap();
+    let visual_group = LifecycleVisualGroup::from_bounds(visual, visual, visual, anchor, 1280, 800)
+        .expect("valid restore visual group");
+    let at = AnimationTime::from_nanos(42);
+    let identity = PresentationEngine::enabled()
+        .begin_retained_visual(
+            oblivion_one::core::SceneNodeId::from_raw(window_id.get())
+                .expect("test lifecycle scene node"),
+            PresentationRetainedVisualKind::WindowLifecycle,
+            at,
+        )
+        .expect("test retained lifecycle identity");
+    let lifecycle = LifecycleSceneSample {
+        sampled_at: at,
+        lamps: vec![LampWindowSample {
+            window_id,
+            root_surface_id,
+            presentation_identity: identity,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
+            visual_group,
+            progress: 0.5,
+            opacity: 1.0,
+            direction: LifecycleDirection::Restore,
+            mathematically_settled: true,
+        }],
+        visual_sources: Vec::new(),
+    };
+    let resolved = ResolvedNativeFrameScene::from_server_at_with_lifecycle(
+        &server,
+        at,
+        oblivion_one::compositor::PresentationSampleTimeSource::MonotonicFallback,
+        lifecycle,
+    );
+
+    assert_eq!(resolved.lifecycle.lamps.len(), 1);
+    assert_eq!(
+        resolved.lifecycle.lamps[0].direction,
+        LifecycleDirection::Restore
+    );
+    assert_eq!(resolved.lifecycle.sampled_at, at);
+    assert_eq!(resolved.lifecycle.lamps[0].root_surface_id, root_surface_id);
+    assert!(
+        !resolved
+            .surface_ids()
+            .any(|surface_id| surface_id == root_surface_id)
     );
 }
 

@@ -14,6 +14,7 @@ use crate::compositor::presentation_coverage::{
 };
 use crate::compositor::render::SurfaceTargetRect;
 use crate::effects::EffectRect;
+use crate::presentation_animation::AnimationTime;
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 use crate::wm::WorkspaceLocation;
 use wayland_server::Resource;
@@ -40,6 +41,9 @@ impl CompositorState {
         let scene = self.resolved_effect_scene();
         let output_bounds = EffectRect::new(0, 0, output_size.width, output_size.height)
             .expect("configured output size is nonzero");
+        let lifecycle = self.lifecycle_scene_sample_at(
+            AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)),
+        );
         let mut analysis = DirectScanoutEffectAnalysis {
             raw_instance_count: scene.summary.visible_instance_count,
             instances_truncated: scene.instances.len() > MAX_DIRECT_SCANOUT_EFFECT_DETAILS,
@@ -47,38 +51,39 @@ impl CompositorState {
         };
 
         for instance in &scene.instances {
-            let disposition = if !self
-                .effect_instance_allows_presentation(instance, fullscreen_plan)
-            {
-                analysis.culled_instance_count = analysis.culled_instance_count.saturating_add(1);
-                DirectScanoutEffectDisposition::PresentationCulled
-            } else {
-                analysis.presentation_instance_count =
-                    analysis.presentation_instance_count.saturating_add(1);
-                if instance.region.intersect_rect(output_bounds).is_empty() {
-                    analysis.outside_output_instance_count =
-                        analysis.outside_output_instance_count.saturating_add(1);
-                    DirectScanoutEffectDisposition::OutsideOutput
+            let disposition =
+                if !self.effect_instance_allows_presentation(instance, fullscreen_plan, &lifecycle)
+                {
+                    analysis.culled_instance_count =
+                        analysis.culled_instance_count.saturating_add(1);
+                    DirectScanoutEffectDisposition::PresentationCulled
                 } else {
-                    let disposition = self.classify_direct_scanout_effect(instance, source);
-                    match disposition {
-                        DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource => {
-                            analysis.occluded_instance_count =
-                                analysis.occluded_instance_count.saturating_add(1);
+                    analysis.presentation_instance_count =
+                        analysis.presentation_instance_count.saturating_add(1);
+                    if instance.region.intersect_rect(output_bounds).is_empty() {
+                        analysis.outside_output_instance_count =
+                            analysis.outside_output_instance_count.saturating_add(1);
+                        DirectScanoutEffectDisposition::OutsideOutput
+                    } else {
+                        let disposition = self.classify_direct_scanout_effect(instance, source);
+                        match disposition {
+                            DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource => {
+                                analysis.occluded_instance_count =
+                                    analysis.occluded_instance_count.saturating_add(1);
+                            }
+                            DirectScanoutEffectDisposition::ContributingAboveSource
+                            | DirectScanoutEffectDisposition::ContributingAtSource
+                            | DirectScanoutEffectDisposition::OutputPostProcess
+                            | DirectScanoutEffectDisposition::UnknownOrder => {
+                                analysis.contributing_instance_count =
+                                    analysis.contributing_instance_count.saturating_add(1);
+                            }
+                            DirectScanoutEffectDisposition::PresentationCulled
+                            | DirectScanoutEffectDisposition::OutsideOutput => {}
                         }
-                        DirectScanoutEffectDisposition::ContributingAboveSource
-                        | DirectScanoutEffectDisposition::ContributingAtSource
-                        | DirectScanoutEffectDisposition::OutputPostProcess
-                        | DirectScanoutEffectDisposition::UnknownOrder => {
-                            analysis.contributing_instance_count =
-                                analysis.contributing_instance_count.saturating_add(1);
-                        }
-                        DirectScanoutEffectDisposition::PresentationCulled
-                        | DirectScanoutEffectDisposition::OutsideOutput => {}
+                        disposition
                     }
-                    disposition
-                }
-            };
+                };
 
             if analysis.instances.len() < MAX_DIRECT_SCANOUT_EFFECT_DETAILS {
                 analysis

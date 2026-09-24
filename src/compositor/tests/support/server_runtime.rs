@@ -816,9 +816,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .state
                                 .window_lifecycle_animator
                                 .active_count(),
-                            restore_suppression_active: !server
-                                .state
-                                .lifecycle_render_suppressed_roots()
+                            restore_suppression_active: !lifecycle
+                                .restore_suppressed_roots()
                                 .is_empty(),
                         });
                     }

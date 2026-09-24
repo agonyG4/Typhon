@@ -2,7 +2,7 @@ use super::*;
 use oblivion_one::effects::{
     EffectRect, EffectRegion, EffectRegistryGeneration, effect_output_influence_region,
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashSet};
 
 use oblivion_one::compositor::{
     AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
@@ -243,6 +243,16 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         at: AnimationTime,
         sample_time_source: oblivion_one::compositor::PresentationSampleTimeSource,
     ) -> Self {
+        let lifecycle = server.lifecycle_scene_sample_at(at);
+        Self::from_server_at_with_lifecycle(server, at, sample_time_source, lifecycle)
+    }
+
+    fn from_server_at_with_lifecycle(
+        server: &'a OwnCompositorServer,
+        at: AnimationTime,
+        sample_time_source: oblivion_one::compositor::PresentationSampleTimeSource,
+        lifecycle: LifecycleSceneSample,
+    ) -> Self {
         let (canonical_surfaces, canonical_scene_nodes, fullscreen_plan, visibility) =
             server.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
         let canonical_owner_roots = Cow::Owned(
@@ -251,12 +261,20 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 .map(|surface| server.presentation_owner_root_for_surface(surface.surface_id))
                 .collect::<Vec<_>>(),
         );
-        let lifecycle = server.lifecycle_scene_sample_at(at);
         let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
         let lifecycle_decorations =
             server.lifecycle_decoration_render_instances(&lifecycle, &lifecycle_surfaces);
+        let restore_suppressed_roots = lifecycle
+            .lamps
+            .iter()
+            .filter(|lamp| {
+                lamp.direction
+                    == oblivion_one::window_lifecycle_animation::LifecycleDirection::Restore
+            })
+            .map(|lamp| lamp.root_surface_id)
+            .collect::<HashSet<_>>();
         let (canonical_surfaces, canonical_scene_nodes, canonical_owner_roots) =
-            if server.lifecycle_render_suppressed_roots().is_empty() {
+            if restore_suppressed_roots.is_empty() {
                 (
                     canonical_surfaces,
                     canonical_scene_nodes,
@@ -267,7 +285,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                     canonical_surfaces,
                     canonical_scene_nodes,
                     canonical_owner_roots,
-                    |surface| !server.lifecycle_surface_is_suppressed(surface.surface_id),
+                    |surface| {
+                        !restore_suppressed_roots.contains(
+                            &server.lifecycle_root_surface_for_surface(surface.surface_id),
+                        )
+                    },
                 )
             };
         assert_surface_scene_node_alignment(
@@ -302,8 +324,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
         let effect_registry_generation = server.trusted_effect_registry().current();
-        let effects =
-            server.resolved_effect_scene_for_presentation(&presentation, &fullscreen_plan);
+        let effects = server.resolved_effect_scene_for_presentation_with_lifecycle(
+            &presentation,
+            &fullscreen_plan,
+            &lifecycle,
+        );
         let mut snapshot =
             NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
                 surfaces.as_ref(),

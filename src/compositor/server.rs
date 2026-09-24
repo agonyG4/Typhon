@@ -1212,26 +1212,16 @@ impl OwnCompositorServer {
         self.state.lifecycle_scene_sample_at(at)
     }
 
+    #[doc(hidden)]
+    pub fn lifecycle_root_surface_for_surface(&self, surface_id: u32) -> u32 {
+        self.state.root_surface_id_for_surface(surface_id)
+    }
+
     pub fn lifecycle_renderable_surfaces(
         &self,
         sample: &crate::window_lifecycle_animation::LifecycleSceneSample,
     ) -> Vec<RenderableSurface> {
         self.state.lifecycle_renderable_surfaces(sample)
-    }
-
-    pub fn lifecycle_render_suppressed_roots(&self) -> &std::collections::HashSet<u32> {
-        self.state.lifecycle_render_suppressed_roots()
-    }
-
-    pub fn lifecycle_surface_is_suppressed(&self, surface_id: u32) -> bool {
-        self.state.lifecycle_surface_is_suppressed(surface_id)
-    }
-
-    pub fn lifecycle_frame_snapshot_at(
-        &self,
-        at: AnimationTime,
-    ) -> crate::window_lifecycle_animation::LifecycleFrameSnapshot {
-        self.state.lifecycle_frame_snapshot_at(at)
     }
 
     #[cfg(test)]
@@ -1263,6 +1253,7 @@ impl OwnCompositorServer {
         );
     }
 
+    #[doc(hidden)]
     pub fn presented_lifecycle_frame_id(&self) -> u64 {
         self.state.presented_lifecycle_frame_id()
     }
@@ -1271,7 +1262,7 @@ impl OwnCompositorServer {
     pub fn presented_lifecycle_snapshot_for_test(
         &self,
     ) -> &crate::window_lifecycle_animation::LifecycleFrameSnapshot {
-        &self.state.presented_lifecycle
+        self.state.presented_lifecycle_physical.snapshot()
     }
 
     pub fn set_lifecycle_animation_renderer_available(&mut self, available: bool) {
@@ -1790,6 +1781,21 @@ impl OwnCompositorServer {
     ) -> ResolvedEffectScene {
         self.state
             .resolved_effect_scene_with_presentation(presentation, fullscreen_plan)
+    }
+
+    #[doc(hidden)]
+    pub fn resolved_effect_scene_for_presentation_with_lifecycle(
+        &self,
+        presentation: &PresentationSceneSample,
+        fullscreen_plan: &FullscreenCompositionPlan,
+        lifecycle: &crate::window_lifecycle_animation::LifecycleSceneSample,
+    ) -> ResolvedEffectScene {
+        self.state
+            .resolved_effect_scene_with_presentation_and_lifecycle(
+                presentation,
+                fullscreen_plan,
+                lifecycle,
+            )
     }
 
     pub fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {

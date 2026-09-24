@@ -371,7 +371,7 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> Option<(f64, f64, (i32, i32))> {
-        if self.lifecycle_surface_is_suppressed(root_surface_id) {
+        if self.lifecycle_root_restore_suppressed(root_surface_id) {
             return None;
         }
         let Some(index) = self.active_scene_surface_index(root_surface_id) else {
@@ -441,7 +441,7 @@ impl CompositorState {
             if !self.fullscreen_plan_allows_root(fullscreen_plan, group.root_surface_id()) {
                 continue;
             }
-            if self.lifecycle_surface_is_suppressed(group.root_surface_id()) {
+            if self.lifecycle_root_restore_suppressed(group.root_surface_id()) {
                 continue;
             }
             let Some(root_origin) = origins.get(root_index).copied() else {
@@ -539,7 +539,7 @@ impl CompositorState {
                 if !self.fullscreen_plan_allows_root(fullscreen_plan, root_surface_id) {
                     return None;
                 }
-                if self.lifecycle_surface_is_suppressed(root_surface_id) {
+                if self.lifecycle_root_restore_suppressed(root_surface_id) {
                     return None;
                 }
                 if !self.pointer_scene_owner_is_frontmost(
@@ -583,7 +583,7 @@ impl CompositorState {
                 if !self.fullscreen_plan_allows_root(fullscreen_plan, *root_surface_id) {
                     return None;
                 }
-                if self.lifecycle_surface_is_suppressed(*root_surface_id) {
+                if self.lifecycle_root_restore_suppressed(*root_surface_id) {
                     return None;
                 }
                 if !self.pointer_scene_owner_is_frontmost(

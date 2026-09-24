@@ -184,6 +184,23 @@ pub struct LifecycleSceneSample {
 }
 
 impl LifecycleSceneSample {
+    /// Returns Restore roots suppressed from canonical rendering by this exact
+    /// authoritative sample. The set is a frame projection, never stored state.
+    #[cfg(test)]
+    pub(crate) fn restore_suppressed_roots(&self) -> std::collections::HashSet<u32> {
+        self.lamps
+            .iter()
+            .filter(|lamp| lamp.direction == LifecycleDirection::Restore)
+            .map(|lamp| lamp.root_surface_id)
+            .collect()
+    }
+
+    pub(crate) fn restore_suppresses_root(&self, root_surface_id: u32) -> bool {
+        self.lamps.iter().any(|lamp| {
+            lamp.root_surface_id == root_surface_id && lamp.direction == LifecycleDirection::Restore
+        })
+    }
+
     pub fn visual_source_for_window(&self, window_id: WindowId) -> Option<&LifecycleVisualSource> {
         self.visual_sources
             .iter()

@@ -1,4 +1,4 @@
-use crate::compositor::{ResolvedEffectScene, WindowId};
+use crate::compositor::{DecorationRenderInstance, ResolvedEffectScene, WindowId};
 use crate::core::SceneNodeId;
 use crate::presentation_animation::{
     PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
@@ -34,6 +34,7 @@ pub(crate) struct RetainedLifecyclePayload {
     pub(crate) root_surface_id: u32,
     pub(crate) visual_group: LifecycleVisualGroup,
     pub(crate) effect_scene: Arc<ResolvedEffectScene>,
+    pub(crate) frozen_decoration: Option<DecorationRenderInstance>,
 }
 
 impl RetainedLifecyclePayload {
@@ -43,6 +44,7 @@ impl RetainedLifecyclePayload {
         root_surface_id: u32,
         visual_group: LifecycleVisualGroup,
         effect_scene: ResolvedEffectScene,
+        frozen_decoration: Option<DecorationRenderInstance>,
     ) -> Option<Arc<Self>> {
         if origin_identity.kind() != PresentationRetainedVisualKind::WindowLifecycle
             || !valid_lifecycle_visual_group(visual_group)
@@ -55,6 +57,7 @@ impl RetainedLifecyclePayload {
             root_surface_id,
             visual_group,
             effect_scene: Arc::new(effect_scene),
+            frozen_decoration,
         }))
     }
 }
@@ -198,6 +201,7 @@ mod tests {
             root_surface_id,
             visual_group,
             ResolvedEffectScene::default(),
+            None,
         )
         .expect("valid payload")
     }

@@ -154,7 +154,10 @@ impl CompositorState {
             return;
         };
         let speed = self.animation_control.configuration().speed;
-        let Some((_identity, payload, was_reversal)) = self.install_lifecycle_motion(
+        let frozen_decoration = lifecycle_decorations
+            .into_iter()
+            .find(|decoration| decoration.root_surface_id() == root_surface_id);
+        let Some((_identity, _payload, _was_reversal)) = self.install_lifecycle_motion(
             scene_node_id,
             window_id,
             root_surface_id,
@@ -163,6 +166,7 @@ impl CompositorState {
             visual_group,
             LifecycleDirection::Minimize,
             resolved_effect_scene,
+            frozen_decoration,
             now,
             speed,
         ) else {
@@ -171,15 +175,6 @@ impl CompositorState {
         // Lamp takes over Group Geometry only after the retained transaction
         // and lifecycle executor have both accepted the same identity.
         self.presentation_animator.cancel_geometry(scene_node_id);
-        let active_root_surface_id = payload.root_surface_id;
-        self.lifecycle_render_suppressed_roots
-            .remove(&active_root_surface_id);
-        if !was_reversal {
-            self.replace_lifecycle_decoration_snapshot(
-                active_root_surface_id,
-                lifecycle_decorations,
-            );
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -193,6 +188,7 @@ impl CompositorState {
         visual_group: Option<LifecycleVisualGroup>,
         direction: LifecycleDirection,
         resolved_effect_scene: ResolvedEffectScene,
+        frozen_decoration: Option<DecorationRenderInstance>,
         now: AnimationTime,
         speed: f64,
     ) -> Option<(
@@ -282,6 +278,7 @@ impl CompositorState {
                 root_surface_id,
                 visual_group,
                 resolved_effect_scene,
+                frozen_decoration,
             ) else {
                 self.rollback_lifecycle_reservation(identity, previous_identity);
                 return None;
@@ -354,21 +351,6 @@ impl CompositorState {
         );
     }
 
-    fn replace_lifecycle_decoration_snapshot(
-        &mut self,
-        root_surface_id: u32,
-        decorations: Vec<DecorationRenderInstance>,
-    ) {
-        self.lifecycle_decorations.remove(&root_surface_id);
-        if let Some(decoration) = decorations
-            .into_iter()
-            .find(|decoration| decoration.root_surface_id() == root_surface_id)
-        {
-            self.lifecycle_decorations
-                .insert(root_surface_id, decoration);
-        }
-    }
-
     pub(in crate::compositor) fn begin_lifecycle_restore(
         &mut self,
         window_id: WindowId,
@@ -388,7 +370,10 @@ impl CompositorState {
             return;
         };
         let speed = self.animation_control.configuration().speed;
-        let Some((_identity, payload, was_reversal)) = self.install_lifecycle_motion(
+        let frozen_decoration = lifecycle_decorations
+            .into_iter()
+            .find(|decoration| decoration.root_surface_id() == root_surface_id);
+        let Some((_identity, _payload, _was_reversal)) = self.install_lifecycle_motion(
             scene_node_id,
             window_id,
             root_surface_id,
@@ -397,20 +382,12 @@ impl CompositorState {
             visual_group,
             LifecycleDirection::Restore,
             resolved_effect_scene,
+            frozen_decoration,
             now,
             speed,
         ) else {
             return;
         };
-        let active_root_surface_id = payload.root_surface_id;
-        if !was_reversal {
-            self.replace_lifecycle_decoration_snapshot(
-                active_root_surface_id,
-                lifecycle_decorations,
-            );
-        }
-        self.lifecycle_render_suppressed_roots
-            .insert(active_root_surface_id);
     }
 
     pub(in crate::compositor) fn lifecycle_scene_sample_at(
@@ -519,10 +496,33 @@ impl CompositorState {
             .collect::<HashSet<_>>();
         let mut frozen = Vec::new();
         let mut frozen_roots = HashSet::new();
-        for root_surface_id in roots.iter().copied() {
-            if let Some(decoration) = self.lifecycle_decorations.get(&root_surface_id) {
+        for lamp in &sample.lamps {
+            if self.presentation_animator.active_retained_visual(
+                lamp.presentation_identity.scene_node_id(),
+                PresentationRetainedVisualKind::WindowLifecycle,
+            ) != Some(lamp.presentation_identity)
+            {
+                continue;
+            }
+            let Some(payload) = self
+                .retained_lifecycle_payloads
+                .get_exact(lamp.presentation_identity)
+            else {
+                continue;
+            };
+            if payload.payload_id != lamp.payload_id
+                || payload.root_surface_id != lamp.root_surface_id
+                || payload.window_id != lamp.window_id
+            {
+                continue;
+            }
+            if let Some(decoration) = payload
+                .frozen_decoration
+                .as_ref()
+                .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
+                && frozen_roots.insert(lamp.root_surface_id)
+            {
                 frozen.push(decoration.clone());
-                frozen_roots.insert(root_surface_id);
             }
         }
         frozen.extend(
@@ -536,16 +536,13 @@ impl CompositorState {
         frozen
     }
 
-    pub(in crate::compositor) fn lifecycle_surface_is_suppressed(&self, surface_id: u32) -> bool {
-        self.lifecycle_render_suppressed_roots
-            .contains(&self.root_surface_id_for_surface(surface_id))
-    }
-
-    pub(in crate::compositor) fn lifecycle_frame_snapshot_at(
+    pub(in crate::compositor) fn lifecycle_root_restore_suppressed(
         &self,
-        at: AnimationTime,
-    ) -> LifecycleFrameSnapshot {
-        LifecycleFrameSnapshot::from_sample(&self.lifecycle_scene_sample_at(at))
+        root_surface_id: u32,
+    ) -> bool {
+        let at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        self.lifecycle_scene_sample_at(at)
+            .restore_suppresses_root(root_surface_id)
     }
 
     fn lifecycle_lamp_intersects_output(
@@ -574,28 +571,18 @@ impl CompositorState {
             .into_iter()
             .filter(|lamp| !self.lifecycle_lamp_has_visible_pixels(lamp))
             .filter(|lamp| {
-                !self.presented_lifecycle.lamps.iter().any(|presented| {
-                    presented.presentation_identity.scene_node_id()
-                        == lamp.presentation_identity.scene_node_id()
-                        && !presented.mathematically_settled
-                        && presented.opacity > f64::EPSILON
-                        && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-                            presented.visual_group,
-                            self.output_size.width,
-                            self.output_size.height,
-                        )
-                })
+                !self
+                    .presented_lifecycle_physical
+                    .has_pending_visible_scene_node(
+                        lamp.presentation_identity.scene_node_id(),
+                        self.output_size.width,
+                        self.output_size.height,
+                    )
             })
-            .map(|lamp| {
-                (
-                    lamp.presentation_identity,
-                    lamp.payload_id,
-                    lamp.root_surface_id,
-                )
-            })
+            .map(|lamp| (lamp.presentation_identity, lamp.payload_id))
             .collect::<Vec<_>>();
         let mut settled = false;
-        for (identity, payload_id, root_surface_id) in candidates {
+        for (identity, payload_id) in candidates {
             if self
                 .presentation_animator
                 .active_retained_visual(identity.scene_node_id(), identity.kind())
@@ -620,9 +607,6 @@ impl CompositorState {
                     continue;
                 }
                 self.retained_lifecycle_payloads.retire_exact(identity);
-                self.lifecycle_render_suppressed_roots
-                    .remove(&root_surface_id);
-                self.lifecycle_decorations.remove(&root_surface_id);
                 settled = true;
             }
         }
@@ -637,30 +621,26 @@ impl CompositorState {
             .lamps
             .iter()
             .any(|lamp| self.lifecycle_lamp_has_visible_pixels(lamp));
-        let presented_intersects = self.presented_lifecycle.lamps.iter().any(|lamp| {
-            !lamp.mathematically_settled
-                && lamp.opacity > f64::EPSILON
-                && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-                    lamp.visual_group,
-                    self.output_size.width,
-                    self.output_size.height,
-                )
-        });
-        active_intersects || presented_intersects
+        active_intersects
+            || self
+                .presented_lifecycle_physical
+                .has_pending_visible(self.output_size.width, self.output_size.height)
     }
 
-    pub(in crate::compositor) fn lifecycle_render_suppressed_roots(&self) -> &HashSet<u32> {
-        &self.lifecycle_render_suppressed_roots
-    }
-
+    #[cfg(test)]
     pub(in crate::compositor) fn publish_presented_lifecycle(
         &mut self,
         frame_id: u64,
         snapshot: &LifecycleFrameSnapshot,
     ) {
-        self.publish_presented_lifecycle_with_replacements(frame_id, snapshot, &[], false);
+        self.publish_presented_lifecycle_snapshot(
+            frame_id,
+            snapshot,
+            crate::compositor::PresentedLifecycleScene::Initial,
+        );
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn publish_presented_lifecycle_with_replacements(
         &mut self,
         frame_id: u64,
@@ -668,28 +648,29 @@ impl CompositorState {
         canonical_root_surface_ids: &[u32],
         rendered_scene_replacement: bool,
     ) {
-        self.presented_lifecycle_frame_id = frame_id;
-        let mut qualified = snapshot.clone();
-        for old in &self.presented_lifecycle.lamps {
-            let replaced = snapshot
-                .lamps
-                .iter()
-                .any(|lamp| lamp.root_surface_id == old.root_surface_id);
-            let canonical_replaced = canonical_root_surface_ids.contains(&old.root_surface_id);
-            let rendered_replaced = rendered_scene_replacement && !replaced;
-            let still_visible = !old.mathematically_settled
-                && old.opacity > f64::EPSILON
-                && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-                    old.visual_group,
-                    self.output_size.width,
-                    self.output_size.height,
-                );
-            if !replaced && !canonical_replaced && !rendered_replaced && still_visible {
-                qualified.lamps.push(*old);
+        let scene = if rendered_scene_replacement {
+            crate::compositor::PresentedLifecycleScene::RenderedSceneReplacement {
+                canonical_root_surface_ids,
             }
-        }
-        qualified.refresh_signature();
-        self.presented_lifecycle = qualified;
+        } else {
+            crate::compositor::PresentedLifecycleScene::Initial
+        };
+        self.publish_presented_lifecycle_snapshot(frame_id, snapshot, scene);
+    }
+
+    pub(in crate::compositor) fn publish_presented_lifecycle_snapshot(
+        &mut self,
+        frame_id: u64,
+        snapshot: &LifecycleFrameSnapshot,
+        scene: crate::compositor::PresentedLifecycleScene<'_>,
+    ) {
+        self.presented_lifecycle_physical.publish(
+            frame_id,
+            snapshot,
+            scene,
+            self.output_size.width,
+            self.output_size.height,
+        );
         for lamp in &snapshot.lamps {
             if self.presentation_animator.active_retained_visual(
                 lamp.presentation_identity.scene_node_id(),
@@ -719,13 +700,6 @@ impl CompositorState {
             if retired {
                 self.retained_lifecycle_payloads
                     .retire_exact(lamp.presentation_identity);
-            }
-            if retired && matches!(lamp.direction, LifecycleDirection::Restore) {
-                self.lifecycle_render_suppressed_roots
-                    .remove(&lamp.root_surface_id);
-            }
-            if retired {
-                self.lifecycle_decorations.remove(&lamp.root_surface_id);
             }
         }
         self.advance_pointer_hit_generation();
@@ -796,9 +770,6 @@ impl CompositorState {
         }
         self.retained_lifecycle_payloads
             .retire_exact(fallback.presentation_identity);
-        self.lifecycle_render_suppressed_roots
-            .remove(&fallback.root_surface_id);
-        self.lifecycle_decorations.remove(&fallback.root_surface_id);
         true
     }
 
@@ -827,13 +798,10 @@ impl CompositorState {
                     .retire_retained_visual_exact(identity);
                 self.window_lifecycle_animator.cancel(identity);
             }
-            self.lifecycle_render_suppressed_roots.clear();
-            self.lifecycle_decorations.clear();
         }
     }
 
     pub(in crate::compositor) fn lifecycle_cancel_window(&mut self, window_id: WindowId) {
-        let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
         let scene_node_id = self.scene_node_id_for_window_group(window_id);
         let active_identity = scene_node_id.and_then(|scene_node_id| {
             self.presentation_animator.active_retained_visual(
@@ -841,69 +809,42 @@ impl CompositorState {
                 PresentationRetainedVisualKind::WindowLifecycle,
             )
         });
-        let frozen_root_surface_id = active_identity
-            .and_then(|identity| self.retained_lifecycle_payloads.get_exact(identity))
-            .map(|payload| payload.root_surface_id);
         if let Some(identity) = active_identity {
             self.window_lifecycle_animator.cancel(identity);
             self.presentation_animator
                 .retire_active_retained_visual_exact(identity);
             self.retained_lifecycle_payloads.retire_exact(identity);
         }
-        let orphaned_roots = scene_node_id
+        let orphaned_executions = scene_node_id
             .map(|scene_node_id| {
                 self.window_lifecycle_animator
                     .cancel_scene_executions(scene_node_id)
             })
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|identity| {
-                self.presentation_animator
-                    .retire_retained_visual_exact(identity);
-                self.retained_lifecycle_payloads
-                    .retire_exact(identity)
-                    .map(|payload| payload.root_surface_id)
-            })
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
+        for identity in orphaned_executions {
+            self.presentation_animator
+                .retire_retained_visual_exact(identity);
+            self.retained_lifecycle_payloads.retire_exact(identity);
+        }
         let orphaned_payloads = scene_node_id
             .map(|scene_node_id| {
                 self.retained_lifecycle_payloads
                     .remove_scene_node(scene_node_id)
             })
             .unwrap_or_default();
-        for (identity, payload) in orphaned_payloads {
+        for (identity, _) in orphaned_payloads {
             self.presentation_animator
                 .retire_retained_visual_exact(identity);
             self.window_lifecycle_animator.cancel(identity);
-            self.lifecycle_render_suppressed_roots
-                .remove(&payload.root_surface_id);
-            self.lifecycle_decorations.remove(&payload.root_surface_id);
-        }
-        for root_surface_id in [frozen_root_surface_id, root_surface_id]
-            .into_iter()
-            .flatten()
-            .chain(orphaned_roots)
-        {
-            self.lifecycle_render_suppressed_roots
-                .remove(&root_surface_id);
-            self.lifecycle_decorations.remove(&root_surface_id);
         }
     }
 
     pub(in crate::compositor) fn lifecycle_teardown_window(&mut self, window_id: WindowId) {
-        let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
         self.lifecycle_cancel_window(window_id);
-        self.presented_lifecycle
-            .lamps
-            .retain(|lamp| lamp.window_id != window_id);
-        self.presented_lifecycle.refresh_signature();
-        if let Some(root_surface_id) = root_surface_id {
-            self.lifecycle_render_suppressed_roots
-                .remove(&root_surface_id);
-        }
+        self.presented_lifecycle_physical.remove_window(window_id);
     }
 
     pub(in crate::compositor) const fn presented_lifecycle_frame_id(&self) -> u64 {
-        self.presented_lifecycle_frame_id
+        self.presented_lifecycle_physical.frame_id()
     }
 }
