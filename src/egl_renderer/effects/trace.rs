@@ -388,7 +388,7 @@ impl EffectExecutionResolutionSnapshot {
     pub(crate) fn format_line(self, frame_id: Option<u64>) -> String {
         let issue = self.graph_metadata_issue;
         format!(
-            "event=effect_execution_resolution frame_id={} outcome={} demand_conservative_cause={} iterations_attempted={} max_iterations={} graph_instances={} graph_passes={} dependency_edges={} initial_repair_kind={} initial_repair_rects={} initial_repair_pixels={} last_input_repair_kind={} last_input_repair_rects={} last_input_repair_pixels={} last_execution_region_kind={} last_execution_region_rects={} last_execution_region_pixels={} last_merged_repair_kind={} last_merged_repair_rects={} last_merged_repair_pixels={} last_applied_repair_kind={} last_applied_repair_rects={} last_applied_repair_pixels={} last_repair_changed={} final_repaint_mode={} final_repaint_reason={} graph_metadata_issue={} graph_metadata_instance={} graph_metadata_dependency={} graph_metadata_pass={} graph_metadata_texture={}",
+            "event=effect_execution_resolution frame_id={} outcome={} demand_conservative_cause={} iterations_attempted={} max_iterations={} graph_instances={} graph_passes={} dependency_edges={} initial_repair_kind={} initial_repair_rects={} initial_repair_pixels={} last_input_repair_kind={} last_input_repair_rects={} last_input_repair_pixels={} last_execution_region_kind={} last_execution_region_rects={} last_execution_region_pixels={} last_selected_output_region_kind={} last_selected_output_region_rects={} last_selected_output_region_pixels={} last_capture_work_region_kind={} last_capture_work_region_rects={} last_capture_work_region_pixels={} last_merged_repair_kind={} last_merged_repair_rects={} last_merged_repair_pixels={} last_applied_repair_kind={} last_applied_repair_rects={} last_applied_repair_pixels={} last_repair_changed={} last_output_only_merged_repair_kind={} last_output_only_merged_repair_rects={} last_output_only_merged_repair_pixels={} last_output_only_applied_repair_kind={} last_output_only_applied_repair_rects={} last_output_only_applied_repair_pixels={} output_only_repaint_mode={} output_only_repaint_reason={} last_capture_work_instances={} attribution_available={} attribution_union_coalesces={} final_repaint_mode={} final_repaint_reason={} graph_metadata_issue={} graph_metadata_instance={} graph_metadata_dependency={} graph_metadata_pass={} graph_metadata_texture={}",
             optional_u64(frame_id),
             self.outcome.as_str(),
             self.demand_conservative_cause.as_str(),
@@ -406,6 +406,12 @@ impl EffectExecutionResolutionSnapshot {
             repair_kind(self.last_execution_region),
             self.last_execution_region.rects,
             self.last_execution_region.pixels,
+            repair_kind(self.last_selected_output_region),
+            self.last_selected_output_region.rects,
+            self.last_selected_output_region.pixels,
+            repair_kind(self.last_capture_work_region),
+            self.last_capture_work_region.rects,
+            self.last_capture_work_region.pixels,
             repair_kind(self.last_merged_repair),
             self.last_merged_repair.rects,
             self.last_merged_repair.pixels,
@@ -413,6 +419,19 @@ impl EffectExecutionResolutionSnapshot {
             self.last_applied_repair.rects,
             self.last_applied_repair.pixels,
             self.last_repair_changed,
+            repair_kind(self.last_output_only_merged_repair),
+            self.last_output_only_merged_repair.rects,
+            self.last_output_only_merged_repair.pixels,
+            repair_kind(self.last_output_only_applied_repair),
+            self.last_output_only_applied_repair.rects,
+            self.last_output_only_applied_repair.pixels,
+            self.last_output_only_repaint_mode
+                .map_or("none", RepaintMode::as_str),
+            self.last_output_only_repaint_reason
+                .map_or("none", FullRepaintReason::as_str),
+            self.last_capture_work_instances,
+            self.attribution_available,
+            self.attribution_union_coalesces,
             self.final_repaint_mode.as_str(),
             self.final_repaint_reason
                 .map_or("none", FullRepaintReason::as_str),
@@ -1979,9 +1998,18 @@ mod tests {
             initial_repair: repair,
             last_input_repair: repair,
             last_execution_region: repair,
+            last_selected_output_region: repair,
+            last_capture_work_region: repair,
             last_merged_repair: repair,
             last_applied_repair: repair,
             last_repair_changed: true,
+            last_output_only_merged_repair: repair,
+            last_output_only_applied_repair: repair,
+            last_output_only_repaint_mode: Some(RepaintMode::Partial),
+            last_output_only_repaint_reason: None,
+            last_capture_work_instances: 2,
+            attribution_available: true,
+            attribution_union_coalesces: 0,
             final_repaint_mode: RepaintMode::Full,
             final_repaint_reason: Some(FullRepaintReason::EffectExecutionConservative),
             graph_metadata_issue: Some(GraphExecutionMetadataIssue {
@@ -2013,6 +2041,12 @@ mod tests {
             "last_execution_region_kind",
             "last_execution_region_rects",
             "last_execution_region_pixels",
+            "last_selected_output_region_kind",
+            "last_selected_output_region_rects",
+            "last_selected_output_region_pixels",
+            "last_capture_work_region_kind",
+            "last_capture_work_region_rects",
+            "last_capture_work_region_pixels",
             "last_merged_repair_kind",
             "last_merged_repair_rects",
             "last_merged_repair_pixels",
@@ -2020,6 +2054,17 @@ mod tests {
             "last_applied_repair_rects",
             "last_applied_repair_pixels",
             "last_repair_changed",
+            "last_output_only_merged_repair_kind",
+            "last_output_only_merged_repair_rects",
+            "last_output_only_merged_repair_pixels",
+            "last_output_only_applied_repair_kind",
+            "last_output_only_applied_repair_rects",
+            "last_output_only_applied_repair_pixels",
+            "output_only_repaint_mode",
+            "output_only_repaint_reason",
+            "last_capture_work_instances",
+            "attribution_available",
+            "attribution_union_coalesces",
             "final_repaint_mode",
             "final_repaint_reason",
             "graph_metadata_issue",
@@ -2045,6 +2090,9 @@ mod tests {
         assert!(line.contains("graph_metadata_dependency=3"));
         assert!(line.contains("graph_metadata_pass=none"));
         assert!(line.contains("graph_metadata_texture=none"));
+        assert!(line.contains("output_only_repaint_mode=partial"));
+        assert!(line.contains("output_only_repaint_reason=none"));
+        assert!(line.contains("attribution_available=true"));
         assert!(!line.contains("EffectExecutionResolutionOutcome"));
         assert!(!line.contains("GraphExecutionMetadataIssueKind"));
 

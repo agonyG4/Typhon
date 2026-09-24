@@ -891,12 +891,173 @@ fn effect_execution_resolution_separates_repaint_policy_full_from_conservatism()
 
     assert_eq!(snapshot.outcome.as_str(), "repaint_policy_full");
     assert_eq!(snapshot.demand_conservative_cause.as_str(), "none");
+    assert!(snapshot.attribution_available);
+    assert!(snapshot.last_selected_output_region.pixels > 0);
+    assert!(snapshot.last_capture_work_region.pixels > 0);
+    assert_eq!(snapshot.last_capture_work_instances, 1);
+    assert_eq!(snapshot.attribution_union_coalesces, 0);
+    assert_eq!(
+        snapshot.last_output_only_repaint_mode,
+        Some(RepaintMode::Partial)
+    );
+    assert_eq!(snapshot.last_output_only_repaint_reason, None);
+    assert_eq!(
+        snapshot.last_output_only_applied_repair.kind,
+        EffectExecutionRepairKind::Rects
+    );
+    assert!(snapshot.initial_repair.pixels < snapshot.last_output_only_applied_repair.pixels);
+    assert!(snapshot.last_output_only_applied_repair.pixels < snapshot.last_merged_repair.pixels);
     assert_eq!(
         snapshot.final_repaint_reason,
         Some(FullRepaintReason::DamageAreaThreshold)
     );
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::DamageAreaThreshold)
+    );
     assert_eq!(snapshot.last_applied_repair.kind.as_str(), "full");
     assert!(snapshot.last_merged_repair.pixels >= 6_000);
+}
+
+#[test]
+fn effect_execution_resolution_freezes_attribution_before_full_demand_recompute() {
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 0, 10, 10)),
+            vec![],
+        ),
+        (
+            2,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 80, 80)),
+            vec![1],
+        ),
+        (
+            3,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(90, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::empty(),
+            vec![],
+        ),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert_eq!(
+        snapshot.outcome,
+        EffectExecutionResolutionOutcome::RepaintPolicyFull
+    );
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(demand.instances.len(), 3);
+    assert!(snapshot.attribution_available);
+    assert_eq!(snapshot.last_selected_output_region.rects, 2);
+    assert_eq!(snapshot.last_selected_output_region.pixels, 200);
+    assert_eq!(
+        snapshot.last_output_only_repaint_mode,
+        Some(RepaintMode::Partial)
+    );
+    assert_eq!(snapshot.last_output_only_repaint_reason, None);
+}
+
+#[test]
+fn effect_execution_attribution_omits_capture_work_without_dependencies() {
+    let graph = graph_for_effect_instances([(1, 30, 10, 0, 80, vec![])]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert!(snapshot.attribution_available);
+    assert_eq!(
+        snapshot.last_capture_work_region.kind,
+        EffectExecutionRepairKind::Empty
+    );
+    assert_eq!(snapshot.last_capture_work_instances, 0);
+    assert_eq!(
+        snapshot.last_output_only_merged_repair,
+        snapshot.last_merged_repair
+    );
+    assert_eq!(snapshot.last_output_only_repaint_mode, Some(plan.mode));
+    assert_eq!(
+        snapshot.last_output_only_repaint_reason,
+        plan.fallback_reason
+    );
+}
+
+#[test]
+fn effect_execution_attribution_does_not_assign_cause_to_covered_capture_work() {
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(4, 4, 5, 5)),
+            oblivion_one::effects::EffectRegion::empty(),
+            vec![],
+        ),
+        (
+            2,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(8, 8, 5, 5)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 10, 10, 10)),
+            vec![1],
+        ),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(0, 0, 20, 20)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert!(snapshot.attribution_available);
+    assert_eq!(snapshot.last_capture_work_instances, 1);
+    assert!(snapshot.last_capture_work_region.pixels > 0);
+    assert_eq!(
+        snapshot.outcome,
+        EffectExecutionResolutionOutcome::Converged
+    );
+    assert_eq!(
+        snapshot.last_output_only_merged_repair,
+        snapshot.last_input_repair
+    );
+    assert_eq!(snapshot.last_merged_repair, snapshot.last_input_repair);
+    assert_eq!(
+        snapshot.last_output_only_repaint_mode,
+        Some(RepaintMode::Partial)
+    );
+    assert_eq!(snapshot.last_output_only_repaint_reason, None);
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
 }
 
 #[test]
@@ -975,11 +1136,14 @@ fn ordinary_resolver_does_not_construct_trace_only_resolution_snapshots() {
         ..RepaintPlan::default()
     };
     let before = EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS.with(Cell::get);
+    let attribution_before = EFFECT_EXECUTION_ATTRIBUTION_BUILDS.with(Cell::get);
 
     resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
 
     let after = EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS.with(Cell::get);
+    let attribution_after = EFFECT_EXECUTION_ATTRIBUTION_BUILDS.with(Cell::get);
     assert_eq!(after, before);
+    assert_eq!(attribution_after, attribution_before);
 }
 
 #[test]

@@ -27,6 +27,7 @@ const PARTIAL_REPAINT_COMPLEXITY_POLICY_ENV: &str = "TYPHON_PARTIAL_REPAINT_COMP
 thread_local! {
     static DAMAGE_COMPLEXITY_SHADOW_ANALYSIS_COUNT: Cell<u32> = const { Cell::new(0) };
     static EFFECT_EXECUTION_RESOLUTION_SNAPSHOT_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static EFFECT_EXECUTION_ATTRIBUTION_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A half-open rectangle in output physical pixels with a top-left origin.
@@ -516,6 +517,18 @@ fn resolve_effect_execution_for_repaint_plan_inner(
             return final_demand;
         }
 
+        if let Some(snapshot) = diagnostics.as_deref_mut() {
+            record_effect_execution_attribution(
+                snapshot,
+                graph,
+                &demand,
+                plan,
+                planner,
+                output_width,
+                output_height,
+            );
+        }
+
         if effect_execution_region_is_covered_by_repair(
             &plan.repair_damage,
             &demand.execution_region,
@@ -586,6 +599,128 @@ fn resolve_effect_execution_for_repaint_plan_inner(
         snapshot.finish_with_plan(plan);
     }
     final_demand
+}
+
+fn record_effect_execution_attribution(
+    snapshot: &mut EffectExecutionResolutionSnapshot,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    demand: &oblivion_one::effects::EffectExecutionDemand,
+    plan: &RepaintPlan,
+    planner: &PartialRepaintPlanner,
+    output_width: u32,
+    output_height: u32,
+) {
+    #[cfg(test)]
+    EFFECT_EXECUTION_ATTRIBUTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
+
+    let mut selected_output_region = oblivion_one::effects::EffectRegion::empty();
+    let mut capture_work_region = oblivion_one::effects::EffectRegion::empty();
+    let mut capture_work_instances = 0usize;
+    let mut attribution_union_coalesces = 0usize;
+    let mut identity_available = true;
+    let mut source_region_is_conservative = false;
+
+    for (selected_index, selected) in demand.instances.iter().enumerate() {
+        source_region_is_conservative |=
+            !selected.output_region.is_empty() && selected.output_region.bounding_rect().is_none();
+        let (union, coalesces, conservative) =
+            union_effect_region_for_attribution(&selected_output_region, &selected.output_region);
+        selected_output_region = union;
+        attribution_union_coalesces = attribution_union_coalesces.saturating_add(coalesces);
+        source_region_is_conservative |= conservative;
+
+        if demand.instances[..selected_index]
+            .iter()
+            .any(|previous| previous.id == selected.id)
+        {
+            identity_available = false;
+            continue;
+        }
+
+        let mut matching_instances = graph
+            .instances
+            .iter()
+            .filter(|instance| instance.id == selected.id);
+        let Some(instance) = matching_instances.next() else {
+            identity_available = false;
+            continue;
+        };
+        if matching_instances.next().is_some() {
+            identity_available = false;
+            continue;
+        }
+
+        if instance.dependencies.is_empty() {
+            continue;
+        }
+
+        capture_work_instances = capture_work_instances.saturating_add(1);
+        source_region_is_conservative |= !instance.capture_region.is_empty()
+            && instance.capture_region.bounding_rect().is_none();
+        let (union, coalesces, conservative) =
+            union_effect_region_for_attribution(&capture_work_region, &instance.capture_region);
+        capture_work_region = union;
+        attribution_union_coalesces = attribution_union_coalesces.saturating_add(coalesces);
+        source_region_is_conservative |= conservative;
+    }
+
+    let representation_is_conservative = source_region_is_conservative
+        || (!selected_output_region.is_empty() && selected_output_region.bounding_rect().is_none())
+        || (!capture_work_region.is_empty() && capture_work_region.bounding_rect().is_none());
+    let output_only_merged_repair = merge_effect_damage(
+        plan.repair_damage.clone(),
+        &selected_output_region,
+        output_width,
+        output_height,
+    );
+    let mut output_only_plan = plan.clone();
+    planner.apply_execution_repair(&mut output_only_plan, output_only_merged_repair.clone());
+
+    snapshot.last_selected_output_region = EffectExecutionRepairSnapshot::from_effect_region(
+        &selected_output_region,
+        (output_width, output_height),
+    );
+    snapshot.last_capture_work_region = EffectExecutionRepairSnapshot::from_effect_region(
+        &capture_work_region,
+        (output_width, output_height),
+    );
+    snapshot.last_output_only_merged_repair = EffectExecutionRepairSnapshot::from_damage(
+        &output_only_merged_repair,
+        (output_width, output_height),
+    );
+    snapshot.last_output_only_applied_repair = EffectExecutionRepairSnapshot::from_damage(
+        &output_only_plan.repair_damage,
+        (output_width, output_height),
+    );
+    snapshot.last_output_only_repaint_mode = Some(output_only_plan.mode);
+    snapshot.last_output_only_repaint_reason = output_only_plan.fallback_reason;
+    snapshot.last_capture_work_instances = capture_work_instances;
+    snapshot.attribution_union_coalesces = attribution_union_coalesces;
+    snapshot.attribution_available =
+        identity_available && !representation_is_conservative && attribution_union_coalesces == 0;
+}
+
+fn union_effect_region_for_attribution(
+    aggregate: &oblivion_one::effects::EffectRegion,
+    contribution: &oblivion_one::effects::EffectRegion,
+) -> (oblivion_one::effects::EffectRegion, usize, bool) {
+    let conservative_input = (!aggregate.is_empty() && aggregate.bounding_rect().is_none())
+        || (!contribution.is_empty() && contribution.bounding_rect().is_none());
+    if conservative_input {
+        return (aggregate.union(contribution), 0, true);
+    }
+
+    let mut region = aggregate.clone();
+    let mut coalesces = 0usize;
+    for rect in contribution.rects() {
+        if region.rects().len() >= oblivion_one::effects::MAX_EFFECT_REGION_RECTS
+            && !region.rects().contains(rect)
+        {
+            coalesces = coalesces.saturating_add(1);
+        }
+        region.push(*rect);
+    }
+    (region, coalesces, false)
 }
 
 fn coalesce_rects(mut rects: Vec<OutputRect>) -> Vec<OutputRect> {
@@ -878,9 +1013,18 @@ pub(crate) struct EffectExecutionResolutionSnapshot {
     pub(crate) initial_repair: EffectExecutionRepairSnapshot,
     pub(crate) last_input_repair: EffectExecutionRepairSnapshot,
     pub(crate) last_execution_region: EffectExecutionRepairSnapshot,
+    pub(crate) last_selected_output_region: EffectExecutionRepairSnapshot,
+    pub(crate) last_capture_work_region: EffectExecutionRepairSnapshot,
     pub(crate) last_merged_repair: EffectExecutionRepairSnapshot,
     pub(crate) last_applied_repair: EffectExecutionRepairSnapshot,
     pub(crate) last_repair_changed: bool,
+    pub(crate) last_output_only_merged_repair: EffectExecutionRepairSnapshot,
+    pub(crate) last_output_only_applied_repair: EffectExecutionRepairSnapshot,
+    pub(crate) last_output_only_repaint_mode: Option<RepaintMode>,
+    pub(crate) last_output_only_repaint_reason: Option<FullRepaintReason>,
+    pub(crate) last_capture_work_instances: usize,
+    pub(crate) attribution_available: bool,
+    pub(crate) attribution_union_coalesces: usize,
     pub(crate) final_repaint_mode: RepaintMode,
     pub(crate) final_repaint_reason: Option<FullRepaintReason>,
     pub(crate) graph_metadata_issue: Option<oblivion_one::effects::GraphExecutionMetadataIssue>,
@@ -909,9 +1053,18 @@ impl EffectExecutionResolutionSnapshot {
             ),
             last_input_repair: EffectExecutionRepairSnapshot::EMPTY,
             last_execution_region: EffectExecutionRepairSnapshot::EMPTY,
+            last_selected_output_region: EffectExecutionRepairSnapshot::EMPTY,
+            last_capture_work_region: EffectExecutionRepairSnapshot::EMPTY,
             last_merged_repair: EffectExecutionRepairSnapshot::EMPTY,
             last_applied_repair: EffectExecutionRepairSnapshot::EMPTY,
             last_repair_changed: false,
+            last_output_only_merged_repair: EffectExecutionRepairSnapshot::EMPTY,
+            last_output_only_applied_repair: EffectExecutionRepairSnapshot::EMPTY,
+            last_output_only_repaint_mode: None,
+            last_output_only_repaint_reason: None,
+            last_capture_work_instances: 0,
+            attribution_available: false,
+            attribution_union_coalesces: 0,
             final_repaint_mode: plan.mode,
             final_repaint_reason: plan.fallback_reason,
             graph_metadata_issue: None,
