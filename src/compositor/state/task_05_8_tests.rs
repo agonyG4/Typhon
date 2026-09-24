@@ -72,6 +72,7 @@ mod task_05_8_tests {
                 height: previous.height,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         state.update_toplevel_visual_render_assignment(root_id);
@@ -1027,6 +1028,7 @@ mod task_05_8_tests {
                 height: 526,
                 active_resize: Some(ResizeInteractionId::new(1)),
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
 
@@ -1330,6 +1332,7 @@ mod task_05_8_tests {
                 height: geometry_a.height,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         state.update_toplevel_visual_render_assignment(root_id);
@@ -1347,6 +1350,7 @@ mod task_05_8_tests {
                 height: geometry_b.height,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         assert_eq!(
@@ -1391,6 +1395,7 @@ mod task_05_8_tests {
                 height: previous.height,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         state.update_toplevel_visual_render_assignment(root_id);
@@ -1832,6 +1837,7 @@ mod task_05_8_tests {
                 height: 700,
                 active_resize: Some(interaction_id),
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         state.active_toplevel_resizes.insert(
@@ -1878,6 +1884,7 @@ mod task_05_8_tests {
                 height: 502,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         state.update_toplevel_visual_render_assignment(surface_id);
@@ -1910,6 +1917,7 @@ mod task_05_8_tests {
                 height: 502,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
 
@@ -1991,6 +1999,7 @@ mod task_05_8_tests {
                 height: 520,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
 

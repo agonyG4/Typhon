@@ -80,6 +80,13 @@ impl CompositorState {
         if matched_other || resize_decision == ResizeAckDecision::Matched {
             serial_state.latest_acked = serial_state.latest_acked.max(serial);
         }
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
+            && let Some(fence) = visual.xdg_mode_transition_fence.as_mut()
+            && fence.configure_serial == Some(serial)
+        {
+            fence.ack_commit_sequence_floor =
+                Some(SurfaceCommitSequence(self.next_surface_commit_sequence));
+        }
         match resize_decision {
             ResizeAckDecision::Matched => {
                 self.resize_flow_metrics.acks_matched =

@@ -1094,6 +1094,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         height: visual.height,
                                         active_resize: visual.active_resize.is_some(),
                                         mode_transition: visual.mode_transition,
+                                        xdg_configure_serial: visual
+                                            .xdg_mode_transition_fence
+                                            .and_then(|fence| fence.configure_serial),
+                                        ack_commit_sequence_floor: visual
+                                            .xdg_mode_transition_fence
+                                            .and_then(|fence| fence.ack_commit_sequence_floor)
+                                            .map(SurfaceCommitSequence::get),
                                     });
                                 XdgRootPlacementAuthoritySnapshot {
                                     root_surface_id,

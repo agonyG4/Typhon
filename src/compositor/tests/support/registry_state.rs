@@ -440,6 +440,8 @@ pub(in crate::compositor::tests) struct XdgRootVisualGeometrySnapshot {
     pub(in crate::compositor::tests) height: u32,
     pub(in crate::compositor::tests) active_resize: bool,
     pub(in crate::compositor::tests) mode_transition: bool,
+    pub(in crate::compositor::tests) xdg_configure_serial: Option<u32>,
+    pub(in crate::compositor::tests) ack_commit_sequence_floor: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -852,6 +852,79 @@ fn mode_transition_visual_geometry_stays_coherent_until_client_commit() {
 }
 
 #[test]
+fn zero_sized_xdg_mode_visual_survives_animation_endpoint_without_client_response() {
+    let surface_id = 53;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    let source = SurfacePlacement::absolute_root_at(160, 130);
+    let target = SurfacePlacement::absolute_root_at(120, 90);
+    state
+        .surface_window_geometries
+        .insert(surface_id, XdgWindowGeometry::new(0, 0, 900, 700));
+    state.set_surface_placement(surface_id, target);
+    state.rebuild_active_scene_view();
+    state.install_xdg_mode_transition_visual_geometry(
+        surface_id,
+        WindowGeometry::new(source, 0, 0),
+        VisualGeometryTransition::Immediate,
+        Some(77),
+    );
+
+    let animation_start =
+        crate::presentation_animation::PresentationRect::new(160.0, 130.0, 900.0, 700.0)
+            .expect("animation source");
+    let animation_target =
+        crate::presentation_animation::PresentationRect::new(120.0, 90.0, 900.0, 700.0)
+            .expect("animation target");
+    state.presentation_animator.set_enabled(true);
+    state.start_test_presentation_transition(
+        surface_id,
+        animation_start,
+        animation_target,
+        crate::presentation_animation::AnimationTime::from_nanos(0),
+    );
+    let scene_node_id = state
+        .presentation_scene_node_id_for_root(surface_id)
+        .expect("mode visual scene node");
+    let settled = state
+        .presentation_animator
+        .sample_for_scene_node(
+            scene_node_id,
+            crate::presentation_animation::AnimationTime::from_nanos(1_000_000),
+        )
+        .expect("presentation transition should reach its target");
+    assert!(settled.mathematically_settled);
+    assert_eq!(settled.rect, animation_target);
+
+    state
+        .rebase_interaction_to_presented_origin(
+            surface_id,
+            SurfacePlacement::absolute_root_at(settled.rect.x() as i32, settled.rect.y() as i32),
+            RenderGenerationCause::WindowMode,
+        )
+        .expect("presentation target should update the visual placement");
+
+    let visual = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .expect("animation target must not retire the mode visual");
+    assert!(visual.mode_transition);
+    assert!(visual.active_resize.is_none());
+    assert_eq!(visual.placement, target);
+    assert!(visual.width == 0 || visual.height == 0);
+    assert_eq!(
+        visual
+            .xdg_mode_transition_fence
+            .and_then(|fence| fence.ack_commit_sequence_floor),
+        None,
+        "presentation convergence does not create an XDG ACK-to-commit fence"
+    );
+}
+
+#[test]
 fn repeated_mode_transition_visual_geometry_never_mixes_committed_sizes() {
     let surface_id = 52;
     let mut state = xdg_state(

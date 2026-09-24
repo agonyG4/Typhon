@@ -698,6 +698,7 @@ impl CompositorState {
                         height: canonical_geometry.height,
                         active_resize: None,
                         mode_transition: false,
+                        xdg_mode_transition_fence: None,
                     },
                 );
                 true

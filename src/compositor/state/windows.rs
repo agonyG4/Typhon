@@ -1745,9 +1745,9 @@ impl CompositorState {
 
         let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
         let states = mode.xdg_states();
-        let configured = self
-            .send_configure_root_window_to(surface_id, geometry.width, geometry.height, states)
-            .is_some();
+        let configure_serial =
+            self.send_configure_root_window_to(surface_id, geometry.width, geometry.height, states);
+        let configured = configure_serial.is_some();
         if mode == ToplevelMode::Fullscreen {
             self.set_fullscreen_presentation_owner(surface_id);
         } else {
@@ -1764,7 +1764,12 @@ impl CompositorState {
                 kind,
             }
         });
-        self.install_toplevel_visual_geometry_with_transition(surface_id, geometry, transition);
+        self.install_xdg_mode_transition_visual_geometry(
+            surface_id,
+            geometry,
+            transition,
+            configure_serial,
+        );
         configured
     }
 
@@ -1856,14 +1861,13 @@ impl CompositorState {
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
 
-        let configured = self
-            .send_configure_root_window_to(
-                surface_id,
-                restore_geometry.width,
-                restore_geometry.height,
-                &[],
-            )
-            .is_some();
+        let configure_serial = self.send_configure_root_window_to(
+            surface_id,
+            restore_geometry.width,
+            restore_geometry.height,
+            &[],
+        );
+        let configured = configure_serial.is_some();
         self.set_surface_placement_with_cause(
             surface_id,
             restore_geometry.placement,
@@ -1880,10 +1884,11 @@ impl CompositorState {
                 },
             )
         };
-        self.install_toplevel_visual_geometry_with_transition(
+        self.install_xdg_mode_transition_visual_geometry(
             surface_id,
             restore_geometry,
             transition,
+            configure_serial,
         );
         if configured && let Some(window) = self.toplevel_window_state_mut(surface_id) {
             let _ = window.take_restore_geometry();

@@ -319,6 +319,7 @@ fn closing_special_ends_departing_resize_through_terminal_lifecycle() {
             height: 480,
             active_resize: Some(ResizeInteractionId::new(1)),
             mode_transition: false,
+            xdg_mode_transition_fence: None,
         },
     );
     let mut interaction = test_window_interaction(
@@ -744,6 +745,7 @@ fn tiled_resize_interruption_cancels_presentation_without_baking_visual_size() {
             height: canonical.height,
             active_resize: None,
             mode_transition: false,
+            xdg_mode_transition_fence: None,
         },
     );
     state
@@ -1491,6 +1493,7 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
             height: 240,
             active_resize: Some(interaction_id),
             mode_transition: false,
+            xdg_mode_transition_fence: None,
         },
     );
     state.active_toplevel_resizes.insert(

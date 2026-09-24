@@ -274,6 +274,7 @@ impl CompositorState {
                         height: geometry.height,
                         active_resize: None,
                         mode_transition: false,
+                        xdg_mode_transition_fence: None,
                     })
             });
         let render_target_cleared = self
@@ -300,6 +301,7 @@ impl CompositorState {
                 height,
                 active_resize: Some(interaction_id),
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         );
         self.update_toplevel_visual_render_assignment(surface_id);
@@ -352,15 +354,54 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) {
+        self.update_toplevel_visual_render_assignment_with_root_commit(root_surface_id, None);
+    }
+
+    pub(in crate::compositor) fn update_toplevel_visual_render_assignment_after_root_commit(
+        &mut self,
+        root_surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) {
+        if self
+            .toplevel_visual_geometries
+            .get(&root_surface_id)
+            .is_some_and(|visual| visual.xdg_mode_transition_fence.is_some())
+        {
+            self.update_toplevel_visual_render_assignment_with_root_commit(
+                root_surface_id,
+                Some(commit_sequence),
+            );
+        }
+    }
+
+    fn update_toplevel_visual_render_assignment_with_root_commit(
+        &mut self,
+        root_surface_id: u32,
+        root_commit_sequence: Option<SurfaceCommitSequence>,
+    ) {
         let converged_mode_geometry = self
             .toplevel_visual_geometries
             .get(&root_surface_id)
             .copied()
             .filter(|visual| visual.mode_transition && visual.active_resize.is_none())
             .and_then(|visual| {
+                let client_response_committed =
+                    visual.xdg_mode_transition_fence.is_none_or(|fence| {
+                        fence
+                            .configure_serial
+                            .zip(fence.ack_commit_sequence_floor)
+                            .is_some_and(|(serial, ack_commit_floor)| {
+                                self.xdg_surface_lifecycle(root_surface_id).is_some_and(
+                                    |lifecycle| lifecycle.last_acked_serial == Some(serial),
+                                ) && root_commit_sequence.is_some_and(|commit_sequence| {
+                                    commit_sequence.get() > ack_commit_floor.get()
+                                })
+                            })
+                    });
                 self.current_root_window_geometry(root_surface_id)
                     .filter(|canonical| {
-                        canonical.placement == visual.placement
+                        client_response_committed
+                            && canonical.placement == visual.placement
                             && (visual.width == 0 || visual.width == canonical.width)
                             && (visual.height == 0 || visual.height == canonical.height)
                     })
@@ -507,6 +548,39 @@ impl CompositorState {
         geometry: WindowGeometry,
         transition: VisualGeometryTransition,
     ) {
+        self.install_toplevel_visual_geometry_with_response_fence(
+            root_surface_id,
+            geometry,
+            transition,
+            None,
+        );
+    }
+
+    pub(in crate::compositor) fn install_xdg_mode_transition_visual_geometry(
+        &mut self,
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+        transition: VisualGeometryTransition,
+        configure_serial: Option<u32>,
+    ) {
+        self.install_toplevel_visual_geometry_with_response_fence(
+            root_surface_id,
+            geometry,
+            transition,
+            Some(XdgModeTransitionResponseFence {
+                configure_serial,
+                ack_commit_sequence_floor: None,
+            }),
+        );
+    }
+
+    fn install_toplevel_visual_geometry_with_response_fence(
+        &mut self,
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+        transition: VisualGeometryTransition,
+        xdg_mode_transition_fence: Option<XdgModeTransitionResponseFence>,
+    ) {
         let target_cleared = self
             .renderable_surfaces
             .iter_mut()
@@ -519,6 +593,7 @@ impl CompositorState {
             height: geometry.height,
             active_resize: None,
             mode_transition: true,
+            xdg_mode_transition_fence,
         };
         let changed = self
             .toplevel_visual_geometries

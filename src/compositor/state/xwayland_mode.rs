@@ -278,6 +278,7 @@ impl CompositorState {
                 height: geometry.height,
                 active_resize: None,
                 mode_transition: false,
+                xdg_mode_transition_fence: None,
             },
         ) != Some(ToplevelVisualGeometry {
             placement: geometry.placement,
@@ -285,6 +286,7 @@ impl CompositorState {
             height: geometry.height,
             active_resize: None,
             mode_transition: false,
+            xdg_mode_transition_fence: None,
         });
         self.update_pending_xwayland_visual_content(root_surface_id);
         self.update_toplevel_visual_render_assignment(root_surface_id);

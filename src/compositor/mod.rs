@@ -551,6 +551,12 @@ struct ToplevelVisualGeometry {
     height: u32,
     active_resize: Option<ResizeInteractionId>,
     mode_transition: bool,
+    xdg_mode_transition_fence: Option<XdgModeTransitionResponseFence>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XdgModeTransitionResponseFence {
+    configure_serial: Option<u32>,
+    ack_commit_sequence_floor: Option<SurfaceCommitSequence>,
 }
 impl ToplevelVisualGeometry {
     const fn window_geometry(self) -> WindowGeometry {

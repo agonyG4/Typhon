@@ -1009,6 +1009,7 @@ impl CompositorState {
             resize_capture_finalized,
             window_geometry,
         } = state;
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if self.is_cursor_surface(surface_id) {
             if let Some(mapping) = mapping {
                 self.commit_cursor_surface_mapping_only(
@@ -1065,6 +1066,12 @@ impl CompositorState {
         if let Some(resize_commit) = resize_commit {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
         }
+        if surface_id == root_surface_id {
+            self.update_toplevel_visual_render_assignment_after_root_commit(
+                root_surface_id,
+                commit_sequence,
+            );
+        }
         true
     }
 
@@ -1118,6 +1125,7 @@ impl CompositorState {
                         height: committed_size.height,
                         active_resize: None,
                         mode_transition: false,
+                        xdg_mode_transition_fence: None,
                     },
                 );
                 self.update_toplevel_visual_render_assignment(surface_id);

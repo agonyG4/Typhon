@@ -503,6 +503,12 @@ impl CompositorState {
                 size,
             );
         }
+        if surface_id == root_surface_id {
+            self.update_toplevel_visual_render_assignment_after_root_commit(
+                root_surface_id,
+                commit_sequence,
+            );
+        }
     }
     pub(in crate::compositor) fn record_surface_publication_rejection(
         &mut self,

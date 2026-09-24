@@ -32,9 +32,15 @@ fn gecko_xdg_geometry_origin_converges_after_fullscreen_restore() {
     let pending_float = sequence
         .floating_transition_authority
         .expect("floating transition authority before client commit");
+    let pending_float_visual = pending_float
+        .visual_geometry
+        .expect("the restore visual remains until its configure response is committed");
+    assert!(pending_float_visual.mode_transition);
+    assert!(!pending_float_visual.active_resize);
+    assert!(pending_float_visual.xdg_configure_serial.is_some());
     assert!(
-        pending_float.visual_geometry.is_none(),
-        "once the compositor installs the restore frame, matching canonical geometry retires the temporary authority"
+        pending_float_visual.ack_commit_sequence_floor.is_some(),
+        "the automatic configure ACK establishes a boundary, but no client commit has followed it"
     );
     assert_eq!(
         pending_float.logical_frame_origin,
@@ -306,6 +312,9 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
         .find(|surface| surface.parent_surface_id.is_none())
         .map(|surface| surface.surface_id)
         .expect("mapped XDG root");
+    state.suppress_xdg_surface_ack = true;
+    state.suppress_xdg_surface_commit = true;
+    let configure_count_before_restore = state.surface_configure_serials.len();
     commands
         .send(ServerCommand::ToggleFullscreenFocused)
         .unwrap();
@@ -313,11 +322,58 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
     queue.roundtrip(&mut state).unwrap();
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
 
-    xdg_surface.set_window_geometry(0, 0, 1920, 1080);
-    commit_test_buffered_surface(&parent, &shm, &qh, 1920, 1080).unwrap();
+    assert!(state.surface_configure_serials.len() > configure_count_before_restore);
+    let restore_configure_serial = capture_configure_serial(&commands);
+    assert!(
+        state.surface_configure_serials[configure_count_before_restore..]
+            .contains(&restore_configure_serial)
+    );
+    let pre_response_authority = capture_xdg_root_placement_authority(&commands, root_surface_id)
+        .expect("root placement authority immediately after restore configure");
+    let pre_response_visual = pre_response_authority
+        .visual_geometry
+        .expect("mode visual must remain installed before configure ACK and commit");
+    assert!(pre_response_visual.mode_transition);
+    assert!(!pre_response_visual.active_resize);
+    assert!(pre_response_visual.width == 0 || pre_response_visual.height == 0);
+    assert_eq!(
+        pre_response_visual.xdg_configure_serial,
+        Some(restore_configure_serial)
+    );
+    assert_eq!(pre_response_visual.ack_commit_sequence_floor, None);
+
+    // This root commit was received before ACK C, so it cannot satisfy the
+    // ACK-to-commit response fence.
+    commit_test_buffered_surface(&parent, &shm, &qh, 540, 535).unwrap();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
+    let pre_ack_commit_sequence = capture_surface_presentation_lineage(&commands, root_surface_id)
+        .expect("pre-ACK root commit should publish")
+        .1
+        .get();
+    xdg_surface.ack_configure(restore_configure_serial);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let ack_only_authority = capture_xdg_root_placement_authority(&commands, root_surface_id)
+        .expect("root placement authority after ACK without a following root commit");
+    let ack_only_visual = ack_only_authority
+        .visual_geometry
+        .expect("ACK alone must not retire the mode visual");
+    assert!(ack_only_visual.mode_transition);
+    assert!(!ack_only_visual.active_resize);
+    assert_eq!(
+        ack_only_visual.xdg_configure_serial,
+        Some(restore_configure_serial)
+    );
+    let ack_commit_sequence_floor = ack_only_visual
+        .ack_commit_sequence_floor
+        .expect("ACK should capture the root commit sequence boundary");
+    assert!(
+        pre_ack_commit_sequence <= ack_commit_sequence_floor,
+        "a root commit published before ACK C must stay below its commit barrier"
+    );
 
     let geometry = XdgWindowGeometry::new(10, 10, 520, 515);
     xdg_surface.set_window_geometry(geometry.x, geometry.y, geometry.width, geometry.height);
@@ -327,10 +383,23 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
+    assert!(
+        capture_xdg_root_placement_authority(&commands, root_surface_id)
+            .expect("root placement authority after child commit only")
+            .visual_geometry
+            .is_some()
+    );
     commit_test_buffered_surface(&parent, &shm, &qh, 540, 535).unwrap();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
+    let response_commit_sequence = capture_surface_presentation_lineage(&commands, root_surface_id)
+        .expect("post-ACK root commit should publish")
+        .1
+        .get();
+    assert!(response_commit_sequence > ack_commit_sequence_floor);
+    state.suppress_xdg_surface_ack = false;
+    state.suppress_xdg_surface_commit = false;
 
     let authority = capture_xdg_root_placement_authority(&commands, root_surface_id)
         .expect("root placement authority");
