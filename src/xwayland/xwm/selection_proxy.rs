@@ -309,7 +309,8 @@ pub(crate) fn handle_selection_request(
     } else if let Some(authority) = xwm.data_bridge.selection_proxy.channel(kind).authority {
         let prepared = super::selection_wire::prepared_proxy_selection(xwm, kind);
         let owner = xwm.data_bridge.selection_proxy.owner_window(kind);
-        let valid_time = event.time == CURRENT_TIME || event.time >= authority.ownership_timestamp;
+        let valid_time = event.time == CURRENT_TIME
+            || super::focus::x11_time_after_eq(event.time, authority.ownership_timestamp);
         if xwm.data_bridge.selection_proxy.active_generation
             != Some(BridgeGeneration::from(xwm.generation))
             || authority.id.kind != public_kind(kind)

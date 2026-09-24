@@ -174,6 +174,30 @@ fn request(
     }
 }
 
+fn targets_request_with_timestamps(
+    ownership_timestamp: u32,
+    request_time: u32,
+) -> (Vec<PropertyChange>, Vec<Notify>) {
+    let kind = XwaylandSelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture(kind);
+    assert!(
+        super::super::super::selection_proxy::install_test_authority(
+            &mut xwm,
+            super::super::super::data_bridge::SelectionKind::Clipboard,
+            id,
+            ownership_timestamp,
+        )
+    );
+    let targets = xwm
+        .atoms
+        .get(super::super::super::atoms::XwmAtomName::Targets);
+    let event = request(&xwm, kind, targets, TARGET_PROPERTY, request_time);
+    super::super::super::selection_proxy::handle_selection_request(&mut xwm, event, 10)
+        .expect("serve TARGETS request");
+    let (changes, notifies, _) = fixture_requests(&mut peer);
+    (changes, notifies)
+}
+
 #[test]
 fn targets_and_timestamp_use_prepared_order_and_authority_timestamp() {
     let kind = XwaylandSelectionKind::Clipboard;
@@ -222,6 +246,54 @@ fn targets_and_timestamp_use_prepared_order_and_authority_timestamp() {
     assert_eq!(values32(&changes[0].value), [12_345]);
     assert_eq!(notifies.len(), 1);
     assert_eq!(notifies[0].property, TARGET_PROPERTY + 1);
+}
+
+#[test]
+fn selection_request_timestamp_accepts_post_wrap_time() {
+    let (changes, notifies) = targets_request_with_timestamps(u32::MAX - 2, 2);
+
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].property, TARGET_PROPERTY);
+    assert_eq!(changes[0].property_type, u32::from(xproto::AtomEnum::ATOM));
+    assert_eq!(changes[0].format, 32);
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(notifies[0].property, TARGET_PROPERTY);
+}
+
+#[test]
+fn selection_request_timestamp_rejects_pre_wrap_time() {
+    let (changes, notifies) = targets_request_with_timestamps(2, u32::MAX - 2);
+
+    assert!(changes.is_empty());
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(notifies[0].property, x11rb::NONE);
+}
+
+#[test]
+fn selection_request_current_time_remains_valid() {
+    let (changes, notifies) = targets_request_with_timestamps(12_345, x11rb::CURRENT_TIME);
+
+    assert_eq!(changes.len(), 1);
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(notifies[0].property, TARGET_PROPERTY);
+}
+
+#[test]
+fn selection_request_timestamp_accepts_ownership_timestamp() {
+    let (changes, notifies) = targets_request_with_timestamps(12_345, 12_345);
+
+    assert_eq!(changes.len(), 1);
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(notifies[0].property, TARGET_PROPERTY);
+}
+
+#[test]
+fn selection_request_timestamp_rejects_half_range_ambiguous_time() {
+    let (changes, notifies) = targets_request_with_timestamps(2, 2u32.wrapping_add(0x8000_0000));
+
+    assert!(changes.is_empty());
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(notifies[0].property, x11rb::NONE);
 }
 
 #[test]
