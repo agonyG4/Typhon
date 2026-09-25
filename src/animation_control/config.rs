@@ -42,7 +42,7 @@ impl AnimationConfiguration {
             return Err(AnimationConfigurationError::TooManyOverrides);
         }
         for (&slot, &effect) in &self.overrides {
-            if !effect.is_available() {
+            if !effect.is_available_for_slot(slot) {
                 return Err(AnimationConfigurationError::PlannedEffect { slot, effect });
             }
             if !effect.compatible_with(slot) {
@@ -68,7 +68,10 @@ impl AnimationConfiguration {
             if current.overrides.get(&slot) == Some(&effect) {
                 continue;
             }
-            if !effect.is_executable(runtime_capabilities) {
+            if !effect.is_available_for_slot(slot) {
+                return Err(AnimationConfigurationError::PlannedEffect { slot, effect });
+            }
+            if !effect.is_executable_for(slot, runtime_capabilities) {
                 return Err(AnimationConfigurationError::UnavailableEffect { slot, effect });
             }
         }
@@ -291,5 +294,28 @@ mod tests {
             AnimationConfiguration::from_document(config.to_document()).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn open_scale_and_glide_overrides_validate_but_close_is_planned() {
+        let current = AnimationConfiguration::default();
+        let capabilities = AnimationRuntimeCapabilities::default();
+        for effect in [AnimationEffect::WindowScale, AnimationEffect::WindowGlide] {
+            let mut open = current.clone();
+            open.overrides.insert(AnimationSlot::WindowOpen, effect);
+            assert_eq!(open.validate(), Ok(()));
+
+            let mut close = current.clone();
+            close.overrides.insert(AnimationSlot::WindowClose, effect);
+            let expected = AnimationConfigurationError::PlannedEffect {
+                slot: AnimationSlot::WindowClose,
+                effect,
+            };
+            assert_eq!(close.validate(), Err(expected.clone()));
+            assert_eq!(
+                close.validate_runtime_mutation(&current, capabilities),
+                Err(expected)
+            );
+        }
     }
 }

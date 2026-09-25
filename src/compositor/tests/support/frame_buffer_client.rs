@@ -1071,6 +1071,10 @@ fn create_viewport_dmabuf(
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     wait_for_server_commands(commands);
+    commands.send(ServerCommand::CancelRootPresentationProperties {
+        root_surface_id: surface.id().protocol_id(),
+    })?;
+    wait_for_server_commands(commands);
     retain_live_test_connection(connection);
     Ok(state)
 }

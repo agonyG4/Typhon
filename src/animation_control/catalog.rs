@@ -117,8 +117,25 @@ impl AnimationEffect {
     pub const fn is_available(self) -> bool {
         matches!(
             self,
-            Self::None | Self::GeometryKde | Self::GeometryMacos | Self::MinimizeLamp
+            Self::None
+                | Self::GeometryKde
+                | Self::GeometryMacos
+                | Self::WindowScale
+                | Self::WindowGlide
+                | Self::MinimizeLamp
         )
+    }
+
+    /// Returns whether this effect has an executor for the requested slot.
+    ///
+    /// `compatible_with` remains a separate semantic query: an effect can be
+    /// conceptually compatible with a slot while its slot-specific executor is
+    /// still planned.
+    pub const fn is_available_for_slot(self, slot: AnimationSlot) -> bool {
+        match self {
+            Self::WindowScale | Self::WindowGlide => matches!(slot, AnimationSlot::WindowOpen),
+            _ => self.is_available(),
+        }
     }
 
     pub const fn availability(self) -> &'static str {
@@ -147,6 +164,15 @@ impl AnimationEffect {
         runtime_capabilities: super::AnimationRuntimeCapabilities,
     ) -> bool {
         self.is_available()
+            && (!matches!(self, Self::MinimizeLamp) || runtime_capabilities.lamp_renderer)
+    }
+
+    pub const fn is_executable_for(
+        self,
+        slot: AnimationSlot,
+        runtime_capabilities: super::AnimationRuntimeCapabilities,
+    ) -> bool {
+        self.is_available_for_slot(slot)
             && (!matches!(self, Self::MinimizeLamp) || runtime_capabilities.lamp_renderer)
     }
 
@@ -199,6 +225,8 @@ impl AnimationPreset {
 
     pub const fn requested_effect(self, slot: AnimationSlot) -> AnimationEffect {
         match (self, slot) {
+            (Self::Astrea | Self::Kde, AnimationSlot::WindowOpen) => AnimationEffect::WindowScale,
+            (Self::Macos, AnimationSlot::WindowOpen) => AnimationEffect::WindowGlide,
             (
                 Self::Astrea | Self::Kde,
                 AnimationSlot::WindowMove
@@ -229,7 +257,10 @@ pub const fn effect_for_request(
     enabled: bool,
     runtime_capabilities: super::AnimationRuntimeCapabilities,
 ) -> AnimationEffect {
-    if enabled && requested.is_executable(runtime_capabilities) && requested.compatible_with(slot) {
+    if enabled
+        && requested.is_executable_for(slot, runtime_capabilities)
+        && requested.compatible_with(slot)
+    {
         requested
     } else {
         AnimationEffect::None
@@ -314,5 +345,61 @@ mod tests {
     fn available_and_incompatible_effects_are_validated_separately() {
         assert!(AnimationEffect::MinimizeLamp.is_available());
         assert!(!AnimationEffect::GeometryKde.compatible_with(AnimationSlot::WindowOpen));
+    }
+
+    #[test]
+    fn window_effects_are_available_for_open_and_planned_for_close() {
+        let capabilities = super::super::AnimationRuntimeCapabilities::default();
+        for effect in [AnimationEffect::WindowScale, AnimationEffect::WindowGlide] {
+            assert!(effect.compatible_with(AnimationSlot::WindowClose));
+            assert!(effect.is_available());
+            assert!(effect.is_available_for_slot(AnimationSlot::WindowOpen));
+            assert!(!effect.is_available_for_slot(AnimationSlot::WindowClose));
+            assert!(effect.is_executable_for(AnimationSlot::WindowOpen, capabilities));
+            assert!(!effect.is_executable_for(AnimationSlot::WindowClose, capabilities));
+            assert_eq!(
+                effect_for_request(AnimationSlot::WindowOpen, effect, true, capabilities),
+                effect
+            );
+            assert_eq!(
+                effect_for_request(AnimationSlot::WindowClose, effect, true, capabilities),
+                AnimationEffect::None
+            );
+        }
+    }
+
+    #[test]
+    fn open_presets_select_scale_or_glide_and_keep_close_disabled() {
+        assert_eq!(
+            AnimationPreset::Astrea.requested_effect(AnimationSlot::WindowOpen),
+            AnimationEffect::WindowScale
+        );
+        assert_eq!(
+            AnimationPreset::Kde.requested_effect(AnimationSlot::WindowOpen),
+            AnimationEffect::WindowScale
+        );
+        assert_eq!(
+            AnimationPreset::Macos.requested_effect(AnimationSlot::WindowOpen),
+            AnimationEffect::WindowGlide
+        );
+        for preset in AnimationPreset::ALL {
+            assert_eq!(
+                preset.requested_effect(AnimationSlot::WindowClose),
+                AnimationEffect::None
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_animations_resolves_window_open_to_none() {
+        assert_eq!(
+            effect_for_request(
+                AnimationSlot::WindowOpen,
+                AnimationEffect::WindowScale,
+                false,
+                super::super::AnimationRuntimeCapabilities::default(),
+            ),
+            AnimationEffect::None
+        );
     }
 }

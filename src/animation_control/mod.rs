@@ -196,7 +196,7 @@ impl AnimationControlState {
     }
 }
 
-fn scale_curve(curve: AnimationCurve, speed: f64) -> AnimationCurve {
+pub(crate) fn scale_curve(curve: AnimationCurve, speed: f64) -> AnimationCurve {
     debug_assert!(
         speed.is_finite() && (MIN_ANIMATION_SPEED..=MAX_ANIMATION_SPEED).contains(&speed)
     );
@@ -383,5 +383,33 @@ mod tests {
         );
         animator.set_enabled(false);
         assert_eq!(animator.active_count(), 0);
+    }
+
+    #[test]
+    fn window_open_scale_and_glide_resolve_without_enabling_window_close() {
+        let capabilities = AnimationRuntimeCapabilities::default();
+        let mut state = AnimationControlState::from_store(
+            AnimationConfigurationStore::unavailable(AnimationPersistenceError::Missing),
+        );
+        for effect in [AnimationEffect::WindowScale, AnimationEffect::WindowGlide] {
+            state.configuration.overrides.clear();
+            state
+                .configuration
+                .overrides
+                .insert(AnimationSlot::WindowOpen, effect);
+            assert_eq!(
+                state.effective_effect(AnimationSlot::WindowOpen, capabilities),
+                effect
+            );
+
+            state
+                .configuration
+                .overrides
+                .insert(AnimationSlot::WindowClose, effect);
+            assert_eq!(
+                state.effective_effect(AnimationSlot::WindowClose, capabilities),
+                AnimationEffect::None
+            );
+        }
     }
 }

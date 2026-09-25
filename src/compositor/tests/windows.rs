@@ -279,6 +279,7 @@ fn fullscreen_transition_starts_from_pre_mutation_geometry_when_visual_history_i
         &socket_path,
         &commands,
         &[
+            ServerCommand::CancelFocusedPresentationTransition,
             ServerCommand::DropFocusedToplevelVisualGeometry,
             ServerCommand::SetFocusedRootVisualGeometry {
                 placement: SurfacePlacement::absolute_root_at(640, 320),
@@ -323,6 +324,7 @@ fn maximize_transition_starts_from_pre_mutation_geometry_when_visual_history_is_
         &socket_path,
         &commands,
         &[
+            ServerCommand::CancelFocusedPresentationTransition,
             ServerCommand::DropFocusedToplevelVisualGeometry,
             ServerCommand::SetFocusedRootVisualGeometry {
                 placement: SurfacePlacement::absolute_root_at(640, 320),
@@ -401,7 +403,15 @@ fn window_maximize_entry_uses_the_kde_policy_curve_through_real_state() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let state = create_buffered_toplevel_then_toggle_maximize(&socket_path, &commands).unwrap();
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::CancelFocusedPresentationTransition,
+            ServerCommand::ToggleMaximizeFocused,
+        ],
+    )
+    .unwrap();
     let curve = capture_presentation_transition_curve(&commands);
     let _server = stop_controllable_test_server(commands, server_thread);
 
@@ -425,6 +435,7 @@ fn window_maximize_exit_uses_the_kde_policy_curve_through_real_state() {
         &socket_path,
         &commands,
         &[
+            ServerCommand::CancelFocusedPresentationTransition,
             ServerCommand::ToggleMaximizeFocused,
             ServerCommand::ToggleMaximizeFocused,
         ],

@@ -312,6 +312,10 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
         .find(|surface| surface.parent_surface_id.is_none())
         .map(|surface| surface.surface_id)
         .expect("mapped XDG root");
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties { root_surface_id })
+        .unwrap();
+    wait_for_server_commands(&commands);
     state.suppress_xdg_surface_ack = true;
     state.suppress_xdg_surface_commit = true;
     let configure_count_before_restore = state.surface_configure_serials.len();

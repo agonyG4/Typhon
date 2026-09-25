@@ -57,6 +57,7 @@ mod tiled_resize;
 mod window_actions;
 mod window_decoration;
 mod window_interaction;
+mod window_open_animation;
 mod window_resize;
 mod windows;
 mod workspaces;
@@ -205,3 +206,5 @@ mod tiled_layout_tests;
 mod window_decoration_tests;
 #[cfg(test)]
 mod window_interaction_tests;
+#[cfg(test)]
+mod window_open_animation_tests;

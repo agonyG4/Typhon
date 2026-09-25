@@ -27,6 +27,8 @@ fn unmapped_xdg_toplevel_does_not_establish_keyboard_focus_until_first_buffer_co
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
 
+    assert_eq!(capture_presentation_transition_curve(&commands), None);
+
     assert_eq!(capture_focused_surface_id(&commands), None);
     assert_eq!(capture_keyboard_focus_surface_id(&commands), None);
     assert_eq!(state.keyboard_enter_count, 0);
@@ -36,9 +38,64 @@ fn unmapped_xdg_toplevel_does_not_establish_keyboard_focus_until_first_buffer_co
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
 
+    let root_surface_id = capture_focused_surface_id(&commands).expect("mapped toplevel root");
+    let first_open = capture_presentation_transition_start(&commands, root_surface_id)
+        .expect("first root map starts Window Open");
+
     assert!(capture_focused_surface_id(&commands).is_some());
     assert!(capture_keyboard_focus_surface_id(&commands).is_some());
     assert_eq!(state.keyboard_enter_count, 1);
+
+    // Mapping an already-existing subsurface must not restart the root's Open.
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &surface, &qh, ());
+    child.commit();
+    commit_test_buffered_surface(&child, &shm, &qh, 8, 8).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_presentation_transition_start(&commands, root_surface_id)
+            .expect("root Open remains active")
+            .transition_id,
+        first_open.transition_id
+    );
+
+    // Ordinary root buffer commits also leave the original Open transition intact.
+    commit_test_buffered_surface(&surface, &shm, &qh, 40, 40).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_presentation_transition_start(&commands, root_surface_id)
+            .expect("root Open remains active after a later buffer commit")
+            .transition_id,
+        first_open.transition_id
+    );
+
+    // XDG unmap cancels the property tracks; the next successful map gets a new Open.
+    surface.attach(None, 0, 0);
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_presentation_transition_curve_for_root(&commands, root_surface_id),
+        None
+    );
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 48, 48).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_ne!(
+        capture_presentation_transition_start(&commands, root_surface_id)
+            .expect("remap starts a fresh Open")
+            .transition_id,
+        first_open.transition_id
+    );
 
     stop_controllable_test_server(commands, server_thread);
 }

@@ -46,6 +46,10 @@ fn first_renderable_uses_persistent_committed_geometry_after_geometry_only_commi
     connection.flush().unwrap();
     queue.roundtrip(&mut RegistryTestState::default()).unwrap();
     wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::CancelFocusedPresentationTransition)
+        .unwrap();
+    wait_for_server_commands(&commands);
     let surfaces = capture_renderable_surface_snapshot(&commands);
     let _server = stop_controllable_test_server(commands, server_thread);
 

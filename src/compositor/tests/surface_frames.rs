@@ -1738,6 +1738,12 @@ fn wayland_bufferless_window_geometry_refreshes_pointer_hit_cache_after_derived_
     surface.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties {
+            root_surface_id: surface.id().protocol_id(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
 
     let initial = capture_renderable_surface_snapshot(&commands);
     let surface_id = initial[0].surface_id;
@@ -1829,6 +1835,12 @@ fn wayland_buffer_window_geometry_refreshes_pointer_hit_cache_after_derived_orig
     surface.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties {
+            root_surface_id: surface.id().protocol_id(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
 
     let initial = capture_renderable_surface_snapshot(&commands);
     let surface_id = initial[0].surface_id;
@@ -1914,6 +1926,12 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties {
+            root_surface_id: surface.id().protocol_id(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
     let initial = capture_renderable_surface_snapshot(&commands);
     let surface_id = initial[0].surface_id;
     let pointer_x = f64::from(initial[0].origin_x) + 20.0;

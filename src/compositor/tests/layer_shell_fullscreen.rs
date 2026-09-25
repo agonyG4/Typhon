@@ -11,6 +11,12 @@ fn dominant_fullscreen_culls_chrome_keeps_overlay_and_shares_input_policy() {
     let owner_id = capture_fullscreen_render_plan_metrics(&commands)
         .owner_root_surface_id
         .expect("fullscreen owner should be registered");
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties {
+            root_surface_id: owner_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
 
     let (connection, mut queue, qh, compositor, shm, layer_shell) =
         connect_layer_client(&socket_path);

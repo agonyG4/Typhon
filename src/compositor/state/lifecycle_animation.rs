@@ -172,9 +172,9 @@ impl CompositorState {
         ) else {
             return;
         };
-        // Lamp takes over Group Geometry only after the retained transaction
+        // Lamp takes over Group properties only after the retained transaction
         // and lifecycle executor have both accepted the same identity.
-        self.presentation_animator.cancel_geometry(scene_node_id);
+        self.presentation_animator.cancel_all(scene_node_id);
     }
 
     #[allow(clippy::too_many_arguments)]

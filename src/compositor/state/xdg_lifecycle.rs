@@ -396,6 +396,15 @@ impl CompositorState {
                 .xdg_surface_lifecycle(surface_id)
                 .is_some_and(|lifecycle| lifecycle.currently_mapped)
         {
+            if matches!(self.surface_role(surface_id), SurfaceRole::XdgToplevel)
+                && let Some(window_id) = self.window_id_for_surface(surface_id)
+                && self
+                    .window(window_id)
+                    .is_some_and(|window| window.root_surface_id == surface_id)
+                && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
+            {
+                self.presentation_animator.cancel_all(scene_node_id);
+            }
             self.mark_astrea_toplevel_structure_dirty();
             self.refresh_keyboard_shortcut_inhibition();
         }

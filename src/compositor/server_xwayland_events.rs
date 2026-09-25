@@ -16,6 +16,9 @@ impl OwnCompositorServer {
                 let published = self
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
+                if published {
+                    self.state.maybe_begin_window_open_animation(surface_id);
+                }
                 let wants_initial_focus = self.state.x11_window_wants_initial_focus(window_id);
                 let focus_outcome = if wants_initial_focus {
                     self.state

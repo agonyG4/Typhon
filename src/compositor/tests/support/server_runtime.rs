@@ -267,6 +267,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     DropFocusedToplevelVisualGeometry,
     CancelFocusedPresentationTransition,
+    CancelRootPresentationProperties {
+        root_surface_id: u32,
+    },
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
     CaptureFullscreenRenderPlanMetrics(Sender<FullscreenRenderPlanMetrics>),
     CaptureConfigureSerial(Sender<u32>),
@@ -1249,6 +1252,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             server
                                 .state
                                 .cancel_presentation_geometry_for_root(surface_id);
+                        }
+                    }
+                    ServerCommand::CancelRootPresentationProperties { root_surface_id } => {
+                        if let Some(scene_node_id) = server
+                            .state
+                            .presentation_scene_node_id_for_root(root_surface_id)
+                        {
+                            server.state.presentation_animator.cancel_all(scene_node_id);
                         }
                     }
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {

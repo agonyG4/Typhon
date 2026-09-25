@@ -384,6 +384,12 @@ impl CompositorState {
         if visual_state_changed && let Some(surface) = self.surface_resource_by_id(surface_id) {
             self.reconcile_surface_output_membership(&surface);
         }
+        if !surface_was_renderable
+            && surface_id == root_surface_id
+            && matches!(self.surface_role(surface_id), SurfaceRole::XdgToplevel)
+        {
+            self.maybe_begin_window_open_animation(surface_id);
+        }
         true
     }
     pub(in crate::compositor) fn minimized_root_surface_id_for_surface(
@@ -1802,6 +1808,11 @@ impl CompositorState {
         );
         for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
+        }
+        if surface_id == self.root_surface_id_for_surface(surface_id)
+            && matches!(self.surface_role(surface_id), SurfaceRole::XdgToplevel)
+        {
+            self.maybe_begin_window_open_animation(surface_id);
         }
         if surface_tree_debug_enabled() {
             eprintln!(

@@ -617,6 +617,14 @@ fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
         .map(|surface| surface.surface_id)
         .collect::<Vec<_>>();
     assert_eq!(roots.len(), 2);
+    for root_surface_id in &roots {
+        commands
+            .send(ServerCommand::CancelRootPresentationProperties {
+                root_surface_id: *root_surface_id,
+            })
+            .unwrap();
+    }
+    wait_for_server_commands(&commands);
     focus_root_window(&commands, roots[0]);
     let window_a = capture_focused_window_id(&commands).expect("window A should be focused");
     focus_root_window(&commands, roots[1]);

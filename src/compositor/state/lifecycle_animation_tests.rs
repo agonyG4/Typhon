@@ -1577,6 +1577,109 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
 }
 
 #[test]
+fn successful_minimize_lamp_cancels_both_window_open_property_tracks() {
+    let root_surface_id = 409;
+    let (mut state, window_id) = ssd_test_state(root_surface_id);
+    state.presentation_animator.set_enabled(true);
+    state.lifecycle_animation_renderer_available = Some(true);
+    assert!(state.maybe_begin_window_open_animation(root_surface_id));
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+
+    state.begin_lifecycle_minimize(
+        window_id,
+        root_surface_id,
+        Some(rect(384.0, 60.0, 832.0, 640.0)),
+        Some(rect(384.0, 60.0, 832.0, 640.0)),
+        Some(visual_group(rect(384.0, 60.0, 832.0, 640.0))),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+
+    assert!(!state.presentation_animator.has_track(scene_node_id));
+    let identity = active_lifecycle_identity(&state, scene_node_id);
+    assert!(
+        state
+            .window_lifecycle_animator
+            .sample(
+                identity,
+                AnimationTime::monotonic_now().expect("sample time")
+            )
+            .is_some()
+    );
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(identity)
+            .is_some()
+    );
+}
+
+#[test]
+fn failed_minimize_lamp_install_leaves_window_open_geometry_and_opacity_active() {
+    let root_surface_id = 410;
+    let (mut state, window_id) = ssd_test_state(root_surface_id);
+    state.presentation_animator.set_enabled(true);
+    state.lifecycle_animation_renderer_available = Some(true);
+    assert!(state.maybe_begin_window_open_animation(root_surface_id));
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let geometry_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("Open Geometry transaction");
+    let opacity_transaction = state
+        .presentation_animator
+        .opacity_track_transaction(scene_node_id)
+        .expect("Open Opacity transaction");
+    state.window_lifecycle_animator.fail_next_start_for_test();
+
+    state.begin_lifecycle_minimize(
+        window_id,
+        root_surface_id,
+        Some(rect(384.0, 60.0, 832.0, 640.0)),
+        Some(rect(384.0, 60.0, 832.0, 640.0)),
+        Some(visual_group(rect(384.0, 60.0, 832.0, 640.0))),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        Some(geometry_transaction)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id),
+        Some(opacity_transaction)
+    );
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle
+        ),
+        None
+    );
+}
+
+#[test]
 fn exhausted_identity_namespace_does_not_cancel_geometry_or_add_lifecycle_state() {
     for transaction_ids in [true, false] {
         let surface_id = if transaction_ids { 406 } else { 407 };

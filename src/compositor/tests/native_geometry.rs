@@ -285,6 +285,15 @@ fn native_binding_move_activates_rear_xdg_window_before_moving_it() {
 fn native_binding_on_topmost_window_does_not_duplicate_stack_or_restack() {
     let (commands, server_thread, _first_client, _second_client) = two_window_fixture();
     let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    for root in &baseline {
+        commands
+            .send(ServerCommand::CancelRootPresentationProperties {
+                root_surface_id: root.surface_id,
+            })
+            .unwrap();
+    }
+    wait_for_server_commands(&commands);
+    let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));
     let target_surface_id = baseline[1].surface_id;
     let target_window_id = capture_window_id_for_surface(&commands, target_surface_id)
         .expect("target surface should map to a window");

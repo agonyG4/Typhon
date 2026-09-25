@@ -1561,6 +1561,21 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
         .state
         .toplevel_visual_geometries
         .remove(&fixture.surface_id);
+    let scene_node_id = fixture
+        .server
+        .presentation_scene_node_id_for_root(fixture.surface_id)
+        .expect("XWayland WindowGroup scene node");
+    let open_opacity_transaction = fixture
+        .server
+        .state
+        .presentation_animator
+        .opacity_track_transaction(scene_node_id)
+        .expect("Open opacity remains active");
+    fixture
+        .server
+        .state
+        .presentation_animator
+        .cancel_geometry(scene_node_id);
 
     fixture
         .server
@@ -1573,10 +1588,6 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
             },
         });
 
-    let scene_node_id = fixture
-        .server
-        .presentation_scene_node_id_for_root(fixture.surface_id)
-        .expect("XWayland WindowGroup scene node");
     let start = fixture
         .server
         .state
@@ -1601,6 +1612,15 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
                 .presentation_animation_policy
                 .curve_for(crate::compositor::PresentationAnimationKind::FullscreenEnter)
         )
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id),
+        Some(open_opacity_transaction),
+        "fullscreen Geometry retarget must preserve independent Open opacity"
     );
 }
 

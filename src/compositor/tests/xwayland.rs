@@ -1246,6 +1246,24 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
         .expect("persistent X11 frame geometry")
         .frame
         .placement;
+    let scene_node_id = fixture
+        .server
+        .state
+        .scene_node_id_for_window_group(window_id)
+        .expect("admitted window group node");
+    let open_geometry_transaction = fixture
+        .server
+        .state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("new X11 window starts Open geometry");
+    let open_opacity_transaction = fixture
+        .server
+        .state
+        .presentation_animator
+        .opacity_track_transaction(scene_node_id)
+        .expect("new X11 window starts Open opacity");
+    assert_eq!(open_geometry_transaction, open_opacity_transaction);
     assert_eq!(
         fixture
             .server
@@ -1286,6 +1304,24 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
         "keyboard focus must transfer to the replacement surface"
     );
     assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .track_transaction(scene_node_id),
+        Some(open_geometry_transaction),
+        "backing replacement must preserve the original Open geometry transaction"
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id),
+        Some(open_opacity_transaction),
+        "backing replacement must not start a second Open opacity transaction"
+    );
     fixture
         .server
         .apply_xwayland_association_event(XwmAssociationEvent::Removed {
@@ -1645,6 +1681,68 @@ fn x11_window_ready_initial_focus_activates_normal_toplevel() {
         .server
         .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
 
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    let window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window");
+    let canonical_frame = window
+        .x11_geometry
+        .as_ref()
+        .expect("canonical X11 frame after initial state")
+        .frame;
+    let scene_node_id = fixture
+        .server
+        .state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let open_start = fixture
+        .server
+        .state
+        .presentation_animator
+        .sample_at_transition_start_for_scene_node(scene_node_id)
+        .expect("admission starts Geometry after canonical state is applied");
+    assert!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .has_opacity_track(scene_node_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .track_transaction(scene_node_id),
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    let target = fixture
+        .server
+        .state
+        .current_presentation_rect_for_root(fixture.surface_id)
+        .expect("final canonical X11 target");
+    assert_eq!(
+        open_start.rect,
+        crate::presentation_animation::PresentationRect::new(
+            target.x() + target.width() * 0.03,
+            target.y() + target.height() * 0.03,
+            target.width() * 0.94,
+            target.height() * 0.94,
+        )
+        .expect("scale start rect from post-admission canonical geometry")
+    );
+    assert!(canonical_frame.width > 0 && canonical_frame.height > 0);
+
     assert!(
         fixture
             .server
@@ -1671,6 +1769,21 @@ fn x11_window_ready_initial_focus_skips_auxiliary_popup() {
     fixture
         .server
         .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    if let Some(window_id) = fixture.server.state.window_id_for_x11_handle(handle)
+        && let Some(scene_node_id) = fixture
+            .server
+            .state
+            .scene_node_id_for_window_group(window_id)
+    {
+        assert!(
+            !fixture
+                .server
+                .state
+                .presentation_animator
+                .has_track(scene_node_id)
+        );
+    }
 
     assert!(
         fixture
