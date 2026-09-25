@@ -218,6 +218,15 @@ impl SelectionWireState {
         );
     }
 
+    pub(crate) fn unregister_internal_window(&mut self, window: Window) -> bool {
+        self.internal_windows.remove(&window)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn internal_window_count_for_test(&self) -> usize {
+        self.internal_windows.len()
+    }
+
     pub(crate) fn register_payload_requestor_window(&mut self, window: Window) {
         self.internal_windows.insert(window);
         debug_assert!(

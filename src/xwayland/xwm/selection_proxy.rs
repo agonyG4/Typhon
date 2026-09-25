@@ -29,6 +29,7 @@ pub(crate) const MAX_PENDING_OUTGOING_SELECTION_REPLIES: usize = 4;
 pub(crate) const OUTGOING_SELECTION_IDLE_TIMEOUT_NS: u64 =
     super::selection_outgoing::OUTGOING_SELECTION_IDLE_TIMEOUT_NS;
 const PROXY_OWNERSHIP_TIMEOUT_NS: u64 = 5_000_000_000;
+const PROXY_OWNER_RETIRE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ProxySelectionRequestId(NonZeroU64);
@@ -47,13 +48,30 @@ struct ProxyServingAuthority {
 
 #[derive(Debug, Default)]
 struct ProxySelectionChannel {
-    owner_window: Option<Window>,
+    owner_window: ProxyOwnerWindowState,
     authority: Option<ProxyServingAuthority>,
     desired_id: Option<XwaylandProxySelectionId>,
     suppressed_id: Option<XwaylandProxySelectionId>,
+    // Timestamp of the latest claim that may still name this owner XID.
+    // This is ownership evidence only; release destroys the XID itself.
     held_ownership_timestamp: Option<u32>,
     claim_phase: ProxyClaimPhase,
-    disabled: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ProxyOwnerWindowState {
+    #[default]
+    Uninitialized,
+    Active(Window),
+    Retiring {
+        window: Window,
+        deadline_ns: u64,
+    },
+    // `Some(window)` retains a timed-out retirement identity so a late
+    // DestroyNotify can unregister it without reviving the channel.
+    Disabled {
+        window: Option<Window>,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -197,36 +215,43 @@ pub(crate) fn initialize(xwm: &mut Xwm) -> Result<(), XwmError> {
     }
     xwm.data_bridge.selection_proxy.active_generation = Some(generation);
     for kind in [SelectionKind::Clipboard, SelectionKind::Primary] {
-        let owner = xwm
-            .connection
-            .generate_id()
-            .map_err(|error| XwmError::IdAllocation(error.to_string()))?;
-        let cookie = xwm
-            .connection
-            .create_window(
-                0,
-                owner,
-                xwm.supporting_wm_check,
-                0,
-                0,
-                1,
-                1,
-                0,
-                WindowClass::INPUT_ONLY,
-                0,
-                &xproto::CreateWindowAux::new().event_mask(xproto::EventMask::PROPERTY_CHANGE),
-            )
-            .map_err(XwmError::Connection)?;
-        std::mem::forget(cookie);
-        xwm.data_bridge
-            .selection_wire
-            .register_internal_window(owner);
+        let owner = create_proxy_owner_window(xwm, kind)?;
         xwm.data_bridge
             .selection_proxy
             .channel_mut(kind)
-            .owner_window = Some(owner);
+            .owner_window = ProxyOwnerWindowState::Active(owner);
     }
     Ok(())
+}
+
+fn create_proxy_owner_window(xwm: &mut Xwm, _kind: SelectionKind) -> Result<Window, XwmError> {
+    let owner = xwm
+        .connection
+        .generate_id()
+        .map_err(|error| XwmError::IdAllocation(error.to_string()))?;
+    let cookie = xwm
+        .connection
+        .create_window(
+            0,
+            owner,
+            xwm.supporting_wm_check,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &xproto::CreateWindowAux::new().event_mask(
+                xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY,
+            ),
+        )
+        .map_err(XwmError::Connection)?;
+    std::mem::forget(cookie);
+    xwm.data_bridge
+        .selection_wire
+        .register_internal_window(owner);
+    Ok(owner)
 }
 
 impl SelectionProxyManager {
@@ -239,13 +264,26 @@ impl SelectionProxyManager {
     }
 
     pub(crate) fn owner_window(&self, kind: SelectionKind) -> Option<Window> {
-        self.channel(kind).owner_window
+        match self.channel(kind).owner_window {
+            ProxyOwnerWindowState::Active(owner) => Some(owner),
+            ProxyOwnerWindowState::Uninitialized
+            | ProxyOwnerWindowState::Retiring { .. }
+            | ProxyOwnerWindowState::Disabled { .. } => None,
+        }
     }
 
     fn owner_kind(&self, owner: Window) -> Option<SelectionKind> {
         [SelectionKind::Clipboard, SelectionKind::Primary]
             .into_iter()
-            .find(|kind| self.channel(*kind).owner_window == Some(owner))
+            .find(|kind| match self.channel(*kind).owner_window {
+                ProxyOwnerWindowState::Active(active) => active == owner,
+                ProxyOwnerWindowState::Retiring { window, .. } => window == owner,
+                ProxyOwnerWindowState::Uninitialized
+                | ProxyOwnerWindowState::Disabled { window: None } => false,
+                ProxyOwnerWindowState::Disabled {
+                    window: Some(disabled),
+                } => disabled == owner,
+            })
     }
 
     #[cfg(test)]
@@ -255,7 +293,7 @@ impl SelectionProxyManager {
         id: XwaylandProxySelectionId,
         ownership_timestamp: u32,
     ) -> bool {
-        if self.channel(kind).owner_window.is_none() {
+        if self.owner_window(kind).is_none() {
             return false;
         }
         self.channel_mut(kind).authority = Some(ProxyServingAuthority {
@@ -320,7 +358,7 @@ pub(crate) fn desired_proxy_selection_changed(
             channel.authority = None;
         }
     }
-    if revoke_authority {
+    if revoke_authority && desired_id.is_some() {
         cancel_channel(xwm, kind, now_ns)?;
     }
 
@@ -328,51 +366,33 @@ pub(crate) fn desired_proxy_selection_changed(
     match (desired_id, phase) {
         (None, ProxyClaimPhase::AwaitingTimestamp { .. }) => {
             // The property event has no request identity. Keep this probe
-            // outstanding until its one event is consumed.
-            if let Some(timestamp) = xwm
-                .data_bridge
-                .selection_proxy
-                .channel(kind)
-                .held_ownership_timestamp
-            {
-                safe_release(xwm, kind, timestamp)?;
-                xwm.data_bridge
+            // outstanding until its one event is consumed. If an earlier
+            // claim may still own the selection, retire the physical owner.
+            if revoke_authority
+                || xwm
+                    .data_bridge
                     .selection_proxy
-                    .channel_mut(kind)
-                    .held_ownership_timestamp = None;
+                    .channel(kind)
+                    .held_ownership_timestamp
+                    .is_some()
+            {
+                retire_proxy_owner_window(xwm, kind, now_ns)?;
             }
         }
-        (
-            None,
-            ProxyClaimPhase::AwaitingOwnerConfirmation {
-                sequence,
-                timestamp,
-                ..
-            },
-        ) => {
+        (None, ProxyClaimPhase::AwaitingOwnerConfirmation { sequence, .. }) => {
             discard_owner_confirmation(xwm, kind, sequence);
-            xwm.data_bridge
-                .selection_proxy
-                .channel_mut(kind)
-                .claim_phase = ProxyClaimPhase::Idle;
-            safe_release(xwm, kind, timestamp)?;
-            xwm.data_bridge
-                .selection_proxy
-                .channel_mut(kind)
-                .held_ownership_timestamp = None;
+            retire_proxy_owner_window(xwm, kind, now_ns)?;
         }
         (None, ProxyClaimPhase::Idle) => {
-            if let Some(timestamp) = xwm
-                .data_bridge
-                .selection_proxy
-                .channel(kind)
-                .held_ownership_timestamp
-            {
-                safe_release(xwm, kind, timestamp)?;
-                xwm.data_bridge
+            if revoke_authority
+                || xwm
+                    .data_bridge
                     .selection_proxy
-                    .channel_mut(kind)
-                    .held_ownership_timestamp = None;
+                    .channel(kind)
+                    .held_ownership_timestamp
+                    .is_some()
+            {
+                retire_proxy_owner_window(xwm, kind, now_ns)?;
             }
         }
         (Some(_), ProxyClaimPhase::AwaitingOwnerConfirmation { sequence, .. }) => {
@@ -406,8 +426,7 @@ fn reconcile_channel(xwm: &mut Xwm, kind: SelectionKind, now_ns: u64) -> Result<
     let channel = manager.channel(kind);
     if manager.active_generation != Some(generation)
         || !xwm.capabilities.xfixes
-        || channel.disabled
-        || !matches!(channel.claim_phase, ProxyClaimPhase::Idle)
+        || !matches!(channel.owner_window, ProxyOwnerWindowState::Active(_))
     {
         return Ok(());
     }
@@ -424,24 +443,30 @@ fn reconcile_channel(xwm: &mut Xwm, kind: SelectionKind, now_ns: u64) -> Result<
         return Ok(());
     }
     if prepared.data_targets.is_empty() {
-        let held_timestamp = channel.held_ownership_timestamp;
-        let revoke = xwm
-            .data_bridge
-            .selection_proxy
-            .channel(kind)
-            .authority
-            .is_some();
-        if revoke {
-            xwm.data_bridge.selection_proxy.channel_mut(kind).authority = None;
-            cancel_channel(xwm, kind, now_ns)?;
-        }
-        if let Some(timestamp) = held_timestamp {
-            safe_release(xwm, kind, timestamp)?;
+        let should_retire = channel.held_ownership_timestamp.is_some()
+            || channel.authority.is_some()
+            || matches!(
+                channel.claim_phase,
+                ProxyClaimPhase::AwaitingOwnerConfirmation { .. }
+            );
+        let awaiting_timestamp = matches!(
+            channel.claim_phase,
+            ProxyClaimPhase::AwaitingTimestamp { .. }
+        );
+        let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
+        channel.authority = None;
+        channel.suppressed_id = Some(id);
+        if should_retire {
+            retire_proxy_owner_window(xwm, kind, now_ns)?;
+        } else if !awaiting_timestamp {
             xwm.data_bridge
                 .selection_proxy
                 .channel_mut(kind)
-                .held_ownership_timestamp = None;
+                .claim_phase = ProxyClaimPhase::Idle;
         }
+        return Ok(());
+    }
+    if !matches!(channel.claim_phase, ProxyClaimPhase::Idle) {
         return Ok(());
     }
     if xwm
@@ -453,7 +478,7 @@ fn reconcile_channel(xwm: &mut Xwm, kind: SelectionKind, now_ns: u64) -> Result<
     {
         return Ok(());
     }
-    let Some(owner) = channel.owner_window else {
+    let Some(owner) = manager.owner_window(kind) else {
         return Ok(());
     };
     let cookie = xwm
@@ -479,15 +504,6 @@ fn reconcile_channel(xwm: &mut Xwm, kind: SelectionKind, now_ns: u64) -> Result<
     Ok(())
 }
 
-fn safe_release(xwm: &Xwm, kind: SelectionKind, timestamp: u32) -> Result<(), XwmError> {
-    let cookie = xwm
-        .connection
-        .set_selection_owner(NONE, selection_atom(xwm, kind), timestamp)
-        .map_err(XwmError::Connection)?;
-    std::mem::forget(cookie);
-    Ok(())
-}
-
 fn discard_owner_confirmation(xwm: &mut Xwm, kind: SelectionKind, sequence: SequenceNumber) {
     xwm.data_bridge
         .selection_proxy
@@ -498,6 +514,41 @@ fn discard_owner_confirmation(xwm: &mut Xwm, kind: SelectionKind, sequence: Sequ
         RequestKind::HasResponse,
         DiscardMode::DiscardReply,
     );
+}
+
+fn retire_proxy_owner_window(
+    xwm: &mut Xwm,
+    kind: SelectionKind,
+    now_ns: u64,
+) -> Result<(), XwmError> {
+    let owner_state = xwm.data_bridge.selection_proxy.channel(kind).owner_window;
+    let ProxyOwnerWindowState::Active(owner) = owner_state else {
+        return Ok(());
+    };
+    let phase = xwm.data_bridge.selection_proxy.channel(kind).claim_phase;
+    if let ProxyClaimPhase::AwaitingOwnerConfirmation { sequence, .. } = phase {
+        discard_owner_confirmation(xwm, kind, sequence);
+    }
+    {
+        let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
+        channel.authority = None;
+        channel.held_ownership_timestamp = None;
+        channel.claim_phase = ProxyClaimPhase::Idle;
+    }
+    cancel_channel(xwm, kind, now_ns)?;
+    let cookie = xwm
+        .connection
+        .destroy_window(owner)
+        .map_err(XwmError::Connection)?;
+    std::mem::forget(cookie);
+    xwm.data_bridge
+        .selection_proxy
+        .channel_mut(kind)
+        .owner_window = ProxyOwnerWindowState::Retiring {
+        window: owner,
+        deadline_ns: now_ns.saturating_add(PROXY_OWNER_RETIRE_TIMEOUT_NS),
+    };
+    xwm.connection.flush().map_err(XwmError::Connection)
 }
 
 pub(crate) fn cancel_channel(
@@ -528,7 +579,11 @@ pub(crate) fn cancel_channel(
 
 pub(crate) fn owns_timestamp_property(xwm: &Xwm, window: Window, atom: Atom) -> bool {
     atom == xwm.atoms.get(super::atoms::XwmAtomName::SelectionProxyTime)
-        && xwm.data_bridge.selection_proxy.owner_kind(window).is_some()
+        && xwm
+            .data_bridge
+            .selection_proxy
+            .owner_kind(window)
+            .is_some_and(|kind| xwm.data_bridge.selection_proxy.owner_window(kind) == Some(window))
 }
 
 pub(crate) fn timestamp_property_notify(
@@ -539,6 +594,9 @@ pub(crate) fn timestamp_property_notify(
     let Some(kind) = xwm.data_bridge.selection_proxy.owner_kind(event.window) else {
         return Ok(());
     };
+    if xwm.data_bridge.selection_proxy.owner_window(kind) != Some(event.window) {
+        return Ok(());
+    }
     if event.atom != xwm.atoms.get(super::atoms::XwmAtomName::SelectionProxyTime)
         || event.state != Property::NEW_VALUE
     {
@@ -562,7 +620,7 @@ pub(crate) fn timestamp_property_notify(
         let prepared = super::selection_wire::prepared_proxy_selection(xwm, kind);
         channel.desired_id == Some(probe_id)
             && channel.suppressed_id != Some(probe_id)
-            && !channel.disabled
+            && matches!(channel.owner_window, ProxyOwnerWindowState::Active(owner) if owner == event.window)
             && now_ns < deadline_ns
             && xwm.capabilities.xfixes
             && xwm.data_bridge.selection_proxy.active_generation
@@ -598,8 +656,14 @@ pub(crate) fn timestamp_property_notify(
             deadline_ns: now_ns.saturating_add(PROXY_OWNERSHIP_TIMEOUT_NS),
         };
     } else if now_ns >= deadline_ns {
-        let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
-        channel.suppressed_id = Some(probe_id);
+        let should_retire = {
+            let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
+            channel.suppressed_id = Some(probe_id);
+            channel.held_ownership_timestamp.is_some()
+        };
+        if should_retire {
+            retire_proxy_owner_window(xwm, kind, now_ns)?;
+        }
     }
     reconcile_channel(xwm, kind, now_ns)?;
     xwm.connection.flush().map_err(XwmError::Connection)
@@ -615,6 +679,12 @@ pub(crate) fn selection_clear(
     };
     if event.selection != selection_atom(xwm, kind) {
         return Ok(false);
+    }
+    if matches!(
+        xwm.data_bridge.selection_proxy.channel(kind).owner_window,
+        ProxyOwnerWindowState::Disabled { .. }
+    ) {
+        return Ok(true);
     }
     let phase = xwm.data_bridge.selection_proxy.channel(kind).claim_phase;
     {
@@ -641,12 +711,26 @@ pub(crate) fn observe_xfixes_owner_transition(
     now_ns: u64,
 ) -> Result<(), XwmError> {
     let channel = xwm.data_bridge.selection_proxy.channel(kind);
-    let Some(proxy_owner) = channel.owner_window else {
-        return Ok(());
-    };
-    if owner == Some(proxy_owner) {
-        return Ok(());
+    match channel.owner_window {
+        ProxyOwnerWindowState::Active(proxy_owner) if owner == Some(proxy_owner) => return Ok(()),
+        ProxyOwnerWindowState::Active(_) => {}
+        ProxyOwnerWindowState::Retiring { window, .. } => {
+            if owner == Some(window) || owner.is_none() {
+                return Ok(());
+            }
+            let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
+            if let Some(id) = channel.desired_id {
+                channel.suppressed_id = Some(id);
+            }
+            channel.authority = None;
+            channel.held_ownership_timestamp = None;
+            return Ok(());
+        }
+        ProxyOwnerWindowState::Uninitialized | ProxyOwnerWindowState::Disabled { .. } => {
+            return Ok(());
+        }
     }
+    let channel = xwm.data_bridge.selection_proxy.channel(kind);
     let phase = channel.claim_phase;
     let had_activity = channel.authority.is_some()
         || channel.held_ownership_timestamp.is_some()
@@ -682,27 +766,70 @@ pub(crate) fn proxy_owner_destroyed(
     let Some(kind) = xwm.data_bridge.selection_proxy.owner_kind(owner) else {
         return Ok(false);
     };
-    let phase = xwm.data_bridge.selection_proxy.channel(kind).claim_phase;
-    {
-        let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
-        channel.disabled = true;
-        if let Some(id) = channel.desired_id {
-            channel.suppressed_id = Some(id);
+    let owner_state = xwm.data_bridge.selection_proxy.channel(kind).owner_window;
+    match owner_state {
+        ProxyOwnerWindowState::Retiring {
+            window: retiring, ..
+        } if retiring == owner => {
+            xwm.data_bridge
+                .selection_wire
+                .unregister_internal_window(owner);
+            xwm.data_bridge
+                .selection_proxy
+                .channel_mut(kind)
+                .owner_window = ProxyOwnerWindowState::Disabled { window: None };
+            let generation = BridgeGeneration::from(xwm.generation);
+            if xwm.data_bridge.selection_proxy.active_generation == Some(generation) {
+                let fresh_owner = create_proxy_owner_window(xwm, kind)?;
+                xwm.data_bridge
+                    .selection_proxy
+                    .channel_mut(kind)
+                    .owner_window = ProxyOwnerWindowState::Active(fresh_owner);
+                reconcile_channel(xwm, kind, now_ns)?;
+            }
+            xwm.connection.flush().map_err(XwmError::Connection)?;
+            Ok(true)
         }
-        channel.authority = None;
-        channel.held_ownership_timestamp = None;
-        channel.claim_phase = ProxyClaimPhase::Idle;
+        ProxyOwnerWindowState::Active(active) if active == owner => {
+            let phase = xwm.data_bridge.selection_proxy.channel(kind).claim_phase;
+            {
+                let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
+                channel.owner_window = ProxyOwnerWindowState::Disabled { window: None };
+                if let Some(id) = channel.desired_id {
+                    channel.suppressed_id = Some(id);
+                }
+                channel.authority = None;
+                channel.held_ownership_timestamp = None;
+                channel.claim_phase = ProxyClaimPhase::Idle;
+            }
+            if let ProxyClaimPhase::AwaitingOwnerConfirmation { sequence, .. } = phase {
+                xwm.connection.discard_reply(
+                    sequence,
+                    RequestKind::HasResponse,
+                    DiscardMode::DiscardReply,
+                );
+            }
+            cancel_channel(xwm, kind, now_ns)?;
+            xwm.data_bridge
+                .selection_wire
+                .unregister_internal_window(owner);
+            xwm.connection.flush().map_err(XwmError::Connection)?;
+            Ok(true)
+        }
+        ProxyOwnerWindowState::Disabled {
+            window: Some(disabled),
+        } if disabled == owner => {
+            xwm.data_bridge
+                .selection_wire
+                .unregister_internal_window(owner);
+            xwm.data_bridge
+                .selection_proxy
+                .channel_mut(kind)
+                .owner_window = ProxyOwnerWindowState::Disabled { window: None };
+            Ok(true)
+        }
+        _ => Ok(false),
     }
-    if let ProxyClaimPhase::AwaitingOwnerConfirmation { sequence, .. } = phase {
-        xwm.connection.discard_reply(
-            sequence,
-            RequestKind::HasResponse,
-            DiscardMode::DiscardReply,
-        );
-    }
-    cancel_channel(xwm, kind, now_ns)?;
-    xwm.connection.flush().map_err(XwmError::Connection)?;
-    Ok(true)
 }
 
 pub(crate) fn handle_selection_request(
@@ -1467,11 +1594,12 @@ pub(crate) fn poll_replies(
             Err(error) => return Err(XwmError::Connection(error)),
         };
         processed += 1;
-        let reply_owner = reply.map(|reply| reply.owner).unwrap_or(NONE);
+        let reply_received = reply.is_some();
+        let reply_owner = reply.map(|reply| reply.owner);
         let owner = xwm.data_bridge.selection_proxy.owner_window(kind);
         let prepared = super::selection_wire::prepared_proxy_selection(xwm, kind);
-        let confirmed = reply_owner != NONE
-            && Some(reply_owner) == owner
+        let confirmed = reply_received
+            && reply_owner.is_some_and(|reply_owner| Some(reply_owner) == owner)
             && owner.is_some()
             && deadline_ns > now_ns
             && xwm.data_bridge.selection_proxy.active_generation
@@ -1484,7 +1612,10 @@ pub(crate) fn poll_replies(
                 .channel(kind)
                 .held_ownership_timestamp
                 == Some(timestamp)
-            && !xwm.data_bridge.selection_proxy.channel(kind).disabled
+            && matches!(
+                xwm.data_bridge.selection_proxy.channel(kind).owner_window,
+                ProxyOwnerWindowState::Active(_)
+            )
             && xwm.capabilities.xfixes
             && prepared
                 .is_some_and(|prepared| prepared.id == id && !prepared.data_targets.is_empty());
@@ -1503,7 +1634,9 @@ pub(crate) fn poll_replies(
             if channel.held_ownership_timestamp == Some(timestamp) {
                 channel.held_ownership_timestamp = None;
             }
-            safe_release(xwm, kind, timestamp)?;
+            if !reply_received || reply_owner == owner {
+                retire_proxy_owner_window(xwm, kind, now_ns)?;
+            }
         }
         reconcile_channel(xwm, kind, now_ns)?;
     }
@@ -1832,7 +1965,20 @@ pub(crate) fn next_deadline_ns(xwm: &Xwm) -> Option<u64> {
             },
         )
         .min();
-    request_deadline.into_iter().chain(claim_deadline).min()
+    let retirement_deadline = [SelectionKind::Clipboard, SelectionKind::Primary]
+        .into_iter()
+        .filter_map(
+            |kind| match xwm.data_bridge.selection_proxy.channel(kind).owner_window {
+                ProxyOwnerWindowState::Retiring { deadline_ns, .. } => Some(deadline_ns),
+                _ => None,
+            },
+        )
+        .min();
+    request_deadline
+        .into_iter()
+        .chain(claim_deadline)
+        .chain(retirement_deadline)
+        .min()
 }
 
 #[cfg(test)]
@@ -1913,6 +2059,25 @@ pub(crate) fn held_timestamp_for_test(xwm: &Xwm, kind: SelectionKind) -> Option<
 }
 
 #[cfg(test)]
+pub(crate) fn retiring_owner_for_test(xwm: &Xwm, kind: SelectionKind) -> Option<(Window, u64)> {
+    match xwm.data_bridge.selection_proxy.channel(kind).owner_window {
+        ProxyOwnerWindowState::Retiring {
+            window,
+            deadline_ns,
+        } => Some((window, deadline_ns)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn owner_window_disabled_for_test(xwm: &Xwm, kind: SelectionKind) -> bool {
+    matches!(
+        xwm.data_bridge.selection_proxy.channel(kind).owner_window,
+        ProxyOwnerWindowState::Disabled { .. }
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn timestamp_probe_sequence_for_test(
     xwm: &Xwm,
     kind: SelectionKind,
@@ -1951,6 +2116,18 @@ pub(crate) fn expire_deadlines(
             }
         })
         .collect::<Vec<_>>();
+    let expired_retirements = [SelectionKind::Clipboard, SelectionKind::Primary]
+        .into_iter()
+        .filter_map(
+            |kind| match xwm.data_bridge.selection_proxy.channel(kind).owner_window {
+                ProxyOwnerWindowState::Retiring {
+                    window,
+                    deadline_ns,
+                } if deadline_ns <= now_ns => Some((kind, window, deadline_ns)),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
     for (kind, phase) in expired_claims {
         match phase {
             ProxyClaimPhase::AwaitingTimestamp {
@@ -1969,29 +2146,42 @@ pub(crate) fn expire_deadlines(
                     sequence,
                     deadline_ns: u64::MAX,
                 };
-                if let Some(timestamp) = held_timestamp {
-                    safe_release(xwm, kind, timestamp)?;
-                    xwm.data_bridge
-                        .selection_proxy
-                        .channel_mut(kind)
-                        .held_ownership_timestamp = None;
+                if held_timestamp.is_some() {
+                    retire_proxy_owner_window(xwm, kind, now_ns)?;
                 }
             }
             ProxyClaimPhase::AwaitingOwnerConfirmation {
                 id,
-                timestamp,
                 sequence,
+                timestamp: _,
                 ..
             } => {
-                let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
-                channel.suppressed_id = Some(id);
-                channel.authority = None;
-                channel.claim_phase = ProxyClaimPhase::Idle;
-                channel.held_ownership_timestamp = None;
-                sequences.push(sequence);
-                safe_release(xwm, kind, timestamp)?;
+                xwm.data_bridge
+                    .selection_proxy
+                    .channel_mut(kind)
+                    .suppressed_id = Some(id);
+                discard_owner_confirmation(xwm, kind, sequence);
+                retire_proxy_owner_window(xwm, kind, now_ns)?;
             }
             ProxyClaimPhase::Idle => unreachable!("only expired claim phases are collected"),
+        }
+    }
+    for (kind, owner, deadline_ns) in expired_retirements {
+        let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
+        if channel.owner_window
+            == (ProxyOwnerWindowState::Retiring {
+                window: owner,
+                deadline_ns,
+            })
+        {
+            channel.owner_window = ProxyOwnerWindowState::Disabled {
+                window: Some(owner),
+            };
+            channel.authority = None;
+            channel.held_ownership_timestamp = None;
+            if let Some(id) = channel.desired_id {
+                channel.suppressed_id = Some(id);
+            }
         }
     }
     for request_id in expired {
