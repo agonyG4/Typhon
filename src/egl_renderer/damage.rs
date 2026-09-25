@@ -613,6 +613,7 @@ fn record_effect_execution_attribution(
     #[cfg(test)]
     EFFECT_EXECUTION_ATTRIBUTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
 
+    let demand_stats = demand.plan_stats();
     let mut selected_output_region = oblivion_one::effects::EffectRegion::empty();
     let mut capture_work_region = oblivion_one::effects::EffectRegion::empty();
     let mut capture_work_instances = 0usize;
@@ -667,14 +668,26 @@ fn record_effect_execution_attribution(
     let representation_is_conservative = source_region_is_conservative
         || (!selected_output_region.is_empty() && selected_output_region.bounding_rect().is_none())
         || (!capture_work_region.is_empty() && capture_work_region.bounding_rect().is_none());
-    let output_only_merged_repair = merge_effect_damage(
-        plan.repair_damage.clone(),
-        &selected_output_region,
-        output_width,
-        output_height,
-    );
-    let mut output_only_plan = plan.clone();
-    planner.apply_execution_repair(&mut output_only_plan, output_only_merged_repair.clone());
+    let (output_only_merged_repair, output_only_plan) =
+        if effect_execution_region_is_covered_by_repair(
+            &plan.repair_damage,
+            &selected_output_region,
+            output_width,
+            output_height,
+        ) {
+            (plan.repair_damage.clone(), plan.clone())
+        } else {
+            let output_only_merged_repair = merge_effect_damage(
+                plan.repair_damage.clone(),
+                &selected_output_region,
+                output_width,
+                output_height,
+            );
+            let mut output_only_plan = plan.clone();
+            planner
+                .apply_execution_repair(&mut output_only_plan, output_only_merged_repair.clone());
+            (output_only_merged_repair, output_only_plan)
+        };
 
     snapshot.last_selected_output_region = EffectExecutionRepairSnapshot::from_effect_region(
         &selected_output_region,
@@ -696,8 +709,11 @@ fn record_effect_execution_attribution(
     snapshot.last_output_only_repaint_reason = output_only_plan.fallback_reason;
     snapshot.last_capture_work_instances = capture_work_instances;
     snapshot.attribution_union_coalesces = attribution_union_coalesces;
-    snapshot.attribution_available =
-        identity_available && !representation_is_conservative && attribution_union_coalesces == 0;
+    snapshot.attribution_available = identity_available
+        && !representation_is_conservative
+        && attribution_union_coalesces == 0
+        && demand_stats.region_representation_overflows == 0
+        && demand_stats.work_region_bbox_coalesces == 0;
 }
 
 fn union_effect_region_for_attribution(

@@ -974,6 +974,183 @@ fn effect_execution_resolution_freezes_attribution_before_full_demand_recompute(
 }
 
 #[test]
+fn effect_execution_attribution_does_not_reclassify_covered_selected_output() {
+    let selected_output = oblivion_one::effects::EffectRegion::from_rect(effect_rect(4, 9, 10, 9));
+    let capture_work = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 20, 20));
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            selected_output.clone(),
+            oblivion_one::effects::EffectRegion::empty(),
+            vec![],
+        ),
+        (2, selected_output.clone(), capture_work.clone(), vec![1]),
+    ]);
+    let planner = partial_planner((20, 20), partial_capabilities());
+    let initial_repair = OutputDamage::rects(
+        20,
+        20,
+        [rect(17, 1, 1, 9), rect(4, 1, 13, 14), rect(0, 13, 15, 7)],
+    );
+    assert_eq!(initial_repair.pixels(20, 20), Some(296));
+    assert!(effect_execution_region_is_covered_by_repair(
+        &initial_repair,
+        &selected_output,
+        20,
+        20,
+    ));
+    assert!(!effect_execution_region_is_covered_by_repair(
+        &initial_repair,
+        &capture_work,
+        20,
+        20,
+    ));
+    let mut plan = RepaintPlan {
+        render_damage: initial_repair.clone(),
+        repair_damage: initial_repair.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 20, 20,
+    );
+
+    assert!(snapshot.attribution_available);
+    assert!(snapshot.last_selected_output_region.pixels > 0);
+    assert!(snapshot.last_capture_work_region.pixels > 0);
+    assert_eq!(snapshot.last_capture_work_instances, 1);
+    assert!(
+        snapshot.last_output_only_repaint_mode == Some(RepaintMode::Partial)
+            && snapshot.last_output_only_repaint_reason.is_none(),
+        "covered output changed diagnostic repaint policy: mode={:?} reason={:?}",
+        snapshot.last_output_only_repaint_mode,
+        snapshot.last_output_only_repaint_reason,
+    );
+    assert_eq!(
+        snapshot.last_output_only_merged_repair,
+        snapshot.last_input_repair
+    );
+    assert_eq!(
+        snapshot.last_output_only_applied_repair,
+        snapshot.last_input_repair
+    );
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::DamageAreaThreshold)
+    );
+}
+
+#[test]
+fn effect_execution_attribution_is_unavailable_for_demand_region_overflow() {
+    let base_graph = graph_with_instance_regions([(
+        1,
+        oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
+        oblivion_one::effects::EffectRegion::empty(),
+        vec![],
+    )]);
+    let mut graph = base_graph.clone();
+    graph.stats.region_representation_overflows = 1;
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let make_plan = || RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+    let mut base_plan = make_plan();
+    let mut plan = make_plan();
+
+    let base_demand =
+        resolve_effect_execution_for_repaint_plan(&planner, &base_graph, &mut base_plan, 100, 80);
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert_eq!(demand.plan_stats().region_representation_overflows, 1);
+    assert_eq!(demand.plan_stats().work_region_bbox_coalesces, 0);
+    assert_eq!(plan.mode, base_plan.mode);
+    assert_eq!(plan.repair_damage, base_plan.repair_damage);
+    assert_eq!(plan.fallback_reason, base_plan.fallback_reason);
+    assert_eq!(demand.execution_region, base_demand.execution_region);
+    assert_eq!(
+        demand
+            .instances
+            .iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>(),
+        base_demand
+            .instances
+            .iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>(),
+    );
+    assert!(snapshot.last_selected_output_region.pixels > 0);
+    assert_eq!(snapshot.last_capture_work_instances, 0);
+    assert_eq!(snapshot.attribution_union_coalesces, 0);
+    assert!(!snapshot.attribution_available);
+}
+
+#[test]
+fn effect_execution_attribution_is_unavailable_for_demand_work_region_coalesce() {
+    let base_graph = graph_with_instance_regions([(
+        1,
+        oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
+        oblivion_one::effects::EffectRegion::empty(),
+        vec![],
+    )]);
+    let mut graph = base_graph.clone();
+    graph.stats.work_region_bbox_coalesces = 1;
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let make_plan = || RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+    let mut base_plan = make_plan();
+    let mut plan = make_plan();
+
+    let base_demand =
+        resolve_effect_execution_for_repaint_plan(&planner, &base_graph, &mut base_plan, 100, 80);
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert_eq!(demand.plan_stats().region_representation_overflows, 0);
+    assert_eq!(demand.plan_stats().work_region_bbox_coalesces, 1);
+    assert_eq!(plan.mode, base_plan.mode);
+    assert_eq!(plan.repair_damage, base_plan.repair_damage);
+    assert_eq!(plan.fallback_reason, base_plan.fallback_reason);
+    assert_eq!(demand.execution_region, base_demand.execution_region);
+    assert_eq!(
+        demand
+            .instances
+            .iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>(),
+        base_demand
+            .instances
+            .iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>(),
+    );
+    assert!(snapshot.last_selected_output_region.pixels > 0);
+    assert_eq!(snapshot.last_capture_work_instances, 0);
+    assert_eq!(snapshot.attribution_union_coalesces, 0);
+    assert!(!snapshot.attribution_available);
+}
+
+#[test]
 fn effect_execution_attribution_omits_capture_work_without_dependencies() {
     let graph = graph_for_effect_instances([(1, 30, 10, 0, 80, vec![])]);
     let planner = partial_planner((100, 80), partial_capabilities());
