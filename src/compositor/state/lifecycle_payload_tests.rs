@@ -107,6 +107,19 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
             .get_exact(old_identity)
             .expect("fresh immutable payload"),
     );
+    state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("live root surface")
+        .placement = SurfacePlacement::root_at(55, 66);
+    let new_child_id = root_surface_id + 1;
+    let mut new_child = ssd_test_surface(new_child_id);
+    new_child.placement = SurfacePlacement::subsurface(root_surface_id, 90, 91);
+    state.append_renderable_surface(new_child);
+    state
+        .surface_presentation_generations
+        .insert(new_child_id, 1);
     let before = state
         .window_lifecycle_animator
         .sample(
@@ -144,6 +157,11 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
     assert_eq!(reversed_payload.visual_group, group_a);
     assert_eq!(reversed_payload.root_surface_id, root_surface_id);
     assert_eq!(reversed_payload.window_id, window_id);
+    assert_eq!(reversed_payload.surface_presentation.nodes.len(), 1);
+    assert_eq!(
+        reversed_payload.surface_presentation.nodes[0].placement,
+        SurfacePlacement::root()
+    );
     assert_eq!(
         reversed_payload
             .frozen_decoration
@@ -157,6 +175,17 @@ fn reversal_preserves_existing_frozen_ssd_snapshot() {
         &reversed_payload.effect_scene,
         &original_payload.effect_scene
     ));
+    let projected = state.lifecycle_renderable_surfaces(
+        &state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample")),
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        vec![root_surface_id]
+    );
+    assert_eq!(projected[0].placement, SurfacePlacement::root());
     assert!(
         state
             .presentation_animator
@@ -202,6 +231,10 @@ fn frozen_ssd_resolution_requires_the_exact_payload_identity() {
     state
         .insert_desktop_window(DesktopWindow::new_xdg(window_b, root_b))
         .expect("second XDG window");
+    state.append_renderable_surface(ssd_test_surface(root_a));
+    state.append_renderable_surface(ssd_test_surface(root_b));
+    state.surface_presentation_generations.insert(root_a, 1);
+    state.surface_presentation_generations.insert(root_b, 1);
     state.rebuild_active_scene_view();
     let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
     let decoration_a = lifecycle_decoration(window_a, root_a, 0x71);
@@ -372,6 +405,12 @@ fn later_independent_restore_replaces_settled_ssd_snapshot() {
         .get_exact(old_identity)
         .expect("first independent payload")
         .payload_id;
+    let old_payload = std::sync::Arc::clone(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(old_identity)
+            .expect("first independent payload"),
+    );
     settle_lifecycle_transition(&mut state, window_id);
     assert!(
         state
@@ -379,6 +418,21 @@ fn later_independent_restore_replaces_settled_ssd_snapshot() {
             .get_exact(old_identity)
             .is_none()
     );
+    state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("current root surface")
+        .width = 420;
+    let new_child_id = root_surface_id + 1;
+    let mut new_child = ssd_test_surface(new_child_id);
+    new_child.width = 88;
+    new_child.height = 77;
+    new_child.placement = SurfacePlacement::subsurface(root_surface_id, -48, 72);
+    state.append_renderable_surface(new_child);
+    state
+        .surface_presentation_generations
+        .insert(new_child_id, 2);
 
     state.begin_lifecycle_restore(
         window_id,
@@ -399,6 +453,17 @@ fn later_independent_restore_replaces_settled_ssd_snapshot() {
         .expect("fresh independent payload")
         .payload_id;
     assert_ne!(old_payload_id, new_payload_id);
+    let fresh_payload = state
+        .retained_lifecycle_payloads
+        .get_exact(new_identity)
+        .expect("fresh independent payload captures current topology");
+    assert_eq!(fresh_payload.surface_presentation.nodes.len(), 2);
+    assert_eq!(fresh_payload.surface_presentation.nodes[0].width, 420);
+    assert_eq!(
+        fresh_payload.surface_presentation.nodes[1].placement,
+        SurfacePlacement::subsurface(root_surface_id, -48, 72)
+    );
+    assert_eq!(old_payload.surface_presentation.nodes.len(), 1);
     assert_eq!(
         state
             .retained_lifecycle_payloads

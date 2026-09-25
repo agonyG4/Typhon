@@ -168,6 +168,9 @@ mod tests {
                     lifecycle_visual_group(),
                     ResolvedEffectScene::default(),
                     None,
+                    super::super::state::RetainedSurfacePresentationSnapshot::test_root(
+                        _root_surface_id,
+                    ),
                 )
                 .expect("valid test lifecycle payload");
             assert!(payload_store.publish_exact(presentation_identity, payload));

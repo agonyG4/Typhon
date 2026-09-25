@@ -1036,11 +1036,74 @@ fn lamp_geometry_key(
         mix(surface.placement.local_x as u32 as u64);
         mix(surface.placement.local_y as u32 as u64);
         mix(surface.placement.root_mode as u32 as u64);
+        match surface.render_placement {
+            Some(placement) => {
+                mix(1);
+                mix(u64::from(placement.parent_surface_id.unwrap_or(0)));
+                mix(placement.local_x as u32 as u64);
+                mix(placement.local_y as u32 as u64);
+                mix(placement.root_mode as u32 as u64);
+            }
+            None => mix(0),
+        }
+        match surface.render_target_size {
+            Some(size) => {
+                mix(1);
+                mix(u64::from(size.width));
+                mix(u64::from(size.height));
+            }
+            None => mix(0),
+        }
+        match &surface.visual_clip {
+            Some(aperture) => {
+                mix(1);
+                let logical_target = aperture.logical_target();
+                mix(logical_target.x() as u32 as u64);
+                mix(logical_target.y() as u32 as u64);
+                mix(u64::from(logical_target.width()));
+                mix(u64::from(logical_target.height()));
+                if let Some(content_target) = aperture.committed_content_target() {
+                    mix(1);
+                    mix(content_target.x() as u32 as u64);
+                    mix(content_target.y() as u32 as u64);
+                    mix(u64::from(content_target.width()));
+                    mix(u64::from(content_target.height()));
+                } else {
+                    mix(0);
+                }
+                mix(aperture.committed_extent_regions().len() as u64);
+                for extent in aperture.committed_extent_regions() {
+                    mix(extent.x() as u32 as u64);
+                    mix(extent.y() as u32 as u64);
+                    mix(u64::from(extent.width()));
+                    mix(u64::from(extent.height()));
+                }
+            }
+            None => mix(0),
+        }
         let buffer_size = surface.buffer_size();
         mix(u64::from(buffer_size.width));
         mix(u64::from(buffer_size.height));
         mix(u64::from(surface.buffer_scale));
         mix(surface.buffer_transform as u32 as u64);
+        match surface.viewport_source {
+            Some(source) => {
+                mix(1);
+                mix(source.x.to_bits());
+                mix(source.y.to_bits());
+                mix(source.width.to_bits());
+                mix(source.height.to_bits());
+            }
+            None => mix(0),
+        }
+        match surface.viewport_destination {
+            Some(destination) => {
+                mix(1);
+                mix(u64::from(destination.width));
+                mix(u64::from(destination.height));
+            }
+            None => mix(0),
+        }
     }
     for decoration in decorations {
         mix(u64::from(decoration.root_surface_id()));
@@ -7155,6 +7218,7 @@ mod tests {
             .expect("test retained identity")
     }
 
+    mod lamp_geometry_tests;
     mod presentation_clip;
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
@@ -13483,64 +13547,6 @@ mod tests {
             opaque_region: SurfaceOpaqueRegion::None,
             damage,
         }
-    }
-
-    #[test]
-    #[ignore = "gate failure: live subsurface placement changes the Lamp geometry key; surface snapshot ownership is a separate design"]
-    fn active_lamp_geometry_stays_frozen_when_live_subsurface_moves() {
-        let window_id = oblivion_one::compositor::WindowId::from_raw(501).expect("window id");
-        let group = LifecycleVisualGroup::from_bounds(
-            PresentationRect::new(400.0, 100.0, 800.0, 600.0).expect("client rect"),
-            PresentationRect::new(384.0, 60.0, 832.0, 640.0).expect("visual rect"),
-            PresentationRect::new(400.0, 100.0, 800.0, 600.0).expect("source rect"),
-            PresentationRect::new(1500.0, 500.0, 64.0, 64.0).expect("anchor rect"),
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
-        let lifecycle = LifecycleSceneSample {
-            sampled_at: AnimationTime::from_nanos(0),
-            lamps: vec![LampWindowSample {
-                window_id,
-                root_surface_id: 42,
-                presentation_identity: test_lifecycle_identity(window_id, 1),
-                payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
-                    test_lifecycle_identity(window_id, 1),
-                ),
-                visual_group: group,
-                progress: 0.5,
-                opacity: 1.0,
-                direction: LifecycleDirection::Minimize,
-                mathematically_settled: false,
-            }],
-            visual_sources: Vec::new(),
-        };
-        let mut subsurface = test_shm_surface(RenderableSurfaceDamage::full());
-        subsurface.surface_id = 43;
-        subsurface.width = 64;
-        subsurface.height = 64;
-        subsurface.placement = SurfacePlacement::subsurface(42, 16, 24);
-        let before = lamp_geometry_key(
-            &lifecycle,
-            &[subsurface.clone()],
-            &[],
-            1.0,
-            OutputFramebufferOrigin::BottomLeft,
-        );
-
-        subsurface.placement = SurfacePlacement::subsurface(42, -48, 72);
-        let after = lamp_geometry_key(
-            &lifecycle,
-            &[subsurface],
-            &[],
-            1.0,
-            OutputFramebufferOrigin::BottomLeft,
-        );
-
-        assert_eq!(
-            before, after,
-            "active Lamp geometry changed when live root-owned subsurface placement changed"
-        );
     }
 
     fn test_shm_resource(synced_commit: Option<SurfaceCommitCounter>) -> EglSurfaceResource {

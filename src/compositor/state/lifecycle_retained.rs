@@ -1,3 +1,4 @@
+use crate::compositor::state::RetainedSurfacePresentationSnapshot;
 use crate::compositor::{DecorationRenderInstance, ResolvedEffectScene, WindowId};
 use crate::core::SceneNodeId;
 use crate::presentation_animation::{
@@ -25,8 +26,9 @@ impl PresentationRetainedVisualPayloadId {
     }
 }
 
-/// Frozen compositor metadata and resolved owned effects for one lifecycle
-/// chain. Client surfaces remain live in the canonical compositor scene.
+/// Frozen compositor metadata, client-surface presentation topology, and
+/// resolved owned effects for one lifecycle chain. Client surface contents
+/// remain live in the canonical compositor scene.
 #[derive(Debug, Clone)]
 pub(crate) struct RetainedLifecyclePayload {
     pub(crate) payload_id: PresentationRetainedVisualPayloadId,
@@ -35,6 +37,7 @@ pub(crate) struct RetainedLifecyclePayload {
     pub(crate) visual_group: LifecycleVisualGroup,
     pub(crate) effect_scene: Arc<ResolvedEffectScene>,
     pub(crate) frozen_decoration: Option<DecorationRenderInstance>,
+    pub(crate) surface_presentation: RetainedSurfacePresentationSnapshot,
 }
 
 impl RetainedLifecyclePayload {
@@ -45,6 +48,7 @@ impl RetainedLifecyclePayload {
         visual_group: LifecycleVisualGroup,
         effect_scene: ResolvedEffectScene,
         frozen_decoration: Option<DecorationRenderInstance>,
+        surface_presentation: RetainedSurfacePresentationSnapshot,
     ) -> Option<Arc<Self>> {
         if origin_identity.kind() != PresentationRetainedVisualKind::WindowLifecycle
             || !valid_lifecycle_visual_group(visual_group)
@@ -58,6 +62,7 @@ impl RetainedLifecyclePayload {
             visual_group,
             effect_scene: Arc::new(effect_scene),
             frozen_decoration,
+            surface_presentation,
         }))
     }
 }
@@ -202,6 +207,7 @@ mod tests {
             visual_group,
             ResolvedEffectScene::default(),
             None,
+            RetainedSurfacePresentationSnapshot::test_root(root_surface_id),
         )
         .expect("valid payload")
     }

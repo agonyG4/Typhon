@@ -179,6 +179,7 @@ pub use geometry::{
 };
 pub(crate) use scene::*;
 pub use state_data::ShmBufferLifetimeMetrics;
+pub use state_data::ViewportSourceRect;
 pub(in crate::compositor) use state_data::{
     CurrentSurfaceBuffer, DmabufReleaseObligation, SurfaceBufferReleaseOutcome,
 };

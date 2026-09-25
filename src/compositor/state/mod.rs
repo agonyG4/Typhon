@@ -21,6 +21,9 @@ mod lifecycle_animation;
 mod lifecycle_effects;
 mod lifecycle_physical;
 pub(crate) mod lifecycle_retained;
+mod lifecycle_surface_snapshot;
+#[cfg(test)]
+mod lifecycle_surface_snapshot_tests;
 mod output_membership;
 mod output_state;
 mod override_redirect_stack;
@@ -65,6 +68,7 @@ mod xwayland_windows;
 pub(crate) use lifecycle_physical::PresentedLifecyclePhysicalState;
 pub use lifecycle_retained::PresentationRetainedVisualPayloadId;
 pub(crate) use lifecycle_retained::RetainedLifecyclePayloadStore;
+pub(crate) use lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot;
 pub(crate) use override_redirect_stack::OverrideRedirectStackSnapshotResult;
 
 #[allow(unused_imports)]

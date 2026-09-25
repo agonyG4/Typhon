@@ -84,6 +84,7 @@ fn ssd_test_state(surface_id: u32) -> (CompositorState, WindowId) {
         .xdg_decoration_states
         .insert(surface_id, decoration_state);
     state.append_renderable_surface(ssd_test_surface(surface_id));
+    state.surface_presentation_generations.insert(surface_id, 1);
     state.rebuild_active_scene_view();
     (state, window_id)
 }
@@ -278,6 +279,7 @@ fn lifecycle_request_with_group(
             _visual_group,
             ResolvedEffectScene::default(),
             None,
+            super::super::RetainedSurfacePresentationSnapshot::test_root(_root_surface_id),
         )
         .expect("valid test lifecycle payload");
         assert!(payload_store.publish_exact(presentation_identity, payload));
@@ -300,6 +302,9 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     let snapshot = super::super::desktop_window_tests::x11_snapshot(generation, 3_801, root_a);
     let handle = snapshot.handle;
     let window_id = super::super::desktop_window_tests::insert_x11(&mut state, snapshot);
+    state.append_renderable_surface(ssd_test_surface(root_a));
+    state.surface_presentation_generations.insert(root_a, 1);
+    state.rebuild_active_scene_view();
     let scene_node_id = state
         .scene_node_id_for_window_group(window_id)
         .expect("WindowGroup scene node");
@@ -346,6 +351,8 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
         &state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("monotonic time")),
     );
     assert_eq!(state.attach_x11_surface(handle, root_b), Ok(Some(root_a)));
+    state.append_renderable_surface(ssd_test_surface(root_b));
+    state.surface_presentation_generations.insert(root_b, 2);
     assert_eq!(
         state.scene_node_id_for_window_group(window_id),
         Some(scene_node_id)
@@ -382,11 +389,26 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     assert_eq!(reversed_payload.payload_id, frozen_payload.payload_id);
     assert!(std::sync::Arc::ptr_eq(reversed_payload, &frozen_payload));
     assert_eq!(reversed_payload.root_surface_id, root_a);
+    assert_eq!(
+        reversed_payload.surface_presentation.root_key.surface_id,
+        root_a
+    );
+    assert_eq!(reversed_payload.surface_presentation.root_key.generation, 1);
     assert_eq!(reversed_payload.window_id, window_id);
     assert!(std::sync::Arc::ptr_eq(
         &reversed_payload.effect_scene,
         &frozen_payload.effect_scene
     ));
+    let projected = state.lifecycle_renderable_surfaces(
+        &state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample")),
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        vec![root_a]
+    );
     let active = state
         .window_lifecycle_animator
         .sample(
@@ -661,6 +683,7 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
         group,
         ResolvedEffectScene::default(),
         None,
+        super::super::RetainedSurfacePresentationSnapshot::test_root(312),
     )
     .expect("test payload");
     assert!(

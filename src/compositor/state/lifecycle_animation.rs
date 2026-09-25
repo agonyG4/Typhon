@@ -235,6 +235,11 @@ impl CompositorState {
         ) {
             return None;
         }
+        let fresh_surface_presentation = if previous_payload.is_none() {
+            Some(self.capture_lifecycle_surface_presentation(window_id, root_surface_id)?)
+        } else {
+            None
+        };
 
         let identity = self
             .presentation_animator
@@ -279,6 +284,8 @@ impl CompositorState {
                 visual_group,
                 resolved_effect_scene,
                 frozen_decoration,
+                fresh_surface_presentation
+                    .expect("fresh lifecycle captured surface presentation before reservation"),
             ) else {
                 self.rollback_lifecycle_reservation(identity, previous_identity);
                 return None;
@@ -458,26 +465,63 @@ impl CompositorState {
         &self,
         sample: &LifecycleSceneSample,
     ) -> Vec<RenderableSurface> {
-        let roots = sample
-            .lamps
-            .iter()
-            .map(|lamp| lamp.root_surface_id)
-            .collect::<HashSet<_>>();
-        if roots.is_empty() {
-            return Vec::new();
-        }
-        let mut surfaces = self
-            .renderable_surfaces
-            .iter()
-            .filter(|surface| roots.contains(&self.root_surface_id_for_surface(surface.surface_id)))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut surfaces = Vec::new();
+        let mut seen = HashSet::new();
         for lamp in &sample.lamps {
-            if let Some(window) = self.window(lamp.window_id)
-                && window.state.is_minimized()
+            let Some(payload) = self
+                .retained_lifecycle_payloads
+                .get_exact(lamp.presentation_identity)
+                .filter(|payload| {
+                    payload.payload_id == lamp.payload_id
+                        && payload.window_id == lamp.window_id
+                        && payload.root_surface_id == lamp.root_surface_id
+                })
+            else {
+                continue;
+            };
+            let candidates = self.lifecycle_surface_candidates(lamp.window_id);
+            for surface in payload
+                .surface_presentation
+                .project(&candidates, &self.surface_presentation_generations)
             {
-                surfaces.extend(window.state.minimized_surfaces().iter().cloned());
+                let Some(generation) = self
+                    .surface_presentation_generations
+                    .get(&surface.surface_id)
+                    .copied()
+                else {
+                    continue;
+                };
+                let key = crate::compositor::SurfacePresentationKey {
+                    surface_id: surface.surface_id,
+                    generation,
+                };
+                if seen.insert(key) {
+                    surfaces.push(surface);
+                }
             }
+        }
+        surfaces
+    }
+
+    fn capture_lifecycle_surface_presentation(
+        &self,
+        window_id: WindowId,
+        root_surface_id: u32,
+    ) -> Option<super::lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot> {
+        let surfaces = self.lifecycle_surface_candidates(window_id);
+        super::lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot::capture(
+            root_surface_id,
+            &surfaces,
+            &self.surface_presentation_generations,
+        )
+    }
+
+    fn lifecycle_surface_candidates(&self, window_id: WindowId) -> Vec<RenderableSurface> {
+        let mut surfaces = self.renderable_surfaces.clone();
+        if let Some(window) = self.window(window_id)
+            && window.state.is_minimized()
+        {
+            surfaces.extend(window.state.minimized_surfaces().iter().cloned());
         }
         let mut seen = HashSet::new();
         surfaces.retain(|surface| seen.insert(surface.surface_id));
