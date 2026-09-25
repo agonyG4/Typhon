@@ -1644,6 +1644,19 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
+    /// Replace the built-in-only or already-compiled trusted program table for
+    /// a material update. Material generations do not add shader modules, so
+    /// the existing compiled shader cache remains valid.
+    pub(crate) fn publish_material_effect_generation(
+        &mut self,
+        generation: &EffectRegistryGeneration,
+    ) {
+        self.effect_registry = generation.registry.clone();
+        self.effect_registry_generation = generation.generation;
+        self.failed_effect_generation = None;
+        self.invalidate_presented_damage_history();
+    }
+
     #[allow(dead_code)]
     pub(crate) fn reload_trusted_effect_registry(
         &mut self,

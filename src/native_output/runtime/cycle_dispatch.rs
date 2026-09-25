@@ -1,6 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::*;
 
+use oblivion_one::compositor::MaterialSetError;
 use oblivion_one::compositor::{
     DirectScanoutEffectDoctorDetails, DirectScanoutFeedbackCapabilities,
     DirectScanoutSceneAnalysis, SurfaceRenderBackend,
@@ -779,6 +780,47 @@ impl NativeRuntime {
                     ),
                 },
             );
+        }
+        if command == ControlCommand::MaterialConfigurationGet {
+            if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "material.config.get takes no arguments",
+                    ),
+                ));
+            }
+            return Some(material_snapshot_response(
+                request.id,
+                self.server.material_snapshot(),
+            ));
+        }
+        if command == ControlCommand::MaterialConfigurationSet {
+            let configuration = match serde_json::from_value::<
+                oblivion_one::material::MaterialConfiguration,
+            >(request.args)
+            {
+                Ok(configuration) => configuration,
+                Err(_) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "invalid material configuration",
+                        ),
+                    ));
+                }
+            };
+            match self.server.set_material_configuration(configuration) {
+                Ok(snapshot) => {
+                    let generation = self.server.trusted_effect_registry().current();
+                    self.scanout.publish_material_effect_generation(&generation);
+                    self.queued_redraw_requested = true;
+                    return Some(material_snapshot_response(request.id, snapshot));
+                }
+                Err(error) => return Some(material_set_failure_response(request.id, error)),
+            }
         }
         if command == ControlCommand::EffectsReload {
             if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
@@ -2142,10 +2184,12 @@ mod tests {
     use super::{
         DirectScanoutCounters, DirectScanoutDoctorFormat, DirectScanoutDoctorRuntime,
         DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs,
-        KeyboardLayoutSetArgs, NativePreReadInputDecision, decide_native_pre_read_input,
-        dispatch_keyboard_layout_command, format_direct_scanout_doctor_detail,
-        format_dmabuf_feedback_source_format, input_requires_full_server_progression,
-        keyboard_layout_failure, promote_native_input_before_wayland_read,
+        KeyboardLayoutSetArgs, MaterialSetError, NativePreReadInputDecision,
+        decide_native_pre_read_input, dispatch_keyboard_layout_command,
+        format_direct_scanout_doctor_detail, format_dmabuf_feedback_source_format,
+        input_requires_full_server_progression, keyboard_layout_failure,
+        material_set_failure_response, material_snapshot_response,
+        promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -2156,6 +2200,46 @@ mod tests {
     use std::sync::Mutex;
 
     static KEYBOARD_LAYOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn unsupported_material_set_maps_to_invalid_argument_with_matching_id() {
+        let response = material_set_failure_response(
+            73,
+            MaterialSetError::UnsupportedCapability(
+                oblivion_one::material::MaterialDimension::Blur,
+            ),
+        );
+
+        assert_eq!(response.id, 73);
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.unwrap().code,
+            oblivion_one::control::ControlErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn material_snapshot_response_preserves_authoritative_capabilities() {
+        let snapshot = oblivion_one::material::MaterialSnapshot::new(
+            12,
+            oblivion_one::material::MaterialConfigSource::Runtime,
+            oblivion_one::material::MaterialConfiguration::default(),
+            oblivion_one::material::MaterialCapabilities::full(),
+        )
+        .unwrap();
+        let response = material_snapshot_response(74, snapshot);
+
+        assert_eq!(response.id, 74);
+        assert!(response.ok);
+        assert_eq!(
+            response.result.unwrap()["capabilities"],
+            serde_json::json!({
+                "blurOverride": true,
+                "saturationOverride": true,
+                "noiseOverride": true,
+            })
+        );
+    }
 
     fn direct_doctor_runtime_for_test() -> DirectScanoutDoctorRuntime {
         DirectScanoutDoctorRuntime {
@@ -2999,6 +3083,46 @@ fn keyboard_layout_argument_failure(id: u64) -> ControlResponse {
         )
         .with_detail("invalid_keyboard_layout_arguments"),
     )
+}
+
+fn material_snapshot_response(
+    id: u64,
+    snapshot: oblivion_one::material::MaterialSnapshot,
+) -> ControlResponse {
+    match serde_json::to_value(snapshot) {
+        Ok(result) => ControlResponse::success(id, result),
+        Err(_) => ControlResponse::failure(
+            id,
+            ControlError::new(ControlErrorCode::Internal, "material snapshot failed"),
+        ),
+    }
+}
+
+fn material_set_failure_response(id: u64, error: MaterialSetError) -> ControlResponse {
+    match error {
+        MaterialSetError::Invalid => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::InvalidArgument,
+                "invalid material configuration",
+            ),
+        ),
+        MaterialSetError::UnsupportedCapability(_) => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::InvalidArgument,
+                "material override is unsupported by the active renderer",
+            ),
+        ),
+        error @ MaterialSetError::Persistence(_) => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::Internal,
+                "material configuration was not saved",
+            )
+            .with_detail(error.to_string()),
+        ),
+    }
 }
 
 fn keyboard_layout_failure(

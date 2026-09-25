@@ -39,6 +39,37 @@ there is no alternate runtime to hide that failure.
 The source-layout check requires every retained Rust file to be connected to
 the module tree and keeps production modules below the configured size limits.
 
+## Blur and material ownership
+
+`ext-background-effect-v1` is a semantic per-surface blur request. It carries
+no intensity, radius, pass count, noise, shader, or material implementation.
+Typhon's `BlurAssignmentResolver` decides which surfaces receive the canonical
+background blur. Typhon's `MaterialConfiguration` owns the global appearance
+of that blur and is persisted at
+`$XDG_CONFIG_HOME/AstreaOS/typhon/material.json` (or the normal HOME config
+fallback) using the same private, bounded, atomic persistence policy as
+Animations.
+
+The compositor resolves the versioned configuration through the single
+`MaterialCurveV1`, builds the canonical Backdrop → Dual Kawase Blur →
+ColorMatrix → Noise effect graph, and publishes it as an effect-registry
+generation. That generation participates in existing effect damage and
+sampling-footprint planning. Visible effect instances remain the composition
+and Direct Scanout blocker; stored material configuration alone creates no
+instance. With no visible effects the renderer keeps its legacy scene path.
+
+The public typed commands are `material.config.get` and
+`material.config.set` on the existing `astrea.control` v1 transport. Eclipse
+does not write material renderer configuration to `theme.json`.
+
+`MaterialSnapshot.capabilities` is runtime-confirmed permission to change the
+Advanced blur, saturation, and noise overrides. It does not describe
+persistence support, client-requested blur support, or raw renderer features.
+`AtomicEglGbm` and `NativeEglGbm` currently report all three overrides
+available; `Gbm` and `Dumb` report them unavailable. An unavailable override
+already persisted by the user is preserved when unchanged and may always be
+cleared. Material position remains editable on every backend.
+
 ## Native output choices
 
 These are implementation choices inside the native product, not product

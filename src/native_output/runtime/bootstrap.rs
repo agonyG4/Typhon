@@ -1018,6 +1018,9 @@ impl NativeRuntime {
             (startup_plan, scanout)
         };
         server.set_lifecycle_animation_renderer_available(scanout.lifecycle_animation_available());
+        server.set_material_runtime_capabilities(scanout.material_runtime_capabilities());
+        let initial_material_generation = server.trusted_effect_registry().current();
+        scanout.publish_material_effect_generation(&initial_material_generation);
         let atomic_discovery = match &startup_plan {
             NativeKmsStartupPlan::Atomic { discovery } => Some(discovery.as_ref()),
             NativeKmsStartupPlan::Legacy { .. } => None,
@@ -1292,6 +1295,10 @@ impl NativeRuntime {
                         target.height,
                         drm_file_generation,
                     )?;
+                    let effect_generation = server.trusted_effect_registry().current();
+                    scanout
+                        .publish_effect_registry_generation((*effect_generation).clone())
+                        .map_err(io::Error::other)?;
                     server.set_lifecycle_animation_renderer_available(
                         scanout.lifecycle_animation_available(),
                     );

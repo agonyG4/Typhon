@@ -178,10 +178,18 @@ pub struct EffectRegistryGeneration {
 
 impl EffectRegistryGeneration {
     pub fn with_builtin_background_blur() -> Self {
-        let program = super::validate_effect_program(
-            super::render_graph::builtin_background_blur_program().program,
+        Self::with_builtin_background_material(
+            crate::material::MaterialConfiguration::default()
+                .effective()
+                .expect("built-in material configuration validates"),
         )
-        .expect("builtin effect program must validate");
+    }
+
+    pub fn with_builtin_background_material(material: crate::material::EffectiveMaterial) -> Self {
+        let program = super::validate_effect_program(
+            super::render_graph::builtin_background_material_program(material).program,
+        )
+        .expect("built-in material effect program must validate");
         let mut registry = EffectRegistry::empty();
         registry
             .insert(program.clone())
@@ -258,11 +266,54 @@ impl TrustedEffectRegistry {
         }
     }
 
+    pub fn with_builtin_background_material(material: crate::material::EffectiveMaterial) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(
+                EffectRegistryGeneration::with_builtin_background_material(material),
+            )),
+        }
+    }
+
     pub fn current(&self) -> Arc<EffectRegistryGeneration> {
         self.current
             .read()
             .expect("effect registry lock is not poisoned")
             .clone()
+    }
+
+    /// Prepare a new immutable generation that changes only the canonical
+    /// background material program and preserves all qualified effects.
+    pub fn prepare_material_generation(
+        &self,
+        material: crate::material::EffectiveMaterial,
+    ) -> Result<EffectRegistryGeneration, RegistryReloadError> {
+        let previous = self.current();
+        let program = super::validate_effect_program(
+            super::render_graph::builtin_background_material_program(material).program,
+        )
+        .map_err(|error| RegistryReloadError::Config(EffectConfigError::Validation(error)))?;
+        let name = super::render_graph::BUILTIN_BACKGROUND_BLUR_NAME.to_owned();
+        let mut generation = (*previous).clone();
+        generation.generation = previous.generation.saturating_add(1);
+        generation.registry.insert(program.clone())?;
+        generation.effects.insert(
+            name.clone(),
+            RegisteredEffect {
+                name,
+                program,
+                parameters: BTreeMap::new(),
+            },
+        );
+        Ok(generation)
+    }
+
+    /// Publish a material generation after the renderer has accepted the same
+    /// candidate. All program validation is completed in preparation.
+    pub fn publish_material_generation(
+        &self,
+        generation: EffectRegistryGeneration,
+    ) -> Arc<EffectRegistryGeneration> {
+        self.publish(generation)
     }
 
     // Kept private so callers cannot bypass `build_generation`'s v1 policy
@@ -288,7 +339,8 @@ impl TrustedEffectRegistry {
         F: FnMut(&super::config::EffectShaderAsset) -> Result<(), String>,
     {
         let previous = self.current();
-        let generation = build_generation(manifest, previous.generation.saturating_add(1))?;
+        let mut generation = build_generation(manifest, previous.generation.saturating_add(1))?;
+        inherit_builtin_material(&mut generation, &previous)?;
         for shader in generation.shaders.values() {
             let definition = super::config::EffectShaderAsset {
                 module: shader.module,
@@ -343,9 +395,25 @@ where
     P: EffectGenerationPublisher,
 {
     let previous = registry.current();
-    let candidate = build_generation(manifest, previous.generation.saturating_add(1))?;
+    let mut candidate = build_generation(manifest, previous.generation.saturating_add(1))?;
+    inherit_builtin_material(&mut candidate, &previous)?;
     publisher.publish_effect_generation(candidate.clone())?;
     Ok(registry.publish(candidate))
+}
+
+fn inherit_builtin_material(
+    generation: &mut EffectRegistryGeneration,
+    previous: &EffectRegistryGeneration,
+) -> Result<(), RegistryReloadError> {
+    let name = super::render_graph::BUILTIN_BACKGROUND_BLUR_NAME;
+    let Some(previous_program) = previous.program(name) else {
+        return Ok(());
+    };
+    generation.registry.insert(previous_program.clone())?;
+    if let Some(effect) = generation.effects.get_mut(name) {
+        effect.program = previous_program.clone();
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -512,6 +580,27 @@ mod tests {
     }
 
     #[test]
+    fn material_generation_preserves_trusted_registry_and_replaces_canonical_program() {
+        let registry = TrustedEffectRegistry::with_builtin_background_blur();
+        registry.reload(manifest(), |_| Ok(())).unwrap();
+        let previous = registry.current();
+        let material = crate::material::MaterialConfiguration {
+            position: 1.0,
+            ..crate::material::MaterialConfiguration::default()
+        }
+        .effective()
+        .unwrap();
+
+        let candidate = registry.prepare_material_generation(material).unwrap();
+        assert_eq!(candidate.generation, previous.generation + 1);
+        assert_eq!(candidate.effects.len(), previous.effects.len());
+        assert!(candidate.effects.contains_key("system.background_blur"));
+        assert!(candidate.effects.contains_key("glass.panel"));
+        let blur = candidate.program("system.background_blur").unwrap();
+        assert!(blur.aggregate_footprint.sample_radius_x > 48);
+    }
+
+    #[test]
     fn failed_reload_keeps_previous_generation() {
         let registry = TrustedEffectRegistry::new();
         let first = registry.reload(manifest(), |_| Ok(())).unwrap();
@@ -622,6 +711,63 @@ mod tests {
         assert_eq!(generation.generation, 1);
         assert_eq!(publisher.published, vec![generation.generation]);
         assert_eq!(registry.current().generation, generation.generation);
+    }
+
+    #[test]
+    fn publisher_reload_preserves_loaded_non_default_material_and_prior_state_on_failure() {
+        let material = crate::material::MaterialConfiguration {
+            position: 1.0,
+            ..crate::material::MaterialConfiguration::default()
+        }
+        .effective()
+        .unwrap();
+        let registry = TrustedEffectRegistry::with_builtin_background_material(material);
+        let material_program_before = registry
+            .current()
+            .program("system.background_blur")
+            .expect("canonical material program")
+            .clone();
+        let initial_generation = registry.current().generation;
+        assert!(material_program_before.aggregate_footprint.sample_radius_x > 48);
+        let mut publisher = TestGenerationPublisher::default();
+        publisher
+            .publish_effect_generation((*registry.current()).clone())
+            .unwrap();
+
+        let reloaded = reload_with_publisher(&registry, manifest(), &mut publisher).unwrap();
+
+        assert!(reloaded.effects.contains_key("glass.panel"));
+        let canonical = reloaded
+            .program("system.background_blur")
+            .expect("canonical background material remains present");
+        assert_eq!(canonical, &material_program_before);
+        assert_eq!(
+            publisher.published,
+            vec![initial_generation, reloaded.generation]
+        );
+
+        let generation_before_failure = registry.current().generation;
+        let material_before_failure = registry
+            .current()
+            .program("system.background_blur")
+            .expect("canonical material program")
+            .clone();
+        let mut failing_publisher = TestGenerationPublisher {
+            fail_generation: Some(generation_before_failure + 1),
+            ..TestGenerationPublisher::default()
+        };
+        assert!(matches!(
+            reload_with_publisher(&registry, manifest(), &mut failing_publisher),
+            Err(RegistryReloadError::ShaderCompile { .. })
+        ));
+        let after_failure = registry.current();
+        assert_eq!(after_failure.generation, generation_before_failure);
+        assert_eq!(
+            after_failure.program("system.background_blur"),
+            Some(&material_before_failure)
+        );
+        assert!(after_failure.effects.contains_key("glass.panel"));
+        assert!(failing_publisher.published.is_empty());
     }
 
     #[test]

@@ -6,11 +6,12 @@ use crate::compositor::{
 
 use super::registry::EffectRegistry;
 use super::{
-    BUILTIN_EFFECT_PROGRAM_ID, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
-    EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets,
-    EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectRegionClipFallback,
-    EffectSource, EffectValidationError, EffectWorkingSpace, MAX_EFFECT_PROGRAM_NODES,
-    ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
+    BUILTIN_EFFECT_PROGRAM_ID, ColorMatrixSpec, DualKawaseBlurSpec, EffectAlphaMode,
+    EffectFailurePolicy, EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId,
+    EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId, EffectRect, EffectRegion,
+    EffectRegionClipFallback, EffectSource, EffectValidationError, EffectWorkingSpace,
+    MAX_EFFECT_PROGRAM_NODES, NoiseKind, NoiseSpec, ValidatedEffectProgram, plan_effect_damage,
+    validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -133,8 +134,51 @@ pub fn builtin_background_blur_program_id() -> EffectProgramId {
 }
 
 pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
+    builtin_background_material_program(
+        crate::material::MaterialConfiguration::default()
+            .effective()
+            .expect("built-in material configuration validates"),
+    )
+}
+
+/// Construct the one canonical background material graph from the compositor's
+/// semantic snapshot. Radius and stage details remain Typhon-owned renderer policy.
+pub fn builtin_background_material_program(
+    material: crate::material::EffectiveMaterial,
+) -> ValidatedEffectProgram {
     let source = EffectNodeId::new(1).expect("builtin source node id is non-zero");
     let blur = EffectNodeId::new(2).expect("builtin blur node id is non-zero");
+    let saturation = EffectNodeId::new(3).expect("builtin saturation node id is non-zero");
+    let noise = EffectNodeId::new(4).expect("builtin noise node id is non-zero");
+    // Renderer-specific radius is deliberately derived here, behind the Typhon
+    // material boundary. Public controls stay normalized and renderer-neutral.
+    let radius = 2.0 + material.blur * 8.0;
+    let saturation_factor = material.saturation;
+    let desaturation = 1.0 - saturation_factor;
+    let red_luminance = 0.2126 * desaturation;
+    let green_luminance = 0.7152 * desaturation;
+    let blue_luminance = 0.0722 * desaturation;
+    let color_matrix = ColorMatrixSpec {
+        matrix: [
+            red_luminance + saturation_factor,
+            red_luminance,
+            red_luminance,
+            0.0,
+            green_luminance,
+            green_luminance + saturation_factor,
+            green_luminance,
+            0.0,
+            blue_luminance,
+            blue_luminance,
+            blue_luminance + saturation_factor,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+        bias: [0.0; 4],
+    };
     validate_effect_program(EffectProgram {
         id: builtin_background_blur_program_id(),
         nodes: vec![
@@ -142,11 +186,19 @@ pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
             EffectNode::dual_kawase(
                 blur,
                 source,
-                DualKawaseBlurSpec::new(4.0, 2, 1.0)
+                DualKawaseBlurSpec::new(radius, 2, 1.0)
                     .expect("builtin blur specification must validate"),
             ),
+            EffectNode::color_matrix(saturation, blur, color_matrix)
+                .expect("builtin material saturation validates"),
+            EffectNode::noise(
+                noise,
+                saturation,
+                NoiseSpec::new(NoiseKind::Hash, material.noise * 0.08)
+                    .expect("builtin material noise validates"),
+            ),
         ],
-        output: blur,
+        output: noise,
         working_space: EffectWorkingSpace::LinearSrgb,
         alpha_mode: EffectAlphaMode::Opaque,
         outsets: EffectOutsets::ZERO,
@@ -3267,7 +3319,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_background_blur_has_stable_identity_and_two_pass_shape() {
+    fn builtin_background_material_has_stable_identity_and_canonical_pipeline() {
         let registry = EffectRegistry::with_builtin_background_blur();
         let id = builtin_background_blur_program_id();
         let program = &registry
@@ -3277,11 +3329,20 @@ mod tests {
 
         assert_eq!(BUILTIN_BACKGROUND_BLUR_NAME, "system.background_blur");
         assert_eq!(program.id, id);
-        assert_eq!(program.nodes.len(), 2);
+        assert_eq!(program.nodes.len(), 4);
+        assert!(matches!(
+            program.nodes[0].kind,
+            EffectNodeKind::Source(EffectSource::Backdrop)
+        ));
         assert!(matches!(
             program.nodes[1].kind,
             EffectNodeKind::DualKawaseBlur(_)
         ));
+        assert!(matches!(
+            program.nodes[2].kind,
+            EffectNodeKind::ColorMatrix(_)
+        ));
+        assert!(matches!(program.nodes[3].kind, EffectNodeKind::Noise(_)));
     }
 
     #[test]

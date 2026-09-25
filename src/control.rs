@@ -68,6 +68,8 @@ pub enum ControlCommand {
     BlurReload,
     AnimationConfigurationGet,
     AnimationConfigurationSet,
+    MaterialConfigurationGet,
+    MaterialConfigurationSet,
     WindowActivate,
     WindowMinimize,
     WindowRestore,
@@ -104,6 +106,8 @@ impl ControlCommand {
             Self::BlurReload => "blur.reload",
             Self::AnimationConfigurationGet => "animation.config.get",
             Self::AnimationConfigurationSet => "animation.config.set",
+            Self::MaterialConfigurationGet => "material.config.get",
+            Self::MaterialConfigurationSet => "material.config.set",
             Self::WindowActivate => "window.activate",
             Self::WindowMinimize => "window.minimize",
             Self::WindowRestore => "window.restore",
@@ -140,6 +144,8 @@ impl ControlCommand {
             "blur.reload" => Self::BlurReload,
             "animation.config.get" => Self::AnimationConfigurationGet,
             "animation.config.set" => Self::AnimationConfigurationSet,
+            "material.config.get" => Self::MaterialConfigurationGet,
+            "material.config.set" => Self::MaterialConfigurationSet,
             "window.activate" => Self::WindowActivate,
             "window.minimize" => Self::WindowMinimize,
             "window.restore" => Self::WindowRestore,
@@ -414,5 +420,26 @@ mod tests {
         assert_eq!(ControlCommand::BlurStatus.as_str(), "blur.status");
         assert_eq!(ControlCommand::BlurReload.as_str(), "blur.reload");
         assert_eq!(ControlCommand::parse("blur.set-enabled"), None);
+    }
+
+    #[test]
+    fn material_configuration_commands_are_canonical_and_strictly_named() {
+        assert_eq!(
+            ControlCommand::parse("material.config.get"),
+            Some(ControlCommand::MaterialConfigurationGet)
+        );
+        assert_eq!(
+            ControlCommand::parse("material.config.set"),
+            Some(ControlCommand::MaterialConfigurationSet)
+        );
+        assert_eq!(
+            ControlCommand::MaterialConfigurationGet.as_str(),
+            "material.config.get"
+        );
+        assert_eq!(
+            ControlCommand::MaterialConfigurationSet.as_str(),
+            "material.config.set"
+        );
+        assert_eq!(ControlCommand::parse("material.set"), None);
     }
 }

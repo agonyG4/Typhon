@@ -350,6 +350,20 @@ impl NativeEglGbmScanout {
             .reload_trusted_effect_registry(registry, manifest)
     }
 
+    pub(crate) fn publish_material_effect_generation(
+        &mut self,
+        generation: &oblivion_one::effects::EffectRegistryGeneration,
+    ) {
+        self.scene.publish_material_effect_generation(generation);
+    }
+
+    pub(crate) fn publish_effect_registry_generation(
+        &mut self,
+        generation: oblivion_one::effects::EffectRegistryGeneration,
+    ) -> Result<(), oblivion_one::effects::RegistryReloadError> {
+        self.scene.publish_effect_registry_generation(generation)
+    }
+
     pub(crate) fn set_cursor_image(
         &mut self,
         image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,

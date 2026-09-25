@@ -924,6 +924,13 @@ impl CompositorState {
             .record_with_sequence(commit_sequence, damage, width, height);
     }
     pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
+        let material_control = crate::material::MaterialControlState::from_environment();
+        let trusted_effect_registry =
+            crate::effects::TrustedEffectRegistry::with_builtin_background_material(
+                material_control
+                    .snapshot(crate::material::MaterialCapabilities::unavailable())
+                    .effective,
+            );
         let mut state = Self {
             native_output_id: None,
             output_id_allocator: OutputIdAllocator::default(),
@@ -936,8 +943,8 @@ impl CompositorState {
             dmabuf_scanout_target_device_override: None,
             syncobj_device,
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
-            trusted_effect_registry:
-                crate::effects::TrustedEffectRegistry::with_builtin_background_blur(),
+            material_control,
+            trusted_effect_registry,
             pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()
         };

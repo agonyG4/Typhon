@@ -260,6 +260,14 @@ pub(crate) struct AtomicExplicitRecovery {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn material_runtime_capabilities(
+        &self,
+    ) -> oblivion_one::material::MaterialCapabilities {
+        let effects_renderer_available =
+            matches!(self, Self::AtomicEglGbm(_) | Self::NativeEglGbm(_));
+        material_capabilities_for_effects_renderer(effects_renderer_available)
+    }
+
     pub(crate) fn reload_trusted_effect_registry(
         &mut self,
         registry: &oblivion_one::effects::TrustedEffectRegistry,
@@ -275,6 +283,31 @@ impl NativeScanoutBackend {
             Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "trusted effect reload requires an EGL scene renderer",
             )),
+        }
+    }
+
+    pub(crate) fn publish_material_effect_generation(
+        &mut self,
+        generation: &oblivion_one::effects::EffectRegistryGeneration,
+    ) {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.publish_material_effect_generation(generation),
+            Self::NativeEglGbm(scanout) => scanout.publish_material_effect_generation(generation),
+            // These scanout backends do not execute compositor effects. The
+            // authoritative generation remains in compositor state and will
+            // be applied if an EGL scene renderer becomes active.
+            Self::Gbm(_) | Self::Dumb(_) => {}
+        }
+    }
+
+    pub(crate) fn publish_effect_registry_generation(
+        &mut self,
+        generation: oblivion_one::effects::EffectRegistryGeneration,
+    ) -> Result<(), oblivion_one::effects::RegistryReloadError> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.publish_effect_registry_generation(generation),
+            Self::NativeEglGbm(scanout) => scanout.publish_effect_registry_generation(generation),
+            Self::Gbm(_) | Self::Dumb(_) => Ok(()),
         }
     }
 
@@ -850,5 +883,33 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(scanout) => scanout.dmabuf_kms_preferred_state(),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Default::default(),
         }
+    }
+}
+
+fn material_capabilities_for_effects_renderer(
+    available: bool,
+) -> oblivion_one::material::MaterialCapabilities {
+    if available {
+        oblivion_one::material::MaterialCapabilities::full()
+    } else {
+        oblivion_one::material::MaterialCapabilities::unavailable()
+    }
+}
+
+#[cfg(test)]
+mod material_capability_tests {
+    use super::material_capabilities_for_effects_renderer;
+    use oblivion_one::material::MaterialCapabilities;
+
+    #[test]
+    fn effects_renderer_mapping_enables_all_overrides_and_legacy_mapping_disables_them() {
+        assert_eq!(
+            material_capabilities_for_effects_renderer(true),
+            MaterialCapabilities::full()
+        );
+        assert_eq!(
+            material_capabilities_for_effects_renderer(false),
+            MaterialCapabilities::unavailable()
+        );
     }
 }

@@ -123,6 +123,39 @@ truncated before adding another object and its full `total` is retained. A
 recognized command whose response serialization still fails is reported as a
 bounded internal error, not `invalid_command`.
 
+## Material configuration
+
+`material.config.get` returns the authoritative `MaterialSnapshot`.
+`material.config.set` accepts one complete version-one `MaterialConfiguration`
+and returns the resulting authoritative snapshot. Its request and response
+share the normal 64 KiB and 1 MiB control bounds. The candidate is fully
+validated and resolved by Typhon's `MaterialCurveV1` before persistence. A
+failed save leaves the active configuration and generation unchanged.
+
+The snapshot's three capability booleans are runtime-confirmed permission for
+Advanced override mutations. They do not report persistence support,
+client-requested blur support, or raw renderer features. `AtomicEglGbm` and
+`NativeEglGbm` currently enable Blur, Saturation, and Noise overrides; `Gbm`
+and `Dumb` report them unavailable. An unsupported persisted override may be
+kept at its current value or cleared, while introducing or changing that
+override is rejected with `invalid_argument`. Position-only updates remain
+allowed, including when they preserve an unsupported stored override.
+
+Typhon persists the material document at
+`$XDG_CONFIG_HOME/AstreaOS/typhon/material.json`, or
+`$HOME/.config/AstreaOS/typhon/material.json` when XDG_CONFIG_HOME is unset.
+AstreaOS and Typhon directories are owner-private `0700` directories, and the
+regular material file is owner-private `0600`. The shared secure store rejects
+symlinks, wrong ownership or modes, unsupported versions, malformed JSON, and
+documents over 16 KiB. Writes use a private temporary file, flush and fsync it,
+rename it atomically, and fsync the parent directory. No material file access
+occurs in frame rendering.
+
+A successful update publishes one material-aware canonical background effect
+generation, advances compositor render state, and requests an ordinary redraw.
+The material configuration itself never creates a visible effect instance;
+only an existing surface assignment can require composition.
+
 Cursor changes, wallpaper commands, window actions, and shell protocol remain
 unavailable.
 
