@@ -982,8 +982,10 @@ impl CompositorState {
             WindowBackend::Xdg(_) => {
                 let _ = self.send_configure_root_window_to(
                     root_surface_id,
-                    geometry.width,
-                    geometry.height,
+                    ToplevelConfigureSize::Suggested {
+                        width: geometry.width,
+                        height: geometry.height,
+                    },
                     ToplevelMode::Normal.xdg_states(),
                 );
                 self.set_surface_placement_with_cause(

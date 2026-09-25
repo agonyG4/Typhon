@@ -374,6 +374,53 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn install_xdg_mode_transition_response_fence(
+        &mut self,
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+        configure_serial: u32,
+    ) {
+        let visual = self
+            .toplevel_visual_geometries
+            .entry(root_surface_id)
+            .or_insert(ToplevelVisualGeometry {
+                placement: geometry.placement,
+                width: geometry.width,
+                height: geometry.height,
+                active_resize: None,
+                mode_transition: true,
+                xdg_mode_transition_fence: None,
+            });
+        visual.mode_transition = true;
+        visual.active_resize = None;
+        visual.xdg_mode_transition_fence = Some(XdgModeTransitionResponseFence {
+            configure_serial,
+            ack_commit_sequence_floor: None,
+        });
+    }
+
+    pub(in crate::compositor) fn materialize_pending_normal_restore_geometry(
+        &mut self,
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+    ) {
+        self.store_surface_placement(root_surface_id, geometry.placement);
+        if let Some(surface) = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == root_surface_id)
+        {
+            surface.placement = geometry.placement;
+        }
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&root_surface_id) {
+            visual.placement = geometry.placement;
+            visual.width = geometry.width;
+            visual.height = geometry.height;
+            visual.active_resize = None;
+            visual.mode_transition = true;
+        }
+    }
+
     fn update_toplevel_visual_render_assignment_with_root_commit(
         &mut self,
         root_surface_id: u32,
@@ -384,6 +431,7 @@ impl CompositorState {
             .get(&root_surface_id)
             .copied()
             .filter(|visual| visual.mode_transition && visual.active_resize.is_none())
+            .filter(|_| !self.pending_normal_restores.contains_key(&root_surface_id))
             .and_then(|visual| {
                 let client_response_committed =
                     visual.xdg_mode_transition_fence.is_none_or(|fence| {
@@ -772,8 +820,11 @@ impl CompositorState {
         } else {
             &[][..]
         };
-        let Some(serial) = self.send_configure_root_window_to(surface_id, width, height, states)
-        else {
+        let Some(serial) = self.send_configure_root_window_to(
+            surface_id,
+            ToplevelConfigureSize::Suggested { width, height },
+            states,
+        ) else {
             return false;
         };
         let resize = PendingResizeConfigure {

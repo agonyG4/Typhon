@@ -247,7 +247,7 @@ fn gecko_xdg_geometry_origin_converges_after_fullscreen_restore() {
 }
 
 #[test]
-fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
+fn gecko_unknown_size_restore_keeps_tree_and_active_scene_coherent() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -325,6 +325,7 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (0, 0));
 
     assert!(state.surface_configure_serials.len() > configure_count_before_restore);
     let restore_configure_serial = capture_configure_serial(&commands);
@@ -339,7 +340,10 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
         .expect("mode visual must remain installed before configure ACK and commit");
     assert!(pre_response_visual.mode_transition);
     assert!(!pre_response_visual.active_resize);
-    assert!(pre_response_visual.width == 0 || pre_response_visual.height == 0);
+    assert_eq!(
+        (pre_response_visual.width, pre_response_visual.height),
+        (1920, 1080)
+    );
     assert_eq!(
         pre_response_visual.xdg_configure_serial,
         Some(restore_configure_serial)
@@ -393,7 +397,7 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
             .visual_geometry
             .is_some()
     );
-    commit_test_buffered_surface(&parent, &shm, &qh, 540, 535).unwrap();
+    parent.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
@@ -461,13 +465,12 @@ fn gecko_zero_sized_restore_visual_converges_tree_and_active_scene() {
         current_visual_geometry.map(|geometry| (geometry.width, geometry.height)),
         Some((520, 515))
     );
-    assert_eq!(
+    assert!(
         resize_interaction.is_some_and(|interaction| matches!(
             interaction.kind,
             crate::compositor::WindowInteractionKind::Resize(_)
         )),
-        true,
-        "normal resize path should begin after zero-sized mode visual retirement"
+        "normal resize path should begin after the response-fenced mode visual retires"
     );
     assert_eq!(resize_start_size, Some((520, 515)));
     assert_eq!(

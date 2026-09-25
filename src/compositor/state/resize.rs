@@ -56,6 +56,22 @@ impl CompositorState {
             fence.ack_commit_sequence_floor =
                 Some(SurfaceCommitSequence(self.next_surface_commit_sequence));
         }
+        if transition_configure_consumed
+            && let Some(pending) = self.pending_normal_restores.get(&surface_id)
+            && acknowledgement.consumed_configure(pending.configure_serial)
+            && compositor_debug_surface_logging_enabled()
+        {
+            let boundary = self
+                .toplevel_visual_geometries
+                .get(&surface_id)
+                .and_then(|visual| visual.xdg_mode_transition_fence)
+                .and_then(|fence| fence.ack_commit_sequence_floor)
+                .map_or_else(|| "none".to_string(), |floor| floor.get().to_string());
+            eprintln!(
+                "oblivion-one compositor: event=normal_restore_ack_boundary root_surface_id={surface_id} configure_serial={} acked_serial={serial} ack_commit_sequence_floor={boundary}",
+                pending.configure_serial,
+            );
+        }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -471,7 +487,11 @@ impl CompositorState {
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id));
         let configured = self
-            .send_configure_root_window_to(surface_id, width, height, &[])
+            .send_configure_root_window_to(
+                surface_id,
+                ToplevelConfigureSize::Suggested { width, height },
+                &[],
+            )
             .is_some();
         if configured {
             let geometry = WindowGeometry::new(self.surface_placement(surface_id), width, height);
@@ -489,12 +509,10 @@ impl CompositorState {
     pub(in crate::compositor) fn send_configure_root_window_to(
         &mut self,
         surface_id: u32,
-        width: u32,
-        height: u32,
+        size: ToplevelConfigureSize,
         states: &[xdg_toplevel::State],
     ) -> Option<u32> {
-        let width = self.clamp_toplevel_width(surface_id, width);
-        let height = self.clamp_toplevel_height(surface_id, height);
+        let (width, height) = self.configured_toplevel_size(surface_id, size);
         let toplevel = self.toplevel_surfaces.get(&surface_id).cloned()?;
         let serial =
             self.send_toplevel_configure(surface_id, &toplevel, width, height, states, false)?;
@@ -506,5 +524,62 @@ impl CompositorState {
             );
         }
         Some(serial)
+    }
+
+    fn configured_toplevel_size(&self, surface_id: u32, size: ToplevelConfigureSize) -> (u32, u32) {
+        match size {
+            ToplevelConfigureSize::Suggested { width, height } => (
+                self.clamp_toplevel_width(surface_id, width),
+                self.clamp_toplevel_height(surface_id, height),
+            ),
+            ToplevelConfigureSize::Unspecified => (0, 0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod configure_size_tests {
+    use super::*;
+
+    #[test]
+    fn suggested_configure_size_keeps_existing_constraints() {
+        let state = CompositorState::default();
+
+        assert_eq!(
+            state.configured_toplevel_size(
+                1,
+                ToplevelConfigureSize::Suggested {
+                    width: 520,
+                    height: 515,
+                },
+            ),
+            (520, 515)
+        );
+    }
+
+    #[test]
+    fn suggested_zero_size_still_uses_existing_minimum_constraints() {
+        let state = CompositorState::default();
+
+        assert_eq!(
+            state.configured_toplevel_size(
+                1,
+                ToplevelConfigureSize::Suggested {
+                    width: 0,
+                    height: 0,
+                },
+            ),
+            (160, 120)
+        );
+    }
+
+    #[test]
+    fn unspecified_configure_size_bypasses_minimum_fallbacks() {
+        let state = CompositorState::default();
+
+        assert_eq!(
+            state.configured_toplevel_size(1, ToplevelConfigureSize::Unspecified),
+            (0, 0)
+        );
     }
 }

@@ -7,7 +7,7 @@ use super::{RenderableSurface, SurfacePlacement};
 #[derive(Debug, Clone)]
 pub(crate) struct WindowState {
     mode: ToplevelMode,
-    restore_geometry: Option<WindowGeometry>,
+    normal_restore_target: Option<NormalRestoreTarget>,
     minimized_surfaces: Vec<RenderableSurface>,
     minimized: bool,
 }
@@ -25,8 +25,16 @@ impl WindowState {
         self.minimized
     }
 
+    #[cfg(test)]
     pub(super) fn restore_geometry(&self) -> Option<WindowGeometry> {
-        self.restore_geometry
+        self.normal_restore_target.and_then(|target| match target {
+            NormalRestoreTarget::Known(geometry) => Some(geometry),
+            NormalRestoreTarget::UnknownSize { .. } => None,
+        })
+    }
+
+    pub(super) fn normal_restore_target(&self) -> Option<NormalRestoreTarget> {
+        self.normal_restore_target
     }
 
     pub(super) fn minimize(&mut self, surfaces: Vec<RenderableSurface>) {
@@ -85,13 +93,22 @@ impl WindowState {
     }
 
     pub(super) fn capture_restore_geometry(&mut self, geometry: WindowGeometry) {
-        if self.mode == ToplevelMode::Normal && self.restore_geometry.is_none() {
-            self.restore_geometry = Some(geometry);
+        if self.mode == ToplevelMode::Normal && self.normal_restore_target.is_none() {
+            self.normal_restore_target = Some(NormalRestoreTarget::from_geometry(geometry));
         }
     }
 
     pub(super) fn take_restore_geometry(&mut self) -> Option<WindowGeometry> {
-        self.restore_geometry.take()
+        self.normal_restore_target
+            .take()
+            .and_then(|target| match target {
+                NormalRestoreTarget::Known(geometry) => Some(geometry),
+                NormalRestoreTarget::UnknownSize { .. } => None,
+            })
+    }
+
+    pub(super) fn take_normal_restore_target(&mut self) -> Option<NormalRestoreTarget> {
+        self.normal_restore_target.take()
     }
 }
 
@@ -99,9 +116,27 @@ impl Default for WindowState {
     fn default() -> Self {
         Self {
             mode: ToplevelMode::Normal,
-            restore_geometry: None,
+            normal_restore_target: None,
             minimized_surfaces: Vec::new(),
             minimized: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormalRestoreTarget {
+    Known(WindowGeometry),
+    UnknownSize { placement: SurfacePlacement },
+}
+
+impl NormalRestoreTarget {
+    pub(crate) fn from_geometry(geometry: WindowGeometry) -> Self {
+        if geometry.width > 0 && geometry.height > 0 {
+            Self::Known(geometry)
+        } else {
+            Self::UnknownSize {
+                placement: geometry.placement,
+            }
         }
     }
 }
@@ -128,6 +163,12 @@ pub(crate) struct WindowGeometry {
     pub(super) placement: SurfacePlacement,
     pub(super) width: u32,
     pub(super) height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToplevelConfigureSize {
+    Suggested { width: u32, height: u32 },
+    Unspecified,
 }
 
 impl WindowGeometry {
@@ -177,6 +218,42 @@ mod tests {
 
         state.set_mode(ToplevelMode::Normal);
         state.capture_restore_geometry(normal_geometry);
+        assert_eq!(
+            state.normal_restore_target(),
+            Some(NormalRestoreTarget::Known(normal_geometry))
+        );
         assert_eq!(state.take_restore_geometry(), Some(normal_geometry));
+    }
+
+    #[test]
+    fn zero_sized_normal_geometry_is_not_a_known_restore_geometry() {
+        let mut state = WindowState::default();
+        let unknown_size = WindowGeometry::new(SurfacePlacement::root_at(72, 72), 0, 0);
+
+        state.capture_restore_geometry(unknown_size);
+
+        assert_eq!(state.restore_geometry(), None);
+        assert_eq!(
+            state.normal_restore_target(),
+            Some(NormalRestoreTarget::UnknownSize {
+                placement: unknown_size.placement,
+            })
+        );
+    }
+
+    #[test]
+    fn known_normal_restore_target_survives_later_maximized_geometry() {
+        let normal = WindowGeometry::new(SurfacePlacement::root_at(72, 72), 300, 200);
+        let maximized = WindowGeometry::new(SurfacePlacement::root_at(0, 45), 1920, 955);
+        let mut state = WindowState::default();
+
+        state.capture_restore_geometry(normal);
+        state.set_mode(ToplevelMode::Maximized);
+        state.capture_restore_geometry(maximized);
+
+        assert_eq!(
+            state.normal_restore_target(),
+            Some(NormalRestoreTarget::Known(normal))
+        );
     }
 }

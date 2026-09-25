@@ -258,12 +258,12 @@ use input::{
 };
 pub use interaction::X11MoveResizeBeginResult;
 use interaction::{
-    InteractionCursorOverride, InteractionCursorShape, PendingFloatingResize,
-    PendingResizeConfigure, PointerPress, PointerTarget, ResizeAckDecision, ResizeCommitSnapshot,
-    ResizeConfigureFlow, ResizeEdges, RootSurfaceHit, WindowFrameHit, WindowInteraction,
-    WindowInteractionEndReason, WindowInteractionSource, interactive_resize_geometry,
-    resize_drag_threshold_reached, resize_edges_for_window_point, resize_edges_from_xdg,
-    window_frame_action_for_local_point,
+    InteractionCursorOverride, InteractionCursorShape, PendingFloatingResize, PendingNormalRestore,
+    PendingNormalRestorePolicy, PendingResizeConfigure, PointerPress, PointerTarget,
+    ResizeAckDecision, ResizeCommitSnapshot, ResizeConfigureFlow, ResizeEdges, RootSurfaceHit,
+    WindowFrameHit, WindowInteraction, WindowInteractionEndReason, WindowInteractionSource,
+    interactive_resize_geometry, resize_drag_threshold_reached, resize_edges_for_window_point,
+    resize_edges_from_xdg, window_frame_action_for_local_point,
 };
 pub use interaction::{
     InteractionUpdateOutcome, ResizeInteractionId, TriggerReleaseDelivery,
@@ -413,7 +413,10 @@ pub struct XwaylandSurfaceCommitObserved {
     pub buffer_id: Option<BufferId>,
     pub buffer_size: Option<BufferSize>,
 }
-use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
+use window_state::{
+    NormalRestoreTarget, ToplevelConfigureSize, ToplevelMode, WindowGeometry, WindowState,
+    xdg_toplevel_state_bytes,
+};
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
 const WL_SEAT_NAME_SINCE: u32 = 2;
@@ -838,6 +841,7 @@ pub struct CompositorState {
     fullscreen_presentation: Option<FullscreenPresentationState>,
     resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,
     toplevel_visual_geometries: HashMap<u32, ToplevelVisualGeometry>,
+    pending_normal_restores: HashMap<u32, PendingNormalRestore>,
     active_toplevel_resizes: HashMap<u32, ActiveToplevelResize>,
     pending_xwayland_visual_content: HashSet<u32>,
     next_window_interaction_id: u64,

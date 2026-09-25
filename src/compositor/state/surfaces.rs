@@ -1381,8 +1381,10 @@ impl CompositorState {
             let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
             self.send_configure_root_window_to(
                 surface_id,
-                geometry.width,
-                geometry.height,
+                ToplevelConfigureSize::Suggested {
+                    width: geometry.width,
+                    height: geometry.height,
+                },
                 mode.xdg_states(),
             );
             self.set_surface_placement_with_cause(

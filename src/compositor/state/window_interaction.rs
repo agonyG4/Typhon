@@ -68,6 +68,251 @@ impl BeginWindowInteraction {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn begin_pending_normal_restore(
+        &mut self,
+        root_surface_id: u32,
+        window_id: WindowId,
+        restore_placement: SurfacePlacement,
+        policy: PendingNormalRestorePolicy,
+        retained_visual_geometry: WindowGeometry,
+    ) -> bool {
+        if self.window_id_for_surface(root_surface_id) != Some(window_id) {
+            return false;
+        }
+        self.cancel_pending_normal_restore(root_surface_id, "superseded");
+        self.clear_resize_state_for_surfaces_with_reason(
+            &[root_surface_id],
+            WindowInteractionEndReason::ModeTransition,
+        );
+        let Some(configure_serial) = self.send_configure_root_window_to(
+            root_surface_id,
+            ToplevelConfigureSize::Unspecified,
+            &[],
+        ) else {
+            return false;
+        };
+        if let Some(current) = self.window_mut(window_id) {
+            current.state.set_mode(ToplevelMode::Normal);
+        } else {
+            return false;
+        }
+        self.mark_astrea_toplevel_dirty(window_id);
+        self.clear_fullscreen_presentation_owner(root_surface_id);
+        self.install_xdg_mode_transition_response_fence(
+            root_surface_id,
+            retained_visual_geometry,
+            configure_serial,
+        );
+        self.pending_normal_restores.insert(
+            root_surface_id,
+            PendingNormalRestore {
+                root_surface_id,
+                window_id,
+                configure_serial,
+                restore_placement,
+                policy,
+            },
+        );
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=normal_restore_requested root_surface_id={root_surface_id} window_id={} restore_size=unknown restore_placement={restore_placement:?} configure_serial={configure_serial} policy={policy:?}",
+                window_id.get(),
+            );
+        }
+        true
+    }
+
+    pub(in crate::compositor) fn cancel_pending_normal_restore(
+        &mut self,
+        root_surface_id: u32,
+        reason: &str,
+    ) -> bool {
+        let Some(pending) = self.pending_normal_restores.remove(&root_surface_id) else {
+            return false;
+        };
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&root_surface_id)
+            && visual
+                .xdg_mode_transition_fence
+                .is_some_and(|fence| fence.configure_serial == pending.configure_serial)
+        {
+            visual.xdg_mode_transition_fence = None;
+        }
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=normal_restore_cancelled root_surface_id={root_surface_id} window_id={} configure_serial={} reason={reason}",
+                pending.window_id.get(),
+                pending.configure_serial,
+            );
+        }
+        true
+    }
+
+    pub(in crate::compositor) fn attach_window_interaction_to_pending_normal_restore(
+        &mut self,
+        root_surface_id: u32,
+        window_id: WindowId,
+        interaction_id: WindowInteractionId,
+    ) {
+        if let Some(pending) = self.pending_normal_restores.get_mut(&root_surface_id)
+            && pending.window_id == window_id
+            && let PendingNormalRestorePolicy::InteractivePointer {
+                interaction_id: pending_interaction_id,
+                ..
+            } = &mut pending.policy
+        {
+            *pending_interaction_id = Some(interaction_id);
+        }
+    }
+
+    fn update_pending_normal_restore_pointer(
+        &mut self,
+        root_surface_id: u32,
+        interaction_id: WindowInteractionId,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        let Some(pending) = self.pending_normal_restores.get_mut(&root_surface_id) else {
+            return false;
+        };
+        let PendingNormalRestorePolicy::InteractivePointer {
+            latest_pointer_x,
+            latest_pointer_y,
+            interaction_id: pending_interaction_id,
+            ..
+        } = &mut pending.policy
+        else {
+            return false;
+        };
+        if *pending_interaction_id != Some(interaction_id) {
+            return false;
+        }
+        *latest_pointer_x = x;
+        *latest_pointer_y = y;
+        true
+    }
+
+    pub(in crate::compositor) fn resolve_pending_normal_restore(
+        &mut self,
+        root_surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+        committed_geometry: Option<XdgWindowGeometry>,
+    ) -> bool {
+        let Some(pending) = self.pending_normal_restores.get(&root_surface_id).copied() else {
+            return false;
+        };
+        let identity_matches = pending.root_surface_id == root_surface_id
+            && self.window_id_for_surface(root_surface_id) == Some(pending.window_id)
+            && self
+                .window(pending.window_id)
+                .is_some_and(|window| window.root_surface_id == root_surface_id);
+        if !identity_matches
+            || !self
+                .window(pending.window_id)
+                .is_some_and(|window| window.state.mode() == ToplevelMode::Normal)
+        {
+            self.cancel_pending_normal_restore(root_surface_id, "root_or_mode_replaced");
+            return false;
+        }
+        let Some(fence) = self
+            .toplevel_visual_geometries
+            .get(&root_surface_id)
+            .and_then(|visual| visual.xdg_mode_transition_fence)
+            .filter(|fence| fence.configure_serial == pending.configure_serial)
+        else {
+            self.cancel_pending_normal_restore(root_surface_id, "response_fence_missing");
+            return false;
+        };
+        let Some(ack_commit_floor) = fence.ack_commit_sequence_floor else {
+            return false;
+        };
+        if commit_sequence.get() <= ack_commit_floor.get() {
+            return false;
+        }
+        let Some(committed_geometry) =
+            committed_geometry.filter(|geometry| geometry.width > 0 && geometry.height > 0)
+        else {
+            return false;
+        };
+        let Ok(width) = u32::try_from(committed_geometry.width) else {
+            return false;
+        };
+        let Ok(height) = u32::try_from(committed_geometry.height) else {
+            return false;
+        };
+        let restore_geometry = WindowGeometry::new(pending.restore_placement, width, height);
+        let target = match pending.policy {
+            PendingNormalRestorePolicy::StoredPlacement => restore_geometry,
+            PendingNormalRestorePolicy::InteractivePointer {
+                horizontal_ratio,
+                vertical_offset,
+                latest_pointer_x,
+                latest_pointer_y,
+                ..
+            } => {
+                let Some(base_rect) =
+                    self.presentation_rect_for_geometry(root_surface_id, restore_geometry)
+                else {
+                    return false;
+                };
+                let desired_x = latest_pointer_x - horizontal_ratio * f64::from(width);
+                let desired_y = latest_pointer_y - vertical_offset;
+                let delta_x = (desired_x - base_rect.x()).round() as i32;
+                let delta_y = (desired_y - base_rect.y()).round() as i32;
+                WindowGeometry::new(
+                    SurfacePlacement {
+                        local_x: pending.restore_placement.local_x.saturating_add(delta_x),
+                        local_y: pending.restore_placement.local_y.saturating_add(delta_y),
+                        ..pending.restore_placement
+                    },
+                    width,
+                    height,
+                )
+            }
+        };
+        self.pending_normal_restores.remove(&root_surface_id);
+        if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
+            let _ = window.take_normal_restore_target();
+        }
+        self.materialize_pending_normal_restore_geometry(root_surface_id, target);
+        if let PendingNormalRestorePolicy::InteractivePointer {
+            latest_pointer_x,
+            latest_pointer_y,
+            interaction_id: Some(interaction_id),
+            ..
+        } = pending.policy
+            && let Some(interaction) = self.window_interaction.as_mut()
+            && interaction.id == interaction_id
+            && interaction.window_id == pending.window_id
+            && interaction.root_surface_id == root_surface_id
+            && matches!(interaction.kind, WindowInteractionKind::Move)
+        {
+            interaction.start_placement = target.placement;
+            interaction.start_width = width;
+            interaction.start_height = height;
+            interaction.start_pointer_x = latest_pointer_x;
+            interaction.start_pointer_y = latest_pointer_y;
+            self.pending_window_interaction_pointer = None;
+        }
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=normal_restore_finalized root_surface_id={root_surface_id} window_id={} configure_serial={} root_commit_sequence={} client_geometry=({}, {}, {}, {}) pointer_policy={:?} canonical_frame=({},{},{},{})",
+                pending.window_id.get(),
+                pending.configure_serial,
+                commit_sequence.get(),
+                committed_geometry.x,
+                committed_geometry.y,
+                committed_geometry.width,
+                committed_geometry.height,
+                pending.policy,
+                target.placement.local_x,
+                target.placement.local_y,
+                target.width,
+                target.height,
+            );
+        }
+        true
+    }
+
     pub(in crate::compositor) fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
         self.begin_window_move_at_with_trigger(x, y, 0)
     }
@@ -567,6 +812,10 @@ impl CompositorState {
             log_begin_rejection(self, begin, "window_identity_missing");
             return false;
         };
+        if self.pending_normal_restores.contains_key(&root_surface_id) {
+            log_begin_rejection(self, begin, "normal_restore_response_pending");
+            return false;
+        }
         if self
             .window(window_id)
             .is_some_and(|window| !window_interaction_allowed_for_mode(window.state.mode(), kind))
@@ -823,6 +1072,13 @@ impl CompositorState {
             tiled_resize,
             decoration_owned,
         });
+        if maximized_restore {
+            self.attach_window_interaction_to_pending_normal_restore(
+                root_surface_id,
+                window_id,
+                id,
+            );
+        }
         if let Some(preparation) = tiled_resize_data.as_ref() {
             self.install_tiled_resize_session(
                 id,
@@ -906,14 +1162,15 @@ impl CompositorState {
         // A tiled maximize stores the tiled geometry in WindowState. A titlebar
         // drag abandons that layout, so its restore base is the last floating
         // geometry instead.
-        let restore_geometry = if tiled_detach_required {
+        let restore_target = if tiled_detach_required {
             window
                 .floating_geometry
-                .or_else(|| window.state.restore_geometry())
+                .map(NormalRestoreTarget::from_geometry)
+                .or_else(|| window.state.normal_restore_target())
         } else {
-            window.state.restore_geometry()
+            window.state.normal_restore_target()
         };
-        let Some(restore_geometry) = restore_geometry else {
+        let Some(restore_target) = restore_target else {
             return false;
         };
         let prepared_tiled_detach = if tiled_detach_required {
@@ -939,6 +1196,32 @@ impl CompositorState {
             .or_else(|| self.presentation_rect_for_geometry(root_surface_id, physical_geometry))
         else {
             return false;
+        };
+        if let NormalRestoreTarget::UnknownSize { placement } = restore_target {
+            if let Some(prepared) = prepared_tiled_detach
+                && !self.commit_prepared_tiled_detach(prepared, None)
+            {
+                return false;
+            }
+            let horizontal_ratio =
+                ((pointer_x - physical_rect.x()) / physical_rect.width().max(1.0)).clamp(0.0, 1.0);
+            let vertical_offset = pointer_y - physical_rect.y();
+            return self.begin_pending_normal_restore(
+                root_surface_id,
+                window_id,
+                placement,
+                PendingNormalRestorePolicy::InteractivePointer {
+                    horizontal_ratio,
+                    vertical_offset,
+                    latest_pointer_x: pointer_x,
+                    latest_pointer_y: pointer_y,
+                    interaction_id: None,
+                },
+                canonical_geometry,
+            );
+        }
+        let NormalRestoreTarget::Known(restore_geometry) = restore_target else {
+            unreachable!("unknown restore geometry returned above")
         };
         let restore_rect = self
             .presentation_rect_for_geometry(root_surface_id, restore_geometry)
@@ -1226,6 +1509,18 @@ impl CompositorState {
                 .saturating_add(1);
         }
         if matches!(interaction.kind, WindowInteractionKind::Move) {
+            if self.update_pending_normal_restore_pointer(
+                interaction.root_surface_id,
+                interaction_id,
+                x,
+                y,
+            ) {
+                self.resize_flow_metrics.raw_pointer_move_updates = self
+                    .resize_flow_metrics
+                    .raw_pointer_move_updates
+                    .saturating_add(1);
+                return InteractionUpdateOutcome::NoChange;
+            }
             self.resize_flow_metrics.raw_pointer_move_updates = self
                 .resize_flow_metrics
                 .raw_pointer_move_updates

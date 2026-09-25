@@ -282,6 +282,27 @@ pub(super) struct WindowInteraction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum PendingNormalRestorePolicy {
+    StoredPlacement,
+    InteractivePointer {
+        horizontal_ratio: f64,
+        vertical_offset: f64,
+        latest_pointer_x: f64,
+        latest_pointer_y: f64,
+        interaction_id: Option<WindowInteractionId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct PendingNormalRestore {
+    pub(super) root_surface_id: u32,
+    pub(super) window_id: WindowId,
+    pub(super) configure_serial: u32,
+    pub(super) restore_placement: SurfacePlacement,
+    pub(super) policy: PendingNormalRestorePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowInteractionDebugSnapshot {
     pub interaction_id: u64,
     pub resize_interaction_id: Option<u64>,

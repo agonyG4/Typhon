@@ -1419,6 +1419,7 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
         }
+        self.cancel_pending_normal_restore(root_surface_id, "window_minimized");
         self.begin_lifecycle_minimize(
             window_id,
             root_surface_id,
@@ -1686,6 +1687,10 @@ impl CompositorState {
         {
             return false;
         }
+        if mode == ToplevelMode::Normal {
+            return self.restore_normal_root_window(surface_id);
+        }
+        self.cancel_pending_normal_restore(surface_id, "conflicting_mode_transition");
         if let Some(window_id) = self.window_id_for_surface(surface_id)
             && mode != ToplevelMode::Normal
             && let Some(location) = self
@@ -1720,6 +1725,8 @@ impl CompositorState {
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+        let observed_normal_geometry =
+            self.observed_normal_restore_geometry(surface_id, source_geometry.placement);
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
             WindowInteractionEndReason::ModeTransition,
@@ -1736,7 +1743,7 @@ impl CompositorState {
         }
 
         if let Some(window) = self.toplevel_window_state_mut(surface_id) {
-            window.capture_restore_geometry(source_geometry);
+            window.capture_restore_geometry(observed_normal_geometry);
             window.set_mode(mode);
         }
         if let Some(window_id) = self.window_id_for_surface(surface_id) {
@@ -1745,8 +1752,14 @@ impl CompositorState {
 
         let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
         let states = mode.xdg_states();
-        let configure_serial =
-            self.send_configure_root_window_to(surface_id, geometry.width, geometry.height, states);
+        let configure_serial = self.send_configure_root_window_to(
+            surface_id,
+            ToplevelConfigureSize::Suggested {
+                width: geometry.width,
+                height: geometry.height,
+            },
+            states,
+        );
         let configured = configure_serial.is_some();
         if mode == ToplevelMode::Fullscreen {
             self.set_fullscreen_presentation_owner(surface_id);
@@ -1835,65 +1848,99 @@ impl CompositorState {
         }
         self.clear_fullscreen_presentation_owner(surface_id);
         let window_id = self.window_id_for_surface(surface_id);
-        let stored_restore_geometry = {
+        let stored_restore_target = {
             let Some(window) = self.toplevel_window_state(surface_id) else {
                 return false;
             };
-            window.restore_geometry()
+            window.normal_restore_target()
         };
-        if let Some(window) = self.toplevel_window_state_mut(surface_id) {
-            window.set_mode(ToplevelMode::Normal);
-        } else {
-            return false;
-        }
-        if let Some(window_id) = window_id {
-            self.mark_astrea_toplevel_dirty(window_id);
-        }
-        let restore_geometry = interaction_geometry.or(stored_restore_geometry);
         if let Some(location) = tiled_location {
+            let Some(window) = self.toplevel_window_state_mut(surface_id) else {
+                return false;
+            };
+            window.set_mode(ToplevelMode::Normal);
+            if let Some(window_id) = window_id {
+                self.mark_astrea_toplevel_dirty(window_id);
+            }
             let reflowed = self.reflow_tiled_location(location);
             if reflowed && let Some(window) = self.toplevel_window_state_mut(surface_id) {
                 let _ = window.take_restore_geometry();
             }
             return reflowed;
         }
-        let restore_geometry = restore_geometry
-            .or_else(|| self.current_root_window_geometry(surface_id))
-            .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
-
-        let configure_serial = self.send_configure_root_window_to(
-            surface_id,
-            restore_geometry.width,
-            restore_geometry.height,
-            &[],
-        );
-        let configured = configure_serial.is_some();
-        self.set_surface_placement_with_cause(
-            surface_id,
-            restore_geometry.placement,
-            RenderGenerationCause::WindowMode,
-        );
-        let transition = if interaction_geometry.is_some() {
-            VisualGeometryTransition::Immediate
-        } else {
-            mode_transition_animation_kind(previous_mode, ToplevelMode::Normal).map_or(
-                VisualGeometryTransition::Immediate,
-                |kind| VisualGeometryTransition::Animated {
-                    source: source_geometry,
-                    kind,
-                },
-            )
-        };
-        self.install_xdg_mode_transition_visual_geometry(
-            surface_id,
-            restore_geometry,
-            transition,
-            configure_serial,
-        );
-        if configured && let Some(window) = self.toplevel_window_state_mut(surface_id) {
-            let _ = window.take_restore_geometry();
+        let restore_target =
+            interaction_geometry
+                .map(NormalRestoreTarget::from_geometry)
+                .or(stored_restore_target)
+                .or_else(|| {
+                    (previous_mode == ToplevelMode::Normal).then(|| {
+                        NormalRestoreTarget::from_geometry(self.observed_normal_restore_geometry(
+                            surface_id,
+                            source_geometry.placement,
+                        ))
+                    })
+                })
+                .unwrap_or(NormalRestoreTarget::UnknownSize {
+                    placement: source_geometry.placement,
+                });
+        match restore_target {
+            NormalRestoreTarget::Known(restore_geometry) => {
+                let Some(window) = self.toplevel_window_state_mut(surface_id) else {
+                    return false;
+                };
+                window.set_mode(ToplevelMode::Normal);
+                if let Some(window_id) = window_id {
+                    self.mark_astrea_toplevel_dirty(window_id);
+                }
+                let configure_serial = self.send_configure_root_window_to(
+                    surface_id,
+                    ToplevelConfigureSize::Suggested {
+                        width: restore_geometry.width,
+                        height: restore_geometry.height,
+                    },
+                    &[],
+                );
+                let configured = configure_serial.is_some();
+                self.set_surface_placement_with_cause(
+                    surface_id,
+                    restore_geometry.placement,
+                    RenderGenerationCause::WindowMode,
+                );
+                let transition = if interaction_geometry.is_some() {
+                    VisualGeometryTransition::Immediate
+                } else {
+                    mode_transition_animation_kind(previous_mode, ToplevelMode::Normal).map_or(
+                        VisualGeometryTransition::Immediate,
+                        |kind| VisualGeometryTransition::Animated {
+                            source: source_geometry,
+                            kind,
+                        },
+                    )
+                };
+                self.install_xdg_mode_transition_visual_geometry(
+                    surface_id,
+                    restore_geometry,
+                    transition,
+                    configure_serial,
+                );
+                if configured && let Some(window) = self.toplevel_window_state_mut(surface_id) {
+                    let _ = window.take_normal_restore_target();
+                }
+                configured
+            }
+            NormalRestoreTarget::UnknownSize { placement } => {
+                let Some(window_id) = window_id else {
+                    return false;
+                };
+                self.begin_pending_normal_restore(
+                    surface_id,
+                    window_id,
+                    placement,
+                    PendingNormalRestorePolicy::StoredPlacement,
+                    source_geometry,
+                )
+            }
         }
-        configured
     }
 
     pub(in crate::compositor) fn focused_root_surface_id(&self) -> Option<u32> {
@@ -1960,6 +2007,20 @@ impl CompositorState {
             u32::try_from(geometry.width).ok()?,
             u32::try_from(geometry.height).ok()?,
         ))
+    }
+
+    fn observed_normal_restore_geometry(
+        &self,
+        surface_id: u32,
+        placement: SurfacePlacement,
+    ) -> WindowGeometry {
+        match self
+            .xdg_window_geometry_size(surface_id)
+            .filter(|(width, height)| *width > 0 && *height > 0)
+        {
+            Some((width, height)) => WindowGeometry::new(placement, width, height),
+            None => WindowGeometry::new(placement, 0, 0),
+        }
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {

@@ -253,19 +253,68 @@ fn maximized_uses_reserved_usable_geometry() {
 }
 
 #[test]
-fn window_unmaximize_restores_previous_toplevel_geometry() {
+fn window_unmaximize_uses_unspecified_size_when_normal_geometry_is_unknown() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut client_state = RegistryTestState::default();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
 
-    let state =
-        create_buffered_toplevel_then_toggle_maximize_twice(&socket_path, &commands).unwrap();
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("mapped XDG root")
+        .surface_id;
+    let initial_normal =
+        capture_root_window_geometry(&commands, root_surface_id).expect("initial normal frame");
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut client_state).unwrap();
+    let maximized =
+        capture_root_window_geometry(&commands, root_surface_id).expect("maximized frame");
+    assert_eq!(
+        capture_root_restore_geometry(&commands, root_surface_id),
+        None,
+        "the buffer size alone must not qualify as normal restore size"
+    );
+
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut client_state).unwrap();
+    assert_eq!(
+        (client_state.toplevel_width, client_state.toplevel_height),
+        (0, 0)
+    );
+    assert_eq!(
+        capture_root_window_geometry(&commands, root_surface_id),
+        Some(maximized),
+        "ACK without a root commit keeps the physical maximized frame installed"
+    );
+
+    xdg_surface.set_window_geometry(10, 10, 520, 410);
+    commit_test_buffered_surface(&surface, &shm, &qh, 540, 430).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+    let restored = capture_root_window_geometry(&commands, root_surface_id)
+        .expect("client response must resolve normal frame");
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!(state.toplevel_width, 300);
-    assert_eq!(state.toplevel_height, 200);
-    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!((restored.width, restored.height), (520, 410));
+    assert_eq!(restored.placement, initial_normal.placement);
+    assert!(!client_state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
 }
 
 #[test]

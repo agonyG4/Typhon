@@ -440,7 +440,6 @@ fn titlebar_move_interrupts_size_presentation_without_baking_scaled_geometry() {
     connection.flush().unwrap();
     queue.roundtrip(&mut client_state).unwrap();
     wait_for_server_commands(&commands);
-
     let root_surface_id = capture_renderable_surface_snapshot(&commands)
         .into_iter()
         .find(|surface| surface.parent_surface_id.is_none())
@@ -505,10 +504,15 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
 
     let mut client_state = RegistryTestState::default();
     queue.roundtrip(&mut client_state).unwrap();
-    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    xdg_surface.set_window_geometry(0, 0, 300, 200);
+    commit_test_buffered_surface(&surface, &shm, &qh, 300, 200).unwrap();
     connection.flush().unwrap();
     queue.roundtrip(&mut client_state).unwrap();
     wait_for_server_commands(&commands);
+    assert_eq!(
+        capture_committed_window_geometry(&commands),
+        Some(XdgWindowGeometry::new(0, 0, 300, 200))
+    );
 
     let root_surface_id = capture_renderable_surface_snapshot(&commands)
         .into_iter()
@@ -527,6 +531,14 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
     assert_eq!(
         capture_focused_toplevel_mode(&commands),
         Some(ToplevelMode::Maximized)
+    );
+    assert_eq!(
+        capture_root_restore_geometry(&commands, root_surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(100, 100),
+            300,
+            200,
+        ))
     );
     commands.send(ServerCommand::PresentFrame).unwrap();
     wait_for_server_commands(&commands);
@@ -592,6 +604,133 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
     assert!(transition.is_none());
     assert!(presented_after_frame.0 > presented_before.0);
     assert_ne!(presented_after_frame.1, presented_before.1);
+    drop(decoration);
+}
+
+#[test]
+fn unknown_size_maximized_titlebar_move_waits_for_client_geometry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+    let decoration = manager.get_toplevel_decoration(&toplevel, &qh, ());
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut client_state = RegistryTestState::default();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("mapped XDG root")
+        .surface_id;
+    focus_root_window(&commands, root_surface_id);
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(100, 100),
+        300,
+        200,
+    );
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut client_state).unwrap();
+    assert_eq!(
+        capture_root_restore_geometry(&commands, root_surface_id),
+        None,
+        "the mapped buffer size is not a learned normal restore size"
+    );
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishFocusedPresentationAfter {
+            frame_id: 2,
+            elapsed_nanos: 1_000_000_000,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let presented_before = capture_presented_presentation(&commands, root_surface_id);
+    let physical_rect = presented_before
+        .1
+        .expect("maximized frame should be physically presented")
+        .presented_rect();
+    let maximized_frame = capture_root_window_geometry(&commands, root_surface_id)
+        .expect("maximized visual geometry");
+
+    commands
+        .send(ServerCommand::BeginMove { x: 120.0, y: 87.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut client_state).unwrap();
+    assert_eq!(
+        (client_state.toplevel_width, client_state.toplevel_height),
+        (0, 0)
+    );
+    assert_eq!(
+        capture_root_window_geometry(&commands, root_surface_id),
+        Some(maximized_frame),
+        "begin move must retain the maximized frame while normal size is unknown"
+    );
+    assert_eq!(
+        capture_presented_presentation(&commands, root_surface_id),
+        presented_before,
+        "the physical presentation must not teleport before the client response"
+    );
+    assert_eq!(
+        capture_window_interaction_debug_snapshot(&commands).map(|interaction| interaction.kind),
+        Some(WindowInteractionKind::Move)
+    );
+
+    commands
+        .send(ServerCommand::UpdateInteraction { x: 140.0, y: 87.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    xdg_surface.set_window_geometry(10, 10, 520, 410);
+    commit_test_buffered_surface(&surface, &shm, &qh, 540, 430).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+
+    let horizontal_ratio = ((120.0 - physical_rect.x()) / physical_rect.width()).clamp(0.0, 1.0);
+    let expected_frame_x = (140.0 - horizontal_ratio * 520.0).round() as i32;
+    let expected_frame_y = (87.0 - (87.0 - physical_rect.y())).round() as i32;
+    let restored = capture_root_window_geometry(&commands, root_surface_id)
+        .expect("normal response geometry should finalize the restore");
+    let authority = capture_xdg_root_placement_authority(&commands, root_surface_id)
+        .expect("root placement authority after restore");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!((restored.width, restored.height), (520, 410));
+    assert_eq!(
+        (restored.placement.local_x, restored.placement.local_y),
+        (expected_frame_x, expected_frame_y)
+    );
+    assert_eq!(
+        authority.logical_frame_origin,
+        Some((expected_frame_x, expected_frame_y))
+    );
+    assert_eq!(
+        authority
+            .render_placement
+            .map(|placement| (placement.local_x, placement.local_y)),
+        Some((expected_frame_x - 10, expected_frame_y - 10))
+    );
+    assert_eq!(
+        authority.active_scene_origin,
+        Some((expected_frame_x - 10, expected_frame_y - 10))
+    );
     drop(decoration);
 }
 
