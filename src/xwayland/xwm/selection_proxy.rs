@@ -516,6 +516,66 @@ fn discard_owner_confirmation(xwm: &mut Xwm, kind: SelectionKind, sequence: Sequ
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerLossObservationResolution {
+    NoPendingConfirmation,
+    Rechecked,
+    TimedOut,
+}
+
+fn recheck_owner_after_loss_observation(
+    xwm: &mut Xwm,
+    kind: SelectionKind,
+    now_ns: u64,
+) -> Result<OwnerLossObservationResolution, XwmError> {
+    let phase = xwm.data_bridge.selection_proxy.channel(kind).claim_phase;
+    let ProxyClaimPhase::AwaitingOwnerConfirmation {
+        id,
+        timestamp,
+        sequence: old_sequence,
+        deadline_ns,
+    } = phase
+    else {
+        return Ok(OwnerLossObservationResolution::NoPendingConfirmation);
+    };
+    if !matches!(
+        xwm.data_bridge.selection_proxy.channel(kind).owner_window,
+        ProxyOwnerWindowState::Active(_)
+    ) {
+        return Ok(OwnerLossObservationResolution::NoPendingConfirmation);
+    }
+    if deadline_ns <= now_ns {
+        xwm.data_bridge
+            .selection_proxy
+            .channel_mut(kind)
+            .suppressed_id = Some(id);
+        retire_proxy_owner_window(xwm, kind, now_ns)?;
+        return Ok(OwnerLossObservationResolution::TimedOut);
+    }
+
+    xwm.data_bridge.selection_proxy.channel_mut(kind).authority = None;
+    cancel_channel(xwm, kind, now_ns)?;
+    discard_owner_confirmation(xwm, kind, old_sequence);
+
+    let cookie = xwm
+        .connection
+        .get_selection_owner(selection_atom(xwm, kind))
+        .map_err(XwmError::Connection)?;
+    let sequence = cookie.sequence_number();
+    std::mem::forget(cookie);
+    xwm.data_bridge
+        .selection_proxy
+        .channel_mut(kind)
+        .claim_phase = ProxyClaimPhase::AwaitingOwnerConfirmation {
+        id,
+        timestamp,
+        sequence,
+        deadline_ns,
+    };
+    xwm.connection.flush().map_err(XwmError::Connection)?;
+    Ok(OwnerLossObservationResolution::Rechecked)
+}
+
 fn retire_proxy_owner_window(
     xwm: &mut Xwm,
     kind: SelectionKind,
@@ -686,6 +746,12 @@ pub(crate) fn selection_clear(
     ) {
         return Ok(true);
     }
+    match recheck_owner_after_loss_observation(xwm, kind, now_ns)? {
+        OwnerLossObservationResolution::Rechecked | OwnerLossObservationResolution::TimedOut => {
+            return Ok(true);
+        }
+        OwnerLossObservationResolution::NoPendingConfirmation => {}
+    }
     let phase = xwm.data_bridge.selection_proxy.channel(kind).claim_phase;
     {
         let channel = xwm.data_bridge.selection_proxy.channel_mut(kind);
@@ -729,6 +795,12 @@ pub(crate) fn observe_xfixes_owner_transition(
         ProxyOwnerWindowState::Uninitialized | ProxyOwnerWindowState::Disabled { .. } => {
             return Ok(());
         }
+    }
+    match recheck_owner_after_loss_observation(xwm, kind, now_ns)? {
+        OwnerLossObservationResolution::Rechecked | OwnerLossObservationResolution::TimedOut => {
+            return Ok(());
+        }
+        OwnerLossObservationResolution::NoPendingConfirmation => {}
     }
     let channel = xwm.data_bridge.selection_proxy.channel(kind);
     let phase = channel.claim_phase;

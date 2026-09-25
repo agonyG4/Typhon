@@ -339,6 +339,39 @@ fn confirm_proxy_ownership(
     sequence as u16
 }
 
+fn begin_pending_owner_confirmation(
+    xwm: &mut super::super::super::Xwm,
+    peer: &mut UnixStream,
+    kind: XwaylandSelectionKind,
+    id: XwaylandProxySelectionId,
+    timestamp: u32,
+) -> (u32, u64) {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let selection_kind = match kind {
+        XwaylandSelectionKind::Clipboard => SelectionKind::Clipboard,
+        XwaylandSelectionKind::Primary => SelectionKind::Primary,
+    };
+    let owner = xwm
+        .data_bridge
+        .selection_proxy
+        .owner_window(selection_kind)
+        .expect("private proxy owner window");
+    inject_proxy_time(xwm, peer, kind, timestamp);
+    let (claims, confirmations) = take_owner_requests(peer);
+    assert_eq!(claims, [(owner, selection_atom(xwm, kind), timestamp)]);
+    assert_eq!(confirmations, 1);
+    let (pending_id, pending_timestamp, sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            xwm,
+            selection_kind,
+        )
+        .expect("asynchronous owner confirmation is pending");
+    assert_eq!(pending_id, id);
+    assert_eq!(pending_timestamp, timestamp);
+    (owner, sequence)
+}
+
 fn normalize_proxy_destroy(xwm: &mut super::super::super::Xwm, owner: u32) {
     super::super::super::events::normalize(
         xwm,
@@ -1685,6 +1718,36 @@ fn pending_claim_clear_retires_ambiguous_owner_window() {
             .selection_proxy
             .owner_window(super::super::super::data_bridge::SelectionKind::Clipboard),
         None
+    );
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(super::super::super::data_bridge::SelectionKind::Clipboard)
+        .expect("clipboard XFixes observer remains generation local");
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection,
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY,
+        0,
+        timestamp,
+        timestamp,
+        0,
+    ))
+    .expect("write owner-none observation while exact proxy window retires");
+    xwm.drain_events(64)
+        .expect("retirement observation does not start an owner recheck");
+    let requests = super::read_fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&requests);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
+    assert!(destroyed_windows(&requests).is_empty());
+    assert_eq!(
+        super::super::super::selection_proxy::retiring_owner_for_test(
+            &xwm,
+            super::super::super::data_bridge::SelectionKind::Clipboard
+        )
+        .map(|(retiring, _)| retiring),
+        Some(owner)
     );
 }
 
@@ -3616,4 +3679,866 @@ fn overloaded_requests_and_async_multiple_replies_remain_bounded() {
         super::super::super::selection_proxy::MAX_PENDING_PROXY_SELECTION_REQUESTS
     );
     let _ = fixture_requests(&mut peer);
+}
+
+#[test]
+fn external_xfixes_loss_during_pending_confirmation_rechecks_server_owner() {
+    use super::super::super::data_bridge::{SelectionKind, SelectionOrigin};
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x3456_789a;
+    let (owner, old_sequence) =
+        begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(selection_kind)
+        .expect("clipboard XFixes observer");
+    let external_owner = 0xdead;
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection_atom(&xwm, kind),
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        external_owner,
+        timestamp,
+        timestamp,
+        old_sequence as u16,
+    ))
+    .expect("write external XFixes owner observation");
+    xwm.drain_events(64)
+        .expect("recheck owner after external XFixes observation");
+
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_ne!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        Some(timestamp)
+    );
+    let (pending_id, pending_timestamp, new_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("fresh post-observation owner query is pending");
+    assert_eq!(pending_id, id);
+    assert_eq!(pending_timestamp, timestamp);
+    assert_ne!(new_sequence, old_sequence);
+    assert_eq!(
+        xwm.data_bridge.selection_proxy.owner_window(selection_kind),
+        Some(owner),
+        "the active proxy owner window remains available while identity is ambiguous"
+    );
+
+    let current = xwm
+        .data_bridge
+        .selections
+        .current(selection_kind)
+        .expect("external owner enters F11-A/B1 discovery");
+    assert_eq!(current.owner, Some(external_owner));
+    assert_eq!(current.origin, Some(SelectionOrigin::X11));
+    let requests = super::read_fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&requests);
+    assert!(
+        claims.is_empty(),
+        "recheck must not issue SetSelectionOwner"
+    );
+    assert_eq!(
+        confirmations, 1,
+        "one fresh owner query replaces the old query"
+    );
+    assert!(
+        super::convert_selection_requests(&requests)
+            .iter()
+            .any(|request| {
+                request.selection == selection_atom(&xwm, kind)
+                    && request.target
+                        == xwm
+                            .atoms
+                            .get(super::super::super::atoms::XwmAtomName::Targets)
+            })
+    );
+
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        new_sequence as u16,
+        owner,
+    ))
+    .expect("write post-observation proxy-owner reply");
+    xwm.drain_events(64)
+        .expect("install authority from fresh proxy-owner reply");
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        Some((id, timestamp))
+    );
+    assert_ne!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        Some(timestamp)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+    let follow_up = fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&follow_up.2);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
+    assert!(destroyed_windows(&follow_up.2).is_empty());
+    assert!(!follow_up.2.contains(&xproto::CHANGE_PROPERTY_REQUEST));
+}
+
+#[test]
+fn selection_clear_during_pending_confirmation_rechecks_server_owner() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x4567_89ab;
+    let (owner, old_sequence) =
+        begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let clear = xproto::SelectionClearEvent {
+        response_type: xproto::SELECTION_CLEAR_EVENT,
+        sequence: old_sequence as u16,
+        time: timestamp,
+        owner,
+        selection: selection_atom(&xwm, kind),
+    };
+    peer.write_all(&raw_selection_clear(&clear))
+        .expect("write SelectionClear during owner confirmation");
+    xwm.drain_events(64)
+        .expect("recheck owner after SelectionClear observation");
+
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_ne!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        Some(timestamp)
+    );
+    let (pending_id, pending_timestamp, new_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("fresh post-SelectionClear owner query is pending");
+    assert_eq!(pending_id, id);
+    assert_eq!(pending_timestamp, timestamp);
+    assert_ne!(new_sequence, old_sequence);
+    assert_eq!(
+        xwm.data_bridge.selection_proxy.owner_window(selection_kind),
+        Some(owner)
+    );
+
+    let requests = super::read_fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&requests);
+    assert!(
+        claims.is_empty(),
+        "recheck must not issue SetSelectionOwner"
+    );
+    assert_eq!(
+        confirmations, 1,
+        "one fresh owner query replaces the old query"
+    );
+
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        new_sequence as u16,
+        owner,
+    ))
+    .expect("write post-SelectionClear proxy-owner reply");
+    xwm.drain_events(64)
+        .expect("install authority from fresh proxy-owner reply");
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        Some((id, timestamp))
+    );
+    assert_ne!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        Some(timestamp)
+    );
+    let follow_up = fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&follow_up.2);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
+    assert!(destroyed_windows(&follow_up.2).is_empty());
+}
+
+#[test]
+fn external_xfixes_recheck_reply_suppresses_without_retiring_or_reclaiming() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x5678_9abc;
+    let (owner, old_sequence) =
+        begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(selection_kind)
+        .expect("clipboard XFixes observer");
+    let external_owner = 0xbeef;
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection_atom(&xwm, kind),
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        external_owner,
+        timestamp,
+        timestamp,
+        old_sequence as u16,
+    ))
+    .expect("write external XFixes owner observation");
+    xwm.drain_events(64)
+        .expect("recheck owner after external XFixes observation");
+    let (_, _, new_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("fresh owner query is pending");
+    let requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(owner_requests(&requests).0, Vec::new());
+
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        new_sequence as u16,
+        external_owner,
+    ))
+    .expect("write post-observation external-owner reply");
+    xwm.drain_events(64)
+        .expect("suppress proxy ID from fresh external-owner result");
+
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+    assert_eq!(
+        xwm.data_bridge.selection_proxy.owner_window(selection_kind),
+        Some(owner),
+        "explicit non-ownership keeps the active owner window"
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::retiring_owner_for_test(&xwm, selection_kind),
+        None
+    );
+
+    super::super::super::selection_proxy::prepared_catalog_changed(
+        &mut xwm,
+        selection_kind,
+        80_000,
+    )
+    .expect("suppressed ID does not automatically reclaim ownership");
+    let follow_up = fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&follow_up.2);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
+    assert!(destroyed_windows(&follow_up.2).is_empty());
+    assert!(!follow_up.2.contains(&xproto::CHANGE_PROPERTY_REQUEST));
+}
+
+#[test]
+fn selection_clear_recheck_reply_suppresses_without_retiring_or_reclaiming() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x6789_abcd;
+    let (owner, old_sequence) =
+        begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let clear = xproto::SelectionClearEvent {
+        response_type: xproto::SELECTION_CLEAR_EVENT,
+        sequence: old_sequence as u16,
+        time: timestamp,
+        owner,
+        selection: selection_atom(&xwm, kind),
+    };
+    peer.write_all(&raw_selection_clear(&clear))
+        .expect("write SelectionClear during owner confirmation");
+    xwm.drain_events(64)
+        .expect("recheck owner after SelectionClear observation");
+    let (_, _, new_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("fresh owner query is pending");
+    let requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(owner_requests(&requests).0, Vec::new());
+
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        new_sequence as u16,
+        0xcafe,
+    ))
+    .expect("write post-SelectionClear external-owner reply");
+    xwm.drain_events(64)
+        .expect("suppress proxy ID from fresh external-owner result");
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        xwm.data_bridge.selection_proxy.owner_window(selection_kind),
+        Some(owner)
+    );
+    let follow_up = fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&follow_up.2);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
+    assert!(destroyed_windows(&follow_up.2).is_empty());
+}
+
+#[test]
+fn repeated_loss_observations_replace_owner_recheck_without_unbounded_state() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x789a_bcde;
+    let (owner, first_sequence) =
+        begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let original_deadline = super::super::super::selection_proxy::next_deadline_ns(&xwm)
+        .expect("owner confirmation has one original deadline");
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(selection_kind)
+        .expect("clipboard XFixes observer");
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection_atom(&xwm, kind),
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        0xdead,
+        timestamp,
+        timestamp,
+        first_sequence as u16,
+    ))
+    .expect("write first loss observation");
+    xwm.drain_events(64)
+        .expect("replace first owner query after XFixes loss");
+    let (pending_id, pending_timestamp, second_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("second owner query is current");
+    assert_eq!((pending_id, pending_timestamp), (id, timestamp));
+    assert_ne!(second_sequence, first_sequence);
+    assert_eq!(
+        super::super::super::selection_proxy::next_deadline_ns(&xwm),
+        Some(original_deadline),
+        "the first observation preserves the claim deadline"
+    );
+    let first_requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(owner_requests(&first_requests).1, 1);
+    assert!(owner_requests(&first_requests).0.is_empty());
+
+    let clear = xproto::SelectionClearEvent {
+        response_type: xproto::SELECTION_CLEAR_EVENT,
+        sequence: second_sequence as u16,
+        time: timestamp,
+        owner,
+        selection: selection_atom(&xwm, kind),
+    };
+    peer.write_all(&raw_selection_clear(&clear))
+        .expect("write second loss observation");
+    xwm.drain_events(64)
+        .expect("replace second owner query after SelectionClear");
+    let (pending_id, pending_timestamp, third_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("third owner query is the only current confirmation");
+    assert_eq!((pending_id, pending_timestamp), (id, timestamp));
+    assert_ne!(third_sequence, first_sequence);
+    assert_ne!(third_sequence, second_sequence);
+    assert_eq!(
+        super::super::super::selection_proxy::next_deadline_ns(&xwm),
+        Some(original_deadline),
+        "repeated observations never extend the original claim deadline"
+    );
+    let second_requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(owner_requests(&second_requests).1, 1);
+    assert!(owner_requests(&second_requests).0.is_empty());
+
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        first_sequence as u16,
+        owner,
+    ))
+    .expect("write stale first owner reply");
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        second_sequence as u16,
+        owner,
+    ))
+    .expect("write stale second owner reply");
+    xwm.drain_events(64)
+        .expect("ignore both discarded owner replies");
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        Some((id, timestamp, third_sequence))
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_ne!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        Some(timestamp)
+    );
+    let timeout = xwm.handle_deadlines(original_deadline);
+    assert!(timeout.error.is_none());
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::retiring_owner_for_test(&xwm, selection_kind)
+            .map(|(retiring_owner, _)| retiring_owner),
+        Some(owner),
+        "an unanswered recheck retires the exact ambiguous owner window at the original deadline"
+    );
+    let timeout_requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(destroyed_windows(&timeout_requests), [owner]);
+    assert!(owner_requests(&timeout_requests).0.is_empty());
+    assert_eq!(owner_requests(&timeout_requests).1, 0);
+}
+
+#[test]
+fn external_takeover_during_awaiting_timestamp_does_not_recheck_owner() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp_probe = super::super::super::selection_proxy::timestamp_probe_sequence_for_test(
+        &xwm,
+        selection_kind,
+    )
+    .expect("timestamp probe remains outstanding until its property event is consumed");
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(selection_kind)
+        .expect("clipboard XFixes observer");
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection_atom(&xwm, kind),
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        0xdead,
+        10,
+        9,
+        0,
+    ))
+    .expect("write external takeover during timestamp probe");
+    xwm.drain_events(64)
+        .expect("cancel inert timestamp probe after external takeover");
+
+    assert_eq!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::timestamp_probe_sequence_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        Some(timestamp_probe)
+    );
+    let requests = super::read_fixture_requests(&mut peer);
+    let (claims, confirmations) = owner_requests(&requests);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
+    assert!(!requests.contains(&xproto::SET_SELECTION_OWNER_REQUEST));
+    assert!(!requests.contains(&xproto::GET_SELECTION_OWNER_REQUEST));
+}
+
+#[test]
+fn clipboard_recheck_does_not_change_primary_serving_state() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let (mut xwm, mut peer) = test_fixture(generation(331));
+    initialize_selection_wire(&mut xwm, &mut peer);
+    let clipboard_id = XwaylandProxySelectionId {
+        kind: XwaylandSelectionKind::Clipboard,
+        selection_generation: 51,
+        source_key: crate::compositor::SelectionSourceKey(5101),
+    };
+    let primary_id = XwaylandProxySelectionId {
+        kind: XwaylandSelectionKind::Primary,
+        selection_generation: 52,
+        source_key: crate::compositor::SelectionSourceKey(5201),
+    };
+    let mime_types = vec!["image/png".to_owned()];
+    super::super::super::selection_wire::submit_proxy_selection_snapshots(
+        &mut xwm,
+        [
+            super::proxy_snapshot(XwaylandSelectionKind::Clipboard, 51, 5101, &["image/png"]),
+            super::proxy_snapshot(XwaylandSelectionKind::Primary, 52, 5201, &["image/png"]),
+        ],
+    )
+    .expect("prepare both catalogs");
+    super::finish_proxy_catalog(&mut xwm, &mut peer, clipboard_id, &mime_types);
+    super::finish_proxy_catalog(&mut xwm, &mut peer, primary_id, &mime_types);
+
+    let clipboard_timestamp = 0x1234_5101;
+    let primary_timestamp = 0x1234_5201;
+    inject_proxy_time(
+        &mut xwm,
+        &mut peer,
+        XwaylandSelectionKind::Clipboard,
+        clipboard_timestamp,
+    );
+    let (clipboard_claims, clipboard_confirmations) = take_owner_requests(&mut peer);
+    let clipboard_owner = xwm
+        .data_bridge
+        .selection_proxy
+        .owner_window(SelectionKind::Clipboard)
+        .expect("Clipboard owner window");
+    assert_eq!(
+        clipboard_claims,
+        [(
+            clipboard_owner,
+            selection_atom(&xwm, XwaylandSelectionKind::Clipboard),
+            clipboard_timestamp
+        )]
+    );
+    assert_eq!(clipboard_confirmations, 1);
+    let (_, _, clipboard_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+        )
+        .expect("Clipboard owner confirmation pending");
+
+    let primary_owner = xwm
+        .data_bridge
+        .selection_proxy
+        .owner_window(SelectionKind::Primary)
+        .expect("Primary owner window");
+    inject_proxy_time(
+        &mut xwm,
+        &mut peer,
+        XwaylandSelectionKind::Primary,
+        primary_timestamp,
+    );
+    let (primary_claims, primary_confirmations) = take_owner_requests(&mut peer);
+    assert_eq!(
+        primary_claims,
+        [(
+            primary_owner,
+            selection_atom(&xwm, XwaylandSelectionKind::Primary),
+            primary_timestamp
+        )]
+    );
+    assert_eq!(primary_confirmations, 1);
+    let (_, _, primary_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            SelectionKind::Primary,
+        )
+        .expect("Primary owner confirmation pending");
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        primary_sequence as u16,
+        primary_owner,
+    ))
+    .expect("write Primary owner confirmation");
+    xwm.drain_events(64)
+        .expect("confirm Primary while Clipboard stays pending");
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, SelectionKind::Primary),
+        Some((primary_id, primary_timestamp))
+    );
+
+    let primary_target = super::super::super::selection_wire::prepared_proxy_selection_for_test(
+        &xwm,
+        SelectionKind::Primary,
+    )
+    .expect("prepared Primary catalog")
+    .data_targets[0]
+        .target;
+    let primary_request = request(
+        &xwm,
+        XwaylandSelectionKind::Primary,
+        primary_target,
+        TARGET_PROPERTY + 1,
+        primary_timestamp,
+    );
+    super::super::super::selection_proxy::handle_selection_request(&mut xwm, primary_request, 500)
+        .expect("start Primary serving work");
+    assert_eq!(xwm.data_bridge.selection_outgoing.active_count(), 1);
+    assert_eq!(
+        super::super::super::selection_proxy::request_count_for_test(&xwm),
+        1
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, SelectionKind::Primary),
+        Some(primary_timestamp)
+    );
+
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(SelectionKind::Clipboard)
+        .expect("Clipboard XFixes observer");
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection_atom(&xwm, XwaylandSelectionKind::Clipboard),
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        0xd00d,
+        clipboard_timestamp,
+        clipboard_timestamp,
+        clipboard_sequence as u16,
+    ))
+    .expect("write Clipboard external-owner observation");
+    xwm.drain_events(64)
+        .expect("recheck Clipboard without touching Primary");
+    let (_, _, current_clipboard_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            SelectionKind::Clipboard,
+        )
+        .expect("Clipboard confirmation replaced by recheck");
+    assert_ne!(current_clipboard_sequence, clipboard_sequence);
+    assert_ne!(
+        super::super::super::selection_proxy::suppressed_id_for_test(
+            &xwm,
+            SelectionKind::Clipboard
+        ),
+        Some(clipboard_id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(
+            &xwm,
+            SelectionKind::Clipboard
+        ),
+        Some(clipboard_timestamp)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, SelectionKind::Primary),
+        Some((primary_id, primary_timestamp))
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, SelectionKind::Primary),
+        Some(primary_timestamp)
+    );
+    assert_eq!(xwm.data_bridge.selection_outgoing.active_count(), 1);
+    assert_eq!(
+        super::super::super::selection_proxy::request_count_for_test(&xwm),
+        1
+    );
+}
+
+#[test]
+fn generation_teardown_discards_pending_owner_recheck() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x89ab_cdef;
+    let (owner, old_sequence) =
+        begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let observer = xwm
+        .data_bridge
+        .selection_wire
+        .observer_window_for_test(selection_kind)
+        .expect("clipboard XFixes observer");
+    peer.write_all(&super::raw_xfixes_selection_event(
+        selection_atom(&xwm, kind),
+        observer,
+        x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+        0xf00d,
+        timestamp,
+        timestamp,
+        old_sequence as u16,
+    ))
+    .expect("write external owner observation");
+    xwm.drain_events(64)
+        .expect("issue post-observation owner recheck");
+    let (_, _, recheck_sequence) =
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        )
+        .expect("owner recheck remains pending before teardown");
+    assert_ne!(recheck_sequence, old_sequence);
+    let requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(owner_requests(&requests).1, 1);
+
+    xwm.clear_generation(generation(301));
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        xwm.data_bridge.selection_proxy.owner_window(selection_kind),
+        None
+    );
+    let teardown_requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(owner_requests(&teardown_requests).1, 0);
+    assert!(owner_requests(&teardown_requests).0.is_empty());
+
+    peer.write_all(&super::raw_get_selection_owner_reply(
+        recheck_sequence as u16,
+        owner,
+    ))
+    .expect("write late owner recheck reply after generation teardown");
+    xwm.drain_events(64)
+        .expect("ignore recheck reply from retired generation");
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+}
+
+#[test]
+fn expired_owner_confirmation_loss_uses_ambiguous_retirement_path() {
+    use super::super::super::data_bridge::SelectionKind;
+
+    let kind = XwaylandSelectionKind::Clipboard;
+    let selection_kind = SelectionKind::Clipboard;
+    let (mut xwm, mut peer, id, _) = proxy_fixture_without_authority(kind);
+    let _ = fixture_requests(&mut peer);
+    let timestamp = 0x9abc_def0;
+    let (owner, _) = begin_pending_owner_confirmation(&mut xwm, &mut peer, kind, id, timestamp);
+    let deadline = super::super::super::selection_proxy::next_deadline_ns(&xwm)
+        .expect("owner confirmation deadline");
+    let clear = xproto::SelectionClearEvent {
+        response_type: xproto::SELECTION_CLEAR_EVENT,
+        sequence: 0,
+        time: timestamp,
+        owner,
+        selection: selection_atom(&xwm, kind),
+    };
+
+    assert!(
+        super::super::super::selection_proxy::selection_clear(&mut xwm, clear, deadline)
+            .expect("expire ambiguous owner confirmation on loss observation")
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::authority_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::suppressed_id_for_test(&xwm, selection_kind),
+        Some(id)
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::held_timestamp_for_test(&xwm, selection_kind),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::pending_owner_confirmation_for_test(
+            &xwm,
+            selection_kind,
+        ),
+        None
+    );
+    assert_eq!(
+        super::super::super::selection_proxy::retiring_owner_for_test(&xwm, selection_kind)
+            .map(|(retiring_owner, _)| retiring_owner),
+        Some(owner)
+    );
+    let requests = super::read_fixture_requests(&mut peer);
+    assert_eq!(destroyed_windows(&requests), [owner]);
+    let (claims, confirmations) = owner_requests(&requests);
+    assert!(claims.is_empty());
+    assert_eq!(confirmations, 0);
 }
