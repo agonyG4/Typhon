@@ -652,6 +652,50 @@ impl CompositorState {
                 })
                 .unwrap_or(canonical_geometry)
         };
+        if compositor_debug_surface_logging_enabled() {
+            let committed_xdg_window_geometry = self
+                .surface_window_geometries
+                .get(&root_surface_id)
+                .copied();
+            let derived_root_render_placement = super::window_resize::derive_root_render_placement(
+                canonical_geometry.placement,
+                committed_xdg_window_geometry,
+            );
+            let canonical_frame_output_rect =
+                self.presentation_rect_for_geometry(root_surface_id, canonical_geometry);
+            let resolved_root_output_origin = self
+                .interaction_debug_surface_output_origins(root_surface_id)
+                .root_output_origin;
+            let presented_window_rect = self
+                .presented_window_geometry(root_surface_id)
+                .map(crate::presentation_animation::PresentedWindowGeometry::presented_rect);
+            let presented_transform = self.presented_presentation_transform(root_surface_id);
+            let presentation_animation_pending =
+                self.presentation_animation_pending_for_root(root_surface_id);
+            eprintln!(
+                "oblivion-one compositor: event=window_interaction_geometry_handoff root_surface_id={} window_id={} interaction_kind={:?} interaction_source={:?} canonical_frame_placement={:?} canonical_frame_output_rect={:?} committed_xdg_window_geometry={:?} derived_root_render_placement={:?} resolved_root_output_origin={:?} presented_frame_id={} presented_window_rect={:?} presented_transform_present={} presented_transform_canonical_rect={:?} presented_transform_rect={:?} presented_transform_transition_id={:?} presented_transform_mathematically_settled={:?} presentation_animation_pending={} chosen_start_placement={:?} pointer_output_x={} pointer_output_y={}",
+                root_surface_id,
+                window_id.get(),
+                kind,
+                source,
+                canonical_geometry.placement,
+                canonical_frame_output_rect,
+                committed_xdg_window_geometry,
+                derived_root_render_placement,
+                resolved_root_output_origin,
+                self.presented_presentation_frame_id,
+                presented_window_rect,
+                presented_transform.is_some(),
+                presented_transform.map(|transform| transform.canonical_rect),
+                presented_transform.map(|transform| transform.presented_rect),
+                presented_transform.map(|transform| transform.transition_id),
+                presented_transform.map(|transform| transform.mathematically_settled),
+                presentation_animation_pending,
+                start_geometry.placement,
+                x,
+                y,
+            );
+        }
         if let Some(preparation) = tiled_resize_data.as_mut() {
             self.rebase_tiled_resize_preparation(root_surface_id, window_id, preparation);
         }
@@ -774,6 +818,7 @@ impl CompositorState {
             start_width,
             start_height,
             drag_committed: false,
+            first_move_geometry_logged: false,
             resize_interaction_id,
             tiled_resize,
             decoration_owned,
@@ -1319,6 +1364,47 @@ impl CompositorState {
                     placement,
                     RenderGenerationCause::WindowMove,
                 );
+                if moved
+                    && !interaction.first_move_geometry_logged
+                    && compositor_debug_surface_logging_enabled()
+                {
+                    let committed_xdg_window_geometry = self
+                        .surface_window_geometries
+                        .get(&interaction.root_surface_id)
+                        .copied();
+                    let derived_root_render_placement =
+                        super::window_resize::derive_root_render_placement(
+                            placement,
+                            committed_xdg_window_geometry,
+                        );
+                    let actual_root_render_placement = self
+                        .renderable_surfaces
+                        .iter()
+                        .find(|surface| surface.surface_id == interaction.root_surface_id)
+                        .map(|surface| surface.render_placement.unwrap_or(surface.placement));
+                    let output_origins =
+                        self.interaction_debug_surface_output_origins(interaction.root_surface_id);
+                    let dx = (x - interaction.start_pointer_x).round() as i32;
+                    let dy = (y - interaction.start_pointer_y).round() as i32;
+                    eprintln!(
+                        "oblivion-one compositor: event=window_interaction_first_move root_surface_id={} start_placement={:?} start_pointer=({}, {}) current_pointer=({}, {}) delta=({}, {}) target_canonical_placement={:?} derived_root_render_placement={:?} resolved_root_render_placement={:?} resolved_root_output_origin={:?} resolved_child_output_origin={:?}",
+                        interaction.root_surface_id,
+                        interaction.start_placement,
+                        interaction.start_pointer_x,
+                        interaction.start_pointer_y,
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        placement,
+                        derived_root_render_placement,
+                        actual_root_render_placement,
+                        output_origins.root_output_origin,
+                        output_origins.first_child_output_origin,
+                    );
+                    interaction.first_move_geometry_logged = true;
+                    self.window_interaction = Some(interaction);
+                }
                 if moved
                     && self
                         .window(interaction.window_id)

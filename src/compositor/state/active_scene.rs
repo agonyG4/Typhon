@@ -3,6 +3,12 @@ use crate::presentation_animation::PresentationOpacity;
 use crate::wm::{SpecialWorkspaceId, WorkspaceId};
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InteractionDebugSurfaceOutputOrigins {
+    pub(super) root_output_origin: Option<(i32, i32)>,
+    pub(super) first_child_output_origin: Option<(u32, (i32, i32))>,
+}
+
 #[derive(Debug)]
 pub(in crate::compositor) struct PendingPresentationGeometryTransaction {
     pub(in crate::compositor) started_at: AnimationTime,
@@ -660,6 +666,22 @@ impl CompositorState {
         let canonical_geometry = self
             .current_visual_root_window_geometry(root_surface_id)
             .or_else(|| self.current_root_window_geometry(root_surface_id))?;
+        let debug_before = compositor_debug_surface_logging_enabled().then(|| {
+            let root_render = self
+                .renderable_surfaces
+                .iter()
+                .find(|surface| surface.surface_id == root_surface_id)
+                .map(|surface| surface.render_placement.unwrap_or(surface.placement));
+            let output_origins = self.interaction_debug_surface_output_origins(root_surface_id);
+            (
+                canonical_geometry,
+                root_render,
+                output_origins,
+                self.surface_window_geometries
+                    .get(&root_surface_id)
+                    .copied(),
+            )
+        });
 
         // Keep the last physically presented transform until the next frame
         // publishes its replacement. This preserves the direct-scanout
@@ -710,11 +732,75 @@ impl CompositorState {
         if visual_changed || placement_changed {
             self.advance_pointer_hit_generation();
         }
+        if let Some((
+            canonical_before,
+            root_render_before,
+            output_origins_before,
+            xdg_geometry_before,
+        )) = debug_before
+        {
+            let canonical_after = self
+                .current_visual_root_window_geometry(root_surface_id)
+                .or_else(|| self.current_root_window_geometry(root_surface_id));
+            let root_render_after = self
+                .renderable_surfaces
+                .iter()
+                .find(|surface| surface.surface_id == root_surface_id)
+                .map(|surface| surface.render_placement.unwrap_or(surface.placement));
+            let output_origins_after =
+                self.interaction_debug_surface_output_origins(root_surface_id);
+            let xdg_geometry_after = self
+                .surface_window_geometries
+                .get(&root_surface_id)
+                .copied();
+            eprintln!(
+                "oblivion-one compositor: event=window_interaction_geometry_rebase root_surface_id={} canonical_before={:?} presented_input={:?} canonical_after={:?} root_render_before={:?} root_render_after={:?} root_output_before={:?} root_output_after={:?} child_output_before={:?} child_output_after={:?} xdg_geometry_before={:?} xdg_geometry_after={:?}",
+                root_surface_id,
+                canonical_before,
+                presented_origin,
+                canonical_after,
+                root_render_before,
+                root_render_after,
+                output_origins_before.root_output_origin,
+                output_origins_after.root_output_origin,
+                output_origins_before.first_child_output_origin,
+                output_origins_after.first_child_output_origin,
+                xdg_geometry_before,
+                xdg_geometry_after,
+            );
+        }
         Some(WindowGeometry::new(
             presented_origin,
             canonical_geometry.width,
             canonical_geometry.height,
         ))
+    }
+
+    pub(super) fn interaction_debug_surface_output_origins(
+        &self,
+        root_surface_id: u32,
+    ) -> InteractionDebugSurfaceOutputOrigins {
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        let root_index = surfaces
+            .iter()
+            .position(|surface| surface.surface_id == root_surface_id);
+        let root_origin = root_index.and_then(|index| origins.get(index).copied());
+        let child_origin = surfaces.iter().enumerate().find_map(|(index, surface)| {
+            (surface.surface_id != root_surface_id
+                && self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
+                .then(|| {
+                    origins
+                        .get(index)
+                        .copied()
+                        .map(|origin| (surface.surface_id, origin))
+                })
+                .flatten()
+        });
+        InteractionDebugSurfaceOutputOrigins {
+            root_output_origin: root_origin,
+            first_child_output_origin: child_origin,
+        }
     }
 
     pub(in crate::compositor) fn publish_presented_presentation(

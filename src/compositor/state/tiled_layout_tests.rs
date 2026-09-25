@@ -1000,6 +1000,7 @@ fn active_tiled_resize_migration_commits_inside_one_outer_layout_batch() {
         start_width: 800,
         start_height: 600,
         drag_committed: true,
+        first_move_geometry_logged: false,
         resize_interaction_id: Some(ResizeInteractionId::new(900)),
         tiled_resize: true,
         decoration_owned: false,

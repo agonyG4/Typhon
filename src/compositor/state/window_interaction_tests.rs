@@ -2,6 +2,8 @@ use super::*;
 use crate::wm::layout::TiledResizeHandle;
 use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation};
 use std::num::NonZeroU64;
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 
 #[test]
 fn fullscreen_window_interaction_eligibility_rejects_move_and_all_resize_edges() {
@@ -84,6 +86,189 @@ fn presented_origin_rebase_cancels_animation_without_baking_presented_size() {
         ))
     );
     assert_eq!(state.presentation_animator.active_count(), 0);
+}
+
+#[test]
+fn interactive_move_takeover_keeps_xdg_frame_and_root_buffer_origins_separate() {
+    fn scene_origin(state: &CompositorState, surface_id: u32) -> (i32, i32) {
+        let index = state
+            .active_scene_surfaces()
+            .iter()
+            .position(|surface| surface.surface_id == surface_id)
+            .expect("surface belongs to ActiveScene");
+        state.active_scene_surface_origins()[index]
+    }
+
+    for (xdg_x, xdg_y) in [(10, 10), (0, 0)] {
+        let mut state = CompositorState::new(None);
+        state.ensure_native_output_id().expect("output identity");
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let mut display_handle = display.handle();
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let root =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let child =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let root_surface_id = compositor_surface_id(&root);
+        let child_surface_id = compositor_surface_id(&child);
+        let window_id = state.allocate_window_id().expect("window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
+            .expect("XDG toplevel window");
+
+        let xdg_geometry = XdgWindowGeometry::new(xdg_x, xdg_y, 300, 200);
+        state
+            .surface_window_geometries
+            .insert(root_surface_id, xdg_geometry);
+        state.append_renderable_surface(test_renderable_surface(
+            root_surface_id,
+            300 + xdg_x as u32,
+            200 + xdg_y as u32,
+        ));
+        state.append_renderable_surface(test_renderable_surface(child_surface_id, 300, 200));
+        let canonical_frame = SurfacePlacement::absolute_root_at(200, 200);
+        assert!(state.set_surface_placement(root_surface_id, canonical_frame));
+        assert!(state.set_surface_placement(
+            child_surface_id,
+            SurfacePlacement::subsurface(root_surface_id, xdg_x, xdg_y),
+        ));
+        state.update_toplevel_visual_render_assignment(root_surface_id);
+        state.rebuild_active_scene_view();
+
+        let xdg_geometry_before = state.surface_window_geometries[&root_surface_id];
+        let canonical_geometry = state
+            .current_root_window_geometry(root_surface_id)
+            .expect("canonical window-frame geometry");
+        assert_eq!(canonical_geometry.placement, canonical_frame);
+        assert_eq!(
+            scene_origin(&state, root_surface_id),
+            (200 - xdg_x, 200 - xdg_y),
+            "canonical root output origin is frame minus committed XDG origin"
+        );
+        assert_eq!(scene_origin(&state, child_surface_id), (200, 200));
+
+        let canonical_rect = state
+            .presentation_rect_for_geometry(root_surface_id, canonical_geometry)
+            .expect("canonical presentation frame");
+        state.start_test_presentation_transition(
+            root_surface_id,
+            PresentationRect::new(100.0, 100.0, 300.0, 200.0).expect("transition start"),
+            canonical_rect,
+            AnimationTime::from_nanos(0),
+        );
+        let presentation_sample =
+            state.presentation_scene_sample_at(AnimationTime::from_nanos(500_000));
+        let targets = state.native_frame_presentation_targets(state.active_scene_surfaces());
+        let physically_presented_rect = presentation_sample
+            .transform_for_root(root_surface_id)
+            .expect("active physical presentation transform")
+            .presented_rect;
+        assert_eq!(
+            (physically_presented_rect.x(), physically_presented_rect.y()),
+            (150.0, 150.0)
+        );
+        let presented_windows =
+            state.presented_window_geometries_for_targets(&presentation_sample, &targets);
+        let presentation_frame = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &presentation_sample,
+            presented_windows,
+        );
+        state.publish_presented_presentation(7, &presentation_frame);
+        assert_eq!(state.presented_presentation_frame_id(), 7);
+
+        let interaction_began =
+            state.begin_window_interaction_for_root(BeginWindowInteraction::for_test(
+                Some(window_id),
+                root_surface_id,
+                160.0,
+                160.0,
+                WindowInteractionKind::Move,
+                WindowInteractionSource::XdgToplevelMove,
+                Some(child_surface_id),
+            ));
+        assert!(interaction_began, "XDG move should take over the window");
+        let interaction = state.window_interaction.expect("active move interaction");
+        assert_eq!(
+            interaction.start_placement,
+            SurfacePlacement::absolute_root_at(150, 150)
+        );
+        assert_eq!(
+            state.current_root_window_geometry(root_surface_id),
+            Some(WindowGeometry::new(
+                SurfacePlacement::absolute_root_at(150, 150),
+                300,
+                200,
+            )),
+            "takeover materializes the physically presented window frame exactly once"
+        );
+        assert_eq!(
+            state.renderable_surfaces[0].render_placement,
+            Some(SurfacePlacement::absolute_root_at(150 - xdg_x, 150 - xdg_y))
+        );
+        assert_eq!(
+            scene_origin(&state, root_surface_id),
+            (150 - xdg_x, 150 - xdg_y)
+        );
+        assert_eq!(scene_origin(&state, child_surface_id), (150, 150));
+        assert_eq!(
+            state.surface_window_geometries[&root_surface_id],
+            xdg_geometry_before
+        );
+        assert_eq!(state.presentation_animator.active_count(), 0);
+
+        assert!(state.update_window_interaction_by_id(interaction.id, 160.0, 160.0));
+        let _ = state.flush_pending_floating_interaction_geometry();
+        assert_eq!(
+            state.current_root_window_geometry(root_surface_id),
+            Some(WindowGeometry::new(
+                SurfacePlacement::absolute_root_at(150, 150),
+                300,
+                200,
+            )),
+            "zero-delta update and flush preserve the handed-off frame"
+        );
+        assert_eq!(
+            scene_origin(&state, root_surface_id),
+            (150 - xdg_x, 150 - xdg_y)
+        );
+        assert_eq!(scene_origin(&state, child_surface_id), (150, 150));
+
+        for (dx, dy) in [(17, 9), (32, 20), (40, 25)] {
+            assert!(state.update_window_interaction_by_id(
+                interaction.id,
+                160.0 + f64::from(dx),
+                160.0 + f64::from(dy),
+            ));
+            assert!(state.flush_pending_floating_interaction_geometry());
+            let frame = state
+                .current_root_window_geometry(root_surface_id)
+                .expect("moved window frame");
+            assert_eq!(
+                frame.placement,
+                SurfacePlacement::absolute_root_at(150 + dx, 150 + dy)
+            );
+            assert_eq!(
+                state.renderable_surfaces[0].render_placement,
+                Some(SurfacePlacement::absolute_root_at(
+                    150 + dx - xdg_x,
+                    150 + dy - xdg_y,
+                ))
+            );
+            assert_eq!(scene_origin(&state, child_surface_id), (150 + dx, 150 + dy));
+            assert_eq!(
+                state.surface_window_geometries[&root_surface_id],
+                xdg_geometry_before
+            );
+        }
+
+        assert!(state.end_window_interaction_by_id_with_reason(
+            interaction.id,
+            WindowInteractionEndReason::ExplicitEnd,
+        ));
+    }
 }
 
 #[test]
@@ -462,6 +647,7 @@ fn test_window_interaction_with_target(
         start_width: 300,
         start_height: 200,
         drag_committed: false,
+        first_move_geometry_logged: false,
         resize_interaction_id: matches!(kind, WindowInteractionKind::Resize(_))
             .then_some(ResizeInteractionId::new(id)),
         tiled_resize: false,
