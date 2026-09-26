@@ -317,6 +317,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
     CaptureActiveLockedPointerAnchor(Sender<Option<(f64, f64)>>),
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
+    CaptureSoleToplevelRootSurfaceId(Sender<Option<u32>>),
     CaptureKeyboardFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedWindowId(Sender<Option<WindowId>>),
     CaptureFocusedToplevelMode(Sender<Option<ToplevelMode>>),
@@ -333,6 +334,18 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRootRestoreGeometry {
         root_surface_id: u32,
         reply: Sender<Option<WindowGeometry>>,
+    },
+    CapturePendingNormalRestore {
+        root_surface_id: u32,
+        reply: Sender<bool>,
+    },
+    StartUnknownRestoreBeforeFirstBuffer {
+        root_surface_id: u32,
+        reply: Sender<bool>,
+    },
+    BeginUnknownNormalRestore {
+        root_surface_id: u32,
+        reply: Sender<bool>,
     },
     CapturePointerOwnershipIsClear(Sender<bool>),
     CaptureWindowInteractionReleaseMetrics(Sender<WindowInteractionReleaseMetrics>),
@@ -662,6 +675,44 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .restore_root_window_for_interaction(root_surface_id, geometry);
                         server.publish_astrea_toplevel_updates();
                         let _ = reply.send(configured);
+                    }
+                    ServerCommand::StartUnknownRestoreBeforeFirstBuffer {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let maximized = server
+                            .state
+                            .set_root_window_mode(root_surface_id, ToplevelMode::Maximized);
+                        let restored =
+                            maximized && server.state.restore_normal_root_window(root_surface_id);
+                        server.publish_astrea_toplevel_updates();
+                        let _ = reply.send(restored);
+                    }
+                    ServerCommand::BeginUnknownNormalRestore {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let started = server
+                            .state
+                            .window_id_for_surface(root_surface_id)
+                            .is_some_and(|window_id| {
+                                let placement = server.state.surface_placement(root_surface_id);
+                                let retained_geometry = server
+                                    .state
+                                    .current_visual_root_window_geometry(root_surface_id)
+                                    .or_else(|| {
+                                        server.state.current_root_window_geometry(root_surface_id)
+                                    })
+                                    .unwrap_or_else(|| WindowGeometry::new(placement, 0, 0));
+                                server.state.begin_pending_normal_restore(
+                                    root_surface_id,
+                                    window_id,
+                                    placement,
+                                    PendingNormalRestorePolicy::StoredPlacement,
+                                    retained_geometry,
+                                )
+                            });
+                        let _ = reply.send(started);
                     }
                     ServerCommand::ActivateWorkspace { workspace } => {
                         if let Some(workspace) = WorkspaceId::new(workspace) {
@@ -1633,6 +1684,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .map(compositor_surface_id),
                         );
                     }
+                    ServerCommand::CaptureSoleToplevelRootSurfaceId(reply) => {
+                        let root_surface_id = (server.state.toplevel_surfaces.len() == 1)
+                            .then(|| server.state.toplevel_surfaces.keys().next().copied())
+                            .flatten();
+                        let _ = reply.send(root_surface_id);
+                    }
                     ServerCommand::CaptureKeyboardFocusSurfaceId(reply) => {
                         let _ = reply.send(
                             server
@@ -1690,6 +1747,17 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .and_then(|window_id| server.state.window(window_id))
                             .and_then(|window| window.state.restore_geometry());
                         let _ = reply.send(geometry);
+                    }
+                    ServerCommand::CapturePendingNormalRestore {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            server
+                                .state
+                                .pending_normal_restores
+                                .contains_key(&root_surface_id),
+                        );
                     }
                     ServerCommand::CapturePointerOwnershipIsClear(reply) => {
                         let _ = reply.send(server.pointer_ownership_is_clear());
@@ -2291,6 +2359,18 @@ pub(in crate::compositor::tests) fn capture_focused_surface_id(
         .expect("server should report keyboard focus surface")
 }
 
+pub(in crate::compositor::tests) fn capture_sole_toplevel_root_surface_id(
+    commands: &Sender<ServerCommand>,
+) -> Option<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSoleToplevelRootSurfaceId(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report the sole toplevel root surface")
+}
+
 pub(in crate::compositor::tests) fn capture_keyboard_focus_surface_id(
     commands: &Sender<ServerCommand>,
 ) -> Option<u32> {
@@ -2414,6 +2494,54 @@ pub(in crate::compositor::tests) fn capture_root_restore_geometry(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report root restore geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_pending_normal_restore(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePendingNormalRestore {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pending normal restore state")
+}
+
+pub(in crate::compositor::tests) fn start_unknown_restore_before_first_buffer(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::StartUnknownRestoreBeforeFirstBuffer {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should start and restore the unknown-size window")
+}
+
+pub(in crate::compositor::tests) fn begin_unknown_normal_restore(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::BeginUnknownNormalRestore {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should begin unknown-size normal restore")
 }
 
 pub(in crate::compositor::tests) fn capture_pointer_ownership_is_clear(

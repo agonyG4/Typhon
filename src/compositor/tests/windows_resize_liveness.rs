@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn fullscreen_during_active_resize_restores_visible_pre_transition_geometry() {
+fn fullscreen_during_active_resize_restores_committed_geometry() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -28,12 +28,12 @@ fn fullscreen_during_active_resize_restores_visible_pre_transition_geometry() {
     .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!((state.toplevel_width, state.toplevel_height), (900, 700));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (300, 200));
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
 }
 
 #[test]
-fn maximize_during_active_resize_restores_visible_pre_transition_geometry() {
+fn maximize_during_active_resize_restores_committed_geometry() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -60,7 +60,7 @@ fn maximize_during_active_resize_restores_visible_pre_transition_geometry() {
     .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!((state.toplevel_width, state.toplevel_height), (900, 700));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (300, 200));
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
 }
 

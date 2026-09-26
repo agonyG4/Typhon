@@ -159,6 +159,7 @@ mod input_output;
 mod layer_shell;
 mod lifecycle;
 mod native_geometry;
+mod normal_restore_geometry;
 mod plan;
 mod presentation_modes;
 mod primary_selection;

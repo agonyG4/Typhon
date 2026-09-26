@@ -111,6 +111,7 @@ impl CompositorState {
                 configure_serial,
                 restore_placement,
                 policy,
+                response_commit_sequence: None,
             },
         );
         if compositor_debug_surface_logging_enabled() {
@@ -191,15 +192,17 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn resolve_pending_normal_restore(
+    pub(in crate::compositor) fn qualify_pending_normal_restore_response(
         &mut self,
         root_surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
-        committed_geometry: Option<XdgWindowGeometry>,
     ) -> bool {
         let Some(pending) = self.pending_normal_restores.get(&root_surface_id).copied() else {
             return false;
         };
+        if pending.response_commit_sequence.is_some() {
+            return false;
+        }
         let identity_matches = pending.root_surface_id == root_surface_id
             && self.window_id_for_surface(root_surface_id) == Some(pending.window_id)
             && self
@@ -228,11 +231,88 @@ impl CompositorState {
         if commit_sequence.get() <= ack_commit_floor.get() {
             return false;
         }
-        let Some(committed_geometry) =
-            committed_geometry.filter(|geometry| geometry.width > 0 && geometry.height > 0)
-        else {
+
+        let Some(pending) = self.pending_normal_restores.get_mut(&root_surface_id) else {
             return false;
         };
+        pending.response_commit_sequence = Some(commit_sequence);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=normal_restore_response_qualified root_surface_id={root_surface_id} window_id={} configure_serial={} root_commit_sequence={}",
+                pending.window_id.get(),
+                pending.configure_serial,
+                commit_sequence.get(),
+            );
+        }
+        true
+    }
+
+    pub(in crate::compositor::state) fn try_finalize_pending_normal_restore_from_committed_state(
+        &mut self,
+        root_surface_id: u32,
+    ) -> bool {
+        if self.surface_tree_generation.is_some() {
+            return false;
+        }
+        self.finalize_pending_normal_restore_from_committed_state(root_surface_id)
+    }
+
+    pub(in crate::compositor::state) fn finalize_pending_normal_restore_at_surface_tree_boundary(
+        &mut self,
+        root_surface_id: u32,
+    ) -> bool {
+        debug_assert!(self.surface_tree_generation.is_some());
+        self.finalize_pending_normal_restore_from_committed_state(root_surface_id)
+    }
+
+    fn finalize_pending_normal_restore_from_committed_state(
+        &mut self,
+        root_surface_id: u32,
+    ) -> bool {
+        let Some(pending) = self.pending_normal_restores.get(&root_surface_id).copied() else {
+            return false;
+        };
+        let Some(response_commit_sequence) = pending.response_commit_sequence else {
+            return false;
+        };
+        let identity_matches = pending.root_surface_id == root_surface_id
+            && self.window_id_for_surface(root_surface_id) == Some(pending.window_id)
+            && self
+                .window(pending.window_id)
+                .is_some_and(|window| window.root_surface_id == root_surface_id);
+        if !identity_matches
+            || !self
+                .window(pending.window_id)
+                .is_some_and(|window| window.state.mode() == ToplevelMode::Normal)
+        {
+            self.cancel_pending_normal_restore(root_surface_id, "root_or_mode_replaced");
+            return false;
+        }
+        let Some(observation) = self.normal_restore_geometry_observation(root_surface_id) else {
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: event=normal_restore_geometry_unavailable root_surface_id={root_surface_id} window_id={} configure_serial={} response_commit_sequence={}",
+                    pending.window_id.get(),
+                    pending.configure_serial,
+                    response_commit_sequence.get(),
+                );
+            }
+            return false;
+        };
+        let committed_geometry = observation.geometry;
+        if committed_geometry.width <= 0 || committed_geometry.height <= 0 {
+            return false;
+        }
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=normal_restore_geometry_observed root_surface_id={root_surface_id} source={} geometry={},{},{},{}",
+                observation.source.label(),
+                committed_geometry.x,
+                committed_geometry.y,
+                committed_geometry.width,
+                committed_geometry.height,
+            );
+        }
         let Ok(width) = u32::try_from(committed_geometry.width) else {
             return false;
         };
@@ -269,11 +349,20 @@ impl CompositorState {
                 )
             }
         };
+        let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         self.pending_normal_restores.remove(&root_surface_id);
         if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
             let _ = window.take_normal_restore_target();
         }
         self.materialize_pending_normal_restore_geometry(root_surface_id, target);
+        self.update_toplevel_visual_render_assignment_after_root_commit(
+            root_surface_id,
+            response_commit_sequence,
+        );
+        self.refresh_pointer_focus_after_geometry_change(
+            true,
+            pointer_hit_generation_before_publication,
+        );
         if let PendingNormalRestorePolicy::InteractivePointer {
             latest_pointer_x,
             latest_pointer_y,
@@ -295,10 +384,11 @@ impl CompositorState {
         }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
-                "oblivion-one compositor: event=normal_restore_finalized root_surface_id={root_surface_id} window_id={} configure_serial={} root_commit_sequence={} client_geometry=({}, {}, {}, {}) pointer_policy={:?} canonical_frame=({},{},{},{})",
+                "oblivion-one compositor: event=normal_restore_finalized root_surface_id={root_surface_id} window_id={} configure_serial={} response_commit_sequence={} geometry_source={} client_geometry=({}, {}, {}, {}) pointer_policy={:?} canonical_frame=({},{},{},{})",
                 pending.window_id.get(),
                 pending.configure_serial,
-                commit_sequence.get(),
+                response_commit_sequence.get(),
+                observation.source.label(),
                 committed_geometry.x,
                 committed_geometry.y,
                 committed_geometry.width,

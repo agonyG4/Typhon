@@ -3,7 +3,9 @@ use std::{collections::VecDeque, time::Instant};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{WEnum, protocol::wl_surface};
 
-use super::{SurfacePlacement, WindowGeometry, WindowId, XdgWindowGeometry, render};
+use super::{
+    SurfaceCommitSequence, SurfacePlacement, WindowGeometry, WindowId, XdgWindowGeometry, render,
+};
 
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
@@ -300,6 +302,7 @@ pub(super) struct PendingNormalRestore {
     pub(super) configure_serial: u32,
     pub(super) restore_placement: SurfacePlacement,
     pub(super) policy: PendingNormalRestorePolicy,
+    pub(super) response_commit_sequence: Option<SurfaceCommitSequence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -537,5 +537,9 @@ impl CompositorState {
                 self.advance_render_generation(RenderGenerationCause::WindowDecoration);
             }
         }
+        if self.surface_tree_generation.is_none() {
+            let root_surface_id = self.root_surface_id_for_surface(surface_id);
+            self.try_finalize_pending_normal_restore_from_committed_state(root_surface_id);
+        }
     }
 }

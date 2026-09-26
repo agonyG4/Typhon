@@ -1,4 +1,7 @@
 use super::*;
+use crate::compositor::window_state::{
+    NormalRestoreGeometryObservation, NormalRestoreGeometrySource,
+};
 use crate::wm::layout::TiledResizeHandle;
 use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation};
 use std::num::NonZeroU64;
@@ -114,14 +117,14 @@ fn deferred_unknown_restore_waits_for_ack_boundary_and_anchors_to_latest_pointer
                     latest_pointer_y: 330.0,
                     interaction_id: Some(interaction_id),
                 },
+                response_commit_sequence: None,
             },
         );
         let response_geometry = XdgWindowGeometry::new(xdg_x, xdg_y, 2_010, 1_170);
 
-        assert!(!state.resolve_pending_normal_restore(
+        assert!(!state.qualify_pending_normal_restore_response(
             root_surface_id,
             SurfaceCommitSequence(5),
-            Some(response_geometry),
         ));
         state
             .toplevel_visual_geometries
@@ -131,23 +134,21 @@ fn deferred_unknown_restore_waits_for_ack_boundary_and_anchors_to_latest_pointer
             .as_mut()
             .expect("response fence")
             .ack_commit_sequence_floor = Some(SurfaceCommitSequence(5));
-        assert!(!state.resolve_pending_normal_restore(
+        assert!(!state.qualify_pending_normal_restore_response(
             root_surface_id,
             SurfaceCommitSequence(5),
-            Some(response_geometry),
         ));
-        assert!(!state.resolve_pending_normal_restore(
+        assert!(state.qualify_pending_normal_restore_response(
             root_surface_id,
             SurfaceCommitSequence(6),
-            None,
         ));
+        assert_eq!(
+            state.pending_normal_restores[&root_surface_id].response_commit_sequence,
+            Some(SurfaceCommitSequence(6))
+        );
 
         state.apply_committed_window_geometry(root_surface_id, Some(response_geometry));
-        assert!(state.resolve_pending_normal_restore(
-            root_surface_id,
-            SurfaceCommitSequence(6),
-            Some(response_geometry),
-        ));
+        assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
         state.update_toplevel_visual_render_assignment_after_root_commit(
             root_surface_id,
             SurfaceCommitSequence(6),
@@ -211,6 +212,252 @@ fn deferred_unknown_restore_waits_for_ack_boundary_and_anchors_to_latest_pointer
 }
 
 #[test]
+fn unknown_restore_uses_persistent_explicit_geometry_without_repeated_request() {
+    let root_surface_id = 268;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
+        .expect("XDG toplevel window");
+
+    let physical = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 45), 1_920, 955);
+    let explicit_geometry = XdgWindowGeometry::new(10, 10, 520, 410);
+    let mut root_surface = test_renderable_surface(root_surface_id, 1_920, 955);
+    root_surface.placement = physical.placement;
+    state.append_renderable_surface(root_surface);
+    state.store_surface_placement(root_surface_id, physical.placement);
+    state.install_toplevel_visual_geometry(root_surface_id, physical);
+    state
+        .surface_window_geometries
+        .insert(root_surface_id, explicit_geometry);
+    state.install_xdg_mode_transition_response_fence(root_surface_id, physical, 89);
+    state
+        .toplevel_visual_geometries
+        .get_mut(&root_surface_id)
+        .expect("visual geometry")
+        .xdg_mode_transition_fence
+        .as_mut()
+        .expect("response fence")
+        .ack_commit_sequence_floor = Some(SurfaceCommitSequence(5));
+    state.pending_normal_restores.insert(
+        root_surface_id,
+        PendingNormalRestore {
+            root_surface_id,
+            window_id,
+            configure_serial: 89,
+            restore_placement: SurfacePlacement::absolute_root_at(72, 72),
+            policy: PendingNormalRestorePolicy::StoredPlacement,
+            response_commit_sequence: None,
+        },
+    );
+
+    // Commit B carries no new set_window_geometry request. The explicit
+    // geometry committed earlier remains the restore-size authority.
+    assert!(
+        state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
+    );
+    assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
+    assert_eq!(
+        state.current_root_window_geometry(root_surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(72, 72),
+            520,
+            410,
+        ))
+    );
+    assert_eq!(
+        state.surface_window_geometries.get(&root_surface_id),
+        Some(&explicit_geometry)
+    );
+    assert!(state.pending_normal_restores.is_empty());
+}
+
+#[test]
+fn qualified_bufferless_restore_waits_for_later_committed_implicit_geometry() {
+    let root_surface_id = 269;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
+        .expect("XDG toplevel window");
+    let physical = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 45), 1_920, 955);
+    let mut root_surface = test_renderable_surface(root_surface_id, 1, 1);
+    root_surface.placement = physical.placement;
+    root_surface.width = 0;
+    root_surface.height = 0;
+    state.append_renderable_surface(root_surface);
+    state.store_surface_placement(root_surface_id, physical.placement);
+    state.install_toplevel_visual_geometry(root_surface_id, physical);
+    state.install_xdg_mode_transition_response_fence(root_surface_id, physical, 90);
+    state
+        .toplevel_visual_geometries
+        .get_mut(&root_surface_id)
+        .expect("visual geometry")
+        .xdg_mode_transition_fence
+        .as_mut()
+        .expect("response fence")
+        .ack_commit_sequence_floor = Some(SurfaceCommitSequence(5));
+    state.pending_normal_restores.insert(
+        root_surface_id,
+        PendingNormalRestore {
+            root_surface_id,
+            window_id,
+            configure_serial: 90,
+            restore_placement: SurfacePlacement::absolute_root_at(72, 72),
+            policy: PendingNormalRestorePolicy::StoredPlacement,
+            response_commit_sequence: None,
+        },
+    );
+
+    assert!(
+        state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
+    );
+    assert!(!state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
+    assert_eq!(
+        state.pending_normal_restores[&root_surface_id].response_commit_sequence,
+        Some(SurfaceCommitSequence(6))
+    );
+
+    let root_surface = state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("root renderable surface");
+    root_surface.width = 800;
+    root_surface.height = 600;
+    assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
+    assert_eq!(
+        state.current_visual_root_window_geometry(root_surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(72, 72),
+            800,
+            600,
+        ))
+    );
+    assert!(
+        !state
+            .surface_window_geometries
+            .contains_key(&root_surface_id)
+    );
+    assert!(state.pending_normal_restores.is_empty());
+}
+
+#[test]
+fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() {
+    let root_surface_id = 271;
+    let child_surface_id = 272;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
+        .expect("XDG toplevel window");
+
+    let physical = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 45), 1_920, 955);
+    let mut root_surface = test_renderable_surface(root_surface_id, 400, 300);
+    root_surface.placement = physical.placement;
+    state.append_renderable_surface(root_surface);
+    state.append_renderable_surface(test_renderable_surface(child_surface_id, 200, 150));
+    state.store_surface_placement(
+        child_surface_id,
+        SurfacePlacement::subsurface(root_surface_id, 500, 0),
+    );
+    state.surface_role_lifecycles.insert(
+        child_surface_id,
+        super::roles::SurfaceRoleLifecycle {
+            permanent: Some(super::roles::PermanentSurfaceRole::Subsurface),
+            live_instance: Some(super::roles::LiveRoleInstance::Subsurface {
+                parent_id: root_surface_id,
+            }),
+            xdg_association: false,
+        },
+    );
+    state.store_surface_placement(root_surface_id, physical.placement);
+    state.install_toplevel_visual_geometry(root_surface_id, physical);
+    state.install_xdg_mode_transition_response_fence(root_surface_id, physical, 91);
+    state
+        .toplevel_visual_geometries
+        .get_mut(&root_surface_id)
+        .expect("visual geometry")
+        .xdg_mode_transition_fence
+        .as_mut()
+        .expect("response fence")
+        .ack_commit_sequence_floor = Some(SurfaceCommitSequence(5));
+    state.pending_normal_restores.insert(
+        root_surface_id,
+        PendingNormalRestore {
+            root_surface_id,
+            window_id,
+            configure_serial: 91,
+            restore_placement: SurfacePlacement::absolute_root_at(72, 72),
+            policy: PendingNormalRestorePolicy::StoredPlacement,
+            response_commit_sequence: None,
+        },
+    );
+
+    let render_generation_before_tree = state.render_generation;
+    state.begin_surface_tree_publication();
+    assert!(
+        state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
+    );
+    assert!(!state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
+    assert!(state.pending_normal_restores.contains_key(&root_surface_id));
+    assert_eq!(
+        state.current_visual_root_window_geometry(root_surface_id),
+        Some(physical)
+    );
+
+    let root_surface = state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("root renderable surface");
+    root_surface.width = 500;
+    root_surface.height = 400;
+    state.store_surface_placement(
+        child_surface_id,
+        SurfacePlacement::subsurface(root_surface_id, 350, -20),
+    );
+    let child_surface = state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == child_surface_id)
+        .expect("child renderable surface");
+    child_surface.width = 250;
+    child_surface.height = 150;
+
+    state.finish_surface_tree_publication();
+
+    assert_eq!(
+        state.render_generation, render_generation_before_tree,
+        "restore finalization must not create a second tree generation"
+    );
+    assert_eq!(
+        state.normal_restore_geometry_observation(root_surface_id),
+        Some(NormalRestoreGeometryObservation {
+            geometry: XdgWindowGeometry::new(0, -20, 600, 420),
+            source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
+        })
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(root_surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(72, 72),
+            600,
+            420,
+        ))
+    );
+    assert_eq!(
+        state
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == root_surface_id)
+            .and_then(|surface| surface.render_placement),
+        Some(SurfacePlacement::absolute_root_at(72, 72))
+    );
+    assert!(state.pending_normal_restores.is_empty());
+}
+
+#[test]
 fn cancelled_unknown_restore_cannot_apply_a_late_client_commit() {
     let root_surface_id = 270;
     let mut state = CompositorState::new(None);
@@ -233,6 +480,7 @@ fn cancelled_unknown_restore_cannot_apply_a_late_client_commit() {
             configure_serial: 80,
             restore_placement: SurfacePlacement::absolute_root_at(72, 72),
             policy: PendingNormalRestorePolicy::StoredPlacement,
+            response_commit_sequence: None,
         },
     );
     state
@@ -247,11 +495,9 @@ fn cancelled_unknown_restore_cannot_apply_a_late_client_commit() {
     assert!(state.cancel_pending_normal_restore(root_surface_id, "test_unmap"));
     let response = XdgWindowGeometry::new(0, 0, 800, 600);
     state.apply_committed_window_geometry(root_surface_id, Some(response));
-    assert!(!state.resolve_pending_normal_restore(
-        root_surface_id,
-        SurfaceCommitSequence(6),
-        Some(response),
-    ));
+    assert!(
+        !state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
+    );
     assert_eq!(state.surface_placement(root_surface_id), physical.placement);
     assert!(state.pending_normal_restores.is_empty());
 }
@@ -314,6 +560,7 @@ fn released_unknown_restore_finishes_at_last_pointer_anchor_without_resuming_mov
                 latest_pointer_y: 145.0,
                 interaction_id: Some(interaction_id),
             },
+            response_commit_sequence: None,
         },
     );
     state
@@ -349,11 +596,10 @@ fn released_unknown_restore_finishes_at_last_pointer_anchor_without_resuming_mov
 
     let response = XdgWindowGeometry::new(0, 0, 1_000, 700);
     state.apply_committed_window_geometry(root_surface_id, Some(response));
-    assert!(state.resolve_pending_normal_restore(
-        root_surface_id,
-        SurfaceCommitSequence(6),
-        Some(response),
-    ));
+    assert!(
+        state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
+    );
+    assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
     assert_eq!(
         state.current_root_window_geometry(root_surface_id),
         Some(WindowGeometry::new(
@@ -381,6 +627,14 @@ fn non_interactive_unknown_restore_uses_stored_placement_and_client_size() {
     state.store_surface_placement(root_surface_id, physical.placement);
     state.install_toplevel_visual_geometry(root_surface_id, physical);
     state.install_xdg_mode_transition_response_fence(root_surface_id, physical, 88);
+    if let Some(surface) = state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == root_surface_id)
+    {
+        surface.width = 0;
+        surface.height = 0;
+    }
     state
         .window_mut(window_id)
         .expect("window")
@@ -403,6 +657,7 @@ fn non_interactive_unknown_restore_uses_stored_placement_and_client_size() {
             configure_serial: 88,
             restore_placement: SurfacePlacement::absolute_root_at(72, 72),
             policy: PendingNormalRestorePolicy::StoredPlacement,
+            response_commit_sequence: None,
         },
     );
     state
@@ -416,15 +671,12 @@ fn non_interactive_unknown_restore_uses_stored_placement_and_client_size() {
     let response = XdgWindowGeometry::new(0, 0, 1_010, 700);
 
     assert!(
-        !state.resolve_pending_normal_restore(root_surface_id, SurfaceCommitSequence(6), None,)
+        state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
     );
+    assert!(!state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
     assert_eq!(state.surface_placement(root_surface_id), physical.placement);
     state.apply_committed_window_geometry(root_surface_id, Some(response));
-    assert!(state.resolve_pending_normal_restore(
-        root_surface_id,
-        SurfaceCommitSequence(6),
-        Some(response),
-    ));
+    assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
 
     assert_eq!(
         state.current_root_window_geometry(root_surface_id),

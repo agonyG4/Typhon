@@ -997,6 +997,19 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn finish_surface_tree_publication(&mut self) {
+        let pending_roots = self
+            .pending_normal_restores
+            .iter()
+            .filter_map(|(root_surface_id, pending)| {
+                pending
+                    .response_commit_sequence
+                    .is_some()
+                    .then_some(*root_surface_id)
+            })
+            .collect::<Vec<_>>();
+        for root_surface_id in pending_roots {
+            self.finalize_pending_normal_restore_at_surface_tree_boundary(root_surface_id);
+        }
         self.surface_tree_generation = None;
         if std::mem::take(&mut self.surface_tree_confined_region_refresh_pending) {
             self.update_all_active_confined_pointer_regions("surface_tree_publication");

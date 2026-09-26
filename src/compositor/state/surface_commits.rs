@@ -356,12 +356,10 @@ impl CompositorState {
             );
         }
         if surface_id == root_surface_id {
-            let normal_restore_resolved = self.resolve_pending_normal_restore(
-                root_surface_id,
-                commit_sequence,
-                window_geometry,
-            );
-            if visual_state_changed || normal_restore_resolved {
+            self.qualify_pending_normal_restore_response(root_surface_id, commit_sequence);
+            let normal_restore_resolved = self.surface_tree_generation.is_none()
+                && self.try_finalize_pending_normal_restore_from_committed_state(root_surface_id);
+            if visual_state_changed && !normal_restore_resolved {
                 self.update_toplevel_visual_render_assignment_after_root_commit(
                     root_surface_id,
                     commit_sequence,
@@ -490,18 +488,8 @@ impl CompositorState {
         if window_geometry_changed {
             self.apply_committed_window_geometry(surface_id, window_geometry);
         }
-        let normal_restore_resolved = (surface_id == root_surface_id)
-            && self.resolve_pending_normal_restore(
-                root_surface_id,
-                commit_sequence,
-                window_geometry,
-            );
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;
-        if damage.is_none()
-            && !mapping_changed
-            && !window_geometry_changed
-            && !normal_restore_resolved
-        {
+        if damage.is_none() && !mapping_changed && !window_geometry_changed {
             if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
                 current.update_content_mapping(mapping, commit_sequence);
             }
@@ -575,15 +563,13 @@ impl CompositorState {
             || existing.width != surface_size.width
             || existing.height != surface_size.height
             || existing.placement != placement
-            || window_geometry_changed
-            || normal_restore_resolved;
+            || window_geometry_changed;
         let output_geometry_changed = pointer_geometry_changed;
         let visual_mapping_changed = existing.x != mapping.x
             || existing.y != mapping.y
             || existing.width != surface_size.width
             || existing.height != surface_size.height
             || existing.placement != placement
-            || normal_restore_resolved
             || existing.buffer_scale != mapping.buffer_scale
             || existing.buffer_transform != mapping.buffer_transform
             || existing.viewport_source != mapping.viewport_source
@@ -629,14 +615,13 @@ impl CompositorState {
             journal_size.width,
             journal_size.height,
         );
-        let visual_assignment_updated =
-            (visual_mapping_changed || window_geometry_changed || normal_restore_resolved)
-                && (self
-                    .surface_window_geometries
-                    .contains_key(&root_surface_id)
-                    || self
-                        .toplevel_visual_geometries
-                        .contains_key(&root_surface_id));
+        let visual_assignment_updated = (visual_mapping_changed || window_geometry_changed)
+            && (self
+                .surface_window_geometries
+                .contains_key(&root_surface_id)
+                || self
+                    .toplevel_visual_geometries
+                    .contains_key(&root_surface_id));
         if visual_assignment_updated {
             if surface_id == root_surface_id {
                 self.update_toplevel_visual_render_assignment_after_root_commit(
@@ -722,7 +707,7 @@ impl CompositorState {
         })
     }
 
-    fn refresh_pointer_focus_after_geometry_change(
+    pub(in crate::compositor::state) fn refresh_pointer_focus_after_geometry_change(
         &mut self,
         geometry_changed: bool,
         pointer_hit_generation_before_publication: u64,
@@ -1109,11 +1094,7 @@ impl CompositorState {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
         }
         if surface_id == root_surface_id {
-            let _ = self.resolve_pending_normal_restore(
-                root_surface_id,
-                commit_sequence,
-                window_geometry,
-            );
+            self.qualify_pending_normal_restore_response(root_surface_id, commit_sequence);
             self.update_toplevel_visual_render_assignment_after_root_commit(
                 root_surface_id,
                 commit_sequence,

@@ -163,6 +163,16 @@ assignment when the first renderable is published, metadata changes, or the
 authoritative frame placement changes. Resize previews change the visual
 aperture and frame placement; they do not create a second coordinate system.
 
+Normal-restore size observation follows the committed XDG geometry ownership:
+once explicitly committed, `set_window_geometry` remains the persistent size
+authority across later commits that omit that request. A toplevel that has
+never committed explicit geometry uses the current committed logical bounds of
+its root surface and actual `wl_subsurface` descendants; this implicit
+observation is recomputed from the committed tree and is not stored as explicit
+geometry. It is used for normal restore decisions and does not claim to
+implement the protocol's full explicit-geometry clamping rules for every
+rendering, input, popup, or decoration consumer.
+
 Decoration ownership is negotiated per XDG toplevel through
 `zxdg_decoration_manager_v1`. Explicit client-side mode leaves the client
 pixels untouched; explicit server-side mode and an unset mode with a live

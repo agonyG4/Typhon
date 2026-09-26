@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
-use super::{RenderableSurface, SurfacePlacement};
+use super::{RenderableSurface, SurfacePlacement, XdgWindowGeometry};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowState {
@@ -169,6 +169,27 @@ pub(crate) struct WindowGeometry {
 pub(crate) enum ToplevelConfigureSize {
     Suggested { width: u32, height: u32 },
     Unspecified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormalRestoreGeometrySource {
+    ExplicitPersistent,
+    ImplicitSurfaceTree,
+}
+
+impl NormalRestoreGeometrySource {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::ExplicitPersistent => "explicit_persistent",
+            Self::ImplicitSurfaceTree => "implicit_surface_tree",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormalRestoreGeometryObservation {
+    pub(crate) geometry: XdgWindowGeometry,
+    pub(crate) source: NormalRestoreGeometrySource,
 }
 
 impl WindowGeometry {

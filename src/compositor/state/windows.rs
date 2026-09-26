@@ -3,10 +3,14 @@ use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
 use crate::animation_control::AnimationEffect;
 use crate::compositor::decoration::types::ConfiguredXdgDecorationState;
+use crate::compositor::window_state::{
+    NormalRestoreGeometryObservation, NormalRestoreGeometrySource,
+};
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleVisualGroup, canonical_visual_rect,
 };
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
+use std::collections::HashSet;
 
 impl CompositorState {
     pub(in crate::compositor) fn x11_window_wants_initial_focus(
@@ -2014,13 +2018,101 @@ impl CompositorState {
         surface_id: u32,
         placement: SurfacePlacement,
     ) -> WindowGeometry {
-        match self
-            .xdg_window_geometry_size(surface_id)
-            .filter(|(width, height)| *width > 0 && *height > 0)
+        let Some(observation) = self.normal_restore_geometry_observation(surface_id) else {
+            return WindowGeometry::new(placement, 0, 0);
+        };
+        let Ok(width) = u32::try_from(observation.geometry.width) else {
+            return WindowGeometry::new(placement, 0, 0);
+        };
+        let Ok(height) = u32::try_from(observation.geometry.height) else {
+            return WindowGeometry::new(placement, 0, 0);
+        };
+        WindowGeometry::new(placement, width, height)
+    }
+
+    pub(in crate::compositor) fn normal_restore_geometry_observation(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<NormalRestoreGeometryObservation> {
+        if let Some(geometry) = self
+            .surface_window_geometries
+            .get(&root_surface_id)
+            .copied()
         {
-            Some((width, height)) => WindowGeometry::new(placement, width, height),
-            None => WindowGeometry::new(placement, 0, 0),
+            return (geometry.width > 0 && geometry.height > 0).then_some(
+                NormalRestoreGeometryObservation {
+                    geometry,
+                    source: NormalRestoreGeometrySource::ExplicitPersistent,
+                },
+            );
         }
+
+        self.implicit_surface_tree_window_geometry(root_surface_id)
+            .map(|geometry| NormalRestoreGeometryObservation {
+                geometry,
+                source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
+            })
+    }
+
+    fn implicit_surface_tree_window_geometry(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<XdgWindowGeometry> {
+        let mut surfaces = vec![(root_surface_id, 0_i64, 0_i64)];
+        let mut visited = HashSet::new();
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+
+        while let Some((surface_id, origin_x, origin_y)) = surfaces.pop() {
+            if !visited.insert(surface_id) {
+                continue;
+            }
+
+            if let Some(surface) = self
+                .renderable_surfaces
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                && surface.width > 0
+                && surface.height > 0
+            {
+                let right = origin_x.checked_add(i64::from(surface.width))?;
+                let bottom = origin_y.checked_add(i64::from(surface.height))?;
+                min_x = min_x.min(origin_x);
+                min_y = min_y.min(origin_y);
+                max_x = max_x.max(right);
+                max_y = max_y.max(bottom);
+            }
+
+            for (child_id, lifecycle) in &self.surface_role_lifecycles {
+                let Some(LiveRoleInstance::Subsurface { parent_id }) = lifecycle.live_instance
+                else {
+                    continue;
+                };
+                if parent_id != surface_id {
+                    continue;
+                }
+                let placement = self.surface_placement(*child_id);
+                if placement.parent_surface_id != Some(parent_id) {
+                    continue;
+                }
+                surfaces.push((
+                    *child_id,
+                    origin_x.checked_add(i64::from(placement.local_x))?,
+                    origin_y.checked_add(i64::from(placement.local_y))?,
+                ));
+            }
+        }
+
+        if min_x == i64::MAX || max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+        let width = max_x.checked_sub(min_x)?;
+        let height = max_y.checked_sub(min_y)?;
+        Some(XdgWindowGeometry::new(
+            i32::try_from(min_x).ok()?,
+            i32::try_from(min_y).ok()?,
+            i32::try_from(width).ok()?,
+            i32::try_from(height).ok()?,
+        ))
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
@@ -2155,6 +2247,36 @@ fn popup_debug_log(message: impl FnOnce() -> String) {
 mod tests {
     use super::*;
 
+    fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+        let identity = BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity");
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+                identity,
+                BufferSize::new(width, height).expect("test size"),
+                vec![0; width as usize * height as usize],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::Full,
+        }
+    }
+
     #[test]
     fn mode_transition_animation_kind_keeps_maximize_and_fullscreen_distinct() {
         assert_eq!(
@@ -2172,6 +2294,178 @@ mod tests {
         assert_eq!(
             mode_transition_animation_kind(ToplevelMode::Fullscreen, ToplevelMode::Normal),
             Some(PresentationAnimationKind::FullscreenExit)
+        );
+    }
+
+    #[test]
+    fn never_explicit_window_geometry_observes_committed_root_logical_size_dynamically() {
+        let root_surface_id = 10;
+        let mut state = CompositorState::default();
+        state.append_renderable_surface(test_renderable_surface(root_surface_id, 800, 600));
+
+        let first = state.observed_normal_restore_geometry(
+            root_surface_id,
+            SurfacePlacement::absolute_root_at(40, 50),
+        );
+        assert_eq!((first.width, first.height), (800, 600));
+        assert_eq!(
+            state.normal_restore_geometry_observation(root_surface_id),
+            Some(NormalRestoreGeometryObservation {
+                geometry: XdgWindowGeometry::new(0, 0, 800, 600),
+                source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
+            })
+        );
+        assert!(
+            !state
+                .surface_window_geometries
+                .contains_key(&root_surface_id)
+        );
+
+        let root = state
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == root_surface_id)
+            .expect("root renderable surface");
+        root.width = 1024;
+        root.height = 768;
+        let second = state.observed_normal_restore_geometry(
+            root_surface_id,
+            SurfacePlacement::absolute_root_at(40, 50),
+        );
+
+        assert_eq!((second.width, second.height), (1024, 768));
+        assert_eq!(
+            state.normal_restore_geometry_observation(root_surface_id),
+            Some(NormalRestoreGeometryObservation {
+                geometry: XdgWindowGeometry::new(0, 0, 1024, 768),
+                source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
+            })
+        );
+        assert!(
+            !state
+                .surface_window_geometries
+                .contains_key(&root_surface_id)
+        );
+    }
+
+    #[test]
+    fn explicit_geometry_stays_authoritative_when_committed_content_changes() {
+        let root_surface_id = 11;
+        let explicit = XdgWindowGeometry::new(10, 10, 520, 410);
+        let mut state = CompositorState::default();
+        state.append_renderable_surface(test_renderable_surface(root_surface_id, 400, 300));
+        state
+            .surface_window_geometries
+            .insert(root_surface_id, explicit);
+
+        let root = state
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == root_surface_id)
+            .expect("root renderable surface");
+        root.width = 900;
+        root.height = 700;
+
+        let observed = state.observed_normal_restore_geometry(
+            root_surface_id,
+            SurfacePlacement::absolute_root_at(40, 50),
+        );
+        assert_eq!((observed.width, observed.height), (520, 410));
+        assert_eq!(
+            state.normal_restore_geometry_observation(root_surface_id),
+            Some(NormalRestoreGeometryObservation {
+                geometry: explicit,
+                source: NormalRestoreGeometrySource::ExplicitPersistent,
+            })
+        );
+        assert_eq!(
+            state.surface_window_geometries.get(&root_surface_id),
+            Some(&explicit)
+        );
+    }
+
+    #[test]
+    fn implicit_geometry_includes_live_subsurface_bounds_but_excludes_popups() {
+        let root_surface_id = 12;
+        let subsurface_id = 13;
+        let popup_id = 14;
+        let mut state = CompositorState::default();
+        state.append_renderable_surface(test_renderable_surface(root_surface_id, 400, 300));
+        state.append_renderable_surface(test_renderable_surface(subsurface_id, 200, 150));
+        state.append_renderable_surface(test_renderable_surface(popup_id, 500, 500));
+        state.store_surface_placement(
+            subsurface_id,
+            SurfacePlacement::subsurface(root_surface_id, 350, -20),
+        );
+        state.store_surface_placement(
+            popup_id,
+            SurfacePlacement::subsurface(root_surface_id, 900, 0),
+        );
+        state.surface_role_lifecycles.insert(
+            subsurface_id,
+            super::super::roles::SurfaceRoleLifecycle {
+                permanent: Some(super::super::roles::PermanentSurfaceRole::Subsurface),
+                live_instance: Some(super::super::roles::LiveRoleInstance::Subsurface {
+                    parent_id: root_surface_id,
+                }),
+                xdg_association: false,
+            },
+        );
+        state.surface_role_lifecycles.insert(
+            popup_id,
+            super::super::roles::SurfaceRoleLifecycle {
+                permanent: Some(super::super::roles::PermanentSurfaceRole::XdgPopup),
+                live_instance: Some(super::super::roles::LiveRoleInstance::XdgPopup),
+                xdg_association: true,
+            },
+        );
+
+        let observed = state.observed_normal_restore_geometry(
+            root_surface_id,
+            SurfacePlacement::absolute_root_at(40, 50),
+        );
+        assert_eq!((observed.width, observed.height), (550, 320));
+        assert_eq!(
+            state.normal_restore_geometry_observation(root_surface_id),
+            Some(NormalRestoreGeometryObservation {
+                geometry: XdgWindowGeometry::new(0, -20, 550, 320),
+                source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
+            })
+        );
+        assert!(
+            !state
+                .surface_window_geometries
+                .contains_key(&root_surface_id)
+        );
+    }
+
+    #[test]
+    fn normal_mapped_implicit_content_is_known_before_maximize_but_empty_content_is_unknown() {
+        let root_surface_id = 15;
+        let placement = SurfacePlacement::absolute_root_at(40, 50);
+        let mut state = CompositorState::default();
+        state.append_renderable_surface(test_renderable_surface(root_surface_id, 800, 600));
+        let mut normal = WindowState::default();
+        normal.capture_restore_geometry(
+            state.observed_normal_restore_geometry(root_surface_id, placement),
+        );
+        normal.set_mode(ToplevelMode::Maximized);
+        assert_eq!(
+            normal.normal_restore_target(),
+            Some(NormalRestoreTarget::Known(WindowGeometry::new(
+                placement, 800, 600,
+            )))
+        );
+
+        let empty = CompositorState::default();
+        let mut unknown = WindowState::default();
+        unknown.capture_restore_geometry(
+            empty.observed_normal_restore_geometry(root_surface_id, placement),
+        );
+        unknown.set_mode(ToplevelMode::Maximized);
+        assert_eq!(
+            unknown.normal_restore_target(),
+            Some(NormalRestoreTarget::UnknownSize { placement })
         );
     }
 }
