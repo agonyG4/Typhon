@@ -11,6 +11,7 @@ use oblivion_one::native::event_loop::NativeContinuationReason;
 pub(crate) struct NativeRuntimeState {
     pub(super) scene_dirty: bool,
     pub(super) visual_scene_debt: bool,
+    pub(super) callback_only_frame_work_pending: bool,
     pub(super) visual_work_deadline_due: bool,
     pub(super) cursor_only_due: bool,
     pub(super) screen_capture_pending: bool,
@@ -219,6 +220,7 @@ impl NativeWorkDomains {
             || wakeup
                 .continuation
                 .contains(NativeContinuationReason::FrameScheduler)
+            || state.callback_only_frame_work_pending
             || state.visual_work_deadline_due
             || state.visual_scene_debt
             || state.cursor_only_due
@@ -346,6 +348,31 @@ mod tests {
         assert!(!domains.wayland_dispatch);
         assert!(!domains.presentation);
         assert!(!domains.cursor);
+    }
+
+    #[test]
+    fn callback_only_frame_work_admits_presentation_after_wayland_dispatch() {
+        let wayland_wakeup = wakeup(WAYLAND_CLIENTS);
+        let before_dispatch = state();
+        let before_domains = NativeWorkDomains::classify(&wayland_wakeup, &before_dispatch);
+
+        assert!(before_domains.wayland_dispatch);
+        assert!(!before_domains.presentation);
+        assert!(!before_domains.scene);
+
+        let after_dispatch = NativeRuntimeState {
+            callback_only_frame_work_pending: true,
+            ..before_dispatch
+        };
+        let domains = NativeWorkDomains::classify(&wayland_wakeup, &after_dispatch);
+        let plan = domains.operation_plan();
+
+        assert!(domains.presentation);
+        assert!(!domains.scene);
+        assert!(plan.presentation_due);
+        assert!(plan.presentation_admitted(false, false, false));
+        assert!(!plan.visual_scene_debt);
+        assert!(!plan.service_acquire_and_prepare);
     }
 
     #[test]

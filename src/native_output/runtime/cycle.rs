@@ -112,6 +112,9 @@ impl NativeRuntime {
         NativeRuntimeState {
             scene_dirty: cycle.redraw_requested || self.server.has_pending_frame_prepare_work(),
             visual_scene_debt,
+            callback_only_frame_work_pending: self
+                .server
+                .has_only_pending_surface_frame_callbacks(),
             visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
