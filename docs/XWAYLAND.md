@@ -33,8 +33,10 @@ nonblocking sinks. Wayland → X11 ownership is claimed with a server timestamp
 and confirmed through GetSelectionOwner before SelectionRequest serving begins.
 TARGETS, TIMESTAMP, MULTIPLE, direct properties, and outgoing INCR are active.
 External X11 takeover revokes proxy serving while preserving inbound discovery.
-Native interoperability qualification remains pending F11-D. XDND remains
-inactive.
+The canonical compositor DND state now has the F11-C1 authority and semantic
+contract foundation for generation-qualified XWayland origins and X11 targets.
+XDND ClientMessages and end-to-end application interoperability remain
+inactive; native interoperability qualification remains pending F11-D.
 
 The following remain adapter/model foundations rather than end-to-end support:
 

@@ -36,6 +36,94 @@ impl OwnCompositorServer {
             .collect()
     }
 
+    /// Transfer only payload requests that still name the canonical active
+    /// XWayland-origin drag. Stale request sinks are dropped here.
+    pub fn take_xwayland_dnd_data_requests(
+        &mut self,
+    ) -> Vec<crate::xwayland::XwaylandDndDataRequest> {
+        let current_offer = self
+            .state
+            .active_drag
+            .as_ref()
+            .and_then(|drag| drag.origin.xwayland_offer())
+            .map(crate::xwayland::XwaylandDndOffer::id)
+            .filter(|offer_id| {
+                self.state
+                    .xwayland
+                    .client_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.generation == offer_id.generation())
+            });
+        self.state
+            .xwayland_dnd_data_requests
+            .drain(..)
+            .filter(|request| Some(request.offer_id) == current_offer)
+            .collect()
+    }
+
+    /// Start the canonical drag for a validated XWayland XDND offer.
+    pub fn begin_xwayland_dnd(&mut self, offer: crate::xwayland::XwaylandDndOffer) -> bool {
+        self.state.begin_xwayland_drag_session(offer)
+    }
+
+    /// Apply a terminal event only to the exact current XWayland-origin drag.
+    pub fn drop_xwayland_dnd(&mut self, offer_id: crate::xwayland::XwaylandDndOfferId) -> bool {
+        self.state.drop_xwayland_drag(offer_id)
+    }
+
+    pub fn finish_xwayland_dnd(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        accepted: bool,
+    ) -> bool {
+        self.state.finish_xwayland_drag(offer_id, accepted)
+    }
+
+    pub fn cancel_xwayland_dnd(&mut self, offer_id: crate::xwayland::XwaylandDndOfferId) -> bool {
+        self.state.cancel_xwayland_drag(offer_id)
+    }
+
+    /// Apply a semantic status from the exact current X11 target. This updates
+    /// canonical acceptance/action state without emitting XDND wire messages.
+    pub fn update_xwayland_dnd_target_status(
+        &mut self,
+        session_id: crate::xwayland::CanonicalDndSessionId,
+        target: X11WindowHandle,
+        accepted_mime: Option<String>,
+        action: Option<crate::xwayland::XwaylandDndAction>,
+    ) -> bool {
+        self.state
+            .update_xwayland_drag_target_status(session_id, target, accepted_mime, action)
+    }
+
+    /// Finish or reject a drag only for the exact current X11 target and
+    /// canonical session identity.
+    pub fn finish_xwayland_dnd_target(
+        &mut self,
+        session_id: crate::xwayland::CanonicalDndSessionId,
+        target: X11WindowHandle,
+        accepted: bool,
+        final_action: Option<crate::xwayland::XwaylandDndAction>,
+    ) -> bool {
+        self.state
+            .finish_xwayland_drag_target(session_id, target, accepted, final_action)
+    }
+
+    pub fn cancel_xwayland_dnd_target(
+        &mut self,
+        session_id: crate::xwayland::CanonicalDndSessionId,
+        target: X11WindowHandle,
+    ) -> bool {
+        self.state.cancel_xwayland_drag_target(session_id, target)
+    }
+
+    /// Consume the latest bounded canonical target transition for the XWM.
+    pub fn take_xwayland_dnd_transition(
+        &mut self,
+    ) -> Option<crate::xwayland::XwaylandDndTransition> {
+        self.state.xwayland_dnd_transition.take()
+    }
+
     /// Revalidate a prepared proxy's exact canonical source before handing its
     /// blocking destination FD to that source.
     pub fn request_xwayland_proxy_selection_data(

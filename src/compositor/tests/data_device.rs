@@ -1529,10 +1529,12 @@ impl ProductionDndModel {
     }
 
     fn current_offer(&self) -> Option<wl_data_offer::WlDataOffer> {
-        self.state
-            .active_drag
-            .as_ref()
-            .and_then(|drag| drag.offer.clone())
+        self.state.active_drag.as_ref().and_then(|drag| {
+            drag.target
+                .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
+                .cloned()
+        })
     }
 
     fn apply(&mut self, op: DndModelOp) {
@@ -1584,12 +1586,9 @@ impl ProductionDndModel {
                 if !self.target_available {
                     return;
                 }
-                let x = if self
-                    .state
-                    .active_drag
-                    .as_ref()
-                    .is_some_and(|drag| drag.source.is_some())
-                {
+                let x = if self.state.active_drag.as_ref().is_some_and(|drag| {
+                    matches!(drag.origin, ActiveDragOrigin::WaylandSource { .. })
+                }) {
                     10.0
                 } else {
                     210.0
@@ -1679,7 +1678,11 @@ impl ProductionDndModel {
             .as_ref()
             .and_then(|source| self.state.data_sources.get(&source.id()));
         let offer_binding = active
-            .and_then(|drag| drag.offer.as_ref())
+            .and_then(|drag| {
+                drag.target
+                    .as_ref()
+                    .and_then(ActiveDragTarget::wayland_offer)
+            })
             .and_then(|offer| self.state.data_offers.get(&offer.id()))
             .or_else(|| {
                 self.state
@@ -1698,8 +1701,9 @@ impl ProductionDndModel {
             source_actions: source_binding.map_or(0, |source| source.actions),
             mime_offered: source_binding.is_some_and(|source| !source.mime_types.is_empty()),
             active: active.is_some(),
-            source_attached: active.is_some_and(|drag| drag.source.is_some()),
-            target_present: active.is_some_and(|drag| drag.target_surface.is_some()),
+            source_attached: active
+                .is_some_and(|drag| matches!(drag.origin, ActiveDragOrigin::WaylandSource { .. })),
+            target_present: active.is_some_and(|drag| drag.target.is_some()),
             target_available: self.target_available,
             source_client_available: self.source_client_available,
             offer_alive: offer_binding.is_some(),

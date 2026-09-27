@@ -1,4 +1,5 @@
 use super::*;
+use crate::xwayland::{CanonicalDndSessionId, XwaylandDndOffer};
 
 #[derive(Debug, Clone)]
 pub(super) struct IdleInhibitorBinding {
@@ -60,6 +61,7 @@ pub(super) enum DataOfferKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DragSessionPhase {
     Dragging,
+    DropPendingXwaylandTarget,
     DroppedAwaitingFinish,
     DroppedAwaitingAskResolution,
     Finished,
@@ -75,17 +77,107 @@ pub(super) enum DragOfferPhase {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum ActiveDragOrigin {
+    WaylandSource {
+        source: wl_data_source::WlDataSource,
+        origin_surface: wl_surface::WlSurface,
+        #[allow(dead_code)]
+        initiating_serial: u32,
+    },
+    WaylandSourceless {
+        initiating_client: ClientId,
+        origin_surface: wl_surface::WlSurface,
+        #[allow(dead_code)]
+        initiating_serial: u32,
+    },
+    Xwayland {
+        offer: XwaylandDndOffer,
+    },
+}
+
+impl ActiveDragOrigin {
+    pub(super) fn wayland_source(&self) -> Option<&wl_data_source::WlDataSource> {
+        match self {
+            Self::WaylandSource { source, .. } => Some(source),
+            Self::WaylandSourceless { .. } | Self::Xwayland { .. } => None,
+        }
+    }
+
+    pub(super) fn wayland_origin_surface(&self) -> Option<&wl_surface::WlSurface> {
+        match self {
+            Self::WaylandSource { origin_surface, .. }
+            | Self::WaylandSourceless { origin_surface, .. } => Some(origin_surface),
+            Self::Xwayland { .. } => None,
+        }
+    }
+
+    pub(super) fn wayland_initiating_client(&self) -> Option<ClientId> {
+        match self {
+            Self::WaylandSource { source, .. } => source.client().map(|client| client.id()),
+            Self::WaylandSourceless {
+                initiating_client, ..
+            } => Some(initiating_client.clone()),
+            Self::Xwayland { .. } => None,
+        }
+    }
+
+    pub(super) const fn is_wayland_sourceless(&self) -> bool {
+        matches!(self, Self::WaylandSourceless { .. })
+    }
+
+    pub(super) const fn xwayland_offer(&self) -> Option<&XwaylandDndOffer> {
+        match self {
+            Self::Xwayland { offer } => Some(offer),
+            Self::WaylandSource { .. } | Self::WaylandSourceless { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DragLifecycleDriver {
+    WaylandImplicitPointerGrab,
+    Xwayland,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum ActiveDragTarget {
+    Wayland {
+        surface: wl_surface::WlSurface,
+        client_id: ClientId,
+        offer: Option<wl_data_offer::WlDataOffer>,
+    },
+    Xwayland {
+        window: crate::xwayland::X11WindowHandle,
+    },
+}
+
+impl ActiveDragTarget {
+    pub(super) fn wayland_offer(&self) -> Option<&wl_data_offer::WlDataOffer> {
+        match self {
+            Self::Wayland {
+                offer: Some(offer), ..
+            } => Some(offer),
+            Self::Wayland { offer: None, .. } | Self::Xwayland { .. } => None,
+        }
+    }
+
+    pub(super) fn wayland_client(&self) -> Option<&ClientId> {
+        match self {
+            Self::Wayland { client_id, .. } => Some(client_id),
+            Self::Xwayland { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ActiveDrag {
-    pub(super) source: Option<wl_data_source::WlDataSource>,
-    #[allow(dead_code)]
-    pub(super) origin_surface: wl_surface::WlSurface,
+    pub(super) id: CanonicalDndSessionId,
+    pub(super) origin: ActiveDragOrigin,
+    pub(super) lifecycle_driver: DragLifecycleDriver,
     pub(super) icon_surface: Option<wl_surface::WlSurface>,
-    #[allow(dead_code)]
-    pub(super) initiating_serial: u32,
-    pub(super) target_surface: Option<wl_surface::WlSurface>,
-    pub(super) target_client: Option<ClientId>,
-    pub(super) offer: Option<wl_data_offer::WlDataOffer>,
+    pub(super) target: Option<ActiveDragTarget>,
     pub(super) accepted_mime: Option<String>,
+    pub(super) target_action: Option<crate::xwayland::XwaylandDndAction>,
     pub(super) selected_action: u32,
     pub(super) destination_actions: Option<u32>,
     pub(super) last_offer_action: Option<u32>,

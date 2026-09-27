@@ -351,8 +351,9 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                     offer.drag_phase,
                     Some(DragOfferPhase::Finished | DragOfferPhase::Destroyed)
                 ) || state.active_drag.as_ref().is_some_and(|drag| {
-                    drag.offer
+                    drag.target
                         .as_ref()
+                        .and_then(ActiveDragTarget::wayland_offer)
                         .is_some_and(|current| same_wayland_resource(current, resource))
                         && matches!(
                             drag.phase,

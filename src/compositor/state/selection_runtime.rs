@@ -357,10 +357,12 @@ impl CompositorState {
         device: &wl_data_device::WlDataDevice,
     ) {
         if let Some(client_id) = device.client().map(|client| client.id())
-            && self
-                .active_drag
-                .as_ref()
-                .is_some_and(|drag| drag.target_client.as_ref() == Some(&client_id))
+            && self.active_drag.as_ref().is_some_and(|drag| {
+                drag.target
+                    .as_ref()
+                    .and_then(ActiveDragTarget::wayland_client)
+                    == Some(&client_id)
+            })
         {
             self.cancel_drag_session("data_device_destroyed");
         }
@@ -699,19 +701,54 @@ impl CompositorState {
                 return;
             };
             if active
-                .offer
+                .target
                 .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
                 .is_none_or(|current| !same_wayland_resource(current, offer))
+                || active
+                    .target
+                    .as_ref()
+                    .and_then(ActiveDragTarget::wayland_client)
+                    != Some(client_id)
             {
                 return;
             }
-            let Some(source) = active.source.as_ref() else {
-                return;
-            };
-            let _ = source.send_event(wl_data_source::Event::Send {
-                mime_type,
-                fd: fd.as_fd(),
-            });
+            match &active.origin {
+                ActiveDragOrigin::WaylandSource { source, .. } => {
+                    let _ = source.send_event(wl_data_source::Event::Send {
+                        mime_type,
+                        fd: fd.as_fd(),
+                    });
+                }
+                ActiveDragOrigin::Xwayland {
+                    offer: xwayland_offer,
+                } => {
+                    let offer_id = xwayland_offer.id();
+                    if self
+                        .xwayland
+                        .client_identity
+                        .as_ref()
+                        .is_none_or(|identity| identity.generation != offer_id.generation())
+                        || !xwayland_offer
+                            .mime_types()
+                            .as_slice()
+                            .iter()
+                            .any(|mime| mime == &mime_type)
+                        || self.xwayland_dnd_data_requests.len()
+                            >= super::data_device::MAX_PENDING_XWAYLAND_DND_DATA_REQUESTS
+                    {
+                        return;
+                    }
+                    self.xwayland_dnd_data_requests.push_back(
+                        crate::xwayland::XwaylandDndDataRequest {
+                            offer_id,
+                            mime_type,
+                            sink: fd,
+                        },
+                    );
+                }
+                ActiveDragOrigin::WaylandSourceless { .. } => {}
+            }
             return;
         }
         let Some(source_key) = binding.source_key else {

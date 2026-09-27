@@ -53,13 +53,16 @@ pub struct DataBridge {
 }
 
 impl DataBridge {
-    pub fn clear_generation(&mut self, generation: BridgeGeneration) -> Vec<SequenceNumber> {
-        self.selections.clear_generation(generation);
-        let mut pending_selection_replies = self.selection_wire.clear_generation(generation);
-        pending_selection_replies.extend(self.selection_payloads.clear_generation(generation));
-        pending_selection_replies.extend(self.selection_proxy.clear_generation(generation));
-        pending_selection_replies.extend(self.selection_outgoing.clear_generation(generation));
-        self.transfers.clear_generation(generation);
+    pub fn clear_generation(&mut self, generation: XwaylandGeneration) -> Vec<SequenceNumber> {
+        let bridge_generation = BridgeGeneration::from(generation);
+        self.selections.clear_generation(bridge_generation);
+        let mut pending_selection_replies = self.selection_wire.clear_generation(bridge_generation);
+        pending_selection_replies
+            .extend(self.selection_payloads.clear_generation(bridge_generation));
+        pending_selection_replies.extend(self.selection_proxy.clear_generation(bridge_generation));
+        pending_selection_replies
+            .extend(self.selection_outgoing.clear_generation(bridge_generation));
+        self.transfers.clear_generation(bridge_generation);
         self.dnd.clear_generation(generation);
         pending_selection_replies
     }

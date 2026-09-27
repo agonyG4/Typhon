@@ -301,12 +301,16 @@ impl CompositorState {
         self.remove_keyboard_shortcut_inhibitors_for_client(client_id);
         self.remove_astrea_toplevel_client(client_id);
         if self.active_drag.as_ref().is_some_and(|drag| {
-            drag.target_client.as_ref() == Some(client_id)
+            drag.target
+                .as_ref()
+                .and_then(ActiveDragTarget::wayland_client)
+                == Some(client_id)
                 || drag
-                    .source
-                    .as_ref()
+                    .origin
+                    .wayland_source()
                     .and_then(|source| source.client())
                     .is_some_and(|client| client.id() == *client_id)
+                || drag.origin.wayland_initiating_client().as_ref() == Some(client_id)
         }) {
             self.cancel_drag_session("client_disconnected");
         }
@@ -519,13 +523,20 @@ impl CompositorState {
             .filter(|serial| resource_owned_by_client(&serial.surface, client_id))
             .count();
         if self.active_drag.as_ref().is_some_and(|drag| {
-            drag.target_client.as_ref() == Some(client_id)
+            drag.target
+                .as_ref()
+                .and_then(ActiveDragTarget::wayland_client)
+                == Some(client_id)
                 || drag
-                    .source
-                    .as_ref()
+                    .origin
+                    .wayland_source()
                     .and_then(|source| source.client())
                     .is_some_and(|client| client.id() == *client_id)
-                || resource_owned_by_client(&drag.origin_surface, client_id)
+                || drag.origin.wayland_initiating_client().as_ref() == Some(client_id)
+                || drag
+                    .origin
+                    .wayland_origin_surface()
+                    .is_some_and(|surface| resource_owned_by_client(surface, client_id))
                 || drag
                     .icon_surface
                     .as_ref()
@@ -537,10 +548,12 @@ impl CompositorState {
     }
 
     fn audit_dnd_resource_ownership(&mut self) {
-        let active_offer_id = self
-            .active_drag
-            .as_ref()
-            .and_then(|drag| drag.offer.as_ref().map(|offer| offer.id()));
+        let active_offer_id = self.active_drag.as_ref().and_then(|drag| {
+            drag.target
+                .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
+                .map(|offer| offer.id())
+        });
         let orphaned_offer_ids = self
             .data_offers
             .iter()

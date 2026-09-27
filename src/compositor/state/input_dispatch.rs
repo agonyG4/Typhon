@@ -691,7 +691,9 @@ impl CompositorState {
             compositor_surface_id(&grab.surface),
             reason
         ));
-        if self.active_drag.is_some() {
+        if self.active_drag.as_ref().is_some_and(|drag| {
+            drag.lifecycle_driver == DragLifecycleDriver::WaylandImplicitPointerGrab
+        }) {
             if reason == "last-release" {
                 self.drop_active_drag();
             } else {

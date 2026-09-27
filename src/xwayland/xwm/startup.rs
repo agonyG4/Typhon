@@ -1384,10 +1384,7 @@ impl XwmStartup {
         }
         xwm.mark_override_redirect_stack_dirty();
         if super::selection_wire::initialize(&mut xwm).is_err() {
-            for sequence in xwm
-                .data_bridge
-                .clear_generation(super::data_bridge::BridgeGeneration::from(self.generation))
-            {
+            for sequence in xwm.data_bridge.clear_generation(self.generation) {
                 xwm.connection.discard_reply(
                     sequence,
                     RequestKind::HasResponse,

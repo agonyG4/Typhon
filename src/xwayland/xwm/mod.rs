@@ -560,10 +560,7 @@ impl Xwm {
         self.clear_resize_sync_generation(generation);
         self.shapes
             .retain(|handle, _| handle.generation() != generation);
-        for sequence in self
-            .data_bridge
-            .clear_generation(data_bridge::BridgeGeneration::from(generation))
-        {
+        for sequence in self.data_bridge.clear_generation(generation) {
             self.connection.discard_reply(
                 sequence,
                 RequestKind::HasResponse,

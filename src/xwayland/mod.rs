@@ -6,6 +6,7 @@ mod config;
 mod diagnostics;
 mod display;
 mod displayfd;
+pub mod dnd_metadata;
 mod fs_security;
 mod generation;
 mod launch;
@@ -25,6 +26,11 @@ pub use association::{
     AssociationError, AssociationRegistry, SurfaceAssociation, SurfaceId, XwaylandAssociationEvent,
 };
 pub use config::{XwaylandConfig, XwaylandMode, XwaylandProfile, XwaylandStartPolicy};
+pub use dnd_metadata::{
+    CanonicalDndSessionId, WaylandDndAction, XwaylandDndAction, XwaylandDndAdapterId,
+    XwaylandDndDataRequest, XwaylandDndMetadataError, XwaylandDndMimeCatalog, XwaylandDndOffer,
+    XwaylandDndOfferId, XwaylandDndTransition, XwaylandDndVersion,
+};
 pub use generation::XwaylandGeneration;
 pub use readiness::XwaylandReadinessSnapshot;
 pub use selection_metadata::{

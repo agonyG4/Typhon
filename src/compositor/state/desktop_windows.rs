@@ -234,6 +234,11 @@ impl CompositorState {
         self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window_group_scene_node_id = self.scene_node_id_for_window_group(id);
+        if let Some(WindowBackend::X11(handle)) =
+            self.desktop_windows.get(&id).map(|window| window.backend)
+        {
+            self.retire_xwayland_drag_target(handle);
+        }
         let window = self.desktop_windows.remove(&id)?;
         if let Some(scene_node_id) = window_group_scene_node_id {
             self.presentation_animator.cancel_all(scene_node_id);

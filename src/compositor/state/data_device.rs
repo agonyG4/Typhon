@@ -1,11 +1,35 @@
 use super::*;
+use crate::xwayland::CanonicalDndSessionId;
 
 #[cfg(test)]
 use crate::render_backend::buffer::CommittedSurfaceBuffer;
 
-const DND_COPY: u32 = 1;
-const DND_MOVE: u32 = 2;
-const DND_ASK: u32 = 4;
+pub(super) const DND_COPY: u32 = 1;
+pub(super) const DND_MOVE: u32 = 2;
+pub(super) const DND_ASK: u32 = 4;
+pub(super) const MAX_PENDING_XWAYLAND_DND_DATA_REQUESTS: usize = 64;
+
+pub(super) fn xdnd_action_from_wayland_mask(
+    mask: u32,
+) -> Option<crate::xwayland::XwaylandDndAction> {
+    match mask {
+        DND_COPY => Some(crate::xwayland::XwaylandDndAction::Copy),
+        DND_MOVE => Some(crate::xwayland::XwaylandDndAction::Move),
+        DND_ASK => Some(crate::xwayland::XwaylandDndAction::Ask),
+        _ => None,
+    }
+}
+
+fn xdnd_actions_from_wayland_mask(mask: u32) -> Vec<crate::xwayland::XwaylandDndAction> {
+    [
+        (DND_COPY, crate::xwayland::XwaylandDndAction::Copy),
+        (DND_MOVE, crate::xwayland::XwaylandDndAction::Move),
+        (DND_ASK, crate::xwayland::XwaylandDndAction::Ask),
+    ]
+    .into_iter()
+    .filter_map(|(bit, action)| (mask & bit != 0).then_some(action))
+    .collect()
+}
 
 fn first_dnd_action(mask: u32) -> u32 {
     [DND_COPY, DND_MOVE, DND_ASK]
@@ -14,7 +38,11 @@ fn first_dnd_action(mask: u32) -> u32 {
         .unwrap_or_default()
 }
 
-fn select_dnd_action(source_actions: u32, destination_actions: u32, preferred: u32) -> u32 {
+pub(super) fn select_dnd_action(
+    source_actions: u32,
+    destination_actions: u32,
+    preferred: u32,
+) -> u32 {
     let common = source_actions & destination_actions;
     if common == 0 {
         return 0;
@@ -38,7 +66,7 @@ impl CompositorState {
             .create_resource::<wl_surface::WlSurface, SurfaceData, CompositorState>(
                 handle,
                 version,
-                SurfaceData::new(0),
+                SurfaceData::new(self.allocate_surface_id()),
             )
             .expect("test surface resource creation");
         let surface_id = compositor_surface_id(&surface);
@@ -60,13 +88,14 @@ impl CompositorState {
             .create_resource::<wl_surface::WlSurface, SurfaceData, CompositorState>(
                 handle,
                 6,
-                SurfaceData::new(0),
+                SurfaceData::new(self.allocate_surface_id()),
             )
             .expect("test surface resource creation");
         let surface_id = compositor_surface_id(&surface);
         self.register_surface_resource(surface_id, surface.clone());
         self.register_surface_client(surface_id, client.id());
         self.test_publish_surface(surface_id, width, height, placement);
+        self.refresh_active_scene_surface(surface_id);
         surface
     }
 
@@ -215,8 +244,9 @@ impl CompositorState {
             binding.drag_phase = Some(DragOfferPhase::Destroyed);
         }
         if self.active_drag.as_ref().is_some_and(|drag| {
-            drag.offer
+            drag.target
                 .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
                 .is_some_and(|active_offer| active_offer.id() == offer.id())
         }) {
             self.cancel_drag_session("offer_destroyed");
@@ -236,6 +266,46 @@ impl CompositorState {
         icon_surface: Option<wl_surface::WlSurface>,
         serial: u32,
     ) {
+        let Some(session_serial) = self.next_dnd_session_serial.checked_add(1) else {
+            return;
+        };
+        let Some(session_serial) = std::num::NonZeroU64::new(session_serial) else {
+            return;
+        };
+        let origin = match source {
+            Some(source) => ActiveDragOrigin::WaylandSource {
+                source,
+                origin_surface,
+                initiating_serial: serial,
+            },
+            None => {
+                let Some(initiating_client) = origin_surface.client().map(|client| client.id())
+                else {
+                    return;
+                };
+                ActiveDragOrigin::WaylandSourceless {
+                    initiating_client,
+                    origin_surface,
+                    initiating_serial: serial,
+                }
+            }
+        };
+        self.next_dnd_session_serial = session_serial.get();
+        self.begin_drag_with_origin(
+            CanonicalDndSessionId::Wayland(session_serial),
+            origin,
+            DragLifecycleDriver::WaylandImplicitPointerGrab,
+            icon_surface,
+        );
+    }
+
+    pub(super) fn begin_drag_with_origin(
+        &mut self,
+        id: CanonicalDndSessionId,
+        origin: ActiveDragOrigin,
+        lifecycle_driver: DragLifecycleDriver,
+        icon_surface: Option<wl_surface::WlSurface>,
+    ) {
         self.cancel_drag_session("replaced");
         self.compliance_metrics.dnd_last_terminal_phase = None;
         self.compliance_metrics.dnd_sessions_started = self
@@ -243,14 +313,13 @@ impl CompositorState {
             .dnd_sessions_started
             .saturating_add(1);
         self.active_drag = Some(ActiveDrag {
-            source,
-            origin_surface,
+            id,
+            origin,
+            lifecycle_driver,
             icon_surface,
-            initiating_serial: serial,
-            target_surface: None,
-            target_client: None,
-            offer: None,
+            target: None,
             accepted_mime: None,
+            target_action: None,
             selected_action: 0,
             destination_actions: None,
             last_offer_action: None,
@@ -259,27 +328,109 @@ impl CompositorState {
         });
     }
 
+    pub(super) fn drag_source_mime_types(&self, origin: &ActiveDragOrigin) -> Vec<String> {
+        match origin {
+            ActiveDragOrigin::WaylandSource { source, .. } => self
+                .data_sources
+                .get(&source.id())
+                .map(|source| source.mime_types.clone())
+                .unwrap_or_default(),
+            ActiveDragOrigin::Xwayland { offer } => offer.mime_types().as_slice().to_vec(),
+            ActiveDragOrigin::WaylandSourceless { .. } => Vec::new(),
+        }
+    }
+
+    pub(super) fn drag_source_actions(&self, origin: &ActiveDragOrigin) -> u32 {
+        match origin {
+            ActiveDragOrigin::WaylandSource { source, .. } => self
+                .data_sources
+                .get(&source.id())
+                .map(|source| source.actions)
+                .unwrap_or_default(),
+            ActiveDragOrigin::Xwayland { offer } => offer.wayland_source_actions_mask(),
+            ActiveDragOrigin::WaylandSourceless { .. } => 0,
+        }
+    }
+
     pub(in crate::compositor) fn update_drag_target_at(&mut self, x: f64, y: f64) {
         let Some(active) = self.active_drag.as_ref() else {
             return;
         };
-        let phase = active.phase;
-        let previous_target = active.target_surface.clone();
-        let source = active.source.clone();
-        let origin_client = active.origin_surface.client().map(|client| client.id());
-        if phase != DragSessionPhase::Dragging {
+        if active.phase != DragSessionPhase::Dragging {
             return;
         }
+        let session_id = active.id;
+        let origin = active.origin.clone();
+        let previous_target = active.target.clone();
         let target = self.pointer_target_at(x, y);
-        let target_surface = target.as_ref().map(|target| target.surface.clone());
-        let unchanged = previous_target
-            .as_ref()
-            .zip(target_surface.as_ref())
-            .is_some_and(|(old, new)| same_surface_resource(old, new));
 
-        if unchanged {
-            self.send_drag_motion_to_current_target(target.as_ref());
-            return;
+        if let Some(target) = target.as_ref() {
+            let surface_id = compositor_surface_id(&target.surface);
+            let root_surface_id = self.root_surface_id_for_surface(surface_id);
+            let x11_window = self
+                .window_id_for_surface(root_surface_id)
+                .and_then(|window_id| self.window(window_id))
+                .and_then(|window| match window.backend {
+                    WindowBackend::X11(handle) => Some(handle),
+                    WindowBackend::Xdg(_) => None,
+                })
+                .filter(|handle| {
+                    self.xwayland
+                        .client_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.generation == handle.generation())
+                });
+            if let Some(window) = x11_window {
+                if previous_target.as_ref().is_some_and(|previous| {
+                    matches!(previous, ActiveDragTarget::Xwayland { window: current } if *current == window)
+                }) {
+                    self.queue_xwayland_dnd_position(session_id, window, x, y);
+                    return;
+                }
+                self.leave_drag_target();
+                if origin.is_wayland_sourceless()
+                    && target.surface.client().map(|client| client.id())
+                        != origin.wayland_initiating_client()
+                {
+                    return;
+                }
+                let mime_types = crate::xwayland::XwaylandDndMimeCatalog::bounded_from_iter(
+                    self.drag_source_mime_types(&origin),
+                );
+                let source_actions = match &origin {
+                    ActiveDragOrigin::Xwayland { offer } => offer.source_actions().to_vec(),
+                    ActiveDragOrigin::WaylandSource { .. } => {
+                        xdnd_actions_from_wayland_mask(self.drag_source_actions(&origin))
+                    }
+                    ActiveDragOrigin::WaylandSourceless { .. } => Vec::new(),
+                };
+                self.xwayland_dnd_transition =
+                    Some(crate::xwayland::XwaylandDndTransition::TargetEntered {
+                        session_id,
+                        target: window,
+                        x,
+                        y,
+                        mime_types,
+                        source_actions,
+                    });
+                if let Some(active) = self.active_drag.as_mut() {
+                    active.target = Some(ActiveDragTarget::Xwayland { window });
+                    active.accepted_mime = None;
+                    active.target_action = None;
+                    active.selected_action = 0;
+                    active.destination_actions = None;
+                    active.last_offer_action = None;
+                    active.last_source_action = None;
+                }
+                return;
+            }
+
+            if previous_target.as_ref().is_some_and(|previous| {
+                matches!(previous, ActiveDragTarget::Wayland { surface, .. } if same_surface_resource(surface, &target.surface))
+            }) {
+                self.send_drag_motion_to_current_target(Some(target));
+                return;
+            }
         }
 
         self.leave_drag_target();
@@ -289,10 +440,11 @@ impl CompositorState {
         let Some(target_client) = target.surface.client().map(|client| client.id()) else {
             return;
         };
-        if source.is_none() && Some(target_client.clone()) != origin_client {
-            // Core source-less drags are private to the initiating client.  Do
-            // not manufacture a wl_data_offer or leak enter/motion events to
-            // another client under the pointer.
+        if origin.is_wayland_sourceless()
+            && origin.wayland_initiating_client().as_ref() != Some(&target_client)
+        {
+            // Sourceless core Wayland drags remain private to their initiating
+            // client, including when the pointer is over an X11-backed window.
             return;
         }
         let Some(device) = self
@@ -304,16 +456,9 @@ impl CompositorState {
             return;
         };
 
-        let mime_types = source
-            .as_ref()
-            .and_then(|source| self.data_sources.get(&source.id()))
-            .map(|source| source.mime_types.clone())
-            .unwrap_or_default();
-        let source_actions = source
-            .as_ref()
-            .and_then(|source| self.data_sources.get(&source.id()))
-            .map(|source| source.actions)
-            .unwrap_or_default();
+        let mime_types = self.drag_source_mime_types(&origin);
+        let source_actions = self.drag_source_actions(&origin);
+        let has_source = !origin.is_wayland_sourceless();
         let Some(client) = device.client() else {
             return;
         };
@@ -321,7 +466,7 @@ impl CompositorState {
             return;
         };
         let display = DisplayHandle::from(handle);
-        let offer = if source.is_some() {
+        let offer = if has_source {
             let Ok(offer) = client
                 .create_resource::<wl_data_offer::WlDataOffer, DataOfferData, CompositorState>(
                     &display,
@@ -377,14 +522,62 @@ impl CompositorState {
             id: offer.clone(),
         });
         if let Some(active) = self.active_drag.as_mut() {
-            active.target_surface = Some(target.surface.clone());
-            active.target_client = Some(target_client);
-            active.offer = offer;
+            active.target = Some(ActiveDragTarget::Wayland {
+                surface: target.surface.clone(),
+                client_id: target_client,
+                offer,
+            });
+            active.target_action = None;
             active.selected_action = 0;
             active.destination_actions = None;
             active.last_offer_action = None;
             active.last_source_action = None;
         }
+    }
+
+    fn queue_xwayland_dnd_position(
+        &mut self,
+        session_id: crate::xwayland::CanonicalDndSessionId,
+        target_window: crate::xwayland::X11WindowHandle,
+        x: f64,
+        y: f64,
+    ) {
+        let current = self.active_drag.as_ref().filter(|active| {
+            active.id == session_id
+                && matches!(
+                    active.target.as_ref(),
+                    Some(ActiveDragTarget::Xwayland { window }) if *window == target_window
+                )
+        });
+        let accepted_mime = current.and_then(|active| active.accepted_mime.clone());
+        let action = current.and_then(|active| active.target_action);
+        let mime_types = current
+            .map(|active| {
+                crate::xwayland::XwaylandDndMimeCatalog::bounded_from_iter(
+                    self.drag_source_mime_types(&active.origin),
+                )
+            })
+            .unwrap_or_default();
+        let source_actions = current
+            .map(|active| match &active.origin {
+                ActiveDragOrigin::Xwayland { offer } => offer.source_actions().to_vec(),
+                ActiveDragOrigin::WaylandSource { .. } => {
+                    xdnd_actions_from_wayland_mask(self.drag_source_actions(&active.origin))
+                }
+                ActiveDragOrigin::WaylandSourceless { .. } => Vec::new(),
+            })
+            .unwrap_or_default();
+        self.xwayland_dnd_transition =
+            Some(crate::xwayland::XwaylandDndTransition::TargetPositioned {
+                session_id,
+                target: target_window,
+                x,
+                y,
+                accepted_mime,
+                action,
+                mime_types,
+                source_actions,
+            });
     }
 
     fn send_drag_motion_to_current_target(&mut self, target: Option<&PointerTarget>) {
@@ -394,51 +587,89 @@ impl CompositorState {
         let Some(active) = self.active_drag.as_ref() else {
             return;
         };
-        let Some(client_id) = active.target_client.as_ref() else {
-            return;
-        };
-        let Some(device) = self
-            .data_devices
-            .iter()
-            .find(|binding| &binding.client_id == client_id && binding.device.is_alive())
-            .map(|binding| binding.device.clone())
-        else {
-            return;
-        };
-        let _ = device.send_event(wl_data_device::Event::Motion {
-            time: wayland_event_time(),
-            x: target.surface_x,
-            y: target.surface_y,
-        });
+        match active.target.as_ref() {
+            Some(ActiveDragTarget::Wayland { client_id, .. }) => {
+                let Some(device) = self
+                    .data_devices
+                    .iter()
+                    .find(|binding| &binding.client_id == client_id && binding.device.is_alive())
+                    .map(|binding| binding.device.clone())
+                else {
+                    return;
+                };
+                let _ = device.send_event(wl_data_device::Event::Motion {
+                    time: wayland_event_time(),
+                    x: target.surface_x,
+                    y: target.surface_y,
+                });
+            }
+            Some(ActiveDragTarget::Xwayland { window }) => {
+                self.queue_xwayland_dnd_position(
+                    active.id,
+                    *window,
+                    self.last_pointer_x,
+                    self.last_pointer_y,
+                );
+            }
+            None => {}
+        }
     }
 
     pub(in crate::compositor) fn leave_drag_target(&mut self) {
         let Some(active) = self.active_drag.as_mut() else {
             return;
         };
-        let Some(client_id) = active.target_client.take() else {
-            active.target_surface = None;
-            active.offer = None;
+        let Some(target) = active.target.take() else {
+            active.accepted_mime = None;
+            active.target_action = None;
+            active.selected_action = 0;
+            active.destination_actions = None;
+            active.last_offer_action = None;
+            active.last_source_action = None;
             return;
         };
-        if let Some(device) = self
-            .data_devices
-            .iter()
-            .find(|binding| binding.client_id == client_id && binding.device.is_alive())
-            .map(|binding| binding.device.clone())
-        {
-            let _ = device.send_event(wl_data_device::Event::Leave);
+        match target {
+            ActiveDragTarget::Wayland {
+                client_id, offer, ..
+            } => {
+                if let Some(device) = self
+                    .data_devices
+                    .iter()
+                    .find(|binding| binding.client_id == client_id && binding.device.is_alive())
+                    .map(|binding| binding.device.clone())
+                {
+                    let _ = device.send_event(wl_data_device::Event::Leave);
+                }
+                if let Some(offer) = offer {
+                    self.data_offers.remove(&offer.id());
+                }
+                match &active.origin {
+                    ActiveDragOrigin::WaylandSource { source, .. } if source.is_alive() => {
+                        let _ =
+                            source.send_event(wl_data_source::Event::Target { mime_type: None });
+                    }
+                    ActiveDragOrigin::Xwayland { offer } => {
+                        self.xwayland_dnd_transition =
+                            Some(crate::xwayland::XwaylandDndTransition::SourceFeedback {
+                                offer_id: offer.id(),
+                                accepted_mime: None,
+                                action: None,
+                            });
+                    }
+                    ActiveDragOrigin::WaylandSource { .. }
+                    | ActiveDragOrigin::WaylandSourceless { .. } => {}
+                }
+            }
+            ActiveDragTarget::Xwayland { window } => {
+                self.xwayland_dnd_transition =
+                    Some(crate::xwayland::XwaylandDndTransition::TargetLeft {
+                        session_id: active.id,
+                        target: window,
+                    });
+            }
         }
-        if let Some(offer) = active.offer.take() {
-            self.data_offers.remove(&offer.id());
-        }
-        if let Some(source) = active.source.as_ref()
-            && source.is_alive()
-        {
-            let _ = source.send_event(wl_data_source::Event::Target { mime_type: None });
-        }
-        active.target_surface = None;
         active.accepted_mime = None;
+        active.target_action = None;
         active.selected_action = 0;
         active.destination_actions = None;
         active.last_offer_action = None;
@@ -453,19 +684,30 @@ impl CompositorState {
             return;
         }
         let action = active.selected_action;
-        let offer = active.offer.clone();
-        let source = active.source.clone();
+        let offer = active
+            .target
+            .as_ref()
+            .and_then(ActiveDragTarget::wayland_offer)
+            .cloned();
+        let source = active.origin.wayland_source().cloned();
+        let xwayland_offer_id = active.origin.xwayland_offer().map(|offer| offer.id());
+        let xwayland_action = active
+            .target_action
+            .or_else(|| xdnd_action_from_wayland_mask(active.selected_action));
+        let accepted_mime = active.accepted_mime.clone();
         let send_offer = offer
             .as_ref()
             .is_some_and(|offer| offer.version() >= 3 && active.last_offer_action != Some(action));
         let send_source = source.as_ref().is_some_and(|source| {
             source.version() >= 3 && active.last_source_action != Some(action)
         });
+        let send_xwayland =
+            xwayland_offer_id.is_some() && active.last_source_action != Some(action);
         if let Some(active) = self.active_drag.as_mut() {
             if send_offer {
                 active.last_offer_action = Some(action);
             }
-            if send_source {
+            if send_source || send_xwayland {
                 active.last_source_action = Some(action);
             }
         }
@@ -487,6 +729,14 @@ impl CompositorState {
                 .dnd_source_action_events
                 .saturating_add(1);
         }
+        if send_xwayland && let Some(offer_id) = xwayland_offer_id {
+            self.xwayland_dnd_transition =
+                Some(crate::xwayland::XwaylandDndTransition::SourceFeedback {
+                    offer_id,
+                    accepted_mime,
+                    action: xwayland_action,
+                });
+        }
     }
 
     pub(in crate::compositor) fn update_drag_acceptance(
@@ -498,20 +748,34 @@ impl CompositorState {
             return;
         };
         if active
-            .offer
+            .target
             .as_ref()
+            .and_then(ActiveDragTarget::wayland_offer)
             .is_none_or(|current| !same_wayland_resource(current, offer))
         {
             return;
         }
         active.accepted_mime = mime_type.clone();
-        if let Some(source) = active.source.as_ref()
-            && source.is_alive()
-        {
-            let _ = source.send_event(wl_data_source::Event::Target { mime_type });
+        match &active.origin {
+            ActiveDragOrigin::WaylandSource { source, .. } if source.is_alive() => {
+                let _ = source.send_event(wl_data_source::Event::Target { mime_type });
+            }
+            ActiveDragOrigin::Xwayland { offer } => {
+                self.xwayland_dnd_transition =
+                    Some(crate::xwayland::XwaylandDndTransition::SourceFeedback {
+                        offer_id: offer.id(),
+                        accepted_mime: mime_type,
+                        action: xdnd_action_from_wayland_mask(active.selected_action),
+                    });
+            }
+            ActiveDragOrigin::WaylandSource { .. } | ActiveDragOrigin::WaylandSourceless { .. } => {
+            }
         }
     }
 
+    /// Apply semantic status from an X11-backed target to the canonical drag.
+    /// XDND actions are converted by meaning; Link and Private remain typed but
+    /// have no Wayland core action mask.
     pub(in crate::compositor) fn update_drag_actions(
         &mut self,
         offer: &wl_data_offer::WlDataOffer,
@@ -531,8 +795,9 @@ impl CompositorState {
         binding.selected_action = (selected != 0).then_some(selected);
         if let Some(active) = self.active_drag.as_mut()
             && active
-                .offer
+                .target
                 .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
                 .is_some_and(|current| same_wayland_resource(current, offer))
         {
             active.selected_action = selected;
@@ -550,13 +815,17 @@ impl CompositorState {
             return;
         };
         if active
-            .source
-            .as_ref()
+            .origin
+            .wayland_source()
             .is_none_or(|current| !same_wayland_resource(current, source))
         {
             return;
         }
-        let offer = active.offer.clone();
+        let offer = active
+            .target
+            .as_ref()
+            .and_then(ActiveDragTarget::wayland_offer)
+            .cloned();
         if let Some(offer) = offer.as_ref()
             && let Some(binding) = self.data_offers.get_mut(&offer.id())
         {
@@ -582,6 +851,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn drop_active_drag(&mut self) {
+        self.drop_drag_for_driver(DragLifecycleDriver::WaylandImplicitPointerGrab);
+    }
+
+    pub(super) fn drop_drag_for_driver(&mut self, driver: DragLifecycleDriver) {
+        if self
+            .active_drag
+            .as_ref()
+            .is_some_and(|active| active.lifecycle_driver != driver)
+        {
+            return;
+        }
         if self
             .active_drag
             .as_ref()
@@ -590,57 +870,117 @@ impl CompositorState {
             self.note_dnd_duplicate_terminal_attempt();
             return;
         }
-        let Some(active) = self.active_drag.as_mut() else {
+        let Some(active) = self.active_drag.as_ref().cloned() else {
             return;
         };
-        let Some(client_id) = active.target_client.clone() else {
+        let Some(target) = active.target.clone() else {
             self.cancel_drag_session("drop_without_target");
-            return;
-        };
-        let Some(device) = self
-            .data_devices
-            .iter()
-            .find(|binding| binding.client_id == client_id && binding.device.is_alive())
-            .map(|binding| binding.device.clone())
-        else {
-            self.cancel_drag_session("target_device_gone");
             return;
         };
         if active.phase != DragSessionPhase::Dragging {
             return;
         }
-        if active.source.is_none() {
-            let _ = device.send_event(wl_data_device::Event::Drop);
-            active.phase = DragSessionPhase::Finished;
-            self.compliance_metrics.dnd_last_terminal_phase = Some(DragSessionPhase::Finished);
-            self.complete_drag_session(false);
-            self.compliance_metrics.dnd_sessions_finished = self
-                .compliance_metrics
-                .dnd_sessions_finished
-                .saturating_add(1);
-            return;
+        match target {
+            ActiveDragTarget::Xwayland { window } => {
+                let (Some(mime_type), Some(action)) =
+                    (active.accepted_mime.clone(), active.target_action)
+                else {
+                    self.cancel_drag_session("xwayland_target_not_accepted");
+                    return;
+                };
+                let action_supported = match &active.origin {
+                    ActiveDragOrigin::WaylandSource { .. } => {
+                        action.to_wayland_action().is_some() && active.selected_action != 0
+                    }
+                    ActiveDragOrigin::Xwayland { offer } => {
+                        offer.source_actions().contains(&action)
+                    }
+                    ActiveDragOrigin::WaylandSourceless { .. } => false,
+                };
+                if !action_supported {
+                    self.cancel_drag_session("xwayland_target_action_unsupported");
+                    return;
+                }
+                let mime_types = crate::xwayland::XwaylandDndMimeCatalog::bounded_from_iter(
+                    self.drag_source_mime_types(&active.origin),
+                );
+                let source_actions = match &active.origin {
+                    ActiveDragOrigin::Xwayland { offer } => offer.source_actions().to_vec(),
+                    ActiveDragOrigin::WaylandSource { .. } => {
+                        xdnd_actions_from_wayland_mask(self.drag_source_actions(&active.origin))
+                    }
+                    ActiveDragOrigin::WaylandSourceless { .. } => Vec::new(),
+                };
+                self.xwayland_dnd_transition =
+                    Some(crate::xwayland::XwaylandDndTransition::DropRequested {
+                        session_id: active.id,
+                        target: window,
+                        mime_type,
+                        action,
+                        mime_types,
+                        source_actions,
+                    });
+                if let Some(source) = active.origin.wayland_source()
+                    && source.version() >= 3
+                    && source.is_alive()
+                {
+                    let _ = source.send_event(wl_data_source::Event::DndDropPerformed);
+                }
+                if let Some(active) = self.active_drag.as_mut() {
+                    active.phase = DragSessionPhase::DropPendingXwaylandTarget;
+                }
+            }
+            ActiveDragTarget::Wayland {
+                client_id, offer, ..
+            } => {
+                let Some(device) = self
+                    .data_devices
+                    .iter()
+                    .find(|binding| binding.client_id == client_id && binding.device.is_alive())
+                    .map(|binding| binding.device.clone())
+                else {
+                    self.cancel_drag_session("target_device_gone");
+                    return;
+                };
+                let sourceless = active.origin.is_wayland_sourceless();
+                if !sourceless && (active.accepted_mime.is_none() || active.selected_action == 0) {
+                    self.cancel_drag_session("drop_not_accepted");
+                    return;
+                }
+                let _ = device.send_event(wl_data_device::Event::Drop);
+                if let Some(source) = active.origin.wayland_source()
+                    && source.version() >= 3
+                    && source.is_alive()
+                {
+                    let _ = source.send_event(wl_data_source::Event::DndDropPerformed);
+                }
+                if let Some(offer) = offer.as_ref()
+                    && let Some(binding) = self.data_offers.get_mut(&offer.id())
+                {
+                    binding.drag_phase = Some(DragOfferPhase::Dropped);
+                }
+                if sourceless {
+                    if let Some(active) = self.active_drag.as_mut() {
+                        active.phase = DragSessionPhase::Finished;
+                    }
+                    self.compliance_metrics.dnd_last_terminal_phase =
+                        Some(DragSessionPhase::Finished);
+                    self.complete_drag_session(false);
+                    self.compliance_metrics.dnd_sessions_finished = self
+                        .compliance_metrics
+                        .dnd_sessions_finished
+                        .saturating_add(1);
+                    return;
+                }
+                if let Some(active) = self.active_drag.as_mut() {
+                    active.phase = if active.selected_action == DND_ASK {
+                        DragSessionPhase::DroppedAwaitingAskResolution
+                    } else {
+                        DragSessionPhase::DroppedAwaitingFinish
+                    };
+                }
+            }
         }
-        if active.accepted_mime.is_none() || active.selected_action == 0 {
-            self.cancel_drag_session("drop_not_accepted");
-            return;
-        }
-        let _ = device.send_event(wl_data_device::Event::Drop);
-        if let Some(source) = active.source.as_ref()
-            && source.version() >= 3
-            && source.is_alive()
-        {
-            let _ = source.send_event(wl_data_source::Event::DndDropPerformed);
-        }
-        if let Some(offer) = active.offer.as_ref()
-            && let Some(binding) = self.data_offers.get_mut(&offer.id())
-        {
-            binding.drag_phase = Some(DragOfferPhase::Dropped);
-        }
-        active.phase = if active.selected_action == DND_ASK {
-            DragSessionPhase::DroppedAwaitingAskResolution
-        } else {
-            DragSessionPhase::DroppedAwaitingFinish
-        };
     }
 
     pub(in crate::compositor) fn finish_drag_offer(
@@ -649,8 +989,9 @@ impl CompositorState {
     ) -> bool {
         if self.active_drag.as_ref().is_some_and(|active| {
             active
-                .offer
+                .target
                 .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
                 .is_some_and(|current| same_wayland_resource(current, offer))
                 && matches!(
                     active.phase,
@@ -664,8 +1005,9 @@ impl CompositorState {
             return false;
         };
         if active
-            .offer
+            .target
             .as_ref()
+            .and_then(ActiveDragTarget::wayland_offer)
             .is_none_or(|current| !same_wayland_resource(current, offer))
             || !matches!(
                 active.phase,
@@ -682,7 +1024,8 @@ impl CompositorState {
         }
         let ask_resolution = active.phase == DragSessionPhase::DroppedAwaitingAskResolution;
         let final_action = active.selected_action;
-        if let Some(source) = active.source.as_ref()
+        let origin = active.origin.clone();
+        if let ActiveDragOrigin::WaylandSource { source, .. } = &origin
             && source.version() >= 3
             && source.is_alive()
         {
@@ -712,6 +1055,17 @@ impl CompositorState {
             active.phase = DragSessionPhase::Finished;
         }
         self.compliance_metrics.dnd_last_terminal_phase = Some(DragSessionPhase::Finished);
+        if let ActiveDragOrigin::Xwayland {
+            offer: source_offer,
+        } = origin
+        {
+            self.xwayland_dnd_transition =
+                Some(crate::xwayland::XwaylandDndTransition::SourceFinished {
+                    offer_id: source_offer.id(),
+                    accepted: true,
+                    action: xdnd_action_from_wayland_mask(final_action),
+                });
+        }
         self.complete_drag_session(false);
         self.compliance_metrics.dnd_sessions_finished = self
             .compliance_metrics
@@ -726,8 +1080,8 @@ impl CompositorState {
     ) {
         if self.active_drag.as_ref().is_some_and(|active| {
             active
-                .source
-                .as_ref()
+                .origin
+                .wayland_source()
                 .is_some_and(|current| same_wayland_resource(current, source))
         }) {
             self.cancel_drag_session("source_destroyed");
@@ -750,9 +1104,14 @@ impl CompositorState {
             self.note_dnd_duplicate_terminal_attempt();
             return;
         }
-        if let Some(source) = active.source.as_ref()
+        let session_id = active.id;
+        let xwayland_origin = active.origin.xwayland_offer().map(|offer| offer.id());
+        let xwayland_target_generation = match active.target.as_ref() {
+            Some(ActiveDragTarget::Xwayland { window }) => Some(window.generation()),
+            Some(ActiveDragTarget::Wayland { .. }) | None => None,
+        };
+        if let Some(source) = active.origin.wayland_source()
             && source.is_alive()
-            && active.phase != DragSessionPhase::Finished
             && source.send_event(wl_data_source::Event::Cancelled).is_ok()
         {
             self.compliance_metrics.dnd_source_cancelled_events = self
@@ -765,6 +1124,15 @@ impl CompositorState {
         }
         self.compliance_metrics.dnd_last_terminal_phase = Some(DragSessionPhase::Cancelled);
         self.leave_drag_target();
+        if let Some(generation) = xwayland_origin
+            .map(|offer_id| offer_id.generation())
+            .or(xwayland_target_generation)
+        {
+            self.xwayland_dnd_transition = Some(crate::xwayland::XwaylandDndTransition::Retired {
+                session_id,
+                generation,
+            });
+        }
         self.complete_drag_session(true);
         self.compliance_metrics.dnd_sessions_cancelled = self
             .compliance_metrics
@@ -772,15 +1140,38 @@ impl CompositorState {
             .saturating_add(1);
     }
 
-    fn complete_drag_session(&mut self, remove_offer: bool) {
+    pub(super) fn complete_drag_session(&mut self, remove_offer: bool) {
         let Some(active) = self.active_drag.take() else {
             return;
         };
+        if let Some(offer) = active.origin.xwayland_offer() {
+            self.xwayland_dnd_data_requests
+                .retain(|request| request.offer_id != offer.id());
+        }
         if let Some(icon) = active.icon_surface {
             self.deactivate_role_instance(compositor_surface_id(&icon));
         }
-        if remove_offer && let Some(offer) = active.offer {
+        if remove_offer
+            && let Some(offer) = active
+                .target
+                .as_ref()
+                .and_then(ActiveDragTarget::wayland_offer)
+        {
             self.data_offers.remove(&offer.id());
+        }
+    }
+
+    pub(in crate::compositor) fn retire_xwayland_drag_target(
+        &mut self,
+        window: crate::xwayland::X11WindowHandle,
+    ) {
+        if self.active_drag.as_ref().is_some_and(|active| {
+            matches!(
+                active.target.as_ref(),
+                Some(ActiveDragTarget::Xwayland { window: current }) if *current == window
+            )
+        }) {
+            self.leave_drag_target();
         }
     }
 }

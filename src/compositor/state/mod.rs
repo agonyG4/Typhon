@@ -63,6 +63,7 @@ mod windows;
 mod workspaces;
 mod xdg_lifecycle;
 mod xwayland_mode;
+mod xwayland_dnd;
 mod xwayland_scene;
 mod xwayland_windows;
 
@@ -208,3 +209,5 @@ mod window_decoration_tests;
 mod window_interaction_tests;
 #[cfg(test)]
 mod window_open_animation_tests;
+#[cfg(test)]
+mod xwayland_dnd_tests;

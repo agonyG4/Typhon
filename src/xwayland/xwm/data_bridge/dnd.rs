@@ -1,159 +1,178 @@
-use std::collections::HashMap;
+//! Bounded XDND wire-adapter bookkeeping.
+//!
+//! The compositor supplies canonical session identities and owns drag
+//! lifecycle. This manager keeps one generation-qualified adapter view and
+//! tracks only wire progress needed by a future XDND adapter.
 
-use super::BridgeGeneration;
+use super::super::super::{X11WindowHandle, XwaylandGeneration};
+use crate::xwayland::{CanonicalDndSessionId, XwaylandDndAction, XwaylandDndAdapterId};
 
-pub const DND_ACTION_COPY: u32 = 1;
-pub const DND_ACTION_MOVE: u32 = 2;
-pub const DND_ACTION_LINK: u32 = 4;
-pub const DND_ACTION_ASK: u32 = 8;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XdndAction {
-    Copy,
-    Move,
-    Link,
-    Ask,
-    None,
-}
+pub use crate::xwayland::XwaylandDndAction as XdndAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DndPhase {
+pub enum DndWireProgress {
+    AwaitingEnter,
     Entered,
     Positioned,
-    Dropped,
-    Finished,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DndId {
-    pub generation: BridgeGeneration,
-    pub serial: u64,
+    DropReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DndSession {
-    pub id: DndId,
-    pub source: u32,
-    pub target: Option<u32>,
-    pub phase: DndPhase,
-    pub action: XdndAction,
+    pub id: XwaylandDndAdapterId,
+    pub source: Option<X11WindowHandle>,
+    pub target: Option<X11WindowHandle>,
+    pub progress: DndWireProgress,
+    pub terminal_event_consumed: bool,
+    pub action: Option<XwaylandDndAction>,
     pub x: i32,
     pub y: i32,
-    pub deadline_ns: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct DndManager {
-    next_serial: u64,
-    sessions: HashMap<DndId, DndSession>,
+    active: Option<DndSession>,
 }
 
 impl DndManager {
-    pub fn begin(&mut self, generation: BridgeGeneration, source: u32, deadline_ns: u64) -> DndId {
-        self.next_serial = self.next_serial.saturating_add(1).max(1);
-        let id = DndId {
-            generation,
-            serial: self.next_serial,
+    /// Install the canonical session identity for one XWM adapter view.
+    /// Replacing it drops the old exact identity from this one-slot manager.
+    pub fn install_canonical_session(
+        &mut self,
+        id: XwaylandDndAdapterId,
+        source: Option<X11WindowHandle>,
+    ) -> bool {
+        if self.active.as_ref().is_some_and(|session| session.id == id) {
+            return false;
+        }
+        let source_matches = match (id.session_id(), source) {
+            (CanonicalDndSessionId::Wayland(_), None) => true,
+            (CanonicalDndSessionId::Xwayland(offer_id), Some(source)) => {
+                offer_id.generation() == id.generation() && source.generation() == id.generation()
+            }
+            (CanonicalDndSessionId::Wayland(_), Some(_))
+            | (CanonicalDndSessionId::Xwayland(_), None) => false,
         };
-        self.sessions.insert(
+        if !source_matches {
+            return false;
+        }
+        self.active = Some(DndSession {
             id,
-            DndSession {
-                id,
-                source,
-                target: None,
-                phase: DndPhase::Entered,
-                action: XdndAction::None,
-                x: 0,
-                y: 0,
-                deadline_ns,
-            },
-        );
-        id
+            source,
+            target: None,
+            progress: DndWireProgress::AwaitingEnter,
+            terminal_event_consumed: false,
+            action: None,
+            x: 0,
+            y: 0,
+        });
+        true
     }
 
-    pub fn position(&mut self, id: DndId, target: u32, x: i32, y: i32, action: XdndAction) -> bool {
-        let Some(session) = self.sessions.get_mut(&id) else {
+    pub fn mark_entered(&mut self, id: XwaylandDndAdapterId) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if matches!(session.phase, DndPhase::Finished | DndPhase::Cancelled) {
+        if session.progress != DndWireProgress::AwaitingEnter || session.terminal_event_consumed {
+            return false;
+        }
+        session.progress = DndWireProgress::Entered;
+        true
+    }
+
+    pub fn position(
+        &mut self,
+        id: XwaylandDndAdapterId,
+        target: X11WindowHandle,
+        x: i32,
+        y: i32,
+        action: Option<XwaylandDndAction>,
+    ) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+            return false;
+        };
+        if target.generation() != id.generation()
+            || !matches!(
+                session.progress,
+                DndWireProgress::Entered | DndWireProgress::Positioned
+            )
+            || session.terminal_event_consumed
+        {
             return false;
         }
         session.target = Some(target);
         session.x = x;
         session.y = y;
         session.action = action;
-        session.phase = DndPhase::Positioned;
+        session.progress = DndWireProgress::Positioned;
         true
     }
 
-    pub fn drop(&mut self, id: DndId) -> bool {
-        let Some(session) = self.sessions.get_mut(&id) else {
+    pub fn mark_drop_ready(&mut self, id: XwaylandDndAdapterId) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if session.target.is_none() || session.action == XdndAction::None {
+        if session.progress != DndWireProgress::Positioned
+            || session.target.is_none()
+            || session.action.is_none()
+            || session.terminal_event_consumed
+        {
             return false;
         }
-        session.phase = DndPhase::Dropped;
+        session.progress = DndWireProgress::DropReady;
         true
     }
 
-    pub fn finish(&mut self, id: DndId, accepted: bool) -> bool {
-        let Some(session) = self.sessions.get_mut(&id) else {
+    /// Claim one terminal adapter event for this exact session. This tracks
+    /// wire-event consumption; it does not transition canonical drag state.
+    pub fn consume_terminal_event(&mut self, id: XwaylandDndAdapterId) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if !matches!(session.phase, DndPhase::Dropped | DndPhase::Positioned) {
+        if session.progress == DndWireProgress::AwaitingEnter || session.terminal_event_consumed {
             return false;
         }
-        session.phase = if accepted {
-            DndPhase::Finished
+        session.terminal_event_consumed = true;
+        true
+    }
+
+    pub fn retire(&mut self, id: XwaylandDndAdapterId) -> bool {
+        if self.active.as_ref().is_some_and(|session| session.id == id) {
+            self.active = None;
+            true
         } else {
-            DndPhase::Cancelled
-        };
-        true
+            false
+        }
     }
 
-    pub fn phase(&self, id: DndId) -> Option<DndPhase> {
-        self.sessions.get(&id).map(|session| session.phase)
+    pub fn active_id(&self) -> Option<XwaylandDndAdapterId> {
+        self.active.map(|session| session.id)
     }
 
-    pub fn expire(&mut self, now_ns: u64) {
-        self.sessions
-            .retain(|_, session| now_ns < session.deadline_ns);
+    pub fn active_session(&self) -> Option<&DndSession> {
+        self.active.as_ref()
     }
 
-    pub fn clear_generation(&mut self, generation: BridgeGeneration) {
-        self.sessions.retain(|id, _| id.generation != generation);
+    pub fn progress(&self, id: XwaylandDndAdapterId) -> Option<DndWireProgress> {
+        self.active
+            .as_ref()
+            .filter(|session| session.id == id)
+            .map(|session| session.progress)
     }
-}
 
-pub fn action_from_mask(mask: u32) -> XdndAction {
-    if mask & DND_ACTION_COPY != 0 {
-        XdndAction::Copy
-    } else if mask & DND_ACTION_MOVE != 0 {
-        XdndAction::Move
-    } else if mask & DND_ACTION_LINK != 0 {
-        XdndAction::Link
-    } else if mask & DND_ACTION_ASK != 0 {
-        XdndAction::Ask
-    } else {
-        XdndAction::None
+    pub fn terminal_event_consumed(&self, id: XwaylandDndAdapterId) -> bool {
+        self.active
+            .as_ref()
+            .filter(|session| session.id == id)
+            .is_some_and(|session| session.terminal_event_consumed)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::num::NonZeroU64;
-
-    #[test]
-    fn dnd_requires_target_and_action_before_drop() {
-        let generation = BridgeGeneration::new(NonZeroU64::new(1).expect("nonzero"));
-        let mut manager = DndManager::default();
-        let id = manager.begin(generation, 4, 100);
-        assert!(!manager.drop(id));
-        assert!(manager.position(id, 5, 10, 20, XdndAction::Copy));
-        assert!(manager.drop(id));
-        assert!(manager.finish(id, true));
+    pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
+        if self
+            .active
+            .is_some_and(|session| session.id.generation() == generation)
+        {
+            self.active = None;
+        }
     }
 }

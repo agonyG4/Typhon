@@ -450,6 +450,15 @@ impl CompositorState {
         &mut self,
         generation: XwaylandGeneration,
     ) {
+        self.clear_xwayland_dnd_generation(generation);
+        if self
+            .xwayland
+            .client_identity
+            .as_ref()
+            .is_some_and(|identity| identity.generation == generation)
+        {
+            self.xwayland.client_identity = None;
+        }
         let windows = self
             .desktop_windows
             .values()
