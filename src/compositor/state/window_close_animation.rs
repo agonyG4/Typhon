@@ -7,7 +7,7 @@ use crate::compositor::state::window_exit_retained::{
 use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationGeometryMutation, PresentationOpacity,
     PresentationOpacityMutation, PresentationRect, PresentationRetainedVisualIdentity,
-    PresentationRetainedVisualKind, PresentationTransactionMemberKind,
+    PresentationRetainedVisualKind, PresentationSceneSample, PresentationTransactionMemberKind,
     PresentationTransactionRequest,
 };
 use std::collections::HashSet;
@@ -107,7 +107,6 @@ impl CompositorState {
         if !valid_root_role
             || window.root_surface_id != root_surface_id
             || !window.is_workspace_managed()
-            || window.state.mode() != ToplevelMode::Normal
             || window.state.is_minimized()
             || !self.window_is_visible_in_active_scene(window_id)
             || !self.window_exit_payloads.can_prepare_root(root_surface_id)
@@ -130,10 +129,6 @@ impl CompositorState {
                 return false;
             }
         }
-        if self.presentation_animator.has_track(scene_node_id) {
-            return false;
-        }
-
         let Some(output_id) = self.native_output_id() else {
             return false;
         };
@@ -149,26 +144,8 @@ impl CompositorState {
         let Some(physical_frame) = self.presented_presentation.as_ref() else {
             return false;
         };
-        let Some(physical_opacity) = physical_frame
-            .opacities
-            .iter()
-            .find(|opacity| {
-                opacity.scene_node_id == scene_node_id && opacity.root_surface_id == root_surface_id
-            })
-            .map(|opacity| opacity.opacity)
-        else {
-            return false;
-        };
-        let Some(physical_clip) = physical_frame
-            .clips
-            .iter()
-            .find(|clip| {
-                clip.scene_node_id == scene_node_id && clip.root_surface_id == root_surface_id
-            })
-            .map(|clip| clip.clip)
-        else {
-            return false;
-        };
+        let physical_opacity = physical_frame.opacity_for_scene_node(scene_node_id);
+        let physical_clip = physical_frame.clip_for_scene_node(scene_node_id);
 
         let (surfaces, scene_nodes, fullscreen_plan, _) =
             self.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
@@ -195,16 +172,19 @@ impl CompositorState {
             return false;
         }
 
-        let Some(now) = AnimationTime::monotonic_now() else {
-            return false;
-        };
-        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
-        let sample = self.presentation_scene_sample_for_targets_at_with_source(
-            now,
-            crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
-            &targets,
+        // Property tracks are cancelled during canonical teardown, after this
+        // source has been prepared. Rebuild the effect sample from the latest
+        // physical promotion so takeover begins from pixels already shown.
+        let mut sample = PresentationSceneSample::empty_for_output(
+            physical_frame.output_id,
+            physical_frame.sampled_at,
+            physical_frame.sample_time_source,
         );
-        let lifecycle = self.lifecycle_scene_sample_at(now);
+        sample.transforms.clone_from(&physical_frame.transforms);
+        sample.opacities.clone_from(&physical_frame.opacities);
+        sample.clips.clone_from(&physical_frame.clips);
+        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
+        let lifecycle = self.lifecycle_scene_sample_at(physical_frame.sampled_at);
         let current_effects = self.resolved_effect_scene_with_presentation_and_lifecycle(
             &sample,
             &fullscreen_plan,
@@ -302,12 +282,9 @@ impl CompositorState {
             .iter()
             .map(|surface| surface.surface_id)
             .collect::<HashSet<_>>();
-        let raw_effects = self.resolved_effect_scene_for_composition_plan_with_lifecycle(
-            &fullscreen_plan,
-            &lifecycle,
-        );
-        let frozen_effects = raw_effects
+        let frozen_effects = current_effects
             .instances
+            .clone()
             .into_iter()
             .filter(|instance| {
                 let surface_id = match instance.anchor {

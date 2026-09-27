@@ -4,7 +4,10 @@ use crate::window_lifecycle_animation::LifecycleFrameSnapshot;
 use crate::compositor::surface::SurfaceCommitSequence;
 use crate::compositor::{RenderableSurface, SurfacePresentationKey};
 use crate::core::{OutputId, SceneNodeId};
-use crate::presentation_animation::PresentationRetainedVisualIdentity;
+use crate::presentation_animation::{
+    AnimationTime, PresentationRetainedVisualIdentity, PresentationSampleTimeSource,
+    PresentationSceneSample,
+};
 use crate::render_backend::buffer::BufferId;
 use std::collections::HashSet;
 
@@ -118,6 +121,67 @@ pub enum PresentedLifecycleScene<'a> {
 }
 
 impl CompositorState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_direct_scanout_frame(
+        &mut self,
+        frame_id: u64,
+        presented_at_ns: u64,
+        output_id: OutputId,
+        render_generation: u64,
+        effect_identity_signature: u64,
+        surface_id: u32,
+        surface_presentation_generation: u64,
+        commit_sequence: SurfaceCommitSequence,
+        buffer_id: BufferId,
+        surface_scene_node_id: SceneNodeId,
+        window_scene_node_id: SceneNodeId,
+        root_surface_id: u32,
+        presented_window_rect: crate::presentation_animation::PresentationRect,
+    ) {
+        let sample = PresentationSceneSample::empty_for_output(
+            output_id,
+            AnimationTime::from_nanos(presented_at_ns),
+            PresentationSampleTimeSource::MonotonicFallback,
+        );
+        let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &sample,
+            vec![
+                crate::presentation_animation::PresentedWindowGeometry::with_scene_node(
+                    window_scene_node_id,
+                    root_surface_id,
+                    presented_window_rect,
+                ),
+            ],
+        );
+        let canonical_scene = PresentedCanonicalSceneSnapshot {
+            output_id,
+            render_generation,
+            effect_identity_signature,
+            surfaces: vec![PresentedSurfaceContentEvidence {
+                key: SurfacePresentationKey {
+                    surface_id,
+                    generation: surface_presentation_generation,
+                },
+                commit_sequence,
+                buffer_id,
+                scene_node_id: surface_scene_node_id,
+                visual_root_surface_id: root_surface_id,
+                presentation_owner_root_surface_id: root_surface_id,
+            }],
+        };
+        let lifecycle = LifecycleFrameSnapshot::default();
+        self.publish_presented_frame(PresentedFramePublication {
+            frame_id,
+            presentation: &presentation,
+            lifecycle: &lifecycle,
+            lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
+                canonical_root_surface_ids: &[root_surface_id],
+            },
+            canonical_scene: Some(&canonical_scene),
+            window_exits: &[],
+        });
+    }
+
     pub(in crate::compositor) fn publish_presented_frame(
         &mut self,
         publication: PresentedFramePublication<'_>,

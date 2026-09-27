@@ -146,7 +146,27 @@ fn direct_pageflip_info_preserves_the_accepted_window_projection() {
         )
         .expect("submitted direct candidate");
     assert_eq!(info.root_surface_id, key.content.surface_id);
+    assert_eq!(info.surface_id, key.content.surface_id);
+    assert_eq!(info.buffer_id.get(), key.content.buffer_id.get());
+    assert_eq!(info.candidate_key, key);
+    assert_eq!(
+        info.surface_scene_node_id,
+        oblivion_one::core::SceneNodeId::from_raw(u64::from(key.content.surface_id))
+            .expect("test surface scene node"),
+    );
+    assert_eq!(
+        info.window_scene_node_id,
+        oblivion_one::core::SceneNodeId::from_raw(u64::from(key.content.surface_id))
+            .expect("test window scene node"),
+    );
     assert_eq!(info.presented_window_rect, accepted_rect);
+    assert_eq!(info.render_generation, 0);
+    assert_eq!(info.effect_identity_signature, 0);
+    assert_eq!(info.surface_presentation_generation, 1);
+    assert_eq!(
+        info.commit_sequence,
+        oblivion_one::compositor::SurfaceCommitSequence::initial()
+    );
 
     ownership
         .complete_pageflip(

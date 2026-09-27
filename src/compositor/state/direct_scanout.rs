@@ -384,8 +384,36 @@ impl CompositorState {
         if surface_presentation_generation.is_none() {
             blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
         }
+        let window_scene_node_id = candidate_scene_node_id;
+        let surface_scene_node_id = active_surfaces
+            .iter()
+            .position(|surface| surface.surface_id == source.surface_id)
+            .and_then(|index| {
+                self.active_scene_surface_scene_nodes_in_order()
+                    .get(index)
+                    .copied()
+            });
+        if window_scene_node_id.is_none() || surface_scene_node_id.is_none() {
+            blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
+        }
 
-        let candidate = if blockers.is_empty() {
+        let direct_candidate = if blockers.is_empty() {
+            let identity_sample_time =
+                AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+            let targets = self.native_frame_presentation_targets(active_surfaces);
+            let presentation = self.presentation_scene_sample_for_targets_at_with_source(
+                identity_sample_time,
+                crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+                &targets,
+            );
+            let lifecycle = self.lifecycle_scene_sample_at(identity_sample_time);
+            let effect_identity_signature = self
+                .resolved_effect_scene_with_presentation_and_lifecycle(
+                    &presentation,
+                    &fullscreen_plan,
+                    &lifecycle,
+                )
+                .signature;
             let presented_window_rect = self
                 .current_visual_root_window_geometry(root_surface_id)
                 .and_then(|geometry| {
@@ -403,7 +431,13 @@ impl CompositorState {
                 ) => Some(DirectScanoutSceneCandidate {
                     surface_id: source.surface_id,
                     root_surface_id,
+                    surface_scene_node_id: surface_scene_node_id
+                        .expect("eligible direct candidate has a surface scene node"),
+                    window_scene_node_id: window_scene_node_id
+                        .expect("eligible direct candidate has a WindowGroup scene node"),
                     presented_window_rect,
+                    render_generation: self.scene_render_generation,
+                    effect_identity_signature,
                     content_epoch: self
                         .surface_content_epoch(source.surface_id)
                         .map_or(source.commit_sequence.get(), |sequence| sequence.get()),
@@ -434,7 +468,7 @@ impl CompositorState {
         };
 
         if include_scaled_probe_candidate
-            && candidate.is_none()
+            && direct_candidate.is_none()
             && direct_scanout_probe_blockers_allow_scaling(&blockers)
             && self
                 .current_visual_root_window_geometry(root_surface_id)
@@ -445,7 +479,7 @@ impl CompositorState {
         }
 
         let probe_candidate = if include_scaled_probe_candidate
-            && candidate.is_none()
+            && direct_candidate.is_none()
             && direct_scanout_probe_blockers_allow_scaling(&blockers)
             && buffer.is_some()
         {
@@ -459,11 +493,11 @@ impl CompositorState {
             None
         };
 
-        debug_assert_eq!(candidate.is_some(), blockers.is_empty());
+        debug_assert_eq!(direct_candidate.is_some(), blockers.is_empty());
         DirectScanoutSceneAnalysis {
             coverage,
             effects,
-            candidate,
+            candidate: direct_candidate,
             probe_candidate,
             blockers,
         }

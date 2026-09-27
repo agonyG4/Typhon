@@ -9,6 +9,7 @@ use std::{
 use oblivion_one::compositor::{
     DirectScanoutSceneCandidate, PresentationRect, SurfaceCommitSequence, SurfaceDamagePresentation,
 };
+use oblivion_one::core::SceneNodeId;
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
 use super::{DirectPlaneValidationKey, DirectScanoutCandidateKey, ImportedDirectFramebuffer};
@@ -19,7 +20,12 @@ pub(crate) struct DirectPrimaryLease {
     validation_key: DirectPlaneValidationKey,
     surface_id: u32,
     root_surface_id: u32,
+    buffer_id: oblivion_one::render_backend::buffer::BufferId,
+    surface_scene_node_id: SceneNodeId,
+    window_scene_node_id: SceneNodeId,
     presented_window_rect: PresentationRect,
+    render_generation: u64,
+    effect_identity_signature: u64,
     surface_presentation_generation: u64,
     commit_sequence: SurfaceCommitSequence,
     _buffer: DmabufBufferHandle,
@@ -43,7 +49,12 @@ impl DirectPrimaryLease {
             validation_key,
             surface_id: candidate.surface_id,
             root_surface_id: candidate.root_surface_id,
+            buffer_id: candidate.buffer_identity.id(),
+            surface_scene_node_id: candidate.surface_scene_node_id,
+            window_scene_node_id: candidate.window_scene_node_id,
             presented_window_rect: candidate.presented_window_rect,
+            render_generation: candidate.render_generation,
+            effect_identity_signature: candidate.effect_identity_signature,
             surface_presentation_generation: candidate.surface_presentation_generation,
             commit_sequence: candidate.commit_sequence,
             _buffer: candidate.buffer,
@@ -65,8 +76,28 @@ impl DirectPrimaryLease {
         self.presented_window_rect
     }
 
+    pub(crate) const fn surface_scene_node_id(&self) -> SceneNodeId {
+        self.surface_scene_node_id
+    }
+
+    pub(crate) const fn window_scene_node_id(&self) -> SceneNodeId {
+        self.window_scene_node_id
+    }
+
+    pub(crate) const fn render_generation(&self) -> u64 {
+        self.render_generation
+    }
+
+    pub(crate) const fn effect_identity_signature(&self) -> u64 {
+        self.effect_identity_signature
+    }
+
     pub(crate) const fn root_surface_id(&self) -> u32 {
         self.root_surface_id
+    }
+
+    pub(crate) const fn buffer_id(&self) -> oblivion_one::render_backend::buffer::BufferId {
+        self.buffer_id
     }
 
     pub(crate) const fn surface_presentation_generation(&self) -> u64 {
@@ -166,7 +197,16 @@ impl DirectPrimaryLease {
                 validation_key: super::test_validation_key(key.output_generation),
                 surface_id: key.content.surface_id,
                 root_surface_id: key.content.surface_id,
+                buffer_id: oblivion_one::render_backend::buffer::BufferId::for_tests(
+                    key.content.buffer_id.get(),
+                ),
+                surface_scene_node_id: SceneNodeId::from_raw(u64::from(key.content.surface_id))
+                    .expect("test surface scene node"),
+                window_scene_node_id: SceneNodeId::from_raw(u64::from(key.content.surface_id))
+                    .expect("test window scene node"),
                 presented_window_rect,
+                render_generation: 0,
+                effect_identity_signature: 0,
                 surface_presentation_generation: 1,
                 commit_sequence: SurfaceCommitSequence::initial(),
                 _buffer: buffer,

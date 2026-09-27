@@ -5,7 +5,6 @@ use super::super::presentation_transactions::{
 };
 use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::*;
-use oblivion_one::compositor::PresentedWindowGeometry;
 
 pub(super) fn fail_composited_transition(
     worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
@@ -142,18 +141,20 @@ pub(super) fn settle_direct_pageflip(
         timestamp_ns: presented_at.get(),
     });
     server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
-    let Some(scene_node_id) =
-        server.presentation_scene_node_id_for_root(direct_info.root_surface_id)
-    else {
-        return Err(io::Error::other("direct frame has no WindowGroup SceneNode").into());
-    };
-    server.publish_presented_window_geometry(
+    server.publish_direct_scanout_frame(
         direct_info.frame_id,
-        PresentedWindowGeometry::with_scene_node(
-            scene_node_id,
-            direct_info.root_surface_id,
-            direct_info.presented_window_rect,
-        ),
+        presented_at.get(),
+        direct_info.candidate_key.output_id,
+        direct_info.render_generation,
+        direct_info.effect_identity_signature,
+        direct_info.surface_id,
+        direct_info.surface_presentation_generation,
+        direct_info.commit_sequence,
+        direct_info.buffer_id,
+        direct_info.surface_scene_node_id,
+        direct_info.window_scene_node_id,
+        direct_info.root_surface_id,
+        direct_info.presented_window_rect,
     );
     scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
     drop(completion.replaced);

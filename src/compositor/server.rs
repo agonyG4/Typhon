@@ -1279,6 +1279,40 @@ impl OwnCompositorServer {
         self.state.publish_presented_frame(publication);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_direct_scanout_frame(
+        &mut self,
+        frame_id: u64,
+        presented_at_ns: u64,
+        output_id: OutputId,
+        render_generation: u64,
+        effect_identity_signature: u64,
+        surface_id: u32,
+        surface_presentation_generation: u64,
+        commit_sequence: crate::compositor::surface::SurfaceCommitSequence,
+        buffer_id: crate::render_backend::buffer::BufferId,
+        surface_scene_node_id: crate::core::SceneNodeId,
+        window_scene_node_id: crate::core::SceneNodeId,
+        root_surface_id: u32,
+        presented_window_rect: crate::presentation_animation::PresentationRect,
+    ) {
+        self.state.publish_direct_scanout_frame(
+            frame_id,
+            presented_at_ns,
+            output_id,
+            render_generation,
+            effect_identity_signature,
+            surface_id,
+            surface_presentation_generation,
+            commit_sequence,
+            buffer_id,
+            surface_scene_node_id,
+            window_scene_node_id,
+            root_surface_id,
+            presented_window_rect,
+        );
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn publish_presented_lifecycle_for_scene(

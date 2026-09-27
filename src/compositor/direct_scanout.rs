@@ -1,6 +1,7 @@
 use super::effects::{EffectAnchor, EffectAnchorScope};
 use super::state_data::ViewportSourceRect;
 use super::{BufferIdentity, BufferSize, DmabufBufferHandle, SurfaceCommitSequence};
+use crate::core::SceneNodeId;
 use crate::effects::{EffectInstanceId, EffectProgramId, EffectRegion};
 use wayland_server::protocol::wl_output;
 
@@ -77,7 +78,11 @@ pub(crate) struct DirectScanoutEffectSource {
 pub struct DirectScanoutSceneCandidate {
     pub surface_id: u32,
     pub root_surface_id: u32,
+    pub surface_scene_node_id: SceneNodeId,
+    pub window_scene_node_id: SceneNodeId,
     pub presented_window_rect: crate::compositor::PresentationRect,
+    pub render_generation: u64,
+    pub effect_identity_signature: u64,
     pub content_epoch: u64,
     pub generation: u64,
     pub surface_presentation_generation: u64,
