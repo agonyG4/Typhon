@@ -5,6 +5,7 @@ use crate::xwayland::{
     XwaylandGeneration,
 };
 use std::{
+    io::Read,
     num::NonZeroU64,
     os::fd::{AsRawFd, OwnedFd},
     os::unix::net::UnixStream,
@@ -64,6 +65,193 @@ fn active_wayland_offer(state: &CompositorState) -> Option<wl_data_offer::WlData
         .as_ref()?
         .wayland_offer()
         .cloned()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SourceWireEvent {
+    Target(Option<String>),
+    Cancelled,
+    DropPerformed,
+    Finished,
+    Action(u32),
+    Other(u16),
+}
+
+fn source_wire_events(
+    display: &mut Display<CompositorState>,
+    peer: &mut UnixStream,
+    source: &wl_data_source::WlDataSource,
+) -> Vec<SourceWireEvent> {
+    display.flush_clients().expect("flush test client events");
+    peer.set_nonblocking(true).expect("nonblocking test peer");
+
+    let mut wire = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match peer.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => wire.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("read test client events: {error}"),
+        }
+    }
+
+    let source_id = source.id().protocol_id();
+    let mut events = Vec::new();
+    let mut offset = 0;
+    while offset + 8 <= wire.len() {
+        let object_id = u32::from_ne_bytes(wire[offset..offset + 4].try_into().unwrap());
+        let header = u32::from_ne_bytes(wire[offset + 4..offset + 8].try_into().unwrap());
+        let size = (header >> 16) as usize;
+        let opcode = (header & 0xffff) as u16;
+        assert!(size >= 8, "invalid Wayland event frame size {size}");
+        assert!(
+            offset + size <= wire.len(),
+            "incomplete Wayland event frame"
+        );
+        if object_id == source_id {
+            let payload = &wire[offset + 8..offset + size];
+            let event = match opcode {
+                0 => {
+                    assert!(payload.len() >= 4, "target event must contain a string");
+                    let length = u32::from_ne_bytes(payload[..4].try_into().unwrap()) as usize;
+                    if length == 0 {
+                        SourceWireEvent::Target(None)
+                    } else {
+                        assert!(payload.len() >= 4 + length, "incomplete target string");
+                        assert_eq!(payload[4 + length - 1], 0, "target string terminator");
+                        SourceWireEvent::Target(Some(
+                            String::from_utf8(payload[4..4 + length - 1].to_vec())
+                                .expect("target MIME is UTF-8"),
+                        ))
+                    }
+                }
+                2 => SourceWireEvent::Cancelled,
+                3 => SourceWireEvent::DropPerformed,
+                4 => SourceWireEvent::Finished,
+                5 => {
+                    assert!(payload.len() >= 4, "action event must contain an action");
+                    SourceWireEvent::Action(u32::from_ne_bytes(payload[..4].try_into().unwrap()))
+                }
+                _ => SourceWireEvent::Other(opcode),
+            };
+            events.push(event);
+        }
+        offset += size;
+    }
+    assert_eq!(offset, wire.len(), "complete Wayland event frames");
+    events
+}
+
+struct WaylandSourceX11TargetDrag {
+    display: Display<CompositorState>,
+    _client: Client,
+    peer: UnixStream,
+    state: CompositorState,
+    source: wl_data_source::WlDataSource,
+    session_id: CanonicalDndSessionId,
+    generation: XwaylandGeneration,
+    target: X11WindowHandle,
+    x11_target_surface: wl_surface::WlSurface,
+    wayland_target_surface: wl_surface::WlSurface,
+}
+
+impl WaylandSourceX11TargetDrag {
+    fn source_events(&mut self) -> Vec<SourceWireEvent> {
+        source_wire_events(&mut self.display, &mut self.peer, &self.source)
+    }
+
+    fn remove_target_window(&mut self) {
+        let window_id = self
+            .state
+            .window_id_for_x11_handle(self.target)
+            .expect("X11 target window");
+        assert!(self.state.remove_desktop_window(window_id).is_some());
+    }
+}
+
+fn install_x11_drag_target(
+    state: &mut CompositorState,
+    surface: &wl_surface::WlSurface,
+    generation: XwaylandGeneration,
+    xid: u32,
+) -> X11WindowHandle {
+    let surface_id = compositor_surface_id(surface);
+    let target = X11WindowHandle::new(generation, xid);
+    let mut snapshot = super::desktop_window_tests::x11_snapshot(generation, xid, surface_id);
+    snapshot.geometry = crate::xwayland::xwm::X11Geometry {
+        x: 100,
+        y: 0,
+        width: 800,
+        height: 600,
+    };
+    snapshot.decoration_hints.motif = crate::xwayland::xwm::X11MotifDecorationHint::Undecorated;
+    super::desktop_window_tests::insert_x11(state, snapshot);
+    state.test_set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(100, 0));
+    target
+}
+
+fn wayland_source_x11_target_drag(
+    action: XwaylandDndAction,
+    source_actions: u32,
+) -> WaylandSourceX11TargetDrag {
+    let display = Display::<CompositorState>::new().expect("test display");
+    let (client, peer) = test_client(&display);
+    let mut state = CompositorState::new(None);
+    let generation = generation(61);
+    activate_xwayland_generation(&mut state, &client, generation);
+    let origin = state.test_create_surface_resource(
+        &client,
+        &display.handle(),
+        40,
+        40,
+        SurfacePlacement::absolute_root_at(1000, 1000),
+    );
+    let x11_target_surface = state.test_create_surface_resource(
+        &client,
+        &display.handle(),
+        800,
+        600,
+        SurfacePlacement::absolute_root_at(100, 0),
+    );
+    let target = install_x11_drag_target(&mut state, &x11_target_surface, generation, 0x601);
+    let wayland_target_surface = state.test_create_surface_resource(
+        &client,
+        &display.handle(),
+        80,
+        80,
+        SurfacePlacement::absolute_root_at(0, 0),
+    );
+    state.test_create_data_device(&client, &display.handle());
+
+    let source = state.test_create_data_source(&client, &display.handle());
+    state.offer_data_source_mime_type(&source, "text/plain".to_owned());
+    if let Some(binding) = state.data_sources.get_mut(&source.id()) {
+        binding.actions = source_actions;
+        binding.actions_set = true;
+    }
+    state.begin_drag_session(Some(source.clone()), origin, None, 8);
+    let session_id = state.active_drag.as_ref().expect("canonical drag").id;
+    state.update_drag_target_at(110.0, 100.0);
+    assert!(state.update_xwayland_drag_target_status(
+        session_id,
+        target,
+        Some("text/plain".to_owned()),
+        Some(action),
+    ));
+
+    WaylandSourceX11TargetDrag {
+        display,
+        _client: client,
+        peer,
+        state,
+        source,
+        session_id,
+        generation,
+        target,
+        x11_target_surface,
+        wayland_target_surface,
+    }
 }
 
 #[test]
@@ -634,4 +822,373 @@ fn dnd_transitions_leave_clipboard_and_primary_selection_state_untouched() {
 
     assert_eq!(selection_snapshot(&state), before);
     assert!(state.xwayland_selection_data_requests.is_empty());
+}
+
+#[test]
+fn x11_target_window_retirement_after_drop_cancels_wayland_source_once() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    assert!(
+        drag.source_events()
+            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned(),)))
+    );
+
+    drag.state.drop_active_drag();
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.phase),
+        Some(DragSessionPhase::DropPendingXwaylandTarget)
+    );
+    assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+
+    drag.remove_target_window();
+    assert!(drag.state.active_drag.is_none());
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
+    let terminal = drag.source_events();
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| **event == SourceWireEvent::Cancelled)
+            .count(),
+        1
+    );
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| **event == SourceWireEvent::Finished)
+            .count(),
+        0
+    );
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| **event == SourceWireEvent::Target(None))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn x11_generation_retirement_after_drop_cancels_wayland_source_once() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    let _ = drag.source_events();
+    drag.state.drop_active_drag();
+    assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+
+    drag.state.clear_xwayland_generation(drag.generation);
+    assert!(drag.state.active_drag.is_none());
+    assert!(drag.state.xwayland.client_identity.is_none());
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
+    let terminal = drag.source_events();
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| **event == SourceWireEvent::Cancelled)
+            .count(),
+        1
+    );
+    assert_eq!(
+        terminal
+            .iter()
+            .filter(|event| **event == SourceWireEvent::Finished)
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn x11_target_retirement_before_drop_only_leaves_target_once() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    assert!(
+        drag.source_events()
+            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned(),)))
+    );
+
+    drag.state.retire_xwayland_drag_target(drag.target);
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.phase),
+        Some(DragSessionPhase::Dragging)
+    );
+    assert!(
+        drag.state
+            .active_drag
+            .as_ref()
+            .is_some_and(|active| active.target.is_none() && active.accepted_mime.is_none())
+    );
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 0);
+    assert!(matches!(
+        drag.state.xwayland_dnd_transition.take(),
+        Some(crate::xwayland::XwaylandDndTransition::TargetLeft { session_id, target })
+            if session_id == drag.session_id && target == drag.target
+    ));
+    assert_eq!(drag.source_events(), [SourceWireEvent::Target(None)]);
+
+    drag.state.retire_xwayland_drag_target(drag.target);
+    assert!(drag.state.xwayland_dnd_transition.is_none());
+    assert!(drag.source_events().is_empty());
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 0);
+}
+
+#[test]
+fn stale_x11_target_events_cannot_finish_a_replacement_drag() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    let _ = drag.source_events();
+    drag.state.drop_active_drag();
+    let _ = drag.source_events();
+    drag.remove_target_window();
+    assert!(drag.state.active_drag.is_none());
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 1);
+    let _ = drag.source_events();
+
+    let replacement_generation = generation(62);
+    activate_xwayland_generation(&mut drag.state, &drag._client, replacement_generation);
+    let replacement_target = install_x11_drag_target(
+        &mut drag.state,
+        &drag.x11_target_surface,
+        replacement_generation,
+        drag.target.xid(),
+    );
+    let replacement_source = drag
+        .state
+        .test_create_data_source(&drag._client, &drag.display.handle());
+    drag.state
+        .offer_data_source_mime_type(&replacement_source, "text/plain".to_owned());
+    if let Some(binding) = drag.state.data_sources.get_mut(&replacement_source.id()) {
+        binding.actions = WaylandDndAction::Copy.mask();
+        binding.actions_set = true;
+    }
+    let replacement_origin = drag.state.test_create_surface_resource(
+        &drag._client,
+        &drag.display.handle(),
+        40,
+        40,
+        SurfacePlacement::absolute_root_at(1000, 1000),
+    );
+    drag.state
+        .begin_drag_session(Some(replacement_source), replacement_origin, None, 9);
+    let replacement_id = drag
+        .state
+        .active_drag
+        .as_ref()
+        .expect("replacement drag")
+        .id;
+    drag.state.update_drag_target_at(110.0, 100.0);
+    assert!(matches!(
+        drag.state.active_drag.as_ref().and_then(|active| active.target.as_ref()),
+        Some(ActiveDragTarget::Xwayland { window }) if *window == replacement_target
+    ));
+
+    assert!(!drag.state.update_xwayland_drag_target_status(
+        drag.session_id,
+        drag.target,
+        Some("text/plain".to_owned()),
+        Some(XwaylandDndAction::Copy),
+    ));
+    assert!(!drag.state.finish_xwayland_drag_target(
+        drag.session_id,
+        drag.target,
+        true,
+        Some(XwaylandDndAction::Copy),
+    ));
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.id),
+        Some(replacement_id)
+    );
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.phase),
+        Some(DragSessionPhase::Dragging)
+    );
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 1);
+}
+
+#[test]
+fn leaving_x11_target_clears_mime_feedback_when_switching_or_having_no_target() {
+    let mut switch_to_wayland = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    assert!(
+        switch_to_wayland
+            .source_events()
+            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned())))
+    );
+    switch_to_wayland.state.update_drag_target_at(10.0, 10.0);
+    assert!(matches!(
+        switch_to_wayland
+            .state
+            .active_drag
+            .as_ref()
+            .and_then(|active| active.target.as_ref()),
+        Some(ActiveDragTarget::Wayland { surface, .. })
+            if same_surface_resource(surface, &switch_to_wayland.wayland_target_surface)
+    ));
+    assert!(
+        switch_to_wayland
+            .state
+            .active_drag
+            .as_ref()
+            .is_some_and(|active| active.accepted_mime.is_none())
+    );
+    assert_eq!(
+        switch_to_wayland.source_events(),
+        [SourceWireEvent::Target(None)]
+    );
+
+    let mut move_to_no_target = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    assert!(
+        move_to_no_target
+            .source_events()
+            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned())))
+    );
+    move_to_no_target
+        .state
+        .update_drag_target_at(1200.0, 1200.0);
+    assert!(
+        move_to_no_target
+            .state
+            .active_drag
+            .as_ref()
+            .is_some_and(|active| active.target.is_none() && active.accepted_mime.is_none())
+    );
+    assert_eq!(
+        move_to_no_target.source_events(),
+        [SourceWireEvent::Target(None)]
+    );
+}
+
+#[test]
+fn ask_from_x11_target_requires_an_explicit_supported_copy_or_move_resolution() {
+    let copy = WaylandDndAction::Copy.mask();
+    let move_action = WaylandDndAction::Move.mask();
+    let ask = WaylandDndAction::Ask.mask();
+    let cases = [
+        (None, copy | move_action | ask),
+        (Some(XwaylandDndAction::Ask), copy | move_action | ask),
+        (Some(XwaylandDndAction::Link), copy | move_action | ask),
+        (Some(XwaylandDndAction::Private), copy | move_action | ask),
+        (Some(XwaylandDndAction::Copy), move_action | ask),
+        (Some(XwaylandDndAction::Move), copy | ask),
+    ];
+
+    for (final_action, source_actions) in cases {
+        let mut drag = wayland_source_x11_target_drag(XwaylandDndAction::Ask, source_actions);
+        let _ = drag.source_events();
+        drag.state.drop_active_drag();
+        assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+
+        assert!(!drag.state.finish_xwayland_drag_target(
+            drag.session_id,
+            drag.target,
+            true,
+            final_action,
+        ));
+        assert_eq!(
+            drag.state.active_drag.as_ref().map(|active| active.phase),
+            Some(DragSessionPhase::DropPendingXwaylandTarget)
+        );
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
+        assert_eq!(drag.state.compliance_metrics.dnd_source_finished_events, 0);
+        assert!(drag.source_events().is_empty());
+    }
+}
+
+#[test]
+fn ask_from_x11_target_finishes_only_after_source_supported_copy_or_move_feedback() {
+    let copy = WaylandDndAction::Copy.mask();
+    let move_action = WaylandDndAction::Move.mask();
+    let ask = WaylandDndAction::Ask.mask();
+    for (final_action, expected_mask) in [
+        (XwaylandDndAction::Copy, copy),
+        (XwaylandDndAction::Move, move_action),
+    ] {
+        let mut drag =
+            wayland_source_x11_target_drag(XwaylandDndAction::Ask, copy | move_action | ask);
+        let _ = drag.source_events();
+        drag.state.drop_active_drag();
+        assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+
+        assert!(drag.state.finish_xwayland_drag_target(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(final_action),
+        ));
+        assert!(drag.state.active_drag.is_none());
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 1);
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 0);
+        assert_eq!(drag.state.compliance_metrics.dnd_source_finished_events, 1);
+        assert_eq!(
+            drag.source_events(),
+            [
+                SourceWireEvent::Action(expected_mask),
+                SourceWireEvent::Finished
+            ]
+        );
+        assert!(!drag.state.finish_xwayland_drag_target(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(final_action),
+        ));
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 1);
+        assert_eq!(drag.state.compliance_metrics.dnd_source_finished_events, 1);
+    }
+}
+
+#[test]
+fn xwayland_source_retains_semantic_ask_action_domain_on_x11_finish() {
+    let display = Display::<CompositorState>::new().expect("test display");
+    let (client, _peer) = test_client(&display);
+    let mut state = CompositorState::new(None);
+    let generation = generation(41);
+    activate_xwayland_generation(&mut state, &client, generation);
+    let target_surface = state.test_create_surface_resource(
+        &client,
+        &display.handle(),
+        800,
+        600,
+        SurfacePlacement::absolute_root_at(100, 0),
+    );
+    let target = install_x11_drag_target(&mut state, &target_surface, generation, 0x701);
+    let offer = xwayland_offer(7, 0x700, vec![XwaylandDndAction::Ask]);
+    let offer_id = offer.id();
+    let session_id = CanonicalDndSessionId::Xwayland(offer_id);
+    assert!(state.begin_xwayland_drag_session(offer));
+    state.update_drag_target_at(110.0, 100.0);
+    assert!(state.update_xwayland_drag_target_status(
+        session_id,
+        target,
+        Some("text/plain".to_owned()),
+        Some(XwaylandDndAction::Ask),
+    ));
+    assert!(state.drop_xwayland_drag(offer_id));
+    assert!(state.finish_xwayland_drag_target(session_id, target, true, None));
+    assert!(state.active_drag.is_none());
+    assert_eq!(state.compliance_metrics.dnd_sessions_finished, 1);
+    assert!(matches!(
+        state.xwayland_dnd_transition,
+        Some(crate::xwayland::XwaylandDndTransition::TargetFinished {
+            session_id: current,
+            target: current_target,
+            accepted: true,
+            action: Some(XwaylandDndAction::Ask),
+        }) if current == session_id && current_target == target
+    ));
 }

@@ -661,6 +661,11 @@ impl CompositorState {
                 }
             }
             ActiveDragTarget::Xwayland { window } => {
+                if let ActiveDragOrigin::WaylandSource { source, .. } = &active.origin
+                    && source.is_alive()
+                {
+                    let _ = source.send_event(wl_data_source::Event::Target { mime_type: None });
+                }
                 self.xwayland_dnd_transition =
                     Some(crate::xwayland::XwaylandDndTransition::TargetLeft {
                         session_id: active.id,
@@ -1165,13 +1170,19 @@ impl CompositorState {
         &mut self,
         window: crate::xwayland::X11WindowHandle,
     ) {
-        if self.active_drag.as_ref().is_some_and(|active| {
+        let phase = self.active_drag.as_ref().and_then(|active| {
             matches!(
                 active.target.as_ref(),
                 Some(ActiveDragTarget::Xwayland { window: current }) if *current == window
             )
-        }) {
-            self.leave_drag_target();
+            .then_some(active.phase)
+        });
+        match phase {
+            Some(DragSessionPhase::DropPendingXwaylandTarget) => {
+                self.cancel_drag_session("xwayland_target_retired_after_drop");
+            }
+            Some(_) => self.leave_drag_target(),
+            None => {}
         }
     }
 }

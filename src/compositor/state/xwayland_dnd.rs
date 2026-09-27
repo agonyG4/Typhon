@@ -201,7 +201,20 @@ impl CompositorState {
         let origin = active.origin.clone();
         let accepted_mime = active.accepted_mime.clone();
         let negotiated_action = active.target_action;
-        let action = final_action.or(active.target_action);
+        let action = if accepted
+            && matches!(&origin, ActiveDragOrigin::WaylandSource { .. })
+            && negotiated_action == Some(crate::xwayland::XwaylandDndAction::Ask)
+        {
+            match final_action {
+                Some(
+                    action @ (crate::xwayland::XwaylandDndAction::Copy
+                    | crate::xwayland::XwaylandDndAction::Move),
+                ) => Some(action),
+                _ => return false,
+            }
+        } else {
+            final_action.or(active.target_action)
+        };
         if accepted && accepted_mime.is_none() {
             return false;
         }
@@ -323,6 +336,9 @@ impl CompositorState {
         true
     }
 
+    /// Completion hook for the future XWayland source-side adapter. The
+    /// canonical session remains the sole terminal authority; this method
+    /// validates the exact offer and lifecycle phase before retiring it.
     pub(in crate::compositor) fn finish_xwayland_drag(
         &mut self,
         offer_id: crate::xwayland::XwaylandDndOfferId,
@@ -363,17 +379,21 @@ impl CompositorState {
                 .xwayland_offer()
                 .is_some_and(|offer| offer.id().generation() == generation)
         });
-        let target_matches = self.active_drag.as_ref().is_some_and(|active| {
-            matches!(
-                active.target.as_ref(),
+        let target = self
+            .active_drag
+            .as_ref()
+            .and_then(|active| match active.target.as_ref() {
                 Some(ActiveDragTarget::Xwayland { window })
-                    if window.generation() == generation
-            )
-        });
+                    if window.generation() == generation =>
+                {
+                    Some(*window)
+                }
+                _ => None,
+            });
         if source_matches {
             self.cancel_drag_session("xwayland_generation_retired");
-        } else if target_matches {
-            self.leave_drag_target();
+        } else if let Some(target) = target {
+            self.retire_xwayland_drag_target(target);
         }
 
         self.xwayland_dnd_data_requests
