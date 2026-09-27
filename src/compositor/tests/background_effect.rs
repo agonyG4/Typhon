@@ -285,6 +285,108 @@ fn production_resolution_assigns_public_surface_and_trusted_visual_group_scopes(
 }
 
 #[test]
+fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stays_surface_local() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.state.set_background_effect_enabled(true);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let mut blur_policy = crate::blur_policy::BlurPolicyConfig::default();
+    blur_policy.enabled = true;
+    blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::Auto;
+    replace_blur_policy_config(&commands, blur_policy);
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let background_manager: client_ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1 =
+            globals.bind(&qh, 1..=1, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let (surface, xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 100)?;
+        xdg_surface.set_window_geometry(10, 12, 100, 70);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let raw_surface_origin = crate::compositor::render::FIRST_SURFACE_OFFSET;
+        let expected_window_bounds = EffectRect::new(
+            raw_surface_origin.0 + 10,
+            raw_surface_origin.1 + 12,
+            100,
+            70,
+        )
+        .unwrap();
+        let auto_scene = capture_effect_scene(&commands);
+        assert_eq!(auto_scene.instances.len(), 1);
+        assert_eq!(
+            auto_scene.instances[0].anchor_scope,
+            EffectAnchorScope::VisualGroup
+        );
+        assert_eq!(
+            auto_scene.instances[0].region.rects(),
+            &[expected_window_bounds],
+            "automatic blur must use the committed XDG window geometry translated from the raw root origin"
+        );
+        assert_eq!(
+            auto_scene.instances[0].target_bounds,
+            expected_window_bounds
+        );
+
+        let public_effect = background_manager.get_background_effect(&surface, &qh, ());
+        let client_region = compositor.create_region(&qh, ());
+        client_region.add(0, 0, 5, 5);
+        public_effect.set_blur_region(Some(&client_region));
+        client_region.destroy();
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let expected_client_bounds =
+            EffectRect::new(raw_surface_origin.0, raw_surface_origin.1, 5, 5).unwrap();
+        let client_scene = capture_effect_scene(&commands);
+        assert_eq!(client_scene.instances.len(), 1);
+        assert_eq!(
+            client_scene.instances[0].anchor_scope,
+            EffectAnchorScope::Surface
+        );
+        assert_eq!(
+            client_scene.instances[0].region.rects(),
+            &[expected_client_bounds],
+            "a client region remains rooted at the raw wl_surface origin"
+        );
+
+        public_effect.set_blur_region(None);
+        xdg_surface.set_window_geometry(0, -24, 944, 526);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let expected_negative_offset_bounds =
+            EffectRect::new(raw_surface_origin.0, raw_surface_origin.1 - 24, 944, 526).unwrap();
+        let negative_offset_scene = capture_effect_scene(&commands);
+        assert_eq!(negative_offset_scene.instances.len(), 1);
+        assert_eq!(
+            negative_offset_scene.instances[0].region.rects(),
+            &[expected_negative_offset_bounds],
+            "negative XDG offsets and geometry beyond the root surface must remain in the logical candidate"
+        );
+        assert_ne!(
+            negative_offset_scene.instances[0].signature, auto_scene.instances[0].signature,
+            "a committed XDG geometry change must alter the resolved effect signature"
+        );
+        Ok(())
+    })();
+
+    stop_controllable_test_server(commands, server_thread);
+    result.unwrap();
+}
+
+#[test]
 fn public_child_effects_follow_production_scene_order_not_identifiers() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();

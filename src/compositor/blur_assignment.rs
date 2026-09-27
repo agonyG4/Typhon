@@ -1,3 +1,4 @@
+use super::popup::XdgWindowGeometry;
 use super::{RenderableSurface, SurfaceData, SurfaceOpaqueRegion, WindowBackend};
 use crate::blur_policy::{
     BlurApplicationMode, BlurAssignment, BlurAssignmentCounts, BlurBackend, BlurLayerMode,
@@ -380,6 +381,32 @@ fn bounded_text(text: String) -> String {
     text[..end].to_string()
 }
 
+fn synthetic_wayland_window_candidate(
+    raw_surface_origin: (i32, i32),
+    raw_surface_candidate: &EffectRegion,
+    committed_geometry: Option<XdgWindowGeometry>,
+) -> EffectRegion {
+    let Some(geometry) = committed_geometry else {
+        return raw_surface_candidate.clone();
+    };
+    let Some(x) = raw_surface_origin.0.checked_add(geometry.x) else {
+        return raw_surface_candidate.clone();
+    };
+    let Some(y) = raw_surface_origin.1.checked_add(geometry.y) else {
+        return raw_surface_candidate.clone();
+    };
+    let Ok(width) = u32::try_from(geometry.width) else {
+        return raw_surface_candidate.clone();
+    };
+    let Ok(height) = u32::try_from(geometry.height) else {
+        return raw_surface_candidate.clone();
+    };
+
+    EffectRect::new(x, y, width, height)
+        .map(EffectRegion::from_rect)
+        .unwrap_or_else(|| raw_surface_candidate.clone())
+}
+
 impl super::CompositorState {
     pub(in crate::compositor) fn blur_assignment_for_surface(
         &self,
@@ -394,8 +421,9 @@ impl super::CompositorState {
             .fullscreen_presentation
             .is_some_and(|state| state.owner_root_surface_id == root_surface_id);
         let client_request_committed = !surface_data.committed_background_effect().ops().is_empty();
-        let candidate = EffectRect::new(origin.0, origin.1, surface.width, surface.height)
-            .map(EffectRegion::from_rect)?;
+        let raw_surface_candidate =
+            EffectRect::new(origin.0, origin.1, surface.width, surface.height)
+                .map(EffectRegion::from_rect)?;
         let client_region = crate::compositor::effects::background_effect_output_region(
             &surface_data.committed_background_effect(),
             origin,
@@ -407,7 +435,7 @@ impl super::CompositorState {
             return self.blur_assignment.resolve_layer_assignment(
                 surface.surface_id,
                 client_region,
-                candidate,
+                raw_surface_candidate,
                 &opaque_region,
                 full_opaque,
                 &layer.namespace,
@@ -436,10 +464,20 @@ impl super::CompositorState {
             WindowBackend::Xdg(_) => BlurBackend::Wayland,
             WindowBackend::X11(_) => BlurBackend::Xwayland,
         };
+        let window_candidate = match backend {
+            BlurBackend::Wayland => synthetic_wayland_window_candidate(
+                origin,
+                &raw_surface_candidate,
+                self.surface_window_geometries
+                    .get(&root_surface_id)
+                    .copied(),
+            ),
+            BlurBackend::Xwayland => raw_surface_candidate,
+        };
         self.blur_assignment.resolve_window_assignment(
             surface.surface_id,
             client_region,
-            candidate,
+            window_candidate,
             &opaque_region,
             full_opaque,
             window.metadata.app_id.as_deref(),
@@ -566,6 +604,101 @@ mod tests {
             },
             action,
         }
+    }
+
+    #[test]
+    fn synthetic_wayland_candidate_preserves_negative_offsets_and_falls_back_when_invalid() {
+        let raw_candidate = EffectRegion::from_rect(EffectRect::new(100, 100, 120, 100).unwrap());
+        let negative_offset = XdgWindowGeometry {
+            x: 0,
+            y: -24,
+            width: 944,
+            height: 526,
+        };
+
+        assert_eq!(
+            synthetic_wayland_window_candidate((100, 100), &raw_candidate, Some(negative_offset),)
+                .rects(),
+            &[EffectRect::new(100, 76, 944, 526).unwrap()],
+            "negative offsets and extents outside the raw root surface must be preserved"
+        );
+        assert_eq!(
+            synthetic_wayland_window_candidate((100, 100), &raw_candidate, None),
+            raw_candidate,
+            "implicit or absent geometry must preserve the existing raw candidate"
+        );
+
+        let overflowing_offset = XdgWindowGeometry {
+            x: 1,
+            y: 0,
+            width: 100,
+            height: 70,
+        };
+        assert_eq!(
+            synthetic_wayland_window_candidate(
+                (i32::MAX, 100),
+                &raw_candidate,
+                Some(overflowing_offset),
+            ),
+            raw_candidate,
+            "an overflowing translated origin must fall back to the raw candidate"
+        );
+
+        let invalid_extent = XdgWindowGeometry {
+            x: 0,
+            y: 0,
+            width: -1,
+            height: 70,
+        };
+        assert_eq!(
+            synthetic_wayland_window_candidate((100, 100), &raw_candidate, Some(invalid_extent),),
+            raw_candidate,
+            "an invalid extent must fall back to the raw candidate"
+        );
+    }
+
+    #[test]
+    fn wayland_window_rule_materializes_the_translated_xdg_candidate() {
+        let raw_candidate = EffectRegion::from_rect(EffectRect::new(100, 100, 120, 100).unwrap());
+        let candidate = synthetic_wayland_window_candidate(
+            (100, 100),
+            &raw_candidate,
+            Some(XdgWindowGeometry {
+                x: 10,
+                y: 12,
+                width: 100,
+                height: 70,
+            }),
+        );
+        let mut resolver = resolver();
+        let mut config = resolver.config();
+        config.applications.wayland = BlurApplicationMode::RulesOnly;
+        config.window_rules = vec![window_rule(BlurRuleAction::Enable)];
+        resolver.replace_config(config).unwrap();
+        let empty = EffectRegion::empty();
+
+        let assignment = resolver
+            .resolve_window_assignment(
+                1,
+                empty.clone(),
+                candidate,
+                &empty,
+                false,
+                Some("org.example.app"),
+                None,
+                BlurBackend::Wayland,
+                SurfaceAlphaCapability::Opaque,
+                false,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(assignment.source, BlurAssignmentSource::WindowRule);
+        assert_eq!(assignment.anchor_scope, EffectAnchorScope::VisualGroup);
+        assert_eq!(
+            assignment.region.rects(),
+            &[EffectRect::new(110, 112, 100, 70).unwrap()]
+        );
     }
 
     #[test]
