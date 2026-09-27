@@ -5,8 +5,9 @@ use crate::compositor::direct_scanout::{
     MAX_DIRECT_SCANOUT_EFFECT_DETAILS,
 };
 use crate::compositor::direct_scanout::{
-    DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
-    direct_scanout_viewport_compatibility,
+    DirectScanoutProbeCandidate, DirectScanoutSceneBlockers, DirectScanoutSceneCandidate,
+    DirectScanoutSceneRejection, direct_scanout_probe_blockers_allow_scaling,
+    direct_scanout_probe_viewport_compatibility, direct_scanout_viewport_compatibility,
 };
 use crate::compositor::effects::EffectAnchor;
 use crate::compositor::presentation_coverage::{
@@ -24,6 +25,7 @@ pub struct DirectScanoutSceneAnalysis {
     pub coverage: PresentationCoverageAnalysis,
     pub effects: DirectScanoutEffectAnalysis,
     pub candidate: Option<DirectScanoutSceneCandidate>,
+    pub probe_candidate: Option<DirectScanoutProbeCandidate>,
     pub blockers: DirectScanoutSceneBlockers,
 }
 
@@ -138,6 +140,19 @@ impl CompositorState {
     pub(in crate::compositor) fn direct_scanout_scene_analysis(
         &self,
     ) -> DirectScanoutSceneAnalysis {
+        self.direct_scanout_scene_analysis_impl(false)
+    }
+
+    pub(in crate::compositor) fn direct_scanout_probe_scene_analysis(
+        &self,
+    ) -> DirectScanoutSceneAnalysis {
+        self.direct_scanout_scene_analysis_impl(true)
+    }
+
+    fn direct_scanout_scene_analysis_impl(
+        &self,
+        include_scaled_probe_candidate: bool,
+    ) -> DirectScanoutSceneAnalysis {
         let output_size = BufferSize::new(self.output_size.width, self.output_size.height)
             .expect("configured output size is nonzero");
         let active_surfaces = self.active_scene_surfaces();
@@ -162,6 +177,7 @@ impl CompositorState {
                 coverage,
                 effects,
                 candidate: None,
+                probe_candidate: None,
                 blockers,
             };
         };
@@ -259,6 +275,7 @@ impl CompositorState {
                 coverage,
                 effects,
                 candidate: None,
+                probe_candidate: None,
                 blockers,
             };
         };
@@ -278,6 +295,7 @@ impl CompositorState {
                 coverage,
                 effects,
                 candidate: None,
+                probe_candidate: None,
                 blockers,
             };
         };
@@ -296,14 +314,27 @@ impl CompositorState {
             if buffer.size() != output_size {
                 blockers.push(DirectScanoutSceneRejection::BufferSizeMismatch);
             }
-            if let Err(rejection) = direct_scanout_viewport_compatibility(
-                buffer.size(),
-                output_size,
-                source.buffer_scale,
-                source.buffer_transform,
-                source.viewport_source,
-                source.viewport_destination,
-            ) {
+            let viewport_compatibility =
+                if buffer.size() == output_size || !include_scaled_probe_candidate {
+                    direct_scanout_viewport_compatibility(
+                        buffer.size(),
+                        output_size,
+                        source.buffer_scale,
+                        source.buffer_transform,
+                        source.viewport_source,
+                        source.viewport_destination,
+                    )
+                } else {
+                    direct_scanout_probe_viewport_compatibility(
+                        buffer.size(),
+                        output_size,
+                        source.buffer_scale,
+                        source.buffer_transform,
+                        source.viewport_source,
+                        source.viewport_destination,
+                    )
+                };
+            if let Err(rejection) = viewport_compatibility {
                 blockers.push(rejection);
             }
         }
@@ -361,7 +392,7 @@ impl CompositorState {
                     self.presentation_rect_for_geometry(root_surface_id, geometry)
                 });
             match (
-                buffer,
+                buffer.as_ref(),
                 surface_presentation_generation,
                 presented_window_rect,
             ) {
@@ -380,8 +411,8 @@ impl CompositorState {
                     surface_presentation_generation,
                     commit_sequence: source.commit_sequence,
                     buffer_identity: source.buffer_identity().clone(),
-                    buffer,
-                    buffer_size: output_size,
+                    buffer: buffer.clone(),
+                    buffer_size: buffer.size(),
                     output_size,
                     viewport_identity_metadata_present: source.viewport_source.is_some()
                         || source.viewport_destination.is_some(),
@@ -402,11 +433,38 @@ impl CompositorState {
             None
         };
 
+        if include_scaled_probe_candidate
+            && candidate.is_none()
+            && direct_scanout_probe_blockers_allow_scaling(&blockers)
+            && self
+                .current_visual_root_window_geometry(root_surface_id)
+                .and_then(|geometry| self.presentation_rect_for_geometry(root_surface_id, geometry))
+                .is_none()
+        {
+            blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
+        }
+
+        let probe_candidate = if include_scaled_probe_candidate
+            && candidate.is_none()
+            && direct_scanout_probe_blockers_allow_scaling(&blockers)
+            && buffer.is_some()
+        {
+            buffer.map(|buffer| DirectScanoutProbeCandidate {
+                buffer_identity: source.buffer_identity().clone(),
+                buffer_size: buffer.size(),
+                output_size,
+                buffer,
+            })
+        } else {
+            None
+        };
+
         debug_assert_eq!(candidate.is_some(), blockers.is_empty());
         DirectScanoutSceneAnalysis {
             coverage,
             effects,
             candidate,
+            probe_candidate,
             blockers,
         }
     }

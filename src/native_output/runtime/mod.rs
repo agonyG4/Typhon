@@ -678,6 +678,7 @@ pub(crate) struct NativeRuntime {
     presentation_trace_path: Option<std::path::PathBuf>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
     render_telemetry: NativeRenderTelemetry,
+    scaled_primary_probe: crate::native_output::scanout::ScaledPrimaryProbeCache,
     slow_cycle_trace: NativeSlowCycleTrace,
 }
 

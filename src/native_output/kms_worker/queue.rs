@@ -11,7 +11,7 @@ use std::{
     collections::{HashSet, VecDeque},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
-        Arc, Condvar, Mutex, TryLockError,
+        Arc, Condvar, Mutex, SyncSender, TryLockError,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -417,6 +417,16 @@ pub(crate) struct WorkerState {
     pub(crate) phase: KmsWorkerPhase,
     pub(crate) cursor_sidecar: CursorSidecarMailbox,
     pub(crate) established_base: Option<EstablishedKmsBase>,
+    pub(crate) primary_geometry_probe: Option<KmsPrimaryGeometryProbe>,
+    pub(crate) primary_geometry_probe_executing: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct KmsPrimaryGeometryProbe {
+    pub(crate) framebuffer: oblivion_one::native::kms::FramebufferId,
+    pub(crate) geometry: oblivion_one::native::kms::AtomicPlaneGeometry,
+    pub(crate) content_type: oblivion_one::compositor::DrmContentType,
+    pub(crate) response: SyncSender<Result<(), oblivion_one::native::kms::AtomicKmsError>>,
 }
 
 impl WorkerShared {
@@ -569,6 +579,8 @@ impl WorkerShared {
                 phase: KmsWorkerPhase::Idle,
                 cursor_sidecar: CursorSidecarMailbox::default(),
                 established_base: None,
+                primary_geometry_probe: None,
+                primary_geometry_probe_executing: false,
             }),
             submit_gate: Mutex::new(()),
             work_wakeup: Condvar::new(),

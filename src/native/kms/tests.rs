@@ -302,6 +302,144 @@ fn fullscreen_geometry_uses_checked_unsigned_16_16_source_units() {
     assert!(AtomicPlaneGeometry::fullscreen(u32::MAX, 1).is_err());
 }
 
+#[test]
+fn full_source_to_output_geometry_matches_fullscreen_for_identity_dimensions() {
+    let scaled = AtomicPlaneGeometry::full_source_to_output(1920, 1080, 1920, 1080).unwrap();
+
+    assert_eq!(scaled, AtomicPlaneGeometry::fullscreen(1920, 1080).unwrap());
+}
+
+#[test]
+fn full_source_to_output_geometry_scales_full_buffer_to_full_output() {
+    let geometry = AtomicPlaneGeometry::full_source_to_output(1600, 900, 1920, 1080).unwrap();
+
+    assert_eq!(
+        geometry,
+        AtomicPlaneGeometry {
+            src_x: 0,
+            src_y: 0,
+            src_w: 1600u64 << 16,
+            src_h: 900u64 << 16,
+            crtc_x: 0,
+            crtc_y: 0,
+            crtc_w: 1920,
+            crtc_h: 1080,
+        }
+    );
+}
+
+#[test]
+fn full_source_to_output_geometry_rejects_zero_dimensions_and_source_overflow() {
+    for dimensions in [
+        (0, 900, 1920, 1080),
+        (1600, 0, 1920, 1080),
+        (1600, 900, 0, 1080),
+        (1600, 900, 1920, 0),
+    ] {
+        assert!(
+            AtomicPlaneGeometry::full_source_to_output(
+                dimensions.0,
+                dimensions.1,
+                dimensions.2,
+                dimensions.3,
+            )
+            .is_err()
+        );
+    }
+    assert!(AtomicPlaneGeometry::full_source_to_output(65_536, 900, 1920, 1080).is_err());
+    assert!(AtomicPlaneGeometry::full_source_to_output(1600, 65_536, 1920, 1080).is_err());
+}
+
+#[test]
+fn primary_geometry_request_assigns_framebuffer_crtc_and_all_geometry_properties() {
+    let pipeline = explicit_fence_pipeline();
+    let framebuffer = FramebufferId::new(81).unwrap();
+    let geometry = AtomicPlaneGeometry::full_source_to_output(1600, 900, 1920, 1080).unwrap();
+    let request =
+        AtomicRequest::primary_flip_with_geometry(&pipeline, framebuffer, geometry).unwrap();
+    let serialized = request.serialize();
+    let assignments = serialized
+        .properties
+        .iter()
+        .copied()
+        .zip(serialized.values.iter().copied())
+        .collect::<std::collections::HashMap<_, _>>();
+
+    assert_eq!(serialized.objects, vec![pipeline.plane.get()]);
+    assert_eq!(serialized.property_counts, vec![10]);
+    assert_eq!(request.assignment_count(), 10);
+    assert_eq!(
+        assignments[&pipeline.plane_props.fb_id.0.get()],
+        u64::from(framebuffer.get())
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.crtc_id.0.get()],
+        u64::from(pipeline.crtc.get())
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.src_x.0.get()],
+        geometry.src_x
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.src_y.0.get()],
+        geometry.src_y
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.src_w.0.get()],
+        geometry.src_w
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.src_h.0.get()],
+        geometry.src_h
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.crtc_x.0.get()],
+        geometry.crtc_x
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.crtc_y.0.get()],
+        geometry.crtc_y
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.crtc_w.0.get()],
+        geometry.crtc_w
+    );
+    assert_eq!(
+        assignments[&pipeline.plane_props.crtc_h.0.get()],
+        geometry.crtc_h
+    );
+
+    let submission = AtomicSubmission::test_only(request);
+    assert!(submission.flags.contains_test_only());
+    assert!(!submission.flags.contains_allow_modeset());
+    assert!(!submission.flags.contains_pageflip_event());
+    assert_eq!(submission.user_data, 0);
+}
+
+#[test]
+fn primary_geometry_request_forces_rotate_zero_when_rotation_is_supported() {
+    let mut pipeline = explicit_fence_pipeline();
+    let rotation_property = PlanePropertyId(PropertyId::new(100).unwrap());
+    pipeline.plane_props.rotation = Some(rotation_property);
+    let request = AtomicRequest::primary_flip_with_geometry(
+        &pipeline,
+        FramebufferId::new(81).unwrap(),
+        AtomicPlaneGeometry::full_source_to_output(1600, 900, 1920, 1080).unwrap(),
+    )
+    .unwrap();
+    let serialized = request.serialize();
+    let index = serialized
+        .properties
+        .iter()
+        .position(|property| *property == rotation_property.0.get())
+        .expect("rotation property is part of the request");
+
+    assert_eq!(
+        serialized.values[index],
+        u64::from(drm_sys::DRM_MODE_ROTATE_0)
+    );
+}
+
 fn ids() -> (
     ConnectorId,
     CrtcId,

@@ -225,6 +225,7 @@ pub use decoration::render_plan::DecorationRenderPrimitive;
 use decoration::theme::DecorationThemeSnapshot;
 use decoration::types::DecorationButtonKind;
 pub use decoration::types::DecorationRect;
+pub use direct_scanout::DirectScanoutProbeCandidate;
 pub use direct_scanout::DirectScanoutSceneBlockers;
 #[cfg(test)]
 pub(crate) use direct_scanout::direct_scanout_scene_rejection_for_effects;

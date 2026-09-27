@@ -7,10 +7,10 @@ use super::payload::{
 #[cfg(test)]
 use super::queue::DequeuePause;
 use super::queue::{
-    AttachablePrimary, AttachablePrimaryPhase, KmsWorkerFatalJob, KmsWorkerForcedShutdown,
-    KmsWorkerLifecycle, KmsWorkerPhase, KmsWorkerQueuedCancellation, KmsWorkerShutdownSnapshot,
-    WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd, drain_eventfd,
-    notify_eventfd,
+    AttachablePrimary, AttachablePrimaryPhase, KmsPrimaryGeometryProbe, KmsWorkerFatalJob,
+    KmsWorkerForcedShutdown, KmsWorkerLifecycle, KmsWorkerPhase, KmsWorkerQueuedCancellation,
+    KmsWorkerShutdownSnapshot, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
+    drain_eventfd, notify_eventfd,
 };
 use super::{
     CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, EstablishedKmsBase,
@@ -21,14 +21,17 @@ use crate::native_output::{
     OutputTransactionId, presentation::transaction::DirectScanoutCandidateKey,
     runtime::AtomicCommitKind,
 };
-use oblivion_one::native::kms::AtomicCommitSubmitter;
-use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, PageFlipToken};
+use oblivion_one::compositor::DrmContentType;
+use oblivion_one::native::kms::{
+    AtomicCommitSubmitter, AtomicKmsError, AtomicKmsErrorKind, AtomicPlaneGeometry, FramebufferId,
+    PageFlipToken,
+};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTargetReason};
 use std::{
     collections::VecDeque,
     io,
     os::fd::{AsRawFd, OwnedFd},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -47,6 +50,18 @@ pub(crate) struct KmsWorkerSubmission {
 pub(crate) trait KmsCommitExecutor: Send + Sync {
     fn test_only(&self, _job: &KmsCommitJob) -> Result<(), KmsWorkerSubmitFailure> {
         Ok(())
+    }
+
+    fn test_primary_geometry(
+        &self,
+        _framebuffer: FramebufferId,
+        _geometry: AtomicPlaneGeometry,
+        _content_type: DrmContentType,
+    ) -> Result<(), KmsWorkerSubmitFailure> {
+        Err(KmsWorkerSubmitFailure::new(
+            AtomicKmsErrorKind::Unsupported,
+            "worker executor does not support primary geometry probes",
+        ))
     }
 
     fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure>;
@@ -221,6 +236,50 @@ impl KmsCommitWorkerHandle {
         &self,
     ) -> Result<KmsCommitAdmissionPermit, KmsWorkerAdmissionError> {
         self.shared.try_reserve()
+    }
+
+    /// Synchronously runs a diagnostic primary-plane TEST_ONLY request on the
+    /// KMS worker only when its full submission state is idle. `None` means
+    /// the request was skipped or the worker stopped before returning a result.
+    pub(crate) fn test_primary_geometry_if_idle(
+        &self,
+        framebuffer: FramebufferId,
+        geometry: AtomicPlaneGeometry,
+        content_type: DrmContentType,
+    ) -> Option<Result<(), AtomicKmsError>> {
+        let (response, result) = mpsc::sync_channel(1);
+        let _submit_gate = match self.shared.submit_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let mut state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if !matches!(state.lifecycle, KmsWorkerLifecycle::Running)
+            || !state.queued.is_empty()
+            || state.reserved != 0
+            || state.executing
+            || state.inflight.is_some()
+            || state.phase != KmsWorkerPhase::Idle
+            || state.cursor_sidecar.pending().is_some()
+            || state.primary_geometry_probe.is_some()
+            || state.primary_geometry_probe_executing
+        {
+            return None;
+        }
+        state.primary_geometry_probe = Some(KmsPrimaryGeometryProbe {
+            framebuffer,
+            geometry,
+            content_type,
+            response,
+        });
+        drop(state);
+        drop(_submit_gate);
+        self.shared.work_wakeup.notify_one();
+        result.recv().ok()
     }
     pub(crate) fn cancel_queued_primary(
         &self,
@@ -835,13 +894,19 @@ fn publish_terminal_sidecar_return(
 fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
     let mut dispatch_model = KmsWorkerDispatchModel::default();
     loop {
-        let Some(ExecutingKmsJob {
+        let Some(work) = take_next_work(&shared) else {
+            return;
+        };
+        let ExecutingKmsJob {
             mut job,
             direct_candidate,
             dequeued_at,
-        }) = take_next_job(&shared)
-        else {
-            return;
+        } = match work {
+            WorkerWork::Job(job) => job,
+            WorkerWork::PrimaryGeometryProbe(probe) => {
+                run_primary_geometry_probe(&shared, &executor, probe);
+                continue;
+            }
         };
         #[cfg(test)]
         if let Some(pause) = shared.take_dequeue_pause_for_test() {
@@ -1233,7 +1298,56 @@ struct ExecutingKmsJob {
     dequeued_at: MonotonicTimestampNs,
 }
 
-fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
+#[derive(Debug)]
+enum WorkerWork {
+    Job(ExecutingKmsJob),
+    PrimaryGeometryProbe(KmsPrimaryGeometryProbe),
+}
+
+fn run_primary_geometry_probe(
+    shared: &Arc<WorkerShared>,
+    executor: &Arc<dyn KmsCommitExecutor>,
+    probe: KmsPrimaryGeometryProbe,
+) {
+    let result = {
+        let _submit_gate = shared
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(state.lifecycle, KmsWorkerLifecycle::Running)
+            && state.primary_geometry_probe_executing
+            && !state.executing
+            && state.inflight.is_none()
+        {
+            drop(state);
+            executor
+                .test_primary_geometry(probe.framebuffer, probe.geometry, probe.content_type)
+                .map_err(|failure| failure.error)
+        } else {
+            Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Busy,
+                "KMS worker stopped before the diagnostic geometry probe",
+            ))
+        }
+    };
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.primary_geometry_probe_executing = false;
+    if matches!(state.phase, KmsWorkerPhase::TestOnly) && !state.executing {
+        state.phase = KmsWorkerPhase::Idle;
+    }
+    drop(state);
+    let _ = probe.response.send(result);
+    shared.work_wakeup.notify_all();
+}
+
+fn take_next_work(shared: &Arc<WorkerShared>) -> Option<WorkerWork> {
     let mut state = shared
         .state
         .lock()
@@ -1253,6 +1367,7 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
         ) {
             let returned_jobs = state.queued.drain(..).collect();
             let returned_sidecar = state.cursor_sidecar.take();
+            state.primary_geometry_probe.take();
             state.lifecycle = KmsWorkerLifecycle::Stopped;
             drop(state);
             publish_event(
@@ -1263,6 +1378,37 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
                 },
             );
             return None;
+        }
+        if state.primary_geometry_probe.is_some() {
+            let idle = state.queued.is_empty()
+                && state.reserved == 0
+                && !state.executing
+                && state.inflight.is_none()
+                && state.phase == KmsWorkerPhase::Idle
+                && state.cursor_sidecar.pending().is_none();
+            if idle {
+                let probe = state
+                    .primary_geometry_probe
+                    .take()
+                    .expect("primary geometry probe remains queued");
+                state.primary_geometry_probe_executing = true;
+                state.phase = KmsWorkerPhase::TestOnly;
+                return Some(WorkerWork::PrimaryGeometryProbe(probe));
+            }
+            let probe = state
+                .primary_geometry_probe
+                .take()
+                .expect("primary geometry probe remains queued");
+            drop(state);
+            let _ = probe.response.send(Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Busy,
+                "KMS state became busy before the diagnostic geometry probe",
+            )));
+            state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            continue;
         }
         if state.inflight.is_none()
             && let Some(front) = state.queued.front()
@@ -1330,11 +1476,11 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
             })
             .flatten();
             state.phase = KmsWorkerPhase::DequeuedWaitingPredecessor;
-            return Some(ExecutingKmsJob {
+            return Some(WorkerWork::Job(ExecutingKmsJob {
                 job,
                 direct_candidate,
                 dequeued_at,
-            });
+            }));
         }
         state = shared
             .work_wakeup
@@ -1529,8 +1675,16 @@ fn mark_fatal(shared: &Arc<WorkerShared>, reason: KmsWorkerFatalReason, uncertai
         return;
     }
     let queued_jobs = state.queued.drain(..).collect::<Vec<_>>();
+    let pending_probe = state.primary_geometry_probe.take();
+    state.primary_geometry_probe_executing = false;
     state.lifecycle = KmsWorkerLifecycle::Fatal;
     drop(state);
+    if let Some(probe) = pending_probe {
+        let _ = probe.response.send(Err(AtomicKmsError::new(
+            AtomicKmsErrorKind::DeviceLost,
+            "KMS worker stopped before the diagnostic geometry probe",
+        )));
+    }
     if !queued_jobs.is_empty() {
         let mut fatal_jobs = shared
             .fatal_jobs
@@ -1581,4 +1735,93 @@ fn monotonic_now_ns() -> u64 {
     (time.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(time.tv_nsec as u64)
+}
+
+#[cfg(test)]
+mod scaled_primary_probe_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ProbeExecutor {
+        probes: AtomicUsize,
+        submits: AtomicUsize,
+        reject_probe: bool,
+    }
+
+    impl KmsCommitExecutor for ProbeExecutor {
+        fn test_primary_geometry(
+            &self,
+            _framebuffer: FramebufferId,
+            _geometry: AtomicPlaneGeometry,
+            _content_type: DrmContentType,
+        ) -> Result<(), KmsWorkerSubmitFailure> {
+            self.probes.fetch_add(1, Ordering::Relaxed);
+            if self.reject_probe {
+                Err(KmsWorkerSubmitFailure::new(
+                    AtomicKmsErrorKind::TestOnlyRejected,
+                    "test geometry rejected",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn submit(
+            &self,
+            _job: &KmsCommitJob,
+        ) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+            self.submits.fetch_add(1, Ordering::Relaxed);
+            Err(KmsWorkerSubmitFailure::new(
+                AtomicKmsErrorKind::Unsupported,
+                "real submits are not expected in this probe test",
+            ))
+        }
+    }
+
+    fn request(handle: &KmsCommitWorkerHandle) -> Option<Result<(), AtomicKmsError>> {
+        handle.test_primary_geometry_if_idle(
+            FramebufferId::new(9).unwrap(),
+            AtomicPlaneGeometry::full_source_to_output(1600, 900, 1920, 1080).unwrap(),
+            DrmContentType::Graphics,
+        )
+    }
+
+    #[test]
+    fn probe_runs_only_when_worker_is_idle_and_never_submits_a_real_commit() {
+        let executor = Arc::new(ProbeExecutor {
+            probes: AtomicUsize::new(0),
+            submits: AtomicUsize::new(0),
+            reject_probe: false,
+        });
+        let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+        let reservation = handle.try_reserve_admission_slot().unwrap();
+        assert!(request(&handle).is_none());
+        drop(reservation);
+
+        assert_eq!(request(&handle), Some(Ok(())));
+        assert_eq!(executor.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.submits.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.direct_content_keys(), (None, None, None));
+        assert!(handle.drain_events().is_empty());
+    }
+
+    #[test]
+    fn test_only_rejection_is_returned_without_a_submit() {
+        let executor = Arc::new(ProbeExecutor {
+            probes: AtomicUsize::new(0),
+            submits: AtomicUsize::new(0),
+            reject_probe: true,
+        });
+        let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+
+        let result = request(&handle).expect("idle probe is admitted");
+        assert_eq!(
+            result.unwrap_err().kind,
+            AtomicKmsErrorKind::TestOnlyRejected
+        );
+        assert_eq!(executor.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.submits.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.direct_content_keys(), (None, None, None));
+        assert!(handle.drain_events().is_empty());
+    }
 }

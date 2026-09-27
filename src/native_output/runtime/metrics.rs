@@ -1260,6 +1260,35 @@ impl NativeRuntime {
                     ),
                 ]);
             }
+            if scaled_primary_probe_enabled() {
+                let counters = self.scaled_primary_probe.counters();
+                fields.extend([
+                    NativePerfField::u64(
+                        "scaled_primary_probe_candidate_observations",
+                        counters.candidate_observations,
+                    ),
+                    NativePerfField::u64(
+                        "scaled_primary_probe_test_only_attempts",
+                        counters.test_only_attempts,
+                    ),
+                    NativePerfField::u64("scaled_primary_probe_accepted", counters.accepted),
+                    NativePerfField::u64("scaled_primary_probe_rejected", counters.rejected),
+                    NativePerfField::u64("scaled_primary_probe_cache_hits", counters.cache_hits),
+                    NativePerfField::u64("scaled_primary_probe_busy_skips", counters.busy_skips),
+                    NativePerfField::u64(
+                        "scaled_primary_probe_unavailable_skips",
+                        counters.unavailable_skips,
+                    ),
+                    NativePerfField::u64(
+                        "scaled_primary_probe_import_failures",
+                        counters.import_failures,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_buffer_size_mismatch_rejections",
+                        counters.buffer_size_mismatch_rejections,
+                    ),
+                ]);
+            }
             fields.extend([
                 NativePerfField::str(
                     "direct_scanout_presented_surface",

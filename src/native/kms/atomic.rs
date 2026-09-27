@@ -250,30 +250,23 @@ impl<I: ModeBlobIo> Drop for ModeBlob<I> {
 
 impl AtomicPlaneGeometry {
     pub fn fullscreen(width: u32, height: u32) -> Result<Self, AtomicKmsError> {
-        if width == 0 || height == 0 {
+        Self::full_source_to_output(width, height, width, height)
+    }
+
+    pub fn full_source_to_output(
+        source_width: u32,
+        source_height: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Result<Self, AtomicKmsError> {
+        if source_width == 0 || source_height == 0 || output_width == 0 || output_height == 0 {
             return Err(AtomicKmsError::new(
                 AtomicKmsErrorKind::InvalidGeometry,
                 "atomic plane geometry must be nonzero",
             ));
         }
-        let src_w = u64::from(width)
-            .checked_shl(16)
-            .filter(|value| *value <= u64::from(u32::MAX))
-            .ok_or_else(|| {
-                AtomicKmsError::new(
-                    AtomicKmsErrorKind::InvalidGeometry,
-                    "atomic source width overflows unsigned 16.16",
-                )
-            })?;
-        let src_h = u64::from(height)
-            .checked_shl(16)
-            .filter(|value| *value <= u64::from(u32::MAX))
-            .ok_or_else(|| {
-                AtomicKmsError::new(
-                    AtomicKmsErrorKind::InvalidGeometry,
-                    "atomic source height overflows unsigned 16.16",
-                )
-            })?;
+        let src_w = source_extent_16_16(source_width, "width")?;
+        let src_h = source_extent_16_16(source_height, "height")?;
         Ok(Self {
             src_x: 0,
             src_y: 0,
@@ -281,10 +274,22 @@ impl AtomicPlaneGeometry {
             src_h,
             crtc_x: 0,
             crtc_y: 0,
-            crtc_w: u64::from(width),
-            crtc_h: u64::from(height),
+            crtc_w: u64::from(output_width),
+            crtc_h: u64::from(output_height),
         })
     }
+}
+
+fn source_extent_16_16(dimension: u32, axis: &str) -> Result<u64, AtomicKmsError> {
+    u64::from(dimension)
+        .checked_shl(16)
+        .filter(|value| *value <= u64::from(u32::MAX))
+        .ok_or_else(|| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::InvalidGeometry,
+                format!("atomic source {axis} overflows unsigned 16.16"),
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -509,6 +514,36 @@ impl AtomicRequest {
     ) -> Result<Self, AtomicKmsError> {
         let mut request = Self::new();
         request.set_plane(plane, fb_property, u64::from(framebuffer.get()))?;
+        Ok(request)
+    }
+
+    pub fn primary_flip_with_geometry(
+        pipeline: &AtomicPipelineProperties,
+        framebuffer: FramebufferId,
+        geometry: AtomicPlaneGeometry,
+    ) -> Result<Self, AtomicKmsError> {
+        let mut request =
+            Self::primary_flip(pipeline.plane, pipeline.plane_props.fb_id, framebuffer)?;
+        request.set_plane(
+            pipeline.plane,
+            pipeline.plane_props.crtc_id,
+            u64::from(pipeline.crtc.get()),
+        )?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.src_x, geometry.src_x)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.src_y, geometry.src_y)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.src_w, geometry.src_w)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.src_h, geometry.src_h)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.crtc_x, geometry.crtc_x)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.crtc_y, geometry.crtc_y)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.crtc_w, geometry.crtc_w)?;
+        request.set_plane(pipeline.plane, pipeline.plane_props.crtc_h, geometry.crtc_h)?;
+        if let Some(rotation) = pipeline.plane_props.rotation {
+            request.set_plane(
+                pipeline.plane,
+                rotation,
+                u64::from(drm_sys::DRM_MODE_ROTATE_0),
+            )?;
+        }
         Ok(request)
     }
 

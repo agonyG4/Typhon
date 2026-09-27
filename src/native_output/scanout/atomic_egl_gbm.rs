@@ -191,6 +191,15 @@ impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
 }
 
 impl AtomicEglGbmScanout {
+    pub(crate) fn import_scaled_probe_framebuffer(
+        &self,
+        candidate: &oblivion_one::compositor::DirectScanoutProbeCandidate,
+    ) -> io::Result<std::sync::Arc<ImportedDirectFramebuffer>> {
+        self.direct
+            .framebuffer_cache
+            .import_for_probe(&candidate.buffer_identity, &candidate.buffer)
+    }
+
     pub(crate) fn lifecycle_animation_available(&self) -> bool {
         self.scene.lifecycle_animation_available()
     }

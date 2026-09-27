@@ -179,6 +179,28 @@ impl AtomicCommitSubmitter {
         .map(|_| ())
     }
 
+    /// Tests a primary framebuffer with full source-to-output geometry.
+    ///
+    /// The cursor plane is intentionally left untouched, matching the normal
+    /// primary-only runtime update. This method can issue only TEST_ONLY.
+    pub fn test_primary_with_geometry(
+        &self,
+        framebuffer: FramebufferId,
+        geometry: super::AtomicPlaneGeometry,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        let mut request =
+            AtomicRequest::primary_flip_with_geometry(&self.pipeline, framebuffer, geometry)?;
+        request.set_connector_content_type(&self.pipeline, content_type.as_str())?;
+        request.set_test_input_fence_none(&self.pipeline)?;
+        let submission = AtomicSubmission::test_only(request);
+        self.submit_request(
+            &submission,
+            AtomicKmsErrorKind::TestOnlyRejected,
+            "runtime atomic TEST_ONLY primary geometry probe",
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn submit_primary_inner(
         &self,
@@ -245,11 +267,7 @@ impl AtomicCommitSubmitter {
         }
         let submission =
             AtomicSubmission::for_presentation(request, token, presentation_mode, test_only);
-        // SAFETY: the runtime owns the DRM fd and joins the worker before the
-        // fd can be closed, revoked, restored, or replaced.
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let result = submit_atomic(
-            fd,
+        let result = self.submit_request(
             &submission,
             if test_only {
                 AtomicKmsErrorKind::TestOnlyRejected
@@ -342,6 +360,18 @@ impl AtomicCommitSubmitter {
             content_type,
         )
         .map(|_| ())
+    }
+
+    fn submit_request(
+        &self,
+        submission: &AtomicSubmission,
+        error_kind: AtomicKmsErrorKind,
+        operation: &'static str,
+    ) -> Result<(), AtomicKmsError> {
+        // SAFETY: the runtime owns the DRM fd and joins the worker before the
+        // fd can be closed, revoked, restored, or replaced.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        submit_atomic(fd, submission, error_kind, operation)
     }
 }
 

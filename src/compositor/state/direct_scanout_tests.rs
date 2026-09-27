@@ -14,6 +14,202 @@ use crate::xwayland::XwaylandGeneration;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+fn install_probe_scanout_surface(
+    state: &mut CompositorState,
+    root_surface_id: u32,
+    source_size: BufferSize,
+) {
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    install_probe_scanout_surface_with_metadata(
+        state,
+        root_surface_id,
+        source_size,
+        1,
+        wayland_server::protocol::wl_output::Transform::Normal,
+        None,
+        Some(output_size),
+    );
+}
+
+fn install_probe_scanout_surface_with_metadata(
+    state: &mut CompositorState,
+    root_surface_id: u32,
+    source_size: BufferSize,
+    buffer_scale: u32,
+    buffer_transform: wayland_server::protocol::wl_output::Transform,
+    viewport_source: Option<ViewportSourceRect>,
+    viewport_destination: Option<BufferSize>,
+) {
+    let generation = XwaylandGeneration::new(
+        NonZeroU64::new(u64::from(root_surface_id)).expect("nonzero test surface id"),
+    );
+    let mut surface = x11_scanout_surface(
+        root_surface_id,
+        source_size.width,
+        source_size.height,
+        SurfacePlacement::absolute_root_at(0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    surface.buffer_scale = buffer_scale;
+    surface.buffer_transform = buffer_transform;
+    surface.viewport_source = viewport_source;
+    surface.viewport_destination = viewport_destination;
+    install_x11_scanout_surface(
+        state,
+        surface,
+        x11_output_snapshot(generation, root_surface_id, root_surface_id),
+    );
+}
+
+#[test]
+fn same_size_scene_stays_on_the_accepted_direct_candidate_path() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    install_probe_scanout_surface(&mut state, 301, output_size);
+
+    let direct_candidate = state
+        .direct_scanout_scene_candidate()
+        .expect("same-size scene remains an accepted direct candidate");
+
+    assert_eq!(direct_candidate.buffer_size, output_size);
+    assert_eq!(direct_candidate.output_size, output_size);
+    assert!(
+        state
+            .direct_scanout_probe_scene_analysis()
+            .probe_candidate
+            .is_none()
+    );
+}
+
+#[test]
+fn simple_size_mismatch_is_a_probe_candidate_with_distinct_source_and_output_sizes() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    let source_size = BufferSize::new(1600, 900).expect("source size");
+    install_probe_scanout_surface(&mut state, 302, source_size);
+
+    assert_eq!(
+        state.direct_scanout_scene_candidate().unwrap_err(),
+        DirectScanoutSceneRejection::BufferSizeMismatch
+    );
+    let analysis = state.direct_scanout_probe_scene_analysis();
+    assert!(analysis.candidate.is_none());
+    let probe = analysis
+        .probe_candidate
+        .expect("size mismatch is eligible for diagnostics");
+
+    assert_eq!(probe.buffer_size, source_size);
+    assert_eq!(probe.buffer.size(), source_size);
+    assert_eq!(probe.output_size, output_size);
+    assert_ne!(probe.buffer_size, probe.output_size);
+}
+
+#[test]
+fn probe_rejects_non_unit_scale_non_normal_transform_and_non_identity_viewport() {
+    let source_size = BufferSize::new(1600, 900).unwrap();
+    let output_size = BufferSize::new(1920, 1080).unwrap();
+
+    let mut scaled = CompositorState::new(None);
+    install_probe_scanout_surface_with_metadata(
+        &mut scaled,
+        303,
+        source_size,
+        2,
+        wayland_server::protocol::wl_output::Transform::Normal,
+        None,
+        Some(output_size),
+    );
+    assert!(
+        scaled
+            .direct_scanout_probe_scene_analysis()
+            .probe_candidate
+            .is_none()
+    );
+    assert!(
+        scaled
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::BufferScaleUnsupported)
+    );
+
+    let mut transformed = CompositorState::new(None);
+    install_probe_scanout_surface_with_metadata(
+        &mut transformed,
+        304,
+        source_size,
+        1,
+        wayland_server::protocol::wl_output::Transform::_90,
+        None,
+        Some(output_size),
+    );
+    assert!(
+        transformed
+            .direct_scanout_probe_scene_analysis()
+            .probe_candidate
+            .is_none()
+    );
+    assert!(
+        transformed
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::BufferTransformUnsupported)
+    );
+
+    let mut cropped = CompositorState::new(None);
+    install_probe_scanout_surface_with_metadata(
+        &mut cropped,
+        305,
+        source_size,
+        1,
+        wayland_server::protocol::wl_output::Transform::Normal,
+        Some(ViewportSourceRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1599.0,
+            height: 900.0,
+        }),
+        Some(output_size),
+    );
+    assert!(
+        cropped
+            .direct_scanout_probe_scene_analysis()
+            .probe_candidate
+            .is_none()
+    );
+    assert!(
+        cropped
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::ViewportSourceNonIdentity)
+    );
+
+    let mut non_full_destination = CompositorState::new(None);
+    install_probe_scanout_surface_with_metadata(
+        &mut non_full_destination,
+        306,
+        source_size,
+        1,
+        wayland_server::protocol::wl_output::Transform::Normal,
+        None,
+        Some(BufferSize::new(1800, 1000).unwrap()),
+    );
+    assert!(
+        non_full_destination
+            .direct_scanout_probe_scene_analysis()
+            .probe_candidate
+            .is_none()
+    );
+    assert!(
+        non_full_destination
+            .direct_scanout_scene_blockers()
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::ViewportDestinationNonIdentity)
+    );
+}
+
 fn install_off_output_xdg_window(state: &mut CompositorState, root_surface_id: u32) -> SceneNodeId {
     let window_id = state.allocate_window_id().expect("off-output window id");
     state

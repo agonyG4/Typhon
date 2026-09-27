@@ -115,6 +115,102 @@ pub(crate) fn admit_repaint_visual_work(
     Ok(())
 }
 
+fn run_scaled_probe_candidate(
+    probe_cache: &mut ScaledPrimaryProbeCache,
+    scanout: &NativeScanoutBackend,
+    worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+    candidate: &oblivion_one::compositor::DirectScanoutProbeCandidate,
+    output_id: OutputId,
+    drm_generation: u64,
+    output_generation: u64,
+    pipeline: Option<&oblivion_one::native::kms::AtomicPipelineProperties>,
+    mode_width: u32,
+    mode_height: u32,
+    content_type: DrmContentType,
+    cursor_atomic_key: Option<CursorAtomicValidationKey>,
+    worker_available: bool,
+    safe_to_probe: bool,
+) {
+    probe_cache.observe_candidate();
+    let Some(pipeline) = pipeline else {
+        probe_cache.record_unavailable_skip();
+        return;
+    };
+    let Some(key) = ScaledPrimaryProbeKey::new(
+        output_id,
+        drm_generation,
+        output_generation,
+        pipeline,
+        mode_width,
+        mode_height,
+        &candidate.buffer,
+        content_type,
+        cursor_atomic_key,
+    ) else {
+        probe_cache.record_busy_skip();
+        return;
+    };
+    if probe_cache.lookup(key).is_some() {
+        return;
+    }
+    if !worker_available {
+        probe_cache.record_unavailable_skip();
+        return;
+    }
+    if !safe_to_probe {
+        probe_cache.record_busy_skip();
+        return;
+    }
+    let geometry = match key.geometry() {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            let result = probe_cache.record_import_failure(key, error.to_string());
+            log_scaled_probe_result(&result, key);
+            return;
+        }
+    };
+    match scanout.import_scaled_probe_framebuffer(candidate) {
+        Ok(Some(framebuffer)) => {
+            let Some(worker) = worker else {
+                probe_cache.record_busy_skip();
+                return;
+            };
+            match worker.test_primary_geometry_if_idle(
+                framebuffer.framebuffer,
+                geometry,
+                content_type,
+            ) {
+                None => probe_cache.record_busy_skip(),
+                Some(Ok(())) => {
+                    let result = ScaledPrimaryProbeResult::Supported;
+                    probe_cache.record_test_result(key, result.clone());
+                    log_scaled_probe_result(&result, key);
+                }
+                Some(Err(error)) => {
+                    if error.kind == oblivion_one::native::kms::AtomicKmsErrorKind::Busy {
+                        probe_cache.record_busy_skip();
+                    } else {
+                        let result = ScaledPrimaryProbeResult::Rejected(error.to_string());
+                        probe_cache.record_test_result(key, result.clone());
+                        log_scaled_probe_result(&result, key);
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            let result = probe_cache.record_import_failure(
+                key,
+                "active scanout backend cannot import diagnostic DMA-BUFs".to_string(),
+            );
+            log_scaled_probe_result(&result, key);
+        }
+        Err(error) => {
+            let result = probe_cache.record_import_failure(key, error.to_string());
+            log_scaled_probe_result(&result, key);
+        }
+    }
+}
+
 impl NativeRuntime {
     pub(super) fn render_present_and_update_metrics(
         &mut self,
@@ -193,6 +289,7 @@ impl NativeRuntime {
             resize_perf: _,
             pointer_constraint_backend: _,
             render_telemetry,
+            scaled_primary_probe,
             seat_session: _,
             process_supervisor: _,
             shutdown: _,
@@ -581,33 +678,83 @@ impl NativeRuntime {
             || atomic_cursor.as_ref().is_some_and(|cursor| {
                 cursor_state_changed && cursor.current().visible && !cursor_visible
             });
-        let direct_inspection = inspect_direct_presentation(DirectPresentationInputs {
-            server,
-            output_id: *output_id,
-            kms_kind: kms_backend.effective_kind(),
-            atomic_cursor: atomic_cursor.as_ref(),
-            cursor_render_mode: *cursor_render_mode,
-            cursor_visible,
-            client_surface_content_active,
-            client_cursor_hardware_usable,
-            legacy_cursor_available: legacy_cursor.is_some(),
-            page_flip_pending: scanout.page_flip_pending(),
-            atomic_commit_pending: atomic_commit_arbiter.atomic_commit_pending(),
-            drm_file_generation: *drm_file_generation,
-            effective_cursor: effective_cursor.as_ref(),
-            last_direct_candidate_key,
-            scene_changed,
-            pending_frame_work,
-            pending_interactive_visual_work,
-            primary_redraw_requested,
-            direct_active: presented_planes
-                .primary
-                .is_some_and(|assignment| assignment.is_direct())
-                && !pending_interactive_visual_work,
-            direct_scanout_preference: *direct_scanout_preference,
-            plane_decision: runtime_plane_plan.as_ref().map(|plan| &plan.decision),
-        });
+        let scaled_probe_enabled = scaled_primary_probe_enabled();
+        let direct_inspection = inspect_direct_presentation(
+            DirectPresentationInputs {
+                server,
+                output_id: *output_id,
+                kms_kind: kms_backend.effective_kind(),
+                atomic_cursor: atomic_cursor.as_ref(),
+                cursor_render_mode: *cursor_render_mode,
+                cursor_visible,
+                client_surface_content_active,
+                client_cursor_hardware_usable,
+                legacy_cursor_available: legacy_cursor.is_some(),
+                page_flip_pending: scanout.page_flip_pending(),
+                atomic_commit_pending: atomic_commit_arbiter.atomic_commit_pending(),
+                drm_file_generation: *drm_file_generation,
+                effective_cursor: effective_cursor.as_ref(),
+                last_direct_candidate_key,
+                scene_changed,
+                pending_frame_work,
+                pending_interactive_visual_work,
+                primary_redraw_requested,
+                direct_active: presented_planes
+                    .primary
+                    .is_some_and(|assignment| assignment.is_direct())
+                    && !pending_interactive_visual_work,
+                direct_scanout_preference: *direct_scanout_preference,
+                plane_decision: runtime_plane_plan.as_ref().map(|plan| &plan.decision),
+            },
+            scaled_probe_enabled,
+        );
         server.reconcile_surface_scanout_candidate(direct_inspection.candidate_surface_id);
+        if scaled_probe_enabled && direct_inspection.buffer_size_mismatch_rejection {
+            scaled_primary_probe.record_buffer_size_mismatch_rejection();
+        }
+        if scaled_probe_enabled
+            && let Some(candidate) = direct_inspection.scaled_probe_candidate.as_ref()
+        {
+            let atomic_pipeline = match &kms_backend.backend {
+                oblivion_one::native::kms::KmsDisplayBackend::Atomic(backend) => {
+                    Some(&backend.discovery().pipeline)
+                }
+                oblivion_one::native::kms::KmsDisplayBackend::Legacy(_) => None,
+            };
+            let safe_to_probe = worker_mode
+                && kms_commit_worker.is_some()
+                && !direct_inspection.atomic_primary_commit_pending
+                && scanout.pending_page_flip_token().is_none()
+                && !scanout.ready_frame_queued()
+                && !scanout.output_render_in_progress()
+                && !pending_frame_work
+                && !pending_interactive_visual_work;
+            let worker_available = worker_mode && kms_commit_worker.is_some();
+            run_scaled_probe_candidate(
+                scaled_primary_probe,
+                scanout,
+                kms_commit_worker.as_ref(),
+                candidate,
+                *output_id,
+                *drm_file_generation,
+                confirmed_output_presentation.output_generation,
+                atomic_pipeline,
+                target.width,
+                target.height,
+                confirmed_output_presentation.content_type,
+                atomic_cursor
+                    .as_ref()
+                    .filter(|cursor| cursor.current().visible)
+                    .map(|cursor| {
+                        CursorAtomicValidationKey::from_state(
+                            cursor.current(),
+                            cursor.plane.plane_id,
+                        )
+                    }),
+                worker_available,
+                safe_to_probe,
+            );
+        }
         let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
         let atomic_primary_commit_pending = direct_inspection.atomic_primary_commit_pending;
         let direct_candidate_changed = direct_inspection.direct_candidate_changed;

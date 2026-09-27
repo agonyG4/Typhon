@@ -415,6 +415,22 @@ impl DirectFramebufferCache {
         Ok((framebuffer, false))
     }
 
+    /// Imports a temporary framebuffer for the opt-in diagnostic TEST_ONLY
+    /// path without reading or mutating the production direct-import cache.
+    pub(crate) fn import_for_probe(
+        &self,
+        identity: &BufferIdentity,
+        buffer: &DmabufBufferHandle,
+    ) -> io::Result<Arc<ImportedDirectFramebuffer>> {
+        ImportedDirectFramebuffer::import(
+            Arc::clone(&self.io),
+            Arc::new(AtomicU64::new(0)),
+            identity,
+            buffer,
+        )
+        .map(Arc::new)
+    }
+
     fn evict_if_needed(&mut self) -> bool {
         self.entries.retain(|_, entry| {
             Arc::strong_count(&entry.framebuffer) != 1 || entry.identity.is_alive()
@@ -665,6 +681,24 @@ mod tests {
         cache.clear_for_generation(2);
         assert_eq!(cache.len(), 0);
         assert_eq!(*io.events.lock().unwrap(), ["add_fb", "rm_fb", "gem_close"]);
+    }
+
+    #[test]
+    fn probe_framebuffer_import_does_not_populate_production_cache() {
+        let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+        let identity = ids.allocate().unwrap();
+        let io = Arc::new(FakeIo::default());
+        let cache = DirectFramebufferCache::with_io(io.clone(), 1);
+        let buffer = test_buffer(&identity);
+
+        let imported = cache.import_for_probe(&identity, &buffer).unwrap();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(io.events.lock().unwrap().as_slice(), ["add_fb"]);
+        drop(imported);
+        assert_eq!(
+            io.events.lock().unwrap().as_slice(),
+            ["add_fb", "rm_fb", "gem_close"]
+        );
     }
 
     #[test]

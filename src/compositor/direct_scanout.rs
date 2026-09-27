@@ -90,6 +90,17 @@ pub struct DirectScanoutSceneCandidate {
     pub presentation: crate::compositor::SurfacePresentationMetadata,
 }
 
+/// A scene that passes every direct-scanout scene check except for the
+/// source-buffer/output-mode size mismatch. This is diagnostic metadata only;
+/// it must never be used to plan presentation.
+#[derive(Debug, Clone)]
+pub struct DirectScanoutProbeCandidate {
+    pub buffer_identity: BufferIdentity,
+    pub buffer: DmabufBufferHandle,
+    pub buffer_size: BufferSize,
+    pub output_size: BufferSize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectScanoutViewportCompatibility {
     pub(crate) identity: bool,
@@ -266,6 +277,24 @@ pub(crate) fn direct_scanout_viewport_compatibility(
     if buffer_size != output_size {
         return Err(DirectScanoutSceneRejection::BufferSizeMismatch);
     }
+    direct_scanout_probe_viewport_compatibility(
+        buffer_size,
+        output_size,
+        buffer_scale,
+        buffer_transform,
+        viewport_source,
+        viewport_destination,
+    )
+}
+
+pub(crate) fn direct_scanout_probe_viewport_compatibility(
+    buffer_size: BufferSize,
+    output_size: BufferSize,
+    buffer_scale: u32,
+    buffer_transform: wl_output::Transform,
+    viewport_source: Option<ViewportSourceRect>,
+    viewport_destination: Option<BufferSize>,
+) -> Result<DirectScanoutViewportCompatibility, DirectScanoutSceneRejection> {
     if buffer_scale != 1 {
         return Err(DirectScanoutSceneRejection::BufferScaleUnsupported);
     }
@@ -296,6 +325,12 @@ pub(crate) fn direct_scanout_viewport_compatibility(
         identity: true,
         metadata_present: viewport_source.is_some() || viewport_destination.is_some(),
     })
+}
+
+pub(crate) fn direct_scanout_probe_blockers_allow_scaling(
+    blockers: &DirectScanoutSceneBlockers,
+) -> bool {
+    blockers.reasons() == [DirectScanoutSceneRejection::BufferSizeMismatch]
 }
 
 #[cfg(test)]
@@ -359,6 +394,106 @@ mod tests {
             surface_order: Some(1),
             can_occlude: true,
         }
+    }
+
+    #[test]
+    fn scaled_probe_viewport_accepts_only_full_source_full_output_identity_state() {
+        let source = BufferSize::new(1600, 900).unwrap();
+        let output = BufferSize::new(1920, 1080).unwrap();
+        assert!(
+            direct_scanout_probe_viewport_compatibility(
+                source,
+                output,
+                1,
+                wl_output::Transform::Normal,
+                Some(ViewportSourceRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1600.0,
+                    height: 900.0,
+                }),
+                Some(output),
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            direct_scanout_probe_viewport_compatibility(
+                source,
+                output,
+                2,
+                wl_output::Transform::Normal,
+                None,
+                None,
+            ),
+            Err(DirectScanoutSceneRejection::BufferScaleUnsupported)
+        );
+        assert_eq!(
+            direct_scanout_probe_viewport_compatibility(
+                source,
+                output,
+                1,
+                wl_output::Transform::_90,
+                None,
+                None,
+            ),
+            Err(DirectScanoutSceneRejection::BufferTransformUnsupported)
+        );
+        assert_eq!(
+            direct_scanout_probe_viewport_compatibility(
+                source,
+                output,
+                1,
+                wl_output::Transform::Normal,
+                Some(ViewportSourceRect {
+                    x: 1.0,
+                    y: 0.0,
+                    width: 1599.0,
+                    height: 900.0,
+                }),
+                None,
+            ),
+            Err(DirectScanoutSceneRejection::ViewportSourceNonIdentity)
+        );
+        assert_eq!(
+            direct_scanout_probe_viewport_compatibility(
+                source,
+                output,
+                1,
+                wl_output::Transform::Normal,
+                None,
+                Some(BufferSize::new(1800, 1000).unwrap()),
+            ),
+            Err(DirectScanoutSceneRejection::ViewportDestinationNonIdentity)
+        );
+    }
+
+    #[test]
+    fn only_buffer_size_mismatch_is_relaxed_for_the_probe() {
+        let eligible = DirectScanoutSceneBlockers {
+            reasons: vec![DirectScanoutSceneRejection::BufferSizeMismatch],
+        };
+        assert!(direct_scanout_probe_blockers_allow_scaling(&eligible));
+        for blocker in [
+            DirectScanoutSceneRejection::OverlayVisible,
+            DirectScanoutSceneRejection::PopupVisible,
+            DirectScanoutSceneRejection::EffectRequiresComposition,
+            DirectScanoutSceneRejection::ServerSideDecorationVisible,
+            DirectScanoutSceneRejection::AnimationTransform,
+            DirectScanoutSceneRejection::LifecycleAnimation,
+            DirectScanoutSceneRejection::WindowExitAnimation,
+            DirectScanoutSceneRejection::PresentationOpacity,
+            DirectScanoutSceneRejection::PresentationClip,
+            DirectScanoutSceneRejection::VisualClipPresent,
+            DirectScanoutSceneRejection::ResizePreviewActive,
+        ] {
+            let mut blocked = eligible.clone();
+            blocked.push(blocker);
+            assert!(!direct_scanout_probe_blockers_allow_scaling(&blocked));
+        }
+        assert!(!direct_scanout_probe_blockers_allow_scaling(
+            &DirectScanoutSceneBlockers::default()
+        ));
     }
 
     #[test]

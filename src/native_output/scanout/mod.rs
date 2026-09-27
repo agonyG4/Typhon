@@ -23,6 +23,7 @@ mod kms_preferred;
 mod output_slot;
 #[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
 mod output_swapchain;
+mod scaled_probe;
 mod worker;
 
 pub(crate) use atomic_direct::*;
@@ -45,6 +46,7 @@ pub(crate) use kms_preferred::*;
 pub(crate) use output_slot::*;
 #[allow(unused_imports)]
 pub(crate) use output_swapchain::*;
+pub(crate) use scaled_probe::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutPreference {
@@ -260,6 +262,18 @@ pub(crate) struct AtomicExplicitRecovery {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn import_scaled_probe_framebuffer(
+        &self,
+        candidate: &oblivion_one::compositor::DirectScanoutProbeCandidate,
+    ) -> std::io::Result<Option<std::sync::Arc<ImportedDirectFramebuffer>>> {
+        match self {
+            Self::AtomicEglGbm(scanout) => {
+                scanout.import_scaled_probe_framebuffer(candidate).map(Some)
+            }
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(None),
+        }
+    }
+
     pub(crate) fn material_runtime_capabilities(
         &self,
     ) -> oblivion_one::material::MaterialCapabilities {

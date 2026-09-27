@@ -1929,6 +1929,10 @@ impl OwnCompositorServer {
         self.state.direct_scanout_scene_analysis()
     }
 
+    pub fn direct_scanout_probe_scene_analysis(&self) -> DirectScanoutSceneAnalysis {
+        self.state.direct_scanout_probe_scene_analysis()
+    }
+
     pub fn direct_scanout_layer_shell_doctor_details(
         &self,
         visible_content: &[PresentationCoverageContent],

@@ -10,6 +10,17 @@ use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind};
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
+    fn test_primary_geometry(
+        &self,
+        framebuffer: oblivion_one::native::kms::FramebufferId,
+        geometry: oblivion_one::native::kms::AtomicPlaneGeometry,
+        content_type: oblivion_one::compositor::DrmContentType,
+    ) -> Result<(), KmsWorkerSubmitFailure> {
+        self.submitter
+            .test_primary_with_geometry(framebuffer, geometry, content_type)
+            .map_err(|error| KmsWorkerSubmitFailure { error })
+    }
+
     fn test_only(&self, job: &KmsCommitJob) -> Result<(), KmsWorkerSubmitFailure> {
         let presentation_mode = job.presentation_mode();
         let content_type = job.content_type();

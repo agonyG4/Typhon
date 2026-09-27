@@ -21,6 +21,9 @@ pub(super) struct DirectPresentationInspection {
     pub(super) composition_required: bool,
     pub(super) candidate_key: Option<DirectScanoutCandidateKey>,
     pub(super) candidate_surface_id: Option<u32>,
+    pub(super) scaled_probe_candidate:
+        Option<oblivion_one::compositor::DirectScanoutProbeCandidate>,
+    pub(super) buffer_size_mismatch_rejection: bool,
 }
 
 pub(super) struct DirectPresentationInputs<'a> {
@@ -76,6 +79,7 @@ fn direct_candidate_changed(
 
 pub(super) fn inspect_direct_presentation(
     inputs: DirectPresentationInputs<'_>,
+    scaled_probe_enabled: bool,
 ) -> DirectPresentationInspection {
     let cursor_direct_compatible = if inputs.kms_kind == KmsBackendKind::Atomic {
         if let Some(decision) = inputs.plane_decision {
@@ -101,9 +105,32 @@ pub(super) fn inspect_direct_presentation(
     let atomic_primary_commit_pending = inputs.page_flip_pending || inputs.atomic_commit_pending;
     let inspect_candidate =
         should_inspect_direct_scanout(inputs.direct_scanout_preference, inputs.direct_active);
+    let scene_analysis = if scaled_probe_enabled {
+        Some(inputs.server.direct_scanout_probe_scene_analysis())
+    } else if inspect_candidate {
+        Some(inputs.server.direct_scanout_scene_analysis())
+    } else {
+        None
+    };
     let direct_candidate = inspect_candidate
-        .then(|| inputs.server.direct_scanout_scene_candidate().ok())
+        .then(|| {
+            scene_analysis
+                .as_ref()
+                .and_then(|analysis| analysis.candidate.clone())
+        })
         .flatten();
+    let scaled_probe_candidate = scaled_probe_enabled
+        .then(|| {
+            scene_analysis
+                .as_ref()
+                .and_then(|analysis| analysis.probe_candidate.clone())
+        })
+        .flatten();
+    let buffer_size_mismatch_rejection = scaled_probe_enabled
+        && scene_analysis.as_ref().is_some_and(|analysis| {
+            analysis.blockers.reasons()
+                == [oblivion_one::compositor::DirectScanoutSceneRejection::BufferSizeMismatch]
+        });
     let direct_candidate_eligible = inputs.direct_scanout_preference.enabled()
         && direct_candidate.is_some()
         && !inputs.pending_interactive_visual_work;
@@ -165,6 +192,8 @@ pub(super) fn inspect_direct_presentation(
         composition_required,
         candidate_key: direct_candidate_key,
         candidate_surface_id,
+        scaled_probe_candidate,
+        buffer_size_mismatch_rejection,
     }
 }
 
