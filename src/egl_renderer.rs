@@ -10414,7 +10414,9 @@ mod tests {
             effects::EffectDebugCaptureMode::Replay,
             effects::EffectDebugKawaseMode::Partial,
         );
-        let (_, previous, candidate, _) = render_native_stacked_candidate(fixture, config, None);
+        let (_, previous, candidate, events) =
+            render_native_stacked_candidate(fixture, config, None);
+        assert_scene_work_preservation_trace_events(&events, "native TopBar");
         let full_current_reference = render_native_stacked_full_reference(fixture, config);
         let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
             &candidate,
@@ -10532,7 +10534,9 @@ mod tests {
             effects::EffectDebugCaptureMode::Replay,
             effects::EffectDebugKawaseMode::Partial,
         );
-        let (_, previous, candidate, _) = render_native_stacked_candidate(fixture, config, None);
+        let (_, previous, candidate, events) =
+            render_native_stacked_candidate(fixture, config, None);
+        assert_scene_work_preservation_trace_events(&events, "native Dock");
         let full_current_reference = render_native_stacked_full_reference(fixture, config);
         let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
             &candidate,
@@ -11481,6 +11485,34 @@ mod tests {
         assert_eq!(metrics.checked_out_texture_count, 0);
     }
 
+    fn assert_scene_work_preservation_trace_events(events: &[String], label: &str) {
+        for phase in ["capture", "restore"] {
+            let expected_phase = format!("phase={phase}");
+            let phase_events = events
+                .iter()
+                .filter(|line| {
+                    line.contains("event=effect_scene_work_preservation")
+                        && line
+                            .split_whitespace()
+                            .any(|field| field == expected_phase.as_str())
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !phase_events.is_empty(),
+                "{label} has no scene-work preservation {phase} trace event"
+            );
+            assert!(
+                phase_events.iter().any(|line| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix("pixels="))
+                        .and_then(|pixels| pixels.parse::<u64>().ok())
+                        .is_some_and(|pixels| pixels > 0)
+                }),
+                "{label} has no non-zero scene-work preservation pixels in {phase}: {phase_events:?}"
+            );
+        }
+    }
+
     fn trace_event_index(events: &[String], terms: &[&str]) -> usize {
         events
             .iter()
@@ -11979,7 +12011,7 @@ mod tests {
 
     #[test]
     fn real_gles_scene_work_preservation_restores_only_planned_regions() {
-        let regions = [OutputRect::new(1, 1, 2, 2), OutputRect::new(5, 3, 2, 2)];
+        let regions = [OutputRect::new(1, 0, 3, 2)];
 
         for framebuffer_origin in [
             OutputFramebufferOrigin::BottomLeft,
@@ -11996,8 +12028,8 @@ mod tests {
             )
             .expect("scene-work preservation capture succeeds");
 
-            assert_eq!(preservation.transfer_count(), 2);
-            assert_eq!(preservation.preserved_pixels(), 8);
+            assert_eq!(preservation.transfer_count(), 1);
+            assert_eq!(preservation.preserved_pixels(), 6);
 
             poison_diagnostic_output(&harness, [0.07, 0.19, 0.31, 1.0]);
             let overwritten = read_diagnostic_pixels(&harness);
