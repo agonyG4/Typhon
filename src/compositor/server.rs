@@ -1279,8 +1279,9 @@ impl OwnCompositorServer {
         self.state.publish_presented_frame(publication);
     }
 
+    /// Publish the compositor state associated with a completed direct-scanout pageflip.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn publish_direct_scanout_frame(
+    pub fn publish_direct_scanout_frame(
         &mut self,
         frame_id: u64,
         presented_at_ns: u64,

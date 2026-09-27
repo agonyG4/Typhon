@@ -7,11 +7,12 @@ use super::{
 };
 use crate::native_output::DirectScanoutCandidateKey;
 use oblivion_one::native::presentation_deadline::PresentationTarget;
+use std::sync::mpsc::SyncSender;
 use std::{
     collections::{HashSet, VecDeque},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
-        Arc, Condvar, Mutex, SyncSender, TryLockError,
+        Arc, Condvar, Mutex, TryLockError,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
