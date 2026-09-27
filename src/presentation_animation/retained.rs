@@ -13,6 +13,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PresentationRetainedVisualKind {
     WindowLifecycle,
+    WindowExit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

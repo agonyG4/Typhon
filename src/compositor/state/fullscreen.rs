@@ -549,8 +549,14 @@ impl CompositorState {
     pub(in crate::compositor) fn apply_presentation_to_native_frame_surfaces<'a>(
         &self,
         surfaces: Cow<'a, [RenderableSurface]>,
+        presentation_owner_root_surface_ids: &[u32],
         sample: &PresentationSceneSample,
     ) -> Cow<'a, [RenderableSurface]> {
+        assert_eq!(
+            surfaces.len(),
+            presentation_owner_root_surface_ids.len(),
+            "presentation owner roots must remain aligned with native frame surfaces"
+        );
         if sample.transforms.is_empty() {
             return surfaces;
         }
@@ -559,9 +565,12 @@ impl CompositorState {
         let canonical_origins = render::surface_origins(surfaces.as_ref());
         let mut presented_origins = HashMap::new();
         for transform in &sample.transforms {
-            for (index, surface) in surfaces.iter().enumerate() {
-                if self.root_surface_id_for_surface(surface.surface_id) != transform.root_surface_id
-                {
+            for (index, (surface, owner_root_surface_id)) in surfaces
+                .iter()
+                .zip(presentation_owner_root_surface_ids.iter().copied())
+                .enumerate()
+            {
+                if owner_root_surface_id != transform.root_surface_id {
                     continue;
                 }
                 let Some(origin) = canonical_origins.get(index).copied() else {

@@ -2902,6 +2902,7 @@ fn exact_x11_close_uses_the_existing_backend_close_command() {
         state.close_desktop_window_outcome(id),
         WindowActionOutcome::Changed
     );
+    assert_eq!(state.window_exit_payloads.len(), 0);
     assert!(matches!(
         state.take_backend_commands().as_slice(),
         [crate::compositor::window_backend::WindowBackendCommand::Close { window }] if *window == id

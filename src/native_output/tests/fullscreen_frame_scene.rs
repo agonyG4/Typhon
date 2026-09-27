@@ -67,6 +67,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         },
         scene_identity_signature: snapshot.identity_signature(),
         snapshot,
+        canonical_scene_evidence: None,
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample {
             output_id,
@@ -89,6 +90,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         lifecycle_surfaces: Vec::new(),
         lifecycle_decorations: Vec::new(),
         lifecycle_snapshot: LifecycleFrameSnapshot::default(),
+        window_exit_evidence: Vec::new(),
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
         output_id,
@@ -144,6 +146,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         visibility: FullscreenRenderPlanMetrics::default(),
         scene_identity_signature: snapshot.identity_signature(),
         snapshot,
+        canonical_scene_evidence: None,
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample::empty_for_output(
             output_id,
@@ -159,6 +162,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         lifecycle_surfaces: Vec::new(),
         lifecycle_decorations: Vec::new(),
         lifecycle_snapshot: LifecycleFrameSnapshot::default(),
+        window_exit_evidence: Vec::new(),
     };
     let frozen = resolved_scene.into_owned();
     assert_eq!(
@@ -322,6 +326,8 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         });
         for frame_id in 1..=20_u64 {
             let scene = fullscreen_scene(frame_id);
@@ -333,6 +339,8 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
                 cursor_damage: NativeCursorDamageBounds::default(),
                 presentation: PresentationFrameSnapshot::empty_for_output(output_id),
                 lifecycle: LifecycleFrameSnapshot::default(),
+                canonical_scene_evidence: None,
+                window_exit_evidence: Vec::new(),
             });
             let token = 700 + frame_id;
             assert!(history.queue_submission(token));

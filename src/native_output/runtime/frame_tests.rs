@@ -326,6 +326,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
                 Vec::new(),
                 popup_surface_ids,
             ),
+            canonical_scene_evidence: None,
             scene_identity_signature: 0,
             effects: ResolvedEffectScene::default(),
             presentation: PresentationSceneSample::empty_for_output(
@@ -342,6 +343,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             lifecycle_surfaces: Vec::new(),
             lifecycle_decorations: Vec::new(),
             lifecycle_snapshot: LifecycleFrameSnapshot::default(),
+            window_exit_evidence: Vec::new(),
         };
         assert_eq!(resolved.snapshot_ref().popup_surface_ids, popup_surface_ids);
     }

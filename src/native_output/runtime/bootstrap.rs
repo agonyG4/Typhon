@@ -585,6 +585,8 @@ impl NativeRuntime {
             presentation: &initial_presented_scene.presentation,
             lifecycle: &initial_presented_scene.lifecycle,
             lifecycle_scene: PresentedLifecycleScene::Initial,
+            canonical_scene: initial_presented_scene.canonical_scene_evidence.as_ref(),
+            window_exits: &initial_presented_scene.window_exit_evidence,
         });
         let scene_history = NativeSceneHistory::new(initial_presented_scene);
         let last_client_cursor_damage = None;

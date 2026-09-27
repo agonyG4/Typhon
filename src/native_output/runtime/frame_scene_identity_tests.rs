@@ -73,6 +73,8 @@ fn frame_snapshot(
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     }
 }
 
@@ -408,6 +410,8 @@ fn physical_helpers_expose_decoration_and_cursor_scene_nodes() {
         },
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     };
     let history = NativeSceneHistory::new(snapshot);
 

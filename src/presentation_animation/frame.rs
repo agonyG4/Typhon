@@ -90,7 +90,8 @@ pub struct NativeFramePresentationTargets {
 }
 
 impl NativeFramePresentationTargets {
-    pub(crate) fn from_windows(windows: Vec<PresentationWindowTarget>) -> Self {
+    #[doc(hidden)]
+    pub fn from_windows(windows: Vec<PresentationWindowTarget>) -> Self {
         Self { windows }
     }
 

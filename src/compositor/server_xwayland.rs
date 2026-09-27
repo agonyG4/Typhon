@@ -342,6 +342,8 @@ impl OwnCompositorServer {
             .state
             .window(window_id)
             .map(|window| window.root_surface_id);
+        let prepared_window_exit = root_surface_id
+            .is_some_and(|root_surface_id| self.state.prepare_window_exit(root_surface_id));
         if let Some(root_surface_id) = root_surface_id {
             let _ = self
                 .state
@@ -362,6 +364,15 @@ impl OwnCompositorServer {
                 }
             } else {
                 let _ = self.state.focus_topmost_renderable_toplevel();
+            }
+        }
+        if let Some(root_surface_id) = root_surface_id
+            && prepared_window_exit
+        {
+            if removed {
+                let _ = self.state.activate_prepared_window_exit(root_surface_id);
+            } else {
+                self.state.discard_prepared_window_exit(root_surface_id);
             }
         }
         removed

@@ -149,6 +149,9 @@ impl CompositorState {
         if self.lifecycle_animation_has_pending_visible() {
             blockers.push(DirectScanoutSceneRejection::LifecycleAnimation);
         }
+        if self.window_exit_payloads.active_payloads().next().is_some() {
+            blockers.push(DirectScanoutSceneRejection::WindowExitAnimation);
+        }
 
         let Some(covering_group) = coverage.covering_application_group.as_ref() else {
             blockers.push(DirectScanoutSceneRejection::NoOutputCoveringApplication);

@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn window_open_scale_and_glide_resolve_without_enabling_window_close() {
+    fn window_open_scale_and_glide_resolve_for_open_and_close() {
         let capabilities = AnimationRuntimeCapabilities::default();
         let mut state = AnimationControlState::from_store(
             AnimationConfigurationStore::unavailable(AnimationPersistenceError::Missing),
@@ -408,7 +408,7 @@ mod tests {
                 .insert(AnimationSlot::WindowClose, effect);
             assert_eq!(
                 state.effective_effect(AnimationSlot::WindowClose, capabilities),
-                AnimationEffect::None
+                effect
             );
         }
     }

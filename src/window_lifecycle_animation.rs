@@ -449,6 +449,7 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
             lamp.presentation_identity.scene_node_id().get(),
             match lamp.presentation_identity.kind() {
                 crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle => 1,
+                crate::presentation_animation::PresentationRetainedVisualKind::WindowExit => 2,
             },
             lamp.presentation_identity.transaction_id().get(),
             lamp.presentation_identity.revision_id().get(),

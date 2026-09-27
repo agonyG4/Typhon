@@ -742,6 +742,91 @@ impl PresentationEngine {
         self.cancel_clip(scene_node_id);
     }
 
+    /// Cancel the exact Geometry and Opacity members of a mixed transaction.
+    /// This is used when a retained visual activation fails after the atomic
+    /// property transaction committed; unrelated tracks on the SceneNode are
+    /// left untouched.
+    pub(crate) fn cancel_property_pair_exact(
+        &mut self,
+        scene_node_id: SceneNodeId,
+        transaction_id: PresentationTransactionId,
+        geometry_revision_id: PresentationRevisionId,
+        opacity_revision_id: PresentationRevisionId,
+    ) -> bool {
+        let geometry_matches = self
+            .geometry_tracks
+            .get(&scene_node_id)
+            .is_some_and(|track| {
+                track.transition.transaction_id == transaction_id
+                    && track.transition.revision_id == geometry_revision_id
+            });
+        let opacity_matches = self
+            .opacity_tracks
+            .get(&scene_node_id)
+            .is_some_and(|track| {
+                track.transaction_id == transaction_id && track.revision_id == opacity_revision_id
+            });
+        if !geometry_matches || !opacity_matches {
+            return false;
+        }
+        self.cancel_geometry(scene_node_id);
+        self.cancel_opacity(scene_node_id);
+        true
+    }
+
+    /// Remove the exact mixed WindowExit transaction for one SceneNode,
+    /// including the transaction ledger entry if no active track remains.
+    pub(crate) fn cancel_transaction_exact(
+        &mut self,
+        scene_node_id: SceneNodeId,
+        transaction_id: PresentationTransactionId,
+    ) -> bool {
+        let Some(record) = self.transactions.get(&transaction_id) else {
+            return false;
+        };
+        if record.members().len() != 2
+            || record.members().iter().any(|member| {
+                member.scene_node_id() != scene_node_id
+                    || !matches!(
+                        member.kind(),
+                        PresentationTransactionMemberKind::Property(
+                            PresentationPropertyKind::Geometry | PresentationPropertyKind::Opacity
+                        )
+                    )
+            })
+            || !record.members().iter().any(|member| {
+                member.kind()
+                    == PresentationTransactionMemberKind::Property(
+                        PresentationPropertyKind::Geometry,
+                    )
+            })
+            || !record.members().iter().any(|member| {
+                member.kind()
+                    == PresentationTransactionMemberKind::Property(
+                        PresentationPropertyKind::Opacity,
+                    )
+            })
+        {
+            return false;
+        }
+        let geometry = self
+            .geometry_tracks
+            .get(&scene_node_id)
+            .is_some_and(|track| track.transition.transaction_id == transaction_id);
+        let opacity = self
+            .opacity_tracks
+            .get(&scene_node_id)
+            .is_some_and(|track| track.transaction_id == transaction_id);
+        if geometry {
+            self.cancel_geometry(scene_node_id);
+        }
+        if opacity {
+            self.cancel_opacity(scene_node_id);
+        }
+        self.transactions.remove(&transaction_id);
+        true
+    }
+
     pub fn active_count(&self) -> usize {
         self.geometry_tracks.len() + self.opacity_tracks.len() + self.clip_tracks.len()
     }

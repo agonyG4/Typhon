@@ -78,11 +78,11 @@ use super::{
     InteractionUpdateOutcome, OutputId, OutputPosition, OutputRect, PendingProcessLaunch,
     PointerAxisFrame, PointerConstraintTransitionSnapshot, PresentationClock,
     PresentationProtocolCapabilities, PresentedFramePublication, ProtocolOnlyCompletion,
-    RenderGenerationCause, RendererProtocolCapabilities, ResizeFlowMetrics,
+    RenderGenerationCause, RendererProtocolCapabilities, ResizeFlowMetrics, ResolvedEffectInstance,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    SurfacePacingMetrics, SurfacePipelineEvent, SurfacePresentationMetadata,
-    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowId,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    SurfacePacingMetrics, SurfacePipelineEvent, SurfacePresentationKey,
+    SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason,
+    WindowId, WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
     XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
@@ -150,6 +150,14 @@ impl Drop for OwnCompositorServer {
 impl OwnCompositorServer {
     pub fn native_output_id(&self) -> Option<OutputId> {
         self.state.native_output_id()
+    }
+
+    #[doc(hidden)]
+    pub fn surface_presentation_key_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> Option<SurfacePresentationKey> {
+        self.state.surface_presentation_key_for_surface(surface_id)
     }
 
     pub fn output_dimensions(&self) -> (u32, u32) {
@@ -1202,6 +1210,39 @@ impl OwnCompositorServer {
         self.state.native_frame_presentation_targets(surfaces)
     }
 
+    #[doc(hidden)]
+    pub fn active_window_exit_render_groups(
+        &self,
+    ) -> Vec<crate::compositor::WindowExitRenderGroup> {
+        self.state.active_window_exit_render_groups()
+    }
+
+    #[doc(hidden)]
+    pub fn merge_window_exit_surfaces<'a>(
+        &self,
+        canonical_surfaces: Cow<'a, [RenderableSurface]>,
+        canonical_scene_node_ids: Cow<'a, [SceneNodeId]>,
+        canonical_owner_roots: Cow<'a, [u32]>,
+        exits: &[crate::compositor::WindowExitRenderGroup],
+    ) -> crate::compositor::WindowExitSurfaceMerge<'a> {
+        self.state.merge_window_exit_surfaces(
+            canonical_surfaces,
+            canonical_scene_node_ids,
+            canonical_owner_roots,
+            exits,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn window_exit_effects_for_presentation(
+        &self,
+        presentation: &PresentationSceneSample,
+        exits: &[crate::compositor::WindowExitRenderGroup],
+    ) -> Vec<ResolvedEffectInstance> {
+        self.state
+            .window_exit_effects_for_presentation(presentation, exits)
+    }
+
     pub fn presentation_owner_root_for_surface(&self, surface_id: u32) -> u32 {
         self.state.presentation_owner_root_for_surface(surface_id)
     }
@@ -1358,6 +1399,8 @@ impl OwnCompositorServer {
             presentation: &snapshot,
             lifecycle: &lifecycle,
             lifecycle_scene: super::PresentedLifecycleScene::Initial,
+            canonical_scene: None,
+            window_exits: &[],
         });
     }
 
@@ -1392,10 +1435,24 @@ impl OwnCompositorServer {
     pub fn apply_presentation_to_native_frame_surfaces<'a>(
         &self,
         surfaces: Cow<'a, [RenderableSurface]>,
+        presentation_owner_root_surface_ids: &[u32],
         sample: &PresentationSceneSample,
     ) -> Cow<'a, [RenderableSurface]> {
+        self.state.apply_presentation_to_native_frame_surfaces(
+            surfaces,
+            presentation_owner_root_surface_ids,
+            sample,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn native_scene_root_stack_key(
+        &self,
+        root_surface_id: u32,
+        original_position: usize,
+    ) -> (u8, u8, u64, usize) {
         self.state
-            .apply_presentation_to_native_frame_surfaces(surfaces, sample)
+            .renderable_root_stack_key(root_surface_id, original_position)
     }
 
     pub fn presentation_animation_has_unsettled_visible_at(&self, at: AnimationTime) -> bool {

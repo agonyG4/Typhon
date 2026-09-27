@@ -316,16 +316,26 @@ impl CompositorState {
                 AcquireWatchCancelReason::RoleDestroyed,
             );
         }
+        let prepared_window_exit = window_id.is_some() && self.prepare_window_exit(surface_id);
         self.unmap_xdg_role_surfaces(surface_id);
         self.toplevel_surfaces.remove(&surface_id);
-        if let Some(window_id) = window_id {
-            self.remove_desktop_window(window_id);
-        }
+        let removed_window = window_id
+            .and_then(|window_id| self.remove_desktop_window(window_id))
+            .is_some();
         self.clear_fullscreen_presentation_owner(surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgToplevel);
         self.surface_placements.remove(&surface_id);
         self.xdg_configure_serials.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        if prepared_window_exit {
+            if removed_window {
+                let _ = self.activate_prepared_window_exit(surface_id);
+            } else {
+                self.discard_prepared_window_exit(surface_id);
+            }
+        } else if removed_window {
+            self.resume_window_exit_after_canonical_teardown(surface_id);
+        }
     }
 
     pub(in crate::compositor) fn apply_pending_toplevel_constraints(&mut self, surface_id: u32) {

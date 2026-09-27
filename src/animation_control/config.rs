@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn open_scale_and_glide_overrides_validate_but_close_is_planned() {
+    fn open_and_close_scale_and_glide_overrides_validate() {
         let current = AnimationConfiguration::default();
         let capabilities = AnimationRuntimeCapabilities::default();
         for effect in [AnimationEffect::WindowScale, AnimationEffect::WindowGlide] {
@@ -307,14 +307,10 @@ mod tests {
 
             let mut close = current.clone();
             close.overrides.insert(AnimationSlot::WindowClose, effect);
-            let expected = AnimationConfigurationError::PlannedEffect {
-                slot: AnimationSlot::WindowClose,
-                effect,
-            };
-            assert_eq!(close.validate(), Err(expected.clone()));
+            assert_eq!(close.validate(), Ok(()));
             assert_eq!(
                 close.validate_runtime_mutation(&current, capabilities),
-                Err(expected)
+                Ok(())
             );
         }
     }

@@ -1,11 +1,113 @@
 use super::{CompositorState, PresentationFrameSnapshot};
 use crate::window_lifecycle_animation::LifecycleFrameSnapshot;
 
+use crate::compositor::surface::SurfaceCommitSequence;
+use crate::compositor::{RenderableSurface, SurfacePresentationKey};
+use crate::core::{OutputId, SceneNodeId};
+use crate::presentation_animation::PresentationRetainedVisualIdentity;
+use crate::render_backend::buffer::BufferId;
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedCanonicalSceneSnapshot {
+    pub output_id: OutputId,
+    pub render_generation: u64,
+    pub effect_identity_signature: u64,
+    pub surfaces: Vec<PresentedSurfaceContentEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PresentedSurfaceContentEvidence {
+    pub key: SurfacePresentationKey,
+    pub commit_sequence: SurfaceCommitSequence,
+    pub buffer_id: BufferId,
+    pub scene_node_id: SceneNodeId,
+    pub visual_root_surface_id: u32,
+    pub presentation_owner_root_surface_id: u32,
+}
+
+impl PresentedCanonicalSceneSnapshot {
+    #[doc(hidden)]
+    pub fn capture(
+        output_id: OutputId,
+        render_generation: u64,
+        effect_identity_signature: u64,
+        surfaces: &[RenderableSurface],
+        scene_node_ids: &[SceneNodeId],
+        presentation_owner_root_surface_ids: &[u32],
+        presentation_keys: &[Option<SurfacePresentationKey>],
+        visual_root_surface_ids: &[u32],
+    ) -> Option<Self> {
+        let len = surfaces.len();
+        if scene_node_ids.len() != len
+            || presentation_owner_root_surface_ids.len() != len
+            || presentation_keys.len() != len
+            || visual_root_surface_ids.len() != len
+        {
+            return None;
+        }
+
+        let mut seen_surface_ids = HashSet::with_capacity(len);
+        let mut evidence = Vec::with_capacity(len);
+        for ((((surface, scene_node_id), owner_root_surface_id), key), visual_root_surface_id) in
+            surfaces
+                .iter()
+                .zip(scene_node_ids.iter().copied())
+                .zip(presentation_owner_root_surface_ids.iter().copied())
+                .zip(presentation_keys.iter().copied())
+                .zip(visual_root_surface_ids.iter().copied())
+        {
+            let key = key?;
+            if key.surface_id != surface.surface_id || !seen_surface_ids.insert(surface.surface_id)
+            {
+                return None;
+            }
+            evidence.push(PresentedSurfaceContentEvidence {
+                key,
+                commit_sequence: surface.commit_sequence,
+                buffer_id: surface.buffer_id(),
+                scene_node_id,
+                visual_root_surface_id,
+                presentation_owner_root_surface_id: owner_root_surface_id,
+            });
+        }
+        evidence.sort_unstable_by_key(|surface| (surface.key.surface_id, surface.key.generation));
+
+        Some(Self {
+            output_id,
+            render_generation,
+            effect_identity_signature,
+            surfaces: evidence,
+        })
+    }
+
+    pub(crate) fn surfaces_for_owner(
+        &self,
+        owner_root_surface_id: u32,
+    ) -> Vec<PresentedSurfaceContentEvidence> {
+        self.surfaces
+            .iter()
+            .copied()
+            .filter(|surface| surface.presentation_owner_root_surface_id == owner_root_surface_id)
+            .collect()
+    }
+}
+
 pub struct PresentedFramePublication<'a> {
     pub frame_id: u64,
     pub presentation: &'a PresentationFrameSnapshot,
     pub lifecycle: &'a LifecycleFrameSnapshot,
     pub lifecycle_scene: PresentedLifecycleScene<'a>,
+    pub canonical_scene: Option<&'a PresentedCanonicalSceneSnapshot>,
+    pub window_exits: &'a [WindowExitFrameEvidence],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowExitFrameEvidence {
+    pub identity: PresentationRetainedVisualIdentity,
+    pub payload_id: u64,
+    pub root_surface_id: u32,
+    pub scene_node_id: SceneNodeId,
 }
 
 pub enum PresentedLifecycleScene<'a> {
@@ -26,12 +128,24 @@ impl CompositorState {
         if publication.presentation.output_id != expected_output_id {
             return;
         }
+        if publication
+            .canonical_scene
+            .is_some_and(|scene| scene.output_id != expected_output_id)
+        {
+            return;
+        }
 
+        self.presented_canonical_scene = publication.canonical_scene.cloned();
         self.publish_presented_presentation(publication.frame_id, publication.presentation);
         self.publish_presented_lifecycle_snapshot(
             publication.frame_id,
             publication.lifecycle,
             publication.lifecycle_scene,
+        );
+        self.settle_window_exit_physical(
+            publication.frame_id,
+            publication.presentation,
+            publication.window_exits,
         );
     }
 }
@@ -341,6 +455,8 @@ mod tests {
             lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
                 canonical_root_surface_ids: &[restore_root],
             },
+            canonical_scene: None,
+            window_exits: &[],
         });
 
         assert_eq!(state.presented_presentation_frame_id(), 7);
@@ -393,6 +509,8 @@ mod tests {
             presentation: &presentation,
             lifecycle: &lifecycle,
             lifecycle_scene: PresentedLifecycleScene::Initial,
+            canonical_scene: None,
+            window_exits: &[],
         });
 
         assert_eq!(state.presented_presentation_frame_id(), 9);
@@ -446,6 +564,8 @@ mod tests {
             presentation: &presentation,
             lifecycle: &submitted,
             lifecycle_scene: PresentedLifecycleScene::Initial,
+            canonical_scene: None,
+            window_exits: &[],
         });
         assert_eq!(state.window_lifecycle_animator.active_count(), 1);
 
@@ -455,6 +575,8 @@ mod tests {
             presentation: &presentation,
             lifecycle: &empty_submission,
             lifecycle_scene: PresentedLifecycleScene::Initial,
+            canonical_scene: None,
+            window_exits: &[],
         });
 
         let physical = state.presented_lifecycle_physical.snapshot_for_test();
@@ -547,6 +669,8 @@ mod tests {
             presentation: &stale,
             lifecycle: &LifecycleFrameSnapshot::default(),
             lifecycle_scene: PresentedLifecycleScene::Initial,
+            canonical_scene: None,
+            window_exits: &[],
         });
         assert_eq!(state.presentation_animator.active_count(), 3);
         assert_eq!(state.presentation_animator.transaction_count(), 1);
@@ -556,6 +680,8 @@ mod tests {
             presentation: &settled,
             lifecycle: &LifecycleFrameSnapshot::default(),
             lifecycle_scene: PresentedLifecycleScene::Initial,
+            canonical_scene: None,
+            window_exits: &[],
         });
         assert_eq!(state.presentation_animator.active_count(), 0);
         assert_eq!(state.presentation_animator.transaction_count(), 0);
@@ -605,6 +731,8 @@ mod tests {
             lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
                 canonical_root_surface_ids: &[root_surface_id],
             },
+            canonical_scene: None,
+            window_exits: &[],
         });
 
         assert!(
@@ -691,6 +819,8 @@ mod tests {
             lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
                 canonical_root_surface_ids: &[root_surface_id],
             },
+            canonical_scene: None,
+            window_exits: &[],
         });
         assert_eq!(
             state
@@ -726,6 +856,8 @@ mod tests {
             lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
                 canonical_root_surface_ids: &[root_surface_id],
             },
+            canonical_scene: None,
+            window_exits: &[],
         });
         assert!(
             state

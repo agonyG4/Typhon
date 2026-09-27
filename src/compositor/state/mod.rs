@@ -55,15 +55,18 @@ mod synchronized_cache;
 mod tiled_layout;
 mod tiled_resize;
 mod window_actions;
+mod window_close_animation;
 mod window_decoration;
+mod window_exit_physical;
+pub(crate) mod window_exit_retained;
 mod window_interaction;
 mod window_open_animation;
 mod window_resize;
 mod windows;
 mod workspaces;
 mod xdg_lifecycle;
-mod xwayland_mode;
 mod xwayland_dnd;
+mod xwayland_mode;
 mod xwayland_scene;
 mod xwayland_windows;
 
@@ -72,6 +75,7 @@ pub use lifecycle_retained::PresentationRetainedVisualPayloadId;
 pub(crate) use lifecycle_retained::RetainedLifecyclePayloadStore;
 pub(crate) use lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot;
 pub(crate) use override_redirect_stack::OverrideRedirectStackSnapshotResult;
+pub(crate) use window_exit_retained::WindowExitPayloadStore;
 
 #[allow(unused_imports)]
 pub(in crate::compositor) use xwayland_scene::{
@@ -204,7 +208,11 @@ mod task_05_8_tests;
 #[cfg(test)]
 mod tiled_layout_tests;
 #[cfg(test)]
+mod window_close_animation_tests;
+#[cfg(test)]
 mod window_decoration_tests;
+#[cfg(test)]
+mod window_exit_physical_tests;
 #[cfg(test)]
 mod window_interaction_tests;
 #[cfg(test)]

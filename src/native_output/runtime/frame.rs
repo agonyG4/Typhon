@@ -6,8 +6,8 @@ use std::{borrow::Cow, collections::HashSet};
 
 use oblivion_one::compositor::{
     AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
-    PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample, ResolvedEffectScene,
-    SceneNodeId,
+    PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample,
+    PresentedCanonicalSceneSnapshot, ResolvedEffectScene, SceneNodeId, WindowExitFrameEvidence,
 };
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
@@ -15,6 +15,7 @@ use super::frame_scene_identity::{
     assert_surface_owner_alignment, assert_surface_scene_node_alignment,
     filter_surface_scene_nodes_with_owners, finalize_snapshot,
 };
+use super::window_exit_frame::resolve_window_exit_frame_parts;
 
 #[cfg(test)]
 use super::frame_scene_identity::{
@@ -32,6 +33,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) render_generation: u64,
     pub(crate) visibility: FullscreenRenderPlanMetrics,
     pub(crate) snapshot: NativeSceneSnapshot,
+    pub(crate) canonical_scene_evidence: Option<PresentedCanonicalSceneSnapshot>,
     pub(crate) scene_identity_signature: u64,
     pub(crate) effects: ResolvedEffectScene,
     pub(crate) presentation: PresentationSceneSample,
@@ -40,6 +42,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) lifecycle_surfaces: Vec<RenderableSurface>,
     pub(crate) lifecycle_decorations: Vec<DecorationRenderInstance>,
     pub(crate) lifecycle_snapshot: LifecycleFrameSnapshot,
+    pub(crate) window_exit_evidence: Vec<WindowExitFrameEvidence>,
 }
 
 fn freeze_presentation_effect_influences(
@@ -297,24 +300,24 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_nodes.as_ref(),
         );
         assert_surface_owner_alignment(canonical_surfaces.as_ref(), canonical_owner_roots.as_ref());
-        let targets = server.native_frame_presentation_targets(canonical_surfaces.as_ref());
-        let presentation = server.presentation_scene_sample_for_targets_at_with_source(
+        let exit_parts = resolve_window_exit_frame_parts(
+            server,
+            &canonical_surfaces,
+            &canonical_scene_nodes,
+            &canonical_owner_roots,
             at,
             sample_time_source,
-            &targets,
         );
-        let decorations = server
-            .native_decoration_render_instances_for_scale(canonical_surfaces.as_ref(), 1.0)
-            .into_iter()
-            .map(|decoration| {
-                presentation
-                    .transform_for_root(decoration.root_surface_id())
-                    .and_then(|transform| decoration.with_presentation_transform(transform))
-                    .unwrap_or(decoration)
-            })
-            .collect::<Vec<_>>();
-        let surfaces =
-            server.apply_presentation_to_native_frame_surfaces(canonical_surfaces, &presentation);
+        let exits = exit_parts.exits;
+        let all_canonical_ordered_surfaces = exit_parts.surfaces;
+        let all_canonical_ordered_nodes = exit_parts.scene_nodes;
+        let all_canonical_ordered_owners = exit_parts.owner_roots;
+        let surfaces = exit_parts.presented_surfaces;
+        let decorations = exit_parts.decorations;
+        let targets = exit_parts.targets;
+        let presentation = exit_parts.presentation;
+        let canonical_surface_ids = exit_parts.canonical_surface_ids;
+        let canonical_key_by_surface = exit_parts.canonical_key_by_surface;
         let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &presentation,
             server.presented_window_geometries_for_targets(&presentation, &targets),
@@ -324,16 +327,39 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
         let effect_registry_generation = server.trusted_effect_registry().current();
-        let effects = server.resolved_effect_scene_for_presentation_with_lifecycle(
+        let canonical_effects = server.resolved_effect_scene_for_presentation_with_lifecycle(
             &presentation,
             &fullscreen_plan,
             &lifecycle,
         );
+        let exit_surface_ids = exits
+            .iter()
+            .flat_map(|exit| {
+                exit.content
+                    .surfaces
+                    .iter()
+                    .map(|surface| surface.surface_id)
+            })
+            .collect::<HashSet<_>>();
+        let mut effect_instances = canonical_effects.instances.clone();
+        effect_instances.retain(|instance| {
+            let surface_id = match instance.anchor {
+                oblivion_one::compositor::EffectAnchor::BeforeSurface(surface_id)
+                | oblivion_one::compositor::EffectAnchor::ReplaceSurface(surface_id)
+                | oblivion_one::compositor::EffectAnchor::AfterSurface(surface_id) => {
+                    Some(surface_id)
+                }
+                oblivion_one::compositor::EffectAnchor::OutputPostProcess => None,
+            };
+            surface_id.is_none_or(|surface_id| !exit_surface_ids.contains(&surface_id))
+        });
+        effect_instances.extend(server.window_exit_effects_for_presentation(&presentation, &exits));
+        let effects = ResolvedEffectScene::new(canonical_effects.generation, effect_instances);
         let mut snapshot =
             NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
                 surfaces.as_ref(),
-                canonical_scene_nodes.as_ref(),
-                canonical_owner_roots.as_ref(),
+                all_canonical_ordered_nodes.as_ref(),
+                all_canonical_ordered_owners.as_ref(),
                 decorations
                     .iter()
                     .map(DecorationRenderInstance::scene_snapshot)
@@ -358,6 +384,14 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 &effect_registry_generation,
                 output_bounds,
                 |surface_id| {
+                    if let Some(exit) = exits.iter().find(|exit| {
+                        exit.content
+                            .surfaces
+                            .iter()
+                            .any(|surface| surface.surface_id == surface_id)
+                    }) {
+                        return Some((exit.content.scene_node_id, exit.content.root_surface_id));
+                    }
                     let root_surface_id = server.presentation_owner_root_for_surface(surface_id);
                     server
                         .presentation_scene_node_id_for_root(root_surface_id)
@@ -376,16 +410,79 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             note_snapshot_finalization();
             note_identity_computation();
         }
+        let canonical_presented_surfaces = surfaces
+            .iter()
+            .filter(|surface| canonical_surface_ids.contains(&surface.surface_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let canonical_presented_nodes = all_canonical_ordered_surfaces
+            .iter()
+            .zip(all_canonical_ordered_nodes.iter().copied())
+            .filter_map(|(surface, node)| {
+                canonical_surface_ids
+                    .contains(&surface.surface_id)
+                    .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        let canonical_presented_owners = all_canonical_ordered_surfaces
+            .iter()
+            .zip(all_canonical_ordered_owners.iter().copied())
+            .filter_map(|(surface, owner)| {
+                canonical_surface_ids
+                    .contains(&surface.surface_id)
+                    .then_some(owner)
+            })
+            .collect::<Vec<_>>();
+        let canonical_presented_keys = canonical_presented_surfaces
+            .iter()
+            .map(|surface| {
+                canonical_key_by_surface
+                    .get(&surface.surface_id)
+                    .copied()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        let mut canonical_snapshot = snapshot.clone();
+        canonical_snapshot
+            .surfaces
+            .retain(|surface| canonical_surface_ids.contains(&surface.surface_id));
+        let canonical_visual_root_surface_ids = canonical_snapshot
+            .surfaces
+            .iter()
+            .map(|surface| surface.visual_root_surface_id)
+            .collect::<Vec<_>>();
+        let canonical_scene_evidence = server.native_output_id().and_then(|output_id| {
+            PresentedCanonicalSceneSnapshot::capture(
+                output_id,
+                render_generation,
+                canonical_effects.signature,
+                &canonical_presented_surfaces,
+                &canonical_presented_nodes,
+                &canonical_presented_owners,
+                &canonical_presented_keys,
+                &canonical_visual_root_surface_ids,
+            )
+        });
+        let window_exit_evidence = exits
+            .iter()
+            .map(|exit| WindowExitFrameEvidence {
+                identity: exit.identity,
+                payload_id: exit.payload_id,
+                root_surface_id: exit.content.root_surface_id,
+                scene_node_id: exit.content.scene_node_id,
+            })
+            .collect();
         Self {
             surfaces,
-            surface_scene_node_ids: canonical_scene_nodes,
-            presentation_owner_root_surface_ids: canonical_owner_roots,
+            surface_scene_node_ids: all_canonical_ordered_nodes,
+            presentation_owner_root_surface_ids: all_canonical_ordered_owners,
             decorations,
             popup_surface_ids,
             external_overlay_surface_ids,
             render_generation,
             visibility,
             snapshot,
+            canonical_scene_evidence,
             scene_identity_signature,
             effects,
             presentation,
@@ -394,6 +491,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             lifecycle_surfaces,
             lifecycle_decorations,
             lifecycle_snapshot,
+            window_exit_evidence,
         }
     }
     pub(crate) fn into_owned(self) -> ResolvedNativeFrameScene<'static> {
@@ -409,6 +507,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             render_generation: self.render_generation,
             visibility: self.visibility,
             snapshot: self.snapshot,
+            canonical_scene_evidence: self.canonical_scene_evidence,
             scene_identity_signature: self.scene_identity_signature,
             effects: self.effects,
             presentation: self.presentation,
@@ -417,6 +516,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             lifecycle_surfaces: self.lifecycle_surfaces,
             lifecycle_decorations: self.lifecycle_decorations,
             lifecycle_snapshot: self.lifecycle_snapshot,
+            window_exit_evidence: self.window_exit_evidence,
         }
     }
 

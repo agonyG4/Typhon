@@ -127,6 +127,7 @@ mod shutdown;
 mod shutdown_cycle;
 mod slow_cycle;
 mod wake_plan;
+mod window_exit_frame;
 mod work_domains;
 mod xwayland;
 mod xwayland_reactor;

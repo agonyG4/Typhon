@@ -266,6 +266,8 @@ impl CompositorState {
         );
         surface.mark_xwayland();
         let buffer_size = surface.buffer_size();
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        self.retire_window_exit_for_root(root_surface_id);
 
         if self.renderable_surface_index(surface_id).is_some() {
             self.replace_renderable_surface(surface_id, surface);

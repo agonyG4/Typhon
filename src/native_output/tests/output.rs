@@ -930,6 +930,8 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         output_id,
@@ -939,6 +941,8 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     assert!(history.queue_submission(2));
     assert_eq!(history.presented_scene().surfaces[0].surface_id, 88);
@@ -1093,6 +1097,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         output_id,
@@ -1102,6 +1108,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     assert!(history.queue_submission(220));
     assert!(history.discard_submission(220));
@@ -1113,6 +1121,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
 
     let damage = native_output_damage_for_scene_snapshots(
@@ -1205,6 +1215,8 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         output_id,
@@ -1214,6 +1226,8 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     assert!(history.queue_submission(230));
     assert!(history.discard_submission(230));
@@ -1225,6 +1239,8 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
 
     let damage = native_output_damage_for_scene_snapshots(
@@ -1356,6 +1372,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         });
         let mut planner = PartialRepaintPlanner::new(
             (WIDTH, HEIGHT),
@@ -1400,6 +1418,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
                 cursor_damage: NativeCursorDamageBounds::default(),
                 presentation: PresentationFrameSnapshot::empty_for_output(output_id),
                 lifecycle: LifecycleFrameSnapshot::default(),
+                canonical_scene_evidence: None,
+                window_exit_evidence: Vec::new(),
             });
             let token = 960 + frame_id;
             assert!(history.queue_submission(token));
@@ -1416,6 +1436,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         });
         let rejected_token = 1000 + age as u64;
         assert!(history.queue_submission(rejected_token));
@@ -1428,6 +1450,8 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         });
 
         let current_damage = native_output_damage_for_scene_snapshots(
@@ -1559,6 +1583,8 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
     paint_oversized_ssd_scene(
@@ -1621,6 +1647,8 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         });
         let token = 100 + step as u64;
         assert!(history.queue_submission(token));

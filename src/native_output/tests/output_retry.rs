@@ -29,6 +29,8 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         output_id,
@@ -38,6 +40,8 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
     assert!(history.queue_submission(200));
     assert!(history.discard_submission(200));

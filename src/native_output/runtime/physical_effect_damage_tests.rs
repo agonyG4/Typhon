@@ -130,6 +130,8 @@ fn snapshot_with_clip(frame_id: u64, clip: PresentationClip) -> NativeFrameScene
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation,
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     }
 }
 

@@ -13,6 +13,7 @@ impl OwnCompositorServer {
         let focus_before = self.focused_x11_window_xid();
         match self.state.insert_x11_window(snapshot) {
             Ok(window_id) => {
+                self.state.retire_window_exit_for_root(surface_id);
                 let published = self
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);

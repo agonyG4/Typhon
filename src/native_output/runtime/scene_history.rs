@@ -1,5 +1,7 @@
 use super::*;
-use oblivion_one::compositor::PresentationFrameSnapshot;
+use oblivion_one::compositor::{
+    PresentationFrameSnapshot, PresentedCanonicalSceneSnapshot, WindowExitFrameEvidence,
+};
 use oblivion_one::effects::EffectRect;
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, lamp_footprint};
 
@@ -12,6 +14,8 @@ pub(crate) struct NativeFrameSceneSnapshot {
     pub(crate) cursor_damage: NativeCursorDamageBounds,
     pub(crate) presentation: PresentationFrameSnapshot,
     pub(crate) lifecycle: LifecycleFrameSnapshot,
+    pub(crate) canonical_scene_evidence: Option<PresentedCanonicalSceneSnapshot>,
+    pub(crate) window_exit_evidence: Vec<WindowExitFrameEvidence>,
 }
 
 impl NativeFrameSceneSnapshot {
@@ -29,6 +33,8 @@ impl NativeFrameSceneSnapshot {
             cursor_damage,
             presentation: resolved.presentation_snapshot.clone(),
             lifecycle: resolved.lifecycle_snapshot.clone(),
+            canonical_scene_evidence: resolved.canonical_scene_evidence.clone(),
+            window_exit_evidence: resolved.window_exit_evidence.clone(),
         }
     }
 }
@@ -445,6 +451,8 @@ mod tests {
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         }
     }
 
@@ -487,6 +495,8 @@ mod tests {
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation,
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         }
     }
 
@@ -535,6 +545,8 @@ mod tests {
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation,
             lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
         }
     }
 

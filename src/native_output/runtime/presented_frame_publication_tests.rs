@@ -74,6 +74,8 @@ fn snapshot(output_id: OutputId, frame_id: u64) -> NativeFrameSceneSnapshot {
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     }
 }
 
@@ -190,6 +192,8 @@ fn pageflip_uses_the_promoted_snapshot_roots_after_canonical_scene_changes() {
         presentation: &initial_presentation,
         lifecycle: &old_lifecycle,
         lifecycle_scene: PresentedLifecycleScene::Initial,
+        canonical_scene: None,
+        window_exits: &[],
     });
     assert_eq!(
         server.presented_lifecycle_snapshot_for_test(),

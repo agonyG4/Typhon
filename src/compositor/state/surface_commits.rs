@@ -244,6 +244,9 @@ impl CompositorState {
             }
         };
         let copy_to_release_us = copy_started.elapsed().as_micros() as u64;
+        // Old retained pixels sharing this root must relinquish their exact
+        // release tokens before new canonical content becomes frame-eligible.
+        self.retire_window_exit_for_root(root_surface_id);
         let updated_surface_index = if let Some(index) = renderable_index {
             let visual_placement = {
                 let Some(existing) = self.renderable_surfaces.get_mut(index) else {
@@ -1199,6 +1202,9 @@ impl CompositorState {
         ));
         callbacks.extend(frame_callbacks);
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        let prepared_window_exit = surface_id == root_surface_id
+            && self.surface_role(surface_id) == SurfaceRole::XdgToplevel
+            && self.prepare_window_exit(root_surface_id);
         if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
             node.mapped = false;
         }
@@ -1215,6 +1221,9 @@ impl CompositorState {
             source,
             None,
         );
+        if prepared_window_exit {
+            let _ = self.activate_prepared_window_exit(root_surface_id);
+        }
         self.complete_frame_callbacks(callbacks);
         true
     }
@@ -1809,6 +1818,8 @@ impl CompositorState {
             RenderableSurfaceDamage::Full,
         );
         let buffer_size = surface.buffer_size();
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        self.retire_window_exit_for_root(root_surface_id);
         self.retain_renderable_surfaces(|existing| existing.surface_id != surface_id);
         self.append_renderable_surface(surface);
         self.current_surface_buffers

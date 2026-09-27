@@ -75,6 +75,8 @@ pub(super) fn replace_atomic_ready_scene(
         cursor_damage,
         presentation,
         lifecycle,
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
     });
 }
 
@@ -445,6 +447,8 @@ fn publish_promoted_frame(scene_history: &NativeSceneHistory, server: &mut OwnCo
         lifecycle_scene: PresentedLifecycleScene::RenderedSceneReplacement {
             canonical_root_surface_ids: &canonical_root_surface_ids,
         },
+        canonical_scene: snapshot.canonical_scene_evidence.as_ref(),
+        window_exits: &snapshot.window_exit_evidence,
     });
 }
 

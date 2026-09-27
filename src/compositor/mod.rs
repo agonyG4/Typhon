@@ -700,9 +700,11 @@ pub struct CompositorState {
     pub(in crate::compositor) material_runtime_capabilities: crate::material::MaterialCapabilities,
     window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
     retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,
+    window_exit_payloads: state::WindowExitPayloadStore,
     lifecycle_animation_renderer_available: Option<bool>,
     presented_lifecycle_physical: state::PresentedLifecyclePhysicalState,
     presented_presentation: Option<PresentationFrameSnapshot>,
+    presented_canonical_scene: Option<PresentedCanonicalSceneSnapshot>,
     presented_window_geometries: Vec<PresentedWindowGeometry>,
     presented_presentation_frame_id: u64,
     scene_work_index: SceneWorkIndex,
@@ -998,7 +1000,8 @@ pub enum FrameBatchDiscardReason {
     OutputDestroyed,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SurfacePresentationKey {
+#[doc(hidden)]
+pub struct SurfacePresentationKey {
     surface_id: u32,
     generation: u64,
 }
@@ -1234,7 +1237,16 @@ mod clipboard_state;
 use clipboard_state::*;
 use clipboard_state::{DataDeviceData, DataSourceData};
 mod state;
+#[doc(hidden)]
+pub use presented_frame::{
+    PresentedCanonicalSceneSnapshot, PresentedSurfaceContentEvidence, WindowExitFrameEvidence,
+};
 pub use presented_frame::{PresentedFramePublication, PresentedLifecycleScene};
+#[doc(hidden)]
+pub use state::window_exit_retained::{
+    WindowExitFrozenContent, WindowExitPainterOrder, WindowExitRenderGroup, WindowExitSurfaceMerge,
+    window_exit_stack_order_key,
+};
 use state::*;
 #[cfg(test)]
 mod tests;

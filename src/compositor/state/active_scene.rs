@@ -130,6 +130,16 @@ fn materialize_presented_window_geometry(
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn surface_presentation_key_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> Option<SurfacePresentationKey> {
+        Some(SurfacePresentationKey {
+            surface_id,
+            generation: *self.surface_presentation_generations.get(&surface_id)?,
+        })
+    }
+
     fn presentation_output_id(&self) -> crate::core::OutputId {
         self.native_output_id()
             .expect("native presentation requires allocated logical OutputId")
@@ -494,7 +504,12 @@ impl CompositorState {
     pub(in crate::compositor) fn presentation_animation_has_pending_visible(&self) -> bool {
         let surfaces = self.native_frame_renderable_surfaces();
         let targets = self.native_frame_presentation_targets(surfaces.as_ref());
-        let visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
+        let mut visible_keys = targets.scene_node_ids().collect::<Vec<_>>();
+        visible_keys.extend(
+            self.window_exit_payloads
+                .active_payloads()
+                .map(|(identity, _)| identity.scene_node_id()),
+        );
         self.presentation_animator
             .has_pending_visible(&visible_keys)
     }

@@ -133,7 +133,9 @@ impl AnimationEffect {
     /// still planned.
     pub const fn is_available_for_slot(self, slot: AnimationSlot) -> bool {
         match self {
-            Self::WindowScale | Self::WindowGlide => matches!(slot, AnimationSlot::WindowOpen),
+            Self::WindowScale | Self::WindowGlide => {
+                matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
+            }
             _ => self.is_available(),
         }
     }
@@ -225,8 +227,12 @@ impl AnimationPreset {
 
     pub const fn requested_effect(self, slot: AnimationSlot) -> AnimationEffect {
         match (self, slot) {
-            (Self::Astrea | Self::Kde, AnimationSlot::WindowOpen) => AnimationEffect::WindowScale,
-            (Self::Macos, AnimationSlot::WindowOpen) => AnimationEffect::WindowGlide,
+            (Self::Astrea | Self::Kde, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
+                AnimationEffect::WindowScale
+            }
+            (Self::Macos, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
+                AnimationEffect::WindowGlide
+            }
             (
                 Self::Astrea | Self::Kde,
                 AnimationSlot::WindowMove
@@ -348,28 +354,28 @@ mod tests {
     }
 
     #[test]
-    fn window_effects_are_available_for_open_and_planned_for_close() {
+    fn window_effects_are_available_and_executable_for_open_and_close() {
         let capabilities = super::super::AnimationRuntimeCapabilities::default();
         for effect in [AnimationEffect::WindowScale, AnimationEffect::WindowGlide] {
             assert!(effect.compatible_with(AnimationSlot::WindowClose));
             assert!(effect.is_available());
             assert!(effect.is_available_for_slot(AnimationSlot::WindowOpen));
-            assert!(!effect.is_available_for_slot(AnimationSlot::WindowClose));
+            assert!(effect.is_available_for_slot(AnimationSlot::WindowClose));
             assert!(effect.is_executable_for(AnimationSlot::WindowOpen, capabilities));
-            assert!(!effect.is_executable_for(AnimationSlot::WindowClose, capabilities));
+            assert!(effect.is_executable_for(AnimationSlot::WindowClose, capabilities));
             assert_eq!(
                 effect_for_request(AnimationSlot::WindowOpen, effect, true, capabilities),
                 effect
             );
             assert_eq!(
                 effect_for_request(AnimationSlot::WindowClose, effect, true, capabilities),
-                AnimationEffect::None
+                effect
             );
         }
     }
 
     #[test]
-    fn open_presets_select_scale_or_glide_and_keep_close_disabled() {
+    fn open_and_close_presets_select_scale_or_glide() {
         assert_eq!(
             AnimationPreset::Astrea.requested_effect(AnimationSlot::WindowOpen),
             AnimationEffect::WindowScale
@@ -382,12 +388,18 @@ mod tests {
             AnimationPreset::Macos.requested_effect(AnimationSlot::WindowOpen),
             AnimationEffect::WindowGlide
         );
-        for preset in AnimationPreset::ALL {
-            assert_eq!(
-                preset.requested_effect(AnimationSlot::WindowClose),
-                AnimationEffect::None
-            );
-        }
+        assert_eq!(
+            AnimationPreset::Astrea.requested_effect(AnimationSlot::WindowClose),
+            AnimationEffect::WindowScale
+        );
+        assert_eq!(
+            AnimationPreset::Kde.requested_effect(AnimationSlot::WindowClose),
+            AnimationEffect::WindowScale
+        );
+        assert_eq!(
+            AnimationPreset::Macos.requested_effect(AnimationSlot::WindowClose),
+            AnimationEffect::WindowGlide
+        );
     }
 
     #[test]

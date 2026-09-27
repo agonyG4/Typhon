@@ -1323,6 +1323,38 @@ impl CompositorState {
         for (_, obligation) in active_dmabuf {
             releases.push(obligation);
         }
+
+        let (window_exits, prepared_window_exits) = self.window_exit_payloads.drain_all();
+        for (identity, mut payload) in window_exits {
+            if let Some(revisions) = payload.property_revisions {
+                let cancelled = self.presentation_animator.cancel_property_pair_exact(
+                    identity.scene_node_id(),
+                    revisions.transaction_id,
+                    revisions.geometry_revision_id,
+                    revisions.opacity_revision_id,
+                );
+                if !cancelled {
+                    self.presentation_animator.cancel_transaction_exact(
+                        identity.scene_node_id(),
+                        revisions.transaction_id,
+                    );
+                }
+            }
+            let _ = self
+                .presentation_animator
+                .retire_active_retained_visual_exact(identity);
+            let _ = self
+                .presentation_animator
+                .retire_retained_visual_exact(identity);
+            for held in payload.take_held_release_obligations() {
+                releases.push(held.obligation);
+            }
+        }
+        for prepared in prepared_window_exits {
+            for held in prepared.held_release_obligations {
+                releases.push(held.obligation);
+            }
+        }
     }
 
     pub(in crate::compositor) fn note_buffer_releases_restored(
@@ -1367,6 +1399,10 @@ impl CompositorState {
                 .dmabuf_gpu_release_leases
                 .values()
                 .any(|lease| lease.obligations.iter().any(same))
+            || self
+                .window_exit_payloads
+                .held_release_obligations()
+                .any(same)
     }
 
     pub(in crate::compositor) fn note_buffer_release_duplicate_attempt(&mut self) {
