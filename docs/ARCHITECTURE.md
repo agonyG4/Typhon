@@ -105,6 +105,18 @@ available; `Gbm` and `Dumb` report them unavailable. An unavailable override
 already persisted by the user is preserved when unchanged and may always be
 cleared. Material position remains editable on every backend.
 
+The complete Trusted Effect Registry is distinct from the global Material
+Program Catalog. The catalog includes only validated `OnDamage` effects with
+at least one `Backdrop` source, no `TargetContent` or `StaticTexture` source,
+and `UniformOnly` declared parameters. `system.background_blur` remains the
+default and fallback. Requested selection is stored in the separate private
+`material-program.json` file; effective fallback and renderer availability are
+derived from the current immutable registry generation and active scanout
+backend. Phase 2A `MaterialConfiguration` continues to update the built-in
+program without changing the requested or effective trusted-local selection.
+The semantic background-effect request still carries blur intent only; Typhon
+chooses the effective material program for visible assignments.
+
 ## Native output choices
 
 These are implementation choices inside the native product, not product

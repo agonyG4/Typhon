@@ -120,6 +120,38 @@ It is explicitly unsupported in v1: validation and registry publication reject
 any program that requires it with `UnsupportedStaticTexture`. No blank or
 fallback texture is allocated, and the semantics are never silently degraded.
 
+## Global material programs
+
+The Trusted Effect Registry contains every valid trusted-local named effect.
+The Material Program Catalog is a qualified subset for global background
+material selection. A catalog candidate must already be validated, use
+`OnDamage`, read at least one `Backdrop` source, avoid `TargetContent` and
+`StaticTexture`, and declare only `UniformOnly` parameters. Valid trusted
+effects that do not meet these material-role rules stay in the trusted
+registry and are omitted from the catalog. Continuous effects are not global
+material programs in this phase.
+
+`system.background_blur` is the first catalog entry and the default and
+fallback program. Trusted-local entries follow in stable name order. Catalog
+responses expose only the stable name, origin, schema signature, and parameter
+count; they do not expose program IDs, graphs, shader source, or shader paths.
+
+`material.program.get` reports the requested configuration separately from
+the effective program. If a persisted request disappears from a trusted
+registry generation or becomes unqualified, Typhon temporarily resolves it to
+`system.background_blur` and reports `missing` or `unqualified`. The requested
+name remains persisted and becomes effective automatically if a later
+successful generation restores its qualification. A failed registry reload
+keeps the previous generation and its effective selection.
+
+The semantic `ext-background-effect-v1` client still requests only a blur
+assignment. For each visible assignment, Typhon supplies the globally
+effective material program, manifest parameter defaults, and that program's
+frame demand to the existing effect renderer. Selecting a program without a
+visible blur assignment creates no effect instance. Phase 2A
+`MaterialConfiguration` remains separate and continues to update the built-in
+program while a trusted-local program is selected.
+
 ## Custom shader ABI
 
 Trusted GLSL ES 3.00 assets export:

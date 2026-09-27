@@ -22,6 +22,15 @@ use std::{
     sync::Arc,
 };
 
+fn publish_scanout_runtime_capabilities(
+    server: &mut OwnCompositorServer,
+    scanout: &NativeScanoutBackend,
+) {
+    server.set_lifecycle_animation_renderer_available(scanout.lifecycle_animation_available());
+    server.set_material_runtime_capabilities(scanout.material_runtime_capabilities());
+    server.set_material_program_rendering_available(scanout.material_program_rendering_available());
+}
+
 fn keyboard_persistence_snapshot(
     result: Result<KeyboardConfig, KeyboardPersistenceError>,
 ) -> (Option<KeyboardConfig>, KeyboardConfigurationPersistence) {
@@ -1020,8 +1029,7 @@ impl NativeRuntime {
                 build_native_kms_startup_plan(kms_policy, scanout.kind(), discovery)?;
             (startup_plan, scanout)
         };
-        server.set_lifecycle_animation_renderer_available(scanout.lifecycle_animation_available());
-        server.set_material_runtime_capabilities(scanout.material_runtime_capabilities());
+        publish_scanout_runtime_capabilities(&mut server, &scanout);
         let initial_material_generation = server.trusted_effect_registry().current();
         scanout.publish_material_effect_generation(&initial_material_generation);
         let atomic_discovery = match &startup_plan {
@@ -1302,9 +1310,7 @@ impl NativeRuntime {
                     scanout
                         .publish_effect_registry_generation((*effect_generation).clone())
                         .map_err(io::Error::other)?;
-                    server.set_lifecycle_animation_renderer_available(
-                        scanout.lifecycle_animation_available(),
-                    );
+                    publish_scanout_runtime_capabilities(&mut server, &scanout);
                     scanout.paint_server_frame(
                         &mut frame_renderer,
                         &initial_resolved_scene,

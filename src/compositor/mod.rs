@@ -359,6 +359,7 @@ pub use render::{
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
 pub use selection::*;
+pub use server::MaterialProgramSetError;
 pub use server::MaterialSetError;
 pub use server::{OwnCompositorServer, XwaylandClientIdentity};
 pub use server_error::CompositorError;
@@ -700,6 +701,9 @@ pub struct CompositorState {
     pub(in crate::compositor) animation_control: crate::animation_control::AnimationControlState,
     pub(in crate::compositor) material_control: crate::material::MaterialControlState,
     pub(in crate::compositor) material_runtime_capabilities: crate::material::MaterialCapabilities,
+    pub(in crate::compositor) material_program_control:
+        crate::material_program::MaterialProgramControlState,
+    pub(in crate::compositor) material_program_rendering_available: bool,
     window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
     retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,
     window_exit_payloads: state::WindowExitPayloadStore,

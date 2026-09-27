@@ -277,9 +277,11 @@ impl NativeScanoutBackend {
     pub(crate) fn material_runtime_capabilities(
         &self,
     ) -> oblivion_one::material::MaterialCapabilities {
-        let effects_renderer_available =
-            matches!(self, Self::AtomicEglGbm(_) | Self::NativeEglGbm(_));
-        material_capabilities_for_effects_renderer(effects_renderer_available)
+        material_capabilities_for_scanout_kind(self.kind())
+    }
+
+    pub(crate) fn material_program_rendering_available(&self) -> bool {
+        material_program_rendering_available_for_scanout_kind(self.kind())
     }
 
     pub(crate) fn reload_trusted_effect_registry(
@@ -900,30 +902,80 @@ impl NativeScanoutBackend {
     }
 }
 
-fn material_capabilities_for_effects_renderer(
-    available: bool,
+fn material_capabilities_for_scanout_kind(
+    kind: NativeScanoutKind,
 ) -> oblivion_one::material::MaterialCapabilities {
-    if available {
-        oblivion_one::material::MaterialCapabilities::full()
-    } else {
-        oblivion_one::material::MaterialCapabilities::unavailable()
+    match kind {
+        NativeScanoutKind::AtomicEglGbmExplicit
+        | NativeScanoutKind::NativeEglGbmOpaqueCompatibility => {
+            oblivion_one::material::MaterialCapabilities::full()
+        }
+        NativeScanoutKind::GbmCpuWritePageFlip
+        | NativeScanoutKind::DumbFramebuffer
+        | NativeScanoutKind::Unavailable => {
+            oblivion_one::material::MaterialCapabilities::unavailable()
+        }
     }
+}
+
+fn material_program_rendering_available_for_scanout_kind(kind: NativeScanoutKind) -> bool {
+    matches!(
+        kind,
+        NativeScanoutKind::AtomicEglGbmExplicit
+            | NativeScanoutKind::NativeEglGbmOpaqueCompatibility
+    )
 }
 
 #[cfg(test)]
 mod material_capability_tests {
-    use super::material_capabilities_for_effects_renderer;
+    use super::{
+        NativeScanoutKind, material_capabilities_for_scanout_kind,
+        material_program_rendering_available_for_scanout_kind,
+    };
     use oblivion_one::material::MaterialCapabilities;
 
     #[test]
-    fn effects_renderer_mapping_enables_all_overrides_and_legacy_mapping_disables_them() {
+    fn material_capabilities_match_native_scanout_kind() {
         assert_eq!(
-            material_capabilities_for_effects_renderer(true),
+            material_capabilities_for_scanout_kind(NativeScanoutKind::AtomicEglGbmExplicit),
             MaterialCapabilities::full()
         );
         assert_eq!(
-            material_capabilities_for_effects_renderer(false),
+            material_capabilities_for_scanout_kind(
+                NativeScanoutKind::NativeEglGbmOpaqueCompatibility
+            ),
+            MaterialCapabilities::full()
+        );
+        assert_eq!(
+            material_capabilities_for_scanout_kind(NativeScanoutKind::GbmCpuWritePageFlip),
             MaterialCapabilities::unavailable()
         );
+        assert_eq!(
+            material_capabilities_for_scanout_kind(NativeScanoutKind::DumbFramebuffer),
+            MaterialCapabilities::unavailable()
+        );
+        assert_eq!(
+            material_capabilities_for_scanout_kind(NativeScanoutKind::Unavailable),
+            MaterialCapabilities::unavailable()
+        );
+    }
+
+    #[test]
+    fn material_program_rendering_availability_matches_native_scanout_kind() {
+        assert!(material_program_rendering_available_for_scanout_kind(
+            NativeScanoutKind::AtomicEglGbmExplicit
+        ));
+        assert!(material_program_rendering_available_for_scanout_kind(
+            NativeScanoutKind::NativeEglGbmOpaqueCompatibility
+        ));
+        assert!(!material_program_rendering_available_for_scanout_kind(
+            NativeScanoutKind::GbmCpuWritePageFlip
+        ));
+        assert!(!material_program_rendering_available_for_scanout_kind(
+            NativeScanoutKind::DumbFramebuffer
+        ));
+        assert!(!material_program_rendering_available_for_scanout_kind(
+            NativeScanoutKind::Unavailable
+        ));
     }
 }

@@ -138,7 +138,7 @@ pub fn parse_manifest(
     }
     let mut definitions = BTreeMap::new();
     for (name, value) in effects {
-        validate_name(name)?;
+        validate_effect_name(name)?;
         let definition = parse_definition(name, value, shader_root)?;
         if definitions.insert(name.clone(), definition).is_some() {
             return Err(invalid("duplicate effect name"));
@@ -512,7 +512,7 @@ fn parse_parameters(
     }
     let mut result = BTreeMap::new();
     for (name, value) in object {
-        validate_name(name)?;
+        validate_effect_name(name)?;
         let parameter = as_object(value, "parameter")?;
         reject_unknown(
             parameter,
@@ -825,7 +825,7 @@ fn reject_unknown(
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<(), EffectConfigError> {
+pub fn validate_effect_name(name: &str) -> Result<(), EffectConfigError> {
     if name.is_empty()
         || name.len() > MAX_EFFECT_NAME_BYTES
         || name

@@ -70,6 +70,9 @@ pub enum ControlCommand {
     AnimationConfigurationSet,
     MaterialConfigurationGet,
     MaterialConfigurationSet,
+    MaterialProgramCatalogGet,
+    MaterialProgramGet,
+    MaterialProgramSet,
     WindowActivate,
     WindowMinimize,
     WindowRestore,
@@ -108,6 +111,9 @@ impl ControlCommand {
             Self::AnimationConfigurationSet => "animation.config.set",
             Self::MaterialConfigurationGet => "material.config.get",
             Self::MaterialConfigurationSet => "material.config.set",
+            Self::MaterialProgramCatalogGet => "material.program.catalog.get",
+            Self::MaterialProgramGet => "material.program.get",
+            Self::MaterialProgramSet => "material.program.set",
             Self::WindowActivate => "window.activate",
             Self::WindowMinimize => "window.minimize",
             Self::WindowRestore => "window.restore",
@@ -146,6 +152,9 @@ impl ControlCommand {
             "animation.config.set" => Self::AnimationConfigurationSet,
             "material.config.get" => Self::MaterialConfigurationGet,
             "material.config.set" => Self::MaterialConfigurationSet,
+            "material.program.catalog.get" => Self::MaterialProgramCatalogGet,
+            "material.program.get" => Self::MaterialProgramGet,
+            "material.program.set" => Self::MaterialProgramSet,
             "window.activate" => Self::WindowActivate,
             "window.minimize" => Self::WindowMinimize,
             "window.restore" => Self::WindowRestore,
@@ -441,5 +450,41 @@ mod tests {
             "material.config.set"
         );
         assert_eq!(ControlCommand::parse("material.set"), None);
+    }
+
+    #[test]
+    fn material_program_commands_have_exact_canonical_names() {
+        assert_eq!(
+            ControlCommand::parse("material.program.catalog.get"),
+            Some(ControlCommand::MaterialProgramCatalogGet)
+        );
+        assert_eq!(
+            ControlCommand::parse("material.program.get"),
+            Some(ControlCommand::MaterialProgramGet)
+        );
+        assert_eq!(
+            ControlCommand::parse("material.program.set"),
+            Some(ControlCommand::MaterialProgramSet)
+        );
+        assert_eq!(
+            ControlCommand::MaterialProgramCatalogGet.as_str(),
+            "material.program.catalog.get"
+        );
+        assert_eq!(
+            ControlCommand::MaterialProgramGet.as_str(),
+            "material.program.get"
+        );
+        assert_eq!(
+            ControlCommand::MaterialProgramSet.as_str(),
+            "material.program.set"
+        );
+        for near_miss in [
+            "material.catalog.get",
+            "material.programs.get",
+            "material.program.describe",
+            "material.shader.set",
+        ] {
+            assert_eq!(ControlCommand::parse(near_miss), None);
+        }
     }
 }

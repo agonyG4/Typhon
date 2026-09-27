@@ -32,6 +32,14 @@ trusted resolution, exact Surface versus complete VisualGroup composition
 ranges, child scene order independent of effect identifiers, and overlapping
 child blur checkpoint dependencies including the lower child content.
 
+Material Program tests also pin the boundary between the complete trusted
+registry and its global-material subset. They cover qualification, strict
+catalog serialization and response sizing, requested/effective fallback over
+registry generations, manifest defaults in a resolved semantic blur instance,
+backend-derived rendering availability, and generic Direct Scanout behavior
+for visible and absent effect assignments. These are deterministic regression
+tests, not additional hardware qualification.
+
 Fresh final results for the 2026-09-09 effect-surface verification are:
 `effects` 132 passed (90 library plus 42 main-target tests), `egl_renderer`
 153 passed, `native_output` 1175 passed, and the full serial suite 3755

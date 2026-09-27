@@ -430,6 +430,11 @@ pub struct EffectDemandPlanStats {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectInstanceExecutionDemand {
     pub id: EffectInstanceId,
+    /// Direct output from the current presentation repair intersected with
+    /// this instance's output influence, before dependency propagation. If the
+    /// bounded intersection overflows, this retains its conservative clip.
+    pub presentation_output_region: EffectRegion,
+    /// Output this instance must produce, including dependency-propagated work.
     pub output_region: EffectRegion,
 }
 
@@ -450,6 +455,8 @@ pub struct EffectPassExecutionDemand {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectExecutionDemand {
     pub instances: Vec<EffectInstanceExecutionDemand>,
+    /// Internal execution-work envelope containing selected output and
+    /// required capture work. This is not presentation damage.
     pub execution_region: EffectRegion,
     pub passes: Vec<EffectPassExecutionDemand>,
     pub visible_clip_fallbacks: Vec<EffectVisibleClipFallback>,
@@ -524,10 +531,11 @@ fn all_visible_instances_with_output_regions(
         .instances
         .iter()
         .map(|instance| {
+            let output_region = instance.output_influence_region.clone();
             max_instance_region_rect_count =
-                max_instance_region_rect_count.max(instance.output_influence_region.rects().len());
+                max_instance_region_rect_count.max(output_region.rects().len());
             let (next_execution_region, coalesced) =
-                execution_region.union_with_diagnostics(&instance.output_influence_region);
+                execution_region.union_with_diagnostics(&output_region);
             execution_region = next_execution_region;
             if coalesced {
                 work_region_bbox_coalesces = work_region_bbox_coalesces.saturating_add(1);
@@ -542,7 +550,8 @@ fn all_visible_instances_with_output_regions(
             }
             EffectInstanceExecutionDemand {
                 id: instance.id,
-                output_region: instance.output_influence_region.clone(),
+                presentation_output_region: output_region.clone(),
+                output_region,
             }
         })
         .collect::<Vec<_>>();
@@ -733,6 +742,7 @@ fn plan_effect_execution_demand_with_kawase_mode_observing(
         return all_visible_instances_with_output_regions(graph, repair_rect_count);
     }
 
+    let mut presentation_output_regions = vec![EffectRegion::empty(); graph.instances.len()];
     let mut output_regions = vec![None; graph.instances.len()];
     let mut max_instance_region_rect_count = 0;
     let mut region_representation_overflows = graph.stats.region_representation_overflows;
@@ -756,6 +766,7 @@ fn plan_effect_execution_demand_with_kawase_mode_observing(
         if !direct.is_empty() {
             max_instance_region_rect_count =
                 max_instance_region_rect_count.max(direct.rects().len());
+            presentation_output_regions[index] = direct.clone();
             output_regions[index] = Some(direct);
         }
     }
@@ -840,6 +851,7 @@ fn plan_effect_execution_demand_with_kawase_mode_observing(
                 }
                 EffectInstanceExecutionDemand {
                     id: graph.instances[index].id,
+                    presentation_output_region: presentation_output_regions[index].clone(),
                     output_region,
                 }
             })

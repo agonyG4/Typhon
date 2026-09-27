@@ -1,5 +1,50 @@
 use super::*;
-use crate::effects::EffectRect;
+use crate::effects::{
+    EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode, EffectNodeId,
+    EffectOutsets, EffectParameterId, EffectParameterImpact, EffectParameterSpec,
+    EffectParameterType, EffectProgram, EffectProgramId, EffectRect, EffectSource,
+    EffectUniformValue, EffectWorkingSpace,
+    config::{EffectDefinition, EffectManifest, EffectParameterDefinition},
+};
+use std::os::unix::fs::PermissionsExt;
+use std::{collections::BTreeMap, sync::Arc};
+
+fn material_default_manifest() -> EffectManifest {
+    let backdrop = EffectNodeId::new(1).unwrap();
+    EffectManifest {
+        version: 1,
+        effects: BTreeMap::from([(
+            "glass.liquid".to_owned(),
+            EffectDefinition {
+                name: "glass.liquid".to_owned(),
+                program: EffectProgram {
+                    id: EffectProgramId::new(900).unwrap(),
+                    nodes: vec![EffectNode::source(backdrop, EffectSource::Backdrop)],
+                    output: backdrop,
+                    working_space: EffectWorkingSpace::LinearSrgb,
+                    alpha_mode: EffectAlphaMode::Opaque,
+                    outsets: EffectOutsets::ZERO,
+                    frame_demand: EffectFrameDemand::OnDamage,
+                    failure_policy: EffectFailurePolicy::Passthrough,
+                },
+                parameters: BTreeMap::from([(
+                    "intensity".to_owned(),
+                    EffectParameterDefinition {
+                        spec: EffectParameterSpec {
+                            id: EffectParameterId::new(1).unwrap(),
+                            name: "intensity".to_owned(),
+                            ty: EffectParameterType::Float,
+                            range: None,
+                            impact: EffectParameterImpact::UniformOnly,
+                        },
+                        default: EffectUniformValue::Float(0.65),
+                    },
+                )]),
+                shader_assets: Vec::new(),
+            },
+        )]),
+    }
+}
 
 fn capture_effect_scene(commands: &Sender<ServerCommand>) -> ResolvedEffectScene {
     let (reply, receiver) = mpsc::channel();
@@ -10,6 +55,26 @@ fn capture_effect_scene(commands: &Sender<ServerCommand>) -> ResolvedEffectScene
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("effect scene capture should complete")
+}
+
+fn set_material_program(
+    commands: &Sender<ServerCommand>,
+    requested_program: &str,
+) -> Result<(), String> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetMaterialProgramConfiguration {
+            configuration: crate::material_program::MaterialProgramConfiguration {
+                version: 1,
+                requested_program: requested_program.to_owned(),
+            },
+            reply,
+        })
+        .expect("material program selection command should be accepted");
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("material program selection should complete")
 }
 
 type BackgroundEffectConnection = (
@@ -87,6 +152,118 @@ fn duplicate_background_effect_object_is_the_exact_manager_error() {
 fn background_effect_state_is_copied_and_double_buffered() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let persistence_directory = std::env::temp_dir().join(format!(
+        "typhon-material-program-{}-{}",
+        std::process::id(),
+        socket_name
+    ));
+    std::fs::create_dir(&persistence_directory).unwrap();
+    std::fs::set_permissions(
+        &persistence_directory,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    server.state.material_program_control =
+        crate::material_program::MaterialProgramControlState::from_store(
+            crate::material_program::MaterialProgramConfigurationStore::new(
+                persistence_directory.clone(),
+            )
+            .unwrap(),
+        );
+    server.state.material_control = crate::material::MaterialControlState::from_store(
+        crate::material::MaterialConfigurationStore::new(persistence_directory.clone()).unwrap(),
+    );
+    server.set_material_runtime_capabilities(crate::material::MaterialCapabilities::full());
+    server
+        .state
+        .trusted_effect_registry
+        .reload(material_default_manifest(), |_| Ok(()))
+        .unwrap();
+    let builtin_radius_before = server
+        .state
+        .trusted_effect_registry
+        .current()
+        .program(crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)
+        .unwrap()
+        .aggregate_footprint
+        .sample_radius_x;
+    server
+        .set_material_configuration(crate::material::MaterialConfiguration {
+            position: 1.0,
+            ..crate::material::MaterialConfiguration::default()
+        })
+        .unwrap();
+    let builtin_radius_after = server
+        .state
+        .trusted_effect_registry
+        .current()
+        .program(crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)
+        .unwrap()
+        .aggregate_footprint
+        .sample_radius_x;
+    assert!(builtin_radius_after > builtin_radius_before);
+    let selection_after_material_update = server.material_program_selection_snapshot();
+    assert_eq!(
+        selection_after_material_update
+            .configuration
+            .requested_program,
+        "glass.liquid"
+    );
+    assert_eq!(
+        selection_after_material_update.effective_program,
+        "glass.liquid"
+    );
+    server
+        .set_material_program_configuration(crate::material_program::MaterialProgramConfiguration {
+            version: 1,
+            requested_program: "glass.liquid".to_owned(),
+        })
+        .unwrap();
+    let active_generation = server.state.trusted_effect_registry.current();
+    let selection_before_invalid_reload = server.material_program_selection_snapshot();
+    let mut invalid_manifest = material_default_manifest();
+    invalid_manifest
+        .effects
+        .get_mut("glass.liquid")
+        .unwrap()
+        .parameters
+        .insert(
+            "highlight".to_owned(),
+            EffectParameterDefinition {
+                spec: EffectParameterSpec {
+                    id: EffectParameterId::new(1).unwrap(),
+                    name: "highlight".to_owned(),
+                    ty: EffectParameterType::Float,
+                    range: None,
+                    impact: EffectParameterImpact::UniformOnly,
+                },
+                default: EffectUniformValue::Float(0.2),
+            },
+        );
+    invalid_manifest
+        .effects
+        .get_mut("glass.liquid")
+        .unwrap()
+        .shader_assets
+        .push(crate::effects::config::EffectShaderAsset {
+            module: crate::effects::ShaderModuleId::new(901).unwrap(),
+            relative_path: "invalid.frag".into(),
+            source: "void main() {}".to_owned(),
+            uniforms: Vec::new(),
+        });
+    assert!(
+        server
+            .state
+            .trusted_effect_registry
+            .reload(invalid_manifest, |_| Ok(()))
+            .is_err()
+    );
+    let current_generation = server.state.trusted_effect_registry.current();
+    assert!(Arc::ptr_eq(&active_generation, &current_generation));
+    assert_eq!(
+        server.material_program_selection_snapshot(),
+        selection_before_invalid_reload
+    );
     let mut blur_policy = server.state.blur_assignment.config();
     blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::RulesOnly;
     server
@@ -121,6 +298,12 @@ fn background_effect_state_is_copied_and_double_buffered() {
             before_commit.is_empty(),
             "pending state must not be visible"
         );
+        assert_eq!(before_commit.summary.visible_instance_count, 0);
+        assert_eq!(
+            crate::compositor::direct_scanout_scene_rejection_for_effects(before_commit.summary),
+            None,
+            "selecting a program without a visible blur assignment must not block Direct Scanout"
+        );
 
         surface.commit();
         connection.flush()?;
@@ -128,6 +311,40 @@ fn background_effect_state_is_copied_and_double_buffered() {
 
         let after_commit = capture_effect_scene(&commands);
         assert_eq!(after_commit.instances.len(), 1);
+        assert_eq!(
+            after_commit.instances[0].program,
+            EffectProgramId::new(900).unwrap()
+        );
+        assert_eq!(
+            after_commit.instances[0].frame_demand,
+            EffectFrameDemand::OnDamage
+        );
+        assert_eq!(after_commit.instances[0].parameter_block.values().len(), 1);
+        assert_eq!(
+            after_commit.instances[0].parameter_block.values()[0].value,
+            EffectUniformValue::Float(0.65)
+        );
+        assert_eq!(
+            crate::compositor::direct_scanout_scene_rejection_for_effects(after_commit.summary),
+            Some(crate::compositor::DirectScanoutSceneRejection::EffectRequiresComposition)
+        );
+        set_material_program(&commands, crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)?;
+        let selected_builtin = capture_effect_scene(&commands);
+        assert_eq!(selected_builtin.instances.len(), 1);
+        assert_eq!(
+            selected_builtin.instances[0].program,
+            crate::effects::builtin_background_blur_program_id()
+        );
+        set_material_program(&commands, "glass.liquid")?;
+        let restored_custom = capture_effect_scene(&commands);
+        assert_eq!(
+            restored_custom.instances[0].program,
+            EffectProgramId::new(900).unwrap()
+        );
+        assert_eq!(
+            restored_custom.instances[0].parameter_block.values()[0].value,
+            EffectUniformValue::Float(0.65)
+        );
         assert_eq!(after_commit.instances[0].region.rects().len(), 1);
         assert_eq!(
             after_commit.instances[0].region.rects()[0],
@@ -141,7 +358,13 @@ fn background_effect_state_is_copied_and_double_buffered() {
         surface.commit();
         connection.flush()?;
         queue.roundtrip(&mut RegistryTestState::default())?;
-        assert!(capture_effect_scene(&commands).is_empty());
+        let cleared = capture_effect_scene(&commands);
+        assert!(cleared.is_empty());
+        assert_eq!(
+            crate::compositor::direct_scanout_scene_rejection_for_effects(cleared.summary),
+            None,
+            "Direct Scanout eligibility must recover when the semantic blur assignment disappears"
+        );
 
         let region = compositor.create_region(&qh, ());
         region.add(0, 0, 2, 2);
@@ -179,6 +402,7 @@ fn background_effect_state_is_copied_and_double_buffered() {
     })();
 
     stop_controllable_test_server(commands, server_thread);
+    let _ = std::fs::remove_dir_all(persistence_directory);
     result.unwrap();
 }
 
@@ -314,13 +538,8 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         queue.roundtrip(&mut RegistryTestState::default())?;
 
         let raw_surface_origin = crate::compositor::render::FIRST_SURFACE_OFFSET;
-        let expected_window_bounds = EffectRect::new(
-            raw_surface_origin.0 + 10,
-            raw_surface_origin.1 + 12,
-            100,
-            70,
-        )
-        .unwrap();
+        let expected_window_bounds =
+            EffectRect::new(raw_surface_origin.0, raw_surface_origin.1, 100, 70).unwrap();
         let auto_scene = capture_effect_scene(&commands);
         assert_eq!(auto_scene.instances.len(), 1);
         assert_eq!(
@@ -347,7 +566,7 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         queue.roundtrip(&mut RegistryTestState::default())?;
 
         let expected_client_bounds =
-            EffectRect::new(raw_surface_origin.0, raw_surface_origin.1, 5, 5).unwrap();
+            EffectRect::new(raw_surface_origin.0 - 10, raw_surface_origin.1 - 12, 5, 5).unwrap();
         let client_scene = capture_effect_scene(&commands);
         assert_eq!(client_scene.instances.len(), 1);
         assert_eq!(
@@ -367,13 +586,13 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         queue.roundtrip(&mut RegistryTestState::default())?;
 
         let expected_negative_offset_bounds =
-            EffectRect::new(raw_surface_origin.0, raw_surface_origin.1 - 24, 944, 526).unwrap();
+            EffectRect::new(raw_surface_origin.0, raw_surface_origin.1, 120, 100).unwrap();
         let negative_offset_scene = capture_effect_scene(&commands);
         assert_eq!(negative_offset_scene.instances.len(), 1);
         assert_eq!(
             negative_offset_scene.instances[0].region.rects(),
             &[expected_negative_offset_bounds],
-            "negative XDG offsets and geometry beyond the root surface must remain in the logical candidate"
+            "explicit geometry is clamped to the committed tree before becoming the logical candidate"
         );
         assert_ne!(
             negative_offset_scene.instances[0].signature, auto_scene.instances[0].signature,

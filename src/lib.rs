@@ -21,6 +21,7 @@ pub mod effects;
 pub mod keyboard_persistence;
 mod launch_env;
 pub mod material;
+pub mod material_program;
 pub mod native;
 mod paths;
 mod pointer_debug;

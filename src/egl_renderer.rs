@@ -963,6 +963,7 @@ fn lamp_geometry_key(
             lamp.presentation_identity.scene_node_id().get(),
             match lamp.presentation_identity.kind() {
                 oblivion_one::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle => 1,
+                oblivion_one::presentation_animation::PresentationRetainedVisualKind::WindowExit => 2,
             },
             lamp.presentation_identity.transaction_id().get(),
             lamp.presentation_identity.revision_id().get(),
@@ -8980,6 +8981,7 @@ mod tests {
         let mut demand = oblivion_one::effects::EffectExecutionDemand::new(
             vec![EffectInstanceExecutionDemand {
                 id: instance,
+                presentation_output_region: materialization_region.clone(),
                 output_region: materialization_region.clone(),
             }],
             materialization_region.clone(),

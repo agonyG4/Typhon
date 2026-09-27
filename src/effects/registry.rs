@@ -6,10 +6,14 @@ use std::{
 };
 
 use super::{
-    BUILTIN_EFFECT_PROGRAM_ID, EffectFrameDemand, EffectParameterImpact, EffectParameterRange,
-    EffectParameterType, EffectProgramId, EffectUniformValue, INTERNAL_EFFECT_SHADER_MODULE_IDS,
-    MAX_EFFECT_PROGRAMS, ShaderModuleId, ValidatedEffectProgram,
-    config::{EffectConfigError, EffectDefinition, EffectManifest, load_manifest},
+    BUILTIN_EFFECT_PROGRAM_ID, EffectFrameDemand, EffectNodeKind, EffectParameterId,
+    EffectParameterImpact, EffectParameterRange, EffectParameterType, EffectProgramId,
+    EffectUniformValue, INTERNAL_EFFECT_SHADER_MODULE_IDS, MAX_EFFECT_PROGRAMS, ShaderModuleId,
+    ValidatedEffectProgram,
+    config::{
+        EffectConfigError, EffectDefinition, EffectManifest, EffectParameterDefinition,
+        load_manifest,
+    },
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -64,6 +68,17 @@ pub struct RegisteredEffect {
 }
 
 impl RegisteredEffect {
+    /// Build the renderer parameter block from the validated manifest defaults.
+    pub fn default_parameter_block(
+        &self,
+    ) -> Result<super::EffectParameterBlock, super::EffectValidationError> {
+        super::EffectParameterBlock::from_values(
+            self.parameters
+                .values()
+                .map(|parameter| (parameter.spec.id, parameter.default)),
+        )
+    }
+
     pub fn schema_signature(&self) -> u64 {
         let mut signature = 0xcbf2_9ce4_8422_2325_u64;
         schema_mix(&mut signature, self.program.program.id.get());
@@ -423,6 +438,8 @@ pub enum RegistryReloadError {
     ProgramIdCollision(EffectProgramId),
     ReservedProgramId(EffectProgramId),
     ReservedSystemEffectName(String),
+    DuplicateParameterId(EffectParameterId),
+    UndefinedUniformParameter(EffectParameterId),
     ShaderModuleCollision(ShaderModuleId),
     ReservedShaderModuleId(ShaderModuleId),
     ShaderCompile { module: ShaderModuleId, log: String },
@@ -473,6 +490,7 @@ pub fn build_generation(
             shader_assets,
             ..
         } = definition;
+        validate_parameter_schema(&program, &parameters)?;
         if let Some(parameter) = parameters
             .values()
             .find(|parameter| parameter.spec.impact != EffectParameterImpact::UniformOnly)
@@ -496,6 +514,14 @@ pub fn build_generation(
         }
         let validated = super::validate_effect_program(program)
             .map_err(|error| RegistryReloadError::Config(EffectConfigError::Validation(error)))?;
+        let effect = RegisteredEffect {
+            name: name.clone(),
+            program: validated.clone(),
+            parameters,
+        };
+        effect
+            .default_parameter_block()
+            .map_err(|error| RegistryReloadError::Config(EffectConfigError::Validation(error)))?;
         registry.insert(validated.clone())?;
         for asset in shader_assets {
             if INTERNAL_EFFECT_SHADER_MODULE_IDS.contains(&asset.module.get()) {
@@ -516,14 +542,7 @@ pub fn build_generation(
                 return Err(RegistryReloadError::ShaderModuleCollision(asset.module));
             }
         }
-        effects.insert(
-            name.clone(),
-            RegisteredEffect {
-                name,
-                program: validated,
-                parameters,
-            },
-        );
+        effects.insert(name.clone(), effect);
     }
     Ok(EffectRegistryGeneration {
         generation,
@@ -531,6 +550,38 @@ pub fn build_generation(
         effects,
         shaders,
     })
+}
+
+fn validate_parameter_schema(
+    program: &super::EffectProgram,
+    parameters: &BTreeMap<String, EffectParameterDefinition>,
+) -> Result<(), RegistryReloadError> {
+    let mut parameter_ids = Vec::with_capacity(parameters.len());
+    for parameter in parameters.values() {
+        if parameter_ids.contains(&parameter.spec.id) {
+            return Err(RegistryReloadError::DuplicateParameterId(parameter.spec.id));
+        }
+        parameter_ids.push(parameter.spec.id);
+    }
+    validate_custom_fragment_parameters(program, &parameter_ids)
+}
+
+fn validate_custom_fragment_parameters(
+    program: &super::EffectProgram,
+    parameter_ids: &[EffectParameterId],
+) -> Result<(), RegistryReloadError> {
+    for node in &program.nodes {
+        if let EffectNodeKind::CustomFragment(spec) = &node.kind {
+            for binding in &spec.uniforms {
+                if !parameter_ids.contains(&binding.parameter) {
+                    return Err(RegistryReloadError::UndefinedUniformParameter(
+                        binding.parameter,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,6 +649,206 @@ mod tests {
         assert!(candidate.effects.contains_key("glass.panel"));
         let blur = candidate.program("system.background_blur").unwrap();
         assert!(blur.aggregate_footprint.sample_radius_x > 48);
+    }
+
+    #[test]
+    fn registered_effect_default_parameter_block_uses_manifest_values() {
+        let mut candidate = manifest();
+        candidate
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .parameters
+            .insert(
+                "intensity".to_owned(),
+                super::super::config::EffectParameterDefinition {
+                    spec: super::super::EffectParameterSpec {
+                        id: super::super::EffectParameterId::new(1).unwrap(),
+                        name: "intensity".to_owned(),
+                        ty: super::super::EffectParameterType::Float,
+                        range: None,
+                        impact: EffectParameterImpact::UniformOnly,
+                    },
+                    default: EffectUniformValue::Float(0.65),
+                },
+            );
+        let registry = TrustedEffectRegistry::new();
+        registry.reload(candidate, |_| Ok(())).unwrap();
+
+        let effect = registry.current().effects["glass.panel"].clone();
+        let block = effect.default_parameter_block().unwrap();
+
+        assert_eq!(block.values().len(), 1);
+        assert_eq!(block.values()[0].id.get(), 1);
+        assert_eq!(block.values()[0].value, EffectUniformValue::Float(0.65));
+    }
+
+    #[test]
+    fn build_generation_rejects_duplicate_parameter_ids() {
+        let mut candidate = manifest();
+        candidate
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .parameters
+            .extend([
+                (
+                    "intensity".to_owned(),
+                    super::super::config::EffectParameterDefinition {
+                        spec: super::super::EffectParameterSpec {
+                            id: super::super::EffectParameterId::new(1).unwrap(),
+                            name: "intensity".to_owned(),
+                            ty: super::super::EffectParameterType::Float,
+                            range: None,
+                            impact: EffectParameterImpact::UniformOnly,
+                        },
+                        default: EffectUniformValue::Float(0.65),
+                    },
+                ),
+                (
+                    "highlight".to_owned(),
+                    super::super::config::EffectParameterDefinition {
+                        spec: super::super::EffectParameterSpec {
+                            id: super::super::EffectParameterId::new(1).unwrap(),
+                            name: "highlight".to_owned(),
+                            ty: super::super::EffectParameterType::Float,
+                            range: None,
+                            impact: EffectParameterImpact::UniformOnly,
+                        },
+                        default: EffectUniformValue::Float(0.2),
+                    },
+                ),
+            ]);
+
+        assert!(build_generation(candidate, 1).is_err());
+    }
+
+    #[test]
+    fn reload_from_path_rejects_duplicate_parameter_ids_in_the_config_file() {
+        let config_root = std::env::temp_dir().join(format!(
+            "typhon-effect-schema-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&config_root).unwrap();
+        std::fs::write(
+            config_root.join("effects.json"),
+            r#"{
+                "version": 1,
+                "effects": {
+                    "glass.panel": {
+                        "nodes": [{"id": 1, "kind": "backdrop"}],
+                        "output": 1,
+                        "parameters": {
+                            "intensity": {"id": 1, "type": "float", "default": 0.65},
+                            "highlight": {"id": 1, "type": "float", "default": 0.2}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let registry = TrustedEffectRegistry::new();
+        let previous = registry.current();
+
+        let result = registry.reload_from_path(Path::new("effects.json"), &config_root, |_| {
+            panic!("invalid parameter schema reached shader precompile")
+        });
+
+        assert!(result.is_err());
+        assert!(Arc::ptr_eq(&previous, &registry.current()));
+        std::fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn build_generation_rejects_undefined_custom_fragment_parameter_bindings() {
+        let mut candidate = manifest();
+        let definition = candidate.effects.get_mut("glass.panel").unwrap();
+        definition.parameters.insert(
+            "intensity".to_owned(),
+            super::super::config::EffectParameterDefinition {
+                spec: super::super::EffectParameterSpec {
+                    id: super::super::EffectParameterId::new(1).unwrap(),
+                    name: "intensity".to_owned(),
+                    ty: super::super::EffectParameterType::Float,
+                    range: None,
+                    impact: EffectParameterImpact::UniformOnly,
+                },
+                default: EffectUniformValue::Float(0.65),
+            },
+        );
+        let fragment = super::super::EffectNode::custom_fragment(
+            super::super::EffectNodeId::new(3).unwrap(),
+            definition.program.output,
+            super::super::CustomFragmentSpec {
+                shader: super::super::ShaderModuleId::new(9).unwrap(),
+                declared_footprint: super::super::EffectFootprint {
+                    sample_radius_x: 0,
+                    sample_radius_y: 0,
+                    output_outsets: super::super::EffectOutsets::ZERO,
+                },
+                uniforms: vec![super::super::EffectUniformBinding {
+                    parameter: super::super::EffectParameterId::new(2).unwrap(),
+                    shader_name: "u_intensity".to_owned(),
+                }],
+                auxiliary_inputs: Vec::new(),
+            },
+        )
+        .unwrap();
+        definition.program.output = fragment.id;
+        definition.program.nodes.push(fragment);
+
+        assert!(build_generation(candidate, 1).is_err());
+    }
+
+    #[test]
+    fn invalid_parameter_schema_reload_retains_the_previous_generation() {
+        let registry = TrustedEffectRegistry::new();
+        let first = registry.reload(manifest(), |_| Ok(())).unwrap();
+        let mut invalid = manifest();
+        invalid
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .parameters
+            .extend([
+                (
+                    "intensity".to_owned(),
+                    super::super::config::EffectParameterDefinition {
+                        spec: super::super::EffectParameterSpec {
+                            id: super::super::EffectParameterId::new(1).unwrap(),
+                            name: "intensity".to_owned(),
+                            ty: super::super::EffectParameterType::Float,
+                            range: None,
+                            impact: EffectParameterImpact::UniformOnly,
+                        },
+                        default: EffectUniformValue::Float(0.65),
+                    },
+                ),
+                (
+                    "highlight".to_owned(),
+                    super::super::config::EffectParameterDefinition {
+                        spec: super::super::EffectParameterSpec {
+                            id: super::super::EffectParameterId::new(1).unwrap(),
+                            name: "highlight".to_owned(),
+                            ty: super::super::EffectParameterType::Float,
+                            range: None,
+                            impact: EffectParameterImpact::UniformOnly,
+                        },
+                        default: EffectUniformValue::Float(0.2),
+                    },
+                ),
+            ]);
+
+        let failed = registry.reload(invalid, |_| {
+            panic!("invalid schema reached shader precompile")
+        });
+
+        assert!(failed.is_err());
+        assert!(Arc::ptr_eq(&first, &registry.current()));
     }
 
     #[test]

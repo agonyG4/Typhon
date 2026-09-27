@@ -5671,6 +5671,7 @@ mod tests {
         let mut demand = EffectExecutionDemand::new(
             vec![oblivion_one::effects::EffectInstanceExecutionDemand {
                 id: instance,
+                presentation_output_region: output_region.clone(),
                 output_region: output_region.clone(),
             }],
             output_region,
@@ -7007,6 +7008,9 @@ mod tests {
         let demand = oblivion_one::effects::EffectExecutionDemand::new(
             vec![oblivion_one::effects::EffectInstanceExecutionDemand {
                 id: first,
+                presentation_output_region: EffectRegion::from_rect(
+                    oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
+                ),
                 output_region: EffectRegion::from_rect(
                     oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
                 ),
@@ -7739,6 +7743,7 @@ mod tests {
         let demand = EffectExecutionDemand::new(
             vec![oblivion_one::effects::EffectInstanceExecutionDemand {
                 id: instance,
+                presentation_output_region: EffectRegion::from_rect(full),
                 output_region: EffectRegion::from_rect(full),
             }],
             EffectRegion::from_rect(full),
@@ -7865,6 +7870,7 @@ mod tests {
         let demand = EffectExecutionDemand::new(
             vec![oblivion_one::effects::EffectInstanceExecutionDemand {
                 id: instance,
+                presentation_output_region: EffectRegion::from_rect(capture_domain),
                 output_region: EffectRegion::from_rect(capture_domain),
             }],
             EffectRegion::from_rect(capture_domain),
@@ -7935,6 +7941,7 @@ mod tests {
         let demand = EffectExecutionDemand::new(
             vec![oblivion_one::effects::EffectInstanceExecutionDemand {
                 id: instance,
+                presentation_output_region: EffectRegion::from_rect(capture_domain),
                 output_region: EffectRegion::from_rect(capture_domain),
             }],
             EffectRegion::from_rect(capture_domain),
@@ -8103,7 +8110,7 @@ mod tests {
     }
 
     #[test]
-    fn effect_selection_matches_the_final_converged_repair() {
+    fn effect_selection_follows_direct_presentation_and_graph_dependencies() {
         use crate::egl_renderer::damage::{
             EglPartialRepaintCapabilities, OutputDamage, PartialRepaintPlanner, RepaintMode,
             RepaintPlan, resolve_effect_execution_for_repaint_plan,
@@ -8205,7 +8212,7 @@ mod tests {
         let initial_damage = OutputDamage::rects(100, 80, [OutputRect::new(30, 0, 10, 10)]);
         let mut repaint_plan = RepaintPlan {
             render_damage: initial_damage.clone(),
-            repair_damage: initial_damage,
+            repair_damage: initial_damage.clone(),
             buffer_age: Some(2),
             mode: RepaintMode::Partial,
             fallback_reason: None,
@@ -8214,19 +8221,30 @@ mod tests {
         let demand =
             resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut repaint_plan, 100, 80);
 
+        let dependency_demand = demand
+            .instances
+            .iter()
+            .find(|instance| instance.id == first)
+            .expect("required earlier dependency demand");
+        let presented_demand = demand
+            .instances
+            .iter()
+            .find(|instance| instance.id == second)
+            .expect("directly presented effect demand");
+        assert!(dependency_demand.presentation_output_region.is_empty());
+        assert!(!dependency_demand.output_region.is_empty());
+        assert!(!presented_demand.presentation_output_region.is_empty());
+
         let selection = select_effect_execution(&graph, &demand);
 
-        assert_eq!(selection.executed_instances, vec![first, second, third]);
+        assert_eq!(selection.executed_instances, vec![first, second]);
         assert_eq!(
             selection.executed_passes,
-            vec![
-                GraphPassId::new(1).unwrap(),
-                GraphPassId::new(2).unwrap(),
-                GraphPassId::new(3).unwrap(),
-            ]
+            vec![GraphPassId::new(1).unwrap(), GraphPassId::new(2).unwrap(),]
         );
         assert!(!selection.executed_instances.contains(&unrelated));
         assert_eq!(repaint_plan.mode, RepaintMode::Partial);
+        assert_eq!(repaint_plan.repair_damage, initial_damage);
     }
 
     fn test_checkpoint_requirement(pass: u16, rects: &[OutputRect]) -> SceneCheckpointRequirement {

@@ -55,7 +55,7 @@ use wayland_server::{
 };
 #[path = "server_control.rs"]
 mod control_api;
-pub use control_api::MaterialSetError;
+pub use control_api::{MaterialProgramSetError, MaterialSetError};
 #[path = "server_xwayland.rs"]
 mod xwayland_api;
 use crate::wm::{SpecialWorkspaceToggleOutcome, WorkspaceId, WorkspaceSwitchOutcome};

@@ -14,6 +14,25 @@ pub enum MaterialSetError {
     Persistence(crate::material::MaterialPersistenceError),
 }
 
+#[derive(Debug)]
+pub enum MaterialProgramSetError {
+    InvalidConfiguration,
+    UnknownProgram,
+    Unqualified,
+    Persistence(crate::material_program::MaterialProgramPersistenceError),
+}
+
+impl std::fmt::Display for MaterialProgramSetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidConfiguration => "material program configuration is invalid",
+            Self::UnknownProgram => "requested material program is not registered",
+            Self::Unqualified => "requested program is not qualified as a global material",
+            Self::Persistence(error) => return error.fmt(formatter),
+        })
+    }
+}
+
 impl std::fmt::Display for MaterialSetError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -37,6 +56,60 @@ impl crate::compositor::CompositorState {
         capabilities: crate::material::MaterialCapabilities,
     ) {
         self.material_runtime_capabilities = capabilities;
+    }
+
+    pub(crate) fn material_program_catalog_snapshot(
+        &self,
+    ) -> crate::material_program::MaterialProgramCatalogSnapshot {
+        let generation = self.trusted_effect_registry.current();
+        crate::material_program::MaterialProgramCatalogSnapshot::from_registry_generation(
+            &generation,
+            self.material_program_rendering_available,
+        )
+    }
+
+    pub(crate) fn material_program_selection_snapshot(
+        &self,
+    ) -> crate::material_program::MaterialProgramSelectionSnapshot {
+        let generation = self.trusted_effect_registry.current();
+        self.material_program_control
+            .snapshot(&generation, self.material_program_rendering_available)
+    }
+
+    pub(crate) fn set_material_program_rendering_available(&mut self, available: bool) {
+        self.material_program_rendering_available = available;
+    }
+
+    pub(crate) fn note_trusted_effect_registry_reload(&mut self) {
+        self.advance_render_generation_with_scene_effect(
+            super::RenderGenerationCause::EffectBinding,
+            true,
+        );
+        self.refresh_effect_scene_summary();
+    }
+
+    pub(crate) fn set_material_program_configuration(
+        &mut self,
+        configuration: crate::material_program::MaterialProgramConfiguration,
+    ) -> Result<crate::material_program::MaterialProgramSelectionUpdate, MaterialProgramSetError>
+    {
+        let generation = self.trusted_effect_registry.current();
+        let update = self
+            .material_program_control
+            .set_configuration(
+                configuration,
+                &generation,
+                self.material_program_rendering_available,
+            )
+            .map_err(map_material_program_mutation_error)?;
+        if update.changed {
+            self.advance_render_generation_with_scene_effect(
+                super::RenderGenerationCause::EffectBinding,
+                true,
+            );
+            self.refresh_effect_scene_summary();
+        }
+        Ok(update)
     }
 
     pub(crate) fn set_material_configuration(
@@ -104,6 +177,25 @@ fn map_material_mutation_error(error: crate::material::MaterialMutationError) ->
     }
 }
 
+fn map_material_program_mutation_error(
+    error: crate::material_program::MaterialProgramMutationError,
+) -> MaterialProgramSetError {
+    match error {
+        crate::material_program::MaterialProgramMutationError::InvalidConfiguration => {
+            MaterialProgramSetError::InvalidConfiguration
+        }
+        crate::material_program::MaterialProgramMutationError::UnknownProgram => {
+            MaterialProgramSetError::UnknownProgram
+        }
+        crate::material_program::MaterialProgramMutationError::Unqualified => {
+            MaterialProgramSetError::Unqualified
+        }
+        crate::material_program::MaterialProgramMutationError::Persistence(error) => {
+            MaterialProgramSetError::Persistence(error)
+        }
+    }
+}
+
 impl OwnCompositorServer {
     pub fn material_snapshot(&self) -> crate::material::MaterialSnapshot {
         self.state.material_snapshot()
@@ -114,6 +206,36 @@ impl OwnCompositorServer {
         capabilities: crate::material::MaterialCapabilities,
     ) {
         self.state.set_material_runtime_capabilities(capabilities);
+    }
+
+    pub fn material_program_catalog_snapshot(
+        &self,
+    ) -> crate::material_program::MaterialProgramCatalogSnapshot {
+        self.state.material_program_catalog_snapshot()
+    }
+
+    pub fn material_program_selection_snapshot(
+        &self,
+    ) -> crate::material_program::MaterialProgramSelectionSnapshot {
+        self.state.material_program_selection_snapshot()
+    }
+
+    pub fn set_material_program_rendering_available(&mut self, available: bool) {
+        self.state
+            .set_material_program_rendering_available(available);
+    }
+
+    #[doc(hidden)]
+    pub fn note_trusted_effect_registry_reload(&mut self) {
+        self.state.note_trusted_effect_registry_reload();
+    }
+
+    pub fn set_material_program_configuration(
+        &mut self,
+        configuration: crate::material_program::MaterialProgramConfiguration,
+    ) -> Result<crate::material_program::MaterialProgramSelectionUpdate, MaterialProgramSetError>
+    {
+        self.state.set_material_program_configuration(configuration)
     }
 
     pub fn set_material_configuration(
@@ -286,6 +408,181 @@ mod tests {
         let mut state = crate::compositor::CompositorState::new(None);
         state.material_control = MaterialControlState::from_store(store);
         state
+    }
+
+    #[test]
+    fn material_program_selection_changes_only_scene_selection_not_registry() {
+        let directory = material_config_home();
+        let mut state = crate::compositor::CompositorState::new(None);
+        state.material_control = MaterialControlState::from_store(
+            MaterialConfigurationStore::new(directory.clone()).unwrap(),
+        );
+        state.set_material_runtime_capabilities(crate::material::MaterialCapabilities::full());
+        state.material_program_control =
+            crate::material_program::MaterialProgramControlState::from_store(
+                crate::material_program::MaterialProgramConfigurationStore::new(directory.clone())
+                    .unwrap(),
+            );
+        let source = crate::effects::EffectNodeId::new(1).unwrap();
+        let program = crate::effects::EffectProgram {
+            id: crate::effects::EffectProgramId::new(79).unwrap(),
+            nodes: vec![crate::effects::EffectNode::source(
+                source,
+                crate::effects::EffectSource::Backdrop,
+            )],
+            output: source,
+            working_space: crate::effects::EffectWorkingSpace::LinearSrgb,
+            alpha_mode: crate::effects::EffectAlphaMode::Opaque,
+            outsets: crate::effects::EffectOutsets::ZERO,
+            frame_demand: crate::effects::EffectFrameDemand::OnDamage,
+            failure_policy: crate::effects::EffectFailurePolicy::Passthrough,
+        };
+        state
+            .trusted_effect_registry
+            .reload(
+                crate::effects::EffectManifest {
+                    version: 1,
+                    effects: [(
+                        "glass.liquid".to_owned(),
+                        crate::effects::EffectDefinition {
+                            name: "glass.liquid".to_owned(),
+                            program,
+                            parameters: Default::default(),
+                            shader_assets: Vec::new(),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let previous_registry = state.trusted_effect_registry.current();
+        let previous_scene_generation = state.scene_render_generation;
+
+        let update = state
+            .set_material_program_configuration(
+                crate::material_program::MaterialProgramConfiguration {
+                    version: 1,
+                    requested_program: "glass.liquid".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert!(update.changed);
+        assert_eq!(update.snapshot.effective_program, "glass.liquid");
+        assert_eq!(state.scene_render_generation, previous_scene_generation + 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &state.trusted_effect_registry.current(),
+            &previous_registry
+        ));
+        assert_eq!(
+            state.resolved_effect_scene().summary.visible_instance_count,
+            0
+        );
+        assert!(!state.resolved_effect_scene().summary.requires_composition);
+        let catalog = state.material_program_catalog_snapshot();
+        assert_eq!(
+            catalog.registry_generation,
+            state.trusted_effect_registry.current().generation
+        );
+        assert_eq!(
+            catalog.programs.first().unwrap().name,
+            crate::effects::BUILTIN_BACKGROUND_BLUR_NAME
+        );
+        assert!(!catalog.rendering_available);
+
+        let previous_builtin_radius = state
+            .trusted_effect_registry
+            .current()
+            .program(crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)
+            .unwrap()
+            .aggregate_footprint
+            .sample_radius_x;
+        state
+            .set_material_configuration(MaterialConfiguration {
+                position: 1.0,
+                ..MaterialConfiguration::default()
+            })
+            .unwrap();
+        let material_registry = state.trusted_effect_registry.current();
+        let current_builtin_radius = material_registry
+            .program(crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)
+            .unwrap()
+            .aggregate_footprint
+            .sample_radius_x;
+        assert!(current_builtin_radius > previous_builtin_radius);
+        assert!(material_registry.effects.contains_key("glass.liquid"));
+        let selected_after_material_update = state.material_program_selection_snapshot();
+        assert_eq!(
+            selected_after_material_update
+                .configuration
+                .requested_program,
+            "glass.liquid"
+        );
+        assert_eq!(
+            selected_after_material_update.effective_program,
+            "glass.liquid"
+        );
+
+        let after_change = state.scene_render_generation;
+        let idempotent = state
+            .set_material_program_configuration(
+                crate::material_program::MaterialProgramConfiguration {
+                    version: 1,
+                    requested_program: "glass.liquid".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(!idempotent.changed);
+        assert_eq!(state.scene_render_generation, after_change);
+        assert!(std::sync::Arc::ptr_eq(
+            &state.trusted_effect_registry.current(),
+            &material_registry
+        ));
+
+        let selection_generation = state.material_program_selection_snapshot().generation;
+        let scene_generation = state.scene_render_generation;
+        state
+            .trusted_effect_registry
+            .reload(
+                crate::effects::EffectManifest {
+                    version: 1,
+                    effects: Default::default(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        state.note_trusted_effect_registry_reload();
+        let fallback = state.material_program_selection_snapshot();
+        assert_eq!(fallback.configuration.requested_program, "glass.liquid");
+        assert_eq!(
+            fallback.effective_program,
+            crate::effects::BUILTIN_BACKGROUND_BLUR_NAME
+        );
+        assert_eq!(
+            fallback.fallback_reason,
+            Some(crate::material_program::MaterialProgramFallbackReason::Missing)
+        );
+        assert_eq!(fallback.generation, selection_generation);
+        assert_eq!(state.scene_render_generation, scene_generation + 1);
+
+        let scene_generation_after_fallback = state.scene_render_generation;
+        let same_requested_program = state
+            .set_material_program_configuration(
+                crate::material_program::MaterialProgramConfiguration {
+                    version: 1,
+                    requested_program: "glass.liquid".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(!same_requested_program.changed);
+        assert_eq!(same_requested_program.snapshot, fallback);
+        assert_eq!(
+            state.scene_render_generation,
+            scene_generation_after_fallback
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

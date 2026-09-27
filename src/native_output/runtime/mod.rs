@@ -77,6 +77,8 @@ macro_rules! require_validation_base {
 
 mod atomic_commit;
 mod bootstrap;
+#[cfg(test)]
+mod bootstrap_runtime_capabilities_tests;
 mod commit_timing;
 mod cursor_cycle;
 mod cycle;
@@ -694,7 +696,11 @@ pub(super) fn reload_trusted_effects_from_disk(
     let generation = scanout
         .reload_trusted_effect_registry(server.trusted_effect_registry(), manifest)
         .map_err(|error| error.to_string())?;
+    let previous_scene_generation = server.scene_render_generation();
     server.reconcile_trusted_effect_bindings();
+    if server.scene_render_generation() == previous_scene_generation {
+        server.note_trusted_effect_registry_reload();
+    }
     Ok(Some(
         oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot {
             manifest_path: path.display().to_string(),

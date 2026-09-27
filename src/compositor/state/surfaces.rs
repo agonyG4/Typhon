@@ -925,6 +925,8 @@ impl CompositorState {
     }
     pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
         let material_control = crate::material::MaterialControlState::from_environment();
+        let material_program_control =
+            crate::material_program::MaterialProgramControlState::from_environment();
         let trusted_effect_registry =
             crate::effects::TrustedEffectRegistry::with_builtin_background_material(
                 material_control
@@ -944,6 +946,7 @@ impl CompositorState {
             syncobj_device,
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
             material_control,
+            material_program_control,
             trusted_effect_registry,
             pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()

@@ -529,12 +529,33 @@ fn resolve_effect_execution_for_repaint_plan_inner(
             );
         }
 
-        if effect_execution_region_is_covered_by_repair(
-            &plan.repair_damage,
-            &demand.execution_region,
-            output_width,
-            output_height,
-        ) {
+        let previous_repair = plan.repair_damage.clone();
+        let mut candidate_repair = previous_repair.clone();
+        let mut presentation_repair_expanded = false;
+        // Execution work also includes dependency output and capture domains.
+        // Only direct presentation output may widen repair here.
+        for instance_demand in &demand.instances {
+            let presentation_output_region = &instance_demand.presentation_output_region;
+            if presentation_output_region.is_empty()
+                || effect_execution_region_is_covered_by_repair(
+                    &candidate_repair,
+                    presentation_output_region,
+                    output_width,
+                    output_height,
+                )
+            {
+                continue;
+            }
+            presentation_repair_expanded = true;
+            candidate_repair = merge_effect_damage(
+                candidate_repair,
+                presentation_output_region,
+                output_width,
+                output_height,
+            );
+        }
+
+        if !presentation_repair_expanded {
             if let Some(snapshot) = diagnostics.as_deref_mut() {
                 snapshot.last_merged_repair = snapshot.last_input_repair;
                 snapshot.last_applied_repair = snapshot.last_input_repair;
@@ -545,20 +566,13 @@ fn resolve_effect_execution_for_repaint_plan_inner(
             return demand;
         }
 
-        let previous_repair = plan.repair_damage.clone();
-        let execution_repair = merge_effect_damage(
-            previous_repair.clone(),
-            &demand.execution_region,
-            output_width,
-            output_height,
-        );
         if let Some(snapshot) = diagnostics.as_deref_mut() {
             snapshot.last_merged_repair = EffectExecutionRepairSnapshot::from_damage(
-                &execution_repair,
+                &candidate_repair,
                 (output_width, output_height),
             );
         }
-        planner.apply_execution_repair(plan, execution_repair);
+        planner.apply_execution_repair(plan, candidate_repair);
         if let Some(snapshot) = diagnostics.as_deref_mut() {
             snapshot.last_applied_repair = EffectExecutionRepairSnapshot::from_damage(
                 &plan.repair_damage,
@@ -613,22 +627,26 @@ fn record_effect_execution_attribution(
     #[cfg(test)]
     EFFECT_EXECUTION_ATTRIBUTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
 
-    let demand_stats = demand.plan_stats();
     let mut selected_output_region = oblivion_one::effects::EffectRegion::empty();
     let mut capture_work_region = oblivion_one::effects::EffectRegion::empty();
     let mut capture_work_instances = 0usize;
     let mut attribution_union_coalesces = 0usize;
+    let mut presentation_union_coalesces = 0usize;
     let mut identity_available = true;
-    let mut source_region_is_conservative = false;
+    let mut presentation_region_is_conservative = false;
 
     for (selected_index, selected) in demand.instances.iter().enumerate() {
-        source_region_is_conservative |=
-            !selected.output_region.is_empty() && selected.output_region.bounding_rect().is_none();
-        let (union, coalesces, conservative) =
-            union_effect_region_for_attribution(&selected_output_region, &selected.output_region);
+        let presentation_output_region = &selected.presentation_output_region;
+        presentation_region_is_conservative |= !presentation_output_region.is_empty()
+            && presentation_output_region.bounding_rect().is_none();
+        let (union, coalesces, conservative) = union_effect_region_for_attribution(
+            &selected_output_region,
+            presentation_output_region,
+        );
         selected_output_region = union;
         attribution_union_coalesces = attribution_union_coalesces.saturating_add(coalesces);
-        source_region_is_conservative |= conservative;
+        presentation_union_coalesces = presentation_union_coalesces.saturating_add(coalesces);
+        presentation_region_is_conservative |= conservative;
 
         if demand.instances[..selected_index]
             .iter()
@@ -656,18 +674,14 @@ fn record_effect_execution_attribution(
         }
 
         capture_work_instances = capture_work_instances.saturating_add(1);
-        source_region_is_conservative |= !instance.capture_region.is_empty()
-            && instance.capture_region.bounding_rect().is_none();
-        let (union, coalesces, conservative) =
+        let (union, coalesces, _) =
             union_effect_region_for_attribution(&capture_work_region, &instance.capture_region);
         capture_work_region = union;
         attribution_union_coalesces = attribution_union_coalesces.saturating_add(coalesces);
-        source_region_is_conservative |= conservative;
     }
 
-    let representation_is_conservative = source_region_is_conservative
-        || (!selected_output_region.is_empty() && selected_output_region.bounding_rect().is_none())
-        || (!capture_work_region.is_empty() && capture_work_region.bounding_rect().is_none());
+    let representation_is_conservative = presentation_region_is_conservative
+        || (!selected_output_region.is_empty() && selected_output_region.bounding_rect().is_none());
     let (output_only_merged_repair, output_only_plan) =
         if effect_execution_region_is_covered_by_repair(
             &plan.repair_damage,
@@ -709,11 +723,8 @@ fn record_effect_execution_attribution(
     snapshot.last_output_only_repaint_reason = output_only_plan.fallback_reason;
     snapshot.last_capture_work_instances = capture_work_instances;
     snapshot.attribution_union_coalesces = attribution_union_coalesces;
-    snapshot.attribution_available = identity_available
-        && !representation_is_conservative
-        && attribution_union_coalesces == 0
-        && demand_stats.region_representation_overflows == 0
-        && demand_stats.work_region_bbox_coalesces == 0;
+    snapshot.attribution_available =
+        identity_available && !representation_is_conservative && presentation_union_coalesces == 0;
 }
 
 fn union_effect_region_for_attribution(
@@ -1027,11 +1038,17 @@ pub(crate) struct EffectExecutionResolutionSnapshot {
     pub(crate) graph_passes: usize,
     pub(crate) dependency_edges: usize,
     pub(crate) initial_repair: EffectExecutionRepairSnapshot,
+    /// Presentation repair entering the most recent selective iteration.
     pub(crate) last_input_repair: EffectExecutionRepairSnapshot,
+    /// Internal output and capture work envelope; it may exceed presentation repair.
     pub(crate) last_execution_region: EffectExecutionRepairSnapshot,
+    /// Direct output regions attributed to the current presentation repair.
     pub(crate) last_selected_output_region: EffectExecutionRepairSnapshot,
+    /// Internal capture domains required by selected dependency consumers.
     pub(crate) last_capture_work_region: EffectExecutionRepairSnapshot,
+    /// Candidate presentation repair after direct presentation-output contributions.
     pub(crate) last_merged_repair: EffectExecutionRepairSnapshot,
+    /// Presentation repair after the repaint policy was applied.
     pub(crate) last_applied_repair: EffectExecutionRepairSnapshot,
     pub(crate) last_repair_changed: bool,
     pub(crate) last_output_only_merged_repair: EffectExecutionRepairSnapshot,

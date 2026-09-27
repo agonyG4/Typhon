@@ -605,7 +605,7 @@ fn age_3_repair_revives_effect_from_two_presented_frames_ago() {
 }
 
 #[test]
-fn effect_execution_repair_demand_converges_across_forward_consumers() {
+fn presentation_repair_does_not_expand_through_forward_capture_work() {
     let graph = graph_for_effect_instances([
         (1, 10, 10, 10, 10, vec![]),
         (2, 30, 10, 10, 40, vec![1]),
@@ -624,40 +624,128 @@ fn effect_execution_repair_demand_converges_across_forward_consumers() {
     };
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
-    let execution_repair = merge_effect_damage(
-        plan.repair_damage.clone(),
-        &demand.execution_region,
-        100,
-        80,
-    );
-    planner.apply_execution_repair(&mut plan, execution_repair);
-
-    assert!(
-        plan.repair_damage
-            .rects_slice()
-            .iter()
-            .any(|repair| repair.x <= 45 && repair.right() >= 50)
-    );
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.repair_damage, initial_render_damage);
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+    assert!(!demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
     assert!(!demand.contains(oblivion_one::effects::EffectInstanceId::new(4).unwrap()));
+    let dependency = demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == oblivion_one::effects::EffectInstanceId::new(1).unwrap())
+        .expect("required earlier dependency");
+    let consumer = demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == oblivion_one::effects::EffectInstanceId::new(2).unwrap())
+        .expect("directly presented consumer");
+    assert!(dependency.presentation_output_region.is_empty());
+    assert!(!dependency.output_region.is_empty());
+    assert!(!consumer.presentation_output_region.is_empty());
     assert!(
-        demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()),
-        "the returned demand must match the expanded final repair"
+        !effect_execution_region_is_covered_by_repair(
+            &plan.repair_damage,
+            &demand.execution_region,
+            100,
+            80,
+        ),
+        "internal execution work may extend beyond presentation repair"
     );
-    assert_eq!(plan.render_damage, initial_render_damage);
+    assert_eq!(plan.render_damage, plan.repair_damage);
 }
 
 #[test]
-fn effect_execution_repair_demand_converges_across_multiple_forward_hops() {
+fn bounded_direct_output_overflow_preserves_clip_as_presentation_expansion() {
+    let output_size = 1_000;
+    let rect_count = 64;
+    let output_influence_region = [0, 250, 500].into_iter().fold(
+        oblivion_one::effects::EffectRegion::empty(),
+        |mut region, x| {
+            region.push(effect_rect(x, 0, 1, output_size));
+            region
+        },
+    );
+    let later_output = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 1, 1, 1));
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            output_influence_region.clone(),
+            output_influence_region.clone(),
+            vec![],
+        ),
+        (2, later_output.clone(), later_output, vec![]),
+    ]);
+    let initial = OutputDamage::rects(
+        output_size,
+        output_size,
+        (0..rect_count).map(|index| rect(0, index * 4, output_size, 1)),
+    );
+    let planner = partial_planner_with_policy(
+        (output_size, output_size),
+        partial_capabilities(),
+        PartialRepaintComplexityPolicy::StructuredExperimental,
+    );
+    let mut plan = RepaintPlan {
+        render_damage: initial.clone(),
+        repair_damage: initial.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+        ..RepaintPlan::default()
+    };
+
+    let direct_demand =
+        effect_execution_demand_for_repaint_plan(&graph, &plan, output_size, output_size);
+    assert!(direct_demand.plan_stats().region_representation_overflows > 0);
+    assert_eq!(direct_demand.instances.len(), 1);
+    assert_eq!(
+        direct_demand.instances[0].presentation_output_region, output_influence_region,
+        "bounded direct intersection overflow must retain its authoritative clip"
+    );
+
+    let (demand, resolution) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner,
+        &graph,
+        &mut plan,
+        output_size,
+        output_size,
+    );
+
+    assert_eq!(
+        resolution.outcome,
+        EffectExecutionResolutionOutcome::Converged
+    );
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
+    assert!(resolution.last_merged_repair.pixels > resolution.initial_repair.pixels);
+    assert_ne!(plan.repair_damage, initial);
+    assert!(effect_execution_region_is_covered_by_repair(
+        &plan.repair_damage,
+        &output_influence_region,
+        output_size,
+        output_size,
+    ));
+    assert_eq!(demand.instances.len(), 2);
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+    let newly_presented = demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == oblivion_one::effects::EffectInstanceId::new(2).unwrap())
+        .expect("later output demanded after conservative expansion");
+    assert!(!newly_presented.presentation_output_region.is_empty());
+}
+
+#[test]
+fn transitive_dependencies_remain_selected_without_expanding_presentation_repair() {
     let graph = graph_for_effect_instances([
         (1, 10, 10, 10, 10, vec![]),
-        (2, 30, 10, 10, 40, vec![1]),
-        (3, 45, 10, 45, 25, vec![2]),
-        (4, 65, 10, 65, 25, vec![]),
+        (2, 30, 10, 10, 35, vec![1]),
+        (3, 50, 10, 30, 40, vec![2]),
+        (4, 35, 10, 35, 10, vec![]),
     ]);
     let planner = partial_planner((100, 80), partial_capabilities());
-    let initial_render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let initial_render_damage = OutputDamage::rects(100, 80, [rect(50, 0, 10, 10)]);
     let mut plan = RepaintPlan {
         render_damage: initial_render_damage.clone(),
         repair_damage: initial_render_damage.clone(),
@@ -674,33 +762,47 @@ fn effect_execution_repair_demand_converges_across_multiple_forward_hops() {
     assert_eq!(plan.mode, RepaintMode::Partial);
     assert_eq!(plan.fallback_reason, None);
     assert_eq!(resolution.outcome.as_str(), "converged");
-    assert!(resolution.iterations_attempted >= 2);
+    assert_eq!(resolution.iterations_attempted, 1);
     assert_eq!(resolution.initial_repair.pixels, 100);
-    assert!(resolution.last_input_repair.pixels > resolution.initial_repair.pixels);
+    assert_eq!(resolution.last_input_repair, resolution.initial_repair);
     assert!(resolution.last_execution_region.rects > 0);
-    assert_eq!(
-        resolution.last_merged_repair,
-        resolution.last_applied_repair
-    );
+    assert_eq!(resolution.last_merged_repair, resolution.initial_repair);
     assert_eq!(
         resolution.last_applied_repair,
         EffectExecutionRepairSnapshot::from_damage(&plan.repair_damage, (100, 80))
     );
-    assert!(plan.repair_damage.rects_slice().iter().any(|repair| {
-        repair.x <= 30 && repair.y <= 0 && repair.right() >= 40 && repair.bottom() >= 10
-    }));
     assert!(!resolution.last_repair_changed);
+    assert_eq!(plan.repair_damage, initial_render_damage);
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
-    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(4).unwrap()));
-    assert!(
-        plan.repair_damage
-            .rects_slice()
+    assert!(!demand.contains(oblivion_one::effects::EffectInstanceId::new(4).unwrap()));
+    for id in [1, 2] {
+        let instance = demand
+            .instances
             .iter()
-            .any(|repair| repair.x <= 65 && repair.right() >= 70)
+            .find(|instance| {
+                instance.id == oblivion_one::effects::EffectInstanceId::new(id).unwrap()
+            })
+            .expect("transitive dependency");
+        assert!(instance.presentation_output_region.is_empty());
+        assert!(!instance.output_region.is_empty());
+    }
+    let final_consumer = demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == oblivion_one::effects::EffectInstanceId::new(3).unwrap())
+        .expect("directly presented final consumer");
+    assert!(!final_consumer.presentation_output_region.is_empty());
+    assert!(
+        !effect_execution_region_is_covered_by_repair(
+            &plan.repair_damage,
+            &demand.execution_region,
+            100,
+            80,
+        ),
+        "dependency-propagated execution work is internal"
     );
-    assert_eq!(plan.render_damage, initial_render_damage);
 }
 
 #[test]
@@ -754,7 +856,7 @@ fn effect_execution_resolution_diagnostics_report_convergence_and_fixed_point_ev
 }
 
 #[test]
-fn effect_execution_resolution_converges_when_execution_region_is_already_covered() {
+fn effect_execution_resolution_converges_when_presentation_output_is_already_covered() {
     let initial_repair =
         OutputDamage::rects(8, 8, [rect(0, 0, 1, 1), rect(0, 1, 2, 1), rect(0, 2, 1, 1)]);
     let region = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 1, 1));
@@ -776,6 +878,18 @@ fn effect_execution_resolution_converges_when_execution_region_is_already_covere
     let instance_id = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
 
     assert!(demand.contains(instance_id));
+    let presentation_output = &demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .expect("directly presented instance")
+        .presentation_output_region;
+    assert!(effect_execution_region_is_covered_by_repair(
+        &plan.repair_damage,
+        presentation_output,
+        8,
+        8,
+    ));
     assert_eq!(snapshot.graph_instances, 1);
     assert_eq!(snapshot.dependency_edges, 0);
     assert!(snapshot.last_execution_region.rects > 0);
@@ -859,7 +973,7 @@ fn effect_execution_resolution_freezes_metadata_cause_before_full_demand_recompu
 }
 
 #[test]
-fn effect_execution_resolution_separates_repaint_policy_full_from_conservatism() {
+fn large_capture_work_does_not_promote_partial_presentation_to_full() {
     let graph = graph_with_instance_regions([
         (
             1,
@@ -878,18 +992,18 @@ fn effect_execution_resolution_separates_repaint_policy_full_from_conservatism()
     let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
     let mut plan = RepaintPlan {
         render_damage: initial.clone(),
-        repair_damage: initial,
+        repair_damage: initial.clone(),
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
         ..RepaintPlan::default()
     };
 
-    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
         &planner, &graph, &mut plan, 100, 80,
     );
 
-    assert_eq!(snapshot.outcome.as_str(), "repaint_policy_full");
+    assert_eq!(snapshot.outcome.as_str(), "converged");
     assert_eq!(snapshot.demand_conservative_cause.as_str(), "none");
     assert!(snapshot.attribution_available);
     assert!(snapshot.last_selected_output_region.pixels > 0);
@@ -905,23 +1019,40 @@ fn effect_execution_resolution_separates_repaint_policy_full_from_conservatism()
         snapshot.last_output_only_applied_repair.kind,
         EffectExecutionRepairKind::Rects
     );
-    assert!(snapshot.initial_repair.pixels < snapshot.last_output_only_applied_repair.pixels);
-    assert!(snapshot.last_output_only_applied_repair.pixels < snapshot.last_merged_repair.pixels);
-    assert_eq!(
-        snapshot.final_repaint_reason,
-        Some(FullRepaintReason::DamageAreaThreshold)
+    assert_eq!(snapshot.last_merged_repair, snapshot.initial_repair);
+    assert_eq!(snapshot.last_applied_repair, snapshot.initial_repair);
+    assert_eq!(snapshot.final_repaint_reason, None);
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
+    assert_eq!(plan.repair_damage, initial);
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+    let dependency = demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == oblivion_one::effects::EffectInstanceId::new(1).unwrap())
+        .expect("required earlier dependency");
+    let consumer = demand
+        .instances
+        .iter()
+        .find(|instance| instance.id == oblivion_one::effects::EffectInstanceId::new(2).unwrap())
+        .expect("directly presented consumer");
+    assert!(dependency.presentation_output_region.is_empty());
+    assert!(!dependency.output_region.is_empty());
+    assert!(!consumer.presentation_output_region.is_empty());
+    assert!(
+        !effect_execution_region_is_covered_by_repair(
+            &plan.repair_damage,
+            &demand.execution_region,
+            100,
+            80,
+        ),
+        "capture work is internal even when its work envelope exceeds repair"
     );
-    assert_eq!(plan.mode, RepaintMode::Full);
-    assert_eq!(
-        plan.fallback_reason,
-        Some(FullRepaintReason::DamageAreaThreshold)
-    );
-    assert_eq!(snapshot.last_applied_repair.kind.as_str(), "full");
-    assert!(snapshot.last_merged_repair.pixels >= 6_000);
 }
 
 #[test]
-fn effect_execution_resolution_freezes_attribution_before_full_demand_recompute() {
+fn effect_execution_resolution_keeps_large_capture_work_internal() {
     let graph = graph_with_instance_regions([
         (
             1,
@@ -946,7 +1077,7 @@ fn effect_execution_resolution_freezes_attribution_before_full_demand_recompute(
     let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
     let mut plan = RepaintPlan {
         render_damage: initial.clone(),
-        repair_damage: initial,
+        repair_damage: initial.clone(),
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
@@ -959,18 +1090,28 @@ fn effect_execution_resolution_freezes_attribution_before_full_demand_recompute(
 
     assert_eq!(
         snapshot.outcome,
-        EffectExecutionResolutionOutcome::RepaintPolicyFull
+        EffectExecutionResolutionOutcome::Converged
     );
-    assert_eq!(plan.mode, RepaintMode::Full);
-    assert_eq!(demand.instances.len(), 3);
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
+    assert_eq!(plan.repair_damage, initial);
+    assert_eq!(demand.instances.len(), 2);
     assert!(snapshot.attribution_available);
-    assert_eq!(snapshot.last_selected_output_region.rects, 2);
-    assert_eq!(snapshot.last_selected_output_region.pixels, 200);
+    assert_eq!(snapshot.last_selected_output_region.rects, 1);
+    assert_eq!(snapshot.last_selected_output_region.pixels, 100);
+    assert!(snapshot.last_capture_work_region.pixels > 0);
+    assert!(!demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
     assert_eq!(
         snapshot.last_output_only_repaint_mode,
         Some(RepaintMode::Partial)
     );
     assert_eq!(snapshot.last_output_only_repaint_reason, None);
+    assert!(!effect_execution_region_is_covered_by_repair(
+        &plan.repair_damage,
+        &demand.execution_region,
+        100,
+        80,
+    ));
 }
 
 #[test]
@@ -1037,15 +1178,19 @@ fn effect_execution_attribution_does_not_reclassify_covered_selected_output() {
         snapshot.last_output_only_applied_repair,
         snapshot.last_input_repair
     );
-    assert_eq!(plan.mode, RepaintMode::Full);
-    assert_eq!(
-        plan.fallback_reason,
-        Some(FullRepaintReason::DamageAreaThreshold)
-    );
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
+    assert_eq!(plan.repair_damage, initial_repair);
+    assert!(!effect_execution_region_is_covered_by_repair(
+        &plan.repair_damage,
+        &capture_work,
+        20,
+        20,
+    ));
 }
 
 #[test]
-fn effect_execution_attribution_is_unavailable_for_demand_region_overflow() {
+fn effect_execution_attribution_ignores_work_only_region_overflow_count() {
     let base_graph = graph_with_instance_regions([(
         1,
         oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
@@ -1094,11 +1239,11 @@ fn effect_execution_attribution_is_unavailable_for_demand_region_overflow() {
     assert!(snapshot.last_selected_output_region.pixels > 0);
     assert_eq!(snapshot.last_capture_work_instances, 0);
     assert_eq!(snapshot.attribution_union_coalesces, 0);
-    assert!(!snapshot.attribution_available);
+    assert!(snapshot.attribution_available);
 }
 
 #[test]
-fn effect_execution_attribution_is_unavailable_for_demand_work_region_coalesce() {
+fn effect_execution_attribution_ignores_internal_work_region_coalescing() {
     let base_graph = graph_with_instance_regions([(
         1,
         oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
@@ -1147,7 +1292,7 @@ fn effect_execution_attribution_is_unavailable_for_demand_work_region_coalesce()
     assert!(snapshot.last_selected_output_region.pixels > 0);
     assert_eq!(snapshot.last_capture_work_instances, 0);
     assert_eq!(snapshot.attribution_union_coalesces, 0);
-    assert!(!snapshot.attribution_available);
+    assert!(snapshot.attribution_available);
 }
 
 #[test]
@@ -1239,14 +1384,33 @@ fn effect_execution_attribution_does_not_assign_cause_to_covered_capture_work() 
 
 #[test]
 fn effect_execution_resolution_reports_budget_exhaustion_without_overwriting_cause() {
-    let graph = graph_for_effect_instances([
-        (1, 10, 10, 10, 10, vec![]),
-        (2, 30, 10, 10, 40, vec![1]),
-        (3, 45, 10, 45, 25, vec![2]),
-        (4, 65, 10, 65, 25, vec![]),
+    let output_size = 1_000;
+    let output_clip = [0, 250, 500].into_iter().fold(
+        oblivion_one::effects::EffectRegion::empty(),
+        |mut region, x| {
+            region.push(effect_rect(x, 0, 1, output_size));
+            region
+        },
+    );
+    let graph = graph_with_instance_regions([
+        (1, output_clip.clone(), output_clip, vec![]),
+        (
+            2,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 1, 1, 1)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 1, 1, 1)),
+            vec![],
+        ),
     ]);
-    let planner = partial_planner((100, 80), partial_capabilities());
-    let initial = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let planner = partial_planner_with_policy(
+        (output_size, output_size),
+        partial_capabilities(),
+        PartialRepaintComplexityPolicy::StructuredExperimental,
+    );
+    let initial = OutputDamage::rects(
+        output_size,
+        output_size,
+        (0..64).map(|index| rect(0, index * 4, output_size, 1)),
+    );
     let mut plan = RepaintPlan {
         render_damage: initial.clone(),
         repair_damage: initial,
@@ -1257,7 +1421,12 @@ fn effect_execution_resolution_reports_budget_exhaustion_without_overwriting_cau
     };
 
     let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_iteration_budget(
-        &planner, &graph, &mut plan, 100, 80, 1,
+        &planner,
+        &graph,
+        &mut plan,
+        output_size,
+        output_size,
+        1,
     );
 
     assert_eq!(snapshot.outcome.as_str(), "iteration_exhausted");
@@ -1275,6 +1444,7 @@ fn effect_execution_resolution_reports_budget_exhaustion_without_overwriting_cau
     );
     assert_eq!(snapshot.last_merged_repair, snapshot.last_applied_repair);
     assert!(snapshot.last_merged_repair.pixels >= snapshot.last_input_repair.pixels);
+    assert!(snapshot.last_merged_repair.rects > snapshot.last_input_repair.rects);
 }
 
 #[test]
@@ -1324,7 +1494,7 @@ fn ordinary_resolver_does_not_construct_trace_only_resolution_snapshots() {
 }
 
 #[test]
-fn threshold_full_recomputes_effect_demand_from_full_repair() {
+fn capture_work_does_not_cause_full_demand_recompute() {
     let graph = graph_with_instance_regions([
         (
             1,
@@ -1349,7 +1519,7 @@ fn threshold_full_recomputes_effect_demand_from_full_repair() {
     let render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
     let mut plan = RepaintPlan {
         render_damage: render_damage.clone(),
-        repair_damage: render_damage,
+        repair_damage: render_damage.clone(),
         buffer_age: Some(2),
         mode: RepaintMode::Partial,
         fallback_reason: None,
@@ -1358,14 +1528,19 @@ fn threshold_full_recomputes_effect_demand_from_full_repair() {
 
     let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
 
-    assert_eq!(plan.mode, RepaintMode::Full);
-    assert_eq!(plan.repair_damage, OutputDamage::Full);
-    assert_eq!(
-        plan.fallback_reason,
-        Some(FullRepaintReason::DamageAreaThreshold)
-    );
-    assert!(demand.is_conservative_full());
-    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.repair_damage, render_damage);
+    assert_eq!(plan.fallback_reason, None);
+    assert!(!demand.is_conservative_full());
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+    assert!(!demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
+    assert!(!effect_execution_region_is_covered_by_repair(
+        &plan.repair_damage,
+        &demand.execution_region,
+        100,
+        80,
+    ));
     assert_eq!(
         plan.render_damage,
         OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)])

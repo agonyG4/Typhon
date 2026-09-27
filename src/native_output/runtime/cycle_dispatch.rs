@@ -125,6 +125,10 @@ fn settle_native_pointer_constraint_backend_requests(
 #[serde(deny_unknown_fields)]
 struct EmptyCursorArgs {}
 
+fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
+    serde_json::from_value::<EmptyCursorArgs>(args).is_ok()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyKeyboardLayoutArgs {}
@@ -821,6 +825,62 @@ impl NativeRuntime {
                 }
                 Err(error) => return Some(material_set_failure_response(request.id, error)),
             }
+        }
+        if matches!(
+            command,
+            ControlCommand::MaterialProgramCatalogGet | ControlCommand::MaterialProgramGet
+        ) {
+            if !material_program_get_args_are_empty(request.args) {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "material program get commands take no arguments",
+                    ),
+                ));
+            }
+            return Some(if command == ControlCommand::MaterialProgramCatalogGet {
+                material_program_catalog_response(
+                    request.id,
+                    self.server.material_program_catalog_snapshot(),
+                )
+            } else {
+                material_program_selection_response(
+                    request.id,
+                    self.server.material_program_selection_snapshot(),
+                )
+            });
+        }
+        if command == ControlCommand::MaterialProgramSet {
+            let configuration = match serde_json::from_value::<
+                oblivion_one::material_program::MaterialProgramConfiguration,
+            >(request.args)
+            {
+                Ok(configuration) => configuration,
+                Err(_) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "invalid material program configuration",
+                        ),
+                    ));
+                }
+            };
+            return Some(
+                match self
+                    .server
+                    .set_material_program_configuration(configuration)
+                {
+                    Ok(update) => {
+                        if update.changed {
+                            self.queued_redraw_requested = true;
+                        }
+                        material_program_selection_response(request.id, update.snapshot)
+                    }
+                    Err(error) => material_program_set_failure_response(request.id, error),
+                },
+            );
         }
         if command == ControlCommand::EffectsReload {
             if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
@@ -2188,8 +2248,9 @@ mod tests {
         decide_native_pre_read_input, dispatch_keyboard_layout_command,
         format_direct_scanout_doctor_detail, format_dmabuf_feedback_source_format,
         input_requires_full_server_progression, keyboard_layout_failure,
-        material_set_failure_response, material_snapshot_response,
-        promote_native_input_before_wayland_read,
+        material_program_get_args_are_empty, material_program_selection_response,
+        material_program_set_failure_response, material_set_failure_response,
+        material_snapshot_response, promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -2238,6 +2299,49 @@ mod tests {
                 "saturationOverride": true,
                 "noiseOverride": true,
             })
+        );
+    }
+
+    #[test]
+    fn material_program_get_commands_reject_arguments() {
+        assert!(material_program_get_args_are_empty(serde_json::json!({})));
+        assert!(!material_program_get_args_are_empty(
+            serde_json::json!({"unexpected": true})
+        ));
+    }
+
+    #[test]
+    fn material_program_set_returns_the_authoritative_selection_snapshot() {
+        let snapshot = oblivion_one::material_program::MaterialProgramSelectionSnapshot {
+            generation: 4,
+            source: oblivion_one::material_program::MaterialProgramConfigSource::Runtime,
+            configuration: oblivion_one::material_program::MaterialProgramConfiguration {
+                version: 1,
+                requested_program: "glass.liquid".to_owned(),
+            },
+            effective_program: "glass.liquid".to_owned(),
+            registry_generation: 9,
+            rendering_available: true,
+            fallback_reason: None,
+        };
+        let expected = serde_json::to_value(&snapshot).unwrap();
+        let response = material_program_selection_response(75, snapshot);
+
+        assert_eq!(response.id, 75);
+        assert!(response.ok);
+        assert_eq!(response.result, Some(expected));
+    }
+
+    #[test]
+    fn invalid_material_program_selection_maps_to_invalid_argument() {
+        let response = material_program_set_failure_response(
+            76,
+            oblivion_one::compositor::MaterialProgramSetError::UnknownProgram,
+        );
+        assert_eq!(response.id, 76);
+        assert_eq!(
+            response.error.unwrap().code,
+            oblivion_one::control::ControlErrorCode::InvalidArgument
         );
     }
 
@@ -3095,6 +3199,67 @@ fn material_snapshot_response(
             id,
             ControlError::new(ControlErrorCode::Internal, "material snapshot failed"),
         ),
+    }
+}
+
+fn material_program_catalog_response(
+    id: u64,
+    snapshot: oblivion_one::material_program::MaterialProgramCatalogSnapshot,
+) -> ControlResponse {
+    match serde_json::to_value(snapshot) {
+        Ok(result) => ControlResponse::success(id, result),
+        Err(_) => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::Internal,
+                "material program catalog snapshot failed",
+            ),
+        ),
+    }
+}
+
+fn material_program_selection_response(
+    id: u64,
+    snapshot: oblivion_one::material_program::MaterialProgramSelectionSnapshot,
+) -> ControlResponse {
+    match serde_json::to_value(snapshot) {
+        Ok(result) => ControlResponse::success(id, result),
+        Err(_) => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::Internal,
+                "material program selection snapshot failed",
+            ),
+        ),
+    }
+}
+
+fn material_program_set_failure_response(
+    id: u64,
+    error: oblivion_one::compositor::MaterialProgramSetError,
+) -> ControlResponse {
+    match error {
+        oblivion_one::compositor::MaterialProgramSetError::InvalidConfiguration
+        | oblivion_one::compositor::MaterialProgramSetError::UnknownProgram
+        | oblivion_one::compositor::MaterialProgramSetError::Unqualified => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(
+                    ControlErrorCode::InvalidArgument,
+                    "requested material program is invalid or unqualified",
+                ),
+            )
+        }
+        error @ oblivion_one::compositor::MaterialProgramSetError::Persistence(_) => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(
+                    ControlErrorCode::Internal,
+                    "material program configuration was not saved",
+                )
+                .with_detail(error.to_string()),
+            )
+        }
     }
 }
 

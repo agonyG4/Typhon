@@ -156,6 +156,43 @@ generation, advances compositor render state, and requests an ordinary redraw.
 The material configuration itself never creates a visible effect instance;
 only an existing surface assignment can require composition.
 
+## Material program selection
+
+The additive `astrea.control` v1 commands are:
+
+- `material.program.catalog.get` with `{}` returns the bounded qualified
+  Material Program Catalog snapshot.
+- `material.program.get` with `{}` returns the requested/effective selection
+  snapshot.
+- `material.program.set` accepts a complete version-one object containing
+  `version` and `requestedProgram`, and returns the authoritative selection
+  snapshot.
+
+The catalog contains the valid `OnDamage`/`Backdrop` subset of the Trusted
+Effect Registry that has only `UniformOnly` parameters and no
+`TargetContent`/`StaticTexture` source. The built-in
+`system.background_blur` is first and is the default and fallback. A set request
+must name a currently registered qualified program. It may be remembered when
+the active renderer cannot execute effects; renderer availability is reported
+separately from Advanced override capabilities.
+
+Selection is persisted separately at
+`$XDG_CONFIG_HOME/AstreaOS/typhon/material-program.json`, or
+`$HOME/.config/AstreaOS/typhon/material-program.json` when
+`XDG_CONFIG_HOME` is unset. This private file stores requested intent only. It
+does not store the effective fallback, registry generation, renderer
+availability, or catalog contents. Missing or newly unqualified requested
+programs fall back to `system.background_blur` without rewriting the request;
+they become effective again automatically when a later successful registry
+generation qualifies them. Failed saves publish no selection change, and an
+identical set is a no-op.
+
+This selection is independent of `material.config.get` and
+`material.config.set`. Phase 2A `MaterialConfiguration` remains persisted in
+`material.json` and continues to update `system.background_blur` while a
+trusted-local program is selected. No material-program parameter-description
+or parameter-override command is implemented here.
+
 Cursor changes, wallpaper commands, window actions, and shell protocol remain
 unavailable.
 

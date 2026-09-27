@@ -285,6 +285,38 @@ impl super::CompositorState {
     }
 
     pub(in crate::compositor) fn resolved_effect_scene(&self) -> ResolvedEffectScene {
+        let registry_generation = self.trusted_effect_registry.current();
+        let material_selection = self.material_program_control.snapshot(
+            &registry_generation,
+            self.material_program_rendering_available,
+        );
+        let selected_effect = registry_generation
+            .effects
+            .get(&material_selection.effective_program);
+        let selected_effect_with_parameters = selected_effect.and_then(|effect| {
+            effect
+                .default_parameter_block()
+                .ok()
+                .map(|parameters| (effect, parameters))
+        });
+        let (selected_program, selected_parameter_block, selected_frame_demand) =
+            selected_effect_with_parameters.map_or_else(
+                || {
+                    (
+                        crate::effects::builtin_background_blur_program_id(),
+                        EffectParameterBlock::default(),
+                        EffectFrameDemand::OnDamage,
+                    )
+                },
+                |(effect, parameters)| {
+                    (
+                        effect.program.program.id,
+                        parameters,
+                        effect.program.program.frame_demand,
+                    )
+                },
+            );
+
         let mut instances = self
             .internal_surface_effects
             .values()
@@ -326,20 +358,20 @@ impl super::CompositorState {
                 };
                 instances.push(ResolvedEffectInstance {
                     id: background_effect_instance_id(surface.surface_id),
-                    program: crate::effects::builtin_background_blur_program_id(),
+                    program: selected_program,
                     anchor: EffectAnchor::BeforeSurface(surface.surface_id),
                     signature: internal_effect_signature(
                         surface.surface_id,
                         EffectAnchor::BeforeSurface(surface.surface_id),
-                        crate::effects::builtin_background_blur_program_id(),
+                        selected_program,
                         &assignment.region,
-                        &EffectParameterBlock::default(),
+                        &selected_parameter_block,
                     ),
-                    frame_demand: EffectFrameDemand::OnDamage,
+                    frame_demand: selected_frame_demand,
                     visual_group: self.visual_group_for_surface(surface.surface_id),
                     region: assignment.region,
                     target_bounds,
-                    parameter_block: EffectParameterBlock::default(),
+                    parameter_block: selected_parameter_block.clone(),
                     anchor_scope: assignment.anchor_scope,
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
                         surface.surface_id,
