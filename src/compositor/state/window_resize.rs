@@ -421,7 +421,7 @@ impl CompositorState {
         }
     }
 
-    fn update_toplevel_visual_render_assignment_with_root_commit(
+    pub(in crate::compositor) fn update_toplevel_visual_render_assignment_with_root_commit(
         &mut self,
         root_surface_id: u32,
         root_commit_sequence: Option<SurfaceCommitSequence>,
@@ -456,9 +456,8 @@ impl CompositorState {
             self.toplevel_visual_geometries.remove(&root_surface_id);
         }
         let geometry = self
-            .surface_window_geometries
-            .get(&root_surface_id)
-            .copied();
+            .effective_xdg_window_geometry(root_surface_id)
+            .map(|geometry| geometry.geometry);
         let authoritative = self.surface_placement(root_surface_id);
         let visual = self
             .toplevel_visual_geometries
@@ -480,10 +479,12 @@ impl CompositorState {
                         .renderable_surfaces
                         .iter()
                         .find(|surface| surface.surface_id == root_surface_id);
-                    let (width, height) = self
-                        .xdg_window_geometry_size(root_surface_id)
-                        .or_else(|| surface.map(|surface| (surface.width, surface.height)))
-                        .unwrap_or_default();
+                    let size = if self.xdg_surface_lifecycles.contains_key(&root_surface_id) {
+                        self.xdg_window_geometry_size(root_surface_id)
+                    } else {
+                        surface.map(|surface| (surface.width, surface.height))
+                    };
+                    let (width, height) = size.unwrap_or_default();
                     (authoritative, width, height, None)
                 })
             });

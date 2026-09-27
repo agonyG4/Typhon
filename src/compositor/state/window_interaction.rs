@@ -993,9 +993,8 @@ impl CompositorState {
         };
         if compositor_debug_surface_logging_enabled() {
             let committed_xdg_window_geometry = self
-                .surface_window_geometries
-                .get(&root_surface_id)
-                .copied();
+                .effective_xdg_window_geometry(root_surface_id)
+                .map(|geometry| geometry.geometry);
             let derived_root_render_placement = super::window_resize::derive_root_render_placement(
                 canonical_geometry.placement,
                 committed_xdg_window_geometry,
@@ -1754,9 +1753,8 @@ impl CompositorState {
                     && compositor_debug_surface_logging_enabled()
                 {
                     let committed_xdg_window_geometry = self
-                        .surface_window_geometries
-                        .get(&interaction.root_surface_id)
-                        .copied();
+                        .effective_xdg_window_geometry(interaction.root_surface_id)
+                        .map(|geometry| geometry.geometry);
                     let derived_root_render_placement =
                         super::window_resize::derive_root_render_placement(
                             placement,

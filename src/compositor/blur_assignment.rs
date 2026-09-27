@@ -468,9 +468,8 @@ impl super::CompositorState {
             BlurBackend::Wayland => synthetic_wayland_window_candidate(
                 origin,
                 &raw_surface_candidate,
-                self.surface_window_geometries
-                    .get(&root_surface_id)
-                    .copied(),
+                self.effective_xdg_window_geometry(root_surface_id)
+                    .map(|geometry| geometry.geometry),
             ),
             BlurBackend::Xwayland => raw_surface_candidate,
         };

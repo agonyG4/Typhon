@@ -81,7 +81,7 @@ fn zero_sized_xdg_mode_transition_state(surface_id: u32, configure_serial: u32) 
         .entry(surface_id)
         .or_default()
         .record_configure(configure_serial);
-    state.surface_window_geometries.insert(
+    state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
     );
@@ -888,7 +888,7 @@ fn mode_transition_visual_geometry_stays_coherent_until_client_commit() {
         ToplevelMode::Normal,
     );
     let floating = WindowGeometry::new(SurfacePlacement::absolute_root_at(120, 90), 900, 700);
-    state.surface_window_geometries.insert(
+    state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(
             floating.placement.local_x,
@@ -919,7 +919,7 @@ fn mode_transition_visual_geometry_stays_coherent_until_client_commit() {
         .expect("fullscreen-target SSD instance");
     assert_eq!(instance.scene_snapshot().bounds().2, 1920);
 
-    state.surface_window_geometries.insert(
+    state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(
             fullscreen_target.placement.local_x,
@@ -953,8 +953,7 @@ fn zero_sized_xdg_mode_visual_survives_animation_endpoint_without_client_respons
     let source = SurfacePlacement::absolute_root_at(160, 130);
     let target = SurfacePlacement::absolute_root_at(120, 90);
     state
-        .surface_window_geometries
-        .insert(surface_id, XdgWindowGeometry::new(0, 0, 900, 700));
+        .set_test_effective_xdg_window_geometry(surface_id, XdgWindowGeometry::new(0, 0, 900, 700));
     state.set_surface_placement(surface_id, target);
     state.rebuild_active_scene_view();
     state.install_xdg_mode_transition_visual_geometry(
@@ -1058,7 +1057,7 @@ fn xdg_mode_transition_without_an_emitted_configure_uses_generic_convergence() {
         ToplevelMode::Normal,
     );
     let target = SurfacePlacement::absolute_root_at(120, 90);
-    state.surface_window_geometries.insert(
+    state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
     );
@@ -1218,7 +1217,7 @@ fn repeated_mode_transition_visual_geometry_never_mixes_committed_sizes() {
             Some(fullscreen),
             "cycle {cycle}: entering fullscreen must use one target geometry"
         );
-        state.surface_window_geometries.insert(
+        state.set_test_effective_xdg_window_geometry(
             surface_id,
             XdgWindowGeometry::new(
                 fullscreen.placement.local_x,
@@ -1240,7 +1239,7 @@ fn repeated_mode_transition_visual_geometry_never_mixes_committed_sizes() {
             Some(floating),
             "cycle {cycle}: restoring must use the saved floating target"
         );
-        state.surface_window_geometries.insert(
+        state.set_test_effective_xdg_window_geometry(
             surface_id,
             XdgWindowGeometry::new(
                 floating.placement.local_x,

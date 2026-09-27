@@ -39,6 +39,41 @@ there is no alternate runtime to hide that failure.
 The source-layout check requires every retained Rust file to be connected to
 the module tree and keeps production modules below the configured size limits.
 
+## Effective XDG window geometry
+
+The compositor has one logical authority for native XDG window geometry.
+Pending explicit requests are double-buffered protocol state and do not affect
+current rendering, window management, hit testing, popup placement, resize, or
+restore behavior before their `wl_surface.commit` is published.
+
+A committed explicit request with no positive committed surface-tree bounds is
+kept in `AwaitingBounds` as a client-compatibility policy. It is not effective
+geometry, and this deferred resolution is not a protocol requirement. When
+positive bounds become available, Typhon intersects the request once with the
+bounding rectangle of the committed root `wl_surface` and its real
+`wl_subsurface` descendants. A successful result is `ExplicitEffective` and
+stays frozen until another explicit request commits. A usable tree with no
+positive intersection is an invalid XDG window geometry and follows the XDG
+protocol-error path.
+
+If the client has never established explicit geometry, `ImplicitSurfaceTree`
+geometry dynamically follows committed logical dimensions and committed
+subsurface positions throughout the real `wl_subsurface` tree. XDG popups,
+buffer-position offsets, server decorations, and presentation transforms are
+not part of these bounds.
+
+Synchronized tree commits resolve geometry only after all committed root and
+child state in that publication is installed. The canonical window-frame
+placement is the top-left of effective XDG geometry; root `wl_surface` render
+placement compensates for the geometry origin:
+
+```text
+root_render_origin = canonical_frame_origin - effective_xdg_geometry_origin
+```
+
+Canonical window-frame placement and root-buffer render placement are distinct.
+Buffer offsets are presentation state and are not part of XDG window geometry.
+
 ## Blur and material ownership
 
 `ext-background-effect-v1` is a semantic per-surface blur request. It carries

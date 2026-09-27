@@ -64,6 +64,23 @@ pub(super) fn window_open_animation_plan(
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn begin_window_open_animation_after_surface_tree_publication(
+        &mut self,
+        root_surface_id: u32,
+    ) {
+        if self.surface_tree_generation.is_some() {
+            if !self
+                .surface_tree_pending_window_open_animations
+                .contains(&root_surface_id)
+            {
+                self.surface_tree_pending_window_open_animations
+                    .push(root_surface_id);
+            }
+        } else {
+            self.maybe_begin_window_open_animation(root_surface_id);
+        }
+    }
+
     pub(in crate::compositor) fn maybe_begin_window_open_animation(
         &mut self,
         root_surface_id: u32,

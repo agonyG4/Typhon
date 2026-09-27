@@ -231,6 +231,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         reply: Sender<Option<u32>>,
     },
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
+    CaptureEffectiveXdgWindowGeometry {
+        surface_id: u32,
+        reply: Sender<Option<XdgWindowGeometry>>,
+    },
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureRootWindowGeometry {
         root_surface_id: u32,
@@ -770,12 +774,6 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     surface.width = width;
                                     surface.height = height;
                                 }
-                                if let Some(geometry) =
-                                    server.state.surface_window_geometries.get_mut(&surface_id)
-                                {
-                                    geometry.width = width as i32;
-                                    geometry.height = height as i32;
-                                }
                             }
                             server.state.reconcile_all_surface_output_memberships();
                             server
@@ -1088,14 +1086,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     |surface_id| {
                                         server
                                             .state
-                                            .surface_window_geometries
-                                            .get(surface_id)
-                                            .copied()
+                                            .committed_explicit_effective_xdg_geometry(*surface_id)
                                     },
                                 )
                             } else {
                                 None
                             };
+                        let _ = reply.send(geometry);
+                    }
+                    ServerCommand::CaptureEffectiveXdgWindowGeometry { surface_id, reply } => {
+                        let geometry = server
+                            .state
+                            .effective_xdg_window_geometry(surface_id)
+                            .map(|geometry| geometry.geometry);
                         let _ = reply.send(geometry);
                     }
                     ServerCommand::CaptureToplevelVisualGeometry(reply) => {
@@ -1178,9 +1181,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     visual_geometry,
                                     committed_window_geometry: server
                                         .state
-                                        .surface_window_geometries
-                                        .get(&root_surface_id)
-                                        .copied(),
+                                        .committed_explicit_effective_xdg_geometry(root_surface_id),
                                     renderable_placement: surface.placement,
                                     render_placement: surface.render_placement,
                                     resolved_render_origin: origins[index],
@@ -1458,8 +1459,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             popup_grab_active: server.state.popup_grab.is_some(),
                             window_geometry_present: server
                                 .state
-                                .surface_window_geometries
-                                .contains_key(&tracked_surface_id),
+                                .committed_explicit_effective_xdg_geometry(tracked_surface_id)
+                                .is_some(),
                             placement: server
                                 .state
                                 .surface_placements
@@ -2590,6 +2591,19 @@ pub(in crate::compositor::tests) fn capture_committed_window_geometry(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report committed window geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_effective_xdg_window_geometry(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<XdgWindowGeometry> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureEffectiveXdgWindowGeometry { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report effective XDG window geometry")
 }
 
 pub(in crate::compositor::tests) fn capture_toplevel_visual_geometry(

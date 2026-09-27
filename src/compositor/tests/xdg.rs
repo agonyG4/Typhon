@@ -1472,6 +1472,203 @@ fn wayland_client_xdg_popup_uses_parent_and_popup_window_geometry_for_placement(
 }
 
 #[test]
+fn popup_placement_ignores_uncommitted_parent_and_popup_geometry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let parent = compositor.create_surface(&qh, ());
+    let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = parent_xdg_surface.get_toplevel(&qh, ());
+    parent.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    parent_xdg_surface.set_window_geometry(8, 9, 100, 80);
+    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let parent_id = capture_focused_surface_id(&commands).expect("mapped parent toplevel");
+
+    // This request is double-buffered and intentionally has no parent commit.
+    parent_xdg_surface.set_window_geometry(30, 40, 60, 50);
+
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+    let positioner = wm_base.create_positioner(&qh, ());
+    positioner.set_size(40, 30);
+    positioner.set_anchor_rect(10, 20, 1, 1);
+    positioner.set_anchor(client_xdg_positioner::Anchor::TopLeft);
+    positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
+    positioner.set_reactive();
+    let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+    popup_xdg_surface.set_window_geometry(2, 3, 40, 30);
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )
+    .unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+
+    let popup_placement = || {
+        let surfaces = capture_renderable_surface_snapshot(&commands);
+        surfaces
+            .iter()
+            .find(|surface| surface.parent_surface_id.is_some())
+            .cloned()
+            .unwrap_or_else(|| panic!("popup is not renderable: {surfaces:?}"))
+    };
+    let initial_popup = popup_placement();
+    assert_eq!(
+        capture_effective_xdg_window_geometry(&commands, initial_popup.surface_id),
+        Some(XdgWindowGeometry::new(2, 3, 38, 27))
+    );
+    assert_eq!((initial_popup.local_x, initial_popup.local_y), (16, 26));
+    assert_eq!(
+        capture_xdg_root_placement_authority(&commands, initial_popup.surface_id)
+            .expect("popup placement authority")
+            .canonical_surface_placement
+            .local_x,
+        16
+    );
+
+    // Neither the pending parent request nor this popup request may affect a
+    // semantic placement triggered before their respective commits.
+    popup_xdg_surface.set_window_geometry(20, 20, 10, 10);
+    popup.reposition(&positioner, 77);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        (popup_placement().local_x, popup_placement().local_y),
+        (16, 26)
+    );
+
+    popup_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        (popup_placement().local_x, popup_placement().local_y),
+        (-2, 9)
+    );
+
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        capture_xdg_root_placement_authority(&commands, initial_popup.surface_id)
+            .expect("reactive popup placement authority")
+            .canonical_surface_placement,
+        SurfacePlacement::subsurface(parent_id, 20, 40)
+    );
+
+    // The reactive configure changes semantic placement; the current popup
+    // image follows that placement when the client commits its next content.
+    commit_test_buffered_surface(&popup_surface, &shm, &qh, 40, 30).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        (popup_placement().local_x, popup_placement().local_y),
+        (20, 40)
+    );
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn popup_placement_uses_the_parents_implicit_subsurface_geometry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let parent = compositor.create_surface(&qh, ());
+    let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = parent_xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_position(-20, -10);
+    parent.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&child, &shm, &qh, 200, 100).unwrap();
+    commit_test_buffered_surface(&parent, &shm, &qh, 400, 300).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    let parent_id = capture_focused_surface_id(&commands).expect("mapped parent toplevel");
+    let parent_geometry = capture_xdg_root_placement_authority(&commands, parent_id)
+        .expect("parent geometry authority")
+        .logical_window_geometry
+        .expect("implicit parent geometry");
+    assert_eq!((parent_geometry.width, parent_geometry.height), (420, 310));
+    assert_eq!(
+        capture_committed_window_geometry(&commands),
+        None,
+        "the parent remains never-explicit"
+    );
+
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+    let positioner = wm_base.create_positioner(&qh, ());
+    positioner.set_size(40, 30);
+    positioner.set_anchor_rect(10, 20, 1, 1);
+    positioner.set_anchor(client_xdg_positioner::Anchor::TopLeft);
+    positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
+    let _popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )
+    .unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+
+    let popup_surface = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.width == 40 && surface.height == 30)
+        .expect("popup renderable");
+    assert_eq!((popup_surface.local_x, popup_surface.local_y), (-10, 10));
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn xdg_popup_set_window_geometry_does_not_reconfigure_non_reactive_popup() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

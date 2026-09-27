@@ -838,7 +838,7 @@ pub(in crate::compositor::tests) fn capture_syncobj_resize_window_geometry_snaps
     let before_blocked_commit = capture_renderable_surface_snapshot(commands);
     let before_blocked_geometry = capture_committed_window_geometry(commands);
 
-    xdg_surface.set_window_geometry(16, 30, state.toplevel_width, state.toplevel_height);
+    xdg_surface.set_window_geometry(16, 30, 1_000, 800);
     sync_surface.set_acquire_point(&sync_acquire_timeline, 0, 3);
     sync_surface.set_release_point(&sync_release_timeline, 0, 4);
     surface.attach(Some(&second_buffer), 0, 0);

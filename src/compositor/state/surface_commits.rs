@@ -25,8 +25,7 @@ impl CompositorState {
         );
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         let previous_placement = self.surface_placement(surface_id);
-        let window_geometry_changed =
-            self.apply_committed_window_geometry(surface_id, window_geometry);
+        let xdg_geometry_publication = self.capture_xdg_geometry_before_surface_commit(surface_id);
         let resize_placement = match self.take_pending_resize_commit_placement(surface_id, &pending)
         {
             Ok(placement) => placement,
@@ -109,7 +108,7 @@ impl CompositorState {
         }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
-                "oblivion-one compositor: commit surface={surface_id} wl_buffer={} buffer_id={} buffer={}x{} surface={}x{} offset={},{} shm={} dmabuf={} dmabuf_layout={:?} commit_resize_serial={:?} pending_resize={:?} window_geometry={:?}",
+                "oblivion-one compositor: commit surface={surface_id} wl_buffer={} buffer_id={} buffer={}x{} surface={}x{} offset={},{} shm={} dmabuf={} dmabuf_layout={:?} commit_resize_serial={:?} pending_resize={:?} window_geometry_request={:?} effective_window_geometry={:?}",
                 pending.resource.id().protocol_id(),
                 pending.data.buffer_id().get(),
                 buffer_width,
@@ -123,9 +122,9 @@ impl CompositorState {
                 pending.data.dmabuf_handle(),
                 pending.resize_commit.as_deref().map(|resize| resize.serial),
                 resize_commit.map(|resize| resize.serial),
-                window_geometry
-                    .as_ref()
-                    .or_else(|| self.surface_window_geometries.get(&surface_id)),
+                window_geometry,
+                self.effective_xdg_window_geometry(surface_id)
+                    .map(|geometry| geometry.geometry),
             );
         }
         if self.popup_surfaces.contains_key(&surface_id) && !self.popup_node_is_alive(surface_id) {
@@ -199,14 +198,14 @@ impl CompositorState {
                 buffer_size.width,
                 buffer_size.height,
             );
-            if self
-                .surface_window_geometries
-                .contains_key(&root_surface_id)
-                || self
-                    .toplevel_visual_geometries
-                    .contains_key(&root_surface_id)
-            {
-                self.update_toplevel_visual_render_assignment(root_surface_id);
+            if let Some((xdg_root, before)) = xdg_geometry_publication {
+                self.publish_xdg_geometry_after_surface_commit(
+                    xdg_root,
+                    surface_id,
+                    before,
+                    window_geometry,
+                    commit_sequence.get(),
+                );
             }
             if let Some(resize_commit) = resize_commit {
                 self.complete_applied_resize_transaction(surface_id, resize_commit);
@@ -290,18 +289,7 @@ impl CompositorState {
             .get(updated_surface_index)
             .map(RenderableSurface::buffer_size);
         let placement_changed = previous_placement != placement;
-        let visual_state_changed = visual_mapping_changed || window_geometry_changed;
-        if surface_id != root_surface_id
-            && visual_state_changed
-            && (self
-                .surface_window_geometries
-                .contains_key(&root_surface_id)
-                || self
-                    .toplevel_visual_geometries
-                    .contains_key(&root_surface_id))
-        {
-            self.update_toplevel_visual_render_assignment(root_surface_id);
-        }
+        let surface_visual_state_changed = visual_mapping_changed;
         let stack_reorder_needed = !surface_was_renderable || placement_changed;
         if stack_reorder_needed {
             self.compliance_metrics.note_surface_commit_stack_reorder();
@@ -333,7 +321,7 @@ impl CompositorState {
                 self.refresh_active_scene_popup_view();
                 self.raise_renderable_surface_tree(surface_id);
             }
-            if visual_state_changed {
+            if surface_visual_state_changed {
                 self.refresh_active_scene_surface_tree(root_surface_id);
             }
         }
@@ -346,6 +334,19 @@ impl CompositorState {
         for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
+        let window_geometry_changed = xdg_geometry_publication.is_some_and(|(xdg_root, before)| {
+            self.publish_xdg_geometry_after_surface_commit(
+                xdg_root,
+                surface_id,
+                before,
+                window_geometry,
+                commit_sequence.get(),
+            )
+        });
+        if committed_popup && surface_was_renderable && !window_geometry_changed {
+            self.compliance_metrics.note_surface_commit_geometry_noop();
+        }
+        let visual_state_changed = surface_visual_state_changed || window_geometry_changed;
         if let Some(release) = shm_release {
             self.release_materialized_shm(release, copy_to_release_us);
         }
@@ -362,13 +363,24 @@ impl CompositorState {
             self.qualify_pending_normal_restore_response(root_surface_id, commit_sequence);
             let normal_restore_resolved = self.surface_tree_generation.is_none()
                 && self.try_finalize_pending_normal_restore_from_committed_state(root_surface_id);
-            if visual_state_changed && !normal_restore_resolved {
+            if surface_visual_state_changed
+                && self
+                    .toplevel_visual_geometries
+                    .contains_key(&root_surface_id)
+                && !normal_restore_resolved
+                && self.surface_tree_generation.is_none()
+            {
                 self.update_toplevel_visual_render_assignment_after_root_commit(
                     root_surface_id,
                     commit_sequence,
                 );
             }
-        } else if visual_state_changed {
+        } else if surface_visual_state_changed
+            && self
+                .toplevel_visual_geometries
+                .contains_key(&root_surface_id)
+            && self.surface_tree_generation.is_none()
+        {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
         self.publish_surface_generation(
@@ -405,7 +417,7 @@ impl CompositorState {
             && surface_id == root_surface_id
             && matches!(self.surface_role(surface_id), SurfaceRole::XdgToplevel)
         {
-            self.maybe_begin_window_open_animation(surface_id);
+            self.begin_window_open_animation_after_surface_tree_publication(surface_id);
         }
         true
     }
@@ -485,14 +497,11 @@ impl CompositorState {
             return false;
         };
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        let xdg_geometry_publication = self.capture_xdg_geometry_before_surface_commit(surface_id);
         let mapping_changed = current.current_content_mapping() != Ok(mapping);
-        let window_geometry_changed =
-            self.committed_window_geometry_changed(surface_id, window_geometry);
-        if window_geometry_changed {
-            self.apply_committed_window_geometry(surface_id, window_geometry);
-        }
+        let geometry_request_present = window_geometry.is_some();
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;
-        if damage.is_none() && !mapping_changed && !window_geometry_changed {
+        if damage.is_none() && !mapping_changed && !geometry_request_present {
             if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
                 current.update_content_mapping(mapping, commit_sequence);
             }
@@ -527,7 +536,7 @@ impl CompositorState {
         );
         let placement = self.surface_placement(surface_id);
         let damage = damage.unwrap_or(RenderableSurfaceDamage::Empty);
-        let damage = if mapping_changed || window_geometry_changed {
+        let damage = if mapping_changed || geometry_request_present {
             self.compliance_metrics
                 .note_surface_commit_mapping_full_promotion();
             RenderableSurfaceDamage::Full
@@ -561,13 +570,12 @@ impl CompositorState {
             mapping.surface_size,
             resize_pending,
         );
-        let pointer_geometry_changed = existing.x != mapping.x
+        let mut pointer_geometry_changed = existing.x != mapping.x
             || existing.y != mapping.y
             || existing.width != surface_size.width
             || existing.height != surface_size.height
-            || existing.placement != placement
-            || window_geometry_changed;
-        let output_geometry_changed = pointer_geometry_changed;
+            || existing.placement != placement;
+        let mut output_geometry_changed = pointer_geometry_changed;
         let visual_mapping_changed = existing.x != mapping.x
             || existing.y != mapping.y
             || existing.width != surface_size.width
@@ -618,13 +626,23 @@ impl CompositorState {
             journal_size.width,
             journal_size.height,
         );
-        let visual_assignment_updated = (visual_mapping_changed || window_geometry_changed)
-            && (self
-                .surface_window_geometries
+        let window_geometry_changed = xdg_geometry_publication.is_some_and(|(xdg_root, before)| {
+            self.publish_xdg_geometry_after_surface_commit(
+                xdg_root,
+                surface_id,
+                before,
+                window_geometry,
+                commit_sequence.get(),
+            )
+        });
+        pointer_geometry_changed |= window_geometry_changed;
+        output_geometry_changed |= window_geometry_changed;
+        let visual_assignment_updated = visual_mapping_changed
+            && xdg_geometry_publication.is_some_and(|(xdg_root, _)| xdg_root == root_surface_id)
+            && self
+                .toplevel_visual_geometries
                 .contains_key(&root_surface_id)
-                || self
-                    .toplevel_visual_geometries
-                    .contains_key(&root_surface_id));
+            && self.surface_tree_generation.is_none();
         if visual_assignment_updated {
             if surface_id == root_surface_id {
                 self.update_toplevel_visual_render_assignment_after_root_commit(
@@ -656,58 +674,6 @@ impl CompositorState {
             );
         }
         true
-    }
-
-    pub(in crate::compositor) fn apply_committed_window_geometry(
-        &mut self,
-        surface_id: u32,
-        window_geometry: Option<XdgWindowGeometry>,
-    ) -> bool {
-        let Some(window_geometry) = window_geometry else {
-            return false;
-        };
-        let changed = self
-            .surface_window_geometries
-            .insert(surface_id, window_geometry)
-            != Some(window_geometry);
-        if !changed {
-            self.compliance_metrics.note_surface_commit_geometry_noop();
-            return false;
-        }
-        self.update_popup_surface_placement_from_committed_state(surface_id);
-        if let Some(positioner) = self
-            .popup_surfaces
-            .get(&surface_id)
-            .map(|popup| popup.positioner)
-            && positioner.reactive
-            && self.xdg_surface_is_configured(surface_id)
-        {
-            self.configure_popup_surface(surface_id, positioner, None);
-        }
-        let child_popups = self
-            .popup_surfaces
-            .iter()
-            .filter_map(|(popup_surface_id, popup)| {
-                (popup.parent_surface_id == Some(surface_id)
-                    && popup.positioner.reactive
-                    && self.xdg_surface_is_configured(*popup_surface_id))
-                .then_some((*popup_surface_id, popup.positioner))
-            })
-            .collect::<Vec<_>>();
-        for (popup_surface_id, positioner) in child_popups {
-            self.configure_popup_surface(popup_surface_id, positioner, None);
-        }
-        changed
-    }
-
-    pub(in crate::compositor) fn committed_window_geometry_changed(
-        &self,
-        surface_id: u32,
-        window_geometry: Option<XdgWindowGeometry>,
-    ) -> bool {
-        window_geometry.is_some_and(|geometry| {
-            self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
-        })
     }
 
     pub(in crate::compositor::state) fn refresh_pointer_focus_after_geometry_change(
@@ -1040,6 +1006,7 @@ impl CompositorState {
             window_geometry,
         } = state;
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        let xdg_geometry_publication = self.capture_xdg_geometry_before_surface_commit(surface_id);
         if self.is_cursor_surface(surface_id) {
             if let Some(mapping) = mapping {
                 self.commit_cursor_surface_mapping_only(
@@ -1062,28 +1029,7 @@ impl CompositorState {
         } else {
             self.capture_acked_resize_for_surface_commit(surface_id)
         };
-        if let Some(snapshot) = resize_commit.as_mut() {
-            if let Some(window_geometry) = window_geometry {
-                *snapshot = snapshot.with_committed_window_geometry(window_geometry);
-            }
-            let committed_size = window_geometry
-                .or_else(|| self.surface_window_geometries.get(&surface_id).copied())
-                .map(|geometry| BufferSize {
-                    width: geometry.width as u32,
-                    height: geometry.height as u32,
-                })
-                .or_else(|| mapping.map(|mapping| mapping.surface_size))
-                .or_else(|| self.current_committed_surface_content_size(surface_id))
-                .unwrap_or(BufferSize {
-                    width: 1,
-                    height: 1,
-                });
-            *snapshot = snapshot.with_committed_size(committed_size.width, committed_size.height);
-        }
         let has_current_buffer = self.current_surface_buffers.contains_key(&surface_id);
-        if !has_current_buffer {
-            self.apply_committed_window_geometry(surface_id, window_geometry);
-        }
         if has_current_buffer && let Some(mapping) = mapping {
             self.commit_surface_mapping_only(
                 surface_id,
@@ -1092,16 +1038,60 @@ impl CompositorState {
                 mapping,
                 window_geometry,
             );
+        } else if let Some((xdg_root, before)) = xdg_geometry_publication {
+            self.publish_xdg_geometry_after_surface_commit(
+                xdg_root,
+                surface_id,
+                before,
+                window_geometry,
+                commit_sequence.get(),
+            );
+        }
+        if let Some(snapshot) = resize_commit.as_mut() {
+            if self.committed_xdg_geometry_is_invalid(surface_id) {
+                *snapshot = snapshot.without_effective_xdg_window_geometry();
+            }
+            let effective_size =
+                self.effective_xdg_window_geometry(surface_id)
+                    .and_then(|geometry| {
+                        Some(BufferSize {
+                            width: u32::try_from(geometry.geometry.width).ok()?,
+                            height: u32::try_from(geometry.geometry.height).ok()?,
+                        })
+                    });
+            if let Some(effective) = self
+                .effective_xdg_window_geometry(surface_id)
+                .map(|geometry| geometry.geometry)
+            {
+                *snapshot = snapshot.with_effective_xdg_window_geometry(effective);
+            }
+            let committed_size = if self.committed_xdg_geometry_is_invalid(surface_id) {
+                BufferSize {
+                    width: 0,
+                    height: 0,
+                }
+            } else {
+                effective_size
+                    .or_else(|| mapping.map(|mapping| mapping.surface_size))
+                    .or_else(|| self.current_committed_surface_content_size(surface_id))
+                    .unwrap_or(BufferSize {
+                        width: 1,
+                        height: 1,
+                    })
+            };
+            *snapshot = snapshot.with_committed_size(committed_size.width, committed_size.height);
         }
         if let Some(resize_commit) = resize_commit {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
         }
         if surface_id == root_surface_id {
             self.qualify_pending_normal_restore_response(root_surface_id, commit_sequence);
-            self.update_toplevel_visual_render_assignment_after_root_commit(
-                root_surface_id,
-                commit_sequence,
-            );
+            if self.surface_tree_generation.is_none() {
+                self.update_toplevel_visual_render_assignment_after_root_commit(
+                    root_surface_id,
+                    commit_sequence,
+                );
+            }
         }
         true
     }
@@ -1111,9 +1101,20 @@ impl CompositorState {
         surface_id: u32,
         resize: ResizeCommitSnapshot,
     ) -> bool {
+        if self.committed_xdg_geometry_is_invalid(surface_id) {
+            return false;
+        }
+        if self.surface_tree_generation.is_some() {
+            self.surface_tree_pending_resize_completions
+                .push((surface_id, resize));
+            return true;
+        }
         let committed_size = resize
-            .committed_window_geometry
-            .or_else(|| self.surface_window_geometries.get(&surface_id).copied())
+            .effective_xdg_window_geometry
+            .or_else(|| {
+                self.effective_xdg_window_geometry(surface_id)
+                    .map(|geometry| geometry.geometry)
+            })
             .map(|geometry| BufferSize {
                 width: geometry.width as u32,
                 height: geometry.height as u32,
@@ -1848,7 +1849,7 @@ impl CompositorState {
         if surface_id == self.root_surface_id_for_surface(surface_id)
             && matches!(self.surface_role(surface_id), SurfaceRole::XdgToplevel)
         {
-            self.maybe_begin_window_open_animation(surface_id);
+            self.begin_window_open_animation_after_surface_tree_publication(surface_id);
         }
         if surface_tree_debug_enabled() {
             eprintln!(

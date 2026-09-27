@@ -418,7 +418,7 @@ pub(super) struct ResizeCommitSnapshot {
     pub(super) resizing: bool,
     pub(super) emitted_at: Instant,
     pub(super) committed_size: Option<(u32, u32)>,
-    pub(super) committed_window_geometry: Option<XdgWindowGeometry>,
+    pub(super) effective_xdg_window_geometry: Option<XdgWindowGeometry>,
     pub(super) buffer_id: Option<u64>,
     pub(super) interaction_id: ResizeInteractionId,
 }
@@ -444,11 +444,17 @@ impl ResizeCommitSnapshot {
         self
     }
 
-    pub(super) const fn with_committed_window_geometry(
+    pub(super) const fn with_effective_xdg_window_geometry(
         mut self,
         window_geometry: XdgWindowGeometry,
     ) -> Self {
-        self.committed_window_geometry = Some(window_geometry);
+        self.effective_xdg_window_geometry = Some(window_geometry);
+        self
+    }
+
+    pub(super) const fn without_effective_xdg_window_geometry(mut self) -> Self {
+        self.committed_size = Some((0, 0));
+        self.effective_xdg_window_geometry = None;
         self
     }
 
@@ -818,7 +824,7 @@ fn snapshot_from_sent_resize(
         resizing: sent.resizing,
         emitted_at: sent.emitted_at,
         committed_size: None,
-        committed_window_geometry: None,
+        effective_xdg_window_geometry: None,
         buffer_id: None,
         interaction_id: sent.interaction_id,
     }

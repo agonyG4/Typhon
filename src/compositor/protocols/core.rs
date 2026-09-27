@@ -104,7 +104,9 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 state.apply_pending_toplevel_constraints(surface_id);
                 let pointer_constraint_state =
                     state.take_pending_pointer_constraint_surface_state(surface_id);
-                let window_geometry = state.pending_surface_window_geometries.remove(&surface_id);
+                let window_geometry = state
+                    .pending_xdg_window_geometry_requests
+                    .remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
                 let viewport_change = data.take_pending_viewport();

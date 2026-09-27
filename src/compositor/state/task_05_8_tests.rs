@@ -132,7 +132,7 @@ mod task_05_8_tests {
             resizing,
             emitted_at: Instant::now(),
             committed_size: Some((width, height)),
-            committed_window_geometry: None,
+            effective_xdg_window_geometry: None,
             buffer_id: None,
             interaction_id,
         }
@@ -1017,9 +1017,10 @@ mod task_05_8_tests {
             .surface_placements
             .insert(titlebar_id, titlebar.placement);
         state.append_renderable_surface(titlebar);
-        state
-            .surface_window_geometries
-            .insert(root_id, XdgWindowGeometry::new(0, -24, 944, 526));
+        state.set_test_effective_xdg_window_geometry(
+            root_id,
+            XdgWindowGeometry::new(0, -24, 944, 526),
+        );
         state.toplevel_visual_geometries.insert(
             root_id,
             ToplevelVisualGeometry {
@@ -1320,9 +1321,10 @@ mod task_05_8_tests {
             .surface_placements
             .insert(titlebar_id, titlebar.placement);
         state.append_renderable_surface(titlebar);
-        state
-            .surface_window_geometries
-            .insert(root_id, XdgWindowGeometry::new(0, -24, 944, 526));
+        state.set_test_effective_xdg_window_geometry(
+            root_id,
+            XdgWindowGeometry::new(0, -24, 944, 526),
+        );
         let geometry_a = WindowGeometry::new(SurfacePlacement::root_at(100, 100), 944, 526);
         state.toplevel_visual_geometries.insert(
             root_id,
@@ -1863,6 +1865,13 @@ mod task_05_8_tests {
             commit_sequence: 2,
             ..test_resize_snapshot(surface_id, interaction_id, false, 1000, 620)
         };
+        let committed_surface = state
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == surface_id)
+            .expect("committed root surface");
+        committed_surface.width = 1000;
+        committed_surface.height = 620;
         install_captured_snapshot(&mut state, surface_id, final_snapshot);
         assert!(state.complete_pending_resize_from_current_geometry(surface_id, final_snapshot));
         assert!(!state.active_toplevel_resizes.contains_key(&surface_id));
@@ -1937,9 +1946,10 @@ mod task_05_8_tests {
         let surface_id = 42;
         let interaction_id = ResizeInteractionId::new(1);
         state.append_renderable_surface(test_surface(surface_id, 944, 502));
-        state
-            .surface_window_geometries
-            .insert(surface_id, XdgWindowGeometry::new(16, 10, 944, 502));
+        state.set_test_effective_xdg_window_geometry(
+            surface_id,
+            XdgWindowGeometry::new(16, 10, 944, 502),
+        );
         state.active_toplevel_resizes.insert(
             surface_id,
             ActiveToplevelResize {

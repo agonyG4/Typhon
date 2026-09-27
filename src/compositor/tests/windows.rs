@@ -253,7 +253,7 @@ fn maximized_uses_reserved_usable_geometry() {
 }
 
 #[test]
-fn window_unmaximize_uses_unspecified_size_when_normal_geometry_is_unknown() {
+fn window_unmaximize_uses_root_only_implicit_geometry_when_no_explicit_geometry_exists() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -284,10 +284,11 @@ fn window_unmaximize_uses_unspecified_size_when_normal_geometry_is_unknown() {
     queue.roundtrip(&mut client_state).unwrap();
     let maximized =
         capture_root_window_geometry(&commands, root_surface_id).expect("maximized frame");
+    assert_eq!((maximized.width, maximized.height), (1280, 800));
     assert_eq!(
         capture_root_restore_geometry(&commands, root_surface_id),
-        None,
-        "the buffer size alone must not qualify as normal restore size"
+        Some(initial_normal),
+        "root-only implicit XDG geometry is the shared restore-size authority"
     );
 
     commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
@@ -295,12 +296,12 @@ fn window_unmaximize_uses_unspecified_size_when_normal_geometry_is_unknown() {
     queue.roundtrip(&mut client_state).unwrap();
     assert_eq!(
         (client_state.toplevel_width, client_state.toplevel_height),
-        (0, 0)
+        (300, 200)
     );
     assert_eq!(
         capture_root_window_geometry(&commands, root_surface_id),
-        Some(maximized),
-        "ACK without a root commit keeps the physical maximized frame installed"
+        Some(initial_normal),
+        "the known implicit geometry restores synchronously after ACK"
     );
 
     xdg_surface.set_window_geometry(10, 10, 520, 410);
@@ -1438,7 +1439,7 @@ fn state_with_preview_resize(
         resizing,
         emitted_at: Instant::now(),
         committed_size: Some((944, 502)),
-        committed_window_geometry: None,
+        effective_xdg_window_geometry: None,
         buffer_id: Some(identity.id().get()),
         interaction_id: desired.interaction_id,
     };
@@ -1468,8 +1469,7 @@ fn state_with_preview_resize(
         damage: RenderableSurfaceDamage::Full,
     });
     state
-        .surface_window_geometries
-        .insert(surface_id, XdgWindowGeometry::new(0, 0, 944, 502));
+        .set_test_effective_xdg_window_geometry(surface_id, XdgWindowGeometry::new(0, 0, 944, 502));
     state.active_toplevel_resizes.insert(
         surface_id,
         ActiveToplevelResize {
@@ -1976,7 +1976,11 @@ fn explicit_sync_resize_applies_buffer_and_window_geometry_atomically() {
         snapshots.before_blocked_geometry,
         snapshots.blocked_geometry
     );
-    assert_ne!(snapshots.blocked_geometry, snapshots.after_acquire_geometry);
+    assert_eq!(
+        snapshots.after_acquire_geometry,
+        Some(XdgWindowGeometry::new(16, 30, 356, 242)),
+        "resize completion must record the geometry clamped to the newly published buffer"
+    );
     assert_ne!(
         root_buffer_id(&snapshots.while_acquire_blocked),
         root_buffer_id(&snapshots.after_acquire_ready)

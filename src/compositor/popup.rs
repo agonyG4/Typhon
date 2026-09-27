@@ -1,6 +1,43 @@
 use wayland_protocols::xdg::shell::server::xdg_positioner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CommittedExplicitXdgWindowGeometry {
+    AwaitingBounds {
+        requested: XdgWindowGeometry,
+        commit_sequence: u64,
+    },
+    Effective {
+        requested: XdgWindowGeometry,
+        effective: XdgWindowGeometry,
+        commit_sequence: u64,
+    },
+    Invalid {
+        requested: XdgWindowGeometry,
+        commit_sequence: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffectiveXdgWindowGeometrySource {
+    ExplicitEffective,
+    ImplicitSurfaceTree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EffectiveXdgWindowGeometry {
+    pub(super) geometry: XdgWindowGeometry,
+    pub(super) source: EffectiveXdgWindowGeometrySource,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingXdgGeometryPublication {
+    pub(super) before: Option<EffectiveXdgWindowGeometry>,
+    pub(super) latest_request: Option<(XdgWindowGeometry, u64)>,
+    pub(super) latest_commit_sequence: Option<u64>,
+    pub(super) latest_root_commit_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct XdgWindowGeometry {
     pub(super) x: i32,
     pub(super) y: i32,

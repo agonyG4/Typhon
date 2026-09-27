@@ -331,8 +331,9 @@ use output::{
 use pacing::*;
 pub use plan::*;
 use popup::{
-    PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,
-    XdgWindowGeometry,
+    CommittedExplicitXdgWindowGeometry, EffectiveXdgWindowGeometry,
+    EffectiveXdgWindowGeometrySource, PendingXdgGeometryPublication, PopupAnchorRect,
+    PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState, XdgWindowGeometry,
 };
 pub use presentation::{
     FramePresentation, PresentationClock, PresentationKind, PresentationTimestamp,
@@ -818,8 +819,11 @@ pub struct CompositorState {
     subsurface_transactions: SubsurfaceTransactionState,
     subsurface_transaction_metrics: SubsurfaceTransactionMetrics,
     current_surface_buffers: HashMap<u32, CurrentSurfaceBuffer>,
-    surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
-    pending_surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
+    committed_explicit_xdg_window_geometries: HashMap<u32, CommittedExplicitXdgWindowGeometry>,
+    pending_xdg_window_geometry_requests: HashMap<u32, XdgWindowGeometry>,
+    surface_tree_xdg_geometry_publications: HashMap<u32, PendingXdgGeometryPublication>,
+    surface_tree_pending_resize_completions: Vec<(u32, ResizeCommitSnapshot)>,
+    surface_tree_pending_window_open_animations: Vec<u32>,
     surface_output_memberships: HashMap<u32, SurfaceOutputMembership>,
     preferred_output_transform: Option<wl_output::Transform>,
     xdg_surface_resources: HashMap<u32, xdg_surface::XdgSurface>,

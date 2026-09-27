@@ -223,9 +223,8 @@ impl CompositorState {
         let (hit_x, hit_y, _) = self.presentation_input_point_for_root(root_surface_id, x, y)?;
         let geometry = self.current_root_window_geometry(root_surface_id)?;
         let window_geometry = self
-            .surface_window_geometries
-            .get(&root_surface_id)
-            .copied();
+            .effective_xdg_window_geometry(root_surface_id)
+            .map(|geometry| geometry.geometry);
         let local_x = hit_x
             - f64::from(root_origin.0)
             - f64::from(

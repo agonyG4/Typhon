@@ -229,11 +229,11 @@ fn explicit_window_geometry_persists_across_unknown_restore_response_commit() {
     assert!(!capture_pending_normal_restore(&commands, root_surface_id));
     assert_eq!(
         capture_committed_window_geometry(&commands),
-        Some(XdgWindowGeometry::new(10, 10, 520, 410))
+        Some(XdgWindowGeometry::new(10, 10, 70, 50))
     );
     let restored = capture_root_window_geometry(&commands, root_surface_id)
         .expect("persistent explicit geometry finalizes the restore");
-    assert_eq!((restored.width, restored.height), (520, 410));
+    assert_eq!((restored.width, restored.height), (70, 50));
 
     stop_controllable_test_server(commands, server_thread);
 }

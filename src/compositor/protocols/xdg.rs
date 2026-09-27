@@ -755,7 +755,7 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     return;
                 }
                 state
-                    .pending_surface_window_geometries
+                    .pending_xdg_window_geometry_requests
                     .insert(surface_id, XdgWindowGeometry::new(x, y, width, height));
             }
             xdg_surface::Request::AckConfigure { serial } => {

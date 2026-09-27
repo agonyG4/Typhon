@@ -1581,7 +1581,7 @@ fn wayland_bufferless_window_geometry_none_is_not_a_delta() {
     connection.flush().unwrap();
     queue.roundtrip(&mut RegistryTestState::default()).unwrap();
 
-    xdg_surface.set_window_geometry(1, 2, 3, 1);
+    xdg_surface.set_window_geometry(1, 0, 3, 1);
     buffer.attach(&surface, 4, 2);
     surface.commit();
     connection.flush().unwrap();
@@ -1598,7 +1598,7 @@ fn wayland_bufferless_window_geometry_none_is_not_a_delta() {
     let no_op_metrics = capture_core_compliance_metrics(&commands);
     let no_op_geometry = capture_committed_window_geometry(&commands);
 
-    xdg_surface.set_window_geometry(2, 3, 2, 2);
+    xdg_surface.set_window_geometry(2, 0, 2, 2);
     surface.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut RegistryTestState::default()).unwrap();
@@ -1623,7 +1623,7 @@ fn wayland_bufferless_window_geometry_none_is_not_a_delta() {
     assert!(changed[0].generation > no_op[0].generation);
     assert_eq!(changed[0].buffer_id, initial[0].buffer_id);
     assert_eq!(changed[0].pixel_checksum, initial[0].pixel_checksum);
-    assert_eq!(changed_geometry, Some(XdgWindowGeometry::new(2, 3, 2, 2)));
+    assert_eq!(changed_geometry, Some(XdgWindowGeometry::new(2, 0, 2, 2)));
     assert_eq!(
         changed_metrics.surface_commit_mapping_full_promotions,
         no_op_metrics.surface_commit_mapping_full_promotions + 1

@@ -692,9 +692,8 @@ impl CompositorState {
                 canonical_geometry,
                 root_render,
                 output_origins,
-                self.surface_window_geometries
-                    .get(&root_surface_id)
-                    .copied(),
+                self.effective_xdg_window_geometry(root_surface_id)
+                    .map(|geometry| geometry.geometry),
             )
         });
 
@@ -765,9 +764,8 @@ impl CompositorState {
             let output_origins_after =
                 self.interaction_debug_surface_output_origins(root_surface_id);
             let xdg_geometry_after = self
-                .surface_window_geometries
-                .get(&root_surface_id)
-                .copied();
+                .effective_xdg_window_geometry(root_surface_id)
+                .map(|geometry| geometry.geometry);
             eprintln!(
                 "oblivion-one compositor: event=window_interaction_geometry_rebase root_surface_id={} canonical_before={:?} presented_input={:?} canonical_after={:?} root_render_before={:?} root_render_after={:?} root_output_before={:?} root_output_after={:?} child_output_before={:?} child_output_after={:?} xdg_geometry_before={:?} xdg_geometry_after={:?}",
                 root_surface_id,

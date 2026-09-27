@@ -58,9 +58,7 @@ fn deferred_unknown_restore_waits_for_ack_boundary_and_anchors_to_latest_pointer
             .expect("XDG toplevel window");
         let physical = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 45), 1_920, 955);
         let root_geometry = XdgWindowGeometry::new(xdg_x, xdg_y, 1_920, 955);
-        state
-            .surface_window_geometries
-            .insert(root_surface_id, root_geometry);
+        state.set_test_effective_xdg_window_geometry(root_surface_id, root_geometry);
         let mut root_surface = test_renderable_surface(root_surface_id, 1_920, 955);
         root_surface.placement = physical.placement;
         state.append_renderable_surface(root_surface);
@@ -147,7 +145,7 @@ fn deferred_unknown_restore_waits_for_ack_boundary_and_anchors_to_latest_pointer
             Some(SurfaceCommitSequence(6))
         );
 
-        state.apply_committed_window_geometry(root_surface_id, Some(response_geometry));
+        state.set_test_effective_xdg_window_geometry(root_surface_id, response_geometry);
         assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
         state.update_toplevel_visual_render_assignment_after_root_commit(
             root_surface_id,
@@ -227,9 +225,7 @@ fn unknown_restore_uses_persistent_explicit_geometry_without_repeated_request() 
     state.append_renderable_surface(root_surface);
     state.store_surface_placement(root_surface_id, physical.placement);
     state.install_toplevel_visual_geometry(root_surface_id, physical);
-    state
-        .surface_window_geometries
-        .insert(root_surface_id, explicit_geometry);
+    state.set_test_effective_xdg_window_geometry(root_surface_id, explicit_geometry);
     state.install_xdg_mode_transition_response_fence(root_surface_id, physical, 89);
     state
         .toplevel_visual_geometries
@@ -266,8 +262,8 @@ fn unknown_restore_uses_persistent_explicit_geometry_without_repeated_request() 
         ))
     );
     assert_eq!(
-        state.surface_window_geometries.get(&root_surface_id),
-        Some(&explicit_geometry)
+        state.committed_explicit_effective_xdg_geometry(root_surface_id),
+        Some(explicit_geometry)
     );
     assert!(state.pending_normal_restores.is_empty());
 }
@@ -334,10 +330,9 @@ fn qualified_bufferless_restore_waits_for_later_committed_implicit_geometry() {
             600,
         ))
     );
-    assert!(
-        !state
-            .surface_window_geometries
-            .contains_key(&root_surface_id)
+    assert_eq!(
+        state.committed_explicit_effective_xdg_geometry(root_surface_id),
+        None
     );
     assert!(state.pending_normal_restores.is_empty());
 }
@@ -452,7 +447,7 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
             .iter()
             .find(|surface| surface.surface_id == root_surface_id)
             .and_then(|surface| surface.render_placement),
-        Some(SurfacePlacement::absolute_root_at(72, 72))
+        Some(SurfacePlacement::absolute_root_at(72, 92))
     );
     assert!(state.pending_normal_restores.is_empty());
 }
@@ -494,7 +489,7 @@ fn cancelled_unknown_restore_cannot_apply_a_late_client_commit() {
 
     assert!(state.cancel_pending_normal_restore(root_surface_id, "test_unmap"));
     let response = XdgWindowGeometry::new(0, 0, 800, 600);
-    state.apply_committed_window_geometry(root_surface_id, Some(response));
+    state.set_test_effective_xdg_window_geometry(root_surface_id, response);
     assert!(
         !state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
     );
@@ -595,7 +590,7 @@ fn released_unknown_restore_finishes_at_last_pointer_anchor_without_resuming_mov
     }
 
     let response = XdgWindowGeometry::new(0, 0, 1_000, 700);
-    state.apply_committed_window_geometry(root_surface_id, Some(response));
+    state.set_test_effective_xdg_window_geometry(root_surface_id, response);
     assert!(
         state.qualify_pending_normal_restore_response(root_surface_id, SurfaceCommitSequence(6),)
     );
@@ -675,7 +670,7 @@ fn non_interactive_unknown_restore_uses_stored_placement_and_client_size() {
     );
     assert!(!state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
     assert_eq!(state.surface_placement(root_surface_id), physical.placement);
-    state.apply_committed_window_geometry(root_surface_id, Some(response));
+    state.set_test_effective_xdg_window_geometry(root_surface_id, response);
     assert!(state.try_finalize_pending_normal_restore_from_committed_state(root_surface_id));
 
     assert_eq!(
@@ -766,9 +761,7 @@ fn interactive_move_takeover_keeps_xdg_frame_and_root_buffer_origins_separate() 
             .expect("XDG toplevel window");
 
         let xdg_geometry = XdgWindowGeometry::new(xdg_x, xdg_y, 300, 200);
-        state
-            .surface_window_geometries
-            .insert(root_surface_id, xdg_geometry);
+        state.set_test_effective_xdg_window_geometry(root_surface_id, xdg_geometry);
         state.append_renderable_surface(test_renderable_surface(
             root_surface_id,
             300 + xdg_x as u32,
@@ -784,7 +777,9 @@ fn interactive_move_takeover_keeps_xdg_frame_and_root_buffer_origins_separate() 
         state.update_toplevel_visual_render_assignment(root_surface_id);
         state.rebuild_active_scene_view();
 
-        let xdg_geometry_before = state.surface_window_geometries[&root_surface_id];
+        let xdg_geometry_before = state
+            .committed_explicit_effective_xdg_geometry(root_surface_id)
+            .expect("effective explicit geometry");
         let canonical_geometry = state
             .current_root_window_geometry(root_surface_id)
             .expect("canonical window-frame geometry");
@@ -860,7 +855,9 @@ fn interactive_move_takeover_keeps_xdg_frame_and_root_buffer_origins_separate() 
         );
         assert_eq!(scene_origin(&state, child_surface_id), (150, 150));
         assert_eq!(
-            state.surface_window_geometries[&root_surface_id],
+            state
+                .committed_explicit_effective_xdg_geometry(root_surface_id)
+                .unwrap(),
             xdg_geometry_before
         );
         assert_eq!(state.presentation_animator.active_count(), 0);
@@ -905,7 +902,9 @@ fn interactive_move_takeover_keeps_xdg_frame_and_root_buffer_origins_separate() 
             );
             assert_eq!(scene_origin(&state, child_surface_id), (150 + dx, 150 + dy));
             assert_eq!(
-                state.surface_window_geometries[&root_surface_id],
+                state
+                    .committed_explicit_effective_xdg_geometry(root_surface_id)
+                    .unwrap(),
                 xdg_geometry_before
             );
         }

@@ -991,12 +991,19 @@ impl CompositorState {
 
     pub(in crate::compositor) fn begin_surface_tree_publication(&mut self) {
         debug_assert!(self.surface_tree_generation.is_none());
+        debug_assert!(self.surface_tree_xdg_geometry_publications.is_empty());
+        debug_assert!(self.surface_tree_pending_resize_completions.is_empty());
+        debug_assert!(self.surface_tree_pending_window_open_animations.is_empty());
         self.surface_tree_generation = Some(self.render_generation.saturating_add(1));
         self.surface_tree_pointer_focus_refresh_pending = false;
         self.surface_tree_confined_region_refresh_pending = false;
     }
 
     pub(in crate::compositor) fn finish_surface_tree_publication(&mut self) {
+        self.finish_surface_tree_xdg_geometry_publication();
+        self.finish_surface_tree_resize_completions();
+        let pending_window_open_animations =
+            std::mem::take(&mut self.surface_tree_pending_window_open_animations);
         let pending_roots = self
             .pending_normal_restores
             .iter()
@@ -1016,6 +1023,9 @@ impl CompositorState {
         }
         if std::mem::take(&mut self.surface_tree_pointer_focus_refresh_pending) {
             self.refresh_pointer_focus_at_last_position();
+        }
+        for root_surface_id in pending_window_open_animations {
+            self.maybe_begin_window_open_animation(root_surface_id);
         }
     }
 
@@ -1562,8 +1572,7 @@ impl CompositorState {
         self.surface_placements.remove(&surface_id);
         self.xwayland.retired_surface_ids.remove(&surface_id);
         self.remove_current_surface_buffer(surface_id);
-        self.surface_window_geometries.remove(&surface_id);
-        self.pending_surface_window_geometries.remove(&surface_id);
+        self.clear_xdg_window_geometry_state(surface_id);
         self.xdg_surface_resources.remove(&surface_id);
         self.xdg_surface_wm_bases.remove(&surface_id);
         self.xdg_surface_lifecycles.remove(&surface_id);

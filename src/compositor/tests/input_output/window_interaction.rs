@@ -608,7 +608,7 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
 }
 
 #[test]
-fn unknown_size_maximized_titlebar_move_waits_for_client_geometry() {
+fn implicit_size_maximized_titlebar_move_keeps_a_stable_pointer_anchor() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -648,9 +648,10 @@ fn unknown_size_maximized_titlebar_move_waits_for_client_geometry() {
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut client_state).unwrap();
     assert_eq!(
-        capture_root_restore_geometry(&commands, root_surface_id),
-        None,
-        "the mapped buffer size is not a learned normal restore size"
+        capture_root_restore_geometry(&commands, root_surface_id)
+            .map(|geometry| (geometry.width, geometry.height)),
+        Some((300, 200)),
+        "the committed root-only implicit geometry supplies the restore size"
     );
     commands.send(ServerCommand::PresentFrame).unwrap();
     wait_for_server_commands(&commands);
@@ -668,6 +669,7 @@ fn unknown_size_maximized_titlebar_move_waits_for_client_geometry() {
         .presented_rect();
     let maximized_frame = capture_root_window_geometry(&commands, root_surface_id)
         .expect("maximized visual geometry");
+    assert_eq!((maximized_frame.width, maximized_frame.height), (1280, 774));
 
     commands
         .send(ServerCommand::BeginMove { x: 120.0, y: 87.0 })
@@ -676,12 +678,13 @@ fn unknown_size_maximized_titlebar_move_waits_for_client_geometry() {
     queue.roundtrip(&mut client_state).unwrap();
     assert_eq!(
         (client_state.toplevel_width, client_state.toplevel_height),
-        (0, 0)
+        (300, 200)
     );
     assert_eq!(
-        capture_root_window_geometry(&commands, root_surface_id),
-        Some(maximized_frame),
-        "begin move must retain the maximized frame while normal size is unknown"
+        capture_root_window_geometry(&commands, root_surface_id)
+            .map(|geometry| (geometry.width, geometry.height)),
+        Some((300, 200)),
+        "begin move restores the effective implicit geometry"
     );
     assert_eq!(
         capture_presented_presentation(&commands, root_surface_id),
@@ -713,23 +716,22 @@ fn unknown_size_maximized_titlebar_move_waits_for_client_geometry() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert_eq!((restored.width, restored.height), (520, 410));
-    assert_eq!(
-        (restored.placement.local_x, restored.placement.local_y),
-        (expected_frame_x, expected_frame_y)
+    let restored_origin = (restored.placement.local_x, restored.placement.local_y);
+    assert!(
+        restored_origin.0.abs_diff(expected_frame_x) <= 1
+            && restored_origin.1.abs_diff(expected_frame_y) <= 1,
+        "client geometry changes may shift the integer pointer anchor by at most one pixel"
     );
-    assert_eq!(
-        authority.logical_frame_origin,
-        Some((expected_frame_x, expected_frame_y))
-    );
+    assert_eq!(authority.logical_frame_origin, Some(restored_origin));
     assert_eq!(
         authority
             .render_placement
             .map(|placement| (placement.local_x, placement.local_y)),
-        Some((expected_frame_x - 10, expected_frame_y - 10))
+        Some((restored_origin.0 - 10, restored_origin.1 - 10))
     );
     assert_eq!(
         authority.active_scene_origin,
-        Some((expected_frame_x - 10, expected_frame_y - 10))
+        Some((restored_origin.0 - 10, restored_origin.1 - 10))
     );
     drop(decoration);
 }

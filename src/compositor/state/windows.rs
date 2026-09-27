@@ -10,7 +10,6 @@ use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleVisualGroup, canonical_visual_rect,
 };
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
-use std::collections::HashSet;
 
 impl CompositorState {
     pub(in crate::compositor) fn x11_window_wants_initial_focus(
@@ -399,8 +398,7 @@ impl CompositorState {
 
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
-        self.surface_window_geometries.remove(&surface_id);
-        self.pending_surface_window_geometries.remove(&surface_id);
+        self.clear_xdg_window_geometry_state(surface_id);
         self.surface_placements.remove(&surface_id);
         self.clear_popup_grab_for_surface_ids(&[surface_id]);
         self.popup_grab_stack.retain(|id| *id != surface_id);
@@ -564,8 +562,7 @@ impl CompositorState {
         self.refresh_active_scene_popup_view();
         self.refresh_active_scene_surface_order();
         self.surface_placements.remove(&surface_id);
-        self.surface_window_geometries.remove(&surface_id);
-        self.pending_surface_window_geometries.remove(&surface_id);
+        self.clear_xdg_window_geometry_state(surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         if !had_live_role {
             self.note_popup_lifecycle_redundant_cleanup();
@@ -985,25 +982,13 @@ impl CompositorState {
         popup_surface: &PopupSurface,
         geometry: PopupRect,
     ) -> SurfacePlacement {
-        let parent_window_geometry = popup_surface.parent_surface_id.and_then(|surface_id| {
-            self.surface_window_geometries
-                .get(&surface_id)
-                .copied()
-                .or_else(|| {
-                    self.pending_surface_window_geometries
-                        .get(&surface_id)
-                        .copied()
-                })
-        });
+        let parent_window_geometry = popup_surface
+            .parent_surface_id
+            .and_then(|parent_id| self.effective_xdg_window_geometry(parent_id))
+            .map(|geometry| geometry.geometry);
         let popup_window_geometry = self
-            .surface_window_geometries
-            .get(&surface_id)
-            .copied()
-            .or_else(|| {
-                self.pending_surface_window_geometries
-                    .get(&surface_id)
-                    .copied()
-            });
+            .effective_xdg_window_geometry(surface_id)
+            .map(|geometry| geometry.geometry);
         let local_x = parent_window_geometry
             .map(|geometry| geometry.x)
             .unwrap_or_default()
@@ -1185,18 +1170,9 @@ impl CompositorState {
         }
 
         if let Some(surface_id) = popup_surface.parent_surface_id
-            && let Some(geometry) = self.surface_window_geometries.get(&surface_id).copied()
+            && let Some(geometry) = self.effective_xdg_window_geometry(surface_id)
         {
-            return PopupRect::new(0, 0, geometry.width, geometry.height);
-        }
-
-        if let Some(surface_id) = popup_surface.parent_surface_id
-            && let Some(surface) = self
-                .renderable_surfaces
-                .iter()
-                .find(|surface| surface.surface_id == surface_id)
-        {
-            return PopupRect::new(0, 0, surface.width as i32, surface.height as i32);
+            return PopupRect::new(0, 0, geometry.geometry.width, geometry.geometry.height);
         }
 
         PopupRect::new(
@@ -1972,6 +1948,14 @@ impl CompositorState {
         &self,
         surface_id: u32,
     ) -> Option<WindowGeometry> {
+        if self.xdg_surface_lifecycles.contains_key(&surface_id) {
+            let geometry = self.effective_xdg_window_geometry(surface_id)?.geometry;
+            return Some(WindowGeometry::new(
+                self.surface_placement(surface_id),
+                u32::try_from(geometry.width).ok()?,
+                u32::try_from(geometry.height).ok()?,
+            ));
+        }
         let surface = self
             .renderable_surfaces
             .iter()
@@ -1980,14 +1964,10 @@ impl CompositorState {
                 self.toplevel_window_state(surface_id)?
                     .minimized_root_surface(surface_id)
             })?;
-        let (width, height) = self
-            .xdg_window_geometry_size(surface_id)
-            .unwrap_or((surface.width, surface.height));
-
         Some(WindowGeometry::new(
             self.surface_placement(surface_id),
-            width,
-            height,
+            surface.width,
+            surface.height,
         ))
     }
 
@@ -1998,6 +1978,14 @@ impl CompositorState {
         if let Some(visual) = self.toplevel_visual_geometries.get(&surface_id) {
             return Some(visual.window_geometry());
         }
+        if self.xdg_surface_lifecycles.contains_key(&surface_id) {
+            let geometry = self.effective_xdg_window_geometry(surface_id)?.geometry;
+            return Some(WindowGeometry::new(
+                self.surface_placement(surface_id),
+                u32::try_from(geometry.width).ok()?,
+                u32::try_from(geometry.height).ok()?,
+            ));
+        }
         let surface = self
             .renderable_surfaces
             .iter()
@@ -2006,17 +1994,18 @@ impl CompositorState {
                 self.toplevel_window_state(surface_id)?
                     .minimized_root_surface(surface_id)
             })?;
-        let (width, height) = self
-            .xdg_window_geometry_size(surface_id)
-            .unwrap_or((surface.width, surface.height));
-        Some(WindowGeometry::new(surface.placement, width, height))
+        Some(WindowGeometry::new(
+            surface.placement,
+            surface.width,
+            surface.height,
+        ))
     }
 
     pub(in crate::compositor) fn xdg_window_geometry_size(
         &self,
         surface_id: u32,
     ) -> Option<(u32, u32)> {
-        let geometry = self.surface_window_geometries.get(&surface_id)?;
+        let geometry = self.effective_xdg_window_geometry(surface_id)?.geometry;
         Some((
             u32::try_from(geometry.width).ok()?,
             u32::try_from(geometry.height).ok()?,
@@ -2044,85 +2033,18 @@ impl CompositorState {
         &self,
         root_surface_id: u32,
     ) -> Option<NormalRestoreGeometryObservation> {
-        if let Some(geometry) = self
-            .surface_window_geometries
-            .get(&root_surface_id)
-            .copied()
-        {
-            return (geometry.width > 0 && geometry.height > 0).then_some(
-                NormalRestoreGeometryObservation {
-                    geometry,
-                    source: NormalRestoreGeometrySource::ExplicitPersistent,
+        self.effective_xdg_window_geometry(root_surface_id)
+            .map(|effective| NormalRestoreGeometryObservation {
+                geometry: effective.geometry,
+                source: match effective.source {
+                    EffectiveXdgWindowGeometrySource::ExplicitEffective => {
+                        NormalRestoreGeometrySource::ExplicitPersistent
+                    }
+                    EffectiveXdgWindowGeometrySource::ImplicitSurfaceTree => {
+                        NormalRestoreGeometrySource::ImplicitSurfaceTree
+                    }
                 },
-            );
-        }
-
-        self.implicit_surface_tree_window_geometry(root_surface_id)
-            .map(|geometry| NormalRestoreGeometryObservation {
-                geometry,
-                source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
             })
-    }
-
-    fn implicit_surface_tree_window_geometry(
-        &self,
-        root_surface_id: u32,
-    ) -> Option<XdgWindowGeometry> {
-        let mut surfaces = vec![(root_surface_id, 0_i64, 0_i64)];
-        let mut visited = HashSet::new();
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
-
-        while let Some((surface_id, origin_x, origin_y)) = surfaces.pop() {
-            if !visited.insert(surface_id) {
-                continue;
-            }
-
-            if let Some(surface) = self
-                .renderable_surfaces
-                .iter()
-                .find(|surface| surface.surface_id == surface_id)
-                && surface.width > 0
-                && surface.height > 0
-            {
-                let right = origin_x.checked_add(i64::from(surface.width))?;
-                let bottom = origin_y.checked_add(i64::from(surface.height))?;
-                min_x = min_x.min(origin_x);
-                min_y = min_y.min(origin_y);
-                max_x = max_x.max(right);
-                max_y = max_y.max(bottom);
-            }
-
-            for (child_id, lifecycle) in &self.surface_role_lifecycles {
-                let Some(LiveRoleInstance::Subsurface { parent_id }) = lifecycle.live_instance
-                else {
-                    continue;
-                };
-                if parent_id != surface_id {
-                    continue;
-                }
-                let placement = self.surface_placement(*child_id);
-                if placement.parent_surface_id != Some(parent_id) {
-                    continue;
-                }
-                surfaces.push((
-                    *child_id,
-                    origin_x.checked_add(i64::from(placement.local_x))?,
-                    origin_y.checked_add(i64::from(placement.local_y))?,
-                ));
-            }
-        }
-
-        if min_x == i64::MAX || max_x <= min_x || max_y <= min_y {
-            return None;
-        }
-        let width = max_x.checked_sub(min_x)?;
-        let height = max_y.checked_sub(min_y)?;
-        Some(XdgWindowGeometry::new(
-            i32::try_from(min_x).ok()?,
-            i32::try_from(min_y).ok()?,
-            i32::try_from(width).ok()?,
-            i32::try_from(height).ok()?,
-        ))
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
@@ -2325,10 +2247,9 @@ mod tests {
                 source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
             })
         );
-        assert!(
-            !state
-                .surface_window_geometries
-                .contains_key(&root_surface_id)
+        assert_eq!(
+            state.committed_explicit_effective_xdg_geometry(root_surface_id),
+            None
         );
 
         let root = state
@@ -2351,10 +2272,9 @@ mod tests {
                 source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
             })
         );
-        assert!(
-            !state
-                .surface_window_geometries
-                .contains_key(&root_surface_id)
+        assert_eq!(
+            state.committed_explicit_effective_xdg_geometry(root_surface_id),
+            None
         );
     }
 
@@ -2363,10 +2283,8 @@ mod tests {
         let root_surface_id = 11;
         let explicit = XdgWindowGeometry::new(10, 10, 520, 410);
         let mut state = CompositorState::default();
-        state.append_renderable_surface(test_renderable_surface(root_surface_id, 400, 300));
-        state
-            .surface_window_geometries
-            .insert(root_surface_id, explicit);
+        state.append_renderable_surface(test_renderable_surface(root_surface_id, 600, 500));
+        state.set_test_effective_xdg_window_geometry(root_surface_id, explicit);
 
         let root = state
             .renderable_surfaces
@@ -2389,8 +2307,8 @@ mod tests {
             })
         );
         assert_eq!(
-            state.surface_window_geometries.get(&root_surface_id),
-            Some(&explicit)
+            state.committed_explicit_effective_xdg_geometry(root_surface_id),
+            Some(explicit)
         );
     }
 
@@ -2442,11 +2360,42 @@ mod tests {
                 source: NormalRestoreGeometrySource::ImplicitSurfaceTree,
             })
         );
-        assert!(
-            !state
-                .surface_window_geometries
-                .contains_key(&root_surface_id)
+        assert_eq!(
+            state.committed_explicit_effective_xdg_geometry(root_surface_id),
+            None
         );
+    }
+
+    #[test]
+    fn current_root_window_geometry_uses_complete_implicit_tree_bounds() {
+        let root_surface_id = 16;
+        let child_surface_id = 17;
+        let mut state = CompositorState::default();
+        state.append_renderable_surface(test_renderable_surface(root_surface_id, 400, 300));
+        state
+            .xdg_surface_lifecycles
+            .insert(root_surface_id, XdgSurfaceLifecycle::default());
+        state.append_renderable_surface(test_renderable_surface(child_surface_id, 200, 100));
+        state.store_surface_placement(
+            child_surface_id,
+            SurfacePlacement::subsurface(root_surface_id, -20, -10),
+        );
+        state.surface_role_lifecycles.insert(
+            child_surface_id,
+            super::super::roles::SurfaceRoleLifecycle {
+                permanent: Some(super::super::roles::PermanentSurfaceRole::Subsurface),
+                live_instance: Some(super::super::roles::LiveRoleInstance::Subsurface {
+                    parent_id: root_surface_id,
+                }),
+                xdg_association: false,
+            },
+        );
+
+        let geometry = state
+            .current_root_window_geometry(root_surface_id)
+            .expect("mapped root geometry");
+
+        assert_eq!((geometry.width, geometry.height), (420, 310));
     }
 
     #[test]

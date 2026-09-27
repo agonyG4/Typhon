@@ -2513,7 +2513,7 @@ mod tests {
             resizing: true,
             emitted_at: Instant::now(),
             committed_size: Some((100, 100)),
-            committed_window_geometry: None,
+            effective_xdg_window_geometry: None,
             buffer_id: None,
             interaction_id: ResizeInteractionId::new(1),
         };
@@ -3782,13 +3782,7 @@ impl CompositorState {
                 );
             }
             _ => {
-                commit.resize_commit = self
-                    .capture_acked_resize_for_surface_commit(surface_id)
-                    .map(|snapshot| {
-                        commit.window_geometry.map_or(snapshot, |window_geometry| {
-                            snapshot.with_committed_window_geometry(window_geometry)
-                        })
-                    });
+                commit.resize_commit = self.capture_acked_resize_for_surface_commit(surface_id);
                 commit.resize_capture_finalized = true;
             }
         }
@@ -5593,6 +5587,10 @@ impl CompositorState {
             );
         }
         self.begin_surface_tree_publication();
+        // Seed the authority snapshot before applying any node. Capturing only
+        // when each node is reached would allow the first applied root/child
+        // commit to become part of the supposed "before" geometry.
+        let _ = self.capture_xdg_geometry_before_surface_commit(root_id);
         for (surface_id, commit) in commits {
             self.apply_cached_subsurface_commit(surface_id, commit);
         }
@@ -5611,9 +5609,8 @@ impl CompositorState {
         }
         if crate::compositor::state::roles::surface_tree_debug_enabled() {
             let xdg_geometry = self
-                .surface_window_geometries
-                .get(&root_id)
-                .copied()
+                .effective_xdg_window_geometry(root_id)
+                .map(|geometry| geometry.geometry)
                 .map_or_else(
                     || "none".to_string(),
                     |geometry| {

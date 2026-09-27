@@ -393,9 +393,9 @@ impl CompositorState {
         if input_region_changed {
             self.advance_pointer_hit_generation();
         }
-        let window_geometry_changed =
-            self.committed_window_geometry_changed(surface_id, window_geometry);
-        let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
+        let damage = damage.or(window_geometry
+            .is_some()
+            .then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         let render_generation_before_publication = self.render_generation;

@@ -64,6 +64,7 @@ mod window_open_animation;
 mod window_resize;
 mod windows;
 mod workspaces;
+mod xdg_geometry;
 mod xdg_lifecycle;
 mod xwayland_dnd;
 mod xwayland_mode;

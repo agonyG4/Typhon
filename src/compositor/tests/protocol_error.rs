@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn nonintersecting_explicit_xdg_geometry_posts_invalid_size_after_positive_bounds_exist() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 80, 60).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    xdg_surface.set_window_geometry(100, 100, 20, 20);
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let observed = expect_protocol_error(
+        &connection,
+        "xdg_surface",
+        wayland_protocols::xdg::shell::client::xdg_surface::Error::InvalidSize as u32,
+    );
+    assert_eq!(observed.object_id, xdg_surface.id().protocol_id());
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 1);
+}
+
+#[test]
 fn xdg_role_after_subsurface_is_rejected_and_healthy_client_survives() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
