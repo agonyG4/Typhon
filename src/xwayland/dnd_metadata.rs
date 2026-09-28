@@ -6,7 +6,7 @@
 
 use super::{X11WindowHandle, XwaylandGeneration};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     num::{NonZeroU8, NonZeroU64},
     os::fd::OwnedFd,
 };
@@ -14,6 +14,7 @@ use std::{
 pub const MAX_XWAYLAND_DND_MIME_TYPES: usize = 64;
 pub const MAX_XWAYLAND_DND_MIME_TYPE_BYTES: usize = 255;
 pub const MAX_XWAYLAND_DND_ACTIONS: usize = 5;
+pub const MAX_PENDING_XWAYLAND_DND_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct XwaylandDndOfferId {
@@ -327,4 +328,128 @@ pub enum XwaylandDndTransition {
         session_id: CanonicalDndSessionId,
         generation: XwaylandGeneration,
     },
+}
+
+impl XwaylandDndTransition {
+    pub const fn canonical_session_id(&self) -> CanonicalDndSessionId {
+        match self {
+            Self::TargetEntered { session_id, .. }
+            | Self::TargetPositioned { session_id, .. }
+            | Self::TargetLeft { session_id, .. }
+            | Self::DropRequested { session_id, .. }
+            | Self::TargetFinished { session_id, .. }
+            | Self::Retired { session_id, .. } => *session_id,
+            Self::SourceFeedback { offer_id, .. } | Self::SourceFinished { offer_id, .. } => {
+                CanonicalDndSessionId::Xwayland(*offer_id)
+            }
+        }
+    }
+
+    pub const fn generation(&self) -> XwaylandGeneration {
+        match self {
+            Self::TargetEntered { target, .. }
+            | Self::TargetPositioned { target, .. }
+            | Self::TargetLeft { target, .. }
+            | Self::DropRequested { target, .. }
+            | Self::TargetFinished { target, .. } => target.generation(),
+            Self::SourceFeedback { offer_id, .. } | Self::SourceFinished { offer_id, .. } => {
+                offer_id.generation()
+            }
+            Self::Retired { generation, .. } => *generation,
+        }
+    }
+}
+
+/// Ordered, bounded semantic transitions from canonical compositor state to
+/// the future XWM adapter. Only adjacent continuous updates with identical
+/// session/target or offer identity may replace one another.
+#[derive(Debug, Default)]
+pub struct XwaylandDndOutbox {
+    pending: VecDeque<XwaylandDndTransition>,
+}
+
+impl XwaylandDndOutbox {
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn push(&mut self, transition: XwaylandDndTransition) -> Result<(), XwaylandDndTransition> {
+        let coalesces_with_tail = match (self.pending.back(), &transition) {
+            (
+                Some(XwaylandDndTransition::TargetPositioned {
+                    session_id: old_session,
+                    target: old_target,
+                    ..
+                }),
+                XwaylandDndTransition::TargetPositioned {
+                    session_id, target, ..
+                },
+            ) => old_session == session_id && old_target == target,
+            (
+                Some(XwaylandDndTransition::SourceFeedback {
+                    offer_id: old_offer,
+                    ..
+                }),
+                XwaylandDndTransition::SourceFeedback { offer_id, .. },
+            ) => old_offer == offer_id,
+            _ => false,
+        };
+
+        if coalesces_with_tail {
+            *self
+                .pending
+                .back_mut()
+                .expect("coalescing requires a pending tail") = transition;
+            return Ok(());
+        }
+        if self.pending.len() >= MAX_PENDING_XWAYLAND_DND_TRANSITIONS {
+            return Err(transition);
+        }
+        self.pending.push_back(transition);
+        Ok(())
+    }
+
+    pub fn drain(&mut self) -> Vec<XwaylandDndTransition> {
+        self.pending.drain(..).collect()
+    }
+
+    /// Drop only transitions whose exact source, target, or retirement
+    /// identity belongs to the generation being torn down.
+    pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
+        self.pending.retain(|transition| match transition {
+            XwaylandDndTransition::TargetEntered { target, .. }
+            | XwaylandDndTransition::TargetPositioned { target, .. }
+            | XwaylandDndTransition::TargetLeft { target, .. }
+            | XwaylandDndTransition::DropRequested { target, .. }
+            | XwaylandDndTransition::TargetFinished { target, .. } => {
+                target.generation() != generation
+            }
+            XwaylandDndTransition::SourceFeedback { offer_id, .. }
+            | XwaylandDndTransition::SourceFinished { offer_id, .. } => {
+                offer_id.generation() != generation
+            }
+            XwaylandDndTransition::Retired {
+                generation: retired_generation,
+                ..
+            } => *retired_generation != generation,
+        });
+    }
+
+    /// Replace unusable pending adapter history with one bounded recovery
+    /// transition for the exact canonical session and generation.
+    pub fn replace_with_retired(
+        &mut self,
+        session_id: CanonicalDndSessionId,
+        generation: XwaylandGeneration,
+    ) {
+        self.pending.clear();
+        self.pending.push_back(XwaylandDndTransition::Retired {
+            session_id,
+            generation,
+        });
+    }
 }

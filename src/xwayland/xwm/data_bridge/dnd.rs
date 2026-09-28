@@ -96,6 +96,7 @@ impl DndManager {
                 session.progress,
                 DndWireProgress::Entered | DndWireProgress::Positioned
             )
+            || (session.progress == DndWireProgress::Positioned && session.target != Some(target))
             || session.terminal_event_consumed
         {
             return false;
@@ -105,6 +106,30 @@ impl DndManager {
         session.y = y;
         session.action = action;
         session.progress = DndWireProgress::Positioned;
+        true
+    }
+
+    /// Leave one exact X11 target while keeping the canonical adapter session
+    /// active for a later target enter.
+    pub fn leave_target(&mut self, id: XwaylandDndAdapterId, target: X11WindowHandle) -> bool {
+        let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|session| session.id == id && session.target == Some(target))
+        else {
+            return false;
+        };
+        if target.generation() != id.generation()
+            || session.progress != DndWireProgress::Positioned
+            || session.terminal_event_consumed
+        {
+            return false;
+        }
+        session.target = None;
+        session.progress = DndWireProgress::AwaitingEnter;
+        session.action = None;
+        session.x = 0;
+        session.y = 0;
         true
     }
 

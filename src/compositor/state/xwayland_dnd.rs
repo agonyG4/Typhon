@@ -8,6 +8,50 @@ use super::*;
 use crate::xwayland::CanonicalDndSessionId;
 
 impl CompositorState {
+    pub(in crate::compositor) fn take_xwayland_dnd_transitions(
+        &mut self,
+    ) -> Vec<crate::xwayland::XwaylandDndTransition> {
+        self.xwayland_dnd_outbox.drain()
+    }
+
+    pub(in crate::compositor) fn queue_xwayland_dnd_transition(
+        &mut self,
+        transition: crate::xwayland::XwaylandDndTransition,
+    ) -> bool {
+        let overflowed = match self.xwayland_dnd_outbox.push(transition) {
+            Ok(()) => return true,
+            Err(transition) => transition,
+        };
+        let session_id = overflowed.canonical_session_id();
+        let generation = overflowed.generation();
+
+        if self.xwayland_dnd_outbox_overflow_in_progress {
+            return false;
+        }
+        if self.xwayland_dnd_cancel_in_progress {
+            self.xwayland_dnd_cancel_outbox_overflowed = true;
+            return false;
+        }
+
+        let exact_active_session = self.active_drag.as_ref().is_some_and(|active| {
+            active.id == session_id
+                && !matches!(
+                    active.phase,
+                    DragSessionPhase::Finished | DragSessionPhase::Cancelled
+                )
+        });
+        if !exact_active_session {
+            return false;
+        }
+
+        self.xwayland_dnd_outbox_overflow_in_progress = true;
+        self.cancel_drag_session("xwayland_dnd_outbox_overflow");
+        self.xwayland_dnd_outbox_overflow_in_progress = false;
+        self.xwayland_dnd_outbox
+            .replace_with_retired(session_id, generation);
+        false
+    }
+
     pub(in crate::compositor) fn begin_xwayland_drag_session(
         &mut self,
         offer: crate::xwayland::XwaylandDndOffer,
@@ -241,6 +285,16 @@ impl CompositorState {
         }
 
         let accepted = accepted && accepted_mime.is_some();
+        if !self.queue_xwayland_dnd_transition(
+            crate::xwayland::XwaylandDndTransition::TargetFinished {
+                session_id,
+                target,
+                accepted,
+                action,
+            },
+        ) {
+            return false;
+        }
         if let Some(active) = self.active_drag.as_mut() {
             if let Some(action) = action {
                 active.selected_action = action
@@ -289,15 +343,6 @@ impl CompositorState {
         } else {
             DragSessionPhase::Cancelled
         });
-        if matches!(&origin, ActiveDragOrigin::Xwayland { .. }) {
-            self.xwayland_dnd_transition =
-                Some(crate::xwayland::XwaylandDndTransition::TargetFinished {
-                    session_id,
-                    target,
-                    accepted,
-                    action,
-                });
-        }
         if accepted {
             self.compliance_metrics.dnd_sessions_finished = self
                 .compliance_metrics
@@ -404,29 +449,12 @@ impl CompositorState {
         {
             self.last_xwayland_dnd_offer_id = None;
         }
-        if self
-            .xwayland_dnd_transition
-            .as_ref()
-            .is_some_and(|transition| match transition {
-                crate::xwayland::XwaylandDndTransition::TargetEntered { target, .. }
-                | crate::xwayland::XwaylandDndTransition::TargetPositioned { target, .. }
-                | crate::xwayland::XwaylandDndTransition::TargetLeft { target, .. }
-                | crate::xwayland::XwaylandDndTransition::DropRequested { target, .. }
-                | crate::xwayland::XwaylandDndTransition::TargetFinished { target, .. } => {
-                    target.generation() == generation
-                }
-                crate::xwayland::XwaylandDndTransition::SourceFeedback { offer_id, .. }
-                | crate::xwayland::XwaylandDndTransition::SourceFinished { offer_id, .. } => {
-                    offer_id.generation() == generation
-                }
-                crate::xwayland::XwaylandDndTransition::Retired {
-                    generation: retired,
-                    ..
-                } => *retired == generation,
-            })
+        if let Some(active) = self.active_drag.as_mut()
+            && active.xwayland_dnd_generation == Some(generation)
         {
-            self.xwayland_dnd_transition = None;
+            active.xwayland_dnd_generation = None;
         }
+        self.xwayland_dnd_outbox.clear_generation(generation);
     }
 
     fn terminate_drag_from_xwayland(
@@ -450,6 +478,16 @@ impl CompositorState {
             return;
         }
         let final_action = active.selected_action;
+        let action = xdnd_action_from_wayland_mask(final_action);
+        if !self.queue_xwayland_dnd_transition(
+            crate::xwayland::XwaylandDndTransition::SourceFinished {
+                offer_id,
+                accepted,
+                action,
+            },
+        ) {
+            return;
+        }
         if let Some(active) = self.active_drag.as_mut() {
             active.phase = if accepted {
                 DragSessionPhase::Finished
@@ -475,12 +513,6 @@ impl CompositorState {
         } else {
             DragSessionPhase::Cancelled
         });
-        self.xwayland_dnd_transition =
-            Some(crate::xwayland::XwaylandDndTransition::SourceFinished {
-                offer_id,
-                accepted,
-                action: xdnd_action_from_wayland_mask(final_action),
-            });
         if accepted {
             self.compliance_metrics.dnd_sessions_finished = self
                 .compliance_metrics

@@ -174,6 +174,9 @@ pub(super) struct ActiveDrag {
     pub(super) id: CanonicalDndSessionId,
     pub(super) origin: ActiveDragOrigin,
     pub(super) lifecycle_driver: DragLifecycleDriver,
+    /// Exact XWayland generation whose adapter state has participated in this
+    /// canonical drag, retained across temporary moves onto Wayland targets.
+    pub(super) xwayland_dnd_generation: Option<crate::xwayland::XwaylandGeneration>,
     pub(super) icon_surface: Option<wl_surface::WlSurface>,
     pub(super) target: Option<ActiveDragTarget>,
     pub(super) accepted_mime: Option<String>,

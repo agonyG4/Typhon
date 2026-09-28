@@ -1,8 +1,8 @@
 use super::*;
 use crate::xwayland::{
-    CanonicalDndSessionId, WaylandDndAction, X11WindowHandle, XwaylandDndAction,
-    XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId, XwaylandDndVersion,
-    XwaylandGeneration,
+    CanonicalDndSessionId, MAX_PENDING_XWAYLAND_DND_TRANSITIONS, WaylandDndAction, X11WindowHandle,
+    XwaylandDndAction, XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId,
+    XwaylandDndOutbox, XwaylandDndTransition, XwaylandDndVersion, XwaylandGeneration,
 };
 use std::{
     io::Read,
@@ -35,6 +35,313 @@ fn xwayland_offer(
         actions,
     )
     .expect("valid XWayland offer")
+}
+
+#[test]
+fn xwayland_dnd_outbox_coalesces_only_exact_adjacent_positions() {
+    let generation = generation(81);
+    let session = CanonicalDndSessionId::Wayland(NonZeroU64::new(1).unwrap());
+    let target_a = X11WindowHandle::new(generation, 0x810);
+    let target_b = X11WindowHandle::new(generation, 0x811);
+    let mut outbox = XwaylandDndOutbox::default();
+
+    outbox
+        .push(XwaylandDndTransition::TargetEntered {
+            session_id: session,
+            target: target_a,
+            x: 0.0,
+            y: 0.0,
+            mime_types: XwaylandDndMimeCatalog::default(),
+            source_actions: Vec::new(),
+        })
+        .unwrap();
+    for index in 0..MAX_PENDING_XWAYLAND_DND_TRANSITIONS * 8 {
+        let x = index as f64;
+        outbox
+            .push(XwaylandDndTransition::TargetPositioned {
+                session_id: session,
+                target: target_a,
+                x,
+                y: x * 2.0,
+                accepted_mime: None,
+                action: None,
+                mime_types: XwaylandDndMimeCatalog::default(),
+                source_actions: Vec::new(),
+            })
+            .unwrap();
+    }
+    outbox
+        .push(XwaylandDndTransition::TargetPositioned {
+            session_id: session,
+            target: target_b,
+            x: 50.0,
+            y: 60.0,
+            accepted_mime: None,
+            action: None,
+            mime_types: XwaylandDndMimeCatalog::default(),
+            source_actions: Vec::new(),
+        })
+        .unwrap();
+    let replacement_session = CanonicalDndSessionId::Wayland(NonZeroU64::new(2).unwrap());
+    outbox
+        .push(XwaylandDndTransition::TargetPositioned {
+            session_id: replacement_session,
+            target: target_b,
+            x: 70.0,
+            y: 80.0,
+            accepted_mime: None,
+            action: None,
+            mime_types: XwaylandDndMimeCatalog::default(),
+            source_actions: Vec::new(),
+        })
+        .unwrap();
+
+    let transitions = outbox.drain();
+    assert_eq!(transitions.len(), 4);
+    assert!(matches!(
+        transitions[0],
+        XwaylandDndTransition::TargetEntered { target, .. } if target == target_a
+    ));
+    assert!(matches!(
+        transitions[1],
+        XwaylandDndTransition::TargetPositioned {
+            target,
+            x,
+            y,
+            ..
+        }
+            if target == target_a
+                && x == (MAX_PENDING_XWAYLAND_DND_TRANSITIONS * 8 - 1) as f64
+                && y == (MAX_PENDING_XWAYLAND_DND_TRANSITIONS * 8 - 1) as f64 * 2.0
+    ));
+    assert!(matches!(
+        transitions[2],
+        XwaylandDndTransition::TargetPositioned { session_id: current, target, .. }
+            if current == session && target == target_b
+    ));
+    assert!(matches!(
+        transitions[3],
+        XwaylandDndTransition::TargetPositioned { session_id: current, target, .. }
+            if current == replacement_session && target == target_b
+    ));
+}
+
+#[test]
+fn xwayland_dnd_outbox_keeps_edges_ordered_and_preserves_source_finish() {
+    let generation = generation(82);
+    let session = CanonicalDndSessionId::Wayland(NonZeroU64::new(3).unwrap());
+    let offer_id = XwaylandDndOfferId::new(generation, NonZeroU64::new(4).unwrap());
+    let target_a = X11WindowHandle::new(generation, 0x820);
+    let target_b = X11WindowHandle::new(generation, 0x821);
+    let mime_types = XwaylandDndMimeCatalog::default();
+    let mut outbox = XwaylandDndOutbox::default();
+    let required = [
+        XwaylandDndTransition::TargetEntered {
+            session_id: session,
+            target: target_a,
+            x: 1.0,
+            y: 2.0,
+            mime_types: mime_types.clone(),
+            source_actions: Vec::new(),
+        },
+        XwaylandDndTransition::TargetPositioned {
+            session_id: session,
+            target: target_a,
+            x: 3.0,
+            y: 4.0,
+            accepted_mime: None,
+            action: None,
+            mime_types: mime_types.clone(),
+            source_actions: Vec::new(),
+        },
+        XwaylandDndTransition::TargetLeft {
+            session_id: session,
+            target: target_a,
+        },
+        XwaylandDndTransition::TargetEntered {
+            session_id: session,
+            target: target_b,
+            x: 5.0,
+            y: 6.0,
+            mime_types: mime_types.clone(),
+            source_actions: Vec::new(),
+        },
+        XwaylandDndTransition::DropRequested {
+            session_id: session,
+            target: target_b,
+            mime_type: "text/plain".to_owned(),
+            action: XwaylandDndAction::Copy,
+            mime_types,
+            source_actions: vec![XwaylandDndAction::Copy],
+        },
+        XwaylandDndTransition::TargetFinished {
+            session_id: session,
+            target: target_b,
+            accepted: true,
+            action: Some(XwaylandDndAction::Copy),
+        },
+        XwaylandDndTransition::SourceFeedback {
+            offer_id,
+            accepted_mime: Some("text/plain".to_owned()),
+            action: Some(XwaylandDndAction::Copy),
+        },
+        XwaylandDndTransition::SourceFinished {
+            offer_id,
+            accepted: true,
+            action: Some(XwaylandDndAction::Copy),
+        },
+        XwaylandDndTransition::Retired {
+            session_id: session,
+            generation,
+        },
+    ];
+    for transition in required {
+        outbox.push(transition).unwrap();
+    }
+
+    let transitions = outbox.drain();
+    assert_eq!(transitions.len(), 9);
+    assert!(
+        matches!(transitions[0], XwaylandDndTransition::TargetEntered { target, .. } if target == target_a)
+    );
+    assert!(
+        matches!(transitions[1], XwaylandDndTransition::TargetPositioned { target, .. } if target == target_a)
+    );
+    assert!(
+        matches!(transitions[2], XwaylandDndTransition::TargetLeft { target, .. } if target == target_a)
+    );
+    assert!(
+        matches!(transitions[3], XwaylandDndTransition::TargetEntered { target, .. } if target == target_b)
+    );
+    assert!(
+        matches!(transitions[4], XwaylandDndTransition::DropRequested { target, .. } if target == target_b)
+    );
+    assert!(
+        matches!(transitions[5], XwaylandDndTransition::TargetFinished { target, .. } if target == target_b)
+    );
+    assert!(
+        matches!(transitions[6], XwaylandDndTransition::SourceFeedback { offer_id: current, .. } if current == offer_id)
+    );
+    assert!(
+        matches!(transitions[7], XwaylandDndTransition::SourceFinished { offer_id: current, accepted: true, .. } if current == offer_id)
+    );
+    assert!(
+        matches!(transitions[8], XwaylandDndTransition::Retired { session_id: current, generation: current_generation } if current == session && current_generation == generation)
+    );
+}
+
+#[test]
+fn xwayland_dnd_outbox_coalesces_feedback_only_for_the_exact_offer() {
+    let offer_generation = generation(83);
+    let offer_id = XwaylandDndOfferId::new(offer_generation, NonZeroU64::new(1).unwrap());
+    let replacement_offer_id = XwaylandDndOfferId::new(generation(84), NonZeroU64::new(1).unwrap());
+    let mut outbox = XwaylandDndOutbox::default();
+    for transition in [
+        XwaylandDndTransition::SourceFeedback {
+            offer_id,
+            accepted_mime: Some("text/plain".to_owned()),
+            action: Some(XwaylandDndAction::Copy),
+        },
+        XwaylandDndTransition::SourceFeedback {
+            offer_id,
+            accepted_mime: None,
+            action: None,
+        },
+        XwaylandDndTransition::SourceFeedback {
+            offer_id: replacement_offer_id,
+            accepted_mime: Some("text/uri-list".to_owned()),
+            action: Some(XwaylandDndAction::Move),
+        },
+        XwaylandDndTransition::SourceFinished {
+            offer_id: replacement_offer_id,
+            accepted: true,
+            action: Some(XwaylandDndAction::Move),
+        },
+    ] {
+        outbox.push(transition).unwrap();
+    }
+
+    let transitions = outbox.drain();
+    assert_eq!(transitions.len(), 3);
+    assert!(
+        matches!(transitions[0], XwaylandDndTransition::SourceFeedback { offer_id: current, accepted_mime: None, .. } if current == offer_id)
+    );
+    assert!(
+        matches!(transitions[1], XwaylandDndTransition::SourceFeedback { offer_id: current, .. } if current == replacement_offer_id)
+    );
+    assert!(
+        matches!(transitions[2], XwaylandDndTransition::SourceFinished { offer_id: current, accepted: true, .. } if current == replacement_offer_id)
+    );
+}
+
+#[test]
+fn xwayland_dnd_outbox_rejects_required_overflow_and_resets_to_exact_retirement() {
+    let generation = generation(85);
+    let session = CanonicalDndSessionId::Wayland(NonZeroU64::new(5).unwrap());
+    let target = X11WindowHandle::new(generation, 0x850);
+    let mut outbox = XwaylandDndOutbox::default();
+    for _ in 0..MAX_PENDING_XWAYLAND_DND_TRANSITIONS {
+        outbox
+            .push(XwaylandDndTransition::TargetLeft {
+                session_id: session,
+                target,
+            })
+            .unwrap();
+    }
+    let overflow = outbox.push(XwaylandDndTransition::DropRequested {
+        session_id: session,
+        target,
+        mime_type: "text/plain".to_owned(),
+        action: XwaylandDndAction::Copy,
+        mime_types: XwaylandDndMimeCatalog::default(),
+        source_actions: vec![XwaylandDndAction::Copy],
+    });
+    assert!(
+        matches!(overflow, Err(XwaylandDndTransition::DropRequested { session_id, target: current_target, .. }) if session_id == session && current_target == target)
+    );
+    assert_eq!(outbox.drain().len(), MAX_PENDING_XWAYLAND_DND_TRANSITIONS);
+
+    outbox.replace_with_retired(session, generation);
+    assert!(matches!(
+        outbox.drain().as_slice(),
+        [XwaylandDndTransition::Retired { session_id: current, generation: current_generation }]
+            if *current == session && *current_generation == generation
+    ));
+}
+
+#[test]
+fn xwayland_dnd_outbox_clears_only_the_retired_generation() {
+    let old_generation = generation(86);
+    let replacement_generation = generation(87);
+    let old_session = CanonicalDndSessionId::Wayland(NonZeroU64::new(6).unwrap());
+    let replacement_session = CanonicalDndSessionId::Wayland(NonZeroU64::new(7).unwrap());
+    let mut outbox = XwaylandDndOutbox::default();
+    for (session_id, target) in [
+        (old_session, X11WindowHandle::new(old_generation, 0x860)),
+        (
+            replacement_session,
+            X11WindowHandle::new(replacement_generation, 0x870),
+        ),
+    ] {
+        outbox
+            .push(XwaylandDndTransition::TargetEntered {
+                session_id,
+                target,
+                x: 0.0,
+                y: 0.0,
+                mime_types: XwaylandDndMimeCatalog::default(),
+                source_actions: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    outbox.clear_generation(old_generation);
+    assert!(matches!(
+        outbox.drain().as_slice(),
+        [XwaylandDndTransition::TargetEntered { session_id, target, .. }]
+            if *session_id == replacement_session
+                && *target == X11WindowHandle::new(replacement_generation, 0x870)
+    ));
 }
 
 fn test_client(display: &Display<CompositorState>) -> (Client, UnixStream) {
@@ -176,18 +483,28 @@ fn install_x11_drag_target(
     generation: XwaylandGeneration,
     xid: u32,
 ) -> X11WindowHandle {
+    install_x11_drag_target_at(state, surface, generation, xid, 100)
+}
+
+fn install_x11_drag_target_at(
+    state: &mut CompositorState,
+    surface: &wl_surface::WlSurface,
+    generation: XwaylandGeneration,
+    xid: u32,
+    x: i32,
+) -> X11WindowHandle {
     let surface_id = compositor_surface_id(surface);
     let target = X11WindowHandle::new(generation, xid);
     let mut snapshot = super::desktop_window_tests::x11_snapshot(generation, xid, surface_id);
     snapshot.geometry = crate::xwayland::xwm::X11Geometry {
-        x: 100,
+        x,
         y: 0,
         width: 800,
         height: 600,
     };
     snapshot.decoration_hints.motif = crate::xwayland::xwm::X11MotifDecorationHint::Undecorated;
     super::desktop_window_tests::insert_x11(state, snapshot);
-    state.test_set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(100, 0));
+    state.test_set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(x, 0));
     target
 }
 
@@ -252,6 +569,165 @@ fn wayland_source_x11_target_drag(
         x11_target_surface,
         wayland_target_surface,
     }
+}
+
+#[test]
+fn x11_target_switch_preserves_ordered_leave_and_enter_before_drain() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    let target_a = drag.target;
+    let target_b_surface = drag.state.test_create_surface_resource(
+        &drag._client,
+        &drag.display.handle(),
+        200,
+        600,
+        SurfacePlacement::absolute_root_at(1000, 0),
+    );
+    let target_b = install_x11_drag_target_at(
+        &mut drag.state,
+        &target_b_surface,
+        drag.generation,
+        0x602,
+        1000,
+    );
+
+    drag.state.update_drag_target_at(1010.0, 100.0);
+
+    let transitions = drag.state.take_xwayland_dnd_transitions();
+    assert_eq!(transitions.len(), 3);
+    assert!(matches!(
+        transitions.as_slice(),
+        [
+            XwaylandDndTransition::TargetEntered { target: first, .. },
+            XwaylandDndTransition::TargetLeft { target: left, .. },
+            XwaylandDndTransition::TargetEntered { target: entered, .. },
+        ] if *first == target_a && *left == target_a && *entered == target_b
+    ));
+    assert!(matches!(
+        drag.state.active_drag.as_ref().and_then(|active| active.target.as_ref()),
+        Some(ActiveDragTarget::Xwayland { window }) if *window == target_b
+    ));
+}
+
+#[test]
+fn target_enter_is_not_overwritten_by_motion_before_drain() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    let target = drag.target;
+    drag.state.update_drag_target_at(120.0, 130.0);
+    drag.state.update_drag_target_at(140.0, 150.0);
+
+    let transitions = drag.state.take_xwayland_dnd_transitions();
+    assert_eq!(transitions.len(), 2);
+    assert!(matches!(
+        transitions.as_slice(),
+        [
+            XwaylandDndTransition::TargetEntered { target: entered, .. },
+            XwaylandDndTransition::TargetPositioned {
+                target: positioned,
+                x: 140.0,
+                y: 150.0,
+                ..
+            },
+        ] if *entered == target && *positioned == target
+    ));
+}
+
+#[test]
+fn continuous_positions_do_not_cancel_but_mandatory_overflow_retires_exact_drag() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    let target_a = drag.target;
+    let target_b_surface = drag.state.test_create_surface_resource(
+        &drag._client,
+        &drag.display.handle(),
+        200,
+        600,
+        SurfacePlacement::absolute_root_at(1000, 0),
+    );
+    let _target_b = install_x11_drag_target_at(
+        &mut drag.state,
+        &target_b_surface,
+        drag.generation,
+        0x603,
+        1000,
+    );
+
+    for index in 0..MAX_PENDING_XWAYLAND_DND_TRANSITIONS * 8 {
+        let coordinate = 110.0 + index as f64;
+        drag.state
+            .update_drag_target_at(coordinate.min(850.0), 120.0);
+    }
+    assert_eq!(drag.state.xwayland_dnd_outbox.len(), 2);
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.id),
+        Some(drag.session_id)
+    );
+
+    for index in 0..30 {
+        if index % 2 == 0 {
+            drag.state.update_drag_target_at(1010.0, 100.0);
+        } else {
+            drag.state.update_drag_target_at(110.0, 100.0);
+        }
+    }
+    for index in 0..MAX_PENDING_XWAYLAND_DND_TRANSITIONS * 8 {
+        let coordinate = 110.0 + index as f64;
+        drag.state
+            .update_drag_target_at(coordinate.min(850.0), 120.0);
+    }
+    assert_eq!(drag.state.xwayland_dnd_outbox.len(), 63);
+    assert!(matches!(
+        drag.state
+            .active_drag
+            .as_ref()
+            .and_then(|active| active.target.as_ref()),
+        Some(ActiveDragTarget::Xwayland { window }) if *window == target_a
+    ));
+    assert!(drag.state.update_xwayland_drag_target_status(
+        drag.session_id,
+        target_a,
+        Some("text/plain".to_owned()),
+        Some(XwaylandDndAction::Copy),
+    ));
+    let _ = drag.source_events();
+
+    drag.state.drop_active_drag();
+    assert_eq!(
+        drag.state.xwayland_dnd_outbox.len(),
+        MAX_PENDING_XWAYLAND_DND_TRANSITIONS
+    );
+    assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.phase),
+        Some(DragSessionPhase::DropPendingXwaylandTarget)
+    );
+    assert!(!drag.state.finish_xwayland_drag_target(
+        drag.session_id,
+        target_a,
+        true,
+        Some(XwaylandDndAction::Copy),
+    ));
+
+    assert!(drag.state.active_drag.is_none());
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 1);
+    assert_eq!(drag.state.xwayland_dnd_outbox.len(), 1);
+    assert!(matches!(
+        drag.state.take_xwayland_dnd_transitions().as_slice(),
+        [XwaylandDndTransition::Retired { session_id, generation }]
+            if *session_id == drag.session_id && *generation == drag.generation
+    ));
+    assert_eq!(
+        drag.source_events(),
+        [SourceWireEvent::Target(None), SourceWireEvent::Cancelled]
+    );
 }
 
 #[test]
@@ -365,7 +841,7 @@ fn xwayland_origin_creates_wayland_offer_and_queues_exact_move_only_payload_requ
     state.clear_xwayland_generation(generation(41));
     assert!(state.active_drag.is_none());
     assert!(state.xwayland_dnd_data_requests.is_empty());
-    assert!(state.xwayland_dnd_transition.is_none());
+    assert!(state.take_xwayland_dnd_transitions().is_empty());
     assert!(state.xwayland.client_identity.is_none());
     assert!(state.last_xwayland_dnd_offer_id.is_none());
     assert!(!state.begin_xwayland_drag_session(xwayland_offer(
@@ -428,6 +904,7 @@ fn implicit_grab_terminal_does_not_drive_xwayland_drag() {
     assert_eq!(active.id, CanonicalDndSessionId::Xwayland(offer_id));
     assert_eq!(active.lifecycle_driver, DragLifecycleDriver::Xwayland);
     assert_eq!(active.phase, DragSessionPhase::Dragging);
+    assert_eq!(active.xwayland_dnd_generation, Some(generation(41)));
 }
 
 #[test]
@@ -575,13 +1052,14 @@ fn wayland_target_switches_to_exact_x11_window_and_back_without_parallel_authori
             .count(),
         0
     );
+    let transitions = state.take_xwayland_dnd_transitions();
     assert!(matches!(
-        state.xwayland_dnd_transition.take(),
-        Some(crate::xwayland::XwaylandDndTransition::TargetEntered {
+        transitions.as_slice(),
+        [crate::xwayland::XwaylandDndTransition::TargetEntered {
             target,
             mime_types,
             ..
-        }) if target == x11_handle
+        }] if *target == x11_handle
             && mime_types.as_slice().len() == 64
             && !mime_types.as_slice().contains(&omitted_mime_type)
     ));
@@ -699,15 +1177,16 @@ fn x11_target_status_drop_and_finish_use_exact_canonical_identity_and_typed_acti
         Some(DragSessionPhase::DropPendingXwaylandTarget)
     );
     assert!(!state.cancel_xwayland_drag_target(session_id, target_handle));
+    let transitions = state.take_xwayland_dnd_transitions();
     assert!(matches!(
-        state.xwayland_dnd_transition.take(),
+        transitions.last(),
         Some(crate::xwayland::XwaylandDndTransition::DropRequested {
             session_id: current,
             target,
             mime_type,
             action: XwaylandDndAction::Copy,
             ..
-        }) if current == session_id && target == target_handle && mime_type == "text/plain"
+        }) if *current == session_id && *target == target_handle && mime_type == "text/plain"
     ));
     assert!(!state.finish_xwayland_drag_target(
         session_id,
@@ -849,25 +1328,8 @@ fn x11_target_window_retirement_after_drop_cancels_wayland_source_once() {
     assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
     let terminal = drag.source_events();
     assert_eq!(
-        terminal
-            .iter()
-            .filter(|event| **event == SourceWireEvent::Cancelled)
-            .count(),
-        1
-    );
-    assert_eq!(
-        terminal
-            .iter()
-            .filter(|event| **event == SourceWireEvent::Finished)
-            .count(),
-        0
-    );
-    assert_eq!(
-        terminal
-            .iter()
-            .filter(|event| **event == SourceWireEvent::Target(None))
-            .count(),
-        1
+        terminal,
+        [SourceWireEvent::Target(None), SourceWireEvent::Cancelled]
     );
 }
 
@@ -889,19 +1351,84 @@ fn x11_generation_retirement_after_drop_cancels_wayland_source_once() {
     assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
     let terminal = drag.source_events();
     assert_eq!(
-        terminal
-            .iter()
-            .filter(|event| **event == SourceWireEvent::Cancelled)
-            .count(),
-        1
+        terminal,
+        [SourceWireEvent::Target(None), SourceWireEvent::Cancelled]
     );
+}
+
+#[test]
+fn native_wayland_target_cancellation_withdraws_target_before_cancelled() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    drag.state.update_drag_target_at(10.0, 10.0);
+    assert!(matches!(
+        drag.state.active_drag.as_ref().and_then(|active| active.target.as_ref()),
+        Some(ActiveDragTarget::Wayland { surface, .. })
+            if same_surface_resource(surface, &drag.wayland_target_surface)
+    ));
+    assert!(
+        drag.source_events()
+            .ends_with(&[SourceWireEvent::Target(None)])
+    );
+
+    drag.state
+        .cancel_drag_session("native_wayland_target_cancel_test");
+
+    assert!(drag.state.active_drag.is_none());
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
     assert_eq!(
-        terminal
-            .iter()
-            .filter(|event| **event == SourceWireEvent::Finished)
-            .count(),
-        0
+        drag.source_events(),
+        [SourceWireEvent::Target(None), SourceWireEvent::Cancelled]
     );
+    assert!(matches!(
+        drag.state.take_xwayland_dnd_transitions().as_slice(),
+        [
+            XwaylandDndTransition::TargetEntered { target: entered, .. },
+            XwaylandDndTransition::TargetLeft { target: left, .. },
+            XwaylandDndTransition::Retired {
+                session_id,
+                generation,
+            },
+        ] if *entered == drag.target
+            && *left == drag.target
+            && *session_id == drag.session_id
+            && *generation == drag.generation
+    ));
+}
+
+#[test]
+fn xwayland_generation_retirement_preserves_unrelated_wayland_drag() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    drag.state.update_drag_target_at(10.0, 10.0);
+    assert!(matches!(
+        drag.state.active_drag.as_ref().and_then(|active| active.target.as_ref()),
+        Some(ActiveDragTarget::Wayland { surface, .. })
+            if same_surface_resource(surface, &drag.wayland_target_surface)
+    ));
+
+    drag.state.clear_xwayland_generation(drag.generation);
+
+    let active = drag
+        .state
+        .active_drag
+        .as_ref()
+        .expect("Wayland drag remains active");
+    assert_eq!(active.id, drag.session_id);
+    assert_eq!(active.phase, DragSessionPhase::Dragging);
+    assert_eq!(active.xwayland_dnd_generation, None);
+    assert!(matches!(
+        active.target.as_ref(),
+        Some(ActiveDragTarget::Wayland { surface, .. })
+            if same_surface_resource(surface, &drag.wayland_target_surface)
+    ));
+    assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 0);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 0);
 }
 
 #[test]
@@ -914,6 +1441,11 @@ fn x11_target_retirement_before_drop_only_leaves_target_once() {
         drag.source_events()
             .contains(&SourceWireEvent::Target(Some("text/plain".to_owned(),)))
     );
+    assert!(matches!(
+        drag.state.take_xwayland_dnd_transitions().as_slice(),
+        [crate::xwayland::XwaylandDndTransition::TargetEntered { target, .. }]
+            if *target == drag.target
+    ));
 
     drag.state.retire_xwayland_drag_target(drag.target);
     assert_eq!(
@@ -928,14 +1460,14 @@ fn x11_target_retirement_before_drop_only_leaves_target_once() {
     );
     assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 0);
     assert!(matches!(
-        drag.state.xwayland_dnd_transition.take(),
-        Some(crate::xwayland::XwaylandDndTransition::TargetLeft { session_id, target })
-            if session_id == drag.session_id && target == drag.target
+        drag.state.take_xwayland_dnd_transitions().as_slice(),
+        [crate::xwayland::XwaylandDndTransition::TargetLeft { session_id, target }]
+            if *session_id == drag.session_id && *target == drag.target
     ));
     assert_eq!(drag.source_events(), [SourceWireEvent::Target(None)]);
 
     drag.state.retire_xwayland_drag_target(drag.target);
-    assert!(drag.state.xwayland_dnd_transition.is_none());
+    assert!(drag.state.take_xwayland_dnd_transitions().is_empty());
     assert!(drag.source_events().is_empty());
     assert_eq!(drag.state.compliance_metrics.dnd_source_cancelled_events, 0);
 }
@@ -1183,12 +1715,12 @@ fn xwayland_source_retains_semantic_ask_action_domain_on_x11_finish() {
     assert!(state.active_drag.is_none());
     assert_eq!(state.compliance_metrics.dnd_sessions_finished, 1);
     assert!(matches!(
-        state.xwayland_dnd_transition,
+        state.take_xwayland_dnd_transitions().last(),
         Some(crate::xwayland::XwaylandDndTransition::TargetFinished {
             session_id: current,
             target: current_target,
             accepted: true,
             action: Some(XwaylandDndAction::Ask),
-        }) if current == session_id && current_target == target
+        }) if *current == session_id && *current_target == target
     ));
 }

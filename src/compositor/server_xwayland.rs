@@ -117,11 +117,9 @@ impl OwnCompositorServer {
         self.state.cancel_xwayland_drag_target(session_id, target)
     }
 
-    /// Consume the latest bounded canonical target transition for the XWM.
-    pub fn take_xwayland_dnd_transition(
-        &mut self,
-    ) -> Option<crate::xwayland::XwaylandDndTransition> {
-        self.state.xwayland_dnd_transition.take()
+    /// Drain ordered, bounded semantic transitions for the future XWM adapter.
+    pub fn take_xwayland_dnd_transitions(&mut self) -> Vec<crate::xwayland::XwaylandDndTransition> {
+        self.state.take_xwayland_dnd_transitions()
     }
 
     /// Revalidate a prepared proxy's exact canonical source before handing its

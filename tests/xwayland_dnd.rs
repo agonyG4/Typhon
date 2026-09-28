@@ -125,6 +125,48 @@ fn adapter_replacement_retires_exact_identity_and_consumes_terminal_once() {
 }
 
 #[test]
+fn adapter_leaves_one_exact_target_and_reenters_another_without_replacing_session() {
+    let generation = generation(9);
+    let target_a = X11WindowHandle::new(generation, 0x902);
+    let target_b = X11WindowHandle::new(generation, 0x903);
+    let canonical = CanonicalDndSessionId::Wayland(NonZeroU64::new(90).expect("nonzero session"));
+    let adapter_id = XwaylandDndAdapterId::new(canonical, generation).unwrap();
+    let mut manager = DndManager::default();
+    assert!(manager.install_canonical_session(adapter_id, None));
+    assert!(manager.mark_entered(adapter_id));
+    assert!(manager.position(adapter_id, target_a, 40, 50, Some(XwaylandDndAction::Copy),));
+    assert!(!manager.position(adapter_id, target_b, 41, 51, Some(XwaylandDndAction::Copy),));
+    assert!(!manager.leave_target(adapter_id, target_b));
+    assert_eq!(manager.active_id(), Some(adapter_id));
+    assert_eq!(
+        manager.active_session().and_then(|session| session.target),
+        Some(target_a)
+    );
+
+    assert!(manager.leave_target(adapter_id, target_a));
+    let session = manager.active_session().expect("same active session");
+    assert_eq!(session.id, adapter_id);
+    assert_eq!(session.source, None);
+    assert_eq!(session.target, None);
+    assert_eq!(session.progress, DndWireProgress::AwaitingEnter);
+    assert_eq!(session.action, None);
+    assert_eq!((session.x, session.y), (0, 0));
+    assert!(!session.terminal_event_consumed);
+    assert_eq!(manager.active_id(), Some(adapter_id));
+
+    assert!(manager.mark_entered(adapter_id));
+    assert!(manager.position(adapter_id, target_b, 60, 70, Some(XwaylandDndAction::Move),));
+    assert_eq!(manager.active_id(), Some(adapter_id));
+    assert_eq!(
+        manager.active_session().and_then(|session| session.target),
+        Some(target_b)
+    );
+    assert!(manager.mark_drop_ready(adapter_id));
+    assert!(manager.consume_terminal_event(adapter_id));
+    assert!(!manager.leave_target(adapter_id, target_b));
+}
+
+#[test]
 fn generation_retirement_only_clears_the_exact_adapter_session() {
     let current_generation = generation(8);
     let id = XwaylandDndAdapterId::new(
