@@ -5,6 +5,7 @@ use std::{
 };
 
 use glow::HasContext;
+use oblivion_one::compositor::{EffectAnchorScope, VisualGroupId};
 use oblivion_one::effects::{
     CompiledFrameGraph, EffectInstanceId, EffectWorkingSpace, GraphTextureId, GraphTexturePlan,
     GraphTextureSource, RenderPassKind,
@@ -48,18 +49,63 @@ pub struct EffectTextureKey {
 struct CheckpointDependencySemanticIdentity {
     instance: EffectInstanceId,
     semantic_signature: u64,
+    composition: CheckpointCompositionIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CheckpointAnchorIdentity {
+    BeforeSurface(u32),
+    ReplaceSurface(u32),
+    AfterSurface(u32),
+    OutputPostProcess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CheckpointCompositionIdentity {
+    anchor: CheckpointAnchorIdentity,
+    anchor_scope: EffectAnchorScope,
+    visual_group: Option<VisualGroupId>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CheckpointCaptureCacheKey {
     consumer: EffectInstanceId,
     consumer_semantic_signature: u64,
+    consumer_composition: CheckpointCompositionIdentity,
     capture_domain: (i32, i32, u32, u32),
     width: u32,
     height: u32,
     format: EffectTextureFormat,
     working_space: EffectWorkingSpace,
     dependencies: Vec<CheckpointDependencySemanticIdentity>,
+}
+
+fn checkpoint_composition_identity(
+    pass: &oblivion_one::effects::CompiledRenderPass,
+) -> CheckpointCompositionIdentity {
+    let anchor = match pass.anchor {
+        oblivion_one::compositor::EffectAnchor::BeforeSurface(surface) => {
+            CheckpointAnchorIdentity::BeforeSurface(surface)
+        }
+        oblivion_one::compositor::EffectAnchor::ReplaceSurface(surface) => {
+            CheckpointAnchorIdentity::ReplaceSurface(surface)
+        }
+        oblivion_one::compositor::EffectAnchor::AfterSurface(surface) => {
+            CheckpointAnchorIdentity::AfterSurface(surface)
+        }
+        oblivion_one::compositor::EffectAnchor::OutputPostProcess => {
+            CheckpointAnchorIdentity::OutputPostProcess
+        }
+    };
+    let visual_group = match pass.anchor_scope {
+        EffectAnchorScope::Surface => None,
+        EffectAnchorScope::VisualGroup => pass.visual_group,
+    };
+    CheckpointCompositionIdentity {
+        anchor,
+        anchor_scope: pass.anchor_scope,
+        visual_group,
+    }
 }
 
 /// Build a cross-frame identity from compositor-owned effect semantics and
@@ -92,11 +138,13 @@ pub(crate) fn checkpoint_capture_cache_key(
         dependencies.push(CheckpointDependencySemanticIdentity {
             instance: producer_instance.id,
             semantic_signature: producer_instance.semantic_signature,
+            composition: checkpoint_composition_identity(producer),
         });
     }
     Some(CheckpointCaptureCacheKey {
         consumer: consumer.id,
         consumer_semantic_signature: consumer.semantic_signature,
+        consumer_composition: checkpoint_composition_identity(pass),
         capture_domain: (
             capture_texture.domain.x,
             capture_texture.domain.y,
@@ -1227,6 +1275,25 @@ mod tests {
             .expect("third stacked checkpoint")
     }
 
+    fn checkpoint_key_with_composition(
+        mut graph: CompiledFrameGraph,
+        consumer: EffectInstanceId,
+        anchor: oblivion_one::compositor::EffectAnchor,
+        anchor_scope: oblivion_one::compositor::EffectAnchorScope,
+        visual_group: Option<oblivion_one::compositor::VisualGroupId>,
+    ) -> CheckpointCaptureCacheKey {
+        let pass = graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance == consumer)
+            .expect("checkpoint capture");
+        pass.anchor = anchor;
+        pass.anchor_scope = anchor_scope;
+        pass.visual_group = visual_group;
+        checkpoint_capture_cache_key(&graph, stacked_checkpoint(&graph, consumer))
+            .expect("eligible checkpoint capture")
+    }
+
     #[test]
     fn checkpoint_capture_key_ignores_scene_generation_damage_and_pass_ids() {
         let first = backdrop_stack_graph(
@@ -1264,6 +1331,216 @@ mod tests {
 
         assert_ne!(first.final_damage, second.final_damage);
         assert_eq!(first_key, second_key);
+    }
+
+    #[test]
+    fn checkpoint_capture_key_changes_with_consumer_anchor_scope() {
+        let mut surface_graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let visual_group = oblivion_one::compositor::VisualGroupId::new(7).unwrap();
+        let surface_pass = surface_graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance == consumer)
+            .expect("third checkpoint capture");
+        surface_pass.anchor_scope = oblivion_one::compositor::EffectAnchorScope::Surface;
+        surface_pass.visual_group = Some(visual_group);
+        let surface_key = checkpoint_capture_cache_key(
+            &surface_graph,
+            stacked_checkpoint(&surface_graph, consumer),
+        )
+        .expect("surface-scoped checkpoint");
+
+        let mut visual_group_graph = surface_graph.clone();
+        visual_group_graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance == consumer)
+            .expect("third checkpoint capture")
+            .anchor_scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+        let visual_group_key = checkpoint_capture_cache_key(
+            &visual_group_graph,
+            stacked_checkpoint(&visual_group_graph, consumer),
+        )
+        .expect("visual-group-scoped checkpoint");
+
+        assert_eq!(
+            surface_key.consumer_semantic_signature,
+            visual_group_key.consumer_semantic_signature
+        );
+        assert_ne!(surface_key, visual_group_key);
+    }
+
+    #[test]
+    fn checkpoint_capture_key_preserves_anchor_identity() {
+        use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
+
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let visual_group = oblivion_one::compositor::VisualGroupId::new(7);
+        let before_10 = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            EffectAnchor::BeforeSurface(10),
+            EffectAnchorScope::Surface,
+            visual_group,
+        );
+        let before_11 = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            EffectAnchor::BeforeSurface(11),
+            EffectAnchorScope::Surface,
+            visual_group,
+        );
+        let replace_10 = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            EffectAnchor::ReplaceSurface(10),
+            EffectAnchorScope::Surface,
+            visual_group,
+        );
+        let after_10 = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            EffectAnchor::AfterSurface(10),
+            EffectAnchorScope::Surface,
+            visual_group,
+        );
+        let output_post_process = checkpoint_key_with_composition(
+            graph,
+            consumer,
+            EffectAnchor::OutputPostProcess,
+            EffectAnchorScope::Surface,
+            visual_group,
+        );
+
+        assert_ne!(before_10, before_11);
+        assert_ne!(before_10, replace_10);
+        assert_ne!(before_10, after_10);
+        assert_ne!(after_10, output_post_process);
+    }
+
+    #[test]
+    fn checkpoint_capture_key_preserves_visual_group_identity() {
+        use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
+
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let anchor = EffectAnchor::BeforeSurface(10);
+        let group_7 = oblivion_one::compositor::VisualGroupId::new(7);
+        let group_8 = oblivion_one::compositor::VisualGroupId::new(8);
+        let none = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            anchor,
+            EffectAnchorScope::VisualGroup,
+            None,
+        );
+        let some_7 = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            anchor,
+            EffectAnchorScope::VisualGroup,
+            group_7,
+        );
+        let some_8 = checkpoint_key_with_composition(
+            graph,
+            consumer,
+            anchor,
+            EffectAnchorScope::VisualGroup,
+            group_8,
+        );
+
+        assert_ne!(none, some_7);
+        assert_ne!(some_7, some_8);
+    }
+
+    #[test]
+    fn checkpoint_capture_key_ignores_visual_group_for_surface_scope() {
+        use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
+
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let anchor = EffectAnchor::BeforeSurface(10);
+        let group_7 = oblivion_one::compositor::VisualGroupId::new(7);
+        let group_8 = oblivion_one::compositor::VisualGroupId::new(8);
+        let surface_7 = checkpoint_key_with_composition(
+            graph.clone(),
+            consumer,
+            anchor,
+            EffectAnchorScope::Surface,
+            group_7,
+        );
+        let surface_8 = checkpoint_key_with_composition(
+            graph,
+            consumer,
+            anchor,
+            EffectAnchorScope::Surface,
+            group_8,
+        );
+
+        assert_eq!(surface_7, surface_8);
+    }
+
+    #[test]
+    fn checkpoint_capture_key_tracks_dependency_composition_identity() {
+        use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
+
+        let mut surface_graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let dependency_id = stacked_checkpoint(&surface_graph, consumer).checkpoint_dependencies[0];
+        let group_7 = oblivion_one::compositor::VisualGroupId::new(7).unwrap();
+        let group_8 = oblivion_one::compositor::VisualGroupId::new(8).unwrap();
+        let dependency = surface_graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == dependency_id)
+            .expect("checkpoint dependency producer");
+        dependency.anchor = EffectAnchor::BeforeSurface(10);
+        dependency.anchor_scope = EffectAnchorScope::Surface;
+        dependency.visual_group = Some(group_7);
+        let base = checkpoint_capture_cache_key(
+            &surface_graph,
+            stacked_checkpoint(&surface_graph, consumer),
+        )
+        .expect("consumer checkpoint key");
+
+        let mut visual_group_graph = surface_graph.clone();
+        visual_group_graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == dependency_id)
+            .expect("checkpoint dependency producer")
+            .anchor_scope = EffectAnchorScope::VisualGroup;
+        let changed_scope = checkpoint_capture_cache_key(
+            &visual_group_graph,
+            stacked_checkpoint(&visual_group_graph, consumer),
+        )
+        .expect("consumer checkpoint key with visual-group dependency");
+
+        let mut other_group_graph = visual_group_graph.clone();
+        other_group_graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == dependency_id)
+            .expect("checkpoint dependency producer")
+            .visual_group = Some(group_8);
+        let changed_group = checkpoint_capture_cache_key(
+            &other_group_graph,
+            stacked_checkpoint(&other_group_graph, consumer),
+        )
+        .expect("consumer checkpoint key with another dependency group");
+
+        assert_eq!(
+            base.consumer_semantic_signature,
+            changed_scope.consumer_semantic_signature
+        );
+        assert_eq!(
+            base.consumer_semantic_signature,
+            changed_group.consumer_semantic_signature
+        );
+        assert_ne!(base, changed_scope);
+        assert_ne!(changed_scope, changed_group);
     }
 
     #[test]
