@@ -1260,28 +1260,33 @@ impl CompositorState {
             return false;
         }
 
-        self.retain_renderable_surfaces(|surface| {
-            !removed_surface_ids.contains(&surface.surface_id)
-        });
         let scene_effect = removed_surface_ids
             .iter()
             .any(|surface_id| self.surface_is_visible_in_active_scene(*surface_id));
+        self.cleanup_hidden_surface_ids(&removed_surface_ids);
+        self.reconcile_hidden_surface_output_memberships(&removed_surface_ids);
+        self.publish_hidden_surface_ids(scene_effect);
+        true
+    }
+
+    pub(in crate::compositor) fn cleanup_hidden_surface_ids(
+        &mut self,
+        removed_surface_ids: &[u32],
+    ) {
+        self.retain_renderable_surfaces(|surface| {
+            !removed_surface_ids.contains(&surface.surface_id)
+        });
         self.clear_resize_state_for_surfaces_with_reason(
-            &removed_surface_ids,
+            removed_surface_ids,
             WindowInteractionEndReason::SurfaceUnmapped,
         );
-        for removed_surface_id in &removed_surface_ids {
-            if let Some(surface) = self.surface_resource_by_id(*removed_surface_id) {
-                self.reconcile_surface_output_membership(&surface);
-            }
-        }
-        self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
+        self.clear_popup_grab_for_surface_ids(removed_surface_ids);
         self.popup_grab_stack
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
         self.recent_input_serials
             .retain(|input| !removed_surface_ids.contains(&compositor_surface_id(&input.surface)));
         self.clear_pointer_button_state_for_removed_surfaces(
-            &removed_surface_ids,
+            removed_surface_ids,
             "surface-destroyed",
         );
         self.reconcile_idle_inhibition();
@@ -1306,17 +1311,30 @@ impl CompositorState {
             }
             let _ = self.focus_topmost_renderable_toplevel();
         }
+        self.invalidate_surface_origin_cache();
+    }
+
+    pub(in crate::compositor) fn reconcile_hidden_surface_output_memberships(
+        &mut self,
+        removed_surface_ids: &[u32],
+    ) {
+        for removed_surface_id in removed_surface_ids {
+            if let Some(surface) = self.surface_resource_by_id(*removed_surface_id) {
+                self.reconcile_surface_output_membership(&surface);
+            }
+        }
+    }
+
+    fn publish_hidden_surface_ids(&mut self, scene_effect: bool) {
         if scene_effect {
             self.rebuild_active_scene_view();
         } else {
             self.refresh_active_scene_surface_order();
         }
-        self.invalidate_surface_origin_cache();
         self.advance_render_generation_with_scene_effect(
             RenderGenerationCause::SurfaceUnmap,
             scene_effect,
         );
-        true
     }
 
     pub(in crate::compositor) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {

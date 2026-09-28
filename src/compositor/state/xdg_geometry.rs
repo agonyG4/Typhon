@@ -190,6 +190,30 @@ impl CompositorState {
             .then_some(root_surface_id)
     }
 
+    pub(in crate::compositor) fn capture_xdg_geometry_for_topology_mutation(
+        &self,
+        surface_id: u32,
+    ) -> Option<(u32, Option<EffectiveXdgWindowGeometry>)> {
+        let root_surface_id = self.xdg_surface_tree_root_for_surface(surface_id)?;
+        Some((
+            root_surface_id,
+            self.effective_xdg_window_geometry(root_surface_id),
+        ))
+    }
+
+    pub(in crate::compositor) fn publish_xdg_geometry_after_topology_mutation(
+        &mut self,
+        root_surface_id: u32,
+        before: Option<EffectiveXdgWindowGeometry>,
+    ) -> bool {
+        self.resolve_awaiting_xdg_window_geometry(root_surface_id);
+        let after = self.effective_xdg_window_geometry(root_surface_id);
+        let geometry_changed =
+            before.map(|geometry| geometry.geometry) != after.map(|geometry| geometry.geometry);
+        self.publish_xdg_geometry_transition(root_surface_id, before, after, None, None);
+        geometry_changed
+    }
+
     pub(in crate::compositor) fn capture_xdg_geometry_before_surface_commit(
         &mut self,
         surface_id: u32,
@@ -486,17 +510,22 @@ impl CompositorState {
             }
         }
 
-        let own_popup_placement_changed = self.popup_surfaces.contains_key(&root_surface_id)
-            && self.update_popup_surface_placement_from_committed_state(root_surface_id);
-        if own_popup_placement_changed {
-            let placement = self.surface_placement(root_surface_id);
-            if let Some(surface) = self
-                .renderable_surfaces
-                .iter_mut()
-                .find(|surface| surface.surface_id == root_surface_id)
-            {
-                surface.placement = placement;
-            }
+        let before_origin = before
+            .map(|geometry| (geometry.geometry.x, geometry.geometry.y))
+            .unwrap_or_default();
+        let after_origin = after
+            .map(|geometry| (geometry.geometry.x, geometry.geometry.y))
+            .unwrap_or_default();
+        let origin_delta = (
+            after_origin.0.saturating_sub(before_origin.0),
+            after_origin.1.saturating_sub(before_origin.1),
+        );
+        if self.popup_surfaces.contains_key(&root_surface_id) {
+            self.rebase_popup_surface_placement_for_xdg_geometry_change(
+                root_surface_id,
+                (0, 0),
+                origin_delta,
+            );
         }
         if let Some(popup) = self.popup_surfaces.get(&root_surface_id)
             && popup.positioner.reactive
@@ -505,18 +534,24 @@ impl CompositorState {
             self.configure_popup_surface(root_surface_id, popup.positioner, None);
         }
 
-        let child_popups = self
+        let mut child_popups = self
             .popup_surfaces
             .iter()
             .filter_map(|(popup_surface_id, popup)| {
-                (popup.parent_surface_id == Some(root_surface_id)
-                    && popup.positioner.reactive
-                    && self.xdg_surface_is_configured(*popup_surface_id))
-                .then_some((*popup_surface_id, popup.positioner))
+                (popup.parent_surface_id == Some(root_surface_id))
+                    .then_some((*popup_surface_id, popup.positioner))
             })
             .collect::<Vec<_>>();
+        child_popups.sort_by_key(|(popup_surface_id, _)| *popup_surface_id);
         for (popup_surface_id, positioner) in child_popups {
-            self.configure_popup_surface(popup_surface_id, positioner, None);
+            self.rebase_popup_surface_placement_for_xdg_geometry_change(
+                popup_surface_id,
+                origin_delta,
+                (0, 0),
+            );
+            if positioner.reactive && self.xdg_surface_is_configured(popup_surface_id) {
+                self.configure_popup_surface(popup_surface_id, positioner, None);
+            }
         }
 
         self.refresh_active_scene_surface_tree(root_surface_id);
@@ -829,5 +864,110 @@ mod tests {
                 .map(|value| value.geometry),
             Some(XdgWindowGeometry::new(150, 0, 30, 90))
         );
+    }
+
+    #[test]
+    fn topology_geometry_publication_does_not_qualify_pending_normal_restore() {
+        let root_id = 60;
+        let child_id = 61;
+        let mut state = CompositorState::new(None);
+        let window_id = state.allocate_window_id().expect("window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_id))
+            .expect("XDG toplevel window");
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test socket");
+        let client = display_handle
+            .insert_client(server_end, std::sync::Arc::new(()))
+            .expect("test client");
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let xdg_surface = client
+            .create_resource::<
+                wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface,
+                XdgSurfaceData,
+                CompositorState,
+            >(
+                &display_handle,
+                20,
+                XdgSurfaceData {
+                    surface: surface.clone(),
+                    reservation: XdgAssociationReservation::Fresh,
+                },
+            )
+            .expect("test XDG surface");
+        let toplevel = client
+            .create_resource::<
+                wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+                XdgToplevelData,
+                CompositorState,
+            >(
+                &display_handle,
+                21,
+                XdgToplevelData { surface },
+            )
+            .expect("test XDG toplevel");
+        state.toplevel_surfaces.insert(
+            root_id,
+            ToplevelSurface {
+                window_id,
+                xdg_surface,
+                toplevel,
+                pending_constraints: None,
+                wm_capabilities_sent: false,
+            },
+        );
+        let frame = WindowGeometry::new(SurfacePlacement::absolute_root_at(72, 72), 420, 310);
+        let mut root = test_renderable_surface(root_id, 400, 300);
+        root.placement = frame.placement;
+        state.append_renderable_surface(root);
+        state.append_renderable_surface(test_renderable_surface(child_id, 200, 100));
+        state.store_surface_placement(root_id, frame.placement);
+        state.store_surface_placement(child_id, SurfacePlacement::subsurface(root_id, -20, -10));
+        state.xdg_surface_lifecycles.entry(root_id).or_default();
+        set_subsurface_parent(&mut state, child_id, root_id);
+        state.install_toplevel_visual_geometry(root_id, frame);
+        state.install_xdg_mode_transition_response_fence(root_id, frame, 77);
+        state.pending_normal_restores.insert(
+            root_id,
+            PendingNormalRestore {
+                root_surface_id: root_id,
+                window_id,
+                configure_serial: 77,
+                restore_placement: frame.placement,
+                policy: PendingNormalRestorePolicy::StoredPlacement,
+                response_commit_sequence: None,
+            },
+        );
+
+        let (captured_root, before) = state
+            .capture_xdg_geometry_for_topology_mutation(child_id)
+            .expect("subsurface belongs to the XDG root");
+        assert_eq!(captured_root, root_id);
+        assert_eq!(
+            before.map(|geometry| geometry.geometry),
+            Some(XdgWindowGeometry::new(-20, -10, 420, 310))
+        );
+
+        state.retain_renderable_surfaces(|surface| surface.surface_id != child_id);
+        state.deactivate_role_instance(child_id);
+        state.set_surface_placement(child_id, SurfacePlacement::root());
+        assert!(state.publish_xdg_geometry_after_topology_mutation(root_id, before));
+
+        assert_eq!(
+            state.pending_normal_restores[&root_id].response_commit_sequence, None,
+            "topology mutation is not restore-response commit evidence"
+        );
+        assert_eq!(
+            state.toplevel_visual_geometries[&root_id]
+                .xdg_mode_transition_fence
+                .and_then(|fence| fence.ack_commit_sequence_floor),
+            None,
+            "topology mutation does not advance the ACK commit floor"
+        );
+        assert!(state.pending_normal_restores.contains_key(&root_id));
+        drop(client);
+        drop(display);
     }
 }

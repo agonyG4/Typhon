@@ -62,10 +62,28 @@ subsurface positions throughout the real `wl_subsurface` tree. XDG popups,
 buffer-position offsets, server decorations, and presentation transforms are
 not part of these bounds.
 
-Synchronized tree commits resolve geometry only after all committed root and
-child state in that publication is installed. The canonical window-frame
-placement is the top-left of effective XDG geometry; root `wl_surface` render
-placement compensates for the geometry origin:
+Synchronized `wl_surface.commit` tree updates publish geometry only after all
+committed root and child state in that transaction is installed. Immediate
+topology changes such as `wl_subsurface.destroy()` are a separate mutation
+class: they capture the owner root, effective geometry, and affected subtree
+before detaching the role, then derive geometry from the resulting live tree.
+Both mutation classes use the same Effective XDG Window Geometry authority.
+
+An immediate topology mutation is not a `wl_surface.commit`. It carries no
+synthetic commit sequence, ACK boundary, or configure-response evidence. It
+does not advance an ACK fence or qualify a pending normal restore response.
+If explicit effective geometry is already established, removing a subsurface
+does not reclamp it. Removed surfaces leave the live scene and logical
+minimized-surface retention before the topology publication completes.
+
+Topology and geometry-derived state converge before the mutation publishes
+its scene/render generation. This keeps the root render assignment, popup
+placements, ActiveScene origins, output membership, and pointer hit state
+consistent with the resulting surface tree.
+
+The canonical window-frame placement is the top-left of effective XDG
+geometry; root `wl_surface` render placement compensates for the geometry
+origin:
 
 ```text
 root_render_origin = canonical_frame_origin - effective_xdg_geometry_origin
@@ -202,23 +220,23 @@ protocols are enabled only after the active native scanout backend is known.
 ## Surface geometry and decoration ownership
 
 For native XDG toplevels, `surface_placements` and
-`RenderableSurface::placement` own the compositor frame placement. The
-committed `xdg_surface.set_window_geometry` rectangle is retained separately
-as client-content metadata. Rendering derives the root content placement from
-the frame origin minus that committed rectangle, and refreshes the derived
-assignment when the first renderable is published, metadata changes, or the
-authoritative frame placement changes. Resize previews change the visual
-aperture and frame placement; they do not create a second coordinate system.
+`RenderableSurface::placement` own the compositor frame placement. Rendering,
+hit testing, popup placement, resize, and normal restore consume the central
+Effective XDG Window Geometry result. Once an explicit request becomes
+effective, its clamped rectangle remains the persistent authority until a new
+explicit request commits. A toplevel without effective explicit geometry uses
+the current logical bounds of its root surface and real `wl_subsurface`
+descendants; this implicit result follows committed tree changes and immediate
+topology mutations without becoming stored explicit state.
 
-Normal-restore size observation follows the committed XDG geometry ownership:
-once explicitly committed, `set_window_geometry` remains the persistent size
-authority across later commits that omit that request. A toplevel that has
-never committed explicit geometry uses the current committed logical bounds of
-its root surface and actual `wl_subsurface` descendants; this implicit
-observation is recomputed from the committed tree and is not stored as explicit
-geometry. It is used for normal restore decisions and does not claim to
-implement the protocol's full explicit-geometry clamping rules for every
-rendering, input, popup, or decoration consumer.
+An XDG popup's configured position is relative to its parent surface's
+effective XDG window-geometry origin. Typhon stores popup `SurfacePlacement`
+relative to the parent `wl_surface`, so effective origin changes require a
+pure internal coordinate rebase that preserves the configured popup window
+position. This `SurfacePlacement` maintenance is separate from reactive popup
+reconfiguration: only the reactive constraint-policy path reruns popup
+constraints and sends a configure. A non-reactive popup is rebased without
+automatic reconstraining or configure events.
 
 Decoration ownership is negotiated per XDG toplevel through
 `zxdg_decoration_manager_v1`. Explicit client-side mode leaves the client

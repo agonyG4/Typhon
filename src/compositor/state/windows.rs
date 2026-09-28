@@ -958,22 +958,61 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn update_popup_surface_placement_from_committed_state(
+    pub(in crate::compositor) fn rebase_popup_surface_placement_for_xdg_geometry_change(
         &mut self,
         surface_id: u32,
+        parent_origin_delta: (i32, i32),
+        own_origin_delta: (i32, i32),
     ) -> bool {
-        if !self.popup_node_is_alive(surface_id) {
+        if parent_origin_delta == (0, 0) && own_origin_delta == (0, 0) {
             return false;
         }
-        let Some(popup_surface) = self.popup_surfaces.get(&surface_id).cloned() else {
+        let mapped = self
+            .popup_nodes
+            .get(&surface_id)
+            .is_some_and(|node| node.mapped);
+        if !self.popup_node_is_alive(surface_id)
+            || !mapped
+            || self.renderable_surface_index(surface_id).is_none()
+        {
             return false;
-        };
-        let geometry = popup_surface.positioner.constrained_geometry(
-            self.popup_constraint_target(&popup_surface, popup_surface.positioner),
-        );
+        }
         let previous_placement = self.surface_placement(surface_id);
-        let placement = self.store_popup_surface_placement(surface_id, &popup_surface, geometry);
-        previous_placement != placement
+        let mut placement = previous_placement;
+        placement.local_x = placement
+            .local_x
+            .saturating_add(parent_origin_delta.0)
+            .saturating_sub(own_origin_delta.0);
+        placement.local_y = placement
+            .local_y
+            .saturating_add(parent_origin_delta.1)
+            .saturating_sub(own_origin_delta.1);
+        if placement == previous_placement {
+            return false;
+        }
+
+        self.store_surface_placement(surface_id, placement);
+        if let Some(surface) = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == surface_id)
+        {
+            surface.placement = placement;
+        }
+        if compositor_debug_surface_logging_enabled() {
+            let reactive = self
+                .popup_surfaces
+                .get(&surface_id)
+                .is_some_and(|popup| popup.positioner.reactive);
+            eprintln!(
+                "oblivion-one compositor: event=popup_geometry_rebase popup={surface_id} parent_origin_delta={parent_origin_delta:?} own_origin_delta={own_origin_delta:?} placement_before=({}, {}) placement_after=({}, {}) reactive={reactive} configure_sent=false",
+                previous_placement.local_x,
+                previous_placement.local_y,
+                placement.local_x,
+                placement.local_y,
+            );
+        }
+        true
     }
 
     fn store_popup_surface_placement(

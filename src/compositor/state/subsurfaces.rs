@@ -13,6 +13,15 @@ struct PreparedContentUpdateCandidate {
     external_content_update_dependencies: Vec<ContentUpdateRef>,
 }
 
+#[derive(Debug)]
+struct XdgTopologyMutationSnapshot {
+    owner_root_surface_id: Option<u32>,
+    scene_root_surface_id: u32,
+    before_geometry: Option<EffectiveXdgWindowGeometry>,
+    affected_surface_ids: Vec<u32>,
+    affects_active_scene: bool,
+}
+
 type SurfaceMappingProjection =
     Result<Option<SurfaceContentMapping>, (SurfaceMappingError, Option<wp_viewport::WpViewport>)>;
 
@@ -5824,8 +5833,23 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
-        let affected_surfaces = self.subsurface_transactions.subsurface_tree_ids(surface_id);
-        let was_effectively_synchronized = affected_surfaces
+        let affected_surface_ids = self.subsurface_transactions.subsurface_tree_ids(surface_id);
+        let (owner_root_surface_id, before_geometry) = self
+            .capture_xdg_geometry_for_topology_mutation(surface_id)
+            .map_or((None, None), |(root_surface_id, before)| {
+                (Some(root_surface_id), before)
+            });
+        let snapshot = XdgTopologyMutationSnapshot {
+            owner_root_surface_id,
+            scene_root_surface_id: self.root_surface_id_for_surface(surface_id),
+            before_geometry,
+            affects_active_scene: affected_surface_ids
+                .iter()
+                .any(|affected_id| self.surface_is_visible_in_active_scene(*affected_id)),
+            affected_surface_ids,
+        };
+        let was_effectively_synchronized = snapshot
+            .affected_surface_ids
             .iter()
             .map(|surface_id| {
                 (
@@ -5857,16 +5881,64 @@ impl CompositorState {
                 );
         }
         self.update_synchronized_cache_metrics();
-        self.hide_renderable_surface_subtree(surface_id);
+        self.cleanup_hidden_surface_ids(&snapshot.affected_surface_ids);
+        if let Some(owner_root_surface_id) = snapshot.owner_root_surface_id {
+            let affected_ids = snapshot
+                .affected_surface_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if let Some(window_id) = self.window_id_for_surface(owner_root_surface_id)
+                && let Some(window) = self.window_mut(window_id)
+            {
+                window.state.remove_minimized_surface_ids(&affected_ids);
+            }
+        }
         self.deactivate_role_instance(surface_id);
         self.set_surface_placement(surface_id, SurfacePlacement::root());
         self.detach_subsurface_from_parent_stack_lineage(parent_id, surface_id);
         self.reorder_renderable_surfaces_by_committed_stack();
         self.reclassify_unreachable_synchronized_commits(
-            &affected_surfaces,
+            &snapshot.affected_surface_ids,
             &was_effectively_synchronized,
             Some((surface_id, detached.cached_commits)),
         );
+
+        let geometry_changed = snapshot
+            .owner_root_surface_id
+            .is_some_and(|root_surface_id| {
+                self.publish_xdg_geometry_after_topology_mutation(
+                    root_surface_id,
+                    snapshot.before_geometry,
+                )
+            });
+        if !geometry_changed {
+            if snapshot.affects_active_scene {
+                self.refresh_active_scene_surface_tree(snapshot.scene_root_surface_id);
+            } else {
+                self.refresh_active_scene_surface_order();
+            }
+            self.reconcile_surface_tree_output_memberships(snapshot.scene_root_surface_id);
+            self.refresh_pointer_focus_at_last_position();
+        }
+        self.reconcile_hidden_surface_output_memberships(&snapshot.affected_surface_ids);
+        self.advance_render_generation_with_scene_effect(
+            RenderGenerationCause::SurfaceUnmap,
+            snapshot.affects_active_scene,
+        );
+
+        if compositor_debug_surface_logging_enabled() {
+            let after_geometry = snapshot
+                .owner_root_surface_id
+                .and_then(|root_surface_id| self.effective_xdg_window_geometry(root_surface_id));
+            eprintln!(
+                "oblivion-one compositor: event=surface_topology_mutation kind=subsurface_destroy root={:?} removed_ids={:?} geometry_before={:?} geometry_after={:?}",
+                snapshot.owner_root_surface_id,
+                snapshot.affected_surface_ids,
+                snapshot.before_geometry.map(|geometry| geometry.geometry),
+                after_geometry.map(|geometry| geometry.geometry),
+            );
+        }
         self.debug_assert_surface_tree_invariants();
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
