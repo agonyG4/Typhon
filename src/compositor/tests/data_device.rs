@@ -3,6 +3,192 @@ use std::{fs::File, sync::Arc};
 use wayland_server::{Client, Display};
 
 #[test]
+fn v3_source_can_offer_mime_after_start_drag_before_target_enter() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let source_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (source_globals, mut source_queue) =
+        registry_queue_init::<RegistryTestState>(&source_connection).unwrap();
+    let source_qh = source_queue.handle();
+    let source_compositor: client_wl_compositor::WlCompositor =
+        source_globals.bind(&source_qh, 1..=6, ()).unwrap();
+    let source_wm_base: client_xdg_wm_base::XdgWmBase =
+        source_globals.bind(&source_qh, 1..=6, ()).unwrap();
+    let source_shm: client_wl_shm::WlShm = source_globals.bind(&source_qh, 1..=1, ()).unwrap();
+    let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ()).unwrap();
+    let _source_pointer = source_seat.get_pointer(&source_qh, ());
+    let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        source_globals.bind(&source_qh, 1..=3, ()).unwrap();
+    let source_device = source_manager.get_data_device(&source_seat, &source_qh, ());
+    let (source_surface, source_xdg_surface, _source_toplevel) = create_test_buffered_toplevel(
+        &source_compositor,
+        &source_wm_base,
+        &source_shm,
+        &source_qh,
+        160,
+        120,
+    )
+    .unwrap();
+    let source = source_manager.create_data_source(&source_qh, ());
+    source.set_actions(client_wl_data_device_manager::DndAction::Copy);
+    source_surface.commit();
+    source_connection.flush().unwrap();
+    let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&source_xdg_surface);
+    source_connection.flush().unwrap();
+    source_queue.roundtrip(&mut source_state).unwrap();
+
+    let target_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (target_globals, mut target_queue) =
+        registry_queue_init::<RegistryTestState>(&target_connection).unwrap();
+    let target_qh = target_queue.handle();
+    let target_compositor: client_wl_compositor::WlCompositor =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let target_wm_base: client_xdg_wm_base::XdgWmBase =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let target_shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+    let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ()).unwrap();
+    let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        target_globals.bind(&target_qh, 1..=3, ()).unwrap();
+    let _target_device = target_manager.get_data_device(&target_seat, &target_qh, ());
+    let (target_surface, target_xdg_surface, _target_toplevel) = create_test_buffered_toplevel(
+        &target_compositor,
+        &target_wm_base,
+        &target_shm,
+        &target_qh,
+        160,
+        120,
+    )
+    .unwrap();
+    target_surface.commit();
+    target_connection.flush().unwrap();
+    let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&target_xdg_surface);
+    target_connection.flush().unwrap();
+    target_queue.roundtrip(&mut target_state).unwrap();
+
+    focus_root_window(&commands, target_surface.id().protocol_id());
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(300, 200),
+        160,
+        120,
+    );
+    focus_root_window(&commands, source_surface.id().protocol_id());
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    let serial = source_state
+        .pointer_button_serial
+        .expect("source drag must use the real pointer press serial");
+
+    source_device.start_drag(Some(&source), &source_surface, None, serial);
+    source_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    source_queue
+        .roundtrip(&mut source_state)
+        .expect("v3 drag must remain alive after start_drag");
+    target_queue.roundtrip(&mut target_state).unwrap();
+    assert_eq!(source_state.data_source_cancelled_count, 0);
+
+    source.offer("text/plain".to_string());
+    source.offer("text/plain".to_string());
+    source_connection.flush().unwrap();
+    source_queue
+        .roundtrip(&mut source_state)
+        .expect("wl_data_source.offer after start_drag must remain connected");
+    assert_eq!(source_state.data_source_cancelled_count, 0);
+
+    commands
+        .send(ServerCommand::PointerMotion { x: 320.0, y: 220.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    source_queue.roundtrip(&mut source_state).unwrap();
+    assert_eq!(target_state.data_device_enter_count, 1);
+    assert_eq!(target_state.data_offer_mime_types, vec!["text/plain"]);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn v3_source_set_actions_after_start_drag_remains_invalid_source() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let source = manager.create_data_source(&qh, ());
+    origin.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state.pointer_button_serial.expect("pointer press serial");
+
+    source.offer("text/plain".to_string());
+    source.set_actions(client_wl_data_device_manager::DndAction::Copy);
+    device.start_drag(Some(&source), &origin, None, serial);
+    source.set_actions(client_wl_data_device_manager::DndAction::Move);
+    connection.flush().unwrap();
+    assert!(queue.roundtrip(&mut state).is_err());
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn source_less_wire_drag_with_icon_reserves_a_permanent_drag_icon_role() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

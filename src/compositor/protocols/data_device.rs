@@ -184,19 +184,7 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceData> for CompositorState 
     ) {
         match request {
             wl_data_source::Request::Offer { mime_type } => {
-                if state
-                    .data_sources
-                    .get(&resource.id())
-                    .is_some_and(|source| source.use_state != DataSourceUse::Unused)
-                {
-                    state.post_protocol_error(
-                        client,
-                        resource,
-                        wl_data_source::Error::InvalidSource,
-                        "data source is no longer accepting offers".to_string(),
-                    );
-                    return;
-                }
+                // MIME catalog updates are independent of source reuse state.
                 if state
                     .data_sources
                     .get(&resource.id())
