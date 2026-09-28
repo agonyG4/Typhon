@@ -606,6 +606,106 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
 }
 
 #[test]
+fn production_wayland_auto_blur_is_stable_across_transient_opaque_region_changes() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.state.set_background_effect_enabled(true);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let blur_policy = crate::blur_policy::BlurPolicyConfig {
+        enabled: true,
+        applications: crate::blur_policy::BlurApplicationPolicy {
+            wayland: crate::blur_policy::BlurApplicationMode::Auto,
+            ..crate::blur_policy::BlurApplicationPolicy::default()
+        },
+        ..crate::blur_policy::BlurPolicyConfig::default()
+    };
+    replace_blur_policy_config(&commands, blur_policy);
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let (surface, xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 100)?;
+        xdg_surface.set_window_geometry(0, 0, 120, 100);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let initial_scene = capture_effect_scene(&commands);
+        assert_eq!(initial_scene.instances.len(), 1);
+        assert_eq!(
+            initial_scene.instances[0].anchor_scope,
+            EffectAnchorScope::VisualGroup
+        );
+        let initial_region = initial_scene.instances[0].region.clone();
+        let initial_signature = initial_scene.instances[0].signature;
+
+        let spotlight_opaque = compositor.create_region(&qh, ());
+        spotlight_opaque.add(20, 20, 60, 40);
+        surface.set_opaque_region(Some(&spotlight_opaque));
+        spotlight_opaque.destroy();
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let spotlight_scene = capture_effect_scene(&commands);
+        assert_eq!(spotlight_scene.instances[0].region, initial_region);
+        assert_eq!(spotlight_scene.instances[0].signature, initial_signature);
+
+        let moved_spotlight_opaque = compositor.create_region(&qh, ());
+        moved_spotlight_opaque.add(30, 10, 25, 25);
+        surface.set_opaque_region(Some(&moved_spotlight_opaque));
+        moved_spotlight_opaque.destroy();
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let reshaped_spotlight_scene = capture_effect_scene(&commands);
+        assert_eq!(reshaped_spotlight_scene.instances[0].region, initial_region);
+        assert_eq!(
+            reshaped_spotlight_scene.instances[0].signature,
+            initial_signature
+        );
+
+        let empty_opaque = compositor.create_region(&qh, ());
+        surface.set_opaque_region(Some(&empty_opaque));
+        empty_opaque.destroy();
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let after_empty_region_scene = capture_effect_scene(&commands);
+        assert_eq!(after_empty_region_scene.instances[0].region, initial_region);
+        assert_eq!(
+            after_empty_region_scene.instances[0].signature,
+            initial_signature
+        );
+
+        surface.set_opaque_region(None);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let after_null_region_scene = capture_effect_scene(&commands);
+        assert_eq!(after_null_region_scene.instances[0].region, initial_region);
+        assert_eq!(
+            after_null_region_scene.instances[0].signature,
+            initial_signature
+        );
+        Ok(())
+    })();
+
+    stop_controllable_test_server(commands, server_thread);
+    result.unwrap();
+}
+
+#[test]
 fn public_child_effects_follow_production_scene_order_not_identifiers() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();

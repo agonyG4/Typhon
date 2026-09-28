@@ -211,13 +211,15 @@ impl BlurAssignmentResolver {
             fullscreen,
             client_request_committed,
         )?;
-        self.materialize_assignment(
-            target_surface_id,
-            client_region,
-            candidate_region,
-            opaque_region,
-            decision,
-        )
+        let region = match (backend, decision.source) {
+            (
+                BlurBackend::Wayland,
+                BlurAssignmentSource::WaylandAuto | BlurAssignmentSource::WindowRule,
+            ) => candidate_region,
+            (_, BlurAssignmentSource::Client) => client_region,
+            _ => candidate_region.subtract(opaque_region),
+        };
+        self.materialize_assignment(target_surface_id, region, decision)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -248,13 +250,12 @@ impl BlurAssignmentResolver {
             true,
             false,
         )?;
-        self.materialize_assignment(
-            target_surface_id,
-            client_region,
-            candidate_region,
-            opaque_region,
-            decision,
-        )
+        let region = if decision.source == BlurAssignmentSource::Client {
+            client_region
+        } else {
+            candidate_region.subtract(opaque_region)
+        };
+        self.materialize_assignment(target_surface_id, region, decision)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,16 +352,9 @@ impl BlurAssignmentResolver {
     fn materialize_assignment(
         &self,
         target_surface_id: u32,
-        client_region: EffectRegion,
-        candidate_region: EffectRegion,
-        opaque_region: &EffectRegion,
+        region: EffectRegion,
         decision: BlurAssignmentDecision,
     ) -> Option<ResolvedBlurAssignment> {
-        let region = if decision.source == BlurAssignmentSource::Client {
-            client_region
-        } else {
-            candidate_region.subtract(opaque_region)
-        };
         (!region.is_empty()).then_some(ResolvedBlurAssignment {
             source: decision.source,
             anchor_scope: decision.anchor_scope,
@@ -657,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn wayland_window_rule_materializes_the_translated_xdg_candidate() {
+    fn wayland_window_rule_region_is_independent_of_partial_opaque_hint() {
         let raw_candidate = EffectRegion::from_rect(EffectRect::new(100, 100, 120, 100).unwrap());
         let candidate = synthetic_wayland_window_candidate(
             (100, 100),
@@ -674,14 +668,14 @@ mod tests {
         config.applications.wayland = BlurApplicationMode::RulesOnly;
         config.window_rules = vec![window_rule(BlurRuleAction::Enable)];
         resolver.replace_config(config).unwrap();
-        let empty = EffectRegion::empty();
+        let opaque = EffectRegion::from_rect(EffectRect::new(130, 125, 30, 20).unwrap());
 
         let assignment = resolver
             .resolve_window_assignment(
                 1,
-                empty.clone(),
+                EffectRegion::empty(),
                 candidate,
-                &empty,
+                &opaque,
                 false,
                 Some("org.example.app"),
                 None,
@@ -803,10 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn client_is_surface_scoped_and_synthetic_region_subtracts_opaque() {
+    fn wayland_auto_region_is_independent_of_partial_opaque_hint() {
         let r = resolver();
         let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
-        let opaque = EffectRegion::from_rect(EffectRect::new(0, 0, 80, 100).unwrap());
+        let opaque = EffectRegion::from_rect(EffectRect::new(20, 20, 60, 40).unwrap());
         let auto = r
             .resolve_window_assignment(
                 3,
@@ -823,12 +817,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(auto.source, BlurAssignmentSource::WaylandAuto);
-        assert!(!auto.region.contains_point(10, 50));
-        assert!(auto.region.contains_point(90, 50));
+        assert_eq!(auto.anchor_scope, EffectAnchorScope::VisualGroup);
+        assert_eq!(auto.region, candidate);
+    }
+
+    #[test]
+    fn client_exact_region_remains_surface_scoped() {
+        let r = resolver();
+        let client_region = EffectRegion::from_rect(EffectRect::new(5, 6, 30, 40).unwrap());
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let opaque = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
         let client = r
             .resolve_window_assignment(
                 4,
-                candidate.clone(),
+                client_region.clone(),
                 candidate,
                 &opaque,
                 true,
@@ -842,7 +844,138 @@ mod tests {
             .unwrap();
         assert_eq!(client.source, BlurAssignmentSource::Client);
         assert_eq!(client.anchor_scope, EffectAnchorScope::Surface);
-        assert!(client.region.contains_point(10, 50));
+        assert_eq!(client.region, client_region);
+    }
+
+    #[test]
+    fn xwayland_window_rule_preserves_current_opaque_behavior() {
+        let config = BlurPolicyConfig {
+            window_rules: vec![BlurWindowRule {
+                name: "xwayland-rule".to_string(),
+                matcher: BlurWindowMatch {
+                    app_id: Some("org.example.app".to_string()),
+                    title: None,
+                    backend: Some(BlurBackend::Xwayland),
+                },
+                action: BlurRuleAction::Enable,
+            }],
+            ..BlurPolicyConfig::default()
+        };
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let opaque = EffectRegion::from_rect(EffectRect::new(40, 30, 20, 20).unwrap());
+        let assignment = resolver
+            .resolve_window_assignment(
+                5,
+                EffectRegion::empty(),
+                candidate,
+                &opaque,
+                false,
+                Some("org.example.app"),
+                None,
+                BlurBackend::Xwayland,
+                SurfaceAlphaCapability::Opaque,
+                false,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(assignment.source, BlurAssignmentSource::WindowRule);
+        assert_eq!(assignment.anchor_scope, EffectAnchorScope::VisualGroup);
+        assert!(!assignment.region.contains_point(50, 40));
+        assert!(assignment.region.contains_point(10, 10));
+    }
+
+    #[test]
+    fn layer_rule_preserves_current_opaque_behavior() {
+        let config = BlurPolicyConfig {
+            layer_rules: vec![BlurLayerRule {
+                name: "waybar".to_string(),
+                matcher: BlurLayerMatch {
+                    namespace: Some("^waybar$".to_string()),
+                },
+                action: BlurRuleAction::Enable,
+            }],
+            ..BlurPolicyConfig::default()
+        };
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let opaque = EffectRegion::from_rect(EffectRect::new(40, 30, 20, 20).unwrap());
+        let assignment = resolver
+            .resolve_layer_assignment(
+                6,
+                EffectRegion::empty(),
+                candidate,
+                &opaque,
+                false,
+                "waybar",
+                SurfaceAlphaCapability::Opaque,
+                false,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(assignment.source, BlurAssignmentSource::LayerRule);
+        assert_eq!(assignment.anchor_scope, EffectAnchorScope::Surface);
+        assert!(!assignment.region.contains_point(50, 40));
+        assert!(assignment.region.contains_point(10, 10));
+    }
+
+    #[test]
+    fn full_opaque_still_disables_wayland_auto_but_not_an_explicit_window_rule() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let empty = EffectRegion::empty();
+        let automatic = resolver();
+        assert!(
+            automatic
+                .resolve_window_assignment(
+                    7,
+                    empty.clone(),
+                    candidate.clone(),
+                    &empty,
+                    true,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Wayland,
+                    SurfaceAlphaCapability::AlphaCapable,
+                    false,
+                    false,
+                )
+                .is_none(),
+            "a fully opaque surface remains ineligible for automatic blur"
+        );
+
+        let explicit = BlurAssignmentResolver::from_config(
+            BlurPolicyConfig {
+                applications: crate::blur_policy::BlurApplicationPolicy {
+                    wayland: BlurApplicationMode::RulesOnly,
+                    ..crate::blur_policy::BlurApplicationPolicy::default()
+                },
+                window_rules: vec![window_rule(BlurRuleAction::Enable)],
+                ..BlurPolicyConfig::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit
+                .resolve_window_assignment(
+                    8,
+                    empty,
+                    candidate,
+                    &EffectRegion::empty(),
+                    true,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Wayland,
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .source,
+            BlurAssignmentSource::WindowRule
+        );
     }
 
     #[test]
