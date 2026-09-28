@@ -14,9 +14,10 @@ use crate::process::{
 
 use super::trace::{self, TraceFields};
 use super::{
-    XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
-    XwaylandProxySelectionDataRequest, XwaylandProxySelectionTransferId,
-    XwaylandSelectionDataRequest,
+    XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandDndSourceDataRequest,
+    XwaylandDndSourceTransferId, XwaylandDndStatusFeedback, XwaylandDndTransition,
+    XwaylandGeneration, XwaylandMode, XwaylandProxySelectionDataRequest,
+    XwaylandProxySelectionTransferId, XwaylandSelectionDataRequest,
     config::{XwaylandConfig, xwm_reactor_hot_path_logging_enabled},
     diagnostics::{StderrRing, XwaylandFailure, XwaylandFailureStage},
     display::DisplayLease,
@@ -63,6 +64,7 @@ pub enum XwaylandReactorPurpose {
     Xwm,
     SelectionSink(SelectionPayloadTransferId),
     SelectionSource(XwaylandProxySelectionTransferId),
+    DndSource(XwaylandDndSourceTransferId),
     Stderr,
 }
 
@@ -385,6 +387,10 @@ impl XwaylandService {
                 .collect::<Vec<_>>(),
             _ => return false,
         };
+        let dnd_sources_before = match &self.state {
+            ServiceState::Running(resources) => resources.xwm.dnd_source_interests(),
+            _ => return false,
+        };
         let drain = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.drain_events(256),
             _ => return false,
@@ -400,7 +406,13 @@ impl XwaylandService {
                         .collect::<Vec<_>>(),
                     _ => Vec::new(),
                 };
-                if outgoing_sources_before != outgoing_sources_after {
+                let dnd_sources_after = match &self.state {
+                    ServiceState::Running(resources) => resources.xwm.dnd_source_interests(),
+                    _ => Vec::new(),
+                };
+                if outgoing_sources_before != outgoing_sources_after
+                    || dnd_sources_before != dnd_sources_after
+                {
                     self.bump_reactor_registration_generation();
                 }
                 let (
@@ -846,6 +858,42 @@ impl XwaylandService {
                             now,
                         )
                     }
+                    _ => return Ok(false),
+                };
+                match outcome {
+                    Ok(changed) => {
+                        if changed {
+                            self.bump_reactor_registration_generation();
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        self.fail_managed_xwm(
+                            supervisor,
+                            XwaylandFailureStage::Reactor,
+                            io::Error::other(error),
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            XwaylandReactorPurpose::DndSource(transfer_id) => {
+                let Some(generation) = generation else {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                };
+                if Some(generation) != self.generation() {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                }
+                let now = now_ns()?;
+                let outcome = match &mut self.state {
+                    ServiceState::Running(resources) => resources.xwm.handle_dnd_source_ready(
+                        transfer_id,
+                        generation,
+                        reactor_token,
+                        now,
+                    ),
                     _ => return Ok(false),
                 };
                 match outcome {
@@ -1412,6 +1460,90 @@ impl XwaylandService {
     pub fn take_managed_selection_events(&mut self) -> Vec<super::XwaylandSelectionEvent> {
         self.harvest_running_selection_metadata();
         self.selection_metadata_mailbox.take()
+    }
+
+    pub fn take_managed_dnd_feedback(&mut self) -> Vec<XwaylandDndStatusFeedback> {
+        match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.take_dnd_feedback(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn submit_managed_dnd_transitions(
+        &mut self,
+        generation: XwaylandGeneration,
+        transitions: impl IntoIterator<Item = XwaylandDndTransition>,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<bool> {
+        let now = now_ns()?;
+        let result = match &mut self.state {
+            ServiceState::Running(resources) if resources.generation == generation => resources
+                .xwm
+                .submit_dnd_transitions(transitions, now)
+                .and_then(|()| resources.xwm.flush())
+                .map(|()| true),
+            _ => return Ok(false),
+        };
+        match result {
+            Ok(submitted) => Ok(submitted),
+            Err(error) => {
+                self.fail_managed_xwm(
+                    supervisor,
+                    XwaylandFailureStage::CommandFlush,
+                    io::Error::other(error),
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    pub fn take_managed_dnd_source_data_requests(&mut self) -> Vec<XwaylandDndSourceDataRequest> {
+        match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.take_dnd_source_data_requests(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn resolve_managed_dnd_source_data_requests(
+        &mut self,
+        results: impl IntoIterator<Item = (XwaylandDndSourceTransferId, bool)>,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<()> {
+        let now = now_ns()?;
+        let result = match &mut self.state {
+            ServiceState::Running(resources) => resources
+                .xwm
+                .resolve_dnd_source_data_requests(results, now)
+                .and_then(|changed| {
+                    if changed {
+                        resources.xwm.flush()?;
+                    }
+                    Ok(changed)
+                }),
+            _ => return Ok(()),
+        };
+        match result {
+            Ok(changed) => {
+                if changed {
+                    self.bump_reactor_registration_generation();
+                }
+            }
+            Err(error) => self.fail_managed_xwm(
+                supervisor,
+                XwaylandFailureStage::CommandFlush,
+                io::Error::other(error),
+            ),
+        }
+        Ok(())
+    }
+
+    pub fn managed_dnd_source_is_current(&self, source: super::XwaylandDndSourceProxyId) -> bool {
+        matches!(&self.state, ServiceState::Running(resources)
+            if resources.generation == source.adapter_id.generation()
+                && resources.xwm.data_bridge.dnd.active_session().is_some_and(|session|
+                    session.id == source.adapter_id
+                        && session.source_proxy == Some(source.xid)
+                        && session.ownership_confirmed))
     }
 
     /// Start queued Wayland reads against their exact generation-bound X11

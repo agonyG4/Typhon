@@ -86,15 +86,38 @@ impl XwaylandDndAdapterId {
 pub struct XwaylandDndVersion(NonZeroU8);
 
 impl XwaylandDndVersion {
+    pub const MIN_SUPPORTED_TARGET_VERSION: u8 = 3;
+    pub const CURRENT_VERSION: u8 = 5;
+
     pub const fn new(version: u8) -> Option<Self> {
-        match NonZeroU8::new(version) {
-            Some(version) => Some(Self(version)),
-            None => None,
+        if version < Self::MIN_SUPPORTED_TARGET_VERSION || version > Self::CURRENT_VERSION {
+            return None;
         }
+        Some(Self(
+            NonZeroU8::new(version).expect("supported XDND version is nonzero"),
+        ))
     }
 
     pub const fn get(self) -> u8 {
         self.0.get()
+    }
+
+    /// Negotiate one target's advertised highest version with Typhon's live
+    /// XDND wire version. Targets below version 3 are outside the supported
+    /// bridge range; future versions are capped at the version we speak.
+    pub const fn negotiate_target(target_version: u32) -> Option<Self> {
+        if target_version < Self::MIN_SUPPORTED_TARGET_VERSION as u32 {
+            return None;
+        }
+        let negotiated = if target_version < Self::CURRENT_VERSION as u32 {
+            target_version as u8
+        } else {
+            Self::CURRENT_VERSION
+        };
+        match NonZeroU8::new(negotiated) {
+            Some(version) => Some(Self(version)),
+            None => None,
+        }
     }
 }
 
@@ -272,6 +295,39 @@ pub struct XwaylandDndDataRequest {
     pub sink: OwnedFd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct XwaylandDndSourceProxyId {
+    pub adapter_id: XwaylandDndAdapterId,
+    pub xid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct XwaylandDndSourceTransferId {
+    pub source: XwaylandDndSourceProxyId,
+    pub serial: NonZeroU64,
+}
+
+/// Generation/session-qualified semantic feedback from the XWM wire adapter.
+/// `XdndStatus` has no MIME field, so acceptance and action stay independent
+/// from any later `XdndSelection` conversion request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XwaylandDndStatusFeedback {
+    pub session_id: CanonicalDndSessionId,
+    pub target: X11WindowHandle,
+    pub accepted: bool,
+    pub action: Option<XwaylandDndAction>,
+}
+
+/// Move-only Wayland source read requested by the exact live XDND proxy.
+#[derive(Debug)]
+pub struct XwaylandDndSourceDataRequest {
+    pub transfer_id: XwaylandDndSourceTransferId,
+    pub target: X11WindowHandle,
+    pub requestor: u32,
+    pub mime_type: String,
+    pub sink: OwnedFd,
+}
+
 /// Canonical DND snapshots for a later XWM adapter. The compositor publishes
 /// one latest transition at a time and never stores a second active drag here.
 /// Each target snapshot carries enough source metadata to reconcile against
@@ -291,7 +347,6 @@ pub enum XwaylandDndTransition {
         target: X11WindowHandle,
         x: f64,
         y: f64,
-        accepted_mime: Option<String>,
         action: Option<XwaylandDndAction>,
         mime_types: XwaylandDndMimeCatalog,
         source_actions: Vec<XwaylandDndAction>,
@@ -303,7 +358,6 @@ pub enum XwaylandDndTransition {
     DropRequested {
         session_id: CanonicalDndSessionId,
         target: X11WindowHandle,
-        mime_type: String,
         action: XwaylandDndAction,
         mime_types: XwaylandDndMimeCatalog,
         source_actions: Vec<XwaylandDndAction>,
@@ -451,5 +505,39 @@ impl XwaylandDndOutbox {
             session_id,
             generation,
         });
+    }
+}
+
+#[cfg(test)]
+mod xdnd_version_tests {
+    use super::XwaylandDndVersion;
+
+    #[test]
+    fn target_version_negotiation_rejects_old_and_caps_future_versions() {
+        assert_eq!(XwaylandDndVersion::negotiate_target(2), None);
+        assert_eq!(
+            XwaylandDndVersion::negotiate_target(3).map(|v| v.get()),
+            Some(3)
+        );
+        assert_eq!(
+            XwaylandDndVersion::negotiate_target(4).map(|v| v.get()),
+            Some(4)
+        );
+        assert_eq!(
+            XwaylandDndVersion::negotiate_target(5).map(|v| v.get()),
+            Some(5)
+        );
+        assert_eq!(
+            XwaylandDndVersion::negotiate_target(6).map(|v| v.get()),
+            Some(5)
+        );
+        assert_eq!(
+            XwaylandDndVersion::negotiate_target(u32::MAX).map(|v| v.get()),
+            Some(5)
+        );
+        assert!(XwaylandDndVersion::new(2).is_none());
+        assert_eq!(XwaylandDndVersion::new(3).map(|v| v.get()), Some(3));
+        assert_eq!(XwaylandDndVersion::new(5).map(|v| v.get()), Some(5));
+        assert!(XwaylandDndVersion::new(6).is_none());
     }
 }

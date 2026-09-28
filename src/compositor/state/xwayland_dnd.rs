@@ -8,6 +8,52 @@ use super::*;
 use crate::xwayland::CanonicalDndSessionId;
 
 impl CompositorState {
+    /// Hand one XDND MIME read to the exact active Wayland source. Selection
+    /// demand is advisory and never changes XdndStatus acceptance.
+    pub(in crate::compositor) fn request_xwayland_dnd_source_data(
+        &mut self,
+        request: crate::xwayland::XwaylandDndSourceDataRequest,
+    ) -> bool {
+        use std::os::fd::AsFd;
+
+        let adapter_id = request.transfer_id.source.adapter_id;
+        if request.transfer_id.source.xid == 0
+            || adapter_id.generation() != request.target.generation()
+            || self
+                .xwayland
+                .client_identity
+                .as_ref()
+                .is_none_or(|identity| identity.generation != adapter_id.generation())
+        {
+            return false;
+        }
+        let Some(active) = self.active_drag.as_ref() else {
+            return false;
+        };
+        if active.id != adapter_id.session_id()
+            || active.lifecycle_driver != DragLifecycleDriver::WaylandImplicitPointerGrab
+            || active.phase != DragSessionPhase::Dragging
+            || active.xwayland_dnd_generation != Some(adapter_id.generation())
+            || !matches!(active.target.as_ref(), Some(ActiveDragTarget::Xwayland { window }) if *window == request.target)
+            || !matches!(&active.origin, ActiveDragOrigin::WaylandSource { .. })
+            || !self
+                .drag_source_mime_types(&active.origin)
+                .iter()
+                .any(|mime| mime == &request.mime_type)
+        {
+            return false;
+        }
+        let ActiveDragOrigin::WaylandSource { source, .. } = &active.origin else {
+            return false;
+        };
+        source
+            .send_event(wayland_server::protocol::wl_data_source::Event::Send {
+                mime_type: request.mime_type,
+                fd: request.sink.as_fd(),
+            })
+            .is_ok()
+    }
+
     pub(in crate::compositor) fn take_xwayland_dnd_transitions(
         &mut self,
     ) -> Vec<crate::xwayland::XwaylandDndTransition> {
@@ -84,7 +130,7 @@ impl CompositorState {
         &mut self,
         session_id: CanonicalDndSessionId,
         target: crate::xwayland::X11WindowHandle,
-        accepted_mime: Option<String>,
+        accepted: bool,
         action: Option<crate::xwayland::XwaylandDndAction>,
     ) -> bool {
         let Some(active) = self.active_drag.as_ref() else {
@@ -112,16 +158,8 @@ impl CompositorState {
         else {
             return false;
         };
-        let mime_types = crate::xwayland::XwaylandDndMimeCatalog::bounded_from_iter(
-            self.drag_source_mime_types(&origin),
-        );
-        if accepted_mime.as_ref().is_some_and(|mime| {
-            !mime_types
-                .as_slice()
-                .iter()
-                .any(|source_mime| source_mime == mime)
-        }) || (accepted_mime.is_none() && action.is_some())
-        {
+        let action = if accepted { action } else { None };
+        if accepted && action.is_none() {
             return false;
         }
         let action_supported = match &origin {
@@ -150,17 +188,13 @@ impl CompositorState {
         let Some(active) = self.active_drag.as_mut() else {
             return false;
         };
-        active.accepted_mime = accepted_mime.clone();
+        // XDND Status has no MIME field. Keep MIME acceptance owned by the
+        // Wayland-target path and represent X11 wire acceptance through its
+        // action mask and selected action only.
+        active.accepted_mime = None;
         active.target_action = action;
         active.destination_actions = Some(action_mask);
         active.selected_action = selected_action;
-        if let Some(source) = active.origin.wayland_source()
-            && source.is_alive()
-        {
-            let _ = source.send_event(wl_data_source::Event::Target {
-                mime_type: accepted_mime,
-            });
-        }
         self.send_drag_action_if_changed();
         true
     }
@@ -243,7 +277,6 @@ impl CompositorState {
         }
         let source_actions = self.drag_source_actions(&active.origin);
         let origin = active.origin.clone();
-        let accepted_mime = active.accepted_mime.clone();
         let negotiated_action = active.target_action;
         let action = if accepted
             && matches!(&origin, ActiveDragOrigin::WaylandSource { .. })
@@ -259,9 +292,6 @@ impl CompositorState {
         } else {
             final_action.or(active.target_action)
         };
-        if accepted && accepted_mime.is_none() {
-            return false;
-        }
         if accepted {
             let Some(action) = action else {
                 return false;
@@ -284,7 +314,6 @@ impl CompositorState {
             }
         }
 
-        let accepted = accepted && accepted_mime.is_some();
         if !self.queue_xwayland_dnd_transition(
             crate::xwayland::XwaylandDndTransition::TargetFinished {
                 session_id,

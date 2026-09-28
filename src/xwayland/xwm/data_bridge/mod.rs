@@ -5,6 +5,9 @@
 //! and every entry is bound to the active XWayland generation.
 
 pub mod dnd;
+pub(crate) mod dnd_adapter;
+pub(crate) mod dnd_selection;
+pub(crate) mod dnd_wire;
 pub mod selection;
 pub mod transfer;
 
@@ -13,6 +16,13 @@ use std::num::NonZeroU64;
 use x11rb::connection::SequenceNumber;
 
 use super::super::XwaylandGeneration;
+
+pub(crate) fn is_internal_window(xwm: &super::Xwm, window: u32) -> bool {
+    window == xwm.supporting_wm_check
+        || xwm.data_bridge.selection_wire.is_internal_window(window)
+        || super::selection_payload::owns_window(xwm, window)
+        || dnd::is_internal_window(xwm, window)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectionKind {
@@ -50,6 +60,7 @@ pub struct DataBridge {
     pub(crate) selection_outgoing: super::selection_outgoing::SelectionOutgoingManager,
     pub transfers: transfer::TransferManager,
     pub dnd: dnd::DndManager,
+    pub(crate) dnd_outgoing: super::dnd_outgoing::DndOutgoingManager,
 }
 
 impl DataBridge {
@@ -64,6 +75,7 @@ impl DataBridge {
             .extend(self.selection_outgoing.clear_generation(bridge_generation));
         self.transfers.clear_generation(bridge_generation);
         self.dnd.clear_generation(generation);
+        self.dnd_outgoing.clear_generation(generation);
         pending_selection_replies
     }
 

@@ -61,6 +61,16 @@ impl OwnCompositorServer {
             .collect()
     }
 
+    /// Serve one XdndSelection MIME read only for the exact live Wayland drag
+    /// and current X11 hover target. An X selection request is advisory data
+    /// demand; XDND Status remains the sole X11 acceptance signal.
+    pub fn request_xwayland_dnd_source_data(
+        &mut self,
+        request: crate::xwayland::XwaylandDndSourceDataRequest,
+    ) -> bool {
+        self.state.request_xwayland_dnd_source_data(request)
+    }
+
     /// Start the canonical drag for a validated XWayland XDND offer.
     pub fn begin_xwayland_dnd(&mut self, offer: crate::xwayland::XwaylandDndOffer) -> bool {
         self.state.begin_xwayland_drag_session(offer)
@@ -89,11 +99,11 @@ impl OwnCompositorServer {
         &mut self,
         session_id: crate::xwayland::CanonicalDndSessionId,
         target: X11WindowHandle,
-        accepted_mime: Option<String>,
+        accepted: bool,
         action: Option<crate::xwayland::XwaylandDndAction>,
     ) -> bool {
         self.state
-            .update_xwayland_drag_target_status(session_id, target, accepted_mime, action)
+            .update_xwayland_drag_target_status(session_id, target, accepted, action)
     }
 
     /// Finish or reject a drag only for the exact current X11 target and

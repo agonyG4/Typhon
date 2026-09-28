@@ -63,6 +63,36 @@ fn normalized_window_event_target(event: &Event) -> Option<u32> {
 fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     trace_raw_event(&event);
     let event = match event {
+        Event::ClientMessage(message)
+            if super::data_bridge::dnd::client_message(
+                xwm,
+                message,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )? =>
+        {
+            return Ok(());
+        }
+        Event::PropertyNotify(property)
+            if super::data_bridge::dnd::property_notify(
+                xwm,
+                property,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )? =>
+        {
+            return Ok(());
+        }
+        Event::PropertyNotify(property)
+            if property.state == xproto::Property::DELETE
+                && super::dnd_outgoing::owns_property(xwm, property.window, property.atom) =>
+        {
+            super::dnd_outgoing::property_deleted(
+                xwm,
+                property.window,
+                property.atom,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )?;
+            return Ok(());
+        }
         Event::PropertyNotify(property)
             if property.state == xproto::Property::DELETE
                 && super::selection_outgoing::owns_property(
@@ -105,6 +135,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             return Ok(());
         }
         Event::SelectionClear(clear) => {
+            if super::data_bridge::dnd::selection_clear(
+                xwm,
+                clear,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )? {
+                return Ok(());
+            }
             if super::selection_proxy::selection_clear(
                 xwm,
                 clear,
@@ -113,6 +150,11 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 return Ok(());
             }
             Event::SelectionClear(clear)
+        }
+        Event::DestroyNotify(destroy)
+            if super::data_bridge::dnd::destroy_notify(xwm, destroy.window)? =>
+        {
+            return Ok(());
         }
         Event::DestroyNotify(destroy)
             if super::selection_proxy::proxy_owner_destroyed(
@@ -125,13 +167,12 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         event => event,
     };
-    if normalized_window_event_target(&event).is_some_and(|window| {
-        super::selection_wire::is_internal_window(
-            window,
-            Some(xwm.supporting_wm_check),
-            Some(&xwm.data_bridge.selection_wire),
-        ) || super::selection_payload::owns_window(xwm, window)
-    }) {
+    if let Event::DestroyNotify(destroy) = &event {
+        super::dnd_outgoing::requestor_destroyed(xwm, destroy.window)?;
+    }
+    if normalized_window_event_target(&event)
+        .is_some_and(|window| super::data_bridge::is_internal_window(xwm, window))
+    {
         return Ok(());
     }
     if let Event::DestroyNotify(destroy) = &event {
@@ -139,6 +180,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     }
     match event {
         Event::SelectionRequest(event) => {
+            if super::data_bridge::dnd::selection_request(
+                xwm,
+                event,
+                crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+            )? {
+                return Ok(());
+            }
             super::selection_proxy::handle_selection_request(
                 xwm,
                 event,

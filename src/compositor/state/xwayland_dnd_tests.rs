@@ -63,7 +63,6 @@ fn xwayland_dnd_outbox_coalesces_only_exact_adjacent_positions() {
                 target: target_a,
                 x,
                 y: x * 2.0,
-                accepted_mime: None,
                 action: None,
                 mime_types: XwaylandDndMimeCatalog::default(),
                 source_actions: Vec::new(),
@@ -76,7 +75,6 @@ fn xwayland_dnd_outbox_coalesces_only_exact_adjacent_positions() {
             target: target_b,
             x: 50.0,
             y: 60.0,
-            accepted_mime: None,
             action: None,
             mime_types: XwaylandDndMimeCatalog::default(),
             source_actions: Vec::new(),
@@ -89,7 +87,6 @@ fn xwayland_dnd_outbox_coalesces_only_exact_adjacent_positions() {
             target: target_b,
             x: 70.0,
             y: 80.0,
-            accepted_mime: None,
             action: None,
             mime_types: XwaylandDndMimeCatalog::default(),
             source_actions: Vec::new(),
@@ -149,7 +146,6 @@ fn xwayland_dnd_outbox_keeps_edges_ordered_and_preserves_source_finish() {
             target: target_a,
             x: 3.0,
             y: 4.0,
-            accepted_mime: None,
             action: None,
             mime_types: mime_types.clone(),
             source_actions: Vec::new(),
@@ -169,7 +165,6 @@ fn xwayland_dnd_outbox_keeps_edges_ordered_and_preserves_source_finish() {
         XwaylandDndTransition::DropRequested {
             session_id: session,
             target: target_b,
-            mime_type: "text/plain".to_owned(),
             action: XwaylandDndAction::Copy,
             mime_types,
             source_actions: vec![XwaylandDndAction::Copy],
@@ -291,7 +286,6 @@ fn xwayland_dnd_outbox_rejects_required_overflow_and_resets_to_exact_retirement(
     let overflow = outbox.push(XwaylandDndTransition::DropRequested {
         session_id: session,
         target,
-        mime_type: "text/plain".to_owned(),
         action: XwaylandDndAction::Copy,
         mime_types: XwaylandDndMimeCatalog::default(),
         source_actions: vec![XwaylandDndAction::Copy],
@@ -550,12 +544,7 @@ fn wayland_source_x11_target_drag(
     state.begin_drag_session(Some(source.clone()), origin, None, 8);
     let session_id = state.active_drag.as_ref().expect("canonical drag").id;
     state.update_drag_target_at(110.0, 100.0);
-    assert!(state.update_xwayland_drag_target_status(
-        session_id,
-        target,
-        Some("text/plain".to_owned()),
-        Some(action),
-    ));
+    assert!(state.update_xwayland_drag_target_status(session_id, target, true, Some(action),));
 
     WaylandSourceX11TargetDrag {
         display,
@@ -569,6 +558,22 @@ fn wayland_source_x11_target_drag(
         x11_target_surface,
         wayland_target_surface,
     }
+}
+
+#[test]
+fn x11_status_acceptance_does_not_require_or_invent_a_mime() {
+    let mut drag =
+        wayland_source_x11_target_drag(XwaylandDndAction::Copy, WaylandDndAction::Copy.mask());
+
+    assert!(drag.state.update_xwayland_drag_target_status(
+        drag.session_id,
+        drag.target,
+        true,
+        Some(XwaylandDndAction::Copy),
+    ));
+    let active = drag.state.active_drag.as_ref().expect("active drag");
+    assert_eq!(active.target_action, Some(XwaylandDndAction::Copy));
+    assert_eq!(active.accepted_mime, None);
 }
 
 #[test]
@@ -693,7 +698,7 @@ fn continuous_positions_do_not_cancel_but_mandatory_overflow_retires_exact_drag(
     assert!(drag.state.update_xwayland_drag_target_status(
         drag.session_id,
         target_a,
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Copy),
     ));
     let _ = drag.source_events();
@@ -1064,12 +1069,13 @@ fn wayland_target_switches_to_exact_x11_window_and_back_without_parallel_authori
             && !mime_types.as_slice().contains(&omitted_mime_type)
     ));
     let session_id = state.active_drag.as_ref().expect("active drag").id;
-    assert!(!state.update_xwayland_drag_target_status(
+    assert!(state.update_xwayland_drag_target_status(
         session_id,
         x11_handle,
-        Some(omitted_mime_type),
+        true,
         Some(XwaylandDndAction::Copy),
     ));
+    assert_eq!(state.active_drag.as_ref().unwrap().accepted_mime, None);
 
     state.update_drag_target_at(10.0, 10.0);
     let second_offer = active_wayland_offer(&state).expect("new Wayland offer");
@@ -1091,7 +1097,7 @@ fn wayland_target_switches_to_exact_x11_window_and_back_without_parallel_authori
 }
 
 #[test]
-fn x11_target_status_drop_and_finish_use_exact_canonical_identity_and_typed_action() {
+fn x11_status_drop_and_finish_use_exact_canonical_identity_without_mime() {
     let display = Display::<CompositorState>::new().expect("test display");
     let (client, _peer) = test_client(&display);
     let mut state = CompositorState::new(None);
@@ -1145,25 +1151,25 @@ fn x11_target_status_drop_and_finish_use_exact_canonical_identity_and_typed_acti
     assert!(!state.update_xwayland_drag_target_status(
         CanonicalDndSessionId::Wayland(NonZeroU64::new(999).unwrap()),
         target_handle,
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Copy),
     ));
     assert!(!state.update_xwayland_drag_target_status(
         session_id,
         X11WindowHandle::new(generation, target_handle.xid() + 1),
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Copy),
     ));
     assert!(!state.update_xwayland_drag_target_status(
         session_id,
         target_handle,
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Link),
     ));
     assert!(state.update_xwayland_drag_target_status(
         session_id,
         target_handle,
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Copy),
     ));
     assert_eq!(
@@ -1183,10 +1189,9 @@ fn x11_target_status_drop_and_finish_use_exact_canonical_identity_and_typed_acti
         Some(crate::xwayland::XwaylandDndTransition::DropRequested {
             session_id: current,
             target,
-            mime_type,
             action: XwaylandDndAction::Copy,
             ..
-        }) if *current == session_id && *target == target_handle && mime_type == "text/plain"
+        }) if *current == session_id && *target == target_handle
     ));
     assert!(!state.finish_xwayland_drag_target(
         session_id,
@@ -1212,6 +1217,76 @@ fn x11_target_status_drop_and_finish_use_exact_canonical_identity_and_typed_acti
         Some(DragSessionPhase::Finished)
     );
     assert_eq!(state.compliance_metrics.dnd_sessions_finished, 1);
+}
+
+#[test]
+fn x11_target_finish_does_not_require_a_mime() {
+    let mut drag =
+        wayland_source_x11_target_drag(XwaylandDndAction::Copy, WaylandDndAction::Copy.mask());
+    let active = drag.state.active_drag.as_mut().expect("active drag");
+    assert_eq!(active.accepted_mime, None);
+    active.phase = DragSessionPhase::DropPendingXwaylandTarget;
+
+    assert!(drag.state.finish_xwayland_drag_target(
+        drag.session_id,
+        drag.target,
+        true,
+        Some(XwaylandDndAction::Copy),
+    ));
+    assert!(drag.state.active_drag.is_none());
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 1);
+}
+
+#[test]
+fn c2a_physical_drop_on_x11_target_fails_closed_without_pending_drag() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    assert!(drag.state.update_xwayland_drag_target_status(
+        drag.session_id,
+        drag.target,
+        true,
+        Some(XwaylandDndAction::Copy),
+    ));
+    let _ = drag.source_events();
+    drag.state.drop_active_drag();
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.phase),
+        Some(DragSessionPhase::DropPendingXwaylandTarget)
+    );
+    assert!(
+        drag.state
+            .finish_xwayland_drag_target(drag.session_id, drag.target, false, None)
+    );
+    assert!(drag.state.active_drag.is_none());
+    assert_eq!(
+        drag.state.compliance_metrics.dnd_last_terminal_phase,
+        Some(DragSessionPhase::Cancelled)
+    );
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
+    assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
+    assert_eq!(
+        drag.source_events(),
+        [SourceWireEvent::DropPerformed, SourceWireEvent::Cancelled]
+    );
+}
+
+#[test]
+fn rejected_x11_status_clears_the_canonical_action() {
+    let mut drag =
+        wayland_source_x11_target_drag(XwaylandDndAction::Copy, WaylandDndAction::Copy.mask());
+
+    assert!(drag.state.update_xwayland_drag_target_status(
+        drag.session_id,
+        drag.target,
+        false,
+        Some(XwaylandDndAction::Copy),
+    ));
+    let active = drag.state.active_drag.as_ref().expect("active drag");
+    assert_eq!(active.target_action, None);
+    assert_eq!(active.selected_action, 0);
+    assert_eq!(active.accepted_mime, None);
 }
 
 #[test]
@@ -1310,8 +1385,10 @@ fn x11_target_window_retirement_after_drop_cancels_wayland_source_once() {
         WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
     );
     assert!(
-        drag.source_events()
-            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned(),)))
+        !drag
+            .source_events()
+            .iter()
+            .any(|event| matches!(event, SourceWireEvent::Target(Some(_))))
     );
 
     drag.state.drop_active_drag();
@@ -1438,8 +1515,10 @@ fn x11_target_retirement_before_drop_only_leaves_target_once() {
         WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
     );
     assert!(
-        drag.source_events()
-            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned(),)))
+        !drag
+            .source_events()
+            .iter()
+            .any(|event| matches!(event, SourceWireEvent::Target(Some(_))))
     );
     assert!(matches!(
         drag.state.take_xwayland_dnd_transitions().as_slice(),
@@ -1527,7 +1606,7 @@ fn stale_x11_target_events_cannot_finish_a_replacement_drag() {
     assert!(!drag.state.update_xwayland_drag_target_status(
         drag.session_id,
         drag.target,
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Copy),
     ));
     assert!(!drag.state.finish_xwayland_drag_target(
@@ -1554,9 +1633,10 @@ fn leaving_x11_target_clears_mime_feedback_when_switching_or_having_no_target() 
         WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
     );
     assert!(
-        switch_to_wayland
+        !switch_to_wayland
             .source_events()
-            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned())))
+            .iter()
+            .any(|event| matches!(event, SourceWireEvent::Target(Some(_))))
     );
     switch_to_wayland.state.update_drag_target_at(10.0, 10.0);
     assert!(matches!(
@@ -1585,9 +1665,10 @@ fn leaving_x11_target_clears_mime_feedback_when_switching_or_having_no_target() 
         WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
     );
     assert!(
-        move_to_no_target
+        !move_to_no_target
             .source_events()
-            .contains(&SourceWireEvent::Target(Some("text/plain".to_owned())))
+            .iter()
+            .any(|event| matches!(event, SourceWireEvent::Target(Some(_))))
     );
     move_to_no_target
         .state
@@ -1707,7 +1788,7 @@ fn xwayland_source_retains_semantic_ask_action_domain_on_x11_finish() {
     assert!(state.update_xwayland_drag_target_status(
         session_id,
         target,
-        Some("text/plain".to_owned()),
+        true,
         Some(XwaylandDndAction::Ask),
     ));
     assert!(state.drop_xwayland_drag(offer_id));

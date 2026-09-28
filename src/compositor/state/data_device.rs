@@ -329,7 +329,10 @@ impl CompositorState {
         });
     }
 
-    pub(super) fn drag_source_mime_types(&self, origin: &ActiveDragOrigin) -> Vec<String> {
+    pub(in crate::compositor) fn drag_source_mime_types(
+        &self,
+        origin: &ActiveDragOrigin,
+    ) -> Vec<String> {
         match origin {
             ActiveDragOrigin::WaylandSource { source, .. } => self
                 .data_sources
@@ -564,7 +567,6 @@ impl CompositorState {
                     Some(ActiveDragTarget::Xwayland { window }) if *window == target_window
                 )
         });
-        let accepted_mime = current.and_then(|active| active.accepted_mime.clone());
         let action = current.and_then(|active| active.target_action);
         let mime_types = current
             .map(|active| {
@@ -588,7 +590,6 @@ impl CompositorState {
                 target: target_window,
                 x,
                 y,
-                accepted_mime,
                 action,
                 mime_types,
                 source_actions,
@@ -915,9 +916,7 @@ impl CompositorState {
         }
         match target {
             ActiveDragTarget::Xwayland { window } => {
-                let (Some(mime_type), Some(action)) =
-                    (active.accepted_mime.clone(), active.target_action)
-                else {
+                let Some(action) = active.target_action else {
                     self.cancel_drag_session("xwayland_target_not_accepted");
                     return;
                 };
@@ -948,7 +947,6 @@ impl CompositorState {
                     crate::xwayland::XwaylandDndTransition::DropRequested {
                         session_id: active.id,
                         target: window,
-                        mime_type,
                         action,
                         mime_types,
                         source_actions,

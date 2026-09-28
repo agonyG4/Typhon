@@ -22,6 +22,7 @@ mod configure_timeline;
 mod connection;
 pub mod data_bridge;
 mod decoration;
+pub(crate) mod dnd_outgoing;
 mod event_trace;
 mod event_types;
 mod events;
@@ -554,6 +555,7 @@ impl Xwm {
     }
 
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
+        let _ = data_bridge::dnd::retire_generation(self, generation);
         self.windows.clear_generation(generation);
         self.adoption.clear_generation(generation);
         self.association.clear_generation(generation);

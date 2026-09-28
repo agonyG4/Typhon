@@ -408,6 +408,18 @@ impl XwaylandService {
                         .bind_reactor_token(transfer_id, registration.fd, token);
                 }
             }
+            super::XwaylandReactorPurpose::DndSource(transfer_id) => {
+                let token = registered.then_some(reactor_token.unwrap_or(0));
+                if let ServiceState::Running(resources) = &mut self.state
+                    && registration.generation == Some(resources.generation)
+                {
+                    resources.xwm.bind_dnd_source_reactor_token(
+                        transfer_id,
+                        registration.fd,
+                        token,
+                    );
+                }
+            }
             super::XwaylandReactorPurpose::ListenFilesystem
             | super::XwaylandReactorPurpose::ListenAbstract
             | super::XwaylandReactorPurpose::Stderr => {}
@@ -509,6 +521,15 @@ impl XwaylandService {
                     generation: Some(resources.generation),
                     purpose: XwaylandReactorPurpose::SelectionSink(transfer_id),
                     writable: true,
+                    owner: XwaylandReactorOwner::Running,
+                });
+            }
+            for (transfer_id, fd) in resources.xwm.dnd_source_interests() {
+                registrations.push(XwaylandReactorRegistration {
+                    fd,
+                    generation: Some(resources.generation),
+                    purpose: XwaylandReactorPurpose::DndSource(transfer_id),
+                    writable: false,
                     owner: XwaylandReactorOwner::Running,
                 });
             }

@@ -56,11 +56,14 @@ pub(crate) fn sync_xwayland_reactor_sources_with_generation(
             XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::SelectionSink(_) => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::SelectionSource(_) => NativeEventSource::XwaylandXwm,
+            XwaylandReactorPurpose::DndSource(_) => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
         };
         let events = if matches!(
             registration.purpose,
-            XwaylandReactorPurpose::SelectionSink(_) | XwaylandReactorPurpose::SelectionSource(_)
+            XwaylandReactorPurpose::SelectionSink(_)
+                | XwaylandReactorPurpose::SelectionSource(_)
+                | XwaylandReactorPurpose::DndSource(_)
         ) {
             let direction = if matches!(
                 registration.purpose,

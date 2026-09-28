@@ -9,6 +9,64 @@ impl Xwm {
         selection_wire::submit_proxy_selection_snapshots(self, snapshots)
     }
 
+    pub(crate) fn submit_dnd_transitions(
+        &mut self,
+        transitions: impl IntoIterator<Item = crate::xwayland::XwaylandDndTransition>,
+        now_ns: u64,
+    ) -> Result<(), XwmError> {
+        super::data_bridge::dnd::apply_transitions(self, transitions, now_ns)
+    }
+
+    pub(crate) fn take_dnd_feedback(&mut self) -> Vec<crate::xwayland::XwaylandDndStatusFeedback> {
+        super::data_bridge::dnd::take_feedback(self)
+    }
+
+    pub(crate) fn handle_dnd_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
+        super::data_bridge::dnd::handle_deadline(self, now_ns)
+    }
+
+    pub(crate) fn take_dnd_source_data_requests(
+        &mut self,
+    ) -> Vec<crate::xwayland::XwaylandDndSourceDataRequest> {
+        super::dnd_outgoing::take_requests(self)
+    }
+
+    pub(crate) fn resolve_dnd_source_data_requests(
+        &mut self,
+        results: impl IntoIterator<Item = (crate::xwayland::XwaylandDndSourceTransferId, bool)>,
+        now_ns: u64,
+    ) -> Result<bool, XwmError> {
+        super::dnd_outgoing::resolve_requests(self, results, now_ns)
+    }
+
+    pub(crate) fn dnd_source_interests(
+        &self,
+    ) -> Vec<(
+        crate::xwayland::XwaylandDndSourceTransferId,
+        std::os::fd::RawFd,
+    )> {
+        super::dnd_outgoing::source_interests(self)
+    }
+
+    pub(crate) fn bind_dnd_source_reactor_token(
+        &mut self,
+        id: crate::xwayland::XwaylandDndSourceTransferId,
+        fd: std::os::fd::RawFd,
+        token: Option<u64>,
+    ) {
+        super::dnd_outgoing::bind_reactor_token(self, id, fd, token);
+    }
+
+    pub(crate) fn handle_dnd_source_ready(
+        &mut self,
+        id: crate::xwayland::XwaylandDndSourceTransferId,
+        generation: XwaylandGeneration,
+        token: u64,
+        now_ns: u64,
+    ) -> Result<bool, XwmError> {
+        super::dnd_outgoing::handle_source_ready(self, id, generation, token, now_ns)
+    }
+
     pub(crate) fn next_deadline_ns(&self) -> Option<u64> {
         self.next_resize_sync_deadline_ns()
             .into_iter()
@@ -17,6 +75,8 @@ impl Xwm {
             .chain(self.data_bridge.selection_payloads.next_deadline_ns())
             .chain(selection_proxy::next_deadline_ns(self))
             .chain(self.data_bridge.selection_outgoing.next_deadline_ns())
+            .chain(self.data_bridge.dnd.next_deadline_ns())
+            .chain(self.data_bridge.dnd_outgoing.next_deadline_ns())
             .min()
     }
 
@@ -38,6 +98,20 @@ impl Xwm {
             );
         }
         if let Err(error) = selection_outgoing::expire_deadlines(self, now_ns) {
+            return XwmDeadlineOutcome {
+                adoption_timeout_summary,
+                adoption_metrics: self.adoption_metrics(),
+                error: Some(error),
+            };
+        }
+        if let Err(error) = self.handle_dnd_deadline(now_ns) {
+            return XwmDeadlineOutcome {
+                adoption_timeout_summary,
+                adoption_metrics: self.adoption_metrics(),
+                error: Some(error),
+            };
+        }
+        if let Err(error) = super::dnd_outgoing::expire_deadlines(self, now_ns) {
             return XwmDeadlineOutcome {
                 adoption_timeout_summary,
                 adoption_metrics: self.adoption_metrics(),
@@ -355,11 +429,26 @@ impl Xwm {
                 budget_exhausted |= drain.budget_exhausted;
                 Some(drain)
             };
+            let dnd_budget = budget.saturating_sub(selection_replies_processed);
+            let dnd_reply_drain = if dnd_budget == 0 {
+                selection_replies_quiescent = false;
+                budget_exhausted = budget_exhausted || budget != 0;
+                None
+            } else {
+                let processed = super::data_bridge::dnd::poll_replies(
+                    self,
+                    dnd_budget,
+                    crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+                )?;
+                selection_replies_processed = selection_replies_processed.saturating_add(processed);
+                Some(processed)
+            };
             if event_drain.is_none_or(|drain| drain.processed == 0)
                 && reply_drain.is_none_or(|drain| drain.processed == 0)
                 && selection_reply_drain.is_none_or(|drain| drain.processed == 0)
                 && payload_reply_drain.is_none_or(|drain| drain.processed == 0)
                 && proxy_reply_drain.is_none_or(|drain| drain.processed == 0)
+                && dnd_reply_drain.is_none_or(|processed| processed == 0)
             {
                 break;
             }

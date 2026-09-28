@@ -34,13 +34,24 @@ and confirmed through GetSelectionOwner before SelectionRequest serving begins.
 TARGETS, TIMESTAMP, MULTIPLE, direct properties, and outgoing INCR are active.
 External X11 takeover revokes proxy serving while preserving inbound discovery.
 The canonical compositor DND state now has the F11-C1 authority and semantic
-contract foundation for generation-qualified XWayland origins and X11 targets.
-XDND ClientMessages and end-to-end application interoperability remain
-inactive; native interoperability qualification remains pending F11-D.
+contract for generation-qualified XWayland origins and X11 targets. The F11-C1
+canonical cross-layer DND authority is complete.
+
+F11-C2-A implements a bounded Wayland → X11 hover and data bridge: the XWM
+discovers an XDND-aware target asynchronously, uses a per-drag internal source
+proxy, translates Enter/Position/Status/Leave, and serves `XdndSelection`
+TARGETS, TIMESTAMP, MULTIPLE, and offered MIME requests through direct or INCR
+transfers. XDND action feedback is independent of MIME requests. This milestone
+does not implement successful `XdndDrop`/`XdndFinished`; physical release over
+an X11 target is rejected at the C2-A boundary. Move/DELETE behavior is not
+complete: DELETE is unsupported and is not advertised. Native interoperability
+qualification remains pending F11-D.
+
+F11-C2-B, the Wayland → X11 Drop/Finished terminal bridge, is not implemented.
+F11-C3, X11 → Wayland XDND, is not implemented.
 
 The following remain adapter/model foundations rather than end-to-end support:
 
-- Xdnd ClientMessage bridge;
 - runtime RandR publication: inactive foundation; no live output publication;
 - X11 cursor ownership integration: inactive foundation.
 
