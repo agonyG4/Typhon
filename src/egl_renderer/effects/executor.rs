@@ -758,13 +758,13 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         graph,
         selection,
         output_size,
-        false,
+        SceneBaselineAuthority::ReplayRequired,
         debug_config,
     );
     let mut scene_work_state = SceneReplayWorkState::new(
         &scene_work,
         scene_replay_work_mode(
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer,
         ),
     );
@@ -787,6 +787,7 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         }
         if scene_advance_reason(
             pass,
+            SceneBaselineAuthority::ReplayRequired,
             debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer,
         )
         .is_some()
@@ -832,7 +833,13 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
             let execution_damage = prepare_effect_execution_region(
                 graph,
                 pass,
-                capture_execution_damage(graph, demand, pass, false, debug_config),
+                capture_execution_damage(
+                    graph,
+                    demand,
+                    pass,
+                    SceneBaselineAuthority::ReplayRequired,
+                    debug_config,
+                ),
             );
             let target_domain = pass
                 .output
@@ -955,7 +962,7 @@ fn execute_effect_graph_with_debug_config_internal(
         demand,
         selection,
         debug_config,
-        false,
+        SceneBaselineAuthority::ReplayRequired,
         true,
         scene_replay_work_mode_override,
     );
@@ -1023,7 +1030,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         demand,
         selection,
         *effect_debug_config(),
-        true,
+        SceneBaselineAuthority::PrecomposedFramebuffer,
         false,
         None,
     );
@@ -1052,7 +1059,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_graph_passes(
+fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
@@ -1062,7 +1069,7 @@ pub(crate) fn execute_graph_passes(
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
     debug_config: EffectDebugConfig,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     draw_overlays: bool,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
 ) -> RendererResult<EffectExecutionStats> {
@@ -1083,7 +1090,7 @@ pub(crate) fn execute_graph_passes(
         demand,
         selection,
         debug_config,
-        lifecycle_backdrop,
+        scene_baseline_authority,
         draw_overlays,
         scene_replay_work_mode_override,
         graph_scope,
@@ -1101,8 +1108,12 @@ pub(crate) fn execute_graph_passes(
 
 fn scene_advance_reason(
     pass: &CompiledRenderPass,
+    scene_baseline_authority: SceneBaselineAuthority,
     framebuffer_capture: bool,
 ) -> Option<&'static str> {
+    if scene_baseline_authority == SceneBaselineAuthority::PrecomposedFramebuffer {
+        return None;
+    }
     if !pass.checkpoint_dependencies.is_empty()
         && matches!(
             pass.kind,
@@ -1116,10 +1127,12 @@ fn scene_advance_reason(
 }
 
 fn scene_replay_work_mode(
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     framebuffer_capture: bool,
 ) -> SceneReplayWorkMode {
-    if lifecycle_backdrop || framebuffer_capture {
+    if scene_baseline_authority == SceneBaselineAuthority::PrecomposedFramebuffer
+        || framebuffer_capture
+    {
         SceneReplayWorkMode::GlobalBaseline
     } else {
         SceneReplayWorkMode::SuffixDemand
@@ -1137,7 +1150,7 @@ fn execute_graph_passes_inner(
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
     debug_config: EffectDebugConfig,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     draw_overlays: bool,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
@@ -1147,7 +1160,7 @@ fn execute_graph_passes_inner(
     // Validity belongs to this graph execution and logical texture ID. A
     // pooled physical allocation never carries validity into this map.
     let mut valid_regions = std::collections::HashMap::<GraphTextureId, EffectRegion>::new();
-    let framebuffer_capture = !lifecycle_backdrop
+    let framebuffer_capture = scene_baseline_authority == SceneBaselineAuthority::ReplayRequired
         && repaint_plan.is_some()
         && debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer;
     let repaint_rects = if let Some(rects) = explicit_repaint_rects {
@@ -1163,32 +1176,35 @@ fn execute_graph_passes_inner(
         graph,
         selection,
         renderer.current_size,
-        lifecycle_backdrop,
+        scene_baseline_authority,
         debug_config,
     );
     let mut scene_work_state = SceneReplayWorkState::new(
         &scene_work,
-        scene_replay_work_mode_override
-            .unwrap_or_else(|| scene_replay_work_mode(lifecycle_backdrop, framebuffer_capture)),
+        scene_replay_work_mode_override.unwrap_or_else(|| {
+            scene_replay_work_mode(scene_baseline_authority, framebuffer_capture)
+        }),
     );
     let scene_work_rects = &scene_work.baseline_work;
     let output_size = renderer.current_size;
-    let reconstruct_internal_scene_work =
-        framebuffer_capture || !scene_work.extra_scene_work.is_empty();
-    let mut scene_valid_region = EffectRegion::empty();
+    let reconstruct_internal_scene_work = should_reconstruct_scene_work(
+        scene_baseline_authority,
+        framebuffer_capture,
+        !scene_work.extra_scene_work.is_empty(),
+    );
+    let mut scene_valid_region = initial_scene_valid_region(scene_baseline_authority, &scene_work);
     let mut effect_valid_regions =
         std::collections::HashMap::<oblivion_one::effects::EffectInstanceId, EffectRegion>::new();
-    let mut scene_work_preservation =
-        if reconstruct_internal_scene_work && !scene_work.extra_scene_work.is_empty() {
-            Some(capture_scene_work_preservation(
-                renderer,
-                output_size,
-                framebuffer_origin,
-                &scene_work.extra_scene_work,
-            )?)
-        } else {
-            None
-        };
+    let mut scene_work_preservation = if !scene_work.extra_scene_work.is_empty() {
+        Some(capture_scene_work_preservation(
+            renderer,
+            output_size,
+            framebuffer_origin,
+            &scene_work.extra_scene_work,
+        )?)
+    } else {
+        None
+    };
     let execution_result = (|| -> RendererResult<EffectExecutionStats> {
         if reconstruct_internal_scene_work {
             renderer.clear_effect_scene_work(scene_work_rects, framebuffer_origin)?;
@@ -1201,12 +1217,18 @@ fn execute_graph_passes_inner(
             let execution_damage = prepare_effect_execution_region(
                 graph,
                 pass,
-                capture_execution_damage(graph, demand, pass, lifecycle_backdrop, debug_config),
+                capture_execution_damage(
+                    graph,
+                    demand,
+                    pass,
+                    scene_baseline_authority,
+                    debug_config,
+                ),
             );
             let capture_plan = checkpoint_capture_execution_plan_for_pass(
                 renderer,
                 pass,
-                lifecycle_backdrop,
+                scene_baseline_authority,
                 debug_config,
             );
             if renderer.effect_trace.enabled() {
@@ -1253,7 +1275,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -1273,7 +1295,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -1294,14 +1316,16 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
                 );
             }
             resource_result?;
-            if let Some(scene_advance_reason) = scene_advance_reason(pass, framebuffer_capture) {
+            if let Some(scene_advance_reason) =
+                scene_advance_reason(pass, scene_baseline_authority, framebuffer_capture)
+            {
                 let (draw_end, _) = composition_range(
                     &renderer.commands,
                     pass.anchor,
@@ -1458,7 +1482,7 @@ fn execute_graph_passes_inner(
                 }
                 scene_cursor = next_cursor.max(scene_cursor);
             }
-            if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+            if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
                 let required = pass_output_texture_domain(graph, pass);
                 let required_effect_region =
                     checkpoint_dependency_influence_region(graph, pass, &required);
@@ -1528,7 +1552,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -1556,7 +1580,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -1590,7 +1614,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -1635,7 +1659,7 @@ fn execute_graph_passes_inner(
                 pass,
                 framebuffer_origin,
                 &execution_damage.region,
-                lifecycle_backdrop,
+                scene_baseline_authority,
                 debug_config,
                 capture_plan,
                 graph_scope.is_some(),
@@ -1667,7 +1691,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -1679,7 +1703,7 @@ fn execute_graph_passes_inner(
                 }
                 return Err(error);
             }
-            if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+            if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
                 let capture_satisfied = scene_work_state.mark_capture_satisfied(pass.id);
                 if capture_satisfied && renderer.effect_trace.enabled() {
                     let metrics = scene_work_state.work_trace_metrics();
@@ -1713,7 +1737,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     &execution_damage.region,
-                    lifecycle_backdrop,
+                    scene_baseline_authority,
                     debug_config,
                 )
                 .map_err(|error| {
@@ -1736,7 +1760,7 @@ fn execute_graph_passes_inner(
                         &execution_damage.region,
                         scene_work_rects,
                         framebuffer_origin,
-                        lifecycle_backdrop,
+                        scene_baseline_authority,
                         debug_config,
                         capture_plan,
                     ),
@@ -2152,12 +2176,12 @@ fn checkpoint_dependency_influence_region(
 
 fn is_direct_framebuffer_capture(
     pass: &CompiledRenderPass,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
 ) -> bool {
     match pass.kind {
         RenderPassKind::SceneCapture => {
-            lifecycle_backdrop
+            scene_baseline_authority == SceneBaselineAuthority::PrecomposedFramebuffer
                 || !pass.checkpoint_dependencies.is_empty()
                 || debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer
         }
@@ -2176,14 +2200,14 @@ struct CheckpointCaptureExecutionPlan {
 fn checkpoint_capture_execution_plan(
     pass_kind: RenderPassKind,
     checkpoint_dependency_count: usize,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     capture_mode: EffectDebugCaptureMode,
     requested_path: CheckpointCapturePath,
     active_output_texture_available: bool,
 ) -> CheckpointCaptureExecutionPlan {
     let direct_capture = match pass_kind {
         RenderPassKind::SceneCapture => {
-            lifecycle_backdrop
+            scene_baseline_authority == SceneBaselineAuthority::PrecomposedFramebuffer
                 || checkpoint_dependency_count > 0
                 || capture_mode == EffectDebugCaptureMode::Framebuffer
         }
@@ -2192,7 +2216,7 @@ fn checkpoint_capture_execution_plan(
     };
     let checkpoint_direct_capture = pass_kind == RenderPassKind::SceneCapture
         && checkpoint_dependency_count > 0
-        && !lifecycle_backdrop
+        && scene_baseline_authority == SceneBaselineAuthority::ReplayRequired
         && capture_mode == EffectDebugCaptureMode::Replay;
     if checkpoint_direct_capture {
         let requested = Some(requested_path);
@@ -2231,13 +2255,13 @@ fn checkpoint_capture_execution_plan(
 fn checkpoint_capture_execution_plan_for_pass(
     renderer: &GlesSceneRenderer,
     pass: &CompiledRenderPass,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
 ) -> CheckpointCaptureExecutionPlan {
     checkpoint_capture_execution_plan(
         pass.kind,
         pass.checkpoint_dependencies.len(),
-        lifecycle_backdrop,
+        scene_baseline_authority,
         debug_config.capture_mode(),
         debug_config.checkpoint_capture_path(),
         renderer.active_output_texture.is_some(),
@@ -2262,10 +2286,10 @@ fn capture_execution_damage(
     graph: &CompiledFrameGraph,
     demand: &EffectExecutionDemand,
     pass: &CompiledRenderPass,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
 ) -> EffectRegion {
-    if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+    if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
         pass_output_texture_domain(graph, pass)
     } else {
         effective_pass_damage(graph, demand, pass)
@@ -2442,7 +2466,7 @@ fn record_current_frame_output_region(
     graph: &CompiledFrameGraph,
     pass: &CompiledRenderPass,
     execution_damage: &EffectRegion,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
 ) -> Result<EffectRegion, EffectExecutionInvariantError> {
     let output = pass
@@ -2457,7 +2481,7 @@ fn record_current_frame_output_region(
         pass.kind,
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
     ) {
-        if is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config) {
+        if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
             return Ok(EffectRegion::from_rect(output_plan.domain));
         }
         return Ok(capture_materialization_plan(
@@ -2579,7 +2603,7 @@ fn pass_trace_summary(
     execution_damage: &EffectRegion,
     scene_work_rects: &[OutputRect],
     framebuffer_origin: OutputFramebufferOrigin,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
     capture_plan: CheckpointCaptureExecutionPlan,
 ) -> PassTraceSummary {
@@ -2599,7 +2623,8 @@ fn pass_trace_summary(
         output_plan.is_some_and(|texture| texture.source == GraphTextureSource::Output);
     let target_flip_y =
         effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
-    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
+    let direct_capture =
+        is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config);
     let conservative_pass_demand = direct_capture
         || demand.is_conservative_full()
         || demand.instance_is_conservative_full(pass.instance);
@@ -2823,7 +2848,7 @@ fn execute_pass(
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
     capture_plan: CheckpointCaptureExecutionPlan,
     host_timing_enabled: bool,
@@ -2838,7 +2863,7 @@ fn execute_pass(
                 pass,
                 framebuffer_origin,
                 execution_damage,
-                lifecycle_backdrop,
+                scene_baseline_authority,
                 debug_config,
                 capture_plan,
                 host_timing_enabled,
@@ -3525,7 +3550,7 @@ fn execute_capture(
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
     capture_plan: CheckpointCaptureExecutionPlan,
     host_timing_enabled: bool,
@@ -3538,7 +3563,8 @@ fn execute_capture(
         .get(&output)
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
-    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config);
+    let direct_capture =
+        is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config);
     let replay_host_timing_enabled =
         replay_capture_host_timing_enabled(host_timing_enabled, direct_capture);
     let host_start = replay_host_timing_enabled.then(Instant::now);
@@ -4548,6 +4574,35 @@ pub(crate) enum SceneReplayWorkMode {
     SuffixDemand,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SceneBaselineAuthority {
+    ReplayRequired,
+    PrecomposedFramebuffer,
+}
+
+fn should_reconstruct_scene_work(
+    authority: SceneBaselineAuthority,
+    framebuffer_capture: bool,
+    has_extra_scene_work: bool,
+) -> bool {
+    match authority {
+        SceneBaselineAuthority::ReplayRequired => framebuffer_capture || has_extra_scene_work,
+        SceneBaselineAuthority::PrecomposedFramebuffer => false,
+    }
+}
+
+fn initial_scene_valid_region(
+    authority: SceneBaselineAuthority,
+    plan: &SceneReplayWorkPlan,
+) -> EffectRegion {
+    match authority {
+        SceneBaselineAuthority::ReplayRequired => EffectRegion::empty(),
+        SceneBaselineAuthority::PrecomposedFramebuffer => {
+            output_rects_to_effect_region(&plan.baseline_work)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SceneReplayWorkPlan {
     presentation_work: Vec<OutputRect>,
@@ -4755,14 +4810,14 @@ fn scene_replay_work_plan(
     graph: &CompiledFrameGraph,
     selection: &EffectExecutionSelection,
     output_size: (u32, u32),
-    lifecycle_backdrop: bool,
+    scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
 ) -> SceneReplayWorkPlan {
     let presentation_work = repaint_rects.to_vec();
     let mut checkpoint_requirements = Vec::new();
     for pass in &graph.passes {
         if !selection.executed_passes.contains(&pass.id)
-            || !is_direct_framebuffer_capture(pass, lifecycle_backdrop, debug_config)
+            || !is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config)
             || !matches!(
                 pass.kind,
                 RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
@@ -5663,6 +5718,44 @@ mod tests {
         }
     }
 
+    fn compile_builtin_background_blur(
+        region: EffectRegion,
+        source_damage: &EffectRegion,
+        output_bounds: oblivion_one::effects::EffectRect,
+    ) -> CompiledFrameGraph {
+        let program = oblivion_one::effects::builtin_background_blur_program_id();
+        let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(1);
+        let scene = oblivion_one::compositor::ResolvedEffectScene::new(
+            1,
+            vec![oblivion_one::compositor::ResolvedEffectInstance {
+                id: oblivion_one::effects::EffectInstanceId::new(1).unwrap(),
+                program,
+                anchor,
+                target_bounds: region.bounding_rect().unwrap(),
+                region,
+                parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
+                visual_group: None,
+                anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+                scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(anchor),
+            }],
+        );
+        let registry = oblivion_one::effects::EffectRegistry::with_builtin_background_blur();
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) =
+            oblivion_one::effects::compile_frame_execution_plan(
+                &scene,
+                source_damage,
+                output_bounds,
+                &registry,
+            )
+            .unwrap()
+        else {
+            panic!("builtin background blur must compile to an effect graph");
+        };
+        graph
+    }
+
     fn planned_demand(
         instance: oblivion_one::effects::EffectInstanceId,
         output_region: EffectRegion,
@@ -5701,10 +5794,29 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            scene_advance_reason(&ordinary_capture, true),
+            scene_advance_reason(
+                &ordinary_capture,
+                SceneBaselineAuthority::ReplayRequired,
+                true
+            ),
             Some("framebuffer_capture")
         );
-        assert_eq!(scene_advance_reason(&ordinary_capture, false), None);
+        assert_eq!(
+            scene_advance_reason(
+                &ordinary_capture,
+                SceneBaselineAuthority::ReplayRequired,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            scene_advance_reason(
+                &ordinary_capture,
+                SceneBaselineAuthority::PrecomposedFramebuffer,
+                false,
+            ),
+            None
+        );
 
         let checkpoint_capture = test_pass(
             3,
@@ -5715,7 +5827,11 @@ mod tests {
             vec![GraphPassId::new(2).unwrap()],
         );
         assert_eq!(
-            scene_advance_reason(&checkpoint_capture, false),
+            scene_advance_reason(
+                &checkpoint_capture,
+                SceneBaselineAuthority::ReplayRequired,
+                false,
+            ),
             Some("checkpoint_dependency")
         );
 
@@ -5727,7 +5843,144 @@ mod tests {
             output,
             Vec::new(),
         );
-        assert_eq!(scene_advance_reason(&surface_capture, true), None);
+        assert_eq!(
+            scene_advance_reason(
+                &surface_capture,
+                SceneBaselineAuthority::ReplayRequired,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lifecycle_builtin_background_blur_accepts_the_planned_precomposed_baseline() {
+        let visible = oblivion_one::effects::EffectRect::new(700, 300, 220, 120).unwrap();
+        let explicit_region = EffectRegion::from_rect(visible);
+        let graph = compile_builtin_background_blur(
+            explicit_region.clone(),
+            &explicit_region,
+            oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+        );
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .expect("background blur must start with a backdrop capture");
+        let demand =
+            oblivion_one::effects::plan_effect_execution_demand(&graph, &explicit_region, true);
+        let selection = select_effect_execution(&graph, &demand);
+        let repaint_rects = [OutputRect::new(700, 300, 220, 120)];
+        let work = scene_replay_work_plan(
+            &repaint_rects,
+            &graph,
+            &selection,
+            (1920, 1080),
+            SceneBaselineAuthority::PrecomposedFramebuffer,
+            *effect_debug_config(),
+        );
+        let required = pass_output_texture_domain(&graph, capture);
+        let planned_baseline = output_rects_to_effect_region(&work.baseline_work);
+
+        assert!(is_direct_framebuffer_capture(
+            capture,
+            SceneBaselineAuthority::PrecomposedFramebuffer,
+            *effect_debug_config()
+        ));
+        assert!(capture.checkpoint_dependencies.is_empty());
+        assert!(!required.subtract(&explicit_region).is_empty());
+        assert!(required.subtract(&planned_baseline).is_empty());
+        assert!(!work.extra_scene_work.is_empty());
+
+        // Before lifecycle execution had a precomposed baseline authority,
+        // this first direct capture started with empty scene validity and
+        // could not request a replay because it has no dependencies.
+        let empty_baseline_validity = checkpoint_source_semantic_validity(
+            &required,
+            &EffectRegion::empty(),
+            &EffectRegion::empty(),
+            &[],
+        );
+        assert_eq!(empty_baseline_validity.missing, required);
+
+        // Lifecycle capture already has this exact planner-owned domain in
+        // the framebuffer; unrelated framebuffer pixels remain invalid.
+        let scene_valid =
+            initial_scene_valid_region(SceneBaselineAuthority::PrecomposedFramebuffer, &work);
+        assert_eq!(scene_valid, planned_baseline);
+        assert!(!scene_valid.contains_point(0, 0));
+        let validity = checkpoint_source_semantic_validity(
+            &required,
+            &scene_valid,
+            &EffectRegion::empty(),
+            &[],
+        );
+        assert!(
+            validity.missing.is_empty(),
+            "precomposed backdrop pixels in the planner-owned domain must be valid: {:?}",
+            validity.missing
+        );
+    }
+
+    #[test]
+    fn lifecycle_blur_expansion_does_not_clear_the_authoritative_backdrop() {
+        let visible = oblivion_one::effects::EffectRect::new(700, 300, 220, 120).unwrap();
+        let explicit_region = EffectRegion::from_rect(visible);
+        let graph = compile_builtin_background_blur(
+            explicit_region.clone(),
+            &explicit_region,
+            oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+        );
+        let demand =
+            oblivion_one::effects::plan_effect_execution_demand(&graph, &explicit_region, true);
+        let selection = select_effect_execution(&graph, &demand);
+        let work = scene_replay_work_plan(
+            &[OutputRect::new(700, 300, 220, 120)],
+            &graph,
+            &selection,
+            (1920, 1080),
+            SceneBaselineAuthority::PrecomposedFramebuffer,
+            *effect_debug_config(),
+        );
+        assert!(!work.extra_scene_work.is_empty());
+
+        let reconstruct_internal_scene_work = should_reconstruct_scene_work(
+            SceneBaselineAuthority::PrecomposedFramebuffer,
+            false,
+            !work.extra_scene_work.is_empty(),
+        );
+        assert!(
+            !reconstruct_internal_scene_work,
+            "expanded blur work must preserve the already-composed framebuffer baseline"
+        );
+        assert!(should_reconstruct_scene_work(
+            SceneBaselineAuthority::ReplayRequired,
+            false,
+            !work.extra_scene_work.is_empty(),
+        ));
+        assert!(should_reconstruct_scene_work(
+            SceneBaselineAuthority::ReplayRequired,
+            true,
+            false,
+        ));
+        assert!(
+            initial_scene_valid_region(SceneBaselineAuthority::ReplayRequired, &work,).is_empty()
+        );
+    }
+
+    #[test]
+    fn precomposed_base_scene_does_not_satisfy_missing_effect_dependencies() {
+        let required = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(100, 100, 20, 20).unwrap(),
+        );
+        let validity = checkpoint_source_semantic_validity(
+            &required,
+            &required,
+            &required,
+            &[(required.clone(), EffectRegion::empty())],
+        );
+
+        assert_eq!(validity.missing, required);
     }
 
     #[test]
@@ -5737,7 +5990,7 @@ mod tests {
         let plan = checkpoint_capture_execution_plan(
             RenderPassKind::SceneCapture,
             1,
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             config.capture_mode(),
             config.checkpoint_capture_path(),
             true,
@@ -5758,7 +6011,7 @@ mod tests {
         let plan = checkpoint_capture_execution_plan(
             RenderPassKind::SceneCapture,
             1,
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             config.capture_mode(),
             config.checkpoint_capture_path(),
             false,
@@ -5789,7 +6042,7 @@ mod tests {
         let plan = checkpoint_capture_execution_plan(
             RenderPassKind::SceneCapture,
             1,
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             config.capture_mode(),
             config.checkpoint_capture_path(),
             true,
@@ -5813,38 +6066,38 @@ mod tests {
             (
                 RenderPassKind::SceneCapture,
                 0,
-                false,
+                SceneBaselineAuthority::ReplayRequired,
                 replay_default,
                 CaptureTimingMode::Replay,
             ),
             (
                 RenderPassKind::SceneCapture,
                 0,
-                true,
+                SceneBaselineAuthority::PrecomposedFramebuffer,
                 replay_default,
                 CaptureTimingMode::FramebufferBlit,
             ),
             (
                 RenderPassKind::SceneCapture,
                 0,
-                false,
+                SceneBaselineAuthority::ReplayRequired,
                 framebuffer_debug,
                 CaptureTimingMode::FramebufferBlit,
             ),
             (
                 RenderPassKind::SurfaceCapture,
                 1,
-                false,
+                SceneBaselineAuthority::ReplayRequired,
                 replay_default,
                 CaptureTimingMode::FramebufferBlit,
             ),
         ];
 
-        for (kind, checkpoint_count, lifecycle_backdrop, config, expected_mode) in cases {
+        for (kind, checkpoint_count, scene_baseline_authority, config, expected_mode) in cases {
             let plan = checkpoint_capture_execution_plan(
                 kind,
                 checkpoint_count,
-                lifecycle_backdrop,
+                scene_baseline_authority,
                 config.capture_mode(),
                 config.checkpoint_capture_path(),
                 true,
@@ -5871,7 +6124,7 @@ mod tests {
         let replay_plan = checkpoint_capture_execution_plan(
             replay_pass.kind,
             replay_pass.checkpoint_dependencies.len(),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             EffectDebugCaptureMode::Replay,
             CheckpointCapturePath::FramebufferBlit,
             false,
@@ -5892,7 +6145,7 @@ mod tests {
         let checkpoint_plan = checkpoint_capture_execution_plan(
             checkpoint_pass.kind,
             checkpoint_pass.checkpoint_dependencies.len(),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             EffectDebugCaptureMode::Replay,
             CheckpointCapturePath::FramebufferBlit,
             false,
@@ -5940,7 +6193,7 @@ mod tests {
             &graph,
             &selection,
             (200, 150),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             config,
         );
         let work = &regions.baseline_work;
@@ -5960,7 +6213,7 @@ mod tests {
             &graph,
             &selection,
             (200, 150),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             config,
         )
         .baseline_work;
@@ -6014,7 +6267,7 @@ mod tests {
             &graph,
             &selection,
             (1920, 1080),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             config,
         );
 
@@ -6066,7 +6319,7 @@ mod tests {
             &graph,
             &selection,
             (1920, 1080),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             EffectDebugConfig::new(
                 EffectDebugCaptureMode::Replay,
                 EffectDebugKawaseMode::Partial,
@@ -6168,7 +6421,7 @@ mod tests {
             &graph,
             &selection,
             (100, 100),
-            false,
+            SceneBaselineAuthority::ReplayRequired,
             EffectDebugConfig::new(
                 EffectDebugCaptureMode::Replay,
                 EffectDebugKawaseMode::Partial,
@@ -7318,7 +7571,13 @@ mod tests {
         let demand = planned_demand(instance, demanded.clone(), vec![(pass.id, demanded)]);
 
         assert_eq!(
-            capture_execution_damage(&graph, &demand, &pass, false, *effect_debug_config()),
+            capture_execution_damage(
+                &graph,
+                &demand,
+                &pass,
+                SceneBaselineAuthority::ReplayRequired,
+                *effect_debug_config(),
+            ),
             EffectRegion::from_rect(domain)
         );
     }

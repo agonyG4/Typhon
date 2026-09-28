@@ -560,6 +560,52 @@ struct LifecycleResolvedVisualResource {
     source_visual_rect: compositor::PresentationRect,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LifecycleSourceCaptureFailureStage {
+    TargetAllocation,
+    TargetClear,
+    BackupAllocation,
+    BackupCopy,
+    MissingSourceCommands,
+    GraphCompile,
+    EffectExecution,
+    TargetCopy,
+    FramebufferRestore,
+    ResourceRelease,
+}
+
+impl LifecycleSourceCaptureFailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetAllocation => "target_allocation",
+            Self::TargetClear => "target_clear",
+            Self::BackupAllocation => "backup_allocation",
+            Self::BackupCopy => "backup_copy",
+            Self::MissingSourceCommands => "missing_source_commands",
+            Self::GraphCompile => "graph_compile",
+            Self::EffectExecution => "effect_execution",
+            Self::TargetCopy => "target_copy",
+            Self::FramebufferRestore => "framebuffer_restore",
+            Self::ResourceRelease => "resource_release",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LifecycleSourceCaptureFailure {
+    stage: LifecycleSourceCaptureFailureStage,
+    source: Box<dyn Error>,
+}
+
+impl LifecycleSourceCaptureFailure {
+    fn new(stage: LifecycleSourceCaptureFailureStage, source: impl Into<Box<dyn Error>>) -> Self {
+        Self {
+            stage,
+            source: source.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LampUniformLocations {
     output_size: Option<glow::UniformLocation>,
@@ -3907,18 +3953,37 @@ impl GlesSceneRenderer {
                 EffectTextureFilter::Linear,
                 EffectWorkingSpace::OutputEncodedSrgb,
             );
-            let Ok(texture) = self.effect_resources.acquire(&self.gl, texture_key) else {
-                self.record_lifecycle_render_fallback(
-                    lamp,
-                    LifecycleRenderFallbackReason::ResolvedSourceAllocation,
-                );
-                continue;
+            let texture = match self.effect_resources.acquire(&self.gl, texture_key) {
+                Ok(texture) => texture,
+                Err(error) => {
+                    self.record_lifecycle_source_capture_failure(
+                        &LifecycleSourceCaptureFailure::new(
+                            LifecycleSourceCaptureFailureStage::TargetAllocation,
+                            error,
+                        ),
+                    );
+                    self.record_lifecycle_render_fallback(
+                        lamp,
+                        LifecycleRenderFallbackReason::ResolvedSourceAllocation,
+                    );
+                    continue;
+                }
             };
-            if self
-                .capture_lifecycle_visual_source(&source, lamp, texture.clone(), framebuffer_origin)
-                .is_err()
-            {
-                let _ = self.effect_resources.release(texture);
+            if let Err(error) = self.capture_lifecycle_visual_source(
+                &source,
+                lamp,
+                texture.clone(),
+                framebuffer_origin,
+            ) {
+                self.record_lifecycle_source_capture_failure(&error);
+                if let Err(release_error) = self.effect_resources.release(texture) {
+                    self.record_lifecycle_source_capture_failure(
+                        &LifecycleSourceCaptureFailure::new(
+                            LifecycleSourceCaptureFailureStage::ResourceRelease,
+                            Box::new(release_error),
+                        ),
+                    );
+                }
                 self.record_lifecycle_render_fallback(
                     lamp,
                     LifecycleRenderFallbackReason::ResolvedSourceCapture,
@@ -3952,22 +4017,53 @@ impl GlesSceneRenderer {
             });
     }
 
+    fn record_lifecycle_source_capture_failure(&self, failure: &LifecycleSourceCaptureFailure) {
+        self.effect_trace.event(|| {
+            format!(
+                "event=lifecycle_source_capture_failure stage={} error={}",
+                failure.stage.as_str(),
+                failure.source,
+            )
+        });
+    }
+
     fn capture_lifecycle_visual_source(
         &mut self,
         source: &LifecycleVisualSource,
         lamp: LampWindowSample,
         target: PooledEffectTexture,
         framebuffer_origin: OutputFramebufferOrigin,
-    ) -> RendererResult<()> {
-        clear_effect_texture(self, &target)?;
-        let backup = self.effect_resources.acquire(&self.gl, target.key)?;
+    ) -> Result<(), LifecycleSourceCaptureFailure> {
+        clear_effect_texture(self, &target).map_err(|error| {
+            LifecycleSourceCaptureFailure::new(
+                LifecycleSourceCaptureFailureStage::TargetClear,
+                error,
+            )
+        })?;
+        let backup = self
+            .effect_resources
+            .acquire(&self.gl, target.key)
+            .map_err(|error| {
+                LifecycleSourceCaptureFailure::new(
+                    LifecycleSourceCaptureFailureStage::BackupAllocation,
+                    error,
+                )
+            })?;
+        let mut backup_ready = false;
         let result = (|| {
             copy_output_region_to_texture(
                 self,
                 &backup,
                 lamp.visual_group.presented_source_visual_rect,
                 framebuffer_origin,
-            )?;
+            )
+            .map_err(|error| {
+                LifecycleSourceCaptureFailure::new(
+                    LifecycleSourceCaptureFailureStage::BackupCopy,
+                    error,
+                )
+            })?;
+            backup_ready = true;
 
             let source_vertices = self
                 .lifecycle_source_vertices
@@ -3980,9 +4076,10 @@ impl GlesSceneRenderer {
                 .cloned()
                 .unwrap_or_default();
             if source_vertices.is_empty() || source_commands.is_empty() {
-                return Err(
-                    io::Error::other("lifecycle visual source has no draw commands").into(),
-                );
+                return Err(LifecycleSourceCaptureFailure::new(
+                    LifecycleSourceCaptureFailureStage::MissingSourceCommands,
+                    io::Error::other("lifecycle visual source has no draw commands"),
+                ));
             }
 
             let saved_vertices = std::mem::replace(&mut self.vertices, source_vertices);
@@ -3999,13 +4096,21 @@ impl GlesSceneRenderer {
                     &source_damage,
                     output_bounds,
                     &self.effect_registry,
-                )? {
+                )
+                .map_err(|error| {
+                    LifecycleSourceCaptureFailure::new(
+                        LifecycleSourceCaptureFailureStage::GraphCompile,
+                        error,
+                    )
+                })? {
                     FrameExecutionPlan::EffectGraph(graph) => graph,
                     FrameExecutionPlan::LegacyScene => {
-                        return Err(io::Error::other(
-                            "effect lifecycle source unexpectedly compiled as legacy scene",
-                        )
-                        .into());
+                        return Err(LifecycleSourceCaptureFailure::new(
+                            LifecycleSourceCaptureFailureStage::GraphCompile,
+                            io::Error::other(
+                                "effect lifecycle source unexpectedly compiled as legacy scene",
+                            ),
+                        ));
                     }
                 };
                 let demand = plan_effect_execution_demand(&graph, &source_damage, true);
@@ -4020,13 +4125,25 @@ impl GlesSceneRenderer {
                     )],
                     &demand,
                     &selection,
-                )?;
+                )
+                .map_err(|error| {
+                    LifecycleSourceCaptureFailure::new(
+                        LifecycleSourceCaptureFailureStage::EffectExecution,
+                        error,
+                    )
+                })?;
                 copy_output_region_to_texture(
                     self,
                     &target,
                     lamp.visual_group.presented_source_visual_rect,
                     framebuffer_origin,
-                )?;
+                )
+                .map_err(|error| {
+                    LifecycleSourceCaptureFailure::new(
+                        LifecycleSourceCaptureFailureStage::TargetCopy,
+                        error,
+                    )
+                })?;
                 Ok(())
             })();
             self.vertices = saved_vertices;
@@ -4038,17 +4155,42 @@ impl GlesSceneRenderer {
             draw_result
         })();
 
-        let restore_result = restore_output_region_from_texture(
-            self,
-            &backup,
-            lamp.visual_group.presented_source_visual_rect,
-            framebuffer_origin,
-        );
-        let release_result = self.effect_resources.release(backup);
+        let restore_result = if backup_ready {
+            restore_output_region_from_texture(
+                self,
+                &backup,
+                lamp.visual_group.presented_source_visual_rect,
+                framebuffer_origin,
+            )
+            .map_err(|error| {
+                LifecycleSourceCaptureFailure::new(
+                    LifecycleSourceCaptureFailureStage::FramebufferRestore,
+                    error,
+                )
+            })
+        } else {
+            Ok(())
+        };
+        let release_result = self.effect_resources.release(backup).map_err(|error| {
+            LifecycleSourceCaptureFailure::new(
+                LifecycleSourceCaptureFailureStage::ResourceRelease,
+                Box::new(error),
+            )
+        });
+        if result.is_err()
+            && let Err(error) = &restore_result
+        {
+            self.record_lifecycle_source_capture_failure(error);
+        }
+        if (result.is_err() || restore_result.is_err())
+            && let Err(error) = &release_result
+        {
+            self.record_lifecycle_source_capture_failure(error);
+        }
         match (result, restore_result, release_result) {
             (Err(error), _, _) => Err(error),
             (Ok(()), Err(error), _) => Err(error),
-            (Ok(()), Ok(()), Err(error)) => Err(error.into()),
+            (Ok(()), Ok(()), Err(error)) => Err(error),
             (Ok(()), Ok(()), Ok(())) => Ok(()),
         }
     }
@@ -7200,7 +7342,7 @@ mod tests {
     use oblivion_one::effects::{
         CompiledFrameGraph, CompiledRenderPass, CustomFragmentSpec, DualKawaseBlurSpec,
         EffectAlphaMode, EffectColorConversion, EffectFailurePolicy, EffectFootprint,
-        EffectFrameDemand, EffectInstanceExecutionDemand, EffectNode, EffectNodeId,
+        EffectFrameDemand, EffectInstanceExecutionDemand, EffectNode, EffectNodeId, EffectRegion,
         EffectParameterBlock, EffectPassExecutionDemand, EffectProgram, EffectProgramId,
         EffectRect, EffectSource, EffectWorkingSpace, GraphTextureId, GraphTexturePhysicalRect,
         GraphTexturePlan, GraphTextureSource, RenderPassKind, ShaderModuleId,
@@ -12709,6 +12851,108 @@ mod tests {
         }
     }
 
+    fn lifecycle_blur_effect_scene(
+        root_surface_id: u32,
+        program: EffectProgramId,
+    ) -> ResolvedEffectScene {
+        let region = EffectRegion::from_rect(EffectRect::new(60, 40, 180, 110).unwrap());
+        let anchor = compositor::EffectAnchor::BeforeSurface(root_surface_id);
+        ResolvedEffectScene::new(
+            1,
+            vec![compositor::ResolvedEffectInstance {
+                id: oblivion_one::effects::EffectInstanceId::new(1).unwrap(),
+                program,
+                anchor,
+                target_bounds: region.bounding_rect().unwrap(),
+                region,
+                parameter_block: EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+                anchor_scope: compositor::EffectAnchorScope::VisualGroup,
+                scene_order: compositor::EffectSceneOrder::for_anchor(anchor),
+            }],
+        )
+    }
+
+    fn lifecycle_effect_sample(
+        progress: f64,
+        direction: LifecycleDirection,
+        root_surface_id: u32,
+        started_at: u64,
+        effect_scene: ResolvedEffectScene,
+    ) -> LifecycleSceneSample {
+        let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("test window id");
+        let presentation_identity = test_lifecycle_identity(window_id, started_at);
+        let payload_id =
+            oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                presentation_identity,
+            );
+        let source = PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("source rect");
+        let anchor = PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect");
+        let visual_group =
+            LifecycleVisualGroup::from_bounds(source, source, source, anchor, 320, 200)
+                .expect("valid lifecycle visual group");
+        LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(started_at),
+            lamps: vec![LampWindowSample {
+                window_id,
+                root_surface_id,
+                presentation_identity,
+                payload_id,
+                visual_group,
+                progress,
+                opacity: 1.0,
+                direction,
+                mathematically_settled: false,
+            }],
+            visual_sources: vec![LifecycleVisualSource {
+                window_id,
+                root_surface_id,
+                presentation_identity,
+                payload_id,
+                kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
+                effect_scene: Arc::new(effect_scene),
+            }],
+        }
+    }
+
+    fn lifecycle_test_surface(
+        surface_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        color: u32,
+        buffer_ids: &mut BufferIdAllocator,
+    ) -> RenderableSurface {
+        RenderableSurface {
+            surface_id,
+            x,
+            y,
+            width,
+            height,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                buffer_ids.allocate().expect("test buffer identity"),
+                BufferSize::new(width, height).expect("test surface size"),
+                vec![color; width as usize * height as usize],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::full(),
+            opaque_region: SurfaceOpaqueRegion::None,
+        }
+    }
+
     #[test]
     fn decoration_resource_requirements_include_canonical_and_lifecycle_instances() {
         let canonical = vec![DecorationRenderPrimitive::SolidRect {
@@ -12976,6 +13220,261 @@ mod tests {
             renderer.lamp_commands[0].layer,
             EglDrawLayer::LifecycleResolvedVisual(_)
         ));
+    }
+
+    #[test]
+    fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failures_fallback() {
+        let _egl_test_lock = egl_test_lock();
+        const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
+        let egl = unsafe { EglInstance::load_required() }.expect("EGL loader is available");
+        let display = unsafe {
+            egl.get_platform_display(
+                EGL_PLATFORM_SURFACELESS_MESA,
+                std::ptr::null_mut(),
+                &[egl::ATTRIB_NONE],
+            )
+            .or_else(|_| {
+                egl.get_display(egl::DEFAULT_DISPLAY)
+                    .ok_or(egl::Error::BadDisplay)
+            })
+        }
+        .expect("surfaceless EGL display is available");
+        egl.initialize(display).expect("EGL initializes");
+        egl.bind_api(egl::OPENGL_ES_API).expect("EGL binds GLES");
+        let config_attributes = [
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES3_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+        let count = egl
+            .matching_config_count(display, &config_attributes)
+            .expect("EGL returns GLES3 pbuffer configs");
+        assert!(count > 0);
+        let mut configs = Vec::with_capacity(count);
+        egl.choose_config(display, &config_attributes, &mut configs)
+            .expect("EGL chooses a GLES3 pbuffer config");
+        let config = configs[0];
+        let context = create_gles_context(&egl, display, config).expect("GLES3 context creates");
+        let egl_surface = egl
+            .create_pbuffer_surface(
+                display,
+                config,
+                &[egl::WIDTH, 320, egl::HEIGHT, 200, egl::NONE],
+            )
+            .expect("EGL pbuffer surface creates");
+        egl.make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
+            .expect("EGL makes the context current");
+
+        let cursor_image = Arc::new(
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff], 1, 1, 0, 0)
+                .expect("test cursor image is valid"),
+        );
+        let mut renderer = GlesSceneRenderer::new_current(
+            &egl,
+            320,
+            200,
+            None,
+            EglPartialRepaintCapabilities {
+                buffer_age: false,
+                partial_render_repair: false,
+                swap_buffers_with_damage: false,
+            },
+            cursor_image,
+        )
+        .expect("GLES renderer creates");
+        renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+
+        let mut buffer_ids = BufferIdAllocator::default();
+        let background = lifecycle_test_surface(603, 0, 0, 320, 200, 0xff24_4567, &mut buffer_ids);
+        let retained_window =
+            lifecycle_test_surface(604, 60, 40, 180, 110, 0xffee_8844, &mut buffer_ids);
+        let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+        let socket_name = format!("typhon-lifecycle-blur-egl-{}", std::process::id());
+        let mut server =
+            oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+                .expect("test compositor binds");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![background.clone()],
+            &[(background.surface_id, window_id)],
+            None,
+        );
+        let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+            &server,
+            AnimationTime::from_nanos(0),
+        );
+        // The minimized root is absent from the ordinary scene and remains
+        // available only as the retained lifecycle source.
+        resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+        resolved.lifecycle_surfaces = vec![retained_window];
+        let blur_scene = lifecycle_blur_effect_scene(
+            604,
+            oblivion_one::effects::builtin_background_blur_program_id(),
+        );
+        resolved.lifecycle =
+            lifecycle_effect_sample(0.45, LifecycleDirection::Minimize, 604, 1, blur_scene);
+        let identity = resolved.lifecycle.lamps[0].presentation_identity;
+        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let source_scene = Arc::clone(&resolved.lifecycle.visual_sources[0].effect_scene);
+
+        let input_state = crate::native_output::NativeInputState::new(320, 200);
+        let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+        effects::clear_effect_trace_test_events();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let outcome = renderer
+            .draw_scene(&egl, display, egl_surface, request)
+            .expect("lifecycle blur frame draws");
+        let first_evidence = match outcome {
+            EglFrameOutcome::Rendered {
+                commit,
+                lifecycle_evidence,
+                ..
+            } => {
+                renderer
+                    .repaint_planner
+                    .commit_presented_transition(OutputDamage::Full);
+                assert_eq!(commit.repaint_plan.repair_damage, OutputDamage::Full);
+                lifecycle_evidence
+            }
+            EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+                panic!("valid lifecycle blur unexpectedly fell back: {fallbacks:?}")
+            }
+            EglFrameOutcome::Skipped { reason, .. } => {
+                panic!("full-damage lifecycle blur was skipped: {reason:?}")
+            }
+        };
+        assert!(first_evidence.contains(identity, payload_id, 604));
+        assert!(renderer.lifecycle_visual_source_is_ready(payload_id));
+        assert!(matches!(
+            renderer.lamp_commands.as_slice(),
+            [EglLampDrawCommand {
+                layer: EglDrawLayer::LifecycleResolvedVisual(layer_payload),
+                ..
+            }] if *layer_payload == payload_id
+        ));
+        let first_trace = effects::take_effect_trace_test_events();
+        assert!(
+            !first_trace
+                .iter()
+                .any(|event| event.contains("InvalidCheckpointSource"))
+        );
+
+        let source_signature = renderer
+            .lifecycle_visual_resources
+            .get(&payload_id)
+            .expect("successful blur capture owns a resolved texture")
+            .source_signature;
+        // Canonical effects may change while the retained lifecycle payload
+        // and its resolved visual stay frozen through minimize-to-restore.
+        resolved.effects = ResolvedEffectScene::new(999, Vec::new());
+        resolved.lifecycle.sampled_at = AnimationTime::from_nanos(2);
+        resolved.lifecycle.lamps[0].direction = LifecycleDirection::Restore;
+        resolved.lifecycle.lamps[0].progress = 0.55;
+        assert!(Arc::ptr_eq(
+            &source_scene,
+            &resolved.lifecycle.visual_sources[0].effect_scene
+        ));
+        effects::clear_effect_trace_test_events();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let reverse_outcome = renderer
+            .draw_scene(&egl, display, egl_surface, request)
+            .expect("reversed lifecycle blur frame draws");
+        let reverse_evidence = match reverse_outcome {
+            EglFrameOutcome::Rendered {
+                lifecycle_evidence, ..
+            } => lifecycle_evidence,
+            EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+                panic!("reversed retained blur unexpectedly fell back: {fallbacks:?}")
+            }
+            EglFrameOutcome::Skipped { reason, .. } => {
+                panic!("full-damage reversed lifecycle blur was skipped: {reason:?}")
+            }
+        };
+        assert!(reverse_evidence.contains(identity, payload_id, 604));
+        assert!(renderer.lifecycle_visual_source_is_ready(payload_id));
+        assert_eq!(
+            renderer
+                .lifecycle_visual_resources
+                .get(&payload_id)
+                .expect("reversal retains the resolved visual")
+                .source_signature,
+            source_signature
+        );
+        let reverse_trace = effects::take_effect_trace_test_events();
+        assert!(
+            !reverse_trace
+                .iter()
+                .any(|event| event.contains("effect_graph_execute"))
+        );
+
+        let failed_scene = lifecycle_blur_effect_scene(
+            604,
+            EffectProgramId::new(0x7fff).expect("unknown test program id is valid"),
+        );
+        resolved.lifecycle =
+            lifecycle_effect_sample(0.4, LifecycleDirection::Minimize, 604, 2, failed_scene);
+        let failed_identity = resolved.lifecycle.lamps[0].presentation_identity;
+        let failed_payload = resolved.lifecycle.lamps[0].payload_id;
+        effects::clear_effect_trace_test_events();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let failure_outcome = renderer
+            .draw_scene(&egl, display, egl_surface, request)
+            .expect("invalid frozen effect graph is contained as lifecycle fallback");
+        let EglFrameOutcome::LifecycleFallback { fallbacks, .. } = failure_outcome else {
+            panic!("invalid frozen effect graph must not render a raw Lamp");
+        };
+        assert_eq!(fallbacks.failed.len(), 1);
+        assert_eq!(fallbacks.failed[0].presentation_identity, failed_identity);
+        assert_eq!(fallbacks.failed[0].payload_id, failed_payload);
+        assert_eq!(
+            fallbacks.failed[0].reason,
+            LifecycleRenderFallbackReason::ResolvedSourceCapture
+        );
+        assert!(!renderer.lifecycle_visual_source_is_ready(failed_payload));
+        assert!(
+            !renderer
+                .lifecycle_render_evidence
+                .contains(failed_identity, failed_payload, 604)
+        );
+        let failure_trace = effects::take_effect_trace_test_events();
+        assert!(
+            failure_trace
+                .iter()
+                .any(|event| event.contains("stage=graph_compile"))
+        );
     }
 
     #[test]
