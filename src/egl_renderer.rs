@@ -1302,6 +1302,8 @@ impl GlesSceneRenderer {
     pub(crate) fn invalidate_presented_damage_history(&mut self) {
         self.repaint_planner.invalidate();
         self.presented_scene_key = None;
+        self.effect_resources
+            .invalidate_checkpoint_capture_contents();
     }
 
     pub(crate) fn new_current(
@@ -1969,6 +1971,7 @@ impl GlesSceneRenderer {
         buffer_age: BufferAge,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<EglFrameOutcome> {
+        self.effect_resources.begin_checkpoint_frame();
         let EglSceneDrawRequest {
             width,
             height,
@@ -2270,6 +2273,9 @@ impl GlesSceneRenderer {
                 }
             }
         };
+        if matches!(&execution_plan, FrameExecutionPlan::LegacyScene) {
+            self.effect_resources.clear_checkpoint_capture_cache();
+        }
         let compiled_graph = match &execution_plan {
             FrameExecutionPlan::EffectGraph(graph) => Some(graph),
             FrameExecutionPlan::LegacyScene => None,
@@ -2553,6 +2559,8 @@ impl GlesSceneRenderer {
 
     pub(crate) fn discard_rendered(&mut self, frame: EglSceneFrameCommit) {
         self.repaint_planner.discard_rendered(&frame.repaint_plan);
+        self.effect_resources
+            .invalidate_checkpoint_capture_contents();
     }
 
     pub(crate) fn frame_swap_failed(&mut self) {
@@ -7342,11 +7350,11 @@ mod tests {
     use oblivion_one::effects::{
         CompiledFrameGraph, CompiledRenderPass, CustomFragmentSpec, DualKawaseBlurSpec,
         EffectAlphaMode, EffectColorConversion, EffectFailurePolicy, EffectFootprint,
-        EffectFrameDemand, EffectInstanceExecutionDemand, EffectNode, EffectNodeId, EffectRegion,
+        EffectFrameDemand, EffectInstanceExecutionDemand, EffectNode, EffectNodeId,
         EffectParameterBlock, EffectPassExecutionDemand, EffectProgram, EffectProgramId,
-        EffectRect, EffectSource, EffectWorkingSpace, GraphTextureId, GraphTexturePhysicalRect,
-        GraphTexturePlan, GraphTextureSource, RenderPassKind, ShaderModuleId,
-        validate_effect_program,
+        EffectRect, EffectRegion, EffectSource, EffectWorkingSpace, GraphTextureId,
+        GraphTexturePhysicalRect, GraphTexturePlan, GraphTextureSource, RenderPassKind,
+        ShaderModuleId, validate_effect_program,
     };
     use oblivion_one::presentation_animation::{
         AnimationTime, PresentationEngine, PresentationGroupOpacity, PresentationOpacity,
@@ -8984,6 +8992,260 @@ mod tests {
         }
     }
 
+    fn fill_shader_copy_output_rect(
+        harness: &GlesEffectTestHarness,
+        origin: OutputFramebufferOrigin,
+        rect: EffectRect,
+        color: [u8; 4],
+    ) {
+        let height = harness.renderer.current_size.1;
+        let physical_y = match origin {
+            OutputFramebufferOrigin::BottomLeft => {
+                i32::try_from(height).unwrap() - rect.y - rect.height as i32
+            }
+            OutputFramebufferOrigin::TopLeftScanout => rect.y,
+        };
+        harness.renderer.bind_active_output_framebuffer();
+        unsafe {
+            harness.gl.disable(glow::BLEND);
+            harness.gl.enable(glow::SCISSOR_TEST);
+            harness
+                .gl
+                .scissor(rect.x, physical_y, rect.width as i32, rect.height as i32);
+            harness.gl.clear_color(
+                f32::from(color[0]) / 255.0,
+                f32::from(color[1]) / 255.0,
+                f32::from(color[2]) / 255.0,
+                f32::from(color[3]) / 255.0,
+            );
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+            harness.gl.disable(glow::SCISSOR_TEST);
+        }
+        harness.renderer.establish_ordinary_scene_state();
+    }
+
+    fn assert_shader_copy_partial_update_matches_full_reference(
+        origin: OutputFramebufferOrigin,
+        dirty_rects: &[EffectRect],
+    ) {
+        let mut harness = GlesEffectTestHarness::new(64, 48);
+        harness.install_texture_backed_output();
+        fill_shader_copy_test_pattern(&harness);
+        let domain = EffectRect::new(11, 7, 39, 31).unwrap();
+        let target_plan = GraphTexturePlan {
+            id: GraphTextureId::new(1).expect("capture target id"),
+            source: GraphTextureSource::CapturedScene,
+            width: domain.width,
+            height: domain.height,
+            domain,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: None,
+            last_use: None,
+        };
+        let reference_plan = GraphTexturePlan {
+            id: GraphTextureId::new(2).expect("reference target id"),
+            ..target_plan.clone()
+        };
+        let target = harness
+            .renderer
+            .effect_resources
+            .acquire_plan(&harness.gl, &target_plan)
+            .expect("persistent capture texture acquires");
+        let reference = harness
+            .renderer
+            .effect_resources
+            .acquire_plan(&harness.gl, &reference_plan)
+            .expect("full reference texture acquires");
+        let output_texture = harness
+            .renderer
+            .active_output_texture
+            .expect("shader-copy test output texture");
+
+        effects::capture_output_region_to_graph_texture_shader_copy(
+            &mut harness.renderer,
+            &target,
+            &target_plan,
+            origin,
+            output_texture,
+        )
+        .expect("first cache population copies the full checkpoint");
+        effects::capture_output_region_to_graph_texture(
+            &mut harness.renderer,
+            &reference,
+            &reference_plan,
+            origin,
+        )
+        .expect("initial full-current reference capture succeeds");
+        let previous =
+            read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+        let initial_reference =
+            read_effect_texture_pixels(&mut harness, &reference, domain.width, domain.height);
+        assert_eq!(
+            previous, initial_reference,
+            "first population must cover the full domain"
+        );
+
+        let mut damage = EffectRegion::empty();
+        for (index, rect) in dirty_rects.iter().copied().enumerate() {
+            damage = damage.union(&EffectRegion::from_rect(rect));
+            fill_shader_copy_output_rect(
+                &harness,
+                origin,
+                rect,
+                [201, 31 + index as u8 * 17, 89, 255],
+            );
+        }
+        let (output_rects, target_rects) =
+            effects::checkpoint_update_rects_for_test(&damage, domain, (64, 48), &target_plan);
+        let expected_copied_pixels = dirty_rects.iter().fold(0u64, |sum, rect| {
+            sum.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+        });
+        let physically_copied_pixels = output_rects.iter().fold(0u64, |sum, rect| {
+            sum.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+        });
+        assert_eq!(physically_copied_pixels, expected_copied_pixels);
+        assert_eq!(target_rects.len(), dirty_rects.len());
+
+        effects::capture_output_rects_to_graph_texture_shader_copy(
+            &mut harness.renderer,
+            &target,
+            &target_plan,
+            origin,
+            output_texture,
+            &target_rects,
+        )
+        .expect("partial checkpoint shader-copy update succeeds");
+        effects::capture_output_region_to_graph_texture(
+            &mut harness.renderer,
+            &reference,
+            &reference_plan,
+            origin,
+        )
+        .expect("full-current reference capture succeeds");
+        let incremental =
+            read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+        let full_current =
+            read_effect_texture_pixels(&mut harness, &reference, domain.width, domain.height);
+        for y in 0..domain.height {
+            for x in 0..domain.width {
+                let offset = ((y * domain.width + x) * 4) as usize;
+                let changed = target_rects.iter().any(|rect| {
+                    let right = rect.x as u32 + rect.width;
+                    let bottom = rect.y as u32 + rect.height;
+                    x >= rect.x as u32 && x < right && y >= rect.y as u32 && y < bottom
+                });
+                let expected = if changed {
+                    &full_current[offset..offset + 4]
+                } else {
+                    &previous[offset..offset + 4]
+                };
+                assert_eq!(
+                    &incremental[offset..offset + 4],
+                    expected,
+                    "partial update differs at local texture pixel ({x}, {y}) for {origin:?}"
+                );
+            }
+        }
+
+        harness
+            .renderer
+            .effect_resources
+            .release(target)
+            .expect("incrementally updated texture releases");
+        harness
+            .renderer
+            .effect_resources
+            .release(reference)
+            .expect("reference texture releases");
+    }
+
+    #[test]
+    fn gles_checkpoint_single_rect_update_matches_full_reference_for_both_origins() {
+        let dirty = EffectRect::new(16, 11, 7, 5).unwrap();
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            assert_shader_copy_partial_update_matches_full_reference(origin, &[dirty]);
+        }
+    }
+
+    #[test]
+    fn gles_checkpoint_disjoint_updates_preserve_the_gap_for_both_origins() {
+        let dirty = [
+            EffectRect::new(15, 10, 6, 5).unwrap(),
+            EffectRect::new(35, 25, 4, 7).unwrap(),
+        ];
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            assert_shader_copy_partial_update_matches_full_reference(origin, &dirty);
+        }
+    }
+
+    #[test]
+    fn gles_checkpoint_empty_update_does_not_change_a_valid_texture() {
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let mut harness = GlesEffectTestHarness::new(64, 48);
+            harness.install_texture_backed_output();
+            fill_shader_copy_test_pattern(&harness);
+            let domain = EffectRect::new(11, 7, 39, 31).unwrap();
+            let target_plan = GraphTexturePlan {
+                id: GraphTextureId::new(1).unwrap(),
+                source: GraphTextureSource::CapturedScene,
+                width: domain.width,
+                height: domain.height,
+                domain,
+                working_space: EffectWorkingSpace::OutputEncodedSrgb,
+                origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+                first_use: None,
+                last_use: None,
+            };
+            let target = harness
+                .renderer
+                .effect_resources
+                .acquire_plan(&harness.gl, &target_plan)
+                .expect("cache target acquires");
+            let output_texture = harness.renderer.active_output_texture.unwrap();
+            effects::capture_output_region_to_graph_texture_shader_copy(
+                &mut harness.renderer,
+                &target,
+                &target_plan,
+                origin,
+                output_texture,
+            )
+            .expect("initial full capture succeeds");
+            let before =
+                read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+
+            effects::capture_output_rects_to_graph_texture_shader_copy(
+                &mut harness.renderer,
+                &target,
+                &target_plan,
+                origin,
+                output_texture,
+                &[],
+            )
+            .expect("empty update performs no shader-copy draw");
+            let after =
+                read_effect_texture_pixels(&mut harness, &target, domain.width, domain.height);
+            assert_eq!(
+                before, after,
+                "empty update changed the cache for {origin:?}"
+            );
+            harness
+                .renderer
+                .effect_resources
+                .release(target)
+                .expect("cache target releases");
+        }
+    }
+
     fn diagnostic_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
         let physical_y = height.saturating_sub(y).saturating_sub(1);
         let index = ((physical_y * width + x) * 4) as usize;
@@ -9098,6 +9360,7 @@ mod tests {
             passes: vec![pass],
             textures: vec![target.clone()],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -10797,6 +11060,232 @@ mod tests {
             line.contains("executed_capture_path=framebuffer_shader_copy")
                 && line.contains("checkpoints=2")
         }));
+    }
+
+    #[test]
+    fn native_three_checkpoint_incremental_cache_matches_full_capture_reference() {
+        let fixture = native_three_checkpoint_fixture();
+        let incremental_config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let full_capture_config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Framebuffer,
+            effects::EffectDebugKawaseMode::Partial,
+        );
+        let full_region = EffectRegion::from_rect(fixture.output_bounds);
+
+        let mut incremental =
+            GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+        incremental.install_texture_backed_output();
+        install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+        let first_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+        incremental
+            .renderer
+            .effect_resources
+            .begin_checkpoint_frame();
+        execute_diagnostic_frame_with_origin(
+            &mut incremental,
+            &first_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(
+                &[fixture.repair],
+                true,
+                fixture.output_size,
+            ),
+            full_region.clone(),
+            true,
+            incremental_config,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        assert_eq!(
+            incremental
+                .renderer
+                .effect_resources
+                .checkpoint_cache_stats()
+                .0,
+            2,
+            "only the two dependency checkpoints after the first replay capture are cached"
+        );
+        let previous = read_diagnostic_pixels(&incremental);
+
+        update_diagnostic_background_for_surface(
+            &incremental,
+            fixture.scene.background_surface,
+            fixture.repair,
+            [236, 28, 42, 255],
+        );
+        let current_damage = diagnostic_region(fixture.repair);
+        let current_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+        let current_demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+            &current_graph,
+            &current_damage,
+            false,
+            false,
+        );
+        let current_selection = effects::select_effect_execution(&current_graph, &current_demand);
+        for instance in [31, 32, 33] {
+            assert!(
+                current_selection
+                    .executed_instances
+                    .contains(&oblivion_one::effects::EffectInstanceId::new(instance).unwrap()),
+                "stack dependency instance {instance} remains selected"
+            );
+        }
+        incremental
+            .renderer
+            .effect_resources
+            .begin_checkpoint_frame();
+        execute_diagnostic_frame_with_origin(
+            &mut incremental,
+            &current_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(
+                &[fixture.repair],
+                false,
+                fixture.output_size,
+            ),
+            current_damage,
+            false,
+            incremental_config,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        let actual = read_diagnostic_pixels(&incremental);
+        assert_eq!(
+            incremental
+                .renderer
+                .effect_resources
+                .checkpoint_cache_stats()
+                .0,
+            2,
+            "the semantic C and B checkpoints remain separate cache entries"
+        );
+
+        let cache_passes = current_graph
+            .passes
+            .iter()
+            .filter(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cache_passes.len(), 2);
+        let cache_keys = cache_passes
+            .iter()
+            .map(|pass| effects::checkpoint_capture_cache_key(&current_graph, pass).unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(cache_keys[0], cache_keys[1]);
+
+        let mut full_refresh =
+            GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+        full_refresh.install_texture_backed_output();
+        install_native_three_checkpoint_diagnostic_scene(&mut full_refresh, fixture.scene);
+        update_diagnostic_background_for_surface(
+            &full_refresh,
+            fixture.scene.background_surface,
+            fixture.repair,
+            [236, 28, 42, 255],
+        );
+        let reference_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+        full_refresh
+            .renderer
+            .effect_resources
+            .begin_checkpoint_frame();
+        execute_diagnostic_frame_with_origin(
+            &mut full_refresh,
+            &reference_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(
+                &[fixture.repair],
+                true,
+                fixture.output_size,
+            ),
+            full_region.clone(),
+            true,
+            incremental_config,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        for pass in &cache_passes {
+            let key = effects::checkpoint_capture_cache_key(&current_graph, pass).unwrap();
+            let actual_texture = incremental
+                .renderer
+                .effect_resources
+                .checkpoint_capture_texture(&key)
+                .expect("incremental checkpoint texture remains cache-owned");
+            let reference_texture = full_refresh
+                .renderer
+                .effect_resources
+                .checkpoint_capture_texture(&key)
+                .expect("full-current checkpoint was fully populated");
+            let texture_plan = current_graph
+                .textures
+                .iter()
+                .find(|texture| Some(texture.id) == pass.output)
+                .unwrap();
+            let actual_checkpoint = read_effect_texture_pixels(
+                &mut incremental,
+                &actual_texture,
+                texture_plan.width,
+                texture_plan.height,
+            );
+            let reference_checkpoint = read_effect_texture_pixels(
+                &mut full_refresh,
+                &reference_texture,
+                texture_plan.width,
+                texture_plan.height,
+            );
+            assert_eq!(
+                actual_checkpoint,
+                reference_checkpoint,
+                "checkpoint for instance {} differs from its full refresh",
+                pass.instance.get()
+            );
+        }
+
+        let mut uncached_reference =
+            GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+        uncached_reference.install_texture_backed_output();
+        install_native_three_checkpoint_diagnostic_scene(&mut uncached_reference, fixture.scene);
+        update_diagnostic_background_for_surface(
+            &uncached_reference,
+            fixture.scene.background_surface,
+            fixture.repair,
+            [236, 28, 42, 255],
+        );
+        let uncached_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+        uncached_reference
+            .renderer
+            .effect_resources
+            .begin_checkpoint_frame();
+        execute_diagnostic_frame_with_origin(
+            &mut uncached_reference,
+            &uncached_graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(
+                &[fixture.repair],
+                true,
+                fixture.output_size,
+            ),
+            full_region,
+            true,
+            full_capture_config,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        let full_current_reference = read_diagnostic_pixels(&uncached_reference);
+        let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
+            &actual,
+            &previous,
+            &full_current_reference,
+            fixture.output_size.0,
+            fixture.output_size.1,
+            &[fixture.repair],
+            0,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        assert_eq!(
+            inside, 0,
+            "incremental stack differs from full-current reference"
+        );
+        assert_eq!(
+            outside, 0,
+            "incremental stack changed pixels outside repair"
+        );
     }
 
     #[test]

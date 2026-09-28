@@ -27,8 +27,9 @@ use super::{
     CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
     EffectDebugKawaseMode, FrameTraceSummary, PassTraceSummary, blur, capture, effect_debug_config,
     resources::{
-        EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture,
-        release_dead_graph_textures,
+        CheckpointCacheCompatibility, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
+        GraphTextureBinding, PooledEffectTexture, checkpoint_capture_cache_key,
+        estimate_graph_peak_bytes, release_dead_graph_textures,
     },
     shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
@@ -432,6 +433,14 @@ pub(crate) struct EffectExecutionStats {
     pub replay_capture_selection_cpu_ns: u64,
     pub replay_capture_visibility_cpu_ns: u64,
     pub replay_capture_draw_submit_cpu_ns: u64,
+    pub checkpoint_cache_hits: usize,
+    pub checkpoint_cache_full_refreshes: usize,
+    pub checkpoint_cache_zero_copy_hits: usize,
+    pub checkpoint_cache_update_pixels: u64,
+    pub checkpoint_cache_domain_pixels: u64,
+    pub checkpoint_cache_saved_pixels: u64,
+    pub checkpoint_cache_entries: usize,
+    pub checkpoint_cache_bytes: u64,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
@@ -467,6 +476,14 @@ impl EffectExecutionStats {
             replay_capture_selection_cpu_ns: self.replay_capture_selection_cpu_ns,
             replay_capture_visibility_cpu_ns: self.replay_capture_visibility_cpu_ns,
             replay_capture_draw_submit_cpu_ns: self.replay_capture_draw_submit_cpu_ns,
+            checkpoint_cache_hits: self.checkpoint_cache_hits,
+            checkpoint_cache_full_refreshes: self.checkpoint_cache_full_refreshes,
+            checkpoint_cache_zero_copy_hits: self.checkpoint_cache_zero_copy_hits,
+            checkpoint_cache_update_pixels: self.checkpoint_cache_update_pixels,
+            checkpoint_cache_domain_pixels: self.checkpoint_cache_domain_pixels,
+            checkpoint_cache_saved_pixels: self.checkpoint_cache_saved_pixels,
+            checkpoint_cache_entries: self.checkpoint_cache_entries,
+            checkpoint_cache_bytes: self.checkpoint_cache_bytes,
         }
     }
 
@@ -933,6 +950,54 @@ pub(crate) fn execute_effect_graph_with_debug_config_and_scene_replay_mode(
     )
 }
 
+fn prepare_checkpoint_cache_bindings(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    debug_config: EffectDebugConfig,
+) -> std::collections::HashMap<GraphTextureId, GraphTextureBinding> {
+    let mut candidates = Vec::new();
+    if debug_config.capture_mode() == EffectDebugCaptureMode::Replay {
+        for pass in &graph.passes {
+            if pass.kind != RenderPassKind::SceneCapture
+                || pass.checkpoint_dependencies.is_empty()
+                || checkpoint_capture_execution_plan_for_pass(
+                    renderer,
+                    pass,
+                    SceneBaselineAuthority::ReplayRequired,
+                    debug_config,
+                )
+                .executed
+                    != CaptureTimingMode::FramebufferShaderCopy
+            {
+                continue;
+            }
+            let Some(key) = checkpoint_capture_cache_key(graph, pass) else {
+                continue;
+            };
+            let Some(output) = pass.output else {
+                continue;
+            };
+            let Some(plan) = graph.textures.iter().find(|texture| texture.id == output) else {
+                continue;
+            };
+            candidates.push((key, plan.clone()));
+        }
+    }
+    let compatibility = CheckpointCacheCompatibility {
+        output_size: renderer.current_size,
+        framebuffer_origin_top_left: framebuffer_origin == OutputFramebufferOrigin::TopLeftScanout,
+        effect_registry_generation: renderer.effect_registry_generation,
+    };
+    let peak_bytes = estimate_graph_peak_bytes(graph).ok();
+    renderer.effect_resources.prepare_checkpoint_captures(
+        &renderer.gl,
+        compatibility,
+        peak_bytes,
+        &candidates,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_effect_graph_with_debug_config_internal(
     renderer: &mut GlesSceneRenderer,
@@ -944,7 +1009,8 @@ fn execute_effect_graph_with_debug_config_internal(
     debug_config: EffectDebugConfig,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
 ) -> RendererResult<EffectExecutionStats> {
-    let mut textures = std::collections::HashMap::new();
+    let mut textures =
+        prepare_checkpoint_cache_bindings(renderer, graph, framebuffer_origin, debug_config);
     let trace_summary = effect_trace_summary(renderer, graph, Some(repaint_plan), selection);
     renderer
         .effect_trace
@@ -1062,7 +1128,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
 fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
-    textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: Option<&super::super::damage::RepaintPlan>,
     explicit_repaint_rects: Option<&[OutputRect]>,
@@ -1080,7 +1146,7 @@ fn execute_graph_passes(
                 .begin_graph(&renderer.gl, renderer.effect_trace.frame_id())
         })
         .flatten();
-    let result = execute_graph_passes_inner(
+    let mut result = execute_graph_passes_inner(
         renderer,
         graph,
         textures,
@@ -1098,7 +1164,10 @@ fn execute_graph_passes(
     let graph_timing_finished = renderer
         .effect_gpu_profiler
         .end_graph(&renderer.gl, graph_scope);
-    if graph_timing_finished && let Ok(stats) = &result {
+    if graph_timing_finished && let Ok(stats) = &mut result {
+        let (entries, bytes) = renderer.effect_resources.checkpoint_cache_stats();
+        stats.checkpoint_cache_entries = entries;
+        stats.checkpoint_cache_bytes = bytes;
         renderer
             .effect_gpu_profiler
             .attach_capture_execution_summary(graph_scope, stats.capture_timing_summary());
@@ -1143,7 +1212,7 @@ fn scene_replay_work_mode(
 fn execute_graph_passes_inner(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
-    textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: Option<&super::super::damage::RepaintPlan>,
     explicit_repaint_rects: Option<&[OutputRect]>,
@@ -2300,7 +2369,7 @@ fn validate_effect_pass_resources(
     renderer: &GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     pass: &CompiledRenderPass,
-    textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     execution_damage: &EffectRegion,
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> Result<(), EffectExecutionInvariantError> {
@@ -2733,7 +2802,7 @@ fn ensure_pass_textures(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     pass: &CompiledRenderPass,
-    textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     for texture_id in pass.inputs.iter().copied().chain(pass.output) {
@@ -2742,7 +2811,7 @@ fn ensure_pass_textures(
             continue;
         }
         let realized = renderer.effect_resources.acquire_plan(&renderer.gl, plan)?;
-        textures.insert(texture_id, realized);
+        textures.insert(texture_id, GraphTextureBinding::transient(realized));
         stats.resource_acquisitions = stats.resource_acquisitions.saturating_add(1);
     }
     Ok(())
@@ -2844,7 +2913,7 @@ fn finalize_composite_scene_replay_timing(
 fn execute_pass(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
-    textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
@@ -2986,7 +3055,7 @@ fn execute_pass(
 fn execute_fullscreen_stage(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
-    textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
     stage: &EffectNodeKind,
     fragment_shader: &str,
@@ -3546,7 +3615,7 @@ fn set_identity_color_matrix(
 fn execute_capture(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
-    textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
@@ -3568,8 +3637,36 @@ fn execute_capture(
     let replay_host_timing_enabled =
         replay_capture_host_timing_enabled(host_timing_enabled, direct_capture);
     let host_start = replay_host_timing_enabled.then(Instant::now);
+    let checkpoint_cache_key = (pass.kind == RenderPassKind::SceneCapture
+        && !pass.checkpoint_dependencies.is_empty()
+        && scene_baseline_authority == SceneBaselineAuthority::ReplayRequired
+        && debug_config.capture_mode() == EffectDebugCaptureMode::Replay
+        && capture_plan.executed == CaptureTimingMode::FramebufferShaderCopy
+        && target.is_checkpoint_cache())
+    .then(|| checkpoint_capture_cache_key(graph, pass))
+    .flatten();
+    let frame_serial = renderer.effect_resources.checkpoint_frame_serial();
+    let checkpoint_full_refresh = checkpoint_cache_key.as_ref().is_some_and(|key| {
+        renderer
+            .effect_resources
+            .checkpoint_capture_needs_full_refresh(key, frame_serial)
+    });
     let materialization = if direct_capture {
-        None
+        checkpoint_cache_key.as_ref().map(|_| {
+            if checkpoint_full_refresh {
+                capture_materialization_plan(
+                    &EffectRegion::from_rect(target_plan.domain),
+                    Some(target_plan.domain),
+                    renderer.current_size,
+                )
+            } else {
+                checkpoint_update_materialization_plan(
+                    &graph.final_damage,
+                    target_plan.domain,
+                    renderer.current_size,
+                )
+            }
+        })
     } else {
         Some(capture_materialization_plan(
             execution_damage,
@@ -3577,18 +3674,21 @@ fn execute_capture(
             renderer.current_size,
         ))
     };
-    let capture_rects = if direct_capture {
+    let capture_rects = if direct_capture && checkpoint_cache_key.is_none() {
         vec![full_output_rect((target_plan.width, target_plan.height))]
     } else {
         materialization
             .as_ref()
-            .expect("replay capture has a materialization plan")
+            .expect("capture materialization plan is required")
             .output_rects
             .clone()
     };
-    let capture_texture_rects = materialization.as_ref().map_or_else(
-        || capture_rects.clone(),
-        |plan| plan.texture_rects(target_plan),
+    let capture_texture_rects = materialized_target_rects(
+        direct_capture,
+        checkpoint_cache_key.is_some(),
+        materialization.as_ref(),
+        &capture_rects,
+        target_plan,
     );
     let physical_pixels = output_rect_pixels(&capture_rects);
     if let Some(materialization) = materialization.as_ref()
@@ -3617,16 +3717,51 @@ fn execute_capture(
                 )?;
             }
             CaptureTimingMode::FramebufferShaderCopy => {
-                let output_texture = renderer.active_output_texture.ok_or_else(|| {
-                    io::Error::other("shader-copy capture has no sampleable output texture")
-                })?;
-                capture_output_region_to_graph_texture_shader_copy(
-                    renderer,
-                    target,
-                    target_plan,
-                    framebuffer_origin,
-                    output_texture,
-                )?;
+                if let Some(key) = checkpoint_cache_key.as_ref() {
+                    renderer.effect_resources.invalidate_checkpoint_capture(key);
+                }
+                if physical_pixels != 0 {
+                    let output_texture = renderer.active_output_texture.ok_or_else(|| {
+                        io::Error::other("shader-copy capture has no sampleable output texture")
+                    })?;
+                    capture_output_rects_to_graph_texture_shader_copy(
+                        renderer,
+                        target,
+                        target_plan,
+                        framebuffer_origin,
+                        output_texture,
+                        &capture_texture_rects,
+                    )?;
+                }
+                if let Some(key) = checkpoint_cache_key.as_ref() {
+                    renderer
+                        .effect_resources
+                        .mark_checkpoint_capture_populated(key, frame_serial);
+                    if renderer.effect_gpu_profiler.cache_telemetry_enabled() {
+                        let domain_pixels = u64::from(target_plan.width)
+                            .saturating_mul(u64::from(target_plan.height));
+                        stats.checkpoint_cache_domain_pixels = stats
+                            .checkpoint_cache_domain_pixels
+                            .saturating_add(domain_pixels);
+                        stats.checkpoint_cache_update_pixels = stats
+                            .checkpoint_cache_update_pixels
+                            .saturating_add(physical_pixels);
+                        stats.checkpoint_cache_saved_pixels = stats
+                            .checkpoint_cache_saved_pixels
+                            .saturating_add(domain_pixels.saturating_sub(physical_pixels));
+                        if checkpoint_full_refresh {
+                            stats.checkpoint_cache_full_refreshes =
+                                stats.checkpoint_cache_full_refreshes.saturating_add(1);
+                        } else {
+                            stats.checkpoint_cache_hits =
+                                stats.checkpoint_cache_hits.saturating_add(1);
+                            if physical_pixels == 0 {
+                                stats.checkpoint_cache_zero_copy_hits =
+                                    stats.checkpoint_cache_zero_copy_hits.saturating_add(1);
+                            }
+                        }
+                    }
+                }
             }
             CaptureTimingMode::Replay => unreachable!("direct capture selected replay timing"),
         }
@@ -4153,6 +4288,28 @@ pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
     framebuffer_origin: OutputFramebufferOrigin,
     output_texture: glow::Texture,
 ) -> RendererResult<()> {
+    let full_target = full_output_rect((target_plan.width, target_plan.height));
+    capture_output_rects_to_graph_texture_shader_copy(
+        renderer,
+        target,
+        target_plan,
+        framebuffer_origin,
+        output_texture,
+        std::slice::from_ref(&full_target),
+    )
+}
+
+/// Update only the supplied bottom-left-local rectangles in a graph capture
+/// target. The capture shader still samples the active output using the same
+/// output-space mapping as a full-domain capture.
+pub(crate) fn capture_output_rects_to_graph_texture_shader_copy(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    target_plan: &oblivion_one::effects::GraphTexturePlan,
+    framebuffer_origin: OutputFramebufferOrigin,
+    output_texture: glow::Texture,
+    target_rects: &[OutputRect],
+) -> RendererResult<()> {
     if target_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft {
         return Err(io::Error::other("direct capture target is not bottom-left oriented").into());
     }
@@ -4233,7 +4390,26 @@ pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
                 );
             }
             renderer.gl.bind_vertex_array(Some(vertex_array));
-            renderer.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            renderer.gl.enable(glow::SCISSOR_TEST);
+            for rect in target_rects {
+                let right = i64::from(rect.x) + i64::from(rect.width);
+                let bottom = i64::from(rect.y) + i64::from(rect.height);
+                if rect.x < 0
+                    || rect.y < 0
+                    || right > i64::from(target_plan.width)
+                    || bottom > i64::from(target_plan.height)
+                {
+                    return Err(io::Error::other(
+                        "shader-copy update rectangle exceeds capture target",
+                    )
+                    .into());
+                }
+                renderer
+                    .gl
+                    .scissor(rect.x, rect.y, rect.width as i32, rect.height as i32);
+                renderer.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            }
+            renderer.gl.disable(glow::SCISSOR_TEST);
         }
         Ok(())
     })();
@@ -4245,7 +4421,7 @@ pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
 fn execute_fullscreen_pass(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
-    textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
     fragment_shader: &str,
     framebuffer_origin: OutputFramebufferOrigin,
@@ -5059,6 +5235,59 @@ fn capture_materialization_plan(
         region,
         output_rects,
     }
+}
+
+fn materialized_target_rects(
+    direct_capture: bool,
+    persistent_checkpoint: bool,
+    materialization: Option<&CaptureMaterializationPlan>,
+    output_rects: &[OutputRect],
+    target: &oblivion_one::effects::GraphTexturePlan,
+) -> Vec<OutputRect> {
+    if direct_capture && !persistent_checkpoint {
+        vec![full_output_rect((target.width, target.height))]
+    } else if let Some(materialization) = materialization {
+        materialization.texture_rects(target)
+    } else {
+        output_rects.to_vec()
+    }
+}
+
+fn checkpoint_update_materialization_plan(
+    frame_damage: &EffectRegion,
+    capture_domain: oblivion_one::effects::EffectRect,
+    output_size: (u32, u32),
+) -> CaptureMaterializationPlan {
+    let clipped = frame_damage.intersect_rect(capture_domain);
+    if clipped.is_empty() {
+        return CaptureMaterializationPlan {
+            region: EffectRegion::empty(),
+            output_rects: Vec::new(),
+        };
+    }
+    let disjoint = clipped.disjoint_bounded();
+    let region = if disjoint.overflowed {
+        EffectRegion::from_rect(capture_domain)
+    } else {
+        disjoint.region
+    };
+    let output_rects = effect_capture_output_rects(&region, Some(capture_domain), output_size);
+    CaptureMaterializationPlan {
+        region,
+        output_rects,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_update_rects_for_test(
+    frame_damage: &EffectRegion,
+    capture_domain: oblivion_one::effects::EffectRect,
+    output_size: (u32, u32),
+    target: &oblivion_one::effects::GraphTexturePlan,
+) -> (Vec<OutputRect>, Vec<OutputRect>) {
+    let plan = checkpoint_update_materialization_plan(frame_damage, capture_domain, output_size);
+    let texture_rects = plan.texture_rects(target);
+    (plan.output_rects, texture_rects)
 }
 
 fn effect_rect_to_texture_rect(
@@ -6687,12 +6916,14 @@ mod tests {
             ],
             instances: vec![
                 oblivion_one::effects::CompiledEffectInstance {
+                    semantic_signature: 0,
                     id: earlier,
                     output_influence_region: EffectRegion::from_rect(earlier_influence),
                     capture_region: EffectRegion::from_rect(earlier_influence),
                     dependencies: Vec::new(),
                 },
                 oblivion_one::effects::CompiledEffectInstance {
+                    semantic_signature: 0,
                     id: later,
                     output_influence_region: EffectRegion::from_rect(later_capture),
                     capture_region: EffectRegion::from_rect(later_capture),
@@ -6822,6 +7053,62 @@ mod tests {
     }
 
     #[test]
+    fn uncached_direct_shader_copy_keeps_full_domain_materialization() {
+        let domain = oblivion_one::effects::EffectRect::new(100, 80, 120, 90).unwrap();
+        let damage = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(108, 88, 12, 10).unwrap(),
+        );
+        let partial = capture_materialization_plan(&damage, Some(domain), (320, 240));
+        let target = test_texture(1, GraphTextureSource::CapturedScene, domain);
+
+        assert_eq!(
+            materialized_target_rects(true, false, Some(&partial), &partial.output_rects, &target),
+            vec![full_output_rect((target.width, target.height))],
+            "ordinary direct captures must remain full-domain when caching is unavailable"
+        );
+        assert_eq!(
+            materialized_target_rects(true, true, Some(&partial), &partial.output_rects, &target),
+            partial.texture_rects(&target),
+            "persistent checkpoints may use the bounded dirty rectangles"
+        );
+    }
+
+    #[test]
+    fn checkpoint_update_materialization_keeps_disjoint_damage_and_empty_hits() {
+        let domain = oblivion_one::effects::EffectRect::new(100, 80, 64, 40).unwrap();
+        let first = oblivion_one::effects::EffectRect::new(102, 83, 8, 6).unwrap();
+        let second = oblivion_one::effects::EffectRect::new(130, 100, 5, 7).unwrap();
+        let damage = EffectRegion::from_rect(first).union(&EffectRegion::from_rect(second));
+
+        let update = checkpoint_update_materialization_plan(&damage, domain, (320, 240));
+        let target = test_texture(1, GraphTextureSource::CapturedScene, domain);
+
+        assert_eq!(
+            update.output_rects,
+            vec![
+                OutputRect::new(102, 83, 8, 6),
+                OutputRect::new(130, 100, 5, 7),
+            ]
+        );
+        assert_eq!(output_rect_pixels(&update.output_rects), 83);
+        assert_eq!(
+            update.texture_rects(&target),
+            vec![OutputRect::new(2, 31, 8, 6), OutputRect::new(30, 13, 5, 7)]
+        );
+        assert!(update.output_rects.iter().all(|rect| {
+            let right = i64::from(rect.x) + i64::from(rect.width);
+            let bottom = i64::from(rect.y) + i64::from(rect.height);
+            !(i64::from(rect.x) < 135 && right > 110 && i64::from(rect.y) < 100 && bottom > 89)
+        }));
+
+        let empty =
+            checkpoint_update_materialization_plan(&EffectRegion::empty(), domain, (320, 240));
+        assert!(empty.region.is_empty());
+        assert!(empty.output_rects.is_empty());
+        assert!(empty.texture_rects(&target).is_empty());
+    }
+
+    #[test]
     fn replay_capture_region_layout_reports_materialization_and_execution_regions() {
         let output_rects = [
             OutputRect::new(10, 20, 30, 40),
@@ -6894,6 +7181,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Intermediate, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -6942,6 +7230,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Intermediate, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -6988,6 +7277,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Output, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7041,6 +7331,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Intermediate, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7088,6 +7379,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Output, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: visible.clone(),
                 capture_region: visible.clone(),
@@ -7235,6 +7527,7 @@ mod tests {
             textures: Vec::new(),
             instances: vec![
                 oblivion_one::effects::CompiledEffectInstance {
+                    semantic_signature: 0,
                     id: first,
                     output_influence_region: EffectRegion::from_rect(
                         oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
@@ -7245,6 +7538,7 @@ mod tests {
                     dependencies: Vec::new(),
                 },
                 oblivion_one::effects::CompiledEffectInstance {
+                    semantic_signature: 0,
                     id: second,
                     output_influence_region: EffectRegion::from_rect(
                         oblivion_one::effects::EffectRect::new(20, 0, 10, 10).unwrap(),
@@ -7305,6 +7599,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Intermediate, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7347,6 +7642,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Output, output_domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(visible),
                 capture_region: EffectRegion::from_rect(capture_domain),
@@ -7404,6 +7700,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Output, output_domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: visible.clone(),
                 capture_region: visible.clone(),
@@ -7474,6 +7771,7 @@ mod tests {
                 test_texture(4, GraphTextureSource::Intermediate, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7522,6 +7820,7 @@ mod tests {
                 test_texture(2, GraphTextureSource::Intermediate, domain),
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(visible),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7558,6 +7857,7 @@ mod tests {
             passes: vec![pass.clone()],
             textures: vec![test_texture(1, GraphTextureSource::CapturedScene, domain)],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7730,6 +8030,32 @@ mod tests {
         assert_eq!(summary.replay_capture_selection_cpu_ns, 11);
         assert_eq!(summary.replay_capture_visibility_cpu_ns, 22);
         assert_eq!(summary.replay_capture_draw_submit_cpu_ns, 33);
+    }
+
+    #[test]
+    fn checkpoint_cache_timing_uses_bounded_frame_aggregates() {
+        let stats = EffectExecutionStats {
+            checkpoint_cache_hits: 4,
+            checkpoint_cache_full_refreshes: 1,
+            checkpoint_cache_zero_copy_hits: 2,
+            checkpoint_cache_update_pixels: 120,
+            checkpoint_cache_domain_pixels: 2_000,
+            checkpoint_cache_saved_pixels: 1_880,
+            checkpoint_cache_entries: 5,
+            checkpoint_cache_bytes: 80_000,
+            ..Default::default()
+        };
+
+        let summary = stats.capture_timing_summary();
+
+        assert_eq!(summary.checkpoint_cache_hits, 4);
+        assert_eq!(summary.checkpoint_cache_full_refreshes, 1);
+        assert_eq!(summary.checkpoint_cache_zero_copy_hits, 2);
+        assert_eq!(summary.checkpoint_cache_update_pixels, 120);
+        assert_eq!(summary.checkpoint_cache_domain_pixels, 2_000);
+        assert_eq!(summary.checkpoint_cache_saved_pixels, 1_880);
+        assert_eq!(summary.checkpoint_cache_entries, 5);
+        assert_eq!(summary.checkpoint_cache_bytes, 80_000);
     }
 
     #[test]
@@ -7991,6 +8317,7 @@ mod tests {
                 last_use: None,
             }],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(full),
                 capture_region: EffectRegion::from_rect(full),
@@ -8055,6 +8382,7 @@ mod tests {
             passes: vec![pass.clone()],
             textures: vec![test_texture(1, GraphTextureSource::CapturedScene, domain)],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -8118,6 +8446,7 @@ mod tests {
                 capture_domain,
             )],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(capture_domain),
                 capture_region: EffectRegion::from_rect(capture_domain),
@@ -8189,6 +8518,7 @@ mod tests {
                 capture_domain,
             )],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(capture_domain),
                 capture_region: EffectRegion::from_rect(capture_domain),
@@ -8412,6 +8742,7 @@ mod tests {
         };
         let instance = |id, output_x, capture_x, capture_width, dependencies| {
             oblivion_one::effects::CompiledEffectInstance {
+                semantic_signature: 0,
                 id,
                 output_influence_region: EffectRegion::from_rect(
                     oblivion_one::effects::EffectRect::new(output_x, 0, 10, 10).unwrap(),

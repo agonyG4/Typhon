@@ -404,6 +404,7 @@ pub struct CompiledFrameGraph {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledEffectInstance {
     pub id: EffectInstanceId,
+    pub semantic_signature: u64,
     pub output_influence_region: EffectRegion,
     pub capture_region: EffectRegion,
     pub dependencies: Vec<EffectInstanceId>,
@@ -2014,6 +2015,7 @@ pub fn compile_frame_execution_plan(
         )?;
         compiled_instances.push(CompiledEffectInstance {
             id: instance.id,
+            semantic_signature: instance.signature,
             output_influence_region: effect_damage.dependency_region.clone(),
             capture_region: effect_damage.capture_region,
             dependencies: dependency_instances,
@@ -3585,6 +3587,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compiled_effect_instances_preserve_resolved_semantic_signatures() {
+        let (mut scene, registry) = blur_scene();
+        scene.instances[0].signature = 0xfeed_cafe;
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        assert_eq!(graph.instances[0].semantic_signature, 0xfeed_cafe);
+    }
+
+    #[test]
+    fn continuous_lower_effect_demand_reaches_later_checkpoint_damage() {
+        let (base, registry) = blur_scene();
+        let mut lower = base.instances[0].clone();
+        lower.frame_demand = EffectFrameDemand::Continuous;
+        let mut upper = lower.clone();
+        upper.id = EffectInstanceId::new(2).unwrap();
+        upper.anchor = EffectAnchor::BeforeSurface(2);
+        upper.scene_order = EffectSceneOrder::for_anchor(upper.anchor);
+        upper.frame_demand = EffectFrameDemand::OnDamage;
+        let scene = ResolvedEffectScene::new(2, vec![lower.clone(), upper]);
+        let continuous_dirty = scene.frame_demand_snapshot().dirty_region;
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &continuous_dirty, output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("continuous stacked backdrop effects must compile");
+        };
+        let upper_capture = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && pass.instance == EffectInstanceId::new(2).unwrap()
+            })
+            .expect("upper backdrop capture");
+        let upper_domain = graph
+            .textures
+            .iter()
+            .find(|texture| Some(texture.id) == upper_capture.output)
+            .expect("upper capture texture")
+            .domain;
+        let checkpoint_update = graph.final_damage.intersect_rect(upper_domain);
+
+        assert!(!upper_capture.checkpoint_dependencies.is_empty());
+        assert!(!continuous_dirty.is_empty());
+        assert!(
+            !checkpoint_update.is_empty(),
+            "continuous lower effect work must dirty pixels copied into the upper checkpoint"
+        );
+        assert!(
+            graph
+                .final_damage
+                .contains_point(lower.target_bounds.x, lower.target_bounds.y),
+            "frame-local continuous demand must remain in final damage"
+        );
+    }
+
     fn repeated_region(rect: EffectRect, count: usize) -> EffectRegion {
         let mut region = EffectRegion::empty();
         for _ in 0..count {
@@ -3628,6 +3696,7 @@ mod tests {
         dependencies: Vec<EffectInstanceId>,
     ) -> CompiledEffectInstance {
         CompiledEffectInstance {
+            semantic_signature: 0,
             id: EffectInstanceId::new(id).unwrap(),
             output_influence_region,
             capture_region,
@@ -6169,6 +6238,7 @@ mod tests {
                 ),
             ],
             instances: vec![CompiledEffectInstance {
+                semantic_signature: 0,
                 id: instance,
                 output_influence_region: visible.clone(),
                 capture_region: EffectRegion::from_rect(

@@ -14,7 +14,7 @@ use oblivion_one::effects::{
     GraphTextureSource, RenderPassKind,
 };
 
-use super::resources::PooledEffectTexture;
+use super::resources::GraphTextureBinding;
 
 const TRACE_ENV: &str = "TYPHON_EFFECT_EXEC_TRACE";
 const DEBUG_CAPTURE_MODE_ENV: &str = "TYPHON_EFFECT_DEBUG_CAPTURE_MODE";
@@ -1016,7 +1016,7 @@ impl EffectExecutionTrace {
         boundary: &'static str,
         pass: &CompiledRenderPass,
         graph: &CompiledFrameGraph,
-        resources: &HashMap<GraphTextureId, PooledEffectTexture>,
+        resources: &HashMap<GraphTextureId, GraphTextureBinding>,
         summary: PassTraceSummary,
     ) {
         self.event(|| {
@@ -1124,7 +1124,7 @@ fn render_pass_kind_name(kind: RenderPassKind) -> &'static str {
 fn graph_texture_trace(
     graph: &CompiledFrameGraph,
     id: GraphTextureId,
-    resources: &HashMap<GraphTextureId, PooledEffectTexture>,
+    resources: &HashMap<GraphTextureId, GraphTextureBinding>,
 ) -> Option<String> {
     let texture = graph.textures.iter().find(|texture| texture.id == id)?;
     let source = match texture.source {

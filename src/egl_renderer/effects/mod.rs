@@ -28,6 +28,10 @@ pub(crate) use executor::{
 };
 #[cfg(test)]
 pub(crate) use executor::{
+    capture_output_rects_to_graph_texture_shader_copy, checkpoint_update_rects_for_test,
+};
+#[cfg(test)]
+pub(crate) use executor::{
     capture_output_region_to_graph_texture, capture_output_region_to_graph_texture_shader_copy,
 };
 #[cfg(test)]
@@ -38,6 +42,8 @@ pub(crate) use executor::{
 };
 pub(crate) use gpu_timing::{EffectGpuProfiler, ReplayCaptureExecutionDetail};
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
+#[cfg(test)]
+pub(crate) use resources::checkpoint_capture_cache_key;
 pub(crate) use resources::{
     EffectGlResourceCache, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
     PooledEffectTexture,

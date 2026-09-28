@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     io,
+    ops::Deref,
 };
 
 use glow::HasContext;
 use oblivion_one::effects::{
-    CompiledFrameGraph, EffectWorkingSpace, GraphTextureId, GraphTexturePlan, GraphTextureSource,
+    CompiledFrameGraph, EffectInstanceId, EffectWorkingSpace, GraphTextureId, GraphTexturePlan,
+    GraphTextureSource, RenderPassKind,
 };
 
 use super::metrics::EffectResourceMetrics;
@@ -40,6 +42,73 @@ pub struct EffectTextureKey {
     pub format: EffectTextureFormat,
     pub filter: EffectTextureFilter,
     pub working_space: EffectWorkingSpace,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CheckpointDependencySemanticIdentity {
+    instance: EffectInstanceId,
+    semantic_signature: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CheckpointCaptureCacheKey {
+    consumer: EffectInstanceId,
+    consumer_semantic_signature: u64,
+    capture_domain: (i32, i32, u32, u32),
+    width: u32,
+    height: u32,
+    format: EffectTextureFormat,
+    working_space: EffectWorkingSpace,
+    dependencies: Vec<CheckpointDependencySemanticIdentity>,
+}
+
+/// Build a cross-frame identity from compositor-owned effect semantics and
+/// capture texture layout. Frame-local graph IDs are resolved to producer
+/// instances and never become part of the returned key.
+pub(crate) fn checkpoint_capture_cache_key(
+    graph: &CompiledFrameGraph,
+    pass: &oblivion_one::effects::CompiledRenderPass,
+) -> Option<CheckpointCaptureCacheKey> {
+    if pass.kind != RenderPassKind::SceneCapture || pass.checkpoint_dependencies.is_empty() {
+        return None;
+    }
+    let consumer = graph
+        .instances
+        .iter()
+        .find(|instance| instance.id == pass.instance)?;
+    let output = pass.output?;
+    let capture_texture = graph.textures.iter().find(|texture| texture.id == output)?;
+    let capture_key = texture_key(capture_texture);
+    let mut dependencies = Vec::with_capacity(pass.checkpoint_dependencies.len());
+    for dependency in &pass.checkpoint_dependencies {
+        let producer = graph
+            .passes
+            .iter()
+            .find(|candidate| candidate.id == *dependency)?;
+        let producer_instance = graph
+            .instances
+            .iter()
+            .find(|instance| instance.id == producer.instance)?;
+        dependencies.push(CheckpointDependencySemanticIdentity {
+            instance: producer_instance.id,
+            semantic_signature: producer_instance.semantic_signature,
+        });
+    }
+    Some(CheckpointCaptureCacheKey {
+        consumer: consumer.id,
+        consumer_semantic_signature: consumer.semantic_signature,
+        capture_domain: (
+            capture_texture.domain.x,
+            capture_texture.domain.y,
+            capture_texture.domain.width,
+            capture_texture.domain.height,
+        ),
+        width: capture_texture.width,
+        height: capture_texture.height,
+        format: capture_key.format,
+        working_space: capture_texture.working_space,
+        dependencies,
+    })
 }
 
 impl EffectTextureKey {
@@ -102,6 +171,65 @@ pub struct PooledEffectTexture {
     last_used: u64,
     checked_out: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphTextureBindingOwnership {
+    FrameTransient,
+    CheckpointCache,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphTextureBinding {
+    texture: PooledEffectTexture,
+    ownership: GraphTextureBindingOwnership,
+}
+
+impl GraphTextureBinding {
+    pub(crate) fn transient(texture: PooledEffectTexture) -> Self {
+        Self {
+            texture,
+            ownership: GraphTextureBindingOwnership::FrameTransient,
+        }
+    }
+
+    pub(crate) fn checkpoint_cache(texture: PooledEffectTexture) -> Self {
+        Self {
+            texture,
+            ownership: GraphTextureBindingOwnership::CheckpointCache,
+        }
+    }
+
+    fn into_transient(self) -> Option<PooledEffectTexture> {
+        (self.ownership == GraphTextureBindingOwnership::FrameTransient).then_some(self.texture)
+    }
+
+    pub(crate) fn is_checkpoint_cache(&self) -> bool {
+        self.ownership == GraphTextureBindingOwnership::CheckpointCache
+    }
+}
+
+impl Deref for GraphTextureBinding {
+    type Target = PooledEffectTexture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.texture
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointCacheCompatibility {
+    pub(crate) output_size: (u32, u32),
+    pub(crate) framebuffer_origin_top_left: bool,
+    pub(crate) effect_registry_generation: u64,
+}
+
+#[derive(Debug)]
+struct CachedCheckpointCapture {
+    texture: PooledEffectTexture,
+    last_populated_frame_serial: Option<u64>,
+}
+
+const MAX_CHECKPOINT_CACHE_ENTRIES: usize = 32;
 
 #[derive(Debug)]
 pub struct EffectResourcePool {
@@ -236,6 +364,15 @@ impl EffectResourcePool {
         self.current_bytes
     }
 
+    fn checked_out_bytes(&self) -> u64 {
+        self.textures
+            .values()
+            .flatten()
+            .filter(|texture| texture.checked_out)
+            .map(|texture| texture.bytes)
+            .fold(0, u64::saturating_add)
+    }
+
     #[allow(dead_code)]
     pub fn peak_bytes(&self) -> u64 {
         self.peak_bytes
@@ -340,6 +477,9 @@ pub(crate) struct EffectGlResourceCache {
     pool: EffectResourcePool,
     gl_textures: HashMap<u64, glow::Texture>,
     scratch_fbo: Option<glow::Framebuffer>,
+    checkpoint_captures: HashMap<CheckpointCaptureCacheKey, CachedCheckpointCapture>,
+    checkpoint_compatibility: Option<CheckpointCacheCompatibility>,
+    checkpoint_frame_serial: u64,
 }
 
 #[allow(dead_code)]
@@ -349,6 +489,9 @@ impl EffectGlResourceCache {
             pool: EffectResourcePool::new(),
             gl_textures: HashMap::new(),
             scratch_fbo: None,
+            checkpoint_captures: HashMap::new(),
+            checkpoint_compatibility: None,
+            checkpoint_frame_serial: 0,
         }
     }
 
@@ -357,6 +500,9 @@ impl EffectGlResourceCache {
             pool: EffectResourcePool::with_budget(budget_bytes)?,
             gl_textures: HashMap::new(),
             scratch_fbo: None,
+            checkpoint_captures: HashMap::new(),
+            checkpoint_compatibility: None,
+            checkpoint_frame_serial: 0,
         })
     }
 
@@ -372,7 +518,13 @@ impl EffectGlResourceCache {
             }
         }
         if let Entry::Vacant(entry) = self.gl_textures.entry(texture.id) {
-            let gl_texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
+            let gl_texture = match unsafe { gl.create_texture() } {
+                Ok(texture) => texture,
+                Err(error) => {
+                    let _ = self.pool.return_texture(texture);
+                    return Err(io::Error::other(error).into());
+                }
+            };
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(gl_texture));
                 gl.tex_parameter_i32(
@@ -438,7 +590,7 @@ impl EffectGlResourceCache {
                     continue;
                 }
                 let texture = self.acquire_plan(gl, graph_texture_plan(graph, texture_id)?)?;
-                live.insert(texture_id, texture);
+                live.insert(texture_id, GraphTextureBinding::transient(texture));
             }
             release_dead_graph_textures(self, graph, pass.id, &mut live)?;
         }
@@ -453,11 +605,196 @@ impl EffectGlResourceCache {
         self.acquire(gl, texture_key(plan))
     }
 
+    pub(crate) fn begin_checkpoint_frame(&mut self) -> u64 {
+        if self.checkpoint_frame_serial == u64::MAX {
+            self.checkpoint_frame_serial = 1;
+            self.invalidate_checkpoint_capture_contents();
+        } else {
+            self.checkpoint_frame_serial += 1;
+        }
+        self.checkpoint_frame_serial
+    }
+
+    pub(crate) fn checkpoint_frame_serial(&self) -> u64 {
+        self.checkpoint_frame_serial
+    }
+
+    pub(crate) fn checkpoint_cache_stats(&self) -> (usize, u64) {
+        let entries = self.checkpoint_captures.len();
+        let bytes = self
+            .checkpoint_captures
+            .values()
+            .map(|capture| capture.texture.bytes)
+            .fold(0, u64::saturating_add);
+        (entries, bytes)
+    }
+
+    pub(crate) fn prepare_checkpoint_captures(
+        &mut self,
+        gl: &glow::Context,
+        compatibility: CheckpointCacheCompatibility,
+        graph_peak_bytes: Option<u64>,
+        candidates: &[(CheckpointCaptureCacheKey, GraphTexturePlan)],
+    ) -> HashMap<GraphTextureId, GraphTextureBinding> {
+        self.update_checkpoint_compatibility(compatibility);
+        self.retain_checkpoint_captures(
+            candidates
+                .iter()
+                .take(MAX_CHECKPOINT_CACHE_ENTRIES)
+                .map(|(key, _)| key),
+        );
+
+        let Some(graph_peak_bytes) = graph_peak_bytes else {
+            self.clear_checkpoint_capture_cache();
+            return HashMap::new();
+        };
+        if self
+            .pool
+            .checked_out_bytes()
+            .saturating_add(graph_peak_bytes)
+            > self.pool.budget_bytes()
+        {
+            self.clear_checkpoint_capture_cache();
+        }
+        if self
+            .pool
+            .checked_out_bytes()
+            .saturating_add(graph_peak_bytes)
+            > self.pool.budget_bytes()
+        {
+            return HashMap::new();
+        }
+
+        let mut bindings = HashMap::new();
+        for (key, plan) in candidates.iter().take(MAX_CHECKPOINT_CACHE_ENTRIES) {
+            if !self.checkpoint_captures.contains_key(key) {
+                let bytes = match texture_key(plan).estimated_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                if self
+                    .pool
+                    .checked_out_bytes()
+                    .saturating_add(graph_peak_bytes)
+                    .saturating_add(bytes)
+                    > self.pool.budget_bytes()
+                {
+                    continue;
+                }
+                let texture = match self.acquire_plan(gl, plan) {
+                    Ok(texture) => texture,
+                    Err(_) => continue,
+                };
+                self.checkpoint_captures.insert(
+                    key.clone(),
+                    CachedCheckpointCapture {
+                        texture,
+                        last_populated_frame_serial: None,
+                    },
+                );
+            }
+            if let Some(cached) = self.checkpoint_captures.get(key) {
+                bindings.insert(
+                    plan.id,
+                    GraphTextureBinding::checkpoint_cache(cached.texture.clone()),
+                );
+            }
+        }
+        bindings
+    }
+
+    fn update_checkpoint_compatibility(
+        &mut self,
+        compatibility: CheckpointCacheCompatibility,
+    ) -> bool {
+        if self.checkpoint_compatibility == Some(compatibility) {
+            return false;
+        }
+        self.clear_checkpoint_capture_cache();
+        self.checkpoint_compatibility = Some(compatibility);
+        true
+    }
+
+    fn retain_checkpoint_captures<'a>(
+        &mut self,
+        live_keys: impl IntoIterator<Item = &'a CheckpointCaptureCacheKey>,
+    ) {
+        let live_keys = live_keys
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let stale_keys = self
+            .checkpoint_captures
+            .keys()
+            .filter(|key| !live_keys.contains(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            self.evict_checkpoint_capture(&key);
+        }
+    }
+
+    pub(crate) fn checkpoint_capture_texture(
+        &self,
+        key: &CheckpointCaptureCacheKey,
+    ) -> Option<PooledEffectTexture> {
+        self.checkpoint_captures
+            .get(key)
+            .map(|cached| cached.texture.clone())
+    }
+
+    pub(crate) fn checkpoint_capture_needs_full_refresh(
+        &self,
+        key: &CheckpointCaptureCacheKey,
+        frame_serial: u64,
+    ) -> bool {
+        !self.checkpoint_captures.get(key).is_some_and(|cached| {
+            cached
+                .last_populated_frame_serial
+                .and_then(|serial| serial.checked_add(1))
+                == Some(frame_serial)
+        })
+    }
+
+    pub(crate) fn mark_checkpoint_capture_populated(
+        &mut self,
+        key: &CheckpointCaptureCacheKey,
+        frame_serial: u64,
+    ) {
+        if let Some(cached) = self.checkpoint_captures.get_mut(key) {
+            cached.last_populated_frame_serial = Some(frame_serial);
+        }
+    }
+
+    pub(crate) fn invalidate_checkpoint_capture(&mut self, key: &CheckpointCaptureCacheKey) {
+        if let Some(cached) = self.checkpoint_captures.get_mut(key) {
+            cached.last_populated_frame_serial = None;
+        }
+    }
+
+    pub(crate) fn invalidate_checkpoint_capture_contents(&mut self) {
+        for cached in self.checkpoint_captures.values_mut() {
+            cached.last_populated_frame_serial = None;
+        }
+    }
+
+    pub(crate) fn clear_checkpoint_capture_cache(&mut self) {
+        let entries = std::mem::take(&mut self.checkpoint_captures);
+        for cached in entries.into_values() {
+            let _ = self.release(cached.texture);
+        }
+    }
+
+    fn evict_checkpoint_capture(&mut self, key: &CheckpointCaptureCacheKey) {
+        if let Some(cached) = self.checkpoint_captures.remove(key) {
+            let _ = self.release(cached.texture);
+        }
+    }
+
     pub(crate) fn acquire_graph(
         &mut self,
         gl: &glow::Context,
         graph: &CompiledFrameGraph,
-    ) -> Result<HashMap<GraphTextureId, PooledEffectTexture>, Box<dyn std::error::Error>> {
+    ) -> Result<HashMap<GraphTextureId, GraphTextureBinding>, Box<dyn std::error::Error>> {
         let mut checked_out = HashMap::new();
         for texture in &graph.textures {
             if texture.source == GraphTextureSource::Output {
@@ -465,12 +802,10 @@ impl EffectGlResourceCache {
             }
             match self.acquire(gl, texture_key(texture)) {
                 Ok(realized) => {
-                    checked_out.insert(texture.id, realized);
+                    checked_out.insert(texture.id, GraphTextureBinding::transient(realized));
                 }
                 Err(error) => {
-                    for texture in checked_out.into_values() {
-                        let _ = self.release(texture);
-                    }
+                    let _ = self.release_graph(checked_out);
                     return Err(error);
                 }
             }
@@ -480,11 +815,13 @@ impl EffectGlResourceCache {
 
     pub(crate) fn release_graph(
         &mut self,
-        textures: HashMap<GraphTextureId, PooledEffectTexture>,
+        textures: HashMap<GraphTextureId, GraphTextureBinding>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut first_error = None;
         for texture in textures.into_values() {
-            if let Err(error) = self.release(texture) {
+            if let Some(texture) = texture.into_transient()
+                && let Err(error) = self.release(texture)
+            {
                 first_error.get_or_insert(error);
             }
         }
@@ -589,6 +926,7 @@ impl EffectGlResourceCache {
     }
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
+        self.clear_checkpoint_capture_cache();
         for (_, texture) in self.gl_textures.drain() {
             unsafe { gl.delete_texture(texture) };
         }
@@ -669,7 +1007,7 @@ pub(crate) fn release_dead_graph_textures(
     cache: &mut EffectGlResourceCache,
     graph: &CompiledFrameGraph,
     pass: oblivion_one::effects::GraphPassId,
-    live: &mut HashMap<GraphTextureId, PooledEffectTexture>,
+    live: &mut HashMap<GraphTextureId, GraphTextureBinding>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dead = graph
         .textures
@@ -679,7 +1017,9 @@ pub(crate) fn release_dead_graph_textures(
         .collect::<Vec<_>>();
     for id in dead {
         if let Some(texture) = live.remove(&id) {
-            cache.release(texture)?;
+            if let Some(texture) = texture.into_transient() {
+                cache.release(texture)?;
+            }
         }
     }
     Ok(())
@@ -761,6 +1101,77 @@ mod tests {
         CompiledRenderPass, EffectInstanceId, EffectRegion, EffectWorkingSpace, RenderPassKind,
     };
 
+    fn backdrop_stack_graph(generation: u64, source_damage: EffectRegion) -> CompiledFrameGraph {
+        use oblivion_one::{
+            compositor::{
+                EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
+                ResolvedEffectScene,
+            },
+            effects::{
+                DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand,
+                EffectNode, EffectNodeId, EffectOutsets, EffectParameterBlock, EffectProgram,
+                EffectProgramId, EffectSource, EffectWorkingSpace, FrameExecutionPlan,
+                compile_frame_execution_plan, validate_effect_program,
+            },
+        };
+
+        let source = EffectNodeId::new(1).unwrap();
+        let blur = EffectNodeId::new(2).unwrap();
+        let program = EffectProgram {
+            id: EffectProgramId::new(1).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::dual_kawase(
+                    blur,
+                    source,
+                    DualKawaseBlurSpec::new(4.0, 2, 1.0).unwrap(),
+                ),
+            ],
+            output: blur,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        };
+        let mut registry = oblivion_one::effects::EffectRegistry::empty();
+        registry
+            .insert(validate_effect_program(program).unwrap())
+            .unwrap();
+        let region = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(100, 80, 320, 180).unwrap(),
+        );
+        let instances = (1..=3)
+            .map(|id| {
+                let anchor = EffectAnchor::BeforeSurface(1);
+                ResolvedEffectInstance {
+                    id: EffectInstanceId::new(id).unwrap(),
+                    program: EffectProgramId::new(1).unwrap(),
+                    anchor,
+                    target_bounds: region.bounding_rect().unwrap(),
+                    region: region.clone(),
+                    parameter_block: EffectParameterBlock::default(),
+                    signature: 100 + id,
+                    frame_demand: EffectFrameDemand::OnDamage,
+                    visual_group: None,
+                    anchor_scope: EffectAnchorScope::VisualGroup,
+                    scene_order: EffectSceneOrder::for_anchor(anchor),
+                }
+            })
+            .collect();
+        let scene = ResolvedEffectScene::new(generation, instances);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &source_damage,
+            oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("three backdrop instances must compile to a graph");
+        };
+        graph
+    }
+
     fn key(width: u32, height: u32) -> EffectTextureKey {
         EffectTextureKey::new(
             width,
@@ -769,6 +1180,502 @@ mod tests {
             EffectTextureFilter::Linear,
             EffectWorkingSpace::LinearSrgb,
         )
+    }
+
+    fn resource_cache_with_checkpoint(
+        cache_key: CheckpointCaptureCacheKey,
+        last_populated_frame_serial: Option<u64>,
+    ) -> EffectGlResourceCache {
+        let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
+        let texture = cache.pool.checkout(key(8, 8)).unwrap();
+        cache.checkpoint_captures.insert(
+            cache_key,
+            CachedCheckpointCapture {
+                texture,
+                last_populated_frame_serial,
+            },
+        );
+        cache
+    }
+
+    fn sample_checkpoint_key() -> CheckpointCaptureCacheKey {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let checkpoint = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && pass.instance == EffectInstanceId::new(3).unwrap()
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .unwrap();
+        checkpoint_capture_cache_key(&graph, checkpoint).unwrap()
+    }
+
+    fn stacked_checkpoint(
+        graph: &CompiledFrameGraph,
+        consumer: EffectInstanceId,
+    ) -> &CompiledRenderPass {
+        graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && pass.instance == consumer
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .expect("third stacked checkpoint")
+    }
+
+    #[test]
+    fn checkpoint_capture_key_ignores_scene_generation_damage_and_pass_ids() {
+        let first = backdrop_stack_graph(
+            1,
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(101, 81, 2, 3).unwrap()),
+        );
+        let mut second = backdrop_stack_graph(
+            9,
+            EffectRegion::from_rect(
+                oblivion_one::effects::EffectRect::new(139, 113, 3, 2).unwrap(),
+            ),
+        );
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let first_key = checkpoint_capture_cache_key(&first, stacked_checkpoint(&first, consumer))
+            .expect("eligible third checkpoint");
+
+        for pass in &mut second.passes {
+            pass.id = oblivion_one::effects::GraphPassId::new(pass.id.get() + 100).unwrap();
+            for dependency in &mut pass.checkpoint_dependencies {
+                *dependency =
+                    oblivion_one::effects::GraphPassId::new(dependency.get() + 100).unwrap();
+            }
+        }
+        for texture in &mut second.textures {
+            texture.first_use = texture
+                .first_use
+                .map(|id| oblivion_one::effects::GraphPassId::new(id.get() + 100).unwrap());
+            texture.last_use = texture
+                .last_use
+                .map(|id| oblivion_one::effects::GraphPassId::new(id.get() + 100).unwrap());
+        }
+        let second_key =
+            checkpoint_capture_cache_key(&second, stacked_checkpoint(&second, consumer))
+                .expect("renumbered eligible third checkpoint");
+
+        assert_ne!(first.final_damage, second.final_damage);
+        assert_eq!(first_key, second_key);
+    }
+
+    #[test]
+    fn checkpoint_capture_key_changes_with_semantics_and_texture_layout() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let consumer = EffectInstanceId::new(3).unwrap();
+        let checkpoint = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && pass.instance == consumer
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .expect("third stacked checkpoint");
+        let base = checkpoint_capture_cache_key(&graph, checkpoint).unwrap();
+
+        let changed_consumer_signature = {
+            let mut graph = graph.clone();
+            graph
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == consumer)
+                .unwrap()
+                .semantic_signature += 1;
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_consumer_signature);
+
+        let changed_domain = {
+            let mut graph = graph.clone();
+            let output = checkpoint.output.unwrap();
+            let texture = graph
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == output)
+                .unwrap();
+            texture.domain = oblivion_one::effects::EffectRect::new(
+                texture.domain.x + 1,
+                texture.domain.y,
+                texture.domain.width,
+                texture.domain.height,
+            )
+            .unwrap();
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_domain);
+
+        let changed_width = {
+            let mut graph = graph.clone();
+            let output = checkpoint.output.unwrap();
+            graph
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == output)
+                .unwrap()
+                .width += 1;
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_width);
+
+        let changed_height = {
+            let mut graph = graph.clone();
+            let output = checkpoint.output.unwrap();
+            graph
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == output)
+                .unwrap()
+                .height += 1;
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_height);
+
+        let changed_format = {
+            let mut graph = graph.clone();
+            let output = checkpoint.output.unwrap();
+            graph
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == output)
+                .unwrap()
+                .source = GraphTextureSource::Intermediate;
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_format);
+
+        let changed_working_space = {
+            let mut graph = graph.clone();
+            let output = checkpoint.output.unwrap();
+            let texture = graph
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == output)
+                .unwrap();
+            texture.working_space = match texture.working_space {
+                EffectWorkingSpace::LinearSrgb => EffectWorkingSpace::OutputEncodedSrgb,
+                EffectWorkingSpace::OutputEncodedSrgb => EffectWorkingSpace::LinearSrgb,
+            };
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_working_space);
+
+        let changed_dependency_signature = {
+            let mut graph = graph.clone();
+            let dependency_id = graph
+                .passes
+                .iter()
+                .find(|pass| pass.id == checkpoint.checkpoint_dependencies[0])
+                .unwrap()
+                .instance;
+            graph
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == dependency_id)
+                .unwrap()
+                .semantic_signature += 1;
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_dependency_signature);
+
+        let changed_dependency_identity = {
+            let mut graph = graph.clone();
+            let dependency_pass_id = checkpoint.checkpoint_dependencies[0];
+            let old_dependency_id = graph
+                .passes
+                .iter()
+                .find(|pass| pass.id == dependency_pass_id)
+                .unwrap()
+                .instance;
+            let new_dependency_id = EffectInstanceId::new(99).unwrap();
+            graph
+                .passes
+                .iter_mut()
+                .filter(|pass| pass.instance == old_dependency_id)
+                .for_each(|pass| pass.instance = new_dependency_id);
+            graph
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == old_dependency_id)
+                .unwrap()
+                .id = new_dependency_id;
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_dependency_identity);
+
+        let changed_dependency_order = {
+            let mut graph = graph.clone();
+            let target = graph
+                .passes
+                .iter_mut()
+                .find(|pass| pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture)
+                .unwrap();
+            target.checkpoint_dependencies.reverse();
+            checkpoint_capture_cache_key(
+                &graph,
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == consumer && pass.kind == RenderPassKind::SceneCapture
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(base, changed_dependency_order);
+    }
+
+    #[test]
+    fn checkpoint_cache_requires_the_immediately_preceding_frame() {
+        let key = sample_checkpoint_key();
+        let mut cache = resource_cache_with_checkpoint(key.clone(), None);
+
+        assert!(cache.checkpoint_capture_needs_full_refresh(&key, 10));
+        cache.mark_checkpoint_capture_populated(&key, 10);
+        assert!(!cache.checkpoint_capture_needs_full_refresh(&key, 11));
+        assert!(cache.checkpoint_capture_needs_full_refresh(&key, 12));
+
+        cache.mark_checkpoint_capture_populated(&key, 12);
+        cache.invalidate_checkpoint_capture_contents();
+        assert!(cache.checkpoint_capture_needs_full_refresh(&key, 13));
+    }
+
+    #[test]
+    fn checkpoint_compatibility_changes_release_cached_contents() {
+        let base = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 4,
+        };
+        let variants = [
+            CheckpointCacheCompatibility {
+                output_size: (2560, 1440),
+                ..base
+            },
+            CheckpointCacheCompatibility {
+                framebuffer_origin_top_left: true,
+                ..base
+            },
+            CheckpointCacheCompatibility {
+                effect_registry_generation: 5,
+                ..base
+            },
+        ];
+        for changed in variants {
+            let key = sample_checkpoint_key();
+            let mut cache = resource_cache_with_checkpoint(key, Some(9));
+            cache.checkpoint_compatibility = Some(base);
+            assert!(cache.update_checkpoint_compatibility(changed));
+            assert!(cache.checkpoint_captures.is_empty());
+            assert_eq!(cache.pool.checked_out_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn removed_checkpoint_lease_returns_to_pool_once_and_can_be_reused() {
+        let cache_key = sample_checkpoint_key();
+        let mut cache = resource_cache_with_checkpoint(cache_key.clone(), Some(2));
+        let texture_id = cache.checkpoint_captures[&cache_key].texture.id;
+
+        cache.retain_checkpoint_captures(std::iter::empty());
+        assert!(cache.checkpoint_captures.is_empty());
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+        cache.clear_checkpoint_capture_cache();
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+
+        let reused = cache.pool.checkout(key(8, 8)).unwrap();
+        assert_eq!(reused.id, texture_id);
+        cache.pool.return_texture(reused.clone()).unwrap();
+        assert_eq!(
+            cache.pool.return_texture(reused),
+            Err(EffectResourceError::TextureAlreadyReturned(texture_id))
+        );
+    }
+
+    #[test]
+    fn renderer_destroy_releases_persistent_checkpoint_leases() {
+        let cache_key = sample_checkpoint_key();
+        let mut cache = resource_cache_with_checkpoint(cache_key, Some(1));
+        assert_eq!(cache.pool.checked_out_bytes(), 8 * 8 * 4);
+
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        cache.destroy(&gl);
+
+        assert!(cache.checkpoint_captures.is_empty());
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+        assert_eq!(cache.pool.current_bytes(), 0);
+    }
+
+    #[test]
+    fn frame_local_release_keeps_a_cache_owned_texture_checked_out() {
+        let cache_key = sample_checkpoint_key();
+        let mut cache = resource_cache_with_checkpoint(cache_key.clone(), Some(1));
+        let persistent = cache.checkpoint_captures[&cache_key].texture.clone();
+        let texture_id = persistent.id;
+        let graph_texture = GraphTextureId::new(7).unwrap();
+        let borrowed = HashMap::from([(
+            graph_texture,
+            GraphTextureBinding::checkpoint_cache(persistent),
+        )]);
+
+        cache.release_graph(borrowed).unwrap();
+        assert!(cache.pool.is_checked_out(texture_id));
+        assert_eq!(cache.pool.checked_out_bytes(), 8 * 8 * 4);
+        cache.clear_checkpoint_capture_cache();
+        assert!(!cache.pool.is_checked_out(texture_id));
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+    }
+
+    #[test]
+    fn checkpoint_budget_pressure_evicts_cache_and_leaves_room_for_graph_work() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let pass = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .unwrap();
+        let cache_key = checkpoint_capture_cache_key(&graph, pass).unwrap();
+        let plan = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == pass.output.unwrap())
+            .unwrap()
+            .clone();
+        let graph_peak = estimate_graph_peak_bytes(&graph).unwrap();
+        let checkpoint_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let budget = graph_peak
+            .saturating_add(checkpoint_bytes)
+            .saturating_sub(1);
+        assert!(budget >= checkpoint_bytes);
+
+        let mut cache = EffectGlResourceCache::with_budget(budget).unwrap();
+        let lease = cache.pool.checkout(texture_key(&plan)).unwrap();
+        cache.checkpoint_captures.insert(
+            cache_key.clone(),
+            CachedCheckpointCapture {
+                texture: lease.clone(),
+                last_populated_frame_serial: Some(1),
+            },
+        );
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        cache.checkpoint_compatibility = Some(compatibility);
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let bindings = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak),
+            &[(cache_key, plan.clone())],
+        );
+
+        assert!(
+            bindings.is_empty(),
+            "cache lease must be bypassed under pressure"
+        );
+        assert!(cache.checkpoint_captures.is_empty());
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+        assert!(cache.pool.budget_bytes() >= graph_peak);
+        let transient = cache.pool.checkout(texture_key(&plan)).unwrap();
+        assert_eq!(
+            transient.id, lease.id,
+            "the released cache lease is reusable"
+        );
+        cache.pool.return_texture(transient).unwrap();
     }
 
     #[test]

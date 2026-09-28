@@ -381,6 +381,7 @@ fn graph_for_effect_region(
         passes: Vec::new(),
         textures: Vec::new(),
         instances: vec![oblivion_one::effects::CompiledEffectInstance {
+            semantic_signature: 0,
             id: oblivion_one::effects::EffectInstanceId::new(id).unwrap(),
             capture_region: output_influence_region.clone(),
             output_influence_region,
@@ -441,6 +442,7 @@ fn graph_with_instance_regions(
         .map(
             |(id, output_influence_region, capture_region, dependencies)| {
                 oblivion_one::effects::CompiledEffectInstance {
+                    semantic_signature: 0,
                     id: oblivion_one::effects::EffectInstanceId::new(id).unwrap(),
                     output_influence_region,
                     capture_region,
