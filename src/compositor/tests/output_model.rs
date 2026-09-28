@@ -32,9 +32,11 @@ struct ReferenceSurface {
 #[derive(Debug)]
 struct ReferenceOutputModel {
     surfaces: HashMap<u32, ReferenceSurface>,
-    outputs: HashSet<u32>,
+    logical_outputs: HashSet<u32>,
+    bindings: HashMap<u32, u32>,
     next_surface: u32,
-    next_output: u32,
+    next_binding: u32,
+    output_client_connected: bool,
     scale: i32,
     transform: wl_output::Transform,
     enter_events_total: u64,
@@ -47,9 +49,11 @@ impl Default for ReferenceOutputModel {
     fn default() -> Self {
         Self {
             surfaces: HashMap::new(),
-            outputs: HashSet::new(),
+            logical_outputs: HashSet::from([0]),
+            bindings: HashMap::new(),
             next_surface: 0,
-            next_output: 0,
+            next_binding: 0,
+            output_client_connected: true,
             scale: 1,
             transform: wl_output::Transform::Normal,
             enter_events_total: 0,
@@ -97,9 +101,12 @@ impl ReferenceOutputModel {
     }
 
     fn reconcile(&mut self, surface_id: u32) {
-        let overlaps = self.overlaps_output(surface_id);
-        let outputs = if overlaps {
-            self.outputs.clone()
+        let overlaps = self.overlaps_output(surface_id) && self.logical_outputs.contains(&0);
+        let output_bindings = if overlaps {
+            self.bindings
+                .iter()
+                .filter_map(|(binding_id, output_id)| (*output_id == 0).then_some(*binding_id))
+                .collect()
         } else {
             HashSet::new()
         };
@@ -111,7 +118,7 @@ impl ReferenceOutputModel {
             .surfaces
             .get_mut(&surface_id)
             .expect("reference surface");
-        let old_entered = std::mem::replace(&mut surface.entered, outputs);
+        let old_entered = std::mem::replace(&mut surface.entered, output_bindings);
         surface.enter_events += surface.entered.difference(&old_entered).count() as u64;
         surface.leave_events += old_entered.difference(&surface.entered).count() as u64;
         surface.physical = overlaps;
@@ -200,6 +207,56 @@ impl ReferenceOutputModel {
             self.unmap_subtree(child);
         }
     }
+
+    fn bind_output(&mut self) -> Option<u32> {
+        if !self.output_client_connected || !self.logical_outputs.contains(&0) {
+            return None;
+        }
+        let binding_id = self.next_binding;
+        self.next_binding += 1;
+        self.bindings.insert(binding_id, 0);
+        self.reconcile_all();
+        Some(binding_id)
+    }
+
+    fn release_binding(&mut self, binding_id: u32) {
+        if self.bindings.remove(&binding_id).is_none() {
+            return;
+        }
+        for surface in self.surfaces.values_mut() {
+            surface.entered.remove(&binding_id);
+        }
+    }
+
+    fn withdraw_logical_output(&mut self, output_id: u32) {
+        if !self.logical_outputs.remove(&output_id) {
+            return;
+        }
+        self.bindings
+            .retain(|_, bound_output| *bound_output != output_id);
+        self.reconcile_all();
+    }
+
+    fn disconnect_client(&mut self) {
+        self.output_client_connected = false;
+        self.bindings.clear();
+        for surface in self.surfaces.values_mut() {
+            surface.entered.clear();
+        }
+    }
+
+    fn check_invariants(&self) -> bool {
+        self.bindings
+            .values()
+            .all(|output_id| self.logical_outputs.contains(output_id))
+            && self.surfaces.values().all(|surface| {
+                surface
+                    .entered
+                    .iter()
+                    .all(|binding_id| self.bindings.contains_key(binding_id))
+                    && (!surface.physical || self.logical_outputs.contains(&0))
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +277,8 @@ struct ProductionOutputModel {
     state: CompositorState,
     client: ProductionOutputClient,
     surfaces: HashMap<u32, wl_surface::WlSurface>,
-    outputs: HashMap<u32, wl_output::WlOutput>,
+    bindings: HashMap<u32, wl_output::WlOutput>,
+    client_disconnected: bool,
     expected_enter_events: u64,
     expected_leave_events: u64,
     expected_scale_events: u64,
@@ -244,7 +302,8 @@ impl ProductionOutputModel {
             state,
             client: ProductionOutputClient { client, peer },
             surfaces: HashMap::new(),
-            outputs: HashMap::new(),
+            bindings: HashMap::new(),
+            client_disconnected: false,
             expected_enter_events: 0,
             expected_leave_events: 0,
             expected_scale_events: 0,
@@ -319,6 +378,14 @@ impl ProductionOutputModel {
     }
 
     fn bind_output(&mut self, id: u32) {
+        if self.client_disconnected
+            || !self
+                .state
+                .native_output_id()
+                .is_some_and(|id| self.state.logical_output_ids.contains(&id))
+        {
+            return;
+        }
         let output = self
             .client
             .client
@@ -329,13 +396,28 @@ impl ProductionOutputModel {
             )
             .expect("output resource");
         self.state.register_output_resource(output.clone());
-        self.outputs.insert(id, output);
+        self.bindings.insert(id, output);
     }
 
     fn release_output(&mut self, id: u32) {
-        if let Some(output) = self.outputs.remove(&id) {
-            self.state.unregister_output_resource(&output);
+        if let Some(output) = self.bindings.remove(&id) {
+            self.state
+                .forget_output_binding(&output, "model_binding_release");
         }
+    }
+
+    fn withdraw_output(&mut self) {
+        if let Some(output_id) = self.state.native_output_id() {
+            self.state.withdraw_output(output_id);
+        }
+        self.bindings.clear();
+    }
+
+    fn disconnect_client(&mut self) {
+        let client_id = self.client.client.id();
+        self.state.forget_output_bindings_for_client(&client_id);
+        self.bindings.clear();
+        self.client_disconnected = true;
     }
 
     fn snapshot(&self, id: u32) -> Option<ProductionSurfaceSnapshot> {
@@ -350,8 +432,8 @@ impl ProductionOutputModel {
             .entered_resources
             .iter()
             .filter_map(|resource_id| {
-                self.outputs.iter().find_map(|(logical_id, output)| {
-                    (output.id().protocol_id() == *resource_id).then_some(*logical_id)
+                self.bindings.iter().find_map(|(logical_id, output)| {
+                    (output.id() == *resource_id).then_some(*logical_id)
                 })
             })
             .collect();
@@ -402,6 +484,7 @@ impl ProductionOutputModel {
             "{context} preferred transform events"
         );
         assert!(self.state.check_surface_output_membership_invariants());
+        assert!(self.state.check_output_binding_invariants());
     }
 }
 
@@ -463,6 +546,68 @@ fn output_model_comparison_rejects_intentional_divergence() {
 }
 
 #[test]
+fn reference_model_separates_binding_release_output_withdrawal_and_disconnect() {
+    let mut reference = ReferenceOutputModel::default();
+    let surface_id = reference.create_surface(0);
+    let surface = reference.surfaces.get_mut(&surface_id).unwrap();
+    surface.x = 0;
+    surface.y = 0;
+    surface.width = 20;
+    surface.height = 20;
+    surface.published = true;
+    surface.mapped = true;
+    reference.reconcile(surface_id);
+
+    let first_binding = reference.bind_output().unwrap();
+    let surface = &reference.surfaces[&surface_id];
+    assert!(surface.physical);
+    assert_eq!(surface.entered, HashSet::from([first_binding]));
+
+    reference.release_binding(first_binding);
+    let surface = &reference.surfaces[&surface_id];
+    assert!(surface.physical);
+    assert!(surface.entered.is_empty());
+    assert_eq!(surface.leave_events, 0);
+    assert!(reference.logical_outputs.contains(&0));
+
+    let second_binding = reference.bind_output().unwrap();
+    assert_ne!(first_binding, second_binding);
+    assert_eq!(
+        reference.surfaces[&surface_id].entered,
+        HashSet::from([second_binding])
+    );
+    reference.withdraw_logical_output(0);
+    let surface = &reference.surfaces[&surface_id];
+    assert!(!surface.physical);
+    assert!(surface.entered.is_empty());
+    assert_eq!(surface.leave_events, 1);
+    assert!(reference.bindings.is_empty());
+    assert!(reference.logical_outputs.is_empty());
+    assert!(reference.check_invariants());
+
+    let mut disconnected = ReferenceOutputModel::default();
+    let surface_id = disconnected.create_surface(0);
+    let surface = disconnected.surfaces.get_mut(&surface_id).unwrap();
+    surface.x = 0;
+    surface.y = 0;
+    surface.width = 20;
+    surface.height = 20;
+    surface.published = true;
+    disconnected.reconcile(surface_id);
+    let binding = disconnected.bind_output().unwrap();
+    disconnected.disconnect_client();
+    let surface = &disconnected.surfaces[&surface_id];
+    assert!(surface.physical);
+    assert!(surface.entered.is_empty());
+    assert_eq!(surface.leave_events, 0);
+    assert!(disconnected.logical_outputs.contains(&0));
+    assert!(disconnected.bindings.is_empty());
+    assert!(disconnected.check_invariants());
+    assert!(disconnected.bind_output().is_none());
+    assert!(binding < disconnected.next_binding);
+}
+
+#[test]
 fn output_production_model_runs_10_000_operations() {
     const SEED: u64 = 0x4f55_5450_5554_3130;
     let mut random = SEED;
@@ -477,7 +622,7 @@ fn output_production_model_runs_10_000_operations() {
         random = random
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1);
-        let choice = (random >> 32) % 12;
+        let choice = (random >> 32) % 14;
         let surface_id = if reference.surfaces.is_empty() {
             None
         } else {
@@ -534,15 +679,14 @@ fn output_production_model_runs_10_000_operations() {
                 }
             }
             6 => {
-                let id = reference.next_output;
-                reference.next_output += 1;
-                reference.outputs.insert(id);
-                production.bind_output(id);
+                if let Some(binding_id) = reference.bind_output() {
+                    production.bind_output(binding_id);
+                }
             }
             7 => {
-                if let Some(id) = reference.outputs.iter().copied().min() {
-                    production.release_output(id);
-                    reference.outputs.remove(&id);
+                if let Some(binding_id) = reference.bindings.keys().copied().min() {
+                    production.release_output(binding_id);
+                    reference.release_binding(binding_id);
                 }
             }
             8 => {
@@ -581,7 +725,7 @@ fn output_production_model_runs_10_000_operations() {
                     production.move_or_resize_surface(child, &reference, false);
                 }
             }
-            _ => {
+            11 => {
                 if let Some(id) = surface_id {
                     reference
                         .surfaces
@@ -591,9 +735,18 @@ fn output_production_model_runs_10_000_operations() {
                     production.move_or_resize_surface(id, &reference, false);
                 }
             }
+            12 => {
+                reference.withdraw_logical_output(0);
+                production.withdraw_output();
+            }
+            _ => {
+                reference.disconnect_client();
+                production.disconnect_client();
+            }
         }
 
         reference.reconcile_all();
+        assert!(reference.check_invariants());
         production.expected_enter_events = reference.enter_events_total
             + reference
                 .surfaces
@@ -628,8 +781,9 @@ fn output_production_model_runs_10_000_operations() {
     for id in reference.surfaces.keys().copied().collect::<Vec<_>>() {
         production.destroy_surface(id);
     }
-    for id in reference.outputs.iter().copied().collect::<Vec<_>>() {
+    for id in reference.bindings.keys().copied().collect::<Vec<_>>() {
         production.release_output(id);
+        reference.release_binding(id);
     }
     assert!(production.state.surface_output_memberships.is_empty());
     assert!(

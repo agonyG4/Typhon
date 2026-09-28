@@ -232,11 +232,13 @@ impl NativeRuntime {
             self.reap_supervised_children(&cycle)?;
         }
         self.sync_xwayland_selection_metadata()?;
+        self.sync_xwayland_dnd()?;
         if work_domains.xwayland {
             let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             let xwm_drain_started = Instant::now();
             self.dispatch_xwayland_events(&cycle.wakeup)?;
             self.sync_xwayland_selection_metadata()?;
+            self.sync_xwayland_dnd()?;
             self.service_xwayland_proxy_selection_data_requests()?;
             self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
             if self.xwayland.generation().is_some() {
@@ -269,6 +271,7 @@ impl NativeRuntime {
             self.xwayland
                 .handle_deadline(monotonic_now_ns()?, &mut self.process_supervisor)?;
             self.sync_xwayland_selection_metadata()?;
+            self.sync_xwayland_dnd()?;
             if self.xwayland.generation().is_none() {
                 self.revoke_xwayland_private_client();
             }
@@ -283,6 +286,7 @@ impl NativeRuntime {
         }
         self.advance_shutdown_lifecycle(&cycle)?;
         self.sync_xwayland_selection_metadata()?;
+        self.sync_xwayland_dnd()?;
         if !self.session.permits_output() {
             if work_domains.wayland_dispatch
                 || work_domains.astrea_publication
@@ -341,6 +345,7 @@ impl NativeRuntime {
                 NativeWaylandInputDispatchOutcome::default()
             };
         self.sync_xwayland_selection_metadata()?;
+        self.sync_xwayland_dnd()?;
         self.submit_xwayland_selection_data_requests()?;
         if let Some(vt) = dispatch_outcome.vt_switch_requested {
             self.request_native_vt_switch(vt)?;
@@ -1210,7 +1215,7 @@ impl NativeRuntime {
         }
         if !self
             .server
-            .astrea_screen_capture_output_is_current(&pending.output)
+            .astrea_screen_capture_output_is_current(pending.output_id)
         {
             pending.capture.failed("output_gone".to_owned());
             return Ok(());

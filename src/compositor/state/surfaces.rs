@@ -955,6 +955,9 @@ impl CompositorState {
             ..Self::default()
         };
         state.native_output_id = state.output_id_allocator.allocate().ok();
+        if let Some(output_id) = state.native_output_id {
+            state.logical_output_ids.insert(output_id);
+        }
         // PresentationAnimator has its own compatibility defaults for older
         // callers. The compositor-owned control plane is authoritative for
         // the real runtime configuration, including persisted disablement.
@@ -973,6 +976,9 @@ impl CompositorState {
     pub(in crate::compositor) fn ensure_native_output_id(&mut self) -> Option<OutputId> {
         if self.native_output_id.is_none() {
             self.native_output_id = self.output_id_allocator.allocate().ok();
+            if let Some(output_id) = self.native_output_id {
+                self.logical_output_ids.insert(output_id);
+            }
         }
         self.native_output_id
     }

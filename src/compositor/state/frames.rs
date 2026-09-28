@@ -276,12 +276,11 @@ impl CompositorState {
                 pending.feedback.discarded();
                 continue;
             }
-            for output in self
-                .output_resources
-                .iter()
-                .filter(|output| resource_belongs_to_surface_client(*output, &pending.surface))
-            {
-                pending.feedback.sync_output(output);
+            for output in self.output_resources.iter().filter(|binding| {
+                binding.resource.is_alive()
+                    && resource_belongs_to_surface_client(&binding.resource, &pending.surface)
+            }) {
+                pending.feedback.sync_output(&output.resource);
             }
             pending.feedback.presented(
                 tv_sec_hi,

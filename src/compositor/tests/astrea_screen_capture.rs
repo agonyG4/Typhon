@@ -94,6 +94,19 @@ fn pending_capture_state(commands: &Sender<ServerCommand>) -> bool {
         .expect("server should return pending capture state")
 }
 
+fn capture_pending_output(commands: &Sender<ServerCommand>) -> Option<(OutputId, bool)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePendingAstreaScreenCaptureOutput(
+            reply,
+        ))
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report the logical output held by a pending capture")
+}
+
 #[test]
 fn screen_capture_requires_exact_authenticated_client_and_accepts_current_output() {
     let socket_name = unique_socket_name();
@@ -226,9 +239,7 @@ fn screen_capture_rejects_removed_output_and_reports_output_gone() {
     queue.roundtrip(&mut state).unwrap();
     assert!(pending_capture_state(&commands));
 
-    commands
-        .send(ServerCommand::UnregisterOutputResources)
-        .unwrap();
+    commands.send(ServerCommand::WithdrawLogicalOutput).unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(state.failed, vec![String::from("output_gone")]);
@@ -252,6 +263,70 @@ fn screen_capture_rejects_removed_output_and_reports_output_gone() {
     drop(queue);
     drop(globals);
     drop(qh);
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn screen_capture_survives_release_of_the_request_output_binding() {
+    let socket_name = unique_socket_name();
+    let capability_path =
+        crate::compositor::astrea_shell_capability::test_capability_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let capability = std::fs::read_to_string(&capability_path).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ScreenCaptureTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let auth = globals
+        .bind::<client_astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1, _, _>(&qh, 1..=1, ())
+        .unwrap();
+    let manager = globals
+        .bind::<client_astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, _, _>(
+            &qh,
+            1..=1,
+            (),
+        )
+        .unwrap();
+    let output = globals
+        .bind::<client_wl_output::WlOutput, _, _>(&qh, 1..=4, ())
+        .unwrap();
+    let mut state = ScreenCaptureTestState::default();
+    auth.authenticate(capability.trim().to_string());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.authenticated);
+
+    let pending = manager.capture_output(&output, &qh, ());
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let (logical_output_id, current_before_release) = capture_pending_output(&commands)
+        .expect("capture admission should resolve the output binding");
+    assert!(current_before_release);
+
+    output.release();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(connection.roundtrip().is_ok());
+    assert!(state.failed.is_empty());
+    assert_eq!(
+        capture_pending_output(&commands),
+        Some((logical_output_id, true)),
+        "binding release must not invalidate the logical output held by the capture"
+    );
+
+    commands.send(ServerCommand::WithdrawLogicalOutput).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.failed, vec![String::from("output_gone")]);
+    assert!(!pending_capture_state(&commands));
+    pending.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+
+    drop((connection, queue, globals, qh));
     let _ = stop_controllable_test_server(commands, server_thread);
 }
 

@@ -334,15 +334,7 @@ impl CompositorState {
         if self.relative_pointer_resources.len() != before_relative_resources {
             self.advance_relative_pointer_resources_generation();
         }
-        let outputs = self
-            .output_resources
-            .iter()
-            .filter(|output| resource_owned_by_client(*output, client_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        for output in outputs {
-            self.unregister_output_resource(&output);
-        }
+        self.forget_output_bindings_for_client(client_id);
         self.data_devices
             .retain(|device| device.client_id != *client_id);
         self.data_offers.retain(|_, offer| {
@@ -464,7 +456,7 @@ impl CompositorState {
         leaks += self
             .output_resources
             .iter()
-            .filter(|resource| resource_owned_by_client(*resource, client_id))
+            .filter(|binding| binding.client_id == *client_id)
             .count();
         leaks += self
             .pointer_resources

@@ -126,7 +126,7 @@ impl WorkspaceProtocolState {
         client: &Client,
         manager: ext_workspace_manager_v1::ExtWorkspaceManagerV1,
         snapshot: WorkspaceProtocolSnapshot,
-        outputs: &[wl_output::WlOutput],
+        outputs: &[OutputBinding],
     ) {
         let manager_id = manager.id();
         let client_id = client.id();
@@ -220,12 +220,11 @@ impl WorkspaceProtocolState {
             resource: group,
             entered_outputs: HashSet::new(),
         };
-        for output in outputs.iter().filter(|output| {
-            output
-                .client()
-                .is_some_and(|output_client| output_client.id() == client_id)
-        }) {
-            Self::send_output_enter(&mut group_binding, output);
+        for output in outputs
+            .iter()
+            .filter(|output| output.client_id == client_id)
+        {
+            Self::send_output_enter(&mut group_binding, output, "manager_initialization");
         }
 
         let _ = manager.send_event(ext_workspace_manager_v1::Event::Done);
@@ -311,48 +310,112 @@ impl WorkspaceProtocolState {
         }
     }
 
-    pub(crate) fn output_enter(&mut self, output: &wl_output::WlOutput) {
-        let Some(output_client) = output.client() else {
-            return;
-        };
+    pub(crate) fn output_enter(&mut self, output: &OutputBinding) {
         for binding in self.managers.values_mut() {
-            if binding.client_id == output_client.id() {
-                Self::send_output_enter(&mut binding.group, output);
+            if binding.client_id == output.client_id {
+                Self::send_output_enter(&mut binding.group, output, "binding_registered");
             }
         }
     }
 
-    pub(crate) fn output_leave(&mut self, output: &wl_output::WlOutput) {
-        let Some(output_client) = output.client() else {
-            return;
-        };
-        let output_id = output.id();
+    #[allow(dead_code)]
+    pub(crate) fn output_leave(&mut self, output: &OutputBinding) {
+        let output_object_id = output.resource.id();
         for binding in self.managers.values_mut() {
-            if binding.client_id != output_client.id() {
+            if binding.client_id != output.client_id {
                 continue;
             }
-            if binding.group.entered_outputs.remove(&output_id) {
-                let _ = binding.group.resource.send_event(
-                    ext_workspace_group_handle_v1::Event::OutputLeave {
-                        output: output.clone(),
-                    },
-                );
+            if !binding.group.entered_outputs.remove(&output_object_id) {
+                continue;
             }
+            let group_alive = binding.group.resource.is_alive();
+            let output_alive = output.resource.is_alive();
+            let current = output_alive;
+            let result = if group_alive && output_alive {
+                Some(binding.group.resource.send_event(
+                    ext_workspace_group_handle_v1::Event::OutputLeave {
+                        output: output.resource.clone(),
+                    },
+                ))
+            } else {
+                None
+            };
+            let (outcome, error) = match result {
+                Some(Ok(())) => ("queued", None),
+                Some(Err(error)) => ("rejected", Some(format!("{error:?}"))),
+                None => (
+                    "not_attempted",
+                    Some("group_or_output_not_alive".to_string()),
+                ),
+            };
+            output_lifecycle_trace(
+                "workspace.output_leave",
+                "logical_output_withdrawal",
+                None,
+                output,
+                group_alive && output_alive,
+                None,
+                current,
+                outcome,
+                error.as_deref(),
+            );
         }
     }
 
-    fn send_output_enter(group: &mut WorkspaceGroupBinding, output: &wl_output::WlOutput) {
-        if !group.resource.is_alive()
-            || !output.is_alive()
-            || !group.entered_outputs.insert(output.id())
-        {
+    pub(crate) fn forget_output_binding(&mut self, object_id: &ObjectId) {
+        for binding in self.managers.values_mut() {
+            binding.group.entered_outputs.remove(object_id);
+        }
+    }
+
+    fn send_output_enter(
+        group: &mut WorkspaceGroupBinding,
+        output: &OutputBinding,
+        transition: &str,
+    ) {
+        let output_object_id = output.resource.id();
+        if group.entered_outputs.contains(&output_object_id) {
             return;
         }
-        let _ = group
+        let group_alive = group.resource.is_alive();
+        let output_alive = output.resource.is_alive();
+        if !group_alive || !output_alive {
+            output_lifecycle_trace(
+                "workspace.output_enter",
+                transition,
+                None,
+                output,
+                output_alive,
+                None,
+                false,
+                "not_attempted",
+                Some("group_or_output_not_alive"),
+            );
+            return;
+        }
+        let result = group
             .resource
             .send_event(ext_workspace_group_handle_v1::Event::OutputEnter {
-                output: output.clone(),
+                output: output.resource.clone(),
             });
+        let (outcome, error) = match result {
+            Ok(()) => {
+                group.entered_outputs.insert(output_object_id);
+                ("queued", None)
+            }
+            Err(error) => ("rejected", Some(format!("{error:?}"))),
+        };
+        output_lifecycle_trace(
+            "workspace.output_enter",
+            transition,
+            None,
+            output,
+            group_alive && output_alive,
+            None,
+            output_alive,
+            outcome,
+            error.as_deref(),
+        );
     }
 
     pub(crate) fn stop_manager(&mut self, manager_id: &ObjectId, client_id: &ClientId) {
@@ -471,17 +534,12 @@ impl CompositorState {
         self.workspace_presence_dirty = false;
     }
 
-    pub(in crate::compositor) fn publish_workspace_output_enter(
-        &mut self,
-        output: &wl_output::WlOutput,
-    ) {
+    pub(in crate::compositor) fn publish_workspace_output_enter(&mut self, output: &OutputBinding) {
         self.workspace_protocol.output_enter(output);
     }
 
-    pub(in crate::compositor) fn publish_workspace_output_leave(
-        &mut self,
-        output: &wl_output::WlOutput,
-    ) {
+    #[allow(dead_code)]
+    pub(in crate::compositor) fn publish_workspace_output_leave(&mut self, output: &OutputBinding) {
         self.workspace_protocol.output_leave(output);
     }
 

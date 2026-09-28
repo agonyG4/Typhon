@@ -1,6 +1,7 @@
 use super::*;
 
 mod output_keyboard_cursor;
+mod output_lifetime;
 mod pointer_constraint_transaction;
 mod pointer_constraint_workspace;
 mod pointer_cursor;

@@ -687,6 +687,7 @@ pub(in crate::compositor) struct SurfaceTeardownResult {
 pub struct CompositorState {
     native_output_id: Option<OutputId>,
     output_id_allocator: OutputIdAllocator,
+    logical_output_ids: HashSet<OutputId>,
     pub accepted_clients: usize,
     pub xdg_toplevels: usize,
     pub xdg_popups: usize,
@@ -748,7 +749,7 @@ pub struct CompositorState {
     commit_timing_planning_generation: u64,
     commit_timing_planning_signature: u64,
     surface_pacing_metrics: SurfacePacingMetrics,
-    output_resources: Vec<wl_output::WlOutput>,
+    output_resources: Vec<OutputBinding>,
     workspace_protocol: WorkspaceProtocolState,
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,

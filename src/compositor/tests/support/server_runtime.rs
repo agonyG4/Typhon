@@ -17,6 +17,17 @@ pub(in crate::compositor::tests) struct SubsurfaceStackStateSnapshot {
     pub(in crate::compositor::tests) pending: Option<Vec<u32>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct OutputLifecycleSnapshot {
+    pub(in crate::compositor::tests) output_binding_ids: Vec<ObjectId>,
+    pub(in crate::compositor::tests) logical_output_ids: HashSet<OutputId>,
+    pub(in crate::compositor::tests) physical_output_ids: HashSet<OutputId>,
+    pub(in crate::compositor::tests) entered_binding_count: usize,
+    pub(in crate::compositor::tests) surface_enter_events: u64,
+    pub(in crate::compositor::tests) surface_leave_events: u64,
+    pub(in crate::compositor::tests) membership_invariants_valid: bool,
+}
+
 #[derive(Debug)]
 pub(in crate::compositor::tests) struct DelayedParentSubsurfaceStackSnapshots {
     pub(in crate::compositor::tests) after_first_parent_commit: SubsurfaceStackStateSnapshot,
@@ -153,7 +164,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     SetOutputPreferredTransform(u32),
     CapturePendingAstreaScreenCapture(Sender<bool>),
-    UnregisterOutputResources,
+    CapturePendingAstreaScreenCaptureOutput(Sender<Option<(OutputId, bool)>>),
+    WithdrawLogicalOutput,
+    CaptureOutputLifecycle {
+        surface_id: u32,
+        reply: Sender<OutputLifecycleSnapshot>,
+    },
     MinimizeFocused,
     RestoreNextMinimized,
     FocusRootWindow(u32),
@@ -644,11 +660,66 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CapturePendingAstreaScreenCapture(reply) => {
                         let _ = reply.send(server.has_pending_astrea_screen_capture());
                     }
-                    ServerCommand::UnregisterOutputResources => {
-                        let outputs = server.state.output_resources.clone();
-                        for output in outputs {
-                            server.state.unregister_output_resource(&output);
+                    ServerCommand::CapturePendingAstreaScreenCaptureOutput(reply) => {
+                        let output =
+                            server
+                                .state
+                                .astrea_screen_captures
+                                .values()
+                                .next()
+                                .map(|pending| {
+                                    (
+                                        pending.output_id,
+                                        server.astrea_screen_capture_output_is_current(
+                                            pending.output_id,
+                                        ),
+                                    )
+                                });
+                        let _ = reply.send(output);
+                    }
+                    ServerCommand::WithdrawLogicalOutput => {
+                        if let Some(output_id) = server.state.native_output_id() {
+                            server.state.withdraw_output(output_id);
                         }
+                    }
+                    ServerCommand::CaptureOutputLifecycle { surface_id, reply } => {
+                        let compositor_surface_id = server.state.surface_resources.iter().find_map(
+                            |(compositor_surface_id, surface)| {
+                                (surface.id().protocol_id() == surface_id)
+                                    .then_some(*compositor_surface_id)
+                            },
+                        );
+                        let membership = compositor_surface_id.and_then(|surface_id| {
+                            server.state.surface_output_memberships.get(&surface_id)
+                        });
+                        let snapshot = OutputLifecycleSnapshot {
+                            output_binding_ids: server
+                                .state
+                                .output_resources
+                                .iter()
+                                .map(|binding| binding.resource.id())
+                                .collect(),
+                            logical_output_ids: server.state.logical_output_ids.clone(),
+                            physical_output_ids: membership
+                                .map(|membership| membership.physical_outputs.clone())
+                                .unwrap_or_default(),
+                            entered_binding_count: membership
+                                .map(|membership| membership.entered_resources.len())
+                                .unwrap_or_default(),
+                            surface_enter_events: server
+                                .state
+                                .compliance_metrics
+                                .surface_enter_events,
+                            surface_leave_events: server
+                                .state
+                                .compliance_metrics
+                                .surface_leave_events,
+                            membership_invariants_valid: server
+                                .state
+                                .check_surface_output_membership_invariants()
+                                && server.state.check_output_binding_invariants(),
+                        };
+                        let _ = reply.send(snapshot);
                     }
                     ServerCommand::MinimizeFocused => {
                         server.minimize_focused_window();

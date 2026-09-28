@@ -8,13 +8,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct AstreaScreenCapturePending {
     pub capture: astrea_screen_capture_v1::AstreaScreenCaptureV1,
-    pub output: wl_output::WlOutput,
-}
-
-#[derive(Debug, Clone)]
-pub(in crate::compositor) struct AstreaScreenCaptureResourceData {
-    pub(in crate::compositor) _client_id: ClientId,
-    pub(in crate::compositor) _output_id: u32,
+    pub output_id: OutputId,
 }
 
 impl GlobalDispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()>
@@ -48,13 +42,7 @@ impl Dispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()
             astrea_screen_capture_manager_v1::Request::Destroy => {}
             astrea_screen_capture_manager_v1::Request::CaptureOutput { capture, output } => {
                 let client_id = client.id();
-                let capture = data_init.init(
-                    capture,
-                    AstreaScreenCaptureResourceData {
-                        _client_id: client_id.clone(),
-                        _output_id: output.id().protocol_id(),
-                    },
-                );
+                let capture = data_init.init(capture, ());
                 if !state.astrea_shell_mutation_allowed(client) {
                     state.post_protocol_error(
                         client,
@@ -64,7 +52,7 @@ impl Dispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()
                     );
                     return;
                 }
-                if !state.output_resource_is_current(&output) {
+                let Some(output_id) = state.output_id_for_binding(&output) else {
                     state.post_protocol_error(
                         client,
                         resource,
@@ -72,29 +60,27 @@ impl Dispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()
                         "capture output is not a current wl_output resource",
                     );
                     return;
-                }
+                };
                 if state.astrea_screen_captures.contains_key(&client_id) {
                     capture.failed("busy".to_string());
                     return;
                 }
                 state.astrea_screen_captures.insert(
                     client_id.clone(),
-                    AstreaScreenCapturePending { capture, output },
+                    AstreaScreenCapturePending { capture, output_id },
                 );
             }
         }
     }
 }
 
-impl Dispatch<astrea_screen_capture_v1::AstreaScreenCaptureV1, AstreaScreenCaptureResourceData>
-    for CompositorState
-{
+impl Dispatch<astrea_screen_capture_v1::AstreaScreenCaptureV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
         _client: &Client,
         resource: &astrea_screen_capture_v1::AstreaScreenCaptureV1,
         request: astrea_screen_capture_v1::Request,
-        _data: &AstreaScreenCaptureResourceData,
+        _data: &(),
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
@@ -107,22 +93,30 @@ impl Dispatch<astrea_screen_capture_v1::AstreaScreenCaptureV1, AstreaScreenCaptu
         state: &mut Self,
         _client_id: ClientId,
         resource: &astrea_screen_capture_v1::AstreaScreenCaptureV1,
-        _data: &AstreaScreenCaptureResourceData,
+        _data: &(),
     ) {
         state.remove_astrea_screen_capture(resource);
     }
 }
 
 impl CompositorState {
-    pub(in crate::compositor) fn output_resource_is_current(
+    pub(in crate::compositor) fn output_id_for_binding(
         &self,
         output: &wl_output::WlOutput,
-    ) -> bool {
-        self.output_resources.iter().any(|candidate| {
-            candidate.id().protocol_id() == output.id().protocol_id()
-                && candidate.id().same_client_as(&output.id())
-                && candidate.is_alive()
-        })
+    ) -> Option<OutputId> {
+        let object_id = output.id();
+        self.output_resources
+            .iter()
+            .find(|binding| {
+                binding.resource.id() == object_id
+                    && binding.resource.is_alive()
+                    && self.logical_output_ids.contains(&binding.output_id)
+            })
+            .map(|binding| binding.output_id)
+    }
+
+    pub(in crate::compositor) fn logical_output_is_current(&self, output_id: OutputId) -> bool {
+        self.logical_output_ids.contains(&output_id)
     }
 
     pub(in crate::compositor) fn has_pending_astrea_screen_capture(&self) -> bool {
@@ -153,9 +147,10 @@ impl CompositorState {
         self.astrea_screen_captures.remove(client_id);
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn fail_astrea_screen_captures_for_output(
         &mut self,
-        output: &wl_output::WlOutput,
+        output_id: OutputId,
         reason: &str,
     ) {
         // ClientId is the compositor's exact authenticated identity key; it is
@@ -164,9 +159,7 @@ impl CompositorState {
         let mut failed = HashMap::new();
         std::mem::swap(&mut failed, &mut self.astrea_screen_captures);
         for (client_id, pending) in failed {
-            if pending.output.id().protocol_id() == output.id().protocol_id()
-                && pending.output.id().same_client_as(&output.id())
-            {
+            if pending.output_id == output_id {
                 pending.capture.failed(reason.to_string());
             } else {
                 self.astrea_screen_captures.insert(client_id, pending);
@@ -184,7 +177,7 @@ impl OwnCompositorServer {
         self.state.take_pending_astrea_screen_capture()
     }
 
-    pub fn astrea_screen_capture_output_is_current(&self, output: &wl_output::WlOutput) -> bool {
-        self.state.output_resource_is_current(output)
+    pub fn astrea_screen_capture_output_is_current(&self, output_id: OutputId) -> bool {
+        self.state.logical_output_is_current(output_id)
     }
 }

@@ -32,6 +32,8 @@ struct WorkspaceWireState {
     workspaces: HashMap<ObjectId, WorkspaceWireRecord>,
     done_snapshots: Vec<BTreeMap<String, WorkspaceWireSnapshot>>,
     removed_count: usize,
+    output_enters: Vec<u32>,
+    output_leaves: Vec<u32>,
 }
 
 impl WorkspaceWireState {
@@ -134,13 +136,22 @@ impl Dispatch<client_ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1, (
     for WorkspaceWireState
 {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &client_ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
-        _event: client_ext_workspace_group_handle_v1::Event,
+        event: client_ext_workspace_group_handle_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        match event {
+            client_ext_workspace_group_handle_v1::Event::OutputEnter { output } => {
+                state.output_enters.push(output.id().protocol_id());
+            }
+            client_ext_workspace_group_handle_v1::Event::OutputLeave { output } => {
+                state.output_leaves.push(output.id().protocol_id());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -458,5 +469,47 @@ fn wire_regular_workspace_migration_is_atomic() {
     assert_eq!(state.removed_count, 0);
 
     app.unmap_surface(&surface).unwrap();
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn workspace_output_leave_is_sent_only_for_logical_output_withdrawal() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<WorkspaceWireState>(&connection).unwrap();
+    let qh = queue.handle();
+    let first_output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ()).unwrap();
+    let second_output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ()).unwrap();
+    let _manager: client_ext_workspace_manager_v1::ExtWorkspaceManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    connection.flush().unwrap();
+
+    let mut state = WorkspaceWireState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.output_enters,
+        vec![
+            first_output.id().protocol_id(),
+            second_output.id().protocol_id()
+        ]
+    );
+    assert!(state.output_leaves.is_empty());
+
+    first_output.release();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.output_leaves.is_empty());
+    assert!(connection.roundtrip().is_ok());
+
+    commands.send(ServerCommand::WithdrawLogicalOutput).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.output_leaves, vec![second_output.id().protocol_id()]);
+
+    drop((connection, queue, globals, qh, first_output, second_output));
     let _ = stop_controllable_test_server(commands, server_thread);
 }

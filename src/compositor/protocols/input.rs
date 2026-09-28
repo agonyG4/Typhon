@@ -10,9 +10,28 @@ impl Dispatch<wl_output::WlOutput, ()> for CompositorState {
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        if matches!(request, wl_output::Request::Release) {
-            state.unregister_output_resource(resource);
+        match request {
+            // Release destroys this binding; the `destroyed` hook silently
+            // forgets it without changing logical output or surface membership.
+            wl_output::Request::Release => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_output",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client_id: ClientId,
+        resource: &wl_output::WlOutput,
+        _data: &(),
+    ) {
+        state.forget_output_binding(resource, "resource_destroyed");
     }
 }
 
