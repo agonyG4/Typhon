@@ -15,7 +15,7 @@ fn test_key() -> DirectScanoutCandidateKey {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
-            std::num::NonZeroU64::new(42).expect("test buffer ID"),
+            std::num::NonZeroU64::new(1).expect("test buffer ID"),
             ContentEpochId::new(std::num::NonZeroU64::new(3).expect("test content epoch")),
             1920,
             1080,
@@ -132,6 +132,10 @@ fn direct_pageflip_info_preserves_the_accepted_window_projection() {
         42,
         None,
         accepted_rect,
+    );
+    assert_eq!(
+        lease.buffer_id().get(),
+        lease.key().content.buffer_id.get(),
     );
     let mut ownership = DirectPrimaryOwnership::default();
     let submitted = test_submitted(91, lease);

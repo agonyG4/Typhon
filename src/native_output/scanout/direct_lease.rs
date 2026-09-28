@@ -191,15 +191,19 @@ impl DirectPrimaryLease {
     ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
         let (framebuffer, buffer, cleanup_count) =
             super::test_direct_primary_framebuffer(framebuffer_id);
+        let imported_buffer_id = framebuffer.key.buffer_id();
+        assert_eq!(
+            imported_buffer_id.get(),
+            key.content.buffer_id.get(),
+            "direct test candidate key must describe the imported test buffer",
+        );
         (
             Self {
                 key,
                 validation_key: super::test_validation_key(key.output_generation),
                 surface_id: key.content.surface_id,
                 root_surface_id: key.content.surface_id,
-                buffer_id: oblivion_one::render_backend::buffer::BufferId::for_tests(
-                    key.content.buffer_id.get(),
-                ),
+                buffer_id: imported_buffer_id,
                 surface_scene_node_id: SceneNodeId::from_raw(u64::from(key.content.surface_id))
                     .expect("test surface scene node"),
                 window_scene_node_id: SceneNodeId::from_raw(u64::from(key.content.surface_id))

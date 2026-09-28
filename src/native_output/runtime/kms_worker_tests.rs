@@ -69,7 +69,7 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
-            std::num::NonZeroU64::new(42).expect("test buffer ID"),
+            std::num::NonZeroU64::new(1).expect("test buffer ID"),
             ContentEpochId::new(std::num::NonZeroU64::new(3).expect("test content epoch")),
             1920,
             1080,
