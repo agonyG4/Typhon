@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 
 use crate::astrea_effects::server::{astrea_effects_manager_v1, astrea_surface_effect_v1};
 use crate::effects::{
-    EffectParameterBlock, EffectParameterType, EffectProgramId, EffectUniformValue,
+    EffectParameterBlock, EffectProgramId, EffectUniformValue, validate_parameter_value,
 };
 use wayland_server::protocol::wl_surface;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
@@ -392,9 +392,7 @@ fn update_parameter(
         );
         return;
     };
-    if !parameter_matches(definition.spec.ty, value)
-        || !value_in_range(definition.spec.range, value)
-    {
+    if validate_parameter_value(&definition.spec, value).is_err() {
         post_surface_error(
             state,
             client,
@@ -439,80 +437,6 @@ fn parameter_block(
         .expect("validated protocol parameter block")
 }
 
-fn parameter_matches(ty: EffectParameterType, value: EffectUniformValue) -> bool {
-    matches!(
-        (ty, value),
-        (EffectParameterType::Float, EffectUniformValue::Float(_))
-            | (EffectParameterType::Vec2, EffectUniformValue::Vec2(_))
-            | (EffectParameterType::Vec3, EffectUniformValue::Vec3(_))
-            | (EffectParameterType::Vec4, EffectUniformValue::Vec4(_))
-            | (EffectParameterType::Int, EffectUniformValue::Int(_))
-    )
-}
-
-fn value_in_range(
-    range: Option<crate::effects::EffectParameterRange>,
-    value: EffectUniformValue,
-) -> bool {
-    match (range, value) {
-        (
-            Some(crate::effects::EffectParameterRange::Float { min, max }),
-            EffectUniformValue::Float(value),
-        ) => value >= min && value <= max,
-        (
-            Some(crate::effects::EffectParameterRange::Float { min, max }),
-            EffectUniformValue::Vec2(value),
-        ) => value.iter().all(|value| *value >= min && *value <= max),
-        (
-            Some(crate::effects::EffectParameterRange::Float { min, max }),
-            EffectUniformValue::Vec3(value),
-        ) => value.iter().all(|value| *value >= min && *value <= max),
-        (
-            Some(crate::effects::EffectParameterRange::Float { min, max }),
-            EffectUniformValue::Vec4(value),
-        ) => value.iter().all(|value| *value >= min && *value <= max),
-        (
-            Some(crate::effects::EffectParameterRange::FloatComponents {
-                min,
-                max,
-                components: 2,
-            }),
-            EffectUniformValue::Vec2(value),
-        ) => value
-            .iter()
-            .enumerate()
-            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
-        (
-            Some(crate::effects::EffectParameterRange::FloatComponents {
-                min,
-                max,
-                components: 3,
-            }),
-            EffectUniformValue::Vec3(value),
-        ) => value
-            .iter()
-            .enumerate()
-            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
-        (
-            Some(crate::effects::EffectParameterRange::FloatComponents {
-                min,
-                max,
-                components: 4,
-            }),
-            EffectUniformValue::Vec4(value),
-        ) => value
-            .iter()
-            .enumerate()
-            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
-        (
-            Some(crate::effects::EffectParameterRange::Int { min, max }),
-            EffectUniformValue::Int(value),
-        ) => value >= min && value <= max,
-        (None, _) => true,
-        _ => false,
-    }
-}
-
 fn fixed(value: i32) -> f32 {
     (f64::from(value) / FIXED_SCALE) as f32
 }
@@ -525,40 +449,4 @@ fn post_surface_error(
     message: &str,
 ) {
     state.post_protocol_error_deferred(client, resource, error, message);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn float_ranges_apply_component_wise_to_vectors() {
-        let range = Some(crate::effects::EffectParameterRange::Float { min: 0.0, max: 1.0 });
-        assert!(value_in_range(range, EffectUniformValue::Vec2([0.1, 0.9])));
-        assert!(!value_in_range(
-            range,
-            EffectUniformValue::Vec3([0.1, 1.1, 0.2])
-        ));
-        assert!(value_in_range(
-            range,
-            EffectUniformValue::Vec4([0.0, 0.25, 0.5, 1.0])
-        ));
-    }
-
-    #[test]
-    fn component_float_ranges_apply_per_vector_component() {
-        let range = Some(crate::effects::EffectParameterRange::FloatComponents {
-            min: [0.0, 0.2, 0.4, 0.0],
-            max: [0.1, 0.3, 0.6, 1.0],
-            components: 3,
-        });
-        assert!(value_in_range(
-            range,
-            EffectUniformValue::Vec3([0.05, 0.25, 0.5])
-        ));
-        assert!(!value_in_range(
-            range,
-            EffectUniformValue::Vec3([0.05, 0.35, 0.5])
-        ));
-    }
 }

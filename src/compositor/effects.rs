@@ -294,8 +294,8 @@ impl super::CompositorState {
             .effects
             .get(&material_selection.effective_program);
         let selected_effect_with_parameters = selected_effect.and_then(|effect| {
-            effect
-                .default_parameter_block()
+            self.material_program_parameter_control
+                .parameter_block_for_effect(effect)
                 .ok()
                 .map(|parameters| (effect, parameters))
         });

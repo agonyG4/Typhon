@@ -63,6 +63,86 @@ impl EffectUniformValue {
     }
 }
 
+/// Validate a value against the trusted declaration for one effect parameter.
+///
+/// This is the authoritative type, finiteness, and declared-range validator
+/// shared by the authenticated per-surface protocol and Material Program
+/// control.
+pub fn validate_parameter_value(
+    spec: &EffectParameterSpec,
+    value: EffectUniformValue,
+) -> Result<(), EffectValidationError> {
+    let type_matches = matches!(
+        (spec.ty, value),
+        (EffectParameterType::Float, EffectUniformValue::Float(_))
+            | (EffectParameterType::Vec2, EffectUniformValue::Vec2(_))
+            | (EffectParameterType::Vec3, EffectUniformValue::Vec3(_))
+            | (EffectParameterType::Vec4, EffectUniformValue::Vec4(_))
+            | (EffectParameterType::Int, EffectUniformValue::Int(_))
+    );
+    if !type_matches || !value.is_finite() {
+        return Err(EffectValidationError::InvalidParameterValue);
+    }
+
+    let within_range = match (spec.range, value) {
+        (None, _) => true,
+        (Some(EffectParameterRange::Float { min, max }), EffectUniformValue::Float(value)) => {
+            value >= min && value <= max
+        }
+        (Some(EffectParameterRange::Float { min, max }), EffectUniformValue::Vec2(values)) => {
+            values.iter().all(|value| *value >= min && *value <= max)
+        }
+        (Some(EffectParameterRange::Float { min, max }), EffectUniformValue::Vec3(values)) => {
+            values.iter().all(|value| *value >= min && *value <= max)
+        }
+        (Some(EffectParameterRange::Float { min, max }), EffectUniformValue::Vec4(values)) => {
+            values.iter().all(|value| *value >= min && *value <= max)
+        }
+        (
+            Some(EffectParameterRange::FloatComponents {
+                min,
+                max,
+                components: 2,
+            }),
+            EffectUniformValue::Vec2(values),
+        ) => values
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
+        (
+            Some(EffectParameterRange::FloatComponents {
+                min,
+                max,
+                components: 3,
+            }),
+            EffectUniformValue::Vec3(values),
+        ) => values
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
+        (
+            Some(EffectParameterRange::FloatComponents {
+                min,
+                max,
+                components: 4,
+            }),
+            EffectUniformValue::Vec4(values),
+        ) => values
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
+        (Some(EffectParameterRange::Int { min, max }), EffectUniformValue::Int(value)) => {
+            value >= min && value <= max
+        }
+        _ => false,
+    };
+    if within_range {
+        Ok(())
+    } else {
+        Err(EffectValidationError::InvalidParameterValue)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectParameterValue {
     pub id: EffectParameterId,

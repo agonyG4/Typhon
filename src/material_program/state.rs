@@ -5,8 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::effects::EffectRegistryGeneration;
 
 use super::{
-    MaterialProgramConfiguration, MaterialProgramConfigurationStore,
-    MaterialProgramPersistenceError, qualifies_registered_effect,
+    MaterialProgramCatalogSnapshot, MaterialProgramConfiguration,
+    MaterialProgramConfigurationStore, MaterialProgramPersistenceError,
+    qualifies_registered_effect,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -35,6 +36,29 @@ pub struct MaterialProgramSelectionSnapshot {
     pub rendering_available: bool,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub fallback_reason: Option<MaterialProgramFallbackReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MaterialProgramStateSnapshot {
+    pub catalog: MaterialProgramCatalogSnapshot,
+    pub selection: MaterialProgramSelectionSnapshot,
+}
+
+impl MaterialProgramStateSnapshot {
+    pub fn from_registry_generation(
+        registry_generation: &Arc<EffectRegistryGeneration>,
+        selection_state: &MaterialProgramControlState,
+        rendering_available: bool,
+    ) -> Self {
+        Self {
+            catalog: MaterialProgramCatalogSnapshot::from_registry_generation(
+                registry_generation,
+                rendering_available,
+            ),
+            selection: selection_state.snapshot(registry_generation, rendering_available),
+        }
+    }
 }
 
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

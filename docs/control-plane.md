@@ -167,6 +167,13 @@ The additive `astrea.control` v1 commands are:
 - `material.program.set` accepts a complete version-one object containing
   `version` and `requestedProgram`, and returns the authoritative selection
   snapshot.
+- `material.program.state.get` with `{}` returns the catalog and selection
+  captured from the same trusted registry generation.
+- `material.program.describe` accepts `{"name":"glass.liquid"}` and returns
+  the current qualified program's schema and typed parameter descriptors.
+- `material.program.parameters.set` accepts one complete version-one
+  per-program override configuration and returns the authoritative parameter
+  configuration snapshot.
 
 The catalog contains the valid `OnDamage`/`Backdrop` subset of the Trusted
 Effect Registry that has only `UniformOnly` parameters and no
@@ -190,8 +197,57 @@ identical set is a no-op.
 This selection is independent of `material.config.get` and
 `material.config.set`. Phase 2A `MaterialConfiguration` remains persisted in
 `material.json` and continues to update `system.background_blur` while a
-trusted-local program is selected. No material-program parameter-description
-or parameter-override command is implemented here.
+trusted-local program is selected.
+
+`material.program.describe` exposes one descriptor per parameter in stable
+name order. Values identify their own type (`float`, `vec2`, `vec3`, `vec4`, or
+`int`). A trusted range is reported when present; an unbounded parameter has a
+`null` range. Descriptions expose no renderer IDs, uniform locations, shader
+source, filesystem paths, or effect graphs. The built-in
+`system.background_blur` is describable and currently has no public parameters.
+
+Parameter overrides are submitted as a complete desired set:
+
+```json
+{
+  "version": 1,
+  "program": "glass.liquid",
+  "schemaSignature": 123456,
+  "overrides": {
+    "intensity": {"type": "float", "value": 0.72}
+  }
+}
+```
+
+Typhon validates names, types, finite values, ranges, and the current schema
+before saving. A changed non-empty configuration with an old schema signature
+is rejected. Parameter intent is stored separately at
+`$XDG_CONFIG_HOME/AstreaOS/typhon/material-program-parameters.json`, or under
+`$HOME/.config/AstreaOS/typhon/` when `XDG_CONFIG_HOME` is unset. The strict,
+bounded private document stores only program names, schema signatures, and
+named overrides. It does not store defaults, effective values, registry or
+parameter generations, renderer state, or internal effect IDs.
+
+Overrides remain stored if their program disappears or its schema changes.
+They apply only while the current program has the same schema signature and
+the complete override set still validates. A missing or changed schema uses
+trusted manifest defaults without deleting the saved intent; restoring the
+original schema makes the saved overrides effective again. Each accepted
+changed parameter configuration advances `parameterGeneration` once. An
+identical replay and a failed mutation do not advance it or request redraw.
+
+The generations describe separate changes. The selection snapshot's
+`generation` (`selectionGeneration`) tracks requested Material Program
+changes. `registryGeneration` tracks trusted effect registry and schema
+changes. `parameterGeneration` tracks accepted persistent parameter-override
+changes. None substitutes for another; registry reloads do not advance
+`parameterGeneration`, and parameter updates do not advance either selection
+or registry generation.
+
+The persistence domains remain separate: `material-program.json` stores the
+requested program, `material-program-parameters.json` stores per-program
+parameter intent, `effects.json` contains trusted effect definitions, and
+`material.json` stores Phase 2A System Material configuration.
 
 Cursor changes, wallpaper commands, window actions, and shell protocol remain
 unavailable.

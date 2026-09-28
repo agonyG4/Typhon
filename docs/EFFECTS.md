@@ -146,8 +146,11 @@ keeps the previous generation and its effective selection.
 
 The semantic `ext-background-effect-v1` client still requests only a blur
 assignment. For each visible assignment, Typhon supplies the globally
-effective material program, manifest parameter defaults, and that program's
-frame demand to the existing effect renderer. Selecting a program without a
+effective material program, manifest parameter defaults overlaid with valid
+persisted overrides for the matching schema, and that program's frame demand
+to the existing effect renderer. A stale or invalid persisted override set
+falls back to the complete manifest defaults and remains stored for a later
+matching schema. Selecting a program or changing its parameters without a
 visible blur assignment creates no effect instance. Phase 2A
 `MaterialConfiguration` remains separate and continues to update the built-in
 program while a trusted-local program is selected.

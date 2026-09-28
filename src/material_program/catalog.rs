@@ -90,7 +90,7 @@ fn catalog_entry(
     MaterialProgramCatalogEntry {
         name: effect.name.clone(),
         origin,
-        schema_signature: effect.schema_signature(),
+        schema_signature: effect.parameter_schema_signature(),
         parameter_count: u16::try_from(effect.parameters.len())
             .expect("validated effect parameter count fits catalog wire type"),
     }

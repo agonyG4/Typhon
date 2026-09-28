@@ -703,6 +703,8 @@ pub struct CompositorState {
     pub(in crate::compositor) material_runtime_capabilities: crate::material::MaterialCapabilities,
     pub(in crate::compositor) material_program_control:
         crate::material_program::MaterialProgramControlState,
+    pub(in crate::compositor) material_program_parameter_control:
+        crate::material_program::MaterialProgramParameterControlState,
     pub(in crate::compositor) material_program_rendering_available: bool,
     window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
     retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,

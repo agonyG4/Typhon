@@ -787,6 +787,7 @@ pub enum EffectValidationError {
     TooManyUniforms,
     TooManyAuxTextures,
     NonFiniteValue,
+    InvalidParameterValue,
     InvalidBlurRadius,
     InvalidBlurPassCount,
     InvalidScale,

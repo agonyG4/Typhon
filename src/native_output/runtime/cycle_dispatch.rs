@@ -851,6 +851,70 @@ impl NativeRuntime {
                 )
             });
         }
+        if command == ControlCommand::MaterialProgramStateGet {
+            if !material_program_get_args_are_empty(request.args) {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "material.program.state.get takes no arguments",
+                    ),
+                ));
+            }
+            return Some(
+                match serde_json::to_value(self.server.material_program_state_snapshot()) {
+                    Ok(result) => ControlResponse::success(request.id, result),
+                    Err(_) => ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::Internal,
+                            "material program state snapshot failed",
+                        ),
+                    ),
+                },
+            );
+        }
+        if command == ControlCommand::MaterialProgramDescribe {
+            let arguments = match serde_json::from_value::<
+                oblivion_one::material_program::MaterialProgramNameArguments,
+            >(request.args)
+            {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "invalid material program description arguments",
+                        ),
+                    ));
+                }
+            };
+            return Some(
+                match self
+                    .server
+                    .material_program_description_snapshot(&arguments.name)
+                {
+                    Ok(snapshot) => match serde_json::to_value(snapshot) {
+                        Ok(result) => ControlResponse::success(request.id, result),
+                        Err(_) => ControlResponse::failure(
+                            request.id,
+                            ControlError::new(
+                                ControlErrorCode::Internal,
+                                "material program description failed",
+                            ),
+                        ),
+                    },
+                    Err(_) => ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "material program is invalid or unavailable",
+                        ),
+                    ),
+                },
+            );
+        }
         if command == ControlCommand::MaterialProgramSet {
             let configuration = match serde_json::from_value::<
                 oblivion_one::material_program::MaterialProgramConfiguration,
@@ -879,6 +943,48 @@ impl NativeRuntime {
                         material_program_selection_response(request.id, update.snapshot)
                     }
                     Err(error) => material_program_set_failure_response(request.id, error),
+                },
+            );
+        }
+        if command == ControlCommand::MaterialProgramParametersSet {
+            let configuration = match serde_json::from_value::<
+                oblivion_one::material_program::MaterialProgramParameterConfiguration,
+            >(request.args)
+            {
+                Ok(configuration) => configuration,
+                Err(_) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "invalid material program parameter configuration",
+                        ),
+                    ));
+                }
+            };
+            return Some(
+                match self
+                    .server
+                    .set_material_program_parameter_configuration(configuration)
+                {
+                    Ok(update) => {
+                        if update.changed {
+                            self.queued_redraw_requested = true;
+                        }
+                        match serde_json::to_value(update.snapshot) {
+                            Ok(result) => ControlResponse::success(request.id, result),
+                            Err(_) => ControlResponse::failure(
+                                request.id,
+                                ControlError::new(
+                                    ControlErrorCode::Internal,
+                                    "material program parameter snapshot failed",
+                                ),
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        material_program_parameter_set_failure_response(request.id, error)
+                    }
                 },
             );
         }
@@ -2248,9 +2354,10 @@ mod tests {
         decide_native_pre_read_input, dispatch_keyboard_layout_command,
         format_direct_scanout_doctor_detail, format_dmabuf_feedback_source_format,
         input_requires_full_server_progression, keyboard_layout_failure,
-        material_program_get_args_are_empty, material_program_selection_response,
-        material_program_set_failure_response, material_set_failure_response,
-        material_snapshot_response, promote_native_input_before_wayland_read,
+        material_program_get_args_are_empty, material_program_parameter_set_failure_response,
+        material_program_selection_response, material_program_set_failure_response,
+        material_set_failure_response, material_snapshot_response,
+        promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -2342,6 +2449,25 @@ mod tests {
         assert_eq!(
             response.error.unwrap().code,
             oblivion_one::control::ControlErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn stale_material_program_parameter_schema_has_a_stable_bounded_detail() {
+        let response = material_program_parameter_set_failure_response(
+            77,
+            oblivion_one::material_program::MaterialProgramParameterMutationError::StaleSchema,
+        );
+        assert_eq!(response.id, 77);
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(
+            error.code,
+            oblivion_one::control::ControlErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("stale_material_program_schema")
         );
     }
 
@@ -3229,6 +3355,42 @@ fn material_program_selection_response(
             ControlError::new(
                 ControlErrorCode::Internal,
                 "material program selection snapshot failed",
+            ),
+        ),
+    }
+}
+
+fn material_program_parameter_set_failure_response(
+    id: u64,
+    error: oblivion_one::material_program::MaterialProgramParameterMutationError,
+) -> ControlResponse {
+    use oblivion_one::material_program::MaterialProgramParameterMutationError as Error;
+
+    match error {
+        Error::InvalidConfiguration
+        | Error::UnknownProgram
+        | Error::Unqualified
+        | Error::UnknownParameter
+        | Error::InvalidParameterValue => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::InvalidArgument,
+                "material program parameter configuration is invalid",
+            ),
+        ),
+        Error::StaleSchema => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::InvalidArgument,
+                "material program parameter schema is stale",
+            )
+            .with_detail("stale_material_program_schema"),
+        ),
+        Error::GenerationExhausted | Error::Persistence(_) => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::Internal,
+                "material program parameter configuration was not saved",
             ),
         ),
     }

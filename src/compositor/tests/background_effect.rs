@@ -77,6 +77,23 @@ fn set_material_program(
         .expect("material program selection should complete")
 }
 
+fn set_material_program_parameters(
+    commands: &Sender<ServerCommand>,
+    configuration: crate::material_program::MaterialProgramParameterConfiguration,
+) -> Result<(), String> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetMaterialProgramParameterConfiguration {
+            configuration,
+            reply,
+        })
+        .expect("material program parameter command should be accepted");
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("material program parameter configuration should complete")
+}
+
 type BackgroundEffectConnection = (
     Connection,
     EventQueue<RegistryTestState>,
@@ -170,6 +187,13 @@ fn background_effect_state_is_copied_and_double_buffered() {
             )
             .unwrap(),
         );
+    server.state.material_program_parameter_control =
+        crate::material_program::MaterialProgramParameterControlState::from_store(
+            crate::material_program::MaterialProgramParameterConfigurationStore::new(
+                persistence_directory.clone(),
+            )
+            .unwrap(),
+        );
     server.state.material_control = crate::material::MaterialControlState::from_store(
         crate::material::MaterialConfigurationStore::new(persistence_directory.clone()).unwrap(),
     );
@@ -187,6 +211,12 @@ fn background_effect_state_is_copied_and_double_buffered() {
         .unwrap()
         .aggregate_footprint
         .sample_radius_x;
+    server
+        .set_material_program_configuration(crate::material_program::MaterialProgramConfiguration {
+            version: 1,
+            requested_program: "glass.liquid".to_owned(),
+        })
+        .unwrap();
     server
         .set_material_configuration(crate::material::MaterialConfiguration {
             position: 1.0,
@@ -219,6 +249,16 @@ fn background_effect_state_is_copied_and_double_buffered() {
             requested_program: "glass.liquid".to_owned(),
         })
         .unwrap();
+    let parameter_generation = server.state.trusted_effect_registry.current();
+    let parameter_configuration = crate::material_program::MaterialProgramParameterConfiguration {
+        version: 1,
+        program: "glass.liquid".to_owned(),
+        schema_signature: parameter_generation.effects["glass.liquid"].parameter_schema_signature(),
+        overrides: BTreeMap::from([(
+            "intensity".to_owned(),
+            crate::material_program::MaterialProgramParameterValue::Float(0.82),
+        )]),
+    };
     let active_generation = server.state.trusted_effect_registry.current();
     let selection_before_invalid_reload = server.material_program_selection_snapshot();
     let mut invalid_manifest = material_default_manifest();
@@ -305,6 +345,17 @@ fn background_effect_state_is_copied_and_double_buffered() {
             "selecting a program without a visible blur assignment must not block Direct Scanout"
         );
 
+        set_material_program_parameters(&commands, parameter_configuration.clone())?;
+        let parameters_without_assignment = capture_effect_scene(&commands);
+        assert!(parameters_without_assignment.is_empty());
+        assert_eq!(
+            crate::compositor::direct_scanout_scene_rejection_for_effects(
+                parameters_without_assignment.summary
+            ),
+            None,
+            "parameter configuration alone must not block Direct Scanout"
+        );
+
         surface.commit();
         connection.flush()?;
         queue.roundtrip(&mut RegistryTestState::default())?;
@@ -322,10 +373,26 @@ fn background_effect_state_is_copied_and_double_buffered() {
         assert_eq!(after_commit.instances[0].parameter_block.values().len(), 1);
         assert_eq!(
             after_commit.instances[0].parameter_block.values()[0].value,
-            EffectUniformValue::Float(0.65)
+            EffectUniformValue::Float(0.82)
         );
         assert_eq!(
             crate::compositor::direct_scanout_scene_rejection_for_effects(after_commit.summary),
+            Some(crate::compositor::DirectScanoutSceneRejection::EffectRequiresComposition)
+        );
+        set_material_program_parameters(
+            &commands,
+            crate::material_program::MaterialProgramParameterConfiguration {
+                overrides: BTreeMap::new(),
+                ..parameter_configuration.clone()
+            },
+        )?;
+        let restored_default = capture_effect_scene(&commands);
+        assert_eq!(
+            restored_default.instances[0].parameter_block.values()[0].value,
+            EffectUniformValue::Float(0.65)
+        );
+        assert_eq!(
+            crate::compositor::direct_scanout_scene_rejection_for_effects(restored_default.summary),
             Some(crate::compositor::DirectScanoutSceneRejection::EffectRequiresComposition)
         );
         set_material_program(&commands, crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)?;

@@ -927,6 +927,8 @@ impl CompositorState {
         let material_control = crate::material::MaterialControlState::from_environment();
         let material_program_control =
             crate::material_program::MaterialProgramControlState::from_environment();
+        let material_program_parameter_control =
+            crate::material_program::MaterialProgramParameterControlState::from_environment();
         let trusted_effect_registry =
             crate::effects::TrustedEffectRegistry::with_builtin_background_material(
                 material_control
@@ -947,6 +949,7 @@ impl CompositorState {
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
             material_control,
             material_program_control,
+            material_program_parameter_control,
             trusted_effect_registry,
             pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()

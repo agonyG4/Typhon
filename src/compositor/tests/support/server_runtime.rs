@@ -200,6 +200,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         configuration: crate::material_program::MaterialProgramConfiguration,
         reply: Sender<Result<(), String>>,
     },
+    SetMaterialProgramParameterConfiguration {
+        configuration: crate::material_program::MaterialProgramParameterConfiguration,
+        reply: Sender<Result<(), String>>,
+    },
     CaptureLifecycleEffectPath(Sender<LifecycleEffectPathSnapshot>),
     ReplaceBlurPolicyConfig {
         config: crate::blur_policy::BlurPolicyConfig,
@@ -822,6 +826,16 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     } => {
                         let result = server
                             .set_material_program_configuration(configuration)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    ServerCommand::SetMaterialProgramParameterConfiguration {
+                        configuration,
+                        reply,
+                    } => {
+                        let result = server
+                            .set_material_program_parameter_configuration(configuration)
                             .map(|_| ())
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);

@@ -169,6 +169,98 @@ impl RegisteredEffect {
         }
         signature
     }
+
+    /// Stable semantic compatibility for persisted Material Program parameters.
+    ///
+    /// This deliberately excludes renderer identity and implementation details:
+    /// program/parameter IDs, graph nodes, shader modules and sources, and frame
+    /// demand do not affect whether named parameter overrides remain compatible.
+    pub fn parameter_schema_signature(&self) -> u64 {
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in self.name.bytes() {
+            schema_mix(&mut signature, u64::from(byte));
+        }
+        schema_mix(&mut signature, 0xff);
+        schema_mix(&mut signature, self.parameters.len() as u64);
+
+        for (name, parameter) in self.parameters.iter().take(super::MAX_EFFECT_PARAMETERS) {
+            for byte in name.bytes() {
+                schema_mix(&mut signature, u64::from(byte));
+            }
+            schema_mix(&mut signature, 0xff);
+            schema_mix(
+                &mut signature,
+                match parameter.spec.ty {
+                    EffectParameterType::Float => 0,
+                    EffectParameterType::Vec2 => 1,
+                    EffectParameterType::Vec3 => 2,
+                    EffectParameterType::Vec4 => 3,
+                    EffectParameterType::Int => 4,
+                },
+            );
+            match parameter.spec.range {
+                None => schema_mix(&mut signature, 0),
+                Some(EffectParameterRange::Float { min, max }) => {
+                    schema_mix(&mut signature, 1);
+                    schema_mix(&mut signature, u64::from(min.to_bits()));
+                    schema_mix(&mut signature, u64::from(max.to_bits()));
+                }
+                Some(EffectParameterRange::FloatComponents {
+                    min,
+                    max,
+                    components,
+                }) => {
+                    schema_mix(&mut signature, 2);
+                    schema_mix(&mut signature, u64::from(components));
+                    for value in min.into_iter().chain(max) {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                Some(EffectParameterRange::Int { min, max }) => {
+                    schema_mix(&mut signature, 3);
+                    schema_mix(&mut signature, min as u32 as u64);
+                    schema_mix(&mut signature, max as u32 as u64);
+                }
+            }
+            schema_mix(
+                &mut signature,
+                match parameter.spec.impact {
+                    EffectParameterImpact::UniformOnly => 0,
+                    EffectParameterImpact::Footprint => 1,
+                    EffectParameterImpact::Structure => 2,
+                },
+            );
+            match parameter.default {
+                EffectUniformValue::Float(value) => {
+                    schema_mix(&mut signature, 0);
+                    schema_mix(&mut signature, u64::from(value.to_bits()));
+                }
+                EffectUniformValue::Vec2(values) => {
+                    schema_mix(&mut signature, 1);
+                    for value in values {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                EffectUniformValue::Vec3(values) => {
+                    schema_mix(&mut signature, 2);
+                    for value in values {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                EffectUniformValue::Vec4(values) => {
+                    schema_mix(&mut signature, 3);
+                    for value in values {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                EffectUniformValue::Int(value) => {
+                    schema_mix(&mut signature, 4);
+                    schema_mix(&mut signature, value as u32 as u64);
+                }
+            }
+        }
+        signature
+    }
 }
 
 fn schema_mix(signature: &mut u64, value: u64) {

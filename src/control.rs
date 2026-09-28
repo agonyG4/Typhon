@@ -73,6 +73,9 @@ pub enum ControlCommand {
     MaterialProgramCatalogGet,
     MaterialProgramGet,
     MaterialProgramSet,
+    MaterialProgramStateGet,
+    MaterialProgramDescribe,
+    MaterialProgramParametersSet,
     WindowActivate,
     WindowMinimize,
     WindowRestore,
@@ -114,6 +117,9 @@ impl ControlCommand {
             Self::MaterialProgramCatalogGet => "material.program.catalog.get",
             Self::MaterialProgramGet => "material.program.get",
             Self::MaterialProgramSet => "material.program.set",
+            Self::MaterialProgramStateGet => "material.program.state.get",
+            Self::MaterialProgramDescribe => "material.program.describe",
+            Self::MaterialProgramParametersSet => "material.program.parameters.set",
             Self::WindowActivate => "window.activate",
             Self::WindowMinimize => "window.minimize",
             Self::WindowRestore => "window.restore",
@@ -155,6 +161,9 @@ impl ControlCommand {
             "material.program.catalog.get" => Self::MaterialProgramCatalogGet,
             "material.program.get" => Self::MaterialProgramGet,
             "material.program.set" => Self::MaterialProgramSet,
+            "material.program.state.get" => Self::MaterialProgramStateGet,
+            "material.program.describe" => Self::MaterialProgramDescribe,
+            "material.program.parameters.set" => Self::MaterialProgramParametersSet,
             "window.activate" => Self::WindowActivate,
             "window.minimize" => Self::WindowMinimize,
             "window.restore" => Self::WindowRestore,
@@ -478,10 +487,21 @@ mod tests {
             ControlCommand::MaterialProgramSet.as_str(),
             "material.program.set"
         );
+        assert_eq!(
+            ControlCommand::parse("material.program.state.get"),
+            Some(ControlCommand::MaterialProgramStateGet)
+        );
+        assert_eq!(
+            ControlCommand::parse("material.program.describe"),
+            Some(ControlCommand::MaterialProgramDescribe)
+        );
+        assert_eq!(
+            ControlCommand::parse("material.program.parameters.set"),
+            Some(ControlCommand::MaterialProgramParametersSet)
+        );
         for near_miss in [
             "material.catalog.get",
             "material.programs.get",
-            "material.program.describe",
             "material.shader.set",
         ] {
             assert_eq!(ControlCommand::parse(near_miss), None);
