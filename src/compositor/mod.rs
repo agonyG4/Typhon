@@ -528,6 +528,7 @@ pub struct SubsurfaceTransactionMetrics {
     pub acquire_dependencies_replaced: u64,
     pub ready_transactions_preserved_from_newer_unready: u64,
     pub ready_transactions_preserved_from_newer_ready: u64,
+    pub unready_progress_anchors_preserved_from_newer_unready: u64,
     pub callbacks_merged: u64,
     pub feedbacks_merged: u64,
     pub resize_snapshots_preserved: u64,

@@ -226,6 +226,130 @@ mod tests {
         }
     }
 
+    fn submit_test_unready_buffer_commit(
+        state: &mut CompositorState,
+        client: &wayland_server::Client,
+        display_handle: &wayland_server::DisplayHandle,
+        surface_id: u32,
+        object_id: u32,
+        sequence: u64,
+        predecessor: Option<ContentUpdateRef>,
+    ) -> (ContentUpdateRef, AcquireCommitId, u32, BufferId) {
+        submit_test_unready_buffer_commit_with_obligations(
+            state,
+            client,
+            display_handle,
+            surface_id,
+            object_id,
+            sequence,
+            predecessor,
+            None,
+            None,
+        )
+    }
+
+    fn submit_test_unready_buffer_commit_with_obligations(
+        state: &mut CompositorState,
+        client: &wayland_server::Client,
+        display_handle: &wayland_server::DisplayHandle,
+        surface_id: u32,
+        object_id: u32,
+        sequence: u64,
+        predecessor: Option<ContentUpdateRef>,
+        frame_callback: Option<wl_callback::WlCallback>,
+        presentation_feedback: Option<PendingPresentationFeedback>,
+    ) -> (ContentUpdateRef, AcquireCommitId, u32, BufferId) {
+        let mut commit = test_mergeable_commit(sequence);
+        commit.lineage.predecessor = predecessor;
+        let reference = commit.content_update_ref(surface_id);
+        let mut buffer = test_pending_shm_buffer(state, client, display_handle, object_id, 64, 64);
+        buffer.commit_sequence = commit.commit_sequence;
+        let buffer_id = buffer.resource.id().protocol_id();
+        let buffer_identity_id = buffer.data.buffer_id();
+        commit.attachment = Some(PendingSurfaceAttachment::Buffer(buffer));
+        if let Some(callback) = frame_callback {
+            commit.frame_callbacks.push(callback);
+        }
+        if let Some(feedback) = presentation_feedback {
+            commit.presentation_feedbacks.push(feedback);
+        }
+        let mut nodes = vec![(surface_id, commit)];
+        assert!(
+            state
+                .prepare_surface_tree_surface_state(surface_id, &mut nodes, &[])
+                .is_ok()
+        );
+        let acquire_commit_id = AcquireCommitId::for_tests(1_000 + sequence);
+        let dependency = SurfaceTreeAcquireDependency {
+            surface_commit_id: reference.commit_id,
+            commit_id: acquire_commit_id,
+            surface_id,
+            owner_client_id: Some(client.id()),
+            surface_presentation_generation: Some(1),
+            buffer_id,
+            acquire: ExplicitSyncPoint::for_tests_with_signal_script(
+                u32::try_from(10_000 + sequence).expect("test acquire handle"),
+                20_000 + sequence,
+                [false],
+            ),
+            state: PendingAcquireState::EventfdBacked,
+        };
+        state.merge_or_queue_surface_tree_transaction(
+            surface_id,
+            nodes,
+            vec![dependency],
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+        (reference, acquire_commit_id, buffer_id, buffer_identity_id)
+    }
+
+    fn submit_test_ready_buffer_commit(
+        state: &mut CompositorState,
+        client: &wayland_server::Client,
+        display_handle: &wayland_server::DisplayHandle,
+        surface_id: u32,
+        object_id: u32,
+        sequence: u64,
+        predecessor: ContentUpdateRef,
+    ) -> ContentUpdateRef {
+        let mut commit = test_mergeable_commit(sequence);
+        commit.lineage.predecessor = Some(predecessor);
+        let reference = commit.content_update_ref(surface_id);
+        let mut buffer = test_pending_shm_buffer(state, client, display_handle, object_id, 64, 64);
+        buffer.commit_sequence = commit.commit_sequence;
+        commit.attachment = Some(PendingSurfaceAttachment::Buffer(buffer));
+        let mut nodes = vec![(surface_id, commit)];
+        assert!(
+            state
+                .prepare_surface_tree_surface_state(surface_id, &mut nodes, &[])
+                .is_ok()
+        );
+        state.merge_or_queue_surface_tree_transaction(
+            surface_id,
+            nodes,
+            Vec::new(),
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+        reference
+    }
+
+    fn acquire_watch_was_cancelled_as_superseded(
+        state: &CompositorState,
+        commit_id: AcquireCommitId,
+    ) -> bool {
+        state.pending_acquire_watch_changes.iter().any(|change| {
+            matches!(
+                change,
+                AcquireWatchChange::Cancel {
+                    commit_id: cancelled,
+                    reason: AcquireWatchCancelReason::Superseded,
+                } if *cancelled == commit_id
+            )
+        })
+    }
+
     fn test_blocking_external_dependency(
         state: &mut CompositorState,
         client: &wayland_server::Client,
@@ -1109,6 +1233,743 @@ mod tests {
             },
         );
         assert!(state.content_update_dependencies_ready(&waiting));
+    }
+
+    #[test]
+    fn unready_root_head_survives_newer_unready_attachment() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, anchor_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+
+        let (successor_ref, successor_acquire, successor_buffer, _) =
+            submit_test_unready_buffer_commit(
+                &mut state,
+                &client,
+                &display_handle,
+                surface_id,
+                3,
+                2,
+                Some(anchor_ref),
+            );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        let anchor = &state.pending_surface_tree_transactions[0];
+        assert_eq!(anchor.dependencies.len(), 1);
+        assert_eq!(
+            anchor.dependencies[0].surface_commit_id,
+            anchor_ref.commit_id
+        );
+        assert_eq!(anchor.dependencies[0].commit_id, anchor_acquire);
+        assert_eq!(anchor.dependencies[0].buffer_id, anchor_buffer);
+        assert_eq!(anchor.nodes[0].1.commit_id, anchor_ref.commit_id);
+        let Some(PendingSurfaceAttachment::Buffer(anchor_pending)) =
+            anchor.nodes[0].1.attachment.as_ref()
+        else {
+            panic!("progress anchor must retain its pending buffer");
+        };
+        assert_eq!(anchor_pending.resource.id().protocol_id(), anchor_buffer);
+
+        let successor = &state.pending_surface_tree_transactions[1];
+        assert_eq!(successor.dependencies.len(), 1);
+        assert_eq!(
+            successor.dependencies[0].surface_commit_id,
+            successor_ref.commit_id
+        );
+        assert_eq!(successor.dependencies[0].commit_id, successor_acquire);
+        assert_eq!(successor.dependencies[0].buffer_id, successor_buffer);
+        assert_eq!(successor.nodes[0].1.commit_id, successor_ref.commit_id);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert!(!acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+        assert!(state.pending_acquire_watch_changes.iter().any(|change| {
+            matches!(change, AcquireWatchChange::Register(watch) if watch.commit_id == anchor_acquire)
+        }));
+    }
+
+    #[test]
+    fn newer_unready_commits_coalesce_into_successor_not_progress_anchor() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, anchor_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+        let (tail_ref, tail_acquire, _tail_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            3,
+            2,
+            Some(anchor_ref),
+        );
+
+        let (latest_ref, latest_acquire, latest_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            4,
+            3,
+            Some(tail_ref),
+        );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        let anchor = &state.pending_surface_tree_transactions[0];
+        assert_eq!(
+            anchor.dependencies[0].surface_commit_id,
+            anchor_ref.commit_id
+        );
+        assert_eq!(anchor.dependencies[0].commit_id, anchor_acquire);
+        assert_eq!(anchor.dependencies[0].buffer_id, anchor_buffer);
+        assert_eq!(anchor.nodes[0].1.commit_id, anchor_ref.commit_id);
+        let Some(PendingSurfaceAttachment::Buffer(anchor_pending)) =
+            anchor.nodes[0].1.attachment.as_ref()
+        else {
+            panic!("progress anchor must retain its pending buffer");
+        };
+        assert_eq!(anchor_pending.resource.id().protocol_id(), anchor_buffer);
+
+        let tail = &state.pending_surface_tree_transactions[1];
+        assert_eq!(tail.dependencies.len(), 1);
+        assert_eq!(tail.dependencies[0].surface_commit_id, latest_ref.commit_id);
+        assert_eq!(tail.dependencies[0].commit_id, latest_acquire);
+        assert_eq!(tail.dependencies[0].buffer_id, latest_buffer);
+        assert_eq!(tail.nodes[0].1.commit_id, latest_ref.commit_id);
+        assert!(!acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+        assert!(acquire_watch_was_cancelled_as_superseded(
+            &state,
+            tail_acquire
+        ));
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready,
+            1
+        );
+    }
+
+    #[test]
+    fn unresolved_single_surface_stream_keeps_only_anchor_and_latest_successor() {
+        const LAST_SEQUENCE: u64 = 400;
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, anchor_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+        let mut predecessor = anchor_ref;
+        let mut latest_acquire = anchor_acquire;
+        let mut latest_buffer = anchor_buffer;
+        for sequence in 2..=LAST_SEQUENCE {
+            let (reference, acquire, buffer, _) = submit_test_unready_buffer_commit(
+                &mut state,
+                &client,
+                &display_handle,
+                surface_id,
+                u32::try_from(sequence + 1).expect("test buffer resource id"),
+                sequence,
+                Some(predecessor),
+            );
+            predecessor = reference;
+            latest_acquire = acquire;
+            latest_buffer = buffer;
+            assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+            assert_eq!(
+                state.pending_surface_tree_transactions[0].dependencies[0].commit_id,
+                anchor_acquire
+            );
+            assert_eq!(
+                state.pending_surface_tree_transactions[0].nodes[0]
+                    .1
+                    .commit_id,
+                anchor_ref.commit_id
+            );
+            assert!(!acquire_watch_was_cancelled_as_superseded(
+                &state,
+                anchor_acquire
+            ));
+        }
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        let anchor = &state.pending_surface_tree_transactions[0];
+        assert_eq!(anchor.dependencies.len(), 1);
+        assert_eq!(
+            anchor.dependencies[0].surface_commit_id,
+            anchor_ref.commit_id
+        );
+        assert_eq!(anchor.dependencies[0].commit_id, anchor_acquire);
+        assert_eq!(anchor.dependencies[0].buffer_id, anchor_buffer);
+        assert_eq!(anchor.nodes[0].1.commit_id, anchor_ref.commit_id);
+        let Some(PendingSurfaceAttachment::Buffer(anchor_pending)) =
+            anchor.nodes[0].1.attachment.as_ref()
+        else {
+            panic!("progress anchor must retain its pending buffer");
+        };
+        assert_eq!(anchor_pending.resource.id().protocol_id(), anchor_buffer);
+
+        let tail = &state.pending_surface_tree_transactions[1];
+        assert_eq!(tail.dependencies.len(), 1);
+        assert_eq!(
+            tail.dependencies[0].surface_commit_id,
+            predecessor.commit_id
+        );
+        assert_eq!(tail.dependencies[0].commit_id, latest_acquire);
+        assert_eq!(tail.dependencies[0].buffer_id, latest_buffer);
+        assert_eq!(tail.nodes[0].1.commit_id, predecessor.commit_id);
+        assert_eq!(
+            tail.nodes[0].1.commit_sequence,
+            SurfaceCommitSequence(LAST_SEQUENCE)
+        );
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .explicit_sync_queue_overflow,
+            0
+        );
+        assert_eq!(
+            state
+                .surface_pacing_metrics
+                .queue_admission_resource_exhaustion,
+            0
+        );
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .maximum_waiting_slots_per_root,
+            2
+        );
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .maximum_explicit_sync_queue_depth,
+            2
+        );
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready,
+            1
+        );
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 398);
+        assert!(!acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+        assert!(!acquire_watch_was_cancelled_as_superseded(
+            &state,
+            latest_acquire
+        ));
+    }
+
+    #[test]
+    fn progress_anchor_publishes_before_its_latest_successor() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, _anchor_buffer, anchor_buffer_identity) =
+            submit_test_unready_buffer_commit(
+                &mut state,
+                &client,
+                &display_handle,
+                surface_id,
+                2,
+                1,
+                None,
+            );
+        let (tail_ref, tail_acquire, _tail_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            3,
+            2,
+            Some(anchor_ref),
+        );
+        let (latest_ref, latest_acquire, _latest_buffer, latest_buffer_identity) =
+            submit_test_unready_buffer_commit(
+                &mut state,
+                &client,
+                &display_handle,
+                surface_id,
+                4,
+                3,
+                Some(tail_ref),
+            );
+
+        state.pending_surface_tree_transactions[0].dependencies[0].state =
+            PendingAcquireState::Ready;
+        state.commit_ready_surface_tree_transactions();
+
+        assert_eq!(
+            state.surface_publications[&surface_id].latest_published,
+            Some(anchor_ref.commit_sequence)
+        );
+        assert_eq!(
+            state.current_surface_buffers[&surface_id].buffer_id(),
+            anchor_buffer_identity
+        );
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+        assert_eq!(
+            state.pending_surface_tree_transactions[0].dependencies[0].commit_id,
+            latest_acquire
+        );
+        assert_eq!(
+            state.pending_surface_tree_transactions[0].dependencies[0].surface_commit_id,
+            latest_ref.commit_id
+        );
+        assert!(!acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+
+        state.pending_surface_tree_transactions[0].dependencies[0].state =
+            PendingAcquireState::Ready;
+        state.commit_ready_surface_tree_transactions();
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert_eq!(
+            state.surface_publications[&surface_id].latest_published,
+            Some(latest_ref.commit_sequence)
+        );
+        assert_eq!(
+            state.current_surface_buffers[&surface_id].buffer_id(),
+            latest_buffer_identity
+        );
+        assert!(acquire_watch_was_cancelled_as_superseded(
+            &state,
+            tail_acquire
+        ));
+    }
+
+    #[test]
+    fn ready_attachment_replacement_keeps_existing_immediate_behavior() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, _, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+        let ready_ref = submit_test_ready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            3,
+            2,
+            anchor_ref,
+        );
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert_eq!(
+            state.surface_publications[&surface_id].latest_published,
+            Some(ready_ref.commit_sequence)
+        );
+        assert!(acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready,
+            0
+        );
+    }
+
+    #[test]
+    fn explicit_detach_replaces_unready_anchor_without_waiting_for_its_acquire() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, _, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+        let mut detach = test_mergeable_commit(2);
+        detach.lineage.predecessor = Some(anchor_ref);
+        detach.attachment = Some(PendingSurfaceAttachment::RemoveContent);
+        let mut nodes = vec![(surface_id, detach)];
+        assert!(
+            state
+                .prepare_surface_tree_surface_state(surface_id, &mut nodes, &[])
+                .is_ok()
+        );
+        state.merge_or_queue_surface_tree_transaction(
+            surface_id,
+            nodes,
+            Vec::new(),
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert_eq!(
+            state.surface_publications[&surface_id].latest_published,
+            Some(SurfaceCommitSequence(2))
+        );
+        assert!(acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert_eq!(state.subsurface_transaction_metrics.explicit_detaches, 1);
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready,
+            0
+        );
+    }
+
+    #[test]
+    fn metadata_only_commit_still_coalesces_with_unready_anchor() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let (anchor_ref, anchor_acquire, anchor_buffer, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+        let mut metadata = test_mergeable_commit(2);
+        metadata.lineage.predecessor = Some(anchor_ref);
+        metadata.offset = Some((4, 7));
+        let metadata_commit_id = metadata.commit_id;
+        state.merge_or_queue_surface_tree_transaction(
+            surface_id,
+            vec![(surface_id, metadata)],
+            Vec::new(),
+            Vec::new(),
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+        let anchor = &state.pending_surface_tree_transactions[0];
+        assert_eq!(anchor.dependencies.len(), 1);
+        assert_eq!(anchor.dependencies[0].commit_id, anchor_acquire);
+        assert_eq!(anchor.dependencies[0].buffer_id, anchor_buffer);
+        assert_eq!(anchor.nodes[0].1.commit_id, metadata_commit_id);
+        assert_eq!(anchor.nodes[0].1.offset, Some((4, 7)));
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(
+            state
+                .subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready,
+            0
+        );
+    }
+
+    #[test]
+    fn pacing_protected_heads_keep_fifo_timing_and_merge_frozen_boundaries() {
+        #[derive(Clone, Copy)]
+        enum Boundary {
+            Fifo,
+            CommitTiming,
+            MergeFrozen,
+        }
+
+        for boundary in [
+            Boundary::Fifo,
+            Boundary::CommitTiming,
+            Boundary::MergeFrozen,
+        ] {
+            let mut state = CompositorState {
+                external_acquire_readiness: true,
+                ..CompositorState::default()
+            };
+            let (display, client, surface_id) = test_surface_and_client(&mut state);
+            let display_handle = display.handle();
+            let (anchor_ref, anchor_acquire, _, _) = submit_test_unready_buffer_commit(
+                &mut state,
+                &client,
+                &display_handle,
+                surface_id,
+                2,
+                1,
+                None,
+            );
+            let anchor = &mut state.pending_surface_tree_transactions[0].nodes[0].1;
+            match boundary {
+                Boundary::Fifo => anchor.pacing.fifo_set_barrier = true,
+                Boundary::CommitTiming => {
+                    let now = client_pacing_now_ns();
+                    let seconds = now / 1_000_000_000 + 60;
+                    anchor.pacing.commit_timing = Some(
+                        CommitTimingConstraint::from_protocol(
+                            seconds,
+                            (now % 1_000_000_000) as u32,
+                        )
+                        .expect("future commit timing constraint"),
+                    );
+                }
+                Boundary::MergeFrozen => anchor.lineage.merge_frozen = true,
+            }
+
+            let (successor_ref, _, _, _) = submit_test_unready_buffer_commit(
+                &mut state,
+                &client,
+                &display_handle,
+                surface_id,
+                3,
+                2,
+                Some(anchor_ref),
+            );
+
+            assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+            assert_eq!(
+                state.pending_surface_tree_transactions[0].nodes[0]
+                    .1
+                    .commit_id,
+                anchor_ref.commit_id
+            );
+            assert_eq!(
+                state.pending_surface_tree_transactions[0].dependencies[0].commit_id,
+                anchor_acquire
+            );
+            assert_eq!(
+                state.pending_surface_tree_transactions[1].nodes[0]
+                    .1
+                    .commit_id,
+                successor_ref.commit_id
+            );
+            assert!(!acquire_watch_was_cancelled_as_superseded(
+                &state,
+                anchor_acquire
+            ));
+            assert_eq!(
+                state
+                    .subsurface_transaction_metrics
+                    .unready_progress_anchors_preserved_from_newer_unready,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_callbacks_stay_owned_and_tail_feedback_is_discarded_when_coalesced() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = state
+            .surface_resource_by_id(surface_id)
+            .expect("test surface resource")
+            .clone();
+        let (anchor_ref, anchor_acquire, _, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            2,
+            1,
+            None,
+        );
+        let (tail_ref, tail_acquire, _, _) = submit_test_unready_buffer_commit(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            3,
+            2,
+            Some(anchor_ref),
+        );
+        let anchor_callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(
+                &display_handle,
+                20,
+                (),
+            )
+            .expect("anchor frame callback");
+        let tail_callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(
+                &display_handle,
+                21,
+                (),
+            )
+            .expect("tail frame callback");
+        let anchor_feedback = client
+            .create_resource::<
+                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
+                (),
+                CompositorState,
+            >(&display_handle, 30, ())
+            .expect("anchor presentation feedback");
+        let tail_feedback = client
+            .create_resource::<
+                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
+                (),
+                CompositorState,
+            >(&display_handle, 31, ())
+            .expect("tail presentation feedback");
+        let latest_callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(
+                &display_handle,
+                22,
+                (),
+            )
+            .expect("latest frame callback");
+        let latest_feedback = client
+            .create_resource::<
+                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
+                (),
+                CompositorState,
+            >(&display_handle, 32, ())
+            .expect("latest presentation feedback");
+        state.pending_surface_tree_transactions[0].nodes[0]
+            .1
+            .frame_callbacks
+            .push(anchor_callback.clone());
+        state.pending_surface_tree_transactions[0].nodes[0]
+            .1
+            .presentation_feedbacks
+            .push(PendingPresentationFeedback {
+                surface_id,
+                surface_presentation_generation: 1,
+                commit_sequence: anchor_ref.commit_sequence,
+                surface: surface.clone(),
+                feedback: anchor_feedback.clone(),
+            });
+        state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .frame_callbacks
+            .push(tail_callback.clone());
+        state.pending_surface_tree_transactions[1].nodes[0]
+            .1
+            .presentation_feedbacks
+            .push(PendingPresentationFeedback {
+                surface_id,
+                surface_presentation_generation: 1,
+                commit_sequence: tail_ref.commit_sequence,
+                surface: surface.clone(),
+                feedback: tail_feedback.clone(),
+            });
+
+        let (latest_ref, _, _, _) = submit_test_unready_buffer_commit_with_obligations(
+            &mut state,
+            &client,
+            &display_handle,
+            surface_id,
+            4,
+            3,
+            Some(tail_ref),
+            Some(latest_callback.clone()),
+            Some(PendingPresentationFeedback {
+                surface_id,
+                surface_presentation_generation: 1,
+                commit_sequence: SurfaceCommitSequence(3),
+                surface: surface.clone(),
+                feedback: latest_feedback.clone(),
+            }),
+        );
+
+        let anchor = &state.pending_surface_tree_transactions[0].nodes[0].1;
+        assert_eq!(anchor.commit_id, anchor_ref.commit_id);
+        assert_eq!(anchor.frame_callbacks.len(), 1);
+        assert_eq!(
+            anchor.frame_callbacks[0].id().protocol_id(),
+            anchor_callback.id().protocol_id()
+        );
+        assert_eq!(anchor.presentation_feedbacks.len(), 1);
+        assert_eq!(
+            anchor.presentation_feedbacks[0].feedback.id().protocol_id(),
+            anchor_feedback.id().protocol_id()
+        );
+
+        let tail = &state.pending_surface_tree_transactions[1].nodes[0].1;
+        assert_eq!(tail.commit_id, latest_ref.commit_id);
+        assert_eq!(tail.frame_callbacks.len(), 2);
+        assert_eq!(
+            tail.frame_callbacks[0].id().protocol_id(),
+            tail_callback.id().protocol_id()
+        );
+        assert_eq!(
+            tail.frame_callbacks[1].id().protocol_id(),
+            latest_callback.id().protocol_id()
+        );
+        assert_eq!(tail.presentation_feedbacks.len(), 1);
+        assert_eq!(
+            tail.presentation_feedbacks[0].feedback.id().protocol_id(),
+            latest_feedback.id().protocol_id()
+        );
+        assert!(!tail.presentation_feedbacks.iter().any(|feedback| {
+            feedback.feedback.id().protocol_id() == tail_feedback.id().protocol_id()
+        }));
+        assert_eq!(state.subsurface_transaction_metrics.callbacks_merged, 1);
+        assert_eq!(state.subsurface_transaction_metrics.feedbacks_merged, 1);
+        assert!(!acquire_watch_was_cancelled_as_superseded(
+            &state,
+            anchor_acquire
+        ));
+        assert!(acquire_watch_was_cancelled_as_superseded(
+            &state,
+            tail_acquire
+        ));
     }
 
     #[test]
@@ -3070,6 +3931,59 @@ fn add_unique_content_update_ref(
     true
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SurfaceTreeProgressAcquireReplacement {
+    surface_id: u32,
+    anchor_commit_id: SurfaceCommitId,
+    incoming_commit_id: SurfaceCommitId,
+}
+
+fn surface_tree_merge_would_replace_progress_acquire(
+    target: &PendingSurfaceTreeTransaction,
+    incoming_nodes: &[(u32, CachedSubsurfaceCommit)],
+    incoming_dependencies: &[SurfaceTreeAcquireDependency],
+) -> Option<SurfaceTreeProgressAcquireReplacement> {
+    target.dependencies.iter().find_map(|anchor_dependency| {
+        if anchor_dependency.state == PendingAcquireState::Ready {
+            return None;
+        }
+        let (surface_id, anchor_commit) = target.nodes.iter().find(|(surface_id, commit)| {
+            *surface_id == anchor_dependency.surface_id
+                && commit.commit_id == anchor_dependency.surface_commit_id
+        })?;
+        let Some(PendingSurfaceAttachment::Buffer(anchor_buffer)) =
+            anchor_commit.attachment.as_ref()
+        else {
+            return None;
+        };
+        if anchor_buffer.resource.id().protocol_id() != anchor_dependency.buffer_id {
+            return None;
+        }
+        let incoming_commit = incoming_nodes
+            .iter()
+            .find_map(|(incoming_surface_id, commit)| {
+                (*incoming_surface_id == *surface_id).then_some(commit)
+            })?;
+        let Some(PendingSurfaceAttachment::Buffer(incoming_buffer)) =
+            incoming_commit.attachment.as_ref()
+        else {
+            return None;
+        };
+        let incoming_buffer_id = incoming_buffer.resource.id().protocol_id();
+        let incoming_has_unready_acquire = incoming_dependencies.iter().any(|dependency| {
+            dependency.surface_id == *surface_id
+                && dependency.surface_commit_id == incoming_commit.commit_id
+                && dependency.buffer_id == incoming_buffer_id
+                && dependency.state != PendingAcquireState::Ready
+        });
+        incoming_has_unready_acquire.then_some(SurfaceTreeProgressAcquireReplacement {
+            surface_id: *surface_id,
+            anchor_commit_id: anchor_commit.commit_id,
+            incoming_commit_id: incoming_commit.commit_id,
+        })
+    })
+}
+
 fn can_coalesce_pending_surface_tree_transaction(
     target: &PendingSurfaceTreeTransaction,
     incoming_nodes: &[(u32, CachedSubsurfaceCommit)],
@@ -4096,6 +5010,41 @@ impl CompositorState {
             &self.pending_surface_tree_transactions[target_index],
             &nodes,
         ) {
+            self.queue_waiting_surface_tree_with_lifetimes(
+                root_surface_id,
+                nodes,
+                publication_lifetimes,
+                dependencies,
+                external_content_update_dependencies,
+                submission_kind,
+            );
+            self.commit_ready_surface_tree_transactions();
+            return;
+        }
+
+        let progress_anchor_replacement = if matching.first() == Some(&target_index) {
+            surface_tree_merge_would_replace_progress_acquire(
+                &self.pending_surface_tree_transactions[target_index],
+                &nodes,
+                &dependencies,
+            )
+        } else {
+            None
+        };
+        if let Some(replacement) = progress_anchor_replacement {
+            self.subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready = self
+                .subsurface_transaction_metrics
+                .unready_progress_anchors_preserved_from_newer_unready
+                .saturating_add(1);
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: subsurface_tx root={root_surface_id} decision=preserve_unready_progress_anchor surface={} anchor_commit_id={} incoming_commit_id={}",
+                    replacement.surface_id,
+                    replacement.anchor_commit_id.get(),
+                    replacement.incoming_commit_id.get(),
+                );
+            }
             self.queue_waiting_surface_tree_with_lifetimes(
                 root_surface_id,
                 nodes,
