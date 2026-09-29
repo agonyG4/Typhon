@@ -8,6 +8,7 @@ use super::super::atoms::{XwmAtomName, XwmAtoms};
 pub(crate) const XDND_VERSION_SHIFT: u32 = 24;
 pub(crate) const XDND_MORE_TYPES: u32 = 1;
 pub(crate) const XDND_STATUS_ACCEPTED: u32 = 1;
+pub(crate) const XDND_FINISHED_ACCEPTED: u32 = 1;
 
 /// Pack root coordinates as signed 16-bit values. XDND's fields carry the
 /// root-space X11 coordinates, so fractional compositor values are rounded
@@ -74,15 +75,94 @@ pub(crate) fn action_from_atom(atoms: &XwmAtoms, atom: Atom) -> Option<XwaylandD
 pub(crate) fn decode_status_action(
     accepted_bit: bool,
     action_atom: Atom,
+    requested_action: Option<XwaylandDndAction>,
     source_actions: &[XwaylandDndAction],
     atoms: &XwmAtoms,
 ) -> (bool, Option<XwaylandDndAction>) {
     let action = accepted_bit
         .then(|| action_from_atom(atoms, action_atom))
         .flatten()
-        .filter(|action| action.to_wayland_action().is_some() && source_actions.contains(action));
+        .filter(|action| action.to_wayland_action().is_some() && source_actions.contains(action))
+        .filter(|action| {
+            matches!(
+                (requested_action, *action),
+                (Some(XwaylandDndAction::Copy), XwaylandDndAction::Copy)
+                    | (
+                        Some(XwaylandDndAction::Move),
+                        XwaylandDndAction::Move | XwaylandDndAction::Copy
+                    )
+                    | (
+                        Some(XwaylandDndAction::Ask),
+                        XwaylandDndAction::Ask | XwaylandDndAction::Copy
+                    )
+            )
+        });
     let accepted = accepted_bit && action.is_some();
     (accepted, accepted.then_some(action).flatten())
+}
+
+pub(crate) struct XdndDropFields {
+    pub(crate) actual_target: u32,
+    pub(crate) source_proxy: u32,
+    pub(crate) timestamp: u32,
+    pub(crate) drop_atom: Atom,
+}
+
+pub(crate) fn encode_xdnd_drop(fields: XdndDropFields) -> xproto::ClientMessageEvent {
+    xproto::ClientMessageEvent {
+        response_type: xproto::CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: fields.actual_target,
+        type_: fields.drop_atom,
+        data: ClientMessageData::from([fields.source_proxy, 0, fields.timestamp, 0, 0]),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct XdndFinishedResult {
+    pub(crate) accepted: bool,
+    pub(crate) action: Option<XwaylandDndAction>,
+}
+
+pub(crate) fn decode_xdnd_finished(
+    data: [u32; 5],
+    version: u8,
+    accepted_status_action: XwaylandDndAction,
+    source_actions: &[XwaylandDndAction],
+    atoms: &XwmAtoms,
+) -> XdndFinishedResult {
+    if version < 5 {
+        let action_is_concrete = matches!(
+            accepted_status_action,
+            XwaylandDndAction::Copy | XwaylandDndAction::Move
+        );
+        let accepted = action_is_concrete && source_actions.contains(&accepted_status_action);
+        return XdndFinishedResult {
+            accepted,
+            action: accepted.then_some(accepted_status_action),
+        };
+    }
+
+    if data[1] & XDND_FINISHED_ACCEPTED == 0 {
+        return XdndFinishedResult {
+            accepted: false,
+            action: None,
+        };
+    }
+    let action = action_from_atom(atoms, data[2])
+        .filter(|action| matches!(action, XwaylandDndAction::Copy | XwaylandDndAction::Move))
+        .filter(|action| source_actions.contains(action));
+    let action_matches_status = match accepted_status_action {
+        XwaylandDndAction::Copy | XwaylandDndAction::Move => action == Some(accepted_status_action),
+        XwaylandDndAction::Ask => action.is_some(),
+        XwaylandDndAction::Link | XwaylandDndAction::Private => false,
+    };
+    let action = action.filter(|_| action_matches_status);
+    XdndFinishedResult {
+        accepted: action.is_some(),
+        action,
+    }
 }
 
 pub(crate) fn validated_proxy(
@@ -281,24 +361,24 @@ mod tests {
             (14, XwaylandDndAction::Ask),
         ] {
             assert_eq!(
-                decode_status_action(true, wire_atom, &allowed, &atoms),
+                decode_status_action(true, wire_atom, Some(expected), &allowed, &atoms),
                 (true, Some(expected))
             );
         }
         assert_eq!(
-            decode_status_action(false, 11, &allowed, &atoms),
+            decode_status_action(false, 11, Some(XwaylandDndAction::Copy), &allowed, &atoms),
             (false, None)
         );
         assert_eq!(
-            decode_status_action(true, 999, &allowed, &atoms),
+            decode_status_action(true, 999, Some(XwaylandDndAction::Copy), &allowed, &atoms),
             (false, None)
         );
         assert_eq!(
-            decode_status_action(true, 13, &allowed, &atoms),
+            decode_status_action(true, 13, Some(XwaylandDndAction::Copy), &allowed, &atoms),
             (false, None)
         );
         assert_eq!(
-            decode_status_action(true, 15, &allowed, &atoms),
+            decode_status_action(true, 15, Some(XwaylandDndAction::Copy), &allowed, &atoms),
             (false, None)
         );
         assert_eq!(
@@ -333,5 +413,122 @@ mod tests {
         let targets = selection_targets(1, 2, 3, &[30, 31]);
         assert_eq!(targets, [1, 2, 3, 30, 31]);
         assert!(!targets.contains(&99)); // DELETE is deliberately unsupported.
+    }
+
+    #[test]
+    fn xdnd_drop_uses_actual_target_source_proxy_and_x_server_timestamp() {
+        let event = encode_xdnd_drop(XdndDropFields {
+            actual_target: 20,
+            source_proxy: 21,
+            timestamp: 40,
+            drop_atom: 51,
+        });
+        assert_eq!(event.window, 20);
+        assert_eq!(event.type_, 51);
+        assert_eq!(event.data.as_data32(), [21, 0, 40, 0, 0]);
+    }
+
+    #[test]
+    fn status_action_must_match_requested_action_or_protocol_copy_fallback() {
+        let atoms = action_atoms();
+        let source_actions = [XwaylandDndAction::Copy, XwaylandDndAction::Move];
+        assert_eq!(
+            decode_status_action(
+                true,
+                11,
+                Some(XwaylandDndAction::Copy),
+                &source_actions,
+                &atoms
+            ),
+            (true, Some(XwaylandDndAction::Copy))
+        );
+        assert_eq!(
+            decode_status_action(
+                true,
+                12,
+                Some(XwaylandDndAction::Copy),
+                &source_actions,
+                &atoms
+            ),
+            (false, None)
+        );
+        assert_eq!(
+            decode_status_action(
+                true,
+                11,
+                Some(XwaylandDndAction::Move),
+                &source_actions,
+                &atoms
+            ),
+            (true, Some(XwaylandDndAction::Copy))
+        );
+        assert_eq!(
+            decode_status_action(
+                true,
+                12,
+                Some(XwaylandDndAction::Ask),
+                &source_actions,
+                &atoms
+            ),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn xdnd_finished_decodes_v5_result_and_ignores_v5_fields_before_version_five() {
+        let atoms = action_atoms();
+        let source_actions = [XwaylandDndAction::Copy, XwaylandDndAction::Move];
+        assert_eq!(
+            decode_xdnd_finished(
+                [20, XDND_FINISHED_ACCEPTED, 12, 0, 0],
+                5,
+                XwaylandDndAction::Move,
+                &source_actions,
+                &atoms,
+            ),
+            XdndFinishedResult {
+                accepted: true,
+                action: Some(XwaylandDndAction::Move),
+            }
+        );
+        assert_eq!(
+            decode_xdnd_finished(
+                [20, 0, 12, 0, 0],
+                5,
+                XwaylandDndAction::Move,
+                &source_actions,
+                &atoms,
+            ),
+            XdndFinishedResult {
+                accepted: false,
+                action: None,
+            }
+        );
+        assert_eq!(
+            decode_xdnd_finished(
+                [20, 0, 15, 0, 0],
+                4,
+                XwaylandDndAction::Copy,
+                &source_actions,
+                &atoms,
+            ),
+            XdndFinishedResult {
+                accepted: true,
+                action: Some(XwaylandDndAction::Copy),
+            }
+        );
+        assert_eq!(
+            decode_xdnd_finished(
+                [20, XDND_FINISHED_ACCEPTED, 15, 0, 0],
+                5,
+                XwaylandDndAction::Ask,
+                &source_actions,
+                &atoms,
+            ),
+            XdndFinishedResult {
+                accepted: false,
+                action: None,
+            }
+        );
     }
 }

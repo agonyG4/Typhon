@@ -1238,7 +1238,7 @@ fn x11_target_finish_does_not_require_a_mime() {
 }
 
 #[test]
-fn c2a_physical_drop_on_x11_target_fails_closed_without_pending_drag() {
+fn rejected_xdnd_terminal_cancels_drop_pending_wayland_source_once() {
     let mut drag = wayland_source_x11_target_drag(
         XwaylandDndAction::Copy,
         WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
@@ -1270,6 +1270,16 @@ fn c2a_physical_drop_on_x11_target_fails_closed_without_pending_drag() {
         drag.source_events(),
         [SourceWireEvent::DropPerformed, SourceWireEvent::Cancelled]
     );
+    let transitions = drag.state.take_xwayland_dnd_transitions();
+    assert!(matches!(
+        transitions.last(),
+        Some(XwaylandDndTransition::TargetFinished {
+            session_id,
+            target,
+            accepted: false,
+            action: None,
+        }) if *session_id == drag.session_id && *target == drag.target
+    ));
 }
 
 #[test]
@@ -1287,6 +1297,63 @@ fn rejected_x11_status_clears_the_canonical_action() {
     assert_eq!(active.target_action, None);
     assert_eq!(active.selected_action, 0);
     assert_eq!(active.accepted_mime, None);
+}
+
+#[test]
+fn late_exact_x11_status_reconciles_while_physical_drop_is_pending() {
+    let mut drag = wayland_source_x11_target_drag(
+        XwaylandDndAction::Copy,
+        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
+    );
+    let _ = drag.source_events();
+    drag.state.drop_active_drag();
+
+    assert!(drag.state.update_xwayland_drag_target_status(
+        drag.session_id,
+        drag.target,
+        true,
+        Some(XwaylandDndAction::Move),
+    ));
+    assert_eq!(
+        drag.state.active_drag.as_ref().map(|active| active.phase),
+        Some(DragSessionPhase::DropPendingXwaylandTarget)
+    );
+    assert_eq!(
+        drag.state
+            .active_drag
+            .as_ref()
+            .and_then(|active| active.target_action),
+        Some(XwaylandDndAction::Move)
+    );
+}
+
+#[test]
+fn exact_xdnd_selection_source_data_is_served_until_canonical_finish() {
+    use std::os::fd::OwnedFd;
+
+    let mut drag =
+        wayland_source_x11_target_drag(XwaylandDndAction::Copy, WaylandDndAction::Copy.mask());
+    let _ = drag.source_events();
+    drag.state.drop_active_drag();
+    let (sink, _reader) = UnixStream::pair().expect("payload sink");
+    let adapter_id = crate::xwayland::XwaylandDndAdapterId::new(drag.session_id, drag.generation)
+        .expect("exact adapter identity");
+
+    assert!(drag.state.request_xwayland_dnd_source_data(
+        crate::xwayland::XwaylandDndSourceDataRequest {
+            transfer_id: crate::xwayland::XwaylandDndSourceTransferId {
+                source: crate::xwayland::XwaylandDndSourceProxyId {
+                    adapter_id,
+                    xid: 0x880,
+                },
+                serial: NonZeroU64::new(1).unwrap(),
+            },
+            target: drag.target,
+            requestor: drag.target.xid(),
+            mime_type: "text/plain".to_owned(),
+            sink: OwnedFd::from(sink),
+        }
+    ));
 }
 
 #[test]

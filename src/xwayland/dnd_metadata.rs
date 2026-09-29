@@ -307,18 +307,25 @@ pub struct XwaylandDndSourceTransferId {
     pub serial: NonZeroU64,
 }
 
-/// Generation/session-qualified semantic feedback from the XWM wire adapter.
-/// `XdndStatus` has no MIME field, so acceptance and action stay independent
-/// from any later `XdndSelection` conversion request.
+/// Ordered semantic feedback from the bounded XWM wire adapter. Status may
+/// coalesce before a terminal edge; terminal authority is always preserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XwaylandDndStatusFeedback {
-    pub session_id: CanonicalDndSessionId,
-    pub target: X11WindowHandle,
-    pub accepted: bool,
-    pub action: Option<XwaylandDndAction>,
+pub enum XwaylandDndFeedback {
+    Status {
+        session_id: CanonicalDndSessionId,
+        target: X11WindowHandle,
+        accepted: bool,
+        action: Option<XwaylandDndAction>,
+    },
+    Terminal {
+        session_id: CanonicalDndSessionId,
+        target: X11WindowHandle,
+        accepted: bool,
+        action: Option<XwaylandDndAction>,
+    },
 }
 
-/// Move-only Wayland source read requested by the exact live XDND proxy.
+/// Move-only Wayland source read requested by the exact active XDND session.
 #[derive(Debug)]
 pub struct XwaylandDndSourceDataRequest {
     pub transfer_id: XwaylandDndSourceTransferId,
@@ -328,10 +335,11 @@ pub struct XwaylandDndSourceDataRequest {
     pub sink: OwnedFd,
 }
 
-/// Canonical DND snapshots for a later XWM adapter. The compositor publishes
-/// one latest transition at a time and never stores a second active drag here.
-/// Each target snapshot carries enough source metadata to reconcile against
-/// the adapter's previous wire target if an intermediate position was replaced.
+/// Canonical DND snapshots consumed by the active XWM adapter. The compositor
+/// owns the sole active drag; this outbox carries bounded transitions for that
+/// drag. Each target snapshot carries enough source metadata to reconcile
+/// against the adapter's prior wire target if an intermediate position was
+/// replaced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum XwaylandDndTransition {
     TargetEntered {
@@ -415,7 +423,7 @@ impl XwaylandDndTransition {
 }
 
 /// Ordered, bounded semantic transitions from canonical compositor state to
-/// the future XWM adapter. Only adjacent continuous updates with identical
+/// the active XWM adapter. Only adjacent continuous updates with identical
 /// session/target or offer identity may replace one another.
 #[derive(Debug, Default)]
 pub struct XwaylandDndOutbox {

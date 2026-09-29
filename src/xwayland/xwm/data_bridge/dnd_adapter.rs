@@ -1,5 +1,13 @@
 //! X11 wire protocol adapter for canonical Wayland-origin DND sessions.
 
+#[path = "dnd_adapter_discovery.rs"]
+mod discovery;
+use discovery::{
+    create_source_proxy, issue_aware_query, issue_proxy_validation,
+    publish_source_metadata_and_claim, reply_is_current, start_target_discovery,
+    valid_aware_version, valid_single_window,
+};
+
 use x11rb::{
     connection::{Connection, DiscardMode, RequestConnection, RequestKind},
     cookie::Cookie,
@@ -10,9 +18,10 @@ use x11rb::{
 use super::{
     super::{X11WindowHandle, XwaylandGeneration, Xwm, XwmError, atoms::XwmAtomName},
     dnd::{
-        CoalescedPosition, DND_REPLY_BUDGET, DndPendingReply, DndStatusFeedback, DndWireProgress,
-        PositionDisposition, SOURCE_OWNERSHIP_TIMEOUT_NS, SOURCE_TIMESTAMP_TIMEOUT_NS,
-        TARGET_DISCOVERY_TIMEOUT_NS, TARGET_STATUS_TIMEOUT_NS,
+        CoalescedPosition, DND_REPLY_BUDGET, DndFeedback, DndPendingReply, DndStatusFeedback,
+        DndStatusResult, DndTerminalFeedback, DndWireProgress, PositionDisposition,
+        SOURCE_OWNERSHIP_TIMEOUT_NS, SOURCE_TIMESTAMP_TIMEOUT_NS, TARGET_DISCOVERY_TIMEOUT_NS,
+        TARGET_FINISHED_TIMEOUT_NS, TARGET_STATUS_TIMEOUT_NS,
     },
 };
 use crate::xwayland::{
@@ -43,6 +52,17 @@ pub(crate) fn apply_transitions(
                 {
                     continue;
                 }
+                if xwm.data_bridge.dnd.active_session().is_some_and(|session| {
+                    matches!(
+                        session.progress,
+                        DndWireProgress::DropPending
+                            | DndWireProgress::DropPendingAwaitingStatus
+                            | DndWireProgress::AwaitingFinished
+                            | DndWireProgress::TerminalConsumed
+                    )
+                }) {
+                    continue;
+                }
                 if xwm.data_bridge.dnd.active_id() != Some(id) {
                     retire_active_session(xwm)?;
                     if !xwm
@@ -54,7 +74,13 @@ pub(crate) fn apply_transitions(
                     }
                     create_source_proxy(xwm, id, now_ns)?;
                 }
-                if let Some(session) = xwm.data_bridge.dnd.active.as_mut() {
+                if let Some(session) = xwm
+                    .data_bridge
+                    .dnd
+                    .active
+                    .as_mut()
+                    .filter(|session| session.id == id)
+                {
                     session.latest_position = Some(super::dnd::CoalescedPosition {
                         x,
                         y,
@@ -74,7 +100,7 @@ pub(crate) fn apply_transitions(
                 let Some(id) = XwaylandDndAdapterId::new(session_id, xwm.generation) else {
                     continue;
                 };
-                let (current_target, positioned, discovering) = {
+                let (current_target, can_send_position, discovering, frozen) = {
                     let Some(session) = xwm
                         .data_bridge
                         .dnd
@@ -84,23 +110,40 @@ pub(crate) fn apply_transitions(
                     else {
                         continue;
                     };
-                    if session.target == Some(target) || session.discovery_target == Some(target) {
+                    let frozen = matches!(
+                        session.progress,
+                        DndWireProgress::DropPending
+                            | DndWireProgress::DropPendingAwaitingStatus
+                            | DndWireProgress::AwaitingFinished
+                            | DndWireProgress::TerminalConsumed
+                    );
+                    if !frozen
+                        && (session.target == Some(target)
+                            || session.discovery_target == Some(target))
+                    {
                         session.latest_position = Some(CoalescedPosition { x, y, action });
                     }
                     (
                         session.target == Some(target),
-                        session.progress == DndWireProgress::Positioned,
+                        matches!(
+                            session.progress,
+                            DndWireProgress::Positioned | DndWireProgress::AwaitingStatus
+                        ),
                         session.discovery_target == Some(target),
+                        frozen,
                     )
                 };
-                if current_target && positioned {
+                if frozen {
+                    continue;
+                }
+                if current_target && can_send_position {
                     match xwm.data_bridge.dnd.queue_position(
                         id,
                         target,
                         CoalescedPosition { x, y, action },
                     ) {
-                        PositionDisposition::SendNow(_) => {
-                            send_coalesced_position(xwm, id, target, now_ns)?;
+                        PositionDisposition::SendNow(position) => {
+                            send_coalesced_position(xwm, id, target, position, now_ns)?;
                         }
                         PositionDisposition::Coalesced | PositionDisposition::Stale => {}
                     }
@@ -115,14 +158,44 @@ pub(crate) fn apply_transitions(
                 leave_target(xwm, id, target)?;
             }
             XwaylandDndTransition::DropRequested {
-                session_id, target, ..
+                session_id,
+                target,
+                action,
+                ..
             } => {
                 let Some(id) = XwaylandDndAdapterId::new(session_id, xwm.generation) else {
                     continue;
                 };
-                // C2-A has no successful Drop/Finished path. Leave wire hover;
-                // the runtime rejects this exact canonical pending target.
-                leave_target(xwm, id, target)?;
+                let Some(session) = xwm
+                    .data_bridge
+                    .dnd
+                    .active_session()
+                    .filter(|session| session.id == id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                if !matches!(session_id, CanonicalDndSessionId::Wayland(_))
+                    || matches!(
+                        session.progress,
+                        DndWireProgress::DropPending
+                            | DndWireProgress::DropPendingAwaitingStatus
+                            | DndWireProgress::AwaitingFinished
+                            | DndWireProgress::TerminalConsumed
+                    )
+                {
+                    continue;
+                }
+                if session.target != Some(target)
+                    || !xwm.data_bridge.dnd.request_drop(id, target, action)
+                {
+                    reject_drop_request(xwm, id, target)?;
+                    continue;
+                }
+                if xwm.data_bridge.dnd.awaiting_status(id) {
+                    continue;
+                }
+                resolve_pending_drop(xwm, id, target, now_ns)?;
             }
             XwaylandDndTransition::TargetFinished {
                 session_id, target, ..
@@ -130,7 +203,14 @@ pub(crate) fn apply_transitions(
                 let Some(id) = XwaylandDndAdapterId::new(session_id, xwm.generation) else {
                     continue;
                 };
-                leave_target(xwm, id, target)?;
+                if xwm
+                    .data_bridge
+                    .dnd
+                    .active_session()
+                    .is_some_and(|session| session.id == id && session.target == Some(target))
+                {
+                    retire_terminal_session_without_leave(xwm, id)?;
+                }
             }
             XwaylandDndTransition::Retired {
                 session_id,
@@ -139,7 +219,7 @@ pub(crate) fn apply_transitions(
                 if generation == xwm.generation
                     && let Some(id) = XwaylandDndAdapterId::new(session_id, generation)
                 {
-                    retire_session(xwm, id)?;
+                    retire_session_for_canonical_retirement(xwm, id)?;
                 }
             }
             XwaylandDndTransition::SourceFeedback { .. }
@@ -149,402 +229,125 @@ pub(crate) fn apply_transitions(
     Ok(())
 }
 
-fn create_source_proxy(
+fn reject_drop_request(
     xwm: &mut Xwm,
     id: XwaylandDndAdapterId,
-    now_ns: u64,
+    target: X11WindowHandle,
 ) -> Result<(), XwmError> {
-    xwm.data_bridge
-        .dnd_outgoing
-        .initialize_generation(xwm.generation);
-    let window = xwm
-        .connection
-        .generate_id()
-        .map_err(|error| XwmError::IdAllocation(error.to_string()))?;
-    let cookie = xwm
-        .connection
-        .create_window(
-            0,
-            window,
-            xwm.supporting_wm_check,
-            0,
-            0,
-            1,
-            1,
-            0,
-            xproto::WindowClass::INPUT_ONLY,
-            0,
-            &xproto::CreateWindowAux::new().event_mask(
-                xproto::EventMask::PROPERTY_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY,
-            ),
-        )
-        .map_err(XwmError::Connection)?;
-    std::mem::forget(cookie);
-    xwm.data_bridge.dnd.internal_windows.insert(window);
-    if !xwm.data_bridge.dnd.bind_source_proxy(id, window) {
-        xwm.data_bridge.dnd.internal_windows.remove(&window);
-        let _ = xwm.connection.destroy_window(window);
-        return Ok(());
-    }
-    if let Some(session) = xwm.data_bridge.dnd.active.as_mut() {
-        session.timestamp_deadline_ns = Some(now_ns.saturating_add(SOURCE_TIMESTAMP_TIMEOUT_NS));
-    }
-    let property_cookie = xwm
-        .connection
-        .change_property32(
-            PropMode::REPLACE,
-            window,
-            xwm.atoms.get(XwmAtomName::XdndSourceTime),
-            AtomEnum::INTEGER,
-            &[1],
-        )
-        .map_err(XwmError::Connection)?;
-    std::mem::forget(property_cookie);
-
-    let (mime_types, deadline_ns) = {
-        let session = xwm
-            .data_bridge
-            .dnd
-            .active_session()
-            .ok_or(XwmError::InvalidCommand("missing XDND session"))?;
-        (
-            session.mime_types.as_slice().to_vec(),
-            now_ns.saturating_add(SOURCE_TIMESTAMP_TIMEOUT_NS),
-        )
-    };
-    for (ordinal, mime_type) in mime_types.into_iter().enumerate() {
-        let cookie = xwm
-            .connection
-            .intern_atom(false, mime_type.as_bytes())
-            .map_err(XwmError::Connection)?;
-        let sequence = cookie.sequence_number();
-        std::mem::forget(cookie);
-        xwm.data_bridge.dnd.pending_replies.insert(
-            sequence,
-            DndPendingReply::MimeAtom {
-                id,
-                ordinal,
-                deadline_ns,
-            },
-        );
-    }
-    Ok(())
-}
-
-fn start_target_discovery(
-    xwm: &mut Xwm,
-    id: XwaylandDndAdapterId,
-    actual: X11WindowHandle,
-    now_ns: u64,
-) -> Result<(), XwmError> {
-    if actual.generation() != xwm.generation || actual.xid() == 0 {
-        return Ok(());
-    }
-    if let Some(session) = xwm.data_bridge.dnd.active.as_ref()
-        && session.target == Some(actual)
-        && session.progress == DndWireProgress::Positioned
-    {
-        return Ok(());
-    }
-    cancel_discovery_replies(xwm, id, None);
-    if let Some(old_target) = xwm
+    if let Some(current_target) = xwm
         .data_bridge
         .dnd
         .active_session()
+        .filter(|session| session.id == id)
         .and_then(|session| session.target)
-        && old_target != actual
     {
-        send_leave_for_current_target(xwm, id, old_target)?;
-        let _ = xwm.data_bridge.dnd.leave_target(id, old_target);
+        send_leave_for_current_target(xwm, id, current_target)?;
     }
-    let serial = xwm.data_bridge.dnd.next_discovery_serial.saturating_add(1);
-    if serial == 0 {
-        reject_target(xwm, id, actual);
-        return Ok(());
+    if xwm.data_bridge.dnd.consume_drop_rejection(id) {
+        push_terminal_feedback(xwm, id, target, false, None)?;
     }
-    xwm.data_bridge.dnd.next_discovery_serial = serial;
-    let deadline_ns = now_ns.saturating_add(TARGET_DISCOVERY_TIMEOUT_NS);
-    let Some(session) = xwm
+    Ok(())
+}
+
+fn reject_pending_drop(
+    xwm: &mut Xwm,
+    id: XwaylandDndAdapterId,
+    target: X11WindowHandle,
+) -> Result<(), XwmError> {
+    send_leave_for_current_target(xwm, id, target)?;
+    if xwm.data_bridge.dnd.consume_terminal_result(id) {
+        push_terminal_feedback(xwm, id, target, false, None)?;
+    }
+    Ok(())
+}
+
+fn push_terminal_feedback(
+    xwm: &mut Xwm,
+    id: XwaylandDndAdapterId,
+    target: X11WindowHandle,
+    accepted: bool,
+    action: Option<XwaylandDndAction>,
+) -> Result<(), XwmError> {
+    if xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
-        .filter(|session| session.id == id)
-    else {
-        return Ok(());
-    };
-    session.discovery_serial = serial;
-    session.discovery_target = Some(actual);
-    session.discovery_recipient = None;
-    session.discovery_deadline_ns = Some(deadline_ns);
-    let cookie = xwm
-        .connection
-        .get_property(
-            false,
-            actual.xid(),
-            xwm.atoms.get(XwmAtomName::XdndProxy),
-            AtomEnum::WINDOW,
-            0,
-            1,
-        )
-        .map_err(XwmError::Connection)?;
-    let sequence = cookie.sequence_number();
-    std::mem::forget(cookie);
-    xwm.data_bridge.dnd.pending_replies.insert(
-        sequence,
-        DndPendingReply::TargetProxy {
+        .push_terminal_feedback(DndTerminalFeedback {
             id,
-            actual,
-            serial,
-            deadline_ns,
-        },
-    );
-    Ok(())
-}
-
-fn valid_single_window(reply: &xproto::GetPropertyReply) -> Option<u32> {
-    if reply.format != 32 || reply.type_ != u32::from(AtomEnum::WINDOW) || reply.bytes_after != 0 {
-        return None;
-    }
-    let values = reply.value32()?.collect::<Vec<_>>();
-    (values.len() == 1 && values[0] != 0).then_some(values[0])
-}
-
-fn valid_aware_version(reply: &xproto::GetPropertyReply) -> Option<XwaylandDndVersion> {
-    if reply.format != 32 || reply.type_ != u32::from(AtomEnum::ATOM) || reply.bytes_after != 0 {
-        return None;
-    }
-    let values = reply.value32()?.collect::<Vec<_>>();
-    if values.len() != 1 {
-        return None;
-    }
-    XwaylandDndVersion::negotiate_target(values[0])
-}
-
-fn issue_aware_query(
-    xwm: &mut Xwm,
-    id: XwaylandDndAdapterId,
-    actual: X11WindowHandle,
-    recipient: u32,
-    serial: u64,
-    deadline_ns: u64,
-) -> Result<(), XwmError> {
-    let cookie = xwm
-        .connection
-        .get_property(
-            false,
-            recipient,
-            xwm.atoms.get(XwmAtomName::XdndAware),
-            AtomEnum::ATOM,
-            0,
-            1,
-        )
-        .map_err(XwmError::Connection)?;
-    let sequence = cookie.sequence_number();
-    std::mem::forget(cookie);
-    xwm.data_bridge.dnd.pending_replies.insert(
-        sequence,
-        DndPendingReply::Aware {
-            id,
-            actual,
-            recipient,
-            serial,
-            deadline_ns,
-        },
-    );
-    Ok(())
-}
-
-fn reply_is_current(
-    xwm: &Xwm,
-    id: XwaylandDndAdapterId,
-    actual: X11WindowHandle,
-    serial: u64,
-    deadline_ns: u64,
-    now_ns: u64,
-) -> bool {
-    xwm.generation == id.generation()
-        && deadline_ns > now_ns
-        && xwm.data_bridge.dnd.active_session().is_some_and(|session| {
-            session.id == id
-                && session.discovery_target == Some(actual)
-                && session.discovery_serial == serial
-                && session.discovery_deadline_ns == Some(deadline_ns)
+            target,
+            accepted,
+            action,
         })
+    {
+        Ok(())
+    } else {
+        Err(XwmError::InvalidCommand(
+            "XDND terminal feedback capacity exhausted",
+        ))
+    }
 }
 
-fn issue_proxy_validation(
+fn resolve_pending_drop(
     xwm: &mut Xwm,
     id: XwaylandDndAdapterId,
-    actual: X11WindowHandle,
-    proxy: u32,
-    serial: u64,
-    deadline_ns: u64,
-) -> Result<(), XwmError> {
-    let cookie = xwm
-        .connection
-        .get_property(
-            false,
-            proxy,
-            xwm.atoms.get(XwmAtomName::XdndProxy),
-            AtomEnum::WINDOW,
-            0,
-            1,
-        )
-        .map_err(XwmError::Connection)?;
-    let sequence = cookie.sequence_number();
-    std::mem::forget(cookie);
-    xwm.data_bridge.dnd.pending_replies.insert(
-        sequence,
-        DndPendingReply::ProxySelf {
-            id,
-            actual,
-            proxy,
-            serial,
-            deadline_ns,
-        },
-    );
-    Ok(())
-}
-
-fn publish_source_metadata_and_claim(
-    xwm: &mut Xwm,
-    id: XwaylandDndAdapterId,
+    target: X11WindowHandle,
     now_ns: u64,
 ) -> Result<(), XwmError> {
     let Some(session) = xwm
         .data_bridge
         .dnd
         .active_session()
-        .filter(|session| session.id == id)
+        .filter(|session| {
+            session.id == id
+                && session.target == Some(target)
+                && session.progress == DndWireProgress::DropPending
+        })
+        .cloned()
     else {
         return Ok(());
     };
-    let Some(source_proxy) = session.source_proxy else {
-        return Ok(());
+    let Some(status) = session.last_status.filter(|status| status.accepted) else {
+        return reject_pending_drop(xwm, id, target);
     };
-    if session.mime_atoms.iter().any(Option::is_none)
-        || session.mime_atoms.len() != session.mime_types.as_slice().len()
+    let Some(action) = status.action else {
+        return reject_pending_drop(xwm, id, target);
+    };
+    if session.pending_drop_action.is_none()
+        || !session.source_actions.contains(&action)
+        || action.to_wayland_action().is_none()
+        || (session
+            .target_version
+            .is_none_or(|version| version.get() < 5)
+            && action == XwaylandDndAction::Ask)
+    {
+        return reject_pending_drop(xwm, id, target);
+    }
+    let (Some(source_proxy), Some(recipient), Some(timestamp), Some(_version)) = (
+        session.source_proxy,
+        session.wire_recipient,
+        session
+            .ownership_timestamp
+            .filter(|_| session.ownership_confirmed),
+        session.target_version,
+    ) else {
+        return reject_pending_drop(xwm, id, target);
+    };
+    let event = super::dnd_wire::encode_xdnd_drop(super::dnd_wire::XdndDropFields {
+        actual_target: target.xid(),
+        source_proxy,
+        timestamp,
+        drop_atom: xwm.atoms.get(XwmAtomName::XdndDrop),
+    });
+    let deadline_ns = now_ns.saturating_add(TARGET_FINISHED_TIMEOUT_NS);
+    if !xwm
+        .data_bridge
+        .dnd
+        .mark_awaiting_finished(id, action, deadline_ns)
     {
         return Ok(());
     }
-    let Some(timestamp) = session.ownership_timestamp else {
-        return Ok(());
-    };
-    let already_claimed = session.ownership_claim_issued;
-    let mime_atoms = session
-        .mime_atoms
-        .iter()
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    let source_actions = session.source_actions.clone();
-    if mime_atoms.len() > 3 {
-        let cookie = xwm
-            .connection
-            .change_property32(
-                PropMode::REPLACE,
-                source_proxy,
-                xwm.atoms.get(XwmAtomName::XdndTypeList),
-                AtomEnum::ATOM,
-                &mime_atoms,
-            )
-            .map_err(XwmError::Connection)?;
-        std::mem::forget(cookie);
-    }
-    if source_actions.contains(&XwaylandDndAction::Ask) {
-        let concrete = super::dnd_wire::wayland_actions(&source_actions)
-            .into_iter()
-            .filter(|action| {
-                matches!(
-                    action,
-                    crate::xwayland::WaylandDndAction::Copy
-                        | crate::xwayland::WaylandDndAction::Move
-                )
-            })
-            .collect::<Vec<_>>();
-        let atoms = concrete
-            .iter()
-            .filter_map(|action| match action {
-                crate::xwayland::WaylandDndAction::Copy => {
-                    Some(xwm.atoms.get(XwmAtomName::XdndActionCopy))
-                }
-                crate::xwayland::WaylandDndAction::Move => {
-                    Some(xwm.atoms.get(XwmAtomName::XdndActionMove))
-                }
-                crate::xwayland::WaylandDndAction::Ask => None,
-            })
-            .collect::<Vec<_>>();
-        if !atoms.is_empty() {
-            let cookie = xwm
-                .connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    source_proxy,
-                    xwm.atoms.get(XwmAtomName::XdndActionList),
-                    AtomEnum::ATOM,
-                    &atoms,
-                )
-                .map_err(XwmError::Connection)?;
-            std::mem::forget(cookie);
-            let mut descriptions = Vec::new();
-            for action in concrete {
-                descriptions.extend_from_slice(match action {
-                    crate::xwayland::WaylandDndAction::Copy => b"Copy\0",
-                    crate::xwayland::WaylandDndAction::Move => b"Move\0",
-                    crate::xwayland::WaylandDndAction::Ask => b"Ask\0",
-                });
-            }
-            let cookie = xwm
-                .connection
-                .change_property8(
-                    PropMode::REPLACE,
-                    source_proxy,
-                    xwm.atoms.get(XwmAtomName::XdndActionDescription),
-                    xwm.atoms.get(XwmAtomName::String),
-                    &descriptions,
-                )
-                .map_err(XwmError::Connection)?;
-            std::mem::forget(cookie);
-        }
-    }
-    if !already_claimed {
-        let cookie = xwm
-            .connection
-            .set_selection_owner(
-                source_proxy,
-                xwm.atoms.get(XwmAtomName::XdndSelection),
-                timestamp,
-            )
-            .map_err(XwmError::Connection)?;
-        std::mem::forget(cookie);
-        let cookie = xwm
-            .connection
-            .get_selection_owner(xwm.atoms.get(XwmAtomName::XdndSelection))
-            .map_err(XwmError::Connection)?;
-        let sequence = cookie.sequence_number();
-        std::mem::forget(cookie);
-        let deadline_ns = now_ns.saturating_add(SOURCE_OWNERSHIP_TIMEOUT_NS);
-        if let Some(session) = xwm
-            .data_bridge
-            .dnd
-            .active
-            .as_mut()
-            .filter(|session| session.id == id && session.source_proxy == Some(source_proxy))
-        {
-            session.ownership_claim_issued = true;
-            session.ownership_deadline_ns = Some(deadline_ns);
-        }
-        xwm.data_bridge.dnd.pending_replies.insert(
-            sequence,
-            DndPendingReply::Ownership {
-                id,
-                source_proxy,
-                timestamp,
-                deadline_ns,
-            },
-        );
-    }
+    xwm.connection
+        .send_event(false, recipient, xproto::EventMask::NO_EVENT, event)
+        .map_err(XwmError::Connection)?;
     Ok(())
 }
 
@@ -602,6 +405,7 @@ fn maybe_send_enter(xwm: &mut Xwm, id: XwaylandDndAdapterId, now_ns: u64) -> Res
         let _ = xwm.data_bridge.dnd.leave_target(id, actual);
         return Ok(());
     };
+    let position = CoalescedPosition { action, ..position };
     let messages =
         super::dnd_wire::encode_enter_and_initial_position(super::dnd_wire::EnterPositionFields {
             actual_target: actual.xid(),
@@ -630,16 +434,13 @@ fn maybe_send_enter(xwm: &mut Xwm, id: XwaylandDndAdapterId, now_ns: u64) -> Res
     xwm.connection
         .send_event(false, recipient, xproto::EventMask::NO_EVENT, messages[1])
         .map_err(XwmError::Connection)?;
-    if let Some(session) = xwm
+    if !xwm.data_bridge.dnd.mark_initial_position_sent(id, position) {
+        return Ok(());
+    }
+    let _ = xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
-        .filter(|session| session.id == id)
-    {
-        session.awaiting_status = true;
-        session.status_deadline_ns = Some(now_ns.saturating_add(TARGET_STATUS_TIMEOUT_NS));
-    }
+        .set_status_deadline(id, now_ns.saturating_add(TARGET_STATUS_TIMEOUT_NS));
     Ok(())
 }
 
@@ -647,6 +448,7 @@ fn send_coalesced_position(
     xwm: &mut Xwm,
     id: XwaylandDndAdapterId,
     target: X11WindowHandle,
+    position: CoalescedPosition,
     now_ns: u64,
 ) -> Result<(), XwmError> {
     let Some(session) = xwm
@@ -657,15 +459,14 @@ fn send_coalesced_position(
     else {
         return Ok(());
     };
-    let position = session.latest_position.unwrap_or(CoalescedPosition {
-        x: f64::from(session.x),
-        y: f64::from(session.y),
-        action: session.action,
-    });
     let Some(coordinates) = super::dnd_wire::pack_root_coordinates(position.x, position.y) else {
-        send_leave_for_current_target(xwm, id, target)?;
-        reject_target(xwm, id, target);
-        let _ = xwm.data_bridge.dnd.leave_target(id, target);
+        if matches!(session.progress, DndWireProgress::DropPendingAwaitingStatus) {
+            reject_pending_drop(xwm, id, target)?;
+        } else {
+            send_leave_for_current_target(xwm, id, target)?;
+            reject_target(xwm, id, target);
+            let _ = xwm.data_bridge.dnd.leave_target(id, target);
+        }
         return Ok(());
     };
     let source_proxy = session.source_proxy.unwrap_or_default();
@@ -676,9 +477,13 @@ fn send_coalesced_position(
         .or_else(|| super::dnd_wire::requested_action(&session.source_actions))
         .and_then(|action| super::dnd_wire::wayland_action_atom(&xwm.atoms, action))
     else {
-        send_leave_for_current_target(xwm, id, target)?;
-        reject_target(xwm, id, target);
-        let _ = xwm.data_bridge.dnd.leave_target(id, target);
+        if matches!(session.progress, DndWireProgress::DropPendingAwaitingStatus) {
+            reject_pending_drop(xwm, id, target)?;
+        } else {
+            send_leave_for_current_target(xwm, id, target)?;
+            reject_target(xwm, id, target);
+            let _ = xwm.data_bridge.dnd.leave_target(id, target);
+        }
         return Ok(());
     };
     let event = xproto::ClientMessageEvent {
@@ -698,16 +503,10 @@ fn send_coalesced_position(
     xwm.connection
         .send_event(false, recipient, xproto::EventMask::NO_EVENT, event)
         .map_err(XwmError::Connection)?;
-    if let Some(session) = xwm
+    let _ = xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
-        .filter(|session| session.id == id)
-    {
-        session.awaiting_status = true;
-        session.status_deadline_ns = Some(now_ns.saturating_add(TARGET_STATUS_TIMEOUT_NS));
-    }
+        .set_status_deadline(id, now_ns.saturating_add(TARGET_STATUS_TIMEOUT_NS));
     Ok(())
 }
 
@@ -748,6 +547,18 @@ fn leave_target(
     id: XwaylandDndAdapterId,
     target: X11WindowHandle,
 ) -> Result<(), XwmError> {
+    if xwm.data_bridge.dnd.active_session().is_some_and(|session| {
+        session.id == id
+            && matches!(
+                session.progress,
+                DndWireProgress::DropPending
+                    | DndWireProgress::DropPendingAwaitingStatus
+                    | DndWireProgress::AwaitingFinished
+                    | DndWireProgress::TerminalConsumed
+            )
+    }) {
+        return Ok(());
+    }
     send_leave_for_current_target(xwm, id, target)?;
     cancel_discovery_replies(xwm, id, Some(target));
     let manager = &mut xwm.data_bridge.dnd;
@@ -807,7 +618,7 @@ fn cancel_discovery_replies(
 }
 
 fn reject_target(xwm: &mut Xwm, id: XwaylandDndAdapterId, target: X11WindowHandle) {
-    xwm.data_bridge.dnd.push_feedback(DndStatusFeedback {
+    xwm.data_bridge.dnd.push_status_feedback(DndStatusFeedback {
         id,
         target,
         accepted: false,
@@ -830,34 +641,75 @@ fn retire_active_session(xwm: &mut Xwm) -> Result<(), XwmError> {
     let Some(id) = xwm.data_bridge.dnd.active_id() else {
         return Ok(());
     };
-    retire_session(xwm, id)
+    retire_hover_session_with_leave(xwm, id)
 }
 
-fn retire_session(xwm: &mut Xwm, id: XwaylandDndAdapterId) -> Result<(), XwmError> {
-    retire_session_inner(xwm, id, true)
-}
-
-fn retire_session_inner(
+fn retire_hover_session_with_leave(
     xwm: &mut Xwm,
     id: XwaylandDndAdapterId,
-    destroy_source_proxy: bool,
 ) -> Result<(), XwmError> {
-    if let Some(target) = xwm
+    retire_session_resources(xwm, id, RetirementWireSemantics::LeaveHoverTarget)
+}
+
+fn retire_terminal_session_without_leave(
+    xwm: &mut Xwm,
+    id: XwaylandDndAdapterId,
+) -> Result<(), XwmError> {
+    retire_session_resources(xwm, id, RetirementWireSemantics::NoLeaveAfterDrop)
+}
+
+fn retire_session_for_canonical_retirement(
+    xwm: &mut Xwm,
+    id: XwaylandDndAdapterId,
+) -> Result<(), XwmError> {
+    let dropped = xwm
         .data_bridge
         .dnd
         .active_session()
         .filter(|session| session.id == id)
-        .and_then(|session| session.target)
+        .is_some_and(|session| {
+            matches!(
+                session.progress,
+                DndWireProgress::AwaitingFinished | DndWireProgress::TerminalConsumed
+            )
+        });
+    if dropped {
+        retire_terminal_session_without_leave(xwm, id)
+    } else {
+        retire_hover_session_with_leave(xwm, id)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetirementWireSemantics {
+    LeaveHoverTarget,
+    NoLeaveAfterDrop,
+}
+
+fn retire_session_resources(
+    xwm: &mut Xwm,
+    id: XwaylandDndAdapterId,
+    wire_semantics: RetirementWireSemantics,
+) -> Result<(), XwmError> {
+    let exact_session = xwm
+        .data_bridge
+        .dnd
+        .active_session()
+        .filter(|session| session.id == id)
+        .cloned();
+    let Some(session) = exact_session else {
+        return Ok(());
+    };
+    if matches!(wire_semantics, RetirementWireSemantics::LeaveHoverTarget)
+        && !matches!(
+            session.progress,
+            DndWireProgress::AwaitingFinished | DndWireProgress::TerminalConsumed
+        )
+        && let Some(target) = session.target
     {
         send_leave_for_current_target(xwm, id, target)?;
     }
-    let source_proxy = xwm
-        .data_bridge
-        .dnd
-        .active_session()
-        .filter(|session| session.id == id)
-        .and_then(|session| session.source_proxy);
-    if let Some(source_proxy) = source_proxy {
+    if let Some(source_proxy) = session.source_proxy {
         super::super::dnd_outgoing::cancel_source(
             xwm,
             crate::xwayland::XwaylandDndSourceProxyId {
@@ -866,7 +718,8 @@ fn retire_session_inner(
             },
             crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
         )?;
-        if destroy_source_proxy {
+        xwm.data_bridge.dnd.internal_windows.remove(&source_proxy);
+        if !session.source_proxy_destroyed {
             let cookie = xwm
                 .connection
                 .destroy_window(source_proxy)
@@ -874,6 +727,12 @@ fn retire_session_inner(
             std::mem::forget(cookie);
         }
     }
+    discard_pending_session_replies(xwm, id);
+    let _ = xwm.data_bridge.dnd.retire(id);
+    Ok(())
+}
+
+fn discard_pending_session_replies(xwm: &mut Xwm, id: XwaylandDndAdapterId) {
     let sequences = xwm
         .data_bridge
         .dnd
@@ -891,16 +750,14 @@ fn retire_session_inner(
             same.then_some(*sequence)
         })
         .collect::<Vec<_>>();
-    for sequence in &sequences {
+    for sequence in sequences {
         xwm.connection.discard_reply(
-            *sequence,
+            sequence,
             RequestKind::HasResponse,
             DiscardMode::DiscardReply,
         );
-        xwm.data_bridge.dnd.pending_replies.remove(sequence);
+        xwm.data_bridge.dnd.pending_replies.remove(&sequence);
     }
-    let _ = xwm.data_bridge.dnd.retire(id);
-    Ok(())
 }
 
 pub(crate) fn is_internal_window(xwm: &Xwm, window: u32) -> bool {
@@ -937,7 +794,7 @@ pub(crate) fn property_notify(
     // so it cannot prove the exact property-event timestamp needed here.
     if event.time == 0 {
         reject_current_target(xwm, id);
-        retire_session(xwm, id)?;
+        retire_hover_session_with_leave(xwm, id)?;
         return Ok(true);
     }
     if let Some(session) = xwm
@@ -959,6 +816,10 @@ pub(crate) fn client_message(
     event: xproto::ClientMessageEvent,
     now_ns: u64,
 ) -> Result<bool, XwmError> {
+    if event.type_ == xwm.atoms.get(XwmAtomName::XdndFinished) {
+        handle_finished(xwm, event)?;
+        return Ok(true);
+    }
     if event.type_ != xwm.atoms.get(XwmAtomName::XdndStatus)
         || !is_internal_window(xwm, event.window)
     {
@@ -970,6 +831,10 @@ pub(crate) fn client_message(
     let id = session.id;
     let source_proxy = session.source_proxy.unwrap_or_default();
     let source_actions = session.source_actions.clone();
+    let progress = session.progress;
+    let requested_action = session
+        .outstanding_position
+        .and_then(|position| position.action);
     let Some(target) = session.target else {
         return Ok(true);
     };
@@ -981,39 +846,83 @@ pub(crate) fn client_message(
         || event.window != source_proxy
         || data[0] != target.xid()
         || target.generation() != xwm.generation
+        || !matches!(
+            progress,
+            DndWireProgress::AwaitingStatus | DndWireProgress::DropPendingAwaitingStatus
+        )
     {
         return Ok(true);
     }
-    let Some(next) = xwm
-        .data_bridge
-        .dnd
-        .acknowledge_status(id, source_proxy, target, recipient)
+    let accepted_bit = data[1] & super::dnd_wire::XDND_STATUS_ACCEPTED != 0;
+    let (accepted, action) = super::dnd_wire::decode_status_action(
+        accepted_bit,
+        data[4],
+        requested_action,
+        &source_actions,
+        &xwm.atoms,
+    );
+    let result = DndStatusResult {
+        accepted,
+        action,
+        requested_action,
+    };
+    let Some(acknowledgement) =
+        xwm.data_bridge
+            .dnd
+            .acknowledge_status(id, source_proxy, target, recipient, result)
     else {
         return Ok(true);
     };
-    let accepted_bit = data[1] & super::dnd_wire::XDND_STATUS_ACCEPTED != 0;
-    let (accepted, action) =
-        super::dnd_wire::decode_status_action(accepted_bit, data[4], &source_actions, &xwm.atoms);
     let feedback = DndStatusFeedback {
         id,
         target,
         accepted,
         action,
     };
-    xwm.data_bridge.dnd.push_feedback(feedback);
-    if let Some(position) = next {
-        if let Some(session) = xwm
-            .data_bridge
-            .dnd
-            .active
-            .as_mut()
-            .filter(|session| session.id == id)
-        {
-            session.latest_position = Some(position);
-        }
-        send_coalesced_position(xwm, id, target, now_ns)?;
+    xwm.data_bridge.dnd.push_status_feedback(feedback);
+    if let Some(position) = acknowledgement.next_position {
+        send_coalesced_position(xwm, id, target, position, now_ns)?;
+    } else if acknowledgement.pending_drop_action.is_some() {
+        resolve_pending_drop(xwm, id, target, now_ns)?;
     }
     Ok(true)
+}
+
+fn handle_finished(xwm: &mut Xwm, event: xproto::ClientMessageEvent) -> Result<(), XwmError> {
+    let Some(session) = xwm.data_bridge.dnd.active_session().cloned() else {
+        return Ok(());
+    };
+    let (Some(source_proxy), Some(target), Some(version), Some(accepted_status_action)) = (
+        session.source_proxy,
+        session.target,
+        session.target_version,
+        session.authorized_drop_action,
+    ) else {
+        return Ok(());
+    };
+    if event.format != 32
+        || event.window != source_proxy
+        || xwm.generation != session.id.generation()
+        || target.generation() != xwm.generation
+        || session.progress != DndWireProgress::AwaitingFinished
+    {
+        return Ok(());
+    }
+    let data = event.data.as_data32();
+    if data[0] != target.xid() {
+        return Ok(());
+    }
+    let decoded = super::dnd_wire::decode_xdnd_finished(
+        data,
+        version.get(),
+        accepted_status_action,
+        &session.source_actions,
+        &xwm.atoms,
+    );
+    if !xwm.data_bridge.dnd.consume_terminal_result(session.id) {
+        return Ok(());
+    }
+    push_terminal_feedback(xwm, session.id, target, decoded.accepted, decoded.action)
 }
 
 fn reject_current_target(xwm: &mut Xwm, id: XwaylandDndAdapterId) {
@@ -1262,7 +1171,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                     maybe_send_enter(xwm, id, now_ns)?;
                 } else {
                     reject_current_target(xwm, id);
-                    retire_session(xwm, id)?;
+                    retire_hover_session_with_leave(xwm, id)?;
                 }
             }
             DndPendingReply::MultipleRead {
@@ -1322,7 +1231,7 @@ pub(crate) fn handle_deadline(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError
             .is_some_and(|deadline| now_ns >= deadline)
     {
         reject_current_target(xwm, id);
-        retire_session(xwm, id)?;
+        retire_hover_session_with_leave(xwm, id)?;
     } else if session
         .discovery_deadline_ns
         .is_some_and(|deadline| now_ns >= deadline)
@@ -1330,13 +1239,30 @@ pub(crate) fn handle_deadline(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError
     {
         reject_target(xwm, id, target);
     } else if session
+        .finished_deadline_ns
+        .is_some_and(|deadline| now_ns >= deadline)
+        && session.progress == DndWireProgress::AwaitingFinished
+        && let Some(target) = session.target
+    {
+        if xwm.data_bridge.dnd.consume_terminal_result(id) {
+            push_terminal_feedback(xwm, id, target, false, None)?;
+        }
+    } else if session
         .status_deadline_ns
         .is_some_and(|deadline| now_ns >= deadline)
         && let Some(target) = session.target
     {
-        send_leave_for_current_target(xwm, id, target)?;
-        reject_target(xwm, id, target);
-        let _ = xwm.data_bridge.dnd.leave_target(id, target);
+        if session.progress == DndWireProgress::DropPendingAwaitingStatus {
+            if xwm.data_bridge.dnd.status_timed_out(id, now_ns) {
+                reject_pending_drop(xwm, id, target)?;
+            }
+        } else if session.progress == DndWireProgress::AwaitingStatus
+            && xwm.data_bridge.dnd.status_timed_out(id, now_ns)
+        {
+            send_leave_for_current_target(xwm, id, target)?;
+            reject_target(xwm, id, target);
+            let _ = xwm.data_bridge.dnd.leave_target(id, target);
+        }
     }
     let expired = xwm
         .data_bridge
@@ -1368,7 +1294,7 @@ pub(crate) fn handle_deadline(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError
                 | DndPendingReply::Aware { id, actual, .. } => reject_target(xwm, id, actual),
                 DndPendingReply::MimeAtom { id, .. } | DndPendingReply::Ownership { id, .. } => {
                     reject_current_target(xwm, id);
-                    retire_session(xwm, id)?;
+                    retire_hover_session_with_leave(xwm, id)?;
                 }
                 DndPendingReply::MultipleRead {
                     requestor,
@@ -1391,16 +1317,24 @@ pub(crate) fn handle_deadline(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError
     Ok(())
 }
 
-pub(crate) fn take_feedback(xwm: &mut Xwm) -> Vec<crate::xwayland::XwaylandDndStatusFeedback> {
+pub(crate) fn take_feedback(xwm: &mut Xwm) -> Vec<crate::xwayland::XwaylandDndFeedback> {
     xwm.data_bridge
         .dnd
         .take_feedback()
         .into_iter()
-        .map(|feedback| crate::xwayland::XwaylandDndStatusFeedback {
-            session_id: feedback.id.session_id(),
-            target: feedback.target,
-            accepted: feedback.accepted,
-            action: feedback.action,
+        .map(|feedback| match feedback {
+            DndFeedback::Status(feedback) => crate::xwayland::XwaylandDndFeedback::Status {
+                session_id: feedback.id.session_id(),
+                target: feedback.target,
+                accepted: feedback.accepted,
+                action: feedback.action,
+            },
+            DndFeedback::Terminal(feedback) => crate::xwayland::XwaylandDndFeedback::Terminal {
+                session_id: feedback.id.session_id(),
+                target: feedback.target,
+                accepted: feedback.accepted,
+                action: feedback.action,
+            },
         })
         .collect()
 }
@@ -1413,16 +1347,35 @@ pub(crate) fn selection_clear(
     if event.selection != xwm.atoms.get(XwmAtomName::XdndSelection) {
         return Ok(false);
     }
-    let Some(session) =
-        xwm.data_bridge.dnd.active_session().filter(|session| {
-            session.source_proxy == Some(event.owner) && session.ownership_confirmed
-        })
+    let Some(session) = xwm
+        .data_bridge
+        .dnd
+        .active_session()
+        .filter(|session| session.source_proxy == Some(event.owner) && session.ownership_confirmed)
+        .cloned()
     else {
         return Ok(false);
     };
     let id = session.id;
-    reject_current_target(xwm, id);
-    retire_session(xwm, id)?;
+    match session.progress {
+        DndWireProgress::DropPending | DndWireProgress::DropPendingAwaitingStatus => {
+            if let Some(target) = session.target {
+                reject_pending_drop(xwm, id, target)?;
+            }
+        }
+        DndWireProgress::AwaitingFinished => {
+            if let Some(target) = session.target
+                && xwm.data_bridge.dnd.consume_terminal_result(id)
+            {
+                push_terminal_feedback(xwm, id, target, false, None)?;
+            }
+        }
+        DndWireProgress::TerminalConsumed => {}
+        _ => {
+            reject_current_target(xwm, id);
+            retire_hover_session_with_leave(xwm, id)?;
+        }
+    }
     Ok(true)
 }
 
@@ -1432,12 +1385,70 @@ pub(crate) fn destroy_notify(xwm: &mut Xwm, window: u32) -> Result<bool, XwmErro
         .dnd
         .active_session()
         .filter(|session| session.source_proxy == Some(window))
-        .map(|session| session.id);
+        .cloned();
     let was_internal = xwm.data_bridge.dnd.internal_windows.remove(&window);
-    if let Some(id) = destroyed_source {
-        reject_current_target(xwm, id);
-        retire_session_inner(xwm, id, false)?;
+    if let Some(session) = destroyed_source {
+        let id = session.id;
+        let source = crate::xwayland::XwaylandDndSourceProxyId {
+            adapter_id: id,
+            xid: window,
+        };
+        xwm.data_bridge.dnd.mark_source_proxy_destroyed(id, window);
+        super::super::dnd_outgoing::cancel_source(
+            xwm,
+            source,
+            crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+        )?;
+        discard_pending_session_replies(xwm, id);
+        match session.progress {
+            DndWireProgress::DropPending | DndWireProgress::DropPendingAwaitingStatus => {
+                if let Some(target) = session.target {
+                    reject_pending_drop(xwm, id, target)?;
+                }
+            }
+            DndWireProgress::AwaitingFinished => {
+                if let Some(target) = session.target
+                    && xwm.data_bridge.dnd.consume_terminal_result(id)
+                {
+                    push_terminal_feedback(xwm, id, target, false, None)?;
+                }
+            }
+            DndWireProgress::TerminalConsumed => {}
+            _ => {
+                reject_current_target(xwm, id);
+                retire_hover_session_with_leave(xwm, id)?;
+            }
+        }
         return Ok(true);
+    }
+    let destroyed_target = xwm
+        .data_bridge
+        .dnd
+        .active_session()
+        .filter(|session| {
+            session.target.is_some_and(|target| target.xid() == window)
+                || session.wire_recipient == Some(window)
+        })
+        .cloned();
+    if let Some(session) = destroyed_target {
+        let Some(target) = session.target else {
+            return Ok(was_internal);
+        };
+        match session.progress {
+            DndWireProgress::DropPending
+            | DndWireProgress::DropPendingAwaitingStatus
+            | DndWireProgress::AwaitingFinished => {
+                discard_pending_session_replies(xwm, session.id);
+                if xwm.data_bridge.dnd.consume_terminal_result(session.id) {
+                    push_terminal_feedback(xwm, session.id, target, false, None)?;
+                }
+            }
+            DndWireProgress::TerminalConsumed => {}
+            _ => {
+                reject_target(xwm, session.id, target);
+                let _ = xwm.data_bridge.dnd.leave_target(session.id, target);
+            }
+        }
     }
     Ok(was_internal)
 }
@@ -1454,17 +1465,13 @@ pub(crate) fn retire_generation(
         generation,
         crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
     )?;
-    if let Some(session) = xwm.data_bridge.dnd.active_session().cloned() {
-        if let Some(target) = session.target {
-            send_leave_for_current_target(xwm, session.id, target)?;
-        }
-        if let Some(window) = session.source_proxy {
-            let cookie = xwm
-                .connection
-                .destroy_window(window)
-                .map_err(XwmError::Connection)?;
-            std::mem::forget(cookie);
-        }
+    if let Some(id) = xwm
+        .data_bridge
+        .dnd
+        .active_id()
+        .filter(|id| id.generation() == generation)
+    {
+        retire_session_for_canonical_retirement(xwm, id)?;
     }
     for sequence in std::mem::take(&mut xwm.data_bridge.dnd.pending_replies).into_keys() {
         xwm.connection.discard_reply(

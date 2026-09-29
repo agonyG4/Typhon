@@ -84,6 +84,7 @@ pub(crate) struct DndOutgoingTransfer {
 
 #[derive(Debug)]
 struct MultipleGroup {
+    source: XwaylandDndSourceProxyId,
     requestor: u32,
     request_time: u32,
     property: u32,
@@ -233,6 +234,7 @@ fn rewrite_multiple_parent_property(
 
 pub(crate) fn create_multiple_group(
     xwm: &mut Xwm,
+    source: XwaylandDndSourceProxyId,
     requestor: u32,
     request_time: u32,
     parent_property: u32,
@@ -251,6 +253,7 @@ pub(crate) fn create_multiple_group(
     manager.multiple_groups.insert(
         id,
         MultipleGroup {
+            source,
             requestor,
             request_time,
             property: parent_property,
@@ -536,9 +539,19 @@ pub(crate) fn handle_source_ready(
     {
         return Ok(false);
     }
+    let terminal_consumed = xwm
+        .data_bridge
+        .dnd_outgoing
+        .transfers
+        .get(&id)
+        .is_some_and(|transfer| terminal_result_consumed(xwm, transfer.source));
     let Some(mut transfer) = xwm.data_bridge.dnd_outgoing.transfers.remove(&id) else {
         return Ok(false);
     };
+    if terminal_consumed {
+        release_transfer_requestor(xwm, &transfer, false)?;
+        return Ok(true);
+    }
     if !current_source(xwm, transfer.source, transfer.target, transfer.requestor) {
         complete_conversion(xwm, transfer.notification, false, now_ns)?;
         release_transfer_requestor(xwm, &transfer, false)?;
@@ -577,6 +590,17 @@ fn current_source(
                 && session.source_proxy == Some(source.xid)
                 && session.ownership_confirmed
         })
+}
+
+fn terminal_result_consumed(xwm: &Xwm, source: XwaylandDndSourceProxyId) -> bool {
+    xwm.data_bridge.dnd.active_session().is_some_and(|session| {
+        session.id == source.adapter_id
+            && session.source_proxy == Some(source.xid)
+            && xwm
+                .data_bridge
+                .dnd
+                .terminal_event_consumed(source.adapter_id)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -887,9 +911,19 @@ pub(crate) fn property_deleted(
     let Some(id) = id else {
         return Ok(false);
     };
+    let terminal_consumed = xwm
+        .data_bridge
+        .dnd_outgoing
+        .transfers
+        .get(&id)
+        .is_some_and(|transfer| terminal_result_consumed(xwm, transfer.source));
     let Some(mut transfer) = xwm.data_bridge.dnd_outgoing.transfers.remove(&id) else {
         return Ok(false);
     };
+    if terminal_consumed {
+        release_transfer_requestor(xwm, &transfer, false)?;
+        return Ok(true);
+    }
     transfer.deadline_ns = now_ns.saturating_add(DND_TRANSFER_IDLE_TIMEOUT_NS);
     if !transfer.buffer.is_empty() {
         publish_chunk(xwm, &mut transfer, now_ns)?;
@@ -969,6 +1003,14 @@ pub(crate) fn cancel_source(
         }
         release_transfer_requestor(xwm, &transfer, false)?;
     }
+    xwm.data_bridge
+        .dnd_outgoing
+        .requests
+        .retain(|request| request.transfer_id.source != source);
+    xwm.data_bridge
+        .dnd_outgoing
+        .multiple_groups
+        .retain(|_, group| group.source != source);
     Ok(())
 }
 
@@ -1006,11 +1048,12 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
         let Some(transfer) = xwm.data_bridge.dnd_outgoing.transfers.remove(&id) else {
             continue;
         };
+        let terminal_consumed = terminal_result_consumed(xwm, transfer.source);
         xwm.data_bridge
             .dnd_outgoing
             .requests
             .retain(|request| request.transfer_id != id);
-        if !transfer.notify_ready {
+        if !terminal_consumed && !transfer.notify_ready {
             match transfer.notification {
                 ConversionNotification::Single {
                     requestor,
@@ -1045,7 +1088,9 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
         .filter_map(|(id, group)| (group.deadline_ns <= now_ns).then_some(*id))
         .collect::<Vec<_>>();
     for id in expired_groups {
-        if let Some(group) = xwm.data_bridge.dnd_outgoing.multiple_groups.remove(&id) {
+        if let Some(group) = xwm.data_bridge.dnd_outgoing.multiple_groups.remove(&id)
+            && !terminal_result_consumed(xwm, group.source)
+        {
             send_multiple_selection_notify(xwm, group.requestor, group.request_time, None)?;
         }
     }

@@ -21,7 +21,11 @@ pub enum DndWireProgress {
     AwaitingEnter,
     Entered,
     Positioned,
-    DropReady,
+    AwaitingStatus,
+    DropPending,
+    DropPendingAwaitingStatus,
+    AwaitingFinished,
+    TerminalConsumed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,14 +45,19 @@ pub struct DndSession {
     pub wire_recipient: Option<u32>,
     pub target_version: Option<XwaylandDndVersion>,
     pub progress: DndWireProgress,
-    pub terminal_event_consumed: bool,
     pub action: Option<XwaylandDndAction>,
     pub x: i32,
     pub y: i32,
-    pub awaiting_status: bool,
+    /// Exact Position currently awaiting the one corresponding Status.
+    pub outstanding_position: Option<CoalescedPosition>,
     pub coalesced_position: Option<CoalescedPosition>,
     pub latest_position: Option<CoalescedPosition>,
+    pub(super) last_status: Option<DndStatusResult>,
+    pub pending_drop_action: Option<XwaylandDndAction>,
+    pub authorized_drop_action: Option<XwaylandDndAction>,
     pub status_deadline_ns: Option<u64>,
+    pub finished_deadline_ns: Option<u64>,
+    pub source_proxy_destroyed: bool,
     pub mime_types: XwaylandDndMimeCatalog,
     pub source_actions: Vec<XwaylandDndAction>,
     pub mime_atoms: Vec<Option<u32>>,
@@ -65,6 +74,19 @@ pub struct CoalescedPosition {
     pub action: Option<XwaylandDndAction>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DndStatusResult {
+    pub accepted: bool,
+    pub action: Option<XwaylandDndAction>,
+    pub requested_action: Option<XwaylandDndAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct StatusAcknowledgement {
+    pub next_position: Option<CoalescedPosition>,
+    pub pending_drop_action: Option<XwaylandDndAction>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PositionDisposition {
     SendNow(CoalescedPosition),
@@ -77,7 +99,7 @@ pub struct DndManager {
     pub(super) active: Option<DndSession>,
     pub(super) internal_windows: HashSet<u32>,
     pub(super) pending_replies: BTreeMap<SequenceNumber, DndPendingReply>,
-    pub(super) feedback: VecDeque<DndStatusFeedback>,
+    pub(super) feedback: VecDeque<DndFeedback>,
     pub(super) next_discovery_serial: u64,
 }
 
@@ -133,28 +155,84 @@ pub(crate) struct DndStatusFeedback {
     pub action: Option<XwaylandDndAction>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DndTerminalFeedback {
+    pub id: XwaylandDndAdapterId,
+    pub target: X11WindowHandle,
+    pub accepted: bool,
+    pub action: Option<XwaylandDndAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DndFeedback {
+    Status(DndStatusFeedback),
+    Terminal(DndTerminalFeedback),
+}
+
 pub(super) const SOURCE_TIMESTAMP_TIMEOUT_NS: u64 = 2_000_000_000;
 pub(super) const SOURCE_OWNERSHIP_TIMEOUT_NS: u64 = 2_000_000_000;
 pub(super) const TARGET_DISCOVERY_TIMEOUT_NS: u64 = 2_000_000_000;
 pub(super) const TARGET_STATUS_TIMEOUT_NS: u64 = 1_000_000_000;
+/// Twice the 30-second idle transfer deadline, allowing a normal local direct
+/// or paced INCR read to finish before a malfunctioning target is cancelled.
+pub(super) const TARGET_FINISHED_TIMEOUT_NS: u64 = 60_000_000_000;
 pub(super) const DND_REPLY_BUDGET: usize = 64;
 pub(super) const MAX_PENDING_DND_REPLIES: usize = 128;
 pub(super) const MAX_MULTIPLE_PAIRS: usize = 64;
+const MAX_DND_FEEDBACK: usize = 2;
 
 impl DndManager {
-    pub(super) fn push_feedback(&mut self, feedback: DndStatusFeedback) {
+    pub(super) fn push_status_feedback(&mut self, feedback: DndStatusFeedback) {
+        if !self.active.as_ref().is_some_and(|session| {
+            session.id == feedback.id
+                && (session.target == Some(feedback.target)
+                    || session.discovery_target == Some(feedback.target))
+        }) {
+            return;
+        }
+        if self
+            .feedback
+            .iter()
+            .any(|entry| matches!(entry, DndFeedback::Terminal(_)))
+        {
+            return;
+        }
         if let Some(existing) = self
             .feedback
             .iter_mut()
-            .find(|existing| existing.id == feedback.id && existing.target == feedback.target)
+            .find(|entry| matches!(entry, DndFeedback::Status(_)))
         {
-            *existing = feedback;
+            *existing = DndFeedback::Status(feedback);
             return;
         }
-        if self.feedback.len() == 64 {
-            self.feedback.pop_front();
+        debug_assert!(self.feedback.len() < MAX_DND_FEEDBACK);
+        self.feedback.push_back(DndFeedback::Status(feedback));
+    }
+
+    /// Terminal feedback has a reserved position behind the latest Status.
+    /// The one-slot DND manager refuses replacement after a terminal edge, so
+    /// this bounded queue cannot silently discard terminal authority.
+    pub(super) fn push_terminal_feedback(&mut self, feedback: DndTerminalFeedback) -> bool {
+        if self.feedback.iter().any(
+            |entry| matches!(entry, DndFeedback::Terminal(existing) if existing.id == feedback.id),
+        ) {
+            return true;
         }
-        self.feedback.push_back(feedback);
+        while self.feedback.len() >= MAX_DND_FEEDBACK {
+            let Some(status_index) = self
+                .feedback
+                .iter()
+                .position(|entry| matches!(entry, DndFeedback::Status(_)))
+            else {
+                return false;
+            };
+            // Only Status entries coalesce. Keep the newest semantic Status
+            // before Terminal so an impossible duplicate-status overflow can
+            // never discard terminal authority or reverse the terminal edge.
+            self.feedback.remove(status_index);
+        }
+        self.feedback.push_back(DndFeedback::Terminal(feedback));
+        true
     }
 
     /// Install the canonical session identity for one XWM adapter view.
@@ -164,7 +242,21 @@ impl DndManager {
         id: XwaylandDndAdapterId,
         source: Option<X11WindowHandle>,
     ) -> bool {
-        if self.active.as_ref().is_some_and(|session| session.id == id) {
+        if self
+            .feedback
+            .iter()
+            .any(|entry| matches!(entry, DndFeedback::Terminal(_)))
+            || self.active.as_ref().is_some_and(|session| {
+                session.id == id
+                    || matches!(
+                        session.progress,
+                        DndWireProgress::DropPending
+                            | DndWireProgress::DropPendingAwaitingStatus
+                            | DndWireProgress::AwaitingFinished
+                            | DndWireProgress::TerminalConsumed
+                    )
+            })
+        {
             return false;
         }
         let source_matches = match (id.session_id(), source) {
@@ -191,14 +283,18 @@ impl DndManager {
             wire_recipient: None,
             target_version: None,
             progress: DndWireProgress::AwaitingEnter,
-            terminal_event_consumed: false,
             action: None,
             x: 0,
             y: 0,
-            awaiting_status: false,
+            outstanding_position: None,
             coalesced_position: None,
             latest_position: None,
+            last_status: None,
+            pending_drop_action: None,
+            authorized_drop_action: None,
             status_deadline_ns: None,
+            finished_deadline_ns: None,
+            source_proxy_destroyed: false,
             mime_types: XwaylandDndMimeCatalog::default(),
             source_actions: Vec::new(),
             mime_atoms: Vec::new(),
@@ -207,6 +303,7 @@ impl DndManager {
             discovery_deadline_ns: None,
             discovery_serial: 0,
         });
+        self.feedback.clear();
         true
     }
 
@@ -246,7 +343,7 @@ impl DndManager {
         true
     }
 
-    pub(crate) fn take_feedback(&mut self) -> Vec<DndStatusFeedback> {
+    pub(crate) fn take_feedback(&mut self) -> Vec<DndFeedback> {
         self.feedback.drain(..).collect()
     }
 
@@ -257,6 +354,7 @@ impl DndManager {
                 session.ownership_deadline_ns,
                 session.discovery_deadline_ns,
                 session.status_deadline_ns,
+                session.finished_deadline_ns,
             ]
             .into_iter()
             .flatten()
@@ -322,7 +420,7 @@ impl DndManager {
             || actual.xid() == 0
             || recipient == 0
             || session.target.is_some()
-            || session.terminal_event_consumed
+            || session.progress != DndWireProgress::AwaitingEnter
         {
             return false;
         }
@@ -336,7 +434,7 @@ impl DndManager {
         let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if session.progress != DndWireProgress::AwaitingEnter || session.terminal_event_consumed {
+        if session.progress != DndWireProgress::AwaitingEnter {
             return false;
         }
         session.progress = DndWireProgress::Entered;
@@ -360,7 +458,13 @@ impl DndManager {
                 DndWireProgress::Entered | DndWireProgress::Positioned
             )
             || (session.progress == DndWireProgress::Positioned && session.target != Some(target))
-            || session.terminal_event_consumed
+            || matches!(
+                session.progress,
+                DndWireProgress::DropPending
+                    | DndWireProgress::DropPendingAwaitingStatus
+                    | DndWireProgress::AwaitingFinished
+                    | DndWireProgress::TerminalConsumed
+            )
         {
             return false;
         }
@@ -383,48 +487,96 @@ impl DndManager {
         let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return PositionDisposition::Stale;
         };
-        if session.target != Some(target)
-            || session.progress != DndWireProgress::Positioned
-            || session.terminal_event_consumed
-        {
+        if session.target != Some(target) {
             return PositionDisposition::Stale;
         }
-        session.x = position.x.round() as i32;
-        session.y = position.y.round() as i32;
-        session.action = position.action;
-        if session.awaiting_status {
-            session.coalesced_position = Some(position);
-            PositionDisposition::Coalesced
-        } else {
-            session.awaiting_status = true;
-            PositionDisposition::SendNow(position)
+        let position = CoalescedPosition {
+            action: position
+                .action
+                .or_else(|| super::dnd_wire::requested_action(&session.source_actions)),
+            ..position
+        };
+        match session.progress {
+            DndWireProgress::AwaitingStatus => {
+                session.coalesced_position = Some(position);
+                PositionDisposition::Coalesced
+            }
+            DndWireProgress::Positioned => {
+                session.x = position.x.round() as i32;
+                session.y = position.y.round() as i32;
+                session.action = position.action;
+                session.outstanding_position = Some(position);
+                session.progress = DndWireProgress::AwaitingStatus;
+                PositionDisposition::SendNow(position)
+            }
+            _ => PositionDisposition::Stale,
         }
+    }
+
+    pub fn mark_initial_position_sent(
+        &mut self,
+        id: XwaylandDndAdapterId,
+        position: CoalescedPosition,
+    ) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+            return false;
+        };
+        if session.progress != DndWireProgress::Positioned || session.outstanding_position.is_some()
+        {
+            return false;
+        }
+        session.outstanding_position = Some(position);
+        session.progress = DndWireProgress::AwaitingStatus;
+        true
     }
 
     /// A status reply is useful only for the exact source proxy, actual target,
     /// validated recipient, and outstanding Position.
-    pub fn acknowledge_status(
+    pub(super) fn acknowledge_status(
         &mut self,
         id: XwaylandDndAdapterId,
         source_proxy: u32,
         actual_target: X11WindowHandle,
         recipient: u32,
-    ) -> Option<Option<CoalescedPosition>> {
+        status: DndStatusResult,
+    ) -> Option<StatusAcknowledgement> {
         let session = self.active.as_mut().filter(|session| {
             session.id == id
                 && session.source_proxy == Some(source_proxy)
                 && session.target == Some(actual_target)
                 && session.wire_recipient == Some(recipient)
-                && session.awaiting_status
-                && !session.terminal_event_consumed
+                && matches!(
+                    session.progress,
+                    DndWireProgress::AwaitingStatus | DndWireProgress::DropPendingAwaitingStatus
+                )
+                && session.outstanding_position.is_some()
         })?;
-        session.awaiting_status = false;
+        let drop_pending = session.progress == DndWireProgress::DropPendingAwaitingStatus;
+        session.last_status = Some(status);
         session.status_deadline_ns = None;
         let next = session.coalesced_position.take();
-        if next.is_some() {
-            session.awaiting_status = true;
+        let pending_drop_action = if drop_pending {
+            session.pending_drop_action
+        } else {
+            None
+        };
+        if let Some(position) = next {
+            session.outstanding_position = Some(position);
+            return Some(StatusAcknowledgement {
+                next_position: Some(position),
+                pending_drop_action,
+            });
         }
-        Some(next)
+        session.outstanding_position = None;
+        session.progress = if drop_pending {
+            DndWireProgress::DropPending
+        } else {
+            DndWireProgress::Positioned
+        };
+        Some(StatusAcknowledgement {
+            next_position: None,
+            pending_drop_action,
+        })
     }
 
     /// Leave one exact X11 target while keeping the canonical adapter session
@@ -438,8 +590,13 @@ impl DndManager {
             return false;
         };
         if target.generation() != id.generation()
-            || session.progress == DndWireProgress::DropReady
-            || session.terminal_event_consumed
+            || matches!(
+                session.progress,
+                DndWireProgress::DropPending
+                    | DndWireProgress::DropPendingAwaitingStatus
+                    | DndWireProgress::AwaitingFinished
+                    | DndWireProgress::TerminalConsumed
+            )
         {
             return false;
         }
@@ -450,9 +607,13 @@ impl DndManager {
         session.action = None;
         session.x = 0;
         session.y = 0;
-        session.awaiting_status = false;
+        session.outstanding_position = None;
         session.coalesced_position = None;
+        session.last_status = None;
+        session.pending_drop_action = None;
+        session.authorized_drop_action = None;
         session.status_deadline_ns = None;
+        session.finished_deadline_ns = None;
         true
     }
 
@@ -460,57 +621,150 @@ impl DndManager {
         let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if !session.awaiting_status
-            || session
-                .status_deadline_ns
-                .is_none_or(|deadline| now_ns < deadline)
+        if !matches!(
+            session.progress,
+            DndWireProgress::AwaitingStatus | DndWireProgress::DropPendingAwaitingStatus
+        ) || session
+            .status_deadline_ns
+            .is_none_or(|deadline| now_ns < deadline)
         {
             return false;
         }
-        session.awaiting_status = false;
+        session.outstanding_position = None;
         session.coalesced_position = None;
         session.status_deadline_ns = None;
         true
     }
 
     pub fn set_status_deadline(&mut self, id: XwaylandDndAdapterId, deadline_ns: u64) -> bool {
-        let Some(session) = self
-            .active
-            .as_mut()
-            .filter(|session| session.id == id && session.awaiting_status)
-        else {
+        let Some(session) = self.active.as_mut().filter(|session| {
+            session.id == id
+                && matches!(
+                    session.progress,
+                    DndWireProgress::AwaitingStatus | DndWireProgress::DropPendingAwaitingStatus
+                )
+        }) else {
             return false;
         };
         session.status_deadline_ns = Some(deadline_ns);
         true
     }
 
-    pub fn mark_drop_ready(&mut self, id: XwaylandDndAdapterId) -> bool {
+    pub fn request_drop(
+        &mut self,
+        id: XwaylandDndAdapterId,
+        target: X11WindowHandle,
+        action: XwaylandDndAction,
+    ) -> bool {
         let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if session.progress != DndWireProgress::Positioned
-            || session.target.is_none()
-            || session.action.is_none()
-            || session.terminal_event_consumed
+        let awaiting_status = session.progress == DndWireProgress::AwaitingStatus;
+        if session.target != Some(target)
+            || !matches!(
+                session.progress,
+                DndWireProgress::Positioned | DndWireProgress::AwaitingStatus
+            )
+            || session.source_proxy.is_none()
+            || !session.ownership_confirmed
+            || !session.source_actions.contains(&action)
+            || action.to_wayland_action().is_none()
+            || (!awaiting_status
+                && !session
+                    .last_status
+                    .is_some_and(|status| status.accepted && status.action == Some(action)))
         {
             return false;
         }
-        session.progress = DndWireProgress::DropReady;
+        session.pending_drop_action = Some(action);
+        session.progress = if awaiting_status {
+            DndWireProgress::DropPendingAwaitingStatus
+        } else {
+            DndWireProgress::DropPending
+        };
         true
     }
 
-    /// Claim one terminal adapter event for this exact session. This tracks
-    /// wire-event consumption; it does not transition canonical drag state.
-    pub fn consume_terminal_event(&mut self, id: XwaylandDndAdapterId) -> bool {
+    pub fn mark_awaiting_finished(
+        &mut self,
+        id: XwaylandDndAdapterId,
+        accepted_action: XwaylandDndAction,
+        deadline_ns: u64,
+    ) -> bool {
         let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
             return false;
         };
-        if session.progress == DndWireProgress::AwaitingEnter || session.terminal_event_consumed {
+        if session.progress != DndWireProgress::DropPending {
             return false;
         }
-        session.terminal_event_consumed = true;
+        session.authorized_drop_action = Some(accepted_action);
+        session.finished_deadline_ns = Some(deadline_ns);
+        session.progress = DndWireProgress::AwaitingFinished;
         true
+    }
+
+    /// Consume one exact wire terminal edge without completing canonical drag
+    /// state. Runtime submits the result back to the compositor for authority.
+    pub fn consume_terminal_result(&mut self, id: XwaylandDndAdapterId) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+            return false;
+        };
+        if !matches!(
+            session.progress,
+            DndWireProgress::DropPending
+                | DndWireProgress::DropPendingAwaitingStatus
+                | DndWireProgress::AwaitingFinished
+        ) {
+            return false;
+        }
+        session.progress = DndWireProgress::TerminalConsumed;
+        session.pending_drop_action = None;
+        session.outstanding_position = None;
+        session.coalesced_position = None;
+        session.status_deadline_ns = None;
+        session.finished_deadline_ns = None;
+        true
+    }
+
+    /// Consume an exact DropRequested edge that cannot be reconciled with the
+    /// current wire hover. This is a fail-closed adapter result, not canonical
+    /// completion; the compositor still validates the feedback identity.
+    pub fn consume_drop_rejection(&mut self, id: XwaylandDndAdapterId) -> bool {
+        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+            return false;
+        };
+        if session.progress == DndWireProgress::TerminalConsumed {
+            return false;
+        }
+        session.progress = DndWireProgress::TerminalConsumed;
+        session.pending_drop_action = None;
+        session.outstanding_position = None;
+        session.coalesced_position = None;
+        session.status_deadline_ns = None;
+        session.finished_deadline_ns = None;
+        true
+    }
+
+    pub fn mark_source_proxy_destroyed(&mut self, id: XwaylandDndAdapterId, window: u32) -> bool {
+        let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|session| session.id == id && session.source_proxy == Some(window))
+        else {
+            return false;
+        };
+        session.source_proxy_destroyed = true;
+        true
+    }
+
+    pub fn awaiting_status(&self, id: XwaylandDndAdapterId) -> bool {
+        self.active.as_ref().is_some_and(|session| {
+            session.id == id
+                && matches!(
+                    session.progress,
+                    DndWireProgress::AwaitingStatus | DndWireProgress::DropPendingAwaitingStatus
+                )
+        })
     }
 
     pub fn retire(&mut self, id: XwaylandDndAdapterId) -> bool {
@@ -547,7 +801,7 @@ impl DndManager {
         self.active
             .as_ref()
             .filter(|session| session.id == id)
-            .is_some_and(|session| session.terminal_event_consumed)
+            .is_some_and(|session| session.progress == DndWireProgress::TerminalConsumed)
     }
 
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
@@ -566,8 +820,10 @@ impl DndManager {
             | DndPendingReply::Ownership { id, .. }
             | DndPendingReply::MultipleRead { id, .. } => id.generation() != generation,
         });
-        self.feedback
-            .retain(|feedback| feedback.id.generation() != generation);
+        self.feedback.retain(|feedback| match feedback {
+            DndFeedback::Status(feedback) => feedback.id.generation() != generation,
+            DndFeedback::Terminal(feedback) => feedback.id.generation() != generation,
+        });
         self.internal_windows.clear();
     }
 }
@@ -656,26 +912,44 @@ mod tests {
             manager.active_session().unwrap().coalesced_position,
             Some(latest)
         );
-        assert_eq!(manager.acknowledge_status(id, 0x881, target, 0x441), None);
+        let status = DndStatusResult {
+            accepted: true,
+            action: Some(XwaylandDndAction::Copy),
+            requested_action: Some(XwaylandDndAction::Copy),
+        };
+        assert_eq!(
+            manager.acknowledge_status(id, 0x881, target, 0x441, status),
+            None
+        );
         assert_eq!(
             manager.acknowledge_status(
                 id,
                 0x880,
                 X11WindowHandle::new(target.generation(), 0x442),
-                0x441
+                0x441,
+                status,
             ),
             None
         );
         assert_eq!(
-            manager.acknowledge_status(id, 0x880, target, 0x441),
-            Some(Some(latest))
+            manager.acknowledge_status(id, 0x880, target, 0x441, status),
+            Some(StatusAcknowledgement {
+                next_position: Some(latest),
+                pending_drop_action: None,
+            })
         );
         assert_eq!(manager.active_session().unwrap().coalesced_position, None);
         assert_eq!(
-            manager.acknowledge_status(id, 0x880, target, 0x441),
-            Some(None)
+            manager.acknowledge_status(id, 0x880, target, 0x441, status),
+            Some(StatusAcknowledgement {
+                next_position: None,
+                pending_drop_action: None,
+            })
         );
-        assert!(!manager.active_session().unwrap().awaiting_status);
+        assert_eq!(
+            manager.active_session().unwrap().progress,
+            DndWireProgress::Positioned
+        );
     }
 
     #[test]
@@ -744,13 +1018,13 @@ mod tests {
     #[test]
     fn feedback_for_one_target_keeps_only_its_latest_status() {
         let (mut manager, id, target) = new_manager();
-        manager.push_feedback(DndStatusFeedback {
+        manager.push_status_feedback(DndStatusFeedback {
             id,
             target,
             accepted: true,
             action: Some(XwaylandDndAction::Copy),
         });
-        manager.push_feedback(DndStatusFeedback {
+        manager.push_status_feedback(DndStatusFeedback {
             id,
             target,
             accepted: false,
@@ -758,12 +1032,44 @@ mod tests {
         });
         assert_eq!(
             manager.take_feedback(),
-            [DndStatusFeedback {
+            [DndFeedback::Status(DndStatusFeedback {
                 id,
                 target,
                 accepted: false,
                 action: None,
-            }]
+            })]
+        );
+    }
+
+    #[test]
+    fn terminal_feedback_remains_after_the_latest_status_at_capacity() {
+        let (mut manager, id, target) = new_manager();
+        let earlier = DndStatusFeedback {
+            id,
+            target,
+            accepted: false,
+            action: None,
+        };
+        let latest = DndStatusFeedback {
+            id,
+            target,
+            accepted: true,
+            action: Some(XwaylandDndAction::Move),
+        };
+        // Manufacture the otherwise unreachable duplicate Status entries to
+        // exercise the hard bounded-overflow behavior.
+        manager.feedback.push_back(DndFeedback::Status(earlier));
+        manager.feedback.push_back(DndFeedback::Status(latest));
+        let terminal = DndTerminalFeedback {
+            id,
+            target,
+            accepted: true,
+            action: Some(XwaylandDndAction::Move),
+        };
+        assert!(manager.push_terminal_feedback(terminal));
+        assert_eq!(
+            manager.take_feedback(),
+            [DndFeedback::Status(latest), DndFeedback::Terminal(terminal)]
         );
     }
 }

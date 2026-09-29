@@ -86,25 +86,21 @@ fn dnd_offer_is_generation_qualified_and_has_bounded_metadata() {
 }
 
 #[test]
-fn adapter_replacement_retires_exact_identity_and_consumes_terminal_once() {
+fn adapter_replacement_retires_exact_identity_and_rejects_stale_session() {
     let generation = generation(7);
-    let source = X11WindowHandle::new(generation, 11);
     let first_target = X11WindowHandle::new(generation, 21);
-    let first_session = CanonicalDndSessionId::Xwayland(offer_id(generation, 1));
+    let first_session = CanonicalDndSessionId::Wayland(NonZeroU64::new(1).expect("nonzero"));
     let first = XwaylandDndAdapterId::new(first_session, generation).unwrap();
     let mut manager = DndManager::default();
-    assert!(manager.install_canonical_session(first, Some(source)));
+    assert!(manager.install_canonical_session(first, None));
     assert_eq!(
         manager.progress(first),
         Some(DndWireProgress::AwaitingEnter)
     );
     assert!(manager.mark_entered(first));
     assert!(manager.position(first, first_target, 40, 50, Some(XwaylandDndAction::Copy),));
-    assert!(manager.mark_drop_ready(first));
-    assert!(manager.consume_terminal_event(first));
-    assert!(!manager.consume_terminal_event(first));
-    assert!(manager.terminal_event_consumed(first));
-    assert!(!manager.install_canonical_session(first, Some(source)));
+    assert!(!manager.install_canonical_session(first, None));
+    assert!(manager.retire(first));
 
     let second_session =
         CanonicalDndSessionId::Wayland(NonZeroU64::new(2).expect("nonzero session"));
@@ -112,8 +108,7 @@ fn adapter_replacement_retires_exact_identity_and_consumes_terminal_once() {
     assert!(manager.install_canonical_session(second, None));
     assert_eq!(manager.active_id(), Some(second));
     assert_eq!(manager.progress(first), None);
-    assert!(!manager.position(first, first_target, 1, 2, Some(XwaylandDndAction::Move),));
-    assert!(!manager.consume_terminal_event(first));
+    assert!(!manager.consume_terminal_result(first));
     assert_eq!(
         manager.progress(second),
         Some(DndWireProgress::AwaitingEnter)
@@ -151,7 +146,6 @@ fn adapter_leaves_one_exact_target_and_reenters_another_without_replacing_sessio
     assert_eq!(session.progress, DndWireProgress::AwaitingEnter);
     assert_eq!(session.action, None);
     assert_eq!((session.x, session.y), (0, 0));
-    assert!(!session.terminal_event_consumed);
     assert_eq!(manager.active_id(), Some(adapter_id));
 
     assert!(manager.mark_entered(adapter_id));
@@ -161,9 +155,7 @@ fn adapter_leaves_one_exact_target_and_reenters_another_without_replacing_sessio
         manager.active_session().and_then(|session| session.target),
         Some(target_b)
     );
-    assert!(manager.mark_drop_ready(adapter_id));
-    assert!(manager.consume_terminal_event(adapter_id));
-    assert!(!manager.leave_target(adapter_id, target_b));
+    assert!(manager.leave_target(adapter_id, target_b));
 }
 
 #[test]

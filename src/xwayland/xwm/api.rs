@@ -17,7 +17,7 @@ impl Xwm {
         super::data_bridge::dnd::apply_transitions(self, transitions, now_ns)
     }
 
-    pub(crate) fn take_dnd_feedback(&mut self) -> Vec<crate::xwayland::XwaylandDndStatusFeedback> {
+    pub(crate) fn take_dnd_feedback(&mut self) -> Vec<crate::xwayland::XwaylandDndFeedback> {
         super::data_bridge::dnd::take_feedback(self)
     }
 

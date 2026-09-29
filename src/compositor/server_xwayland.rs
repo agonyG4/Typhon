@@ -61,9 +61,10 @@ impl OwnCompositorServer {
             .collect()
     }
 
-    /// Serve one XdndSelection MIME read only for the exact live Wayland drag
-    /// and current X11 hover target. An X selection request is advisory data
-    /// demand; XDND Status remains the sole X11 acceptance signal.
+    /// Serve one XdndSelection MIME read only for the exact live or
+    /// terminal-pending Wayland drag and its current X11 target. An X
+    /// selection request is data demand; XDND Status remains the target's
+    /// acceptance signal.
     pub fn request_xwayland_dnd_source_data(
         &mut self,
         request: crate::xwayland::XwaylandDndSourceDataRequest,

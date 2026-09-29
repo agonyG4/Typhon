@@ -236,12 +236,26 @@ impl NativeRuntime {
     /// the generation-owned XWM wire adapter.
     pub(super) fn sync_xwayland_dnd(&mut self) -> NativeResult<()> {
         for feedback in self.xwayland.take_managed_dnd_feedback() {
-            self.server.update_xwayland_dnd_target_status(
-                feedback.session_id,
-                feedback.target,
-                feedback.accepted,
-                feedback.action,
-            );
+            match feedback {
+                oblivion_one::xwayland::XwaylandDndFeedback::Status {
+                    session_id,
+                    target,
+                    accepted,
+                    action,
+                } => {
+                    self.server
+                        .update_xwayland_dnd_target_status(session_id, target, accepted, action);
+                }
+                oblivion_one::xwayland::XwaylandDndFeedback::Terminal {
+                    session_id,
+                    target,
+                    accepted,
+                    action,
+                } => {
+                    self.server
+                        .finish_xwayland_dnd_target(session_id, target, accepted, action);
+                }
+            }
         }
 
         if self.xwayland.state_kind() != oblivion_one::xwayland::XwaylandStateKind::Running {
@@ -252,56 +266,15 @@ impl NativeRuntime {
         };
 
         let transitions = self.server.take_xwayland_dnd_transitions();
-        let mut current_transitions = Vec::with_capacity(transitions.len());
-        let mut physical_drops = Vec::new();
-        for transition in transitions {
-            if transition.generation() != generation {
-                continue;
-            }
-            if let oblivion_one::xwayland::XwaylandDndTransition::DropRequested {
-                session_id,
-                target,
-                ..
-            } = &transition
-                && matches!(
-                    session_id,
-                    oblivion_one::xwayland::CanonicalDndSessionId::Wayland(_)
-                )
-            {
-                physical_drops.push((*session_id, *target));
-            }
-            current_transitions.push(transition);
-        }
+        let current_transitions = transitions
+            .into_iter()
+            .filter(|transition| transition.generation() == generation)
+            .collect::<Vec<_>>();
         self.xwayland.submit_managed_dnd_transitions(
             generation,
             current_transitions,
             &mut self.process_supervisor,
         )?;
-
-        // C2-A only carries hover and selection data. A physical Wayland drop
-        // must terminate the exact canonical X11 target as rejected here.
-        for (session_id, target) in physical_drops.iter().copied() {
-            self.server
-                .finish_xwayland_dnd_target(session_id, target, false, None);
-        }
-
-        // The canonical fail-closed transition is produced while applying the
-        // first bounded batch. Drain its exact retirement edge once so the
-        // source proxy and XdndSelection ownership are released in this same
-        // runtime phase, without an open-ended outbox fixpoint.
-        if !physical_drops.is_empty() {
-            let terminal = self
-                .server
-                .take_xwayland_dnd_transitions()
-                .into_iter()
-                .filter(|transition| transition.generation() == generation)
-                .collect::<Vec<_>>();
-            self.xwayland.submit_managed_dnd_transitions(
-                generation,
-                terminal,
-                &mut self.process_supervisor,
-            )?;
-        }
 
         let requests = self.xwayland.take_managed_dnd_source_data_requests();
         let mut results = Vec::with_capacity(requests.len());

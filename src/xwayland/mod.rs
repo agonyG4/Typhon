@@ -28,10 +28,10 @@ pub use association::{
 pub use config::{XwaylandConfig, XwaylandMode, XwaylandProfile, XwaylandStartPolicy};
 pub use dnd_metadata::{
     CanonicalDndSessionId, MAX_PENDING_XWAYLAND_DND_TRANSITIONS, WaylandDndAction,
-    XwaylandDndAction, XwaylandDndAdapterId, XwaylandDndDataRequest, XwaylandDndMetadataError,
-    XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId, XwaylandDndOutbox,
-    XwaylandDndSourceDataRequest, XwaylandDndSourceProxyId, XwaylandDndSourceTransferId,
-    XwaylandDndStatusFeedback, XwaylandDndTransition, XwaylandDndVersion,
+    XwaylandDndAction, XwaylandDndAdapterId, XwaylandDndDataRequest, XwaylandDndFeedback,
+    XwaylandDndMetadataError, XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId,
+    XwaylandDndOutbox, XwaylandDndSourceDataRequest, XwaylandDndSourceProxyId,
+    XwaylandDndSourceTransferId, XwaylandDndTransition, XwaylandDndVersion,
 };
 pub use generation::XwaylandGeneration;
 pub use readiness::XwaylandReadinessSnapshot;

@@ -32,7 +32,10 @@ impl CompositorState {
         };
         if active.id != adapter_id.session_id()
             || active.lifecycle_driver != DragLifecycleDriver::WaylandImplicitPointerGrab
-            || active.phase != DragSessionPhase::Dragging
+            || !matches!(
+                active.phase,
+                DragSessionPhase::Dragging | DragSessionPhase::DropPendingXwaylandTarget
+            )
             || active.xwayland_dnd_generation != Some(adapter_id.generation())
             || !matches!(active.target.as_ref(), Some(ActiveDragTarget::Xwayland { window }) if *window == request.target)
             || !matches!(&active.origin, ActiveDragOrigin::WaylandSource { .. })
@@ -142,7 +145,12 @@ impl CompositorState {
         );
         if active.id != session_id
             || !exact_target
-            || active.phase != DragSessionPhase::Dragging
+            || !matches!(
+                active.phase,
+                DragSessionPhase::Dragging | DragSessionPhase::DropPendingXwaylandTarget
+            )
+            || (active.phase == DragSessionPhase::DropPendingXwaylandTarget
+                && !matches!(&active.origin, ActiveDragOrigin::WaylandSource { .. }))
             || self
                 .xwayland
                 .client_identity
@@ -278,7 +286,9 @@ impl CompositorState {
         let source_actions = self.drag_source_actions(&active.origin);
         let origin = active.origin.clone();
         let negotiated_action = active.target_action;
-        let action = if accepted
+        let action = if !accepted && matches!(&origin, ActiveDragOrigin::WaylandSource { .. }) {
+            None
+        } else if accepted
             && matches!(&origin, ActiveDragOrigin::WaylandSource { .. })
             && negotiated_action == Some(crate::xwayland::XwaylandDndAction::Ask)
         {
@@ -330,6 +340,9 @@ impl CompositorState {
                     .to_wayland_action()
                     .map_or(0, crate::xwayland::WaylandDndAction::mask);
                 active.target_action = Some(action);
+            } else if !accepted && matches!(&origin, ActiveDragOrigin::WaylandSource { .. }) {
+                active.selected_action = 0;
+                active.target_action = None;
             }
             active.phase = if accepted {
                 DragSessionPhase::Finished

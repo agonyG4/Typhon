@@ -14,8 +14,8 @@ use crate::process::{
 
 use super::trace::{self, TraceFields};
 use super::{
-    XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandDndSourceDataRequest,
-    XwaylandDndSourceTransferId, XwaylandDndStatusFeedback, XwaylandDndTransition,
+    XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandDndFeedback,
+    XwaylandDndSourceDataRequest, XwaylandDndSourceTransferId, XwaylandDndTransition,
     XwaylandGeneration, XwaylandMode, XwaylandProxySelectionDataRequest,
     XwaylandProxySelectionTransferId, XwaylandSelectionDataRequest,
     config::{XwaylandConfig, xwm_reactor_hot_path_logging_enabled},
@@ -1462,7 +1462,7 @@ impl XwaylandService {
         self.selection_metadata_mailbox.take()
     }
 
-    pub fn take_managed_dnd_feedback(&mut self) -> Vec<XwaylandDndStatusFeedback> {
+    pub fn take_managed_dnd_feedback(&mut self) -> Vec<XwaylandDndFeedback> {
         match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.take_dnd_feedback(),
             _ => Vec::new(),
