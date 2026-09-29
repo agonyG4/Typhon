@@ -127,7 +127,8 @@ fn releasing_one_of_two_output_bindings_preserves_the_other_and_rebind_enters_on
         ]
     );
 
-    let released_protocol_id = first_output.id().protocol_id();
+    let released_binding_id = first_output.id();
+    let released_protocol_id = released_binding_id.protocol_id();
     first_output.release();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
@@ -147,11 +148,15 @@ fn releasing_one_of_two_output_bindings_preserves_the_other_and_rebind_enters_on
     assert_eq!(after_first_release.physical_output_ids.len(), 1);
     assert!(after_first_release.membership_invariants_valid);
 
+    let enter_count_before_rebind = state.surface_enter_count;
     let replacement_output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ()).unwrap();
+    let replacement_binding_id = replacement_output.id();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    assert_eq!(state.surface_enter_count, 3);
+    assert_eq!(replacement_binding_id.protocol_id(), released_protocol_id);
+    assert_ne!(replacement_binding_id, released_binding_id);
+    assert_eq!(state.surface_enter_count, enter_count_before_rebind + 1);
     assert_eq!(state.surface_leave_count, 0);
     assert_eq!(
         state.surface_enter_output_ids.last(),
@@ -172,11 +177,9 @@ fn releasing_one_of_two_output_bindings_preserves_the_other_and_rebind_enters_on
     assert_eq!(snapshot.entered_binding_count, 2);
     assert_eq!(snapshot.physical_output_ids.len(), 1);
     assert!(snapshot.membership_invariants_valid);
-    if replacement_output.id().protocol_id() == released_protocol_id {
-        assert_eq!(snapshot.output_binding_ids.len(), 2);
-        assert_eq!(snapshot.entered_binding_count, 2);
-        assert_eq!(state.surface_leave_count, 0);
-    }
+    assert_eq!(snapshot.output_binding_ids.len(), 2);
+    assert_eq!(snapshot.entered_binding_count, 2);
+    assert_eq!(state.surface_leave_count, 0);
 
     drop((
         connection,

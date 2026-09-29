@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static OUTPUT_LIFECYCLE_DIAGNOSTIC_COUNT: AtomicUsize = AtomicUsize::new(0);
 const OUTPUT_LIFECYCLE_DIAGNOSTIC_LIMIT: usize = 256;
 
+fn output_lifecycle_trace_enabled(setting: Option<&str>) -> bool {
+    setting == Some("1")
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct OutputBinding {
     pub(in crate::compositor) output_id: OutputId,
@@ -29,9 +33,11 @@ pub(in crate::compositor) fn output_lifecycle_trace(
     outcome: &str,
     error: Option<&str>,
 ) {
-    if !cfg!(debug_assertions)
-        || std::env::var("TYPHON_OUTPUT_LIFECYCLE_TRACE").as_deref() != Ok("1")
-    {
+    if !output_lifecycle_trace_enabled(
+        std::env::var("TYPHON_OUTPUT_LIFECYCLE_TRACE")
+            .ok()
+            .as_deref(),
+    ) {
         return;
     }
     if OUTPUT_LIFECYCLE_DIAGNOSTIC_COUNT.fetch_add(1, Ordering::Relaxed)
@@ -70,6 +76,14 @@ mod tests {
         let state = CompositorState::new(None);
 
         assert_eq!(state.native_output_id().map(OutputId::get), Some(1));
+    }
+
+    #[test]
+    fn output_lifecycle_trace_requires_exact_explicit_opt_in() {
+        assert!(output_lifecycle_trace_enabled(Some("1")));
+        assert!(!output_lifecycle_trace_enabled(None));
+        assert!(!output_lifecycle_trace_enabled(Some("0")));
+        assert!(!output_lifecycle_trace_enabled(Some("true")));
     }
 }
 
@@ -173,8 +187,9 @@ impl CompositorState {
         debug_assert!(self.check_output_binding_invariants());
     }
 
-    // The current runtime has no hotplug source; deterministic removal commands
-    // exercise this path until runtime output discovery gains withdrawal events.
+    // This retires Typhon's logical and binding state but leaves the advertised wl_output global
+    // in place. The runtime has no hotplug feed today; before DRM hotplug calls this, the global
+    // needs first-class lifetime ownership so withdrawal can also remove it from the registry.
     #[allow(dead_code)]
     pub(in crate::compositor) fn withdraw_output(&mut self, output_id: OutputId) {
         if !self.logical_output_ids.contains(&output_id) {
