@@ -1998,7 +1998,7 @@ impl GlesSceneRenderer {
             lifecycle_surfaces,
             lifecycle_decorations,
         } = request;
-        self.effect_trace = EffectExecutionTrace::new(
+        self.effect_trace = self.effect_trace.with_frame_context(
             frame_id,
             render_generation,
             Some(scene_generation),
@@ -13861,6 +13861,12 @@ mod tests {
         ));
         let first_trace = effects::take_effect_trace_test_events();
         assert!(
+            first_trace
+                .iter()
+                .any(|event| event.starts_with("event=effect_graph_execute_end ")),
+            "successful lifecycle blur execution must leave positive trace evidence: {first_trace:?}"
+        );
+        assert!(
             !first_trace
                 .iter()
                 .any(|event| event.contains("InvalidCheckpointSource"))
@@ -13917,6 +13923,12 @@ mod tests {
         );
         let reverse_trace = effects::take_effect_trace_test_events();
         assert!(
+            reverse_trace
+                .iter()
+                .any(|event| event.starts_with("event=effect_scene_resolve_begin ")),
+            "restore reversal must prove trace capture is active: {reverse_trace:?}"
+        );
+        assert!(
             !reverse_trace
                 .iter()
                 .any(|event| event.contains("effect_graph_execute"))
@@ -13960,10 +13972,18 @@ mod tests {
                 .contains(failed_identity, failed_payload, 604)
         );
         let failure_trace = effects::take_effect_trace_test_events();
+        let capture_failures = failure_trace
+            .iter()
+            .filter(|event| event.starts_with("event=lifecycle_source_capture_failure "))
+            .collect::<Vec<_>>();
+        assert_eq!(capture_failures.len(), 1, "{failure_trace:?}");
         assert!(
-            failure_trace
-                .iter()
-                .any(|event| event.contains("stage=graph_compile"))
+            capture_failures[0].contains("stage=graph_compile "),
+            "invalid frozen effect graph must be classified at compile time: {capture_failures:?}"
+        );
+        assert!(
+            capture_failures[0].contains("error=MissingProgram("),
+            "trace must identify the missing-program compile failure: {capture_failures:?}"
         );
     }
 

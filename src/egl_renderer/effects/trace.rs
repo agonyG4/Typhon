@@ -673,6 +673,22 @@ impl EffectExecutionTrace {
         }
     }
 
+    pub(crate) const fn with_frame_context(
+        self,
+        frame_id: Option<u64>,
+        render_generation: Option<u64>,
+        scene_generation: Option<u64>,
+        scene_signature: Option<u64>,
+    ) -> Self {
+        Self {
+            enabled: self.enabled,
+            frame_id,
+            render_generation,
+            scene_generation,
+            scene_signature,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn disabled_for_test() -> Self {
         Self {
@@ -1294,6 +1310,38 @@ mod tests {
         });
 
         assert!(!formatted.get());
+    }
+
+    #[test]
+    fn frame_context_retargeting_preserves_enablement_and_formats_metadata() {
+        let enabled = EffectExecutionTrace::enabled_for_test().with_frame_context(
+            Some(11),
+            Some(22),
+            Some(33),
+            Some(44),
+        );
+        assert!(enabled.enabled());
+
+        clear_test_events();
+        enabled.frame_boundary("trace_context", "updated", FrameTraceSummary::default());
+        let events = take_test_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with(
+            "event=trace_context_updated frame_id=11 render_generation=22 scene_generation=33 scene_signature=44 "
+        ));
+
+        let disabled = EffectExecutionTrace::disabled_for_test().with_frame_context(
+            Some(55),
+            Some(66),
+            Some(77),
+            Some(88),
+        );
+        assert!(!disabled.enabled());
+        assert_eq!(disabled.frame_id(), Some(55));
+
+        clear_test_events();
+        disabled.frame_boundary("trace_context", "updated", FrameTraceSummary::default());
+        assert!(take_test_events().is_empty());
     }
 
     #[test]
