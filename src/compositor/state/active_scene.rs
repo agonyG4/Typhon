@@ -58,6 +58,7 @@ pub(in crate::compositor) struct ActiveSceneView {
     surface_indices: HashMap<u32, usize>,
     surface_scene_nodes: HashMap<u32, SceneNodeId>,
     surface_scene_nodes_in_order: Vec<SceneNodeId>,
+    presentation_owner_roots_in_order: Vec<u32>,
     scene_node_indices: HashMap<SceneNodeId, usize>,
     surface_origins: Vec<(i32, i32)>,
     popup_surface_ids: Vec<u32>,
@@ -81,6 +82,10 @@ impl ActiveSceneView {
 
     pub(in crate::compositor) fn surface_scene_nodes_in_order(&self) -> &[SceneNodeId] {
         &self.surface_scene_nodes_in_order
+    }
+
+    pub(in crate::compositor) fn presentation_owner_roots_in_order(&self) -> &[u32] {
+        &self.presentation_owner_roots_in_order
     }
 
     #[allow(dead_code)]
@@ -150,7 +155,19 @@ impl CompositorState {
         root_surface_id: u32,
         geometry: WindowGeometry,
     ) -> Option<PresentationRect> {
-        let surfaces = self.active_scene_surfaces();
+        self.presentation_rect_for_geometry_for_surfaces(
+            self.active_scene_surfaces(),
+            root_surface_id,
+            geometry,
+        )
+    }
+
+    pub(in crate::compositor) fn presentation_rect_for_geometry_for_surfaces(
+        &self,
+        surfaces: &[RenderableSurface],
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+    ) -> Option<PresentationRect> {
         let root_index = surfaces.iter().position(|surface| {
             surface.surface_id == root_surface_id && surface.placement.parent_surface_id.is_none()
         })?;
@@ -178,11 +195,27 @@ impl CompositorState {
         &self,
         surfaces: &[RenderableSurface],
     ) -> NativeFramePresentationTargets {
+        self.presentation_targets_for_surfaces_with_owners(surfaces, None)
+    }
+
+    fn presentation_targets_for_surfaces_with_owners(
+        &self,
+        surfaces: &[RenderableSurface],
+        presentation_owner_root_surface_ids: Option<&[u32]>,
+    ) -> NativeFramePresentationTargets {
+        if let Some(owners) = presentation_owner_root_surface_ids {
+            debug_assert_eq!(surfaces.len(), owners.len());
+        }
         let mut seen_window_groups = std::collections::HashSet::new();
         let windows = surfaces
             .iter()
-            .filter_map(|surface| {
-                let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
+            .enumerate()
+            .filter_map(|(index, surface)| {
+                let root_surface_id = presentation_owner_root_surface_ids
+                    .and_then(|owners| owners.get(index).copied())
+                    .unwrap_or_else(|| {
+                        self.presentation_owner_root_for_surface(surface.surface_id)
+                    });
                 let scene_node_id = self.presentation_scene_node_id_for_root(root_surface_id)?;
                 if !seen_window_groups.insert(scene_node_id) {
                     return None;
@@ -190,8 +223,11 @@ impl CompositorState {
                 let geometry = self
                     .current_visual_root_window_geometry(root_surface_id)
                     .or_else(|| self.current_root_window_geometry(root_surface_id))?;
-                let canonical_rect =
-                    self.presentation_rect_for_geometry(root_surface_id, geometry)?;
+                let canonical_rect = self.presentation_rect_for_geometry_for_surfaces(
+                    surfaces,
+                    root_surface_id,
+                    geometry,
+                )?;
                 let canonical_opacity = self
                     .window_id_for_surface(root_surface_id)
                     .and_then(|window_id| self.window(window_id))
@@ -225,6 +261,16 @@ impl CompositorState {
         surfaces: &[RenderableSurface],
     ) -> NativeFramePresentationTargets {
         self.presentation_targets_for_surfaces(surfaces)
+    }
+
+    pub(in crate::compositor) fn native_frame_presentation_targets_for_scene(
+        &self,
+        scene: &super::fullscreen::CanonicalPresentationScene<'_>,
+    ) -> NativeFramePresentationTargets {
+        self.presentation_targets_for_surfaces_with_owners(
+            scene.surfaces.as_ref(),
+            Some(scene.presentation_owner_root_surface_ids.as_ref()),
+        )
     }
 
     pub(in crate::compositor) fn set_window_canonical_opacity(
@@ -1018,6 +1064,10 @@ impl CompositorState {
                     .expect("active renderable surface has no canonical scene node")
             })
             .collect::<Vec<_>>();
+        let presentation_owner_roots_in_order = surfaces
+            .iter()
+            .map(|surface| self.presentation_owner_root_for_surface(surface.surface_id))
+            .collect::<Vec<_>>();
         let surface_scene_nodes = surfaces
             .iter()
             .zip(surface_scene_nodes_in_order.iter().copied())
@@ -1052,6 +1102,8 @@ impl CompositorState {
         self.active_scene_view.surface_indices = surface_indices;
         self.active_scene_view.surface_scene_nodes = surface_scene_nodes;
         self.active_scene_view.surface_scene_nodes_in_order = surface_scene_nodes_in_order;
+        self.active_scene_view.presentation_owner_roots_in_order =
+            presentation_owner_roots_in_order;
         self.active_scene_view.scene_node_indices = scene_node_indices;
         self.active_scene_view.surface_origins = surface_origins;
         self.active_scene_view.popup_surface_ids = popup_surface_ids;
@@ -1141,6 +1193,8 @@ impl CompositorState {
                     || previous.render_placement != updated.render_placement
             };
             self.active_scene_view.surfaces[index] = updated;
+            self.active_scene_view.presentation_owner_roots_in_order[index] =
+                self.presentation_owner_root_for_surface(surface_id);
             if origin_changed {
                 self.active_scene_view.surface_origins =
                     render::surface_origins(&self.active_scene_view.surfaces);
@@ -1196,6 +1250,8 @@ impl CompositorState {
                         || previous.placement != source.placement
                         || previous.render_placement != source.render_placement;
                     self.active_scene_view.surfaces[index] = source;
+                    self.active_scene_view.presentation_owner_roots_in_order[index] =
+                        self.presentation_owner_root_for_surface(surface_id);
                     updated = updated.saturating_add(1);
                 }
                 (true, None) | (false, Some(_)) => membership_changed = true,
@@ -1232,6 +1288,10 @@ impl CompositorState {
         &self,
     ) -> &[SceneNodeId] {
         self.active_scene_view.surface_scene_nodes_in_order()
+    }
+
+    pub(in crate::compositor) fn active_scene_presentation_owner_roots_in_order(&self) -> &[u32] {
+        self.active_scene_view.presentation_owner_roots_in_order()
     }
 
     pub(in crate::compositor) fn active_scene_surface_index(

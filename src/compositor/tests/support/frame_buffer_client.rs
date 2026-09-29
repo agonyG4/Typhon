@@ -968,6 +968,91 @@ pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dma
     )
 }
 
+pub(in crate::compositor::tests) fn create_fullscreen_dmabuf_subsurface_scanout_source(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, u32, u32), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=3, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let width = 1280;
+    let height = 800;
+    let root = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&root, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &root, &qh, ());
+    subsurface.set_position(0, 0);
+    let root_viewport = viewporter.get_viewport(&root, &qh, ());
+    root_viewport.set_source(0.0, 0.0, f64::from(width), f64::from(height));
+    root_viewport.set_destination(width, height);
+    let child_viewport = viewporter.get_viewport(&child, &qh, ());
+    child_viewport.set_source(0.0, 0.0, f64::from(width), f64::from(height));
+    child_viewport.set_destination(width, height);
+    toplevel.set_app_id("oblivion.fullscreen-subsurface-scanout-test".to_string());
+    toplevel.set_fullscreen(None);
+    root.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    let root_buffer = create_test_dmabuf_buffer_with_format(
+        &dmabuf,
+        &qh,
+        0xff22_4466,
+        width,
+        height,
+        DrmFormat::XRGB8888_FOURCC,
+    )?;
+    let child_buffer = create_test_dmabuf_buffer_with_format(
+        &dmabuf,
+        &qh,
+        0xff66_4422,
+        width,
+        height,
+        DrmFormat::XRGB8888_FOURCC,
+    )?;
+    root.attach(Some(&root_buffer), 0, 0);
+    root.damage_buffer(0, 0, width, height);
+    child.attach(Some(&child_buffer), 0, 0);
+    child.damage_buffer(0, 0, width, height);
+    child.commit();
+    root.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+
+    let snapshots = super::server_runtime::capture_renderable_surface_snapshot(commands);
+    let root_surface_id = snapshots
+        .iter()
+        .find(|surface| {
+            surface.parent_surface_id.is_none()
+                && surface.width == width as u32
+                && surface.height == height as u32
+        })
+        .expect("server should publish the fullscreen root surface")
+        .surface_id;
+    let child_surface_id = snapshots
+        .iter()
+        .find(|surface| {
+            surface.parent_surface_id == Some(root_surface_id)
+                && surface.width == width as u32
+                && surface.height == height as u32
+        })
+        .expect("server should publish the DMABUF child surface")
+        .surface_id;
+    commands.send(ServerCommand::CancelRootPresentationProperties { root_surface_id })?;
+    wait_for_server_commands(commands);
+    retain_live_test_connection(connection);
+    Ok((state, root_surface_id, child_surface_id))
+}
+
 pub(in crate::compositor::tests) fn create_normal_identity_viewport_xrgb_dmabuf(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

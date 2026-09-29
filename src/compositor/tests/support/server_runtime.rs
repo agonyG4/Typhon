@@ -201,6 +201,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         width: u32,
         height: u32,
     },
+    SetFocusedRootRenderableSize {
+        width: u32,
+        height: u32,
+    },
     SetPointerHitInstrumentationEnabled(bool),
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
@@ -210,6 +214,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
         x: f64,
         y: f64,
         reply: Sender<(Option<u32>, Option<(f64, f64)>)>,
+    },
+    CaptureSurfaceInputAcceptance {
+        surface_id: u32,
+        surface_x: f64,
+        surface_y: f64,
+        reply: Sender<bool>,
     },
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
     SetMaterialProgramConfiguration {
@@ -231,6 +241,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureNativeDecorationCount(Sender<usize>),
     CaptureNativeFrameSurfaceIds(Sender<Vec<u32>>),
+    CaptureDirectScanoutSceneAnalysis(Sender<crate::compositor::DirectScanoutSceneAnalysis>),
+    SetDirectScanoutTestBlurEffect {
+        surface_id: u32,
+        reply: Sender<bool>,
+    },
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
@@ -524,7 +539,12 @@ pub(in crate::compositor::tests) struct LifecycleEffectPathSnapshot {
 pub(in crate::compositor::tests) struct DirectScanoutCandidateSnapshot {
     pub(in crate::compositor::tests) surface_id: u32,
     pub(in crate::compositor::tests) root_surface_id: u32,
+    pub(in crate::compositor::tests) surface_scene_node_id: SceneNodeId,
+    pub(in crate::compositor::tests) window_scene_node_id: SceneNodeId,
     pub(in crate::compositor::tests) generation: u64,
+    pub(in crate::compositor::tests) render_generation: u64,
+    pub(in crate::compositor::tests) surface_presentation_generation: u64,
+    pub(in crate::compositor::tests) effect_identity_signature: u64,
     pub(in crate::compositor::tests) commit_sequence: SurfaceCommitSequence,
     pub(in crate::compositor::tests) buffer_size: BufferSize,
     pub(in crate::compositor::tests) output_size: BufferSize,
@@ -860,6 +880,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .update_toplevel_visual_render_assignment(surface_id);
                         }
                     }
+                    ServerCommand::SetFocusedRootRenderableSize { width, height } => {
+                        if let Some(surface_id) = server.state.focused_root_surface_id()
+                            && let Some(surface) = server
+                                .state
+                                .renderable_surfaces
+                                .iter_mut()
+                                .find(|surface| surface.surface_id == surface_id)
+                        {
+                            surface.width = width;
+                            surface.height = height;
+                            server.state.refresh_active_scene_surface(surface_id);
+                        }
+                    }
                     ServerCommand::SetPointerHitInstrumentationEnabled(enabled) => {
                         server.state.pointer_hit_instrumentation_enabled = enabled;
                     }
@@ -887,6 +920,24 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             }
                         };
                         let _ = reply.send(snapshot);
+                    }
+                    ServerCommand::CaptureSurfaceInputAcceptance {
+                        surface_id,
+                        surface_x,
+                        surface_y,
+                        reply,
+                    } => {
+                        let accepted = server
+                            .state
+                            .active_scene_surfaces()
+                            .iter()
+                            .find(|surface| surface.surface_id == surface_id)
+                            .is_some_and(|surface| {
+                                server
+                                    .state
+                                    .surface_accepts_input_at(surface, surface_x, surface_y)
+                            });
+                        let _ = reply.send(accepted);
                     }
                     ServerCommand::CaptureResolvedEffectScene(reply) => {
                         let _ = reply.send(server.resolved_effect_scene());
@@ -1456,7 +1507,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             DirectScanoutCandidateSnapshot {
                                 surface_id: candidate.surface_id,
                                 root_surface_id: candidate.root_surface_id,
+                                surface_scene_node_id: candidate.surface_scene_node_id,
+                                window_scene_node_id: candidate.window_scene_node_id,
                                 generation: candidate.generation,
+                                render_generation: candidate.render_generation,
+                                surface_presentation_generation: candidate
+                                    .surface_presentation_generation,
+                                effect_identity_signature: candidate.effect_identity_signature,
                                 commit_sequence: candidate.commit_sequence,
                                 buffer_size: candidate.buffer_size,
                                 output_size: candidate.output_size,
@@ -1466,6 +1523,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             }
                         });
                         let _ = reply.send(candidate);
+                    }
+                    ServerCommand::CaptureDirectScanoutSceneAnalysis(reply) => {
+                        let _ = reply.send(server.direct_scanout_scene_analysis());
+                    }
+                    ServerCommand::SetDirectScanoutTestBlurEffect { surface_id, reply } => {
+                        let region = crate::effects::EffectRect::new(0, 0, 32, 32)
+                            .map(crate::effects::EffectRegion::from_rect);
+                        let result = region.is_some_and(|region| {
+                            server.state.set_internal_surface_effect(
+                                surface_id,
+                                crate::compositor::EffectAnchor::BeforeSurface(surface_id),
+                                crate::effects::builtin_background_blur_program_id(),
+                                region,
+                            )
+                        });
+                        let _ = reply.send(result);
                     }
                     ServerCommand::CaptureClientCursorSnapshot(reply) => {
                         let snapshot = server.client_cursor_render_state().map(|cursor| {
@@ -2250,6 +2323,26 @@ pub(in crate::compositor::tests) fn capture_pointer_scene_hit(
         .expect("server should report pointer scene hit")
 }
 
+pub(in crate::compositor::tests) fn capture_surface_input_acceptance(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+    surface_x: f64,
+    surface_y: f64,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSurfaceInputAcceptance {
+            surface_id,
+            surface_x,
+            surface_y,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report surface input acceptance")
+}
+
 pub(in crate::compositor::tests) fn capture_last_pointer_position(
     commands: &Sender<ServerCommand>,
 ) -> (f64, f64) {
@@ -2901,6 +2994,31 @@ pub(in crate::compositor::tests) fn capture_direct_scanout_candidate(
         .expect("server should report direct scanout candidate")
 }
 
+pub(in crate::compositor::tests) fn capture_direct_scanout_scene_analysis(
+    commands: &Sender<ServerCommand>,
+) -> crate::compositor::DirectScanoutSceneAnalysis {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureDirectScanoutSceneAnalysis(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report direct scanout scene analysis")
+}
+
+pub(in crate::compositor::tests) fn set_direct_scanout_test_blur_effect(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetDirectScanoutTestBlurEffect { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report test blur effect update")
+}
+
 pub(in crate::compositor::tests) fn capture_resolved_effect_scene(
     commands: &Sender<ServerCommand>,
 ) -> ResolvedEffectScene {
@@ -2972,6 +3090,17 @@ pub(in crate::compositor::tests) fn set_focused_root_visual_geometry(
             width,
             height,
         })
+        .unwrap();
+    wait_for_server_commands(commands);
+}
+
+pub(in crate::compositor::tests) fn set_focused_root_renderable_size(
+    commands: &Sender<ServerCommand>,
+    width: u32,
+    height: u32,
+) {
+    commands
+        .send(ServerCommand::SetFocusedRootRenderableSize { width, height })
         .unwrap();
     wait_for_server_commands(commands);
 }

@@ -1,3 +1,4 @@
+use super::fullscreen::CanonicalPresentationScene;
 use super::*;
 use crate::compositor::direct_scanout::{
     DirectScanoutEffectAnalysis, DirectScanoutEffectDisposition,
@@ -9,7 +10,9 @@ use crate::compositor::direct_scanout::{
     DirectScanoutSceneRejection, direct_scanout_probe_blockers_allow_scaling,
     direct_scanout_probe_viewport_compatibility, direct_scanout_viewport_compatibility,
 };
-use crate::compositor::effects::EffectAnchor;
+use crate::compositor::effects::{
+    EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectScene,
+};
 use crate::compositor::presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageContentKind,
 };
@@ -30,8 +33,75 @@ pub struct DirectScanoutSceneAnalysis {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn direct_scanout_effect_identity_scene(
+        &self,
+        scene: &CanonicalPresentationScene<'_>,
+        presentation: &crate::presentation_animation::PresentationSceneSample,
+        lifecycle: &crate::window_lifecycle_animation::LifecycleSceneSample,
+    ) -> ResolvedEffectScene {
+        let mut effects = self.resolved_effect_scene_with_presentation_and_lifecycle(
+            presentation,
+            &scene.fullscreen_plan,
+            lifecycle,
+        );
+        if matches!(&scene.surfaces, std::borrow::Cow::Borrowed(_)) {
+            return effects;
+        }
+
+        let visual_group_orders = scene.visual_group_orders();
+        for instance in &mut effects.instances {
+            let Some(surface_id) = (match instance.anchor {
+                EffectAnchor::BeforeSurface(surface_id)
+                | EffectAnchor::ReplaceSurface(surface_id)
+                | EffectAnchor::AfterSurface(surface_id) => Some(surface_id),
+                EffectAnchor::OutputPostProcess => None,
+            }) else {
+                continue;
+            };
+            let Some(index) = scene.surface_index(surface_id) else {
+                continue;
+            };
+            let Some(group_order) = visual_group_orders.get(index).copied().flatten() else {
+                continue;
+            };
+            let phase = match instance.anchor {
+                EffectAnchor::BeforeSurface(_) => 0,
+                EffectAnchor::ReplaceSurface(_) => 1,
+                EffectAnchor::AfterSurface(_) => 2,
+                EffectAnchor::OutputPostProcess => 3,
+            };
+            instance.visual_group = Some(
+                VisualGroupId::new(group_order)
+                    .expect("canonical visual group order is a valid identity"),
+            );
+            instance.scene_order = EffectSceneOrder {
+                group_order,
+                surface_order: match instance.anchor_scope {
+                    EffectAnchorScope::Surface => {
+                        u32::try_from(index).unwrap_or(u32::MAX.saturating_sub(1))
+                    }
+                    EffectAnchorScope::VisualGroup => 0,
+                },
+                phase,
+            };
+        }
+        ResolvedEffectScene::new(effects.generation, effects.instances)
+    }
+
+    #[cfg(test)]
     pub(in crate::compositor) fn direct_scanout_effect_analysis(
         &self,
+        fullscreen_plan: &FullscreenCompositionPlan,
+        output_size: BufferSize,
+        source: Option<DirectScanoutEffectSource>,
+    ) -> DirectScanoutEffectAnalysis {
+        let scene = self.canonical_presentation_scene();
+        self.direct_scanout_effect_analysis_for_scene(&scene, fullscreen_plan, output_size, source)
+    }
+
+    fn direct_scanout_effect_analysis_for_scene(
+        &self,
+        scene_view: &CanonicalPresentationScene<'_>,
         fullscreen_plan: &FullscreenCompositionPlan,
         output_size: BufferSize,
         source: Option<DirectScanoutEffectSource>,
@@ -46,6 +116,13 @@ impl CompositorState {
         let lifecycle = self.lifecycle_scene_sample_at(
             AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)),
         );
+        let visual_group_orders = source
+            .is_some()
+            .then(|| {
+                matches!(&scene_view.surfaces, std::borrow::Cow::Owned(_))
+                    .then(|| scene_view.visual_group_orders())
+            })
+            .flatten();
         let mut analysis = DirectScanoutEffectAnalysis {
             raw_instance_count: scene.summary.visible_instance_count,
             instances_truncated: scene.instances.len() > MAX_DIRECT_SCANOUT_EFFECT_DETAILS,
@@ -67,7 +144,12 @@ impl CompositorState {
                             analysis.outside_output_instance_count.saturating_add(1);
                         DirectScanoutEffectDisposition::OutsideOutput
                     } else {
-                        let disposition = self.classify_direct_scanout_effect(instance, source);
+                        let disposition = self.classify_direct_scanout_effect(
+                            instance,
+                            source,
+                            scene_view,
+                            visual_group_orders.as_deref(),
+                        );
                         match disposition {
                             DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource => {
                                 analysis.occluded_instance_count =
@@ -107,6 +189,8 @@ impl CompositorState {
         &self,
         instance: &crate::compositor::ResolvedEffectInstance,
         source: Option<DirectScanoutEffectSource>,
+        scene_view: &CanonicalPresentationScene<'_>,
+        visual_group_orders: Option<&[Option<u32>]>,
     ) -> DirectScanoutEffectDisposition {
         if instance.anchor == EffectAnchor::OutputPostProcess {
             return DirectScanoutEffectDisposition::OutputPostProcess;
@@ -122,19 +206,20 @@ impl CompositorState {
         }) else {
             return DirectScanoutEffectDisposition::UnknownOrder;
         };
-        let anchor_surface_order = self.active_scene_surface_order(anchor_surface_id);
-        crate::compositor::direct_scanout::classify_direct_scanout_effect(
+        let anchor_index = scene_view.surface_index(anchor_surface_id);
+        let anchor_surface_order = anchor_index.and_then(|index| u32::try_from(index).ok());
+        let anchor_group_order = if let Some(orders) = visual_group_orders {
+            anchor_index.and_then(|index| orders.get(index).copied().flatten())
+        } else {
+            self.visual_group_for_surface(anchor_surface_id)
+                .map(|group| group.get())
+        };
+        crate::compositor::direct_scanout::classify_direct_scanout_effect_with_scene_orders(
             instance,
             source,
+            anchor_group_order,
             anchor_surface_order,
         )
-    }
-
-    fn active_scene_surface_order(&self, surface_id: u32) -> Option<u32> {
-        self.active_scene_surfaces()
-            .iter()
-            .position(|surface| surface.surface_id == surface_id)
-            .and_then(|index| u32::try_from(index).ok())
     }
 
     pub(in crate::compositor) fn direct_scanout_scene_analysis(
@@ -155,10 +240,16 @@ impl CompositorState {
     ) -> DirectScanoutSceneAnalysis {
         let output_size = BufferSize::new(self.output_size.width, self.output_size.height)
             .expect("configured output size is nonzero");
-        let active_surfaces = self.active_scene_surfaces();
-        let coverage = self.presentation_coverage_analysis();
-        let fullscreen_plan = self.fullscreen_composition_plan();
-        let mut effects = self.direct_scanout_effect_analysis(&fullscreen_plan, output_size, None);
+        let scene = self.canonical_presentation_scene();
+        let active_surfaces = scene.surfaces.as_ref();
+        let coverage = self.presentation_coverage_analysis_for_scene(&scene);
+        let fullscreen_plan = &scene.fullscreen_plan;
+        let mut effects = self.direct_scanout_effect_analysis_for_scene(
+            &scene,
+            fullscreen_plan,
+            output_size,
+            None,
+        );
 
         let mut blockers = DirectScanoutSceneBlockers::default();
         if self.lifecycle_animation_has_pending_visible() {
@@ -182,7 +273,10 @@ impl CompositorState {
             };
         };
         let root_surface_id = covering_group.root_surface_id;
-        let candidate_scene_node_id = self.presentation_scene_node_id_for_root(root_surface_id);
+        let candidate_scene_node_id = scene
+            .owner_root_for_surface(root_surface_id)
+            .filter(|owner_root| *owner_root == root_surface_id)
+            .and_then(|_| self.presentation_scene_node_id_for_root(root_surface_id));
 
         if let Some(scene_node_id) = candidate_scene_node_id {
             if self.presentation_animator.has_geometry_track(scene_node_id) {
@@ -262,7 +356,6 @@ impl CompositorState {
             };
             blockers.push(rejection);
         }
-
         let Some(covering_surface) = covering_group.covering_surface.as_ref() else {
             blockers.push(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput);
             if self.has_pending_frame_prepare_work() {
@@ -299,6 +392,9 @@ impl CompositorState {
                 blockers,
             };
         };
+        if scene.owner_root_for_surface(source.surface_id) != Some(root_surface_id) {
+            blockers.push(DirectScanoutSceneRejection::OwnerMissing);
+        }
 
         let buffer = source.dmabuf_handle().cloned();
         if source.buffer_source() != SurfaceBufferSource::Dmabuf {
@@ -338,14 +434,22 @@ impl CompositorState {
                 blockers.push(rejection);
             }
         }
-        effects = self.direct_scanout_effect_analysis(
-            &fullscreen_plan,
+        let visual_group_orders = matches!(&scene.surfaces, std::borrow::Cow::Owned(_))
+            .then(|| scene.visual_group_orders());
+        let source_index = scene.surface_index(source_surface_id);
+        let source_group_order = if let Some(orders) = visual_group_orders.as_deref() {
+            source_index.and_then(|index| orders.get(index).copied().flatten())
+        } else {
+            self.visual_group_for_surface(source_surface_id)
+                .map(|group| group.get())
+        };
+        effects = self.direct_scanout_effect_analysis_for_scene(
+            &scene,
+            fullscreen_plan,
             output_size,
             Some(DirectScanoutEffectSource {
-                group_order: self
-                    .visual_group_for_surface(source_surface_id)
-                    .map(|group| group.get()),
-                surface_order: self.active_scene_surface_order(source_surface_id),
+                group_order: source_group_order,
+                surface_order: scene.surface_order(source_surface_id),
                 can_occlude: covering_surface.target
                     == SurfaceTargetRect::new(0, 0, output_size.width, output_size.height)
                     && coverage.geometrically_covers_output()
@@ -385,14 +489,7 @@ impl CompositorState {
             blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
         }
         let window_scene_node_id = candidate_scene_node_id;
-        let surface_scene_node_id = active_surfaces
-            .iter()
-            .position(|surface| surface.surface_id == source.surface_id)
-            .and_then(|index| {
-                self.active_scene_surface_scene_nodes_in_order()
-                    .get(index)
-                    .copied()
-            });
+        let surface_scene_node_id = scene.scene_node_for_surface(source.surface_id);
         if window_scene_node_id.is_none() || surface_scene_node_id.is_none() {
             blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
         }
@@ -400,7 +497,7 @@ impl CompositorState {
         let direct_candidate = if blockers.is_empty() {
             let identity_sample_time =
                 AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-            let targets = self.native_frame_presentation_targets(active_surfaces);
+            let targets = self.native_frame_presentation_targets_for_scene(&scene);
             let presentation = self.presentation_scene_sample_for_targets_at_with_source(
                 identity_sample_time,
                 crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
@@ -408,16 +505,16 @@ impl CompositorState {
             );
             let lifecycle = self.lifecycle_scene_sample_at(identity_sample_time);
             let effect_identity_signature = self
-                .resolved_effect_scene_with_presentation_and_lifecycle(
-                    &presentation,
-                    &fullscreen_plan,
-                    &lifecycle,
-                )
+                .direct_scanout_effect_identity_scene(&scene, &presentation, &lifecycle)
                 .signature;
             let presented_window_rect = self
                 .current_visual_root_window_geometry(root_surface_id)
                 .and_then(|geometry| {
-                    self.presentation_rect_for_geometry(root_surface_id, geometry)
+                    self.presentation_rect_for_geometry_for_surfaces(
+                        active_surfaces,
+                        root_surface_id,
+                        geometry,
+                    )
                 });
             match (
                 buffer.as_ref(),

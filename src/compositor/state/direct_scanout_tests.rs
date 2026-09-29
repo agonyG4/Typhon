@@ -2,6 +2,7 @@ use super::desktop_window_tests::{
     install_x11_scanout_surface, x11_output_snapshot, x11_scanout_surface,
 };
 use super::*;
+use crate::effects::{EffectRect, EffectRegion};
 use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationClip, PresentationClipMutation,
     PresentationClipRect, PresentationGeometryMutation, PresentationGroupClip,
@@ -51,6 +52,8 @@ fn install_probe_scanout_surface_with_metadata(
         SurfacePlacement::absolute_root_at(0, 0),
         DrmFormat::Xrgb8888,
     );
+    surface.width = state.output_size.width;
+    surface.height = state.output_size.height;
     surface.buffer_scale = buffer_scale;
     surface.buffer_transform = buffer_transform;
     surface.viewport_source = viewport_source;
@@ -59,6 +62,231 @@ fn install_probe_scanout_surface_with_metadata(
         state,
         surface,
         x11_output_snapshot(generation, root_surface_id, root_surface_id),
+    );
+}
+
+#[test]
+fn fullscreen_canonical_scene_keeps_subsurface_scanout_identity_aligned_after_filtering() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    let fullscreen_root = x11_scanout_surface(
+        361,
+        output_size.width,
+        output_size.height,
+        SurfacePlacement::absolute_root_at(0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    let scanout_child = x11_scanout_surface(
+        362,
+        output_size.width,
+        output_size.height,
+        SurfacePlacement::subsurface(361, 0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    state.install_native_frame_test_scene(
+        vec![
+            super::desktop_window_tests::x11_shm_surface(
+                360,
+                32,
+                32,
+                SurfacePlacement::absolute_root_at(0, 0),
+            ),
+            fullscreen_root,
+            scanout_child,
+        ],
+        &[
+            (360, WindowId::from_raw(71).expect("culled window id")),
+            (361, WindowId::from_raw(72).expect("fullscreen window id")),
+        ],
+        Some(361),
+    );
+    for surface_id in [360, 361, 362] {
+        state.surface_presentation_generations.insert(surface_id, 1);
+    }
+    let blur_program = crate::effects::builtin_background_blur_program_id();
+    let blur_region = EffectRegion::from_rect(EffectRect::new(0, 0, 32, 32).unwrap());
+    assert!(state.set_internal_surface_effect(
+        360,
+        EffectAnchor::BeforeSurface(360),
+        blur_program,
+        blur_region.clone(),
+    ));
+    assert!(state.set_internal_surface_effect(
+        362,
+        EffectAnchor::BeforeSurface(362),
+        blur_program,
+        blur_region,
+    ));
+
+    let raw_ids = state
+        .active_scene_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let scene = state.canonical_presentation_scene();
+    let canonical_ids = scene
+        .surfaces
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let analysis = state.direct_scanout_scene_analysis();
+    let candidate = analysis
+        .candidate
+        .as_ref()
+        .expect("fullscreen subsurface should remain a direct candidate");
+    let sample_time = AnimationTime::monotonic_now().expect("monotonic sample time");
+    let targets = state.native_frame_presentation_targets_for_scene(&scene);
+    let presentation = state.presentation_scene_sample_for_targets_at_with_source(
+        sample_time,
+        PresentationSampleTimeSource::MonotonicFallback,
+        &targets,
+    );
+    let lifecycle = state.lifecycle_scene_sample_at(sample_time);
+    let canonical_effects =
+        state.direct_scanout_effect_identity_scene(&scene, &presentation, &lifecycle);
+    let canonical_group_order = scene.visual_group_orders()[1].expect("surviving group order");
+
+    assert_eq!(raw_ids, [360, 361, 362]);
+    assert_eq!(canonical_ids, [361, 362]);
+    assert_eq!(scene.surface_index(362), Some(1));
+    assert_eq!(scene.owner_root_for_surface(362), Some(361));
+    assert_eq!(
+        scene.scene_node_for_surface(362),
+        state.scene_node_id_for_surface(362)
+    );
+    assert_eq!(candidate.surface_id, 362);
+    assert_eq!(candidate.root_surface_id, 361);
+    assert_eq!(
+        candidate.surface_scene_node_id,
+        scene.scene_node_for_surface(362).expect("child SceneNode")
+    );
+    assert_eq!(
+        candidate.window_scene_node_id,
+        state
+            .presentation_scene_node_id_for_root(361)
+            .expect("fullscreen root SceneNode")
+    );
+    assert_eq!(candidate.surface_presentation_generation, 1);
+    assert!(canonical_effects.instances.iter().all(|instance| {
+        !matches!(
+            instance.anchor,
+            EffectAnchor::BeforeSurface(360)
+                | EffectAnchor::ReplaceSurface(360)
+                | EffectAnchor::AfterSurface(360)
+        )
+    }));
+    let surviving_effect = canonical_effects
+        .instances
+        .iter()
+        .find(|instance| instance.anchor == EffectAnchor::BeforeSurface(362))
+        .expect("effect on the surviving child");
+    assert_eq!(
+        surviving_effect.scene_order.group_order,
+        canonical_group_order
+    );
+    assert_eq!(
+        surviving_effect.scene_order.surface_order,
+        match surviving_effect.anchor_scope {
+            crate::compositor::EffectAnchorScope::Surface => 1,
+            crate::compositor::EffectAnchorScope::VisualGroup => 0,
+        }
+    );
+    assert_eq!(
+        candidate.effect_identity_signature,
+        canonical_effects.signature
+    );
+    assert!(
+        canonical_effects
+            .instances
+            .iter()
+            .all(|effect| effect.anchor != EffectAnchor::BeforeSurface(360))
+    );
+    assert!(analysis.effects.instances.iter().any(|effect| {
+        effect.anchor == EffectAnchor::BeforeSurface(360)
+            && effect.disposition == DirectScanoutEffectDisposition::PresentationCulled
+    }));
+    assert!(analysis.effects.instances.iter().any(|effect| {
+        effect.anchor == EffectAnchor::BeforeSurface(362)
+            && effect.disposition == DirectScanoutEffectDisposition::OccludedByOpaqueScanoutSource
+    }));
+    assert!(
+        !analysis
+            .effects
+            .instances
+            .iter()
+            .any(|effect| effect.disposition == DirectScanoutEffectDisposition::UnknownOrder)
+    );
+    assert!(!analysis.effects.requires_composition);
+}
+
+#[test]
+fn transitioning_fullscreen_keeps_raw_scene_content_and_does_not_gain_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    let fullscreen_root = x11_scanout_surface(
+        370,
+        output_size.width,
+        output_size.height,
+        SurfacePlacement::absolute_root_at(0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    let visible_above = super::desktop_window_tests::x11_shm_surface(
+        371,
+        64,
+        64,
+        SurfacePlacement::absolute_root_at(0, 0),
+    );
+    state.install_native_frame_test_scene(
+        vec![fullscreen_root, visible_above],
+        &[
+            (370, WindowId::from_raw(73).expect("fullscreen window id")),
+            (371, WindowId::from_raw(74).expect("visible window id")),
+        ],
+        Some(370),
+    );
+    state.surface_presentation_generations.insert(370, 1);
+    state.surface_presentation_generations.insert(371, 1);
+    state.start_test_presentation_transition(
+        370,
+        PresentationRect::new(100.0, 100.0, 320.0, 200.0).expect("transition start"),
+        PresentationRect::new(0.0, 0.0, 1280.0, 800.0).expect("transition target"),
+        AnimationTime::from_nanos(0),
+    );
+
+    let raw_ids = state
+        .active_scene_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let scene = state.canonical_presentation_scene();
+    let canonical_ids = scene
+        .surfaces
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let analysis = state.direct_scanout_scene_analysis();
+
+    assert_eq!(
+        scene.fullscreen_plan.mode,
+        FullscreenCompositionMode::Transitioning
+    );
+    assert_eq!(raw_ids, [370, 371]);
+    assert_eq!(canonical_ids, raw_ids);
+    assert!(
+        analysis
+            .coverage
+            .visible_content_above
+            .iter()
+            .any(|content| content.root_surface_id == 371)
+    );
+    assert!(analysis.candidate.is_none());
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::ApplicationContentAbove)
     );
 }
 
@@ -97,9 +325,13 @@ fn simple_size_mismatch_is_a_probe_candidate_with_distinct_source_and_output_siz
     );
     let analysis = state.direct_scanout_probe_scene_analysis();
     assert!(analysis.candidate.is_none());
-    let probe = analysis
-        .probe_candidate
-        .expect("size mismatch is eligible for diagnostics");
+    let probe = analysis.probe_candidate.unwrap_or_else(|| {
+        panic!(
+            "size mismatch is eligible for diagnostics; blockers={:?} coverage={:?}",
+            analysis.blockers.reasons(),
+            analysis.coverage.covering_application_group
+        )
+    });
 
     assert_eq!(probe.buffer_size, source_size);
     assert_eq!(probe.buffer.size(), source_size);
@@ -109,8 +341,8 @@ fn simple_size_mismatch_is_a_probe_candidate_with_distinct_source_and_output_siz
 
 #[test]
 fn probe_rejects_non_unit_scale_non_normal_transform_and_non_identity_viewport() {
-    let source_size = BufferSize::new(1600, 900).unwrap();
-    let output_size = BufferSize::new(1920, 1080).unwrap();
+    let output_size = BufferSize::new(1280, 800).unwrap();
+    let source_size = output_size;
 
     let mut scaled = CompositorState::new(None);
     install_probe_scanout_surface_with_metadata(
@@ -128,11 +360,13 @@ fn probe_rejects_non_unit_scale_non_normal_transform_and_non_identity_viewport()
             .probe_candidate
             .is_none()
     );
+    let scaled_blockers = scaled.direct_scanout_scene_blockers();
     assert!(
-        scaled
-            .direct_scanout_scene_blockers()
+        scaled_blockers
             .reasons()
-            .contains(&DirectScanoutSceneRejection::BufferScaleUnsupported)
+            .contains(&DirectScanoutSceneRejection::BufferScaleUnsupported),
+        "unexpected blockers: {:?}",
+        scaled_blockers.reasons()
     );
 
     let mut transformed = CompositorState::new(None);

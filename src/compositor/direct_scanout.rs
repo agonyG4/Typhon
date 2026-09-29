@@ -204,15 +204,30 @@ impl DirectScanoutSceneBlockers {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn classify_direct_scanout_effect(
     instance: &crate::compositor::ResolvedEffectInstance,
     source: DirectScanoutEffectSource,
     anchor_surface_order: Option<u32>,
 ) -> DirectScanoutEffectDisposition {
+    classify_direct_scanout_effect_with_scene_orders(
+        instance,
+        source,
+        instance.visual_group.map(|group| group.get()),
+        anchor_surface_order,
+    )
+}
+
+pub(crate) fn classify_direct_scanout_effect_with_scene_orders(
+    instance: &crate::compositor::ResolvedEffectInstance,
+    source: DirectScanoutEffectSource,
+    effect_group_order: Option<u32>,
+    anchor_surface_order: Option<u32>,
+) -> DirectScanoutEffectDisposition {
     if instance.anchor == EffectAnchor::OutputPostProcess {
         return DirectScanoutEffectDisposition::OutputPostProcess;
     }
-    let Some(effect_group_order) = instance.visual_group.map(|group| group.get()) else {
+    let Some(effect_group_order) = effect_group_order else {
         return DirectScanoutEffectDisposition::UnknownOrder;
     };
     let Some(source_group_order) = source.group_order else {

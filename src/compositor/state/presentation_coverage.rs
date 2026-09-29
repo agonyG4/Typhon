@@ -1,3 +1,4 @@
+use super::fullscreen::CanonicalPresentationScene;
 use super::*;
 use crate::compositor::presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageOpacity, analyze_presentation_coverage,
@@ -5,26 +6,28 @@ use crate::compositor::presentation_coverage::{
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 
 impl CompositorState {
-    pub(in crate::compositor) fn presentation_coverage_analysis(
+    pub(in crate::compositor) fn presentation_coverage_analysis_for_scene(
         &self,
+        scene: &CanonicalPresentationScene<'_>,
     ) -> PresentationCoverageAnalysis {
         let output_size = BufferSize::new(self.output_size.width, self.output_size.height)
             .expect("configured output size is nonzero");
-        let active_surfaces = self.active_scene_surfaces();
-        let origins = self.active_scene_surface_origins();
-        let render_targets =
-            crate::compositor::render::surface_render_space_targets(active_surfaces, origins, 1.0);
+        let render_targets = crate::compositor::render::surface_render_space_targets(
+            scene.surfaces.as_ref(),
+            scene.surface_origins.as_ref(),
+            1.0,
+        );
         let decorations = self.native_decoration_render_instances_for_scale_with_origins(
-            active_surfaces,
-            origins,
+            scene.surfaces.as_ref(),
+            scene.surface_origins.as_ref(),
             1.0,
         );
 
         analyze_presentation_coverage(
-            active_surfaces,
+            scene.surfaces.as_ref(),
             &decorations,
             &render_targets,
-            self.active_scene_popup_surface_ids(),
+            scene.popup_surface_ids.as_ref(),
             output_size,
             |root_surface_id| self.window_id_for_surface(root_surface_id).is_some(),
             |root_surface_id| self.layer_surfaces.contains_key(&root_surface_id),

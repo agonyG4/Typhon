@@ -16,6 +16,66 @@ fn select_fullscreen_root_content_type(
     }
 }
 
+pub(in crate::compositor) struct CanonicalPresentationScene<'a> {
+    pub(in crate::compositor) surfaces: Cow<'a, [RenderableSurface]>,
+    pub(in crate::compositor) scene_node_ids: Cow<'a, [SceneNodeId]>,
+    pub(in crate::compositor) presentation_owner_root_surface_ids: Cow<'a, [u32]>,
+    pub(in crate::compositor) surface_origins: Cow<'a, [(i32, i32)]>,
+    pub(in crate::compositor) popup_surface_ids: Cow<'a, [u32]>,
+    pub(in crate::compositor) fullscreen_plan: FullscreenCompositionPlan,
+    pub(in crate::compositor) visibility: FullscreenRenderPlanMetrics,
+}
+
+impl CanonicalPresentationScene<'_> {
+    pub(in crate::compositor) fn surface_index(&self, surface_id: u32) -> Option<usize> {
+        self.surfaces
+            .iter()
+            .position(|surface| surface.surface_id == surface_id)
+    }
+
+    pub(in crate::compositor) fn scene_node_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> Option<SceneNodeId> {
+        self.scene_node_ids
+            .get(self.surface_index(surface_id)?)
+            .copied()
+    }
+
+    pub(in crate::compositor) fn owner_root_for_surface(&self, surface_id: u32) -> Option<u32> {
+        self.presentation_owner_root_surface_ids
+            .get(self.surface_index(surface_id)?)
+            .copied()
+    }
+
+    pub(in crate::compositor) fn surface_order(&self, surface_id: u32) -> Option<u32> {
+        u32::try_from(self.surface_index(surface_id)?).ok()
+    }
+
+    pub(in crate::compositor) fn visual_group_orders(&self) -> Vec<Option<u32>> {
+        let mut orders = vec![None; self.surfaces.len()];
+        for (group_order, group) in crate::compositor::render::visual_stack_groups(
+            self.surfaces.as_ref(),
+            self.popup_surface_ids.as_ref(),
+        )
+        .iter()
+        .enumerate()
+        {
+            let Some(group_id) =
+                crate::compositor::render::VisualStackGroup::id_for_order(group_order)
+            else {
+                continue;
+            };
+            for surface_index in group.surface_indices() {
+                if let Some(order) = orders.get_mut(*surface_index) {
+                    *order = Some(group_id.get());
+                }
+            }
+        }
+        orders
+    }
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn fullscreen_tree_presentation_metadata(
         &self,
@@ -505,33 +565,80 @@ impl CompositorState {
         FullscreenCompositionPlan,
         FullscreenRenderPlanMetrics,
     ) {
+        let scene = self.canonical_presentation_scene();
+        (
+            scene.surfaces,
+            scene.scene_node_ids,
+            scene.fullscreen_plan,
+            scene.visibility,
+        )
+    }
+
+    pub(in crate::compositor) fn canonical_presentation_scene(
+        &self,
+    ) -> CanonicalPresentationScene<'_> {
         let surfaces: Cow<'_, [RenderableSurface]> = Cow::Borrowed(self.active_scene_surfaces());
         let scene_nodes: Cow<'_, [SceneNodeId]> =
             Cow::Borrowed(self.active_scene_surface_scene_nodes_in_order());
+        let owner_roots: Cow<'_, [u32]> =
+            Cow::Borrowed(self.active_scene_presentation_owner_roots_in_order());
+        let surface_origins: Cow<'_, [(i32, i32)]> =
+            Cow::Borrowed(self.active_scene_surface_origins());
+        let popup_surface_ids: Cow<'_, [u32]> =
+            Cow::Borrowed(self.active_scene_popup_surface_ids());
         debug_assert_eq!(surfaces.len(), scene_nodes.len());
+        debug_assert_eq!(surfaces.len(), owner_roots.len());
+        debug_assert_eq!(surfaces.len(), surface_origins.len());
         let eligibility = self.fullscreen_presentation_eligibility();
         let plan = self.fullscreen_composition_plan_for_eligibility(eligibility);
         let metrics = self.fullscreen_render_plan_metrics_for_plan(&plan, eligibility);
         if !plan.mode.is_dominant() {
-            return (surfaces, scene_nodes, plan, metrics);
+            return CanonicalPresentationScene {
+                surfaces,
+                scene_node_ids: scene_nodes,
+                presentation_owner_root_surface_ids: owner_roots,
+                surface_origins,
+                popup_surface_ids,
+                fullscreen_plan: plan,
+                visibility: metrics,
+            };
+        }
+
+        let has_culled_surfaces = owner_roots
+            .iter()
+            .any(|owner_root| !plan.allows_presentation_root(*owner_root));
+        if !has_culled_surfaces {
+            return CanonicalPresentationScene {
+                surfaces,
+                scene_node_ids: scene_nodes,
+                presentation_owner_root_surface_ids: owner_roots,
+                surface_origins,
+                popup_surface_ids,
+                fullscreen_plan: plan,
+                visibility: metrics,
+            };
         }
 
         let mut filtered_surfaces = Vec::with_capacity(surfaces.len());
         let mut filtered_scene_nodes = Vec::with_capacity(scene_nodes.len());
-        for (surface, scene_node) in surfaces.iter().zip(scene_nodes.iter().copied()) {
-            if plan.allows_presentation_root(
-                self.presentation_owner_root_for_surface(surface.surface_id),
-            ) {
-                filtered_surfaces.push(surface.clone());
-                filtered_scene_nodes.push(scene_node);
+        let mut filtered_owner_roots = Vec::with_capacity(owner_roots.len());
+        for index in 0..surfaces.len() {
+            if plan.allows_presentation_root(owner_roots[index]) {
+                filtered_surfaces.push(surfaces[index].clone());
+                filtered_scene_nodes.push(scene_nodes[index]);
+                filtered_owner_roots.push(owner_roots[index]);
             }
         }
-        (
-            Cow::Owned(filtered_surfaces),
-            Cow::Owned(filtered_scene_nodes),
-            plan,
-            metrics,
-        )
+        let filtered_origins = render::surface_origins(&filtered_surfaces);
+        CanonicalPresentationScene {
+            surfaces: Cow::Owned(filtered_surfaces),
+            scene_node_ids: Cow::Owned(filtered_scene_nodes),
+            presentation_owner_root_surface_ids: Cow::Owned(filtered_owner_roots),
+            surface_origins: Cow::Owned(filtered_origins),
+            popup_surface_ids,
+            fullscreen_plan: plan,
+            visibility: metrics,
+        }
     }
 
     pub(in crate::compositor) fn native_frame_renderable_surfaces_with_composition_plan(
