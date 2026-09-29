@@ -86,7 +86,6 @@ pub(crate) struct DndOutgoingTransfer {
 struct MultipleGroup {
     requestor: u32,
     request_time: u32,
-    target: u32,
     property: u32,
     pairs: Vec<(u32, u32)>,
     pending_conversions: usize,
@@ -102,6 +101,8 @@ pub(crate) struct DndOutgoingManager {
     multiple_groups: HashMap<u64, MultipleGroup>,
     next_transfer_serial: u64,
     next_multiple_id: u64,
+    #[cfg(test)]
+    fail_next_multiple_parent_property_write: bool,
 }
 
 impl DndOutgoingManager {
@@ -181,16 +182,64 @@ impl DndOutgoingManager {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn multiple_group_count_for_test(xwm: &Xwm) -> usize {
+    xwm.data_bridge.dnd_outgoing.multiple_groups.len()
+}
+
+#[cfg(test)]
+pub(crate) fn transfer_count_for_test(xwm: &Xwm) -> usize {
+    xwm.data_bridge.dnd_outgoing.transfers.len()
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_multiple_parent_property_write_for_test(xwm: &mut Xwm) {
+    xwm.data_bridge
+        .dnd_outgoing
+        .fail_next_multiple_parent_property_write = true;
+}
+
+fn rewrite_multiple_parent_property(
+    xwm: &mut Xwm,
+    requestor: u32,
+    parent_property: u32,
+    values: &[u32],
+) -> bool {
+    #[cfg(test)]
+    if std::mem::take(
+        &mut xwm
+            .data_bridge
+            .dnd_outgoing
+            .fail_next_multiple_parent_property_write,
+    ) {
+        return false;
+    }
+
+    let cookie = xwm.connection.change_property32(
+        PropMode::REPLACE,
+        requestor,
+        parent_property,
+        xwm.atoms.get(XwmAtomName::AtomPair),
+        values,
+    );
+    match cookie {
+        Ok(cookie) => {
+            std::mem::forget(cookie);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn create_multiple_group(
     xwm: &mut Xwm,
     requestor: u32,
     request_time: u32,
-    target: u32,
-    property: u32,
+    parent_property: u32,
     pairs: Vec<(u32, u32)>,
     now_ns: u64,
 ) -> Option<u64> {
-    if pairs.len() > 64 || property == x11rb::NONE {
+    if pairs.len() > 64 || parent_property == x11rb::NONE {
         return None;
     }
     let manager = &mut xwm.data_bridge.dnd_outgoing;
@@ -204,8 +253,7 @@ pub(crate) fn create_multiple_group(
         MultipleGroup {
             requestor,
             request_time,
-            target,
-            property,
+            property: parent_property,
             pairs,
             pending_conversions: 0,
             setup_complete: false,
@@ -287,34 +335,14 @@ fn maybe_finish_multiple_group(xwm: &mut Xwm, group_id: u64) -> Result<(), XwmEr
     for (target, property) in group.pairs {
         values.extend([target, property]);
     }
-    let cookie = xwm.connection.change_property32(
-        PropMode::REPLACE,
-        group.requestor,
-        group.property,
-        xwm.atoms.get(XwmAtomName::AtomPair),
-        &values,
-    );
-    match cookie {
-        Ok(cookie) => std::mem::forget(cookie),
-        Err(_) => {
-            send_selection_notify(
-                xwm,
-                group.requestor,
-                group.request_time,
-                xwm.atoms.get(XwmAtomName::XdndSelection),
-                x11rb::NONE,
-                group.target,
-            )?;
-            return Ok(());
-        }
+    if !rewrite_multiple_parent_property(xwm, group.requestor, group.property, &values) {
+        return send_multiple_selection_notify(xwm, group.requestor, group.request_time, None);
     }
-    send_selection_notify(
+    send_multiple_selection_notify(
         xwm,
         group.requestor,
         group.request_time,
-        xwm.atoms.get(XwmAtomName::XdndSelection),
-        group.property,
-        group.target,
+        Some(group.property),
     )
 }
 
@@ -780,8 +808,33 @@ pub(crate) fn send_selection_notify(
         target,
         property,
     };
+    send_selection_notify_event(xwm, event)
+}
+
+pub(crate) fn send_multiple_selection_notify(
+    xwm: &Xwm,
+    requestor: u32,
+    time: u32,
+    parent_property: Option<u32>,
+) -> Result<(), XwmError> {
+    let event = xproto::SelectionNotifyEvent {
+        response_type: xproto::SELECTION_NOTIFY_EVENT,
+        sequence: 0,
+        time,
+        requestor,
+        selection: xwm.atoms.get(XwmAtomName::XdndSelection),
+        target: xwm.atoms.get(XwmAtomName::Multiple),
+        property: parent_property.unwrap_or(x11rb::NONE),
+    };
+    send_selection_notify_event(xwm, event)
+}
+
+fn send_selection_notify_event(
+    xwm: &Xwm,
+    event: xproto::SelectionNotifyEvent,
+) -> Result<(), XwmError> {
     xwm.connection
-        .send_event(false, requestor, xproto::EventMask::NO_EVENT, event)
+        .send_event(false, event.requestor, xproto::EventMask::NO_EVENT, event)
         .map_err(XwmError::Connection)?;
     Ok(())
 }
@@ -993,14 +1046,7 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
         .collect::<Vec<_>>();
     for id in expired_groups {
         if let Some(group) = xwm.data_bridge.dnd_outgoing.multiple_groups.remove(&id) {
-            send_selection_notify(
-                xwm,
-                group.requestor,
-                group.request_time,
-                xwm.atoms.get(XwmAtomName::XdndSelection),
-                group.target,
-                x11rb::NONE,
-            )?;
+            send_multiple_selection_notify(xwm, group.requestor, group.request_time, None)?;
         }
     }
     Ok(())
