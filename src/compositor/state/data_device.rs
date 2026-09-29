@@ -327,6 +327,44 @@ impl CompositorState {
             last_source_action: None,
             phase: DragSessionPhase::Dragging,
         });
+        if let Some(icon_surface_id) = self.active_drag_icon_surface_id() {
+            self.activate_drag_icon_visual(icon_surface_id);
+        }
+    }
+
+    pub(in crate::compositor) fn active_drag_icon_surface_id(&self) -> Option<u32> {
+        self.active_drag
+            .as_ref()?
+            .icon_surface
+            .as_ref()
+            .map(compositor_surface_id)
+    }
+
+    fn activate_drag_icon_visual(&mut self, surface_id: u32) {
+        if self.active_drag_icon_surface_id() != Some(surface_id)
+            || !matches!(self.surface_role(surface_id), SurfaceRole::DragIcon)
+        {
+            return;
+        }
+        self.update_active_drag_icon_position();
+        self.adopt_current_surface_content_for_role(surface_id);
+    }
+
+    pub(in crate::compositor) fn update_active_drag_icon_position(&mut self) {
+        let Some(surface_id) = self.active_drag_icon_surface_id() else {
+            return;
+        };
+        if !matches!(self.surface_role(surface_id), SurfaceRole::DragIcon) {
+            return;
+        }
+        self.set_surface_placement_with_cause(
+            surface_id,
+            SurfacePlacement::absolute_root_at(
+                self.last_pointer_x.round() as i32,
+                self.last_pointer_y.round() as i32,
+            ),
+            RenderGenerationCause::SurfacePlacement,
+        );
     }
 
     pub(in crate::compositor) fn drag_source_mime_types(
@@ -1203,7 +1241,9 @@ impl CompositorState {
                 .retain(|request| request.offer_id != offer.id());
         }
         if let Some(icon) = active.icon_surface {
-            self.deactivate_role_instance(compositor_surface_id(&icon));
+            let icon_surface_id = compositor_surface_id(&icon);
+            self.hide_renderable_surface_subtree(icon_surface_id);
+            self.deactivate_role_instance(icon_surface_id);
         }
         if remove_offer
             && let Some(offer) = active
@@ -1212,6 +1252,18 @@ impl CompositorState {
                 .and_then(ActiveDragTarget::wayland_offer)
         {
             self.data_offers.remove(&offer.id());
+        }
+    }
+
+    pub(in crate::compositor) fn forget_destroyed_drag_icon(&mut self, surface_id: u32) {
+        if self
+            .active_drag
+            .as_ref()
+            .and_then(|drag| drag.icon_surface.as_ref())
+            .is_some_and(|icon| compositor_surface_id(icon) == surface_id)
+            && let Some(active) = self.active_drag.as_mut()
+        {
+            active.icon_surface = None;
         }
     }
 

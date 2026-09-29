@@ -154,6 +154,7 @@ mod background_effect;
 mod data_control;
 mod data_device;
 mod direct_scanout;
+mod drag_icon;
 mod frame_pacing;
 mod input_output;
 mod layer_shell;

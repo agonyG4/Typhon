@@ -1002,6 +1002,9 @@ impl CompositorState {
                 || self.client_cursor_render_state().is_some());
         self.last_pointer_x = x;
         self.last_pointer_y = y;
+        if changed {
+            self.update_active_drag_icon_position();
+        }
         if moves_visible_cursor {
             self.advance_cursor_generation();
         }

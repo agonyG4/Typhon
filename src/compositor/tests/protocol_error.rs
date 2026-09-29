@@ -1127,6 +1127,60 @@ fn surface_destroy_with_live_role_posts_defunct_role_object() {
 }
 
 #[test]
+fn surface_destroy_with_live_cursor_role_does_not_post_defunct_role_object() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let (origin, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 80, 60).unwrap();
+    let cursor_surface = compositor.create_surface(&qh, ());
+
+    origin.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let enter_serial = state
+        .pointer_enter_serial
+        .expect("cursor role assignment requires pointer focus");
+
+    pointer.set_cursor(enter_serial, Some(&cursor_surface), 0, 0);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    cursor_surface.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let destroy_result = connection.roundtrip();
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert!(
+        destroy_result.is_ok(),
+        "destroying a live Cursor wl_surface must not post defunct_role_object: {destroy_result:?}"
+    );
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+}
+
+#[test]
 fn xdg_surface_destroy_with_live_role_posts_defunct_role_object() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();

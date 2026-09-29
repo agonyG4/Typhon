@@ -806,6 +806,10 @@ impl CompositorState {
         surface_x: f64,
         surface_y: f64,
     ) -> bool {
+        if self.surface_role(surface.surface_id) == SurfaceRole::DragIcon {
+            return false;
+        }
+
         self.surface_resource_by_id(surface.surface_id)
             .and_then(|resource| {
                 resource.data::<SurfaceData>().map(|data| {

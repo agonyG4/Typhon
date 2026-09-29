@@ -433,6 +433,11 @@ impl CompositorState {
         if self.root_belongs_to_fullscreen_owner_family(owner_root_surface_id, root_surface_id) {
             return FullscreenRootClassification::OwnerFamily;
         }
+        if self.surface_role(root_surface_id) == SurfaceRole::DragIcon {
+            return FullscreenRootClassification::AllowedAboveFullscreen(
+                FullscreenAboveFullscreenReason::DragIcon,
+            );
+        }
         if let Some(role) = self.layer_surfaces.get(&root_surface_id) {
             return match role.committed.layer {
                 Layer::Overlay => FullscreenRootClassification::AllowedAboveFullscreen(

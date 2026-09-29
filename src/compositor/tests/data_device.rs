@@ -260,6 +260,492 @@ fn source_less_wire_drag_with_icon_reserves_a_permanent_drag_icon_role() {
 }
 
 #[test]
+fn destroying_active_drag_icon_keeps_drag_session_and_client_alive() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let icon = compositor.create_surface(&qh, ());
+
+    origin.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("drag must use a real pointer press serial");
+
+    device.start_drag(None, &origin, Some(&icon), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue
+        .roundtrip(&mut state)
+        .expect("drag with an icon must start before icon destruction");
+
+    icon.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let destroy_result = queue.roundtrip(&mut state);
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 48.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 36.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let motion_result = queue.roundtrip(&mut state);
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert!(
+        destroy_result.is_ok(),
+        "destroying a live DragIcon wl_surface must not post defunct_role_object: {destroy_result:?}"
+    );
+    assert!(
+        motion_result.is_ok(),
+        "pointer motion after icon destruction must leave the client connected: {motion_result:?}"
+    );
+    let drag = server
+        .state
+        .active_drag
+        .as_ref()
+        .expect("destroying only the icon must not terminate the drag");
+    assert!(
+        drag.icon_surface.is_none(),
+        "the active drag must release its destroyed icon resource"
+    );
+}
+
+#[test]
+fn start_drag_publishes_a_precommitted_drag_icon_buffer() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let icon = compositor.create_surface(&qh, ());
+
+    origin.commit();
+    commit_test_buffered_surface(&icon, &shm, &qh, 19, 13).unwrap();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let icon_before_drag_is_rendered = capture_renderable_surface_snapshot(&commands)
+        .iter()
+        .any(|surface| (surface.width, surface.height) == (19, 13));
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("drag must use a real pointer press serial");
+
+    device.start_drag(None, &origin, Some(&icon), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue
+        .roundtrip(&mut state)
+        .expect("drag with a precommitted icon must start");
+    let icon_after_drag = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (19, 13));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert!(
+        !icon_before_drag_is_rendered,
+        "an unassigned surface's precommitted buffer must remain unpublished before start_drag"
+    );
+    let icon_after_drag = icon_after_drag.expect(
+        "start_drag must immediately publish the icon's already-committed buffer into the render scene",
+    );
+    assert_eq!((icon_after_drag.width, icon_after_drag.height), (19, 13));
+    assert!(
+        icon_after_drag.pixel_checksum.is_some(),
+        "the adopted icon must contain its committed SHM pixels"
+    );
+}
+
+#[test]
+fn active_drag_icon_publishes_and_replaces_committed_buffers() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let icon = compositor.create_surface(&qh, ());
+
+    origin.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("drag must use a real pointer press serial");
+
+    device.start_drag(None, &origin, Some(&icon), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue
+        .roundtrip(&mut state)
+        .expect("drag with an empty icon must start");
+
+    commit_test_buffered_surface(&icon, &shm, &qh, 21, 14).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let first_icon_buffer = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (21, 14));
+
+    commit_test_buffered_surface(&icon, &shm, &qh, 23, 16).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let replacement_icon_buffer = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (23, 16));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let first_icon_buffer = first_icon_buffer.expect(
+        "an active DragIcon commit must publish its SHM buffer through normal surface publication",
+    );
+    let replacement_icon_buffer = replacement_icon_buffer
+        .expect("a later active DragIcon commit must replace the published buffer");
+    assert_ne!(
+        first_icon_buffer.buffer_id,
+        replacement_icon_buffer.buffer_id
+    );
+    assert!(replacement_icon_buffer.pixel_checksum.is_some());
+}
+
+#[test]
+fn active_drag_icon_tracks_pointer_and_committed_surface_offset() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let icon = compositor.create_surface(&qh, ());
+
+    origin.commit();
+    commit_test_buffered_surface(&icon, &shm, &qh, 25, 17).unwrap();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let pointer_a = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+    );
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_a.0,
+            y: pointer_a.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("drag must use a real pointer press serial");
+
+    device.start_drag(None, &origin, Some(&icon), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue
+        .roundtrip(&mut state)
+        .expect("drag with a precommitted icon must start");
+    let initial = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (25, 17));
+
+    icon.offset(7, -5);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let pending_offset = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (25, 17));
+
+    icon.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let committed_offset = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (25, 17));
+
+    let pointer_b = (pointer_a.0 + 60.0, pointer_a.1 + 40.0);
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_b.0,
+            y: pointer_b.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let moved = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (25, 17));
+    let move_cause = capture_render_generation_cause(&commands);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let initial = initial.expect("precommitted active icon must be rendered");
+    let pending_offset = pending_offset.expect("icon remains visible with an uncommitted offset");
+    let committed_offset = committed_offset.expect("icon remains visible after offset commit");
+    let moved = moved.expect("visible icon remains rendered while the pointer moves");
+
+    assert_eq!(
+        (initial.origin_x, initial.origin_y),
+        (pointer_a.0 as i32, pointer_a.1 as i32)
+    );
+    assert_eq!((initial.content_x, initial.content_y), (0, 0));
+    assert_eq!(
+        (pending_offset.origin_x, pending_offset.origin_y),
+        (initial.origin_x, initial.origin_y),
+        "wl_surface.offset must remain pending until surface.commit"
+    );
+    assert_eq!((pending_offset.content_x, pending_offset.content_y), (0, 0));
+    assert_eq!(
+        (committed_offset.content_x, committed_offset.content_y),
+        (7, -5)
+    );
+    assert_eq!(
+        (committed_offset.origin_x, committed_offset.origin_y),
+        (pointer_a.0 as i32 + 7, pointer_a.1 as i32 - 5)
+    );
+    assert_eq!(
+        (moved.origin_x, moved.origin_y),
+        (pointer_b.0 as i32 + 7, pointer_b.1 as i32 - 5),
+        "pointer motion must move the icon root while preserving its committed offset"
+    );
+    assert_eq!(moved.buffer_id, committed_offset.buffer_id);
+    assert_eq!(moved.generation, committed_offset.generation);
+    assert_eq!(moved.commit_sequence, committed_offset.commit_sequence);
+    assert_eq!(move_cause, RenderGenerationCause::SurfacePlacement);
+}
+
+#[test]
+fn active_drag_icon_input_region_never_receives_pointer_hit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, origin_xdg, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let icon = compositor.create_surface(&qh, ());
+
+    origin.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&origin_xdg);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    focus_root_window(&commands, origin.id().protocol_id());
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(80, 60),
+        160,
+        120,
+    );
+
+    commit_test_buffered_surface(&icon, &shm, &qh, 25, 17).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let underlying_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (160, 120))
+        .expect("underlying application surface must be visible")
+        .surface_id;
+    let pointer = (100.0, 80.0);
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer.0,
+            y: pointer.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("drag must use a real pointer press serial");
+
+    device.start_drag(None, &origin, Some(&icon), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue
+        .roundtrip(&mut state)
+        .expect("drag with a committed icon must start");
+    let icon_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| (surface.width, surface.height) == (25, 17))
+        .expect("active DragIcon must be visible")
+        .surface_id;
+    let default_region_hit = capture_pointer_scene_hit(&commands, pointer.0, pointer.1).0;
+    let default_region_acceptance = capture_surface_input_acceptance(&commands, icon_id, 0.0, 0.0);
+
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 25, 17);
+    icon.set_input_region(Some(&region));
+    icon.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let explicit_region_hit = capture_pointer_scene_hit(&commands, pointer.0, pointer.1).0;
+    let explicit_region_acceptance = capture_surface_input_acceptance(&commands, icon_id, 0.0, 0.0);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert_ne!(icon_id, underlying_surface_id);
+    assert_eq!(
+        default_region_hit,
+        Some(underlying_surface_id),
+        "the default infinite DragIcon input region must not intercept the pointer"
+    );
+    assert!(
+        !default_region_acceptance,
+        "the default infinite DragIcon input region must be ignored"
+    );
+    assert_eq!(
+        explicit_region_hit,
+        Some(underlying_surface_id),
+        "an explicitly-set DragIcon input region must be ignored"
+    );
+    assert!(
+        !explicit_region_acceptance,
+        "an explicitly-set DragIcon input region must be ignored"
+    );
+}
+
+#[test]
 fn v3_source_set_actions_then_selection_is_a_wire_protocol_error() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

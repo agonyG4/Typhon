@@ -1893,6 +1893,15 @@ impl CompositorState {
                 true,
                 self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks),
             ),
+            SurfaceRole::DragIcon if self.active_drag_icon_surface_id() == Some(surface_id) => self
+                .commit_publishable_surface_buffer(
+                    surface_id,
+                    pending,
+                    damage,
+                    frame_callbacks,
+                    source,
+                    window_geometry,
+                ),
             SurfaceRole::Unassigned | SurfaceRole::DragIcon => (
                 true,
                 self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source),
@@ -1904,49 +1913,14 @@ impl CompositorState {
             SurfaceRole::XdgToplevel
             | SurfaceRole::XdgPopup
             | SurfaceRole::LayerSurface
-            | SurfaceRole::Subsurface { .. } => {
-                let buffer_id = pending.data.buffer_id();
-                match self.surface_publication_decision(
-                    surface_id,
-                    commit_sequence,
-                    source.publication_context(),
-                ) {
-                    SurfacePublicationDecision::Publish => {
-                        if self.subsurface_content_is_inactive(surface_id) {
-                            self.retain_inactive_subsurface_buffer(
-                                surface_id,
-                                pending,
-                                frame_callbacks,
-                                source,
-                            );
-                            (true, false)
-                        } else {
-                            let activated = self.commit_surface_buffer(
-                                surface_id,
-                                pending,
-                                damage,
-                                window_geometry,
-                                source,
-                            );
-                            self.note_layer_surface_mapped(surface_id);
-                            self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
-                            (true, activated)
-                        }
-                    }
-                    decision => {
-                        self.record_surface_publication_rejection(
-                            surface_id,
-                            commit_sequence,
-                            Some(buffer_id),
-                            source,
-                            decision,
-                        );
-                        self.release_pending_surface_buffer(pending);
-                        self.complete_frame_callbacks(frame_callbacks);
-                        (false, false)
-                    }
-                }
-            }
+            | SurfaceRole::Subsurface { .. } => self.commit_publishable_surface_buffer(
+                surface_id,
+                pending,
+                damage,
+                frame_callbacks,
+                source,
+                window_geometry,
+            ),
         };
         if accepted && matches!(self.surface_role(surface_id), SurfaceRole::Cursor) {
             let current = self.current_surface_buffers.get(&surface_id);
@@ -1987,5 +1961,58 @@ impl CompositorState {
             self.discard_presentation_feedbacks(presentation_feedbacks);
         }
         accepted
+    }
+
+    fn commit_publishable_surface_buffer(
+        &mut self,
+        surface_id: u32,
+        pending: PendingSurfaceBuffer,
+        damage: RenderableSurfaceDamage,
+        frame_callbacks: Vec<wl_callback::WlCallback>,
+        source: SurfacePublicationSource,
+        window_geometry: Option<XdgWindowGeometry>,
+    ) -> (bool, bool) {
+        let commit_sequence = pending.commit_sequence;
+        let buffer_id = pending.data.buffer_id();
+        match self.surface_publication_decision(
+            surface_id,
+            commit_sequence,
+            source.publication_context(),
+        ) {
+            SurfacePublicationDecision::Publish => {
+                if self.subsurface_content_is_inactive(surface_id) {
+                    self.retain_inactive_subsurface_buffer(
+                        surface_id,
+                        pending,
+                        frame_callbacks,
+                        source,
+                    );
+                    (true, false)
+                } else {
+                    let activated = self.commit_surface_buffer(
+                        surface_id,
+                        pending,
+                        damage,
+                        window_geometry,
+                        source,
+                    );
+                    self.note_layer_surface_mapped(surface_id);
+                    self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
+                    (true, activated)
+                }
+            }
+            decision => {
+                self.record_surface_publication_rejection(
+                    surface_id,
+                    commit_sequence,
+                    Some(buffer_id),
+                    source,
+                    decision,
+                );
+                self.release_pending_surface_buffer(pending);
+                self.complete_frame_callbacks(frame_callbacks);
+                (false, false)
+            }
+        }
     }
 }

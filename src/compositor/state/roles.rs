@@ -44,6 +44,19 @@ pub(in crate::compositor) enum LiveRoleInstance {
     Xwayland,
 }
 
+impl LiveRoleInstance {
+    const fn requires_defunct_role_object_before_surface(&self) -> bool {
+        match self {
+            Self::Cursor | Self::DragIcon => false,
+            Self::XdgToplevel
+            | Self::XdgPopup
+            | Self::LayerSurface
+            | Self::Subsurface { .. }
+            | Self::Xwayland => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(in crate::compositor) struct SurfaceRoleLifecycle {
     pub(in crate::compositor) permanent: Option<PermanentSurfaceRole>,
@@ -766,7 +779,12 @@ impl CompositorState {
     pub(in crate::compositor) fn validate_surface_destroy(&self, surface_id: u32) -> bool {
         self.surface_role_lifecycles
             .get(&surface_id)
-            .is_none_or(|lifecycle| lifecycle.live_instance.is_none())
+            .is_none_or(|lifecycle| {
+                lifecycle
+                    .live_instance
+                    .as_ref()
+                    .is_none_or(|role| !role.requires_defunct_role_object_before_surface())
+            })
     }
 
     pub(in crate::compositor) fn scrub_surface_lifecycle(&mut self, surface_id: u32) {

@@ -94,6 +94,10 @@ impl CompositorState {
         root_id: u32,
         original_position: usize,
     ) -> (u8, u8, u64, usize) {
+        if self.surface_role(root_id) == SurfaceRole::DragIcon {
+            return (8, 0, 0, original_position);
+        }
+
         if let Some(role) = self.layer_surfaces.get(&root_id) {
             let band = match role.committed.layer.scene_rank() {
                 0 => 0,

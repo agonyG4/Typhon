@@ -252,6 +252,20 @@ impl CompositorState {
         );
 
         let mut blockers = DirectScanoutSceneBlockers::default();
+        let output_rect = SurfaceTargetRect::new(0, 0, output_size.width, output_size.height);
+        let render_targets = crate::compositor::render::surface_render_space_targets(
+            scene.surfaces.as_ref(),
+            scene.surface_origins.as_ref(),
+            1.0,
+        );
+        let active_drag_icon_visible = self
+            .active_drag_icon_surface_id()
+            .and_then(|surface_id| {
+                scene
+                    .surface_index(surface_id)
+                    .and_then(|index| render_targets.get(index))
+            })
+            .is_some_and(|target| target.intersects(output_rect));
         if self.lifecycle_animation_has_pending_visible() {
             blockers.push(DirectScanoutSceneRejection::LifecycleAnimation);
         }
@@ -355,6 +369,9 @@ impl CompositorState {
                 }
             };
             blockers.push(rejection);
+        }
+        if active_drag_icon_visible {
+            blockers.push(DirectScanoutSceneRejection::OverlayVisible);
         }
         let Some(covering_surface) = covering_group.covering_surface.as_ref() else {
             blockers.push(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput);

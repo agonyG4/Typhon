@@ -19,6 +19,7 @@ pub enum FullscreenAboveFullscreenReason {
     ApplicationOverlay,
     ApplicationAbove,
     LayerOverlay,
+    DragIcon,
 }
 
 impl FullscreenAboveFullscreenReason {
@@ -29,6 +30,7 @@ impl FullscreenAboveFullscreenReason {
             Self::ApplicationOverlay => "application_overlay",
             Self::ApplicationAbove => "application_above",
             Self::LayerOverlay => "layer_overlay",
+            Self::DragIcon => "drag_icon",
         }
     }
 }

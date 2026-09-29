@@ -221,6 +221,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
         surface_y: f64,
         reply: Sender<bool>,
     },
+    CancelActiveDragForTest,
+    CaptureActiveDragIconSurface(Sender<Option<u32>>),
+    CaptureSurfaceRoleState {
+        surface_id: u32,
+        reply: Sender<(String, bool)>,
+    },
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
     SetMaterialProgramConfiguration {
         configuration: crate::material_program::MaterialProgramConfiguration,
@@ -938,6 +944,21 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     .surface_accepts_input_at(surface, surface_x, surface_y)
                             });
                         let _ = reply.send(accepted);
+                    }
+                    ServerCommand::CancelActiveDragForTest => {
+                        server.state.cancel_drag_session("test_cancel");
+                    }
+                    ServerCommand::CaptureActiveDragIconSurface(reply) => {
+                        let _ = reply.send(server.state.active_drag_icon_surface_id());
+                    }
+                    ServerCommand::CaptureSurfaceRoleState { surface_id, reply } => {
+                        let role = server.state.surface_role(surface_id).label().to_string();
+                        let active = server
+                            .state
+                            .surface_role_lifecycle(surface_id)
+                            .live_instance
+                            .is_some();
+                        let _ = reply.send((role, active));
                     }
                     ServerCommand::CaptureResolvedEffectScene(reply) => {
                         let _ = reply.send(server.resolved_effect_scene());
@@ -2341,6 +2362,38 @@ pub(in crate::compositor::tests) fn capture_surface_input_acceptance(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report surface input acceptance")
+}
+
+pub(in crate::compositor::tests) fn cancel_active_drag_for_test(commands: &Sender<ServerCommand>) {
+    commands
+        .send(ServerCommand::CancelActiveDragForTest)
+        .unwrap();
+    wait_for_server_commands(commands);
+}
+
+pub(in crate::compositor::tests) fn capture_active_drag_icon_surface(
+    commands: &Sender<ServerCommand>,
+) -> Option<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureActiveDragIconSurface(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report active drag icon surface")
+}
+
+pub(in crate::compositor::tests) fn capture_surface_role_state(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> (String, bool) {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSurfaceRoleState { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report surface role state")
 }
 
 pub(in crate::compositor::tests) fn capture_last_pointer_position(
