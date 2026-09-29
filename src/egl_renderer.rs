@@ -11065,9 +11065,10 @@ mod tests {
     #[test]
     fn native_three_checkpoint_incremental_cache_matches_full_capture_reference() {
         let fixture = native_three_checkpoint_fixture();
-        let incremental_config = effects::EffectDebugConfig::new(
+        let incremental_config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
             effects::EffectDebugCaptureMode::Replay,
             effects::EffectDebugKawaseMode::Partial,
+            effects::CheckpointCapturePath::FramebufferShaderCopy,
         );
         let full_capture_config = effects::EffectDebugConfig::new(
             effects::EffectDebugCaptureMode::Framebuffer,
