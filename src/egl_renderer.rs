@@ -6173,13 +6173,37 @@ fn lifecycle_visual_output_rect(
     OutputRect::new(rect.x, rect.y, rect.width, rect.height)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlBlitRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl GlBlitRect {
+    const fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LifecycleOutputBlitPlan {
+    output: GlBlitRect,
+    texture: GlBlitRect,
+}
+
 fn lifecycle_output_copy_region(
-    renderer: &GlesSceneRenderer,
+    output_size: (u32, u32),
     rect: compositor::PresentationRect,
-    target_width: u32,
-    target_height: u32,
-) -> Option<(OutputRect, i32, i32)> {
-    let scale = renderer.effect_output_scale.max(1.0) as f64;
+    texture_size: (u32, u32),
+    output_scale: f64,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> Option<LifecycleOutputBlitPlan> {
+    if output_size.0 == 0 || output_size.1 == 0 || texture_size.0 == 0 || texture_size.1 == 0 {
+        return None;
+    }
+    let scale = output_scale.max(1.0);
     let left = (rect.x() * scale).floor();
     let top = (rect.y() * scale).floor();
     let right = ((rect.x() + rect.width()) * scale).ceil();
@@ -6201,41 +6225,58 @@ fn lifecycle_output_copy_region(
     let top = top as i32;
     let right = right as i32;
     let bottom = bottom as i32;
-    let visible_left = i64::from(left)
-        .max(0)
-        .min(i64::from(renderer.current_size.0));
-    let visible_top = i64::from(top)
-        .max(0)
-        .min(i64::from(renderer.current_size.1));
-    let visible_right = i64::from(right)
-        .max(0)
-        .min(i64::from(renderer.current_size.0));
-    let visible_bottom = i64::from(bottom)
-        .max(0)
-        .min(i64::from(renderer.current_size.1));
+    let visible_left = i64::from(left).max(0).min(i64::from(output_size.0));
+    let visible_top = i64::from(top).max(0).min(i64::from(output_size.1));
+    let visible_right = i64::from(right).max(0).min(i64::from(output_size.0));
+    let visible_bottom = i64::from(bottom).max(0).min(i64::from(output_size.1));
     if visible_right <= visible_left || visible_bottom <= visible_top {
         return None;
     }
-    let visible = OutputRect::new(
-        visible_left as i32,
-        visible_top as i32,
-        (visible_right - visible_left) as u32,
-        (visible_bottom - visible_top) as u32,
-    );
-    let destination_x = visible.x.saturating_sub(left);
-    let destination_top = visible.y.saturating_sub(top);
-    let destination_bottom = destination_top.saturating_add(visible.height as i32);
-    let destination_y =
-        i32::try_from(i64::from(target_height).saturating_sub(i64::from(destination_bottom)))
-            .ok()?;
-    if destination_x < 0
-        || destination_y < 0
-        || destination_x.saturating_add(visible.width as i32) > target_width as i32
-        || destination_y.saturating_add(visible.height as i32) > target_height as i32
+
+    let visible_left = i32::try_from(visible_left).ok()?;
+    let visible_top = i32::try_from(visible_top).ok()?;
+    let visible_right = i32::try_from(visible_right).ok()?;
+    let visible_bottom = i32::try_from(visible_bottom).ok()?;
+    let output_height = i32::try_from(output_size.1).ok()?;
+    let texture_width = i32::try_from(texture_size.0).ok()?;
+    let texture_height = i32::try_from(texture_size.1).ok()?;
+    let texture_left = visible_left.checked_sub(left)?;
+    let texture_right = texture_left.checked_add(visible_right.checked_sub(visible_left)?)?;
+    let logical_texture_top = visible_top.checked_sub(top)?;
+    let logical_texture_bottom =
+        logical_texture_top.checked_add(visible_bottom.checked_sub(visible_top)?)?;
+    let texture_low_y = texture_height.checked_sub(logical_texture_bottom)?;
+    let texture_high_y = texture_height.checked_sub(logical_texture_top)?;
+    if texture_left < 0
+        || texture_right > texture_width
+        || texture_low_y < 0
+        || texture_high_y > texture_height
+        || texture_right <= texture_left
+        || texture_high_y <= texture_low_y
     {
         return None;
     }
-    Some((visible, destination_x, destination_y))
+
+    let output = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => GlBlitRect::new(
+            visible_left,
+            output_height.checked_sub(visible_bottom)?,
+            visible_right,
+            output_height.checked_sub(visible_top)?,
+        ),
+        OutputFramebufferOrigin::TopLeftScanout => {
+            GlBlitRect::new(visible_left, visible_top, visible_right, visible_bottom)
+        }
+    };
+    let texture = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => {
+            GlBlitRect::new(texture_left, texture_low_y, texture_right, texture_high_y)
+        }
+        OutputFramebufferOrigin::TopLeftScanout => {
+            GlBlitRect::new(texture_left, texture_high_y, texture_right, texture_low_y)
+        }
+    };
+    Some(LifecycleOutputBlitPlan { output, texture })
 }
 
 fn copy_output_region_to_texture(
@@ -6244,37 +6285,42 @@ fn copy_output_region_to_texture(
     rect: compositor::PresentationRect,
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> RendererResult<()> {
-    let Some((visible, destination_x, destination_y)) =
-        lifecycle_output_copy_region(renderer, rect, target.key.width, target.key.height)
-    else {
+    let Some(plan) = lifecycle_output_copy_region(
+        renderer.current_size,
+        rect,
+        (target.key.width, target.key.height),
+        f64::from(renderer.effect_output_scale),
+        framebuffer_origin,
+    ) else {
         return Ok(());
     };
-    let source_y = match framebuffer_origin {
-        OutputFramebufferOrigin::BottomLeft => renderer
-            .current_size
-            .1
-            .saturating_sub(visible.y.max(0) as u32 + visible.height)
-            as i32,
-        OutputFramebufferOrigin::TopLeftScanout => visible.y,
-    };
-    let texture = renderer
-        .effect_resources
-        .texture(target)
-        .ok_or_else(|| io::Error::other("lifecycle source texture was not realized"))?;
     renderer.bind_active_output_framebuffer();
+    let draw_framebuffer = renderer
+        .effect_resources
+        .bind_draw_target(&renderer.gl, target)?;
+    if renderer.active_output_framebuffer == Some(draw_framebuffer) {
+        return Err(io::Error::other("lifecycle output and texture targets alias").into());
+    }
     unsafe {
-        renderer.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        renderer.gl.copy_tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            destination_x,
-            destination_y,
-            visible.x,
-            source_y,
-            visible.width as i32,
-            visible.height as i32,
+        renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer
+            .gl
+            .bind_framebuffer(glow::READ_FRAMEBUFFER, renderer.active_output_framebuffer);
+        renderer
+            .gl
+            .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
+        renderer.gl.blit_framebuffer(
+            plan.output.x0,
+            plan.output.y0,
+            plan.output.x1,
+            plan.output.y1,
+            plan.texture.x0,
+            plan.texture.y0,
+            plan.texture.x1,
+            plan.texture.y1,
+            glow::COLOR_BUFFER_BIT,
+            glow::NEAREST,
         );
-        renderer.gl.bind_texture(glow::TEXTURE_2D, None);
     }
     renderer.establish_ordinary_scene_state();
     Ok(())
@@ -6306,96 +6352,43 @@ fn restore_output_region_from_texture(
     rect: compositor::PresentationRect,
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> RendererResult<()> {
-    let Some((visible, destination_x, destination_y)) =
-        lifecycle_output_copy_region(renderer, rect, source.key.width, source.key.height)
-    else {
+    let Some(plan) = lifecycle_output_copy_region(
+        renderer.current_size,
+        rect,
+        (source.key.width, source.key.height),
+        f64::from(renderer.effect_output_scale),
+        framebuffer_origin,
+    ) else {
         return Ok(());
     };
-    let destination_bottom = destination_y.saturating_add(visible.height as i32);
-    let uv_left = destination_x as f32 / source.key.width as f32;
-    let uv_right =
-        destination_x.saturating_add(visible.width as i32) as f32 / source.key.width as f32;
-    let uv_top = 1.0 - destination_y as f32 / source.key.height as f32;
-    let uv_bottom = 1.0 - destination_bottom as f32 / source.key.height as f32;
-    let output_width = renderer.current_size.0.max(1) as f32;
-    let output_height = renderer.current_size.1.max(1) as f32;
-    let left = visible.x as f32 / output_width * 2.0 - 1.0;
-    let right = (visible.x + visible.width as i32) as f32 / output_width * 2.0 - 1.0;
-    let (top, bottom) = match framebuffer_origin {
-        OutputFramebufferOrigin::BottomLeft => (
-            1.0 - visible.y as f32 / output_height * 2.0,
-            1.0 - (visible.y + visible.height as i32) as f32 / output_height * 2.0,
-        ),
-        OutputFramebufferOrigin::TopLeftScanout => (
-            visible.y as f32 / output_height * 2.0 - 1.0,
-            (visible.y + visible.height as i32) as f32 / output_height * 2.0 - 1.0,
-        ),
-    };
-    let vertices = [
-        EglTexturedVertex {
-            position: [left, top],
-            uv: [uv_left, uv_top],
-        },
-        EglTexturedVertex {
-            position: [left, bottom],
-            uv: [uv_left, uv_bottom],
-        },
-        EglTexturedVertex {
-            position: [right, bottom],
-            uv: [uv_right, uv_bottom],
-        },
-        EglTexturedVertex {
-            position: [left, top],
-            uv: [uv_left, uv_top],
-        },
-        EglTexturedVertex {
-            position: [right, bottom],
-            uv: [uv_right, uv_bottom],
-        },
-        EglTexturedVertex {
-            position: [right, top],
-            uv: [uv_right, uv_top],
-        },
-    ];
-    let texture = renderer
-        .effect_resources
-        .texture(source)
-        .ok_or_else(|| io::Error::other("lifecycle backup texture was not realized"))?;
     renderer.bind_active_output_framebuffer();
-    unsafe {
-        renderer
-            .gl
-            .bind_buffer(glow::ARRAY_BUFFER, Some(renderer.scene_vertex_buffer));
-        renderer.gl.buffer_sub_data_u8_slice(
-            glow::ARRAY_BUFFER,
-            0,
-            bytemuck::cast_slice(&vertices),
-        );
-        renderer
-            .gl
-            .bind_vertex_array(Some(renderer.scene_vertex_array));
-        renderer.gl.use_program(Some(renderer.program));
-        renderer.gl.active_texture(glow::TEXTURE0);
-        renderer.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        renderer.gl.enable(glow::BLEND);
-        renderer.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-        renderer.gl.enable(glow::SCISSOR_TEST);
-        let y = match framebuffer_origin {
-            OutputFramebufferOrigin::BottomLeft => renderer
-                .current_size
-                .1
-                .saturating_sub(visible.y.max(0) as u32 + visible.height)
-                as i32,
-            OutputFramebufferOrigin::TopLeftScanout => visible.y,
-        };
-        renderer
-            .gl
-            .scissor(visible.x, y, visible.width as i32, visible.height as i32);
-        renderer.gl.draw_arrays(glow::TRIANGLES, 0, 6);
-        renderer.gl.bind_texture(glow::TEXTURE_2D, None);
-        renderer.gl.disable(glow::SCISSOR_TEST);
+    let read_framebuffer = renderer
+        .effect_resources
+        .bind_read_target(&renderer.gl, source)?;
+    if renderer.active_output_framebuffer == Some(read_framebuffer) {
+        return Err(io::Error::other("lifecycle texture and output targets alias").into());
     }
-    renderer.scene_geometry_dirty = true;
+    unsafe {
+        renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer
+            .gl
+            .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read_framebuffer));
+        renderer
+            .gl
+            .bind_framebuffer(glow::DRAW_FRAMEBUFFER, renderer.active_output_framebuffer);
+        renderer.gl.blit_framebuffer(
+            plan.texture.x0,
+            plan.texture.y0,
+            plan.texture.x1,
+            plan.texture.y1,
+            plan.output.x0,
+            plan.output.y0,
+            plan.output.x1,
+            plan.output.y1,
+            glow::COLOR_BUFFER_BIT,
+            glow::NEAREST,
+        );
+    }
     renderer.establish_ordinary_scene_state();
     Ok(())
 }
@@ -8874,6 +8867,55 @@ mod tests {
         harness.renderer.establish_ordinary_scene_state();
     }
 
+    fn lifecycle_transfer_test_color(x: u32, logical_y: u32) -> [u8; 4] {
+        match logical_y {
+            0..=1 => [255, (x * 19) as u8, 0, 255],
+            2..=3 => [0, 255, (x * 23) as u8, 255],
+            _ => [0, (x * 17) as u8, 255, 255],
+        }
+    }
+
+    fn fill_lifecycle_transfer_test_pattern(
+        harness: &GlesEffectTestHarness,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) {
+        let (width, height) = harness.renderer.current_size;
+        harness.renderer.bind_active_output_framebuffer();
+        unsafe {
+            harness.gl.disable(glow::BLEND);
+            harness.gl.enable(glow::SCISSOR_TEST);
+            for logical_y in 0..height {
+                let gl_y = match framebuffer_origin {
+                    OutputFramebufferOrigin::BottomLeft => height - logical_y - 1,
+                    OutputFramebufferOrigin::TopLeftScanout => logical_y,
+                };
+                for x in 0..width {
+                    let [red, green, blue, alpha] = lifecycle_transfer_test_color(x, logical_y);
+                    harness.gl.scissor(x as i32, gl_y as i32, 1, 1);
+                    harness.gl.clear_color(
+                        f32::from(red) / 255.0,
+                        f32::from(green) / 255.0,
+                        f32::from(blue) / 255.0,
+                        f32::from(alpha) / 255.0,
+                    );
+                    harness.gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+            }
+            harness.gl.disable(glow::SCISSOR_TEST);
+        }
+        harness.renderer.establish_ordinary_scene_state();
+    }
+
+    fn lifecycle_transfer_test_texture_key(width: u32, height: u32) -> EffectTextureKey {
+        EffectTextureKey::new(
+            width,
+            height,
+            EffectTextureFormat::Rgba8,
+            EffectTextureFilter::Nearest,
+            EffectWorkingSpace::OutputEncodedSrgb,
+        )
+    }
+
     fn read_effect_texture_pixels(
         harness: &mut GlesEffectTestHarness,
         target: &PooledEffectTexture,
@@ -8900,6 +8942,201 @@ mod tests {
         }
         harness.renderer.establish_ordinary_scene_state();
         pixels
+    }
+
+    #[test]
+    fn lifecycle_output_capture_is_bottom_left_canonical_for_both_origins() {
+        let mut harness = GlesEffectTestHarness::new(8, 6);
+        harness.install_texture_backed_output();
+        let target = harness
+            .renderer
+            .effect_resources
+            .acquire(&harness.gl, lifecycle_transfer_test_texture_key(8, 6))
+            .expect("lifecycle capture texture allocates");
+        let rect = PresentationRect::new(0.0, 0.0, 8.0, 6.0).expect("full output rectangle");
+        let mut captured = Vec::new();
+
+        for framebuffer_origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            fill_lifecycle_transfer_test_pattern(&harness, framebuffer_origin);
+            clear_effect_texture(&mut harness.renderer, &target)
+                .expect("lifecycle capture texture clears");
+            copy_output_region_to_texture(&mut harness.renderer, &target, rect, framebuffer_origin)
+                .expect("lifecycle output region captures");
+            captured.push(read_effect_texture_pixels(&mut harness, &target, 8, 6));
+        }
+
+        assert_eq!(
+            captured[0], captured[1],
+            "the same logical image must produce identical BottomLeft lifecycle textures"
+        );
+        assert_effect_test_pixel(&captured[0], 8, 0, 5, lifecycle_transfer_test_color(0, 0));
+        assert_effect_test_pixel(&captured[0], 8, 0, 0, lifecycle_transfer_test_color(0, 5));
+    }
+
+    #[test]
+    fn lifecycle_output_blit_plan_clips_edges_and_keeps_texture_offsets() {
+        let cases = [
+            (
+                PresentationRect::new(2.0, 1.0, 6.0, 6.0).unwrap(),
+                GlBlitRect::new(2, 1, 8, 7),
+                GlBlitRect::new(2, 1, 8, 7),
+                GlBlitRect::new(0, 0, 6, 6),
+            ),
+            (
+                PresentationRect::new(2.0, -2.0, 6.0, 6.0).unwrap(),
+                GlBlitRect::new(2, 4, 8, 8),
+                GlBlitRect::new(2, 0, 8, 4),
+                GlBlitRect::new(0, 0, 6, 4),
+            ),
+            (
+                PresentationRect::new(2.0, 6.0, 6.0, 6.0).unwrap(),
+                GlBlitRect::new(2, 0, 8, 2),
+                GlBlitRect::new(2, 6, 8, 8),
+                GlBlitRect::new(0, 4, 6, 6),
+            ),
+            (
+                PresentationRect::new(-2.0, 1.0, 6.0, 6.0).unwrap(),
+                GlBlitRect::new(0, 1, 4, 7),
+                GlBlitRect::new(0, 1, 4, 7),
+                GlBlitRect::new(2, 0, 6, 6),
+            ),
+            (
+                PresentationRect::new(8.0, 1.0, 6.0, 6.0).unwrap(),
+                GlBlitRect::new(8, 1, 10, 7),
+                GlBlitRect::new(8, 1, 10, 7),
+                GlBlitRect::new(0, 0, 2, 6),
+            ),
+        ];
+
+        for (rect, expected_bottom_left_output, expected_top_left_output, expected_texture) in cases
+        {
+            let bottom_left = lifecycle_output_copy_region(
+                (10, 8),
+                rect,
+                (6, 6),
+                1.0,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+            .expect("visible BottomLeft transfer plan");
+            let top_left = lifecycle_output_copy_region(
+                (10, 8),
+                rect,
+                (6, 6),
+                1.0,
+                OutputFramebufferOrigin::TopLeftScanout,
+            )
+            .expect("visible TopLeftScanout transfer plan");
+            assert_eq!(bottom_left.output, expected_bottom_left_output);
+            assert_eq!(bottom_left.texture, expected_texture);
+            assert_eq!(top_left.output, expected_top_left_output);
+            assert_eq!(
+                top_left.texture,
+                GlBlitRect::new(
+                    expected_texture.x0,
+                    expected_texture.y1,
+                    expected_texture.x1,
+                    expected_texture.y0,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_capture_and_restore_round_trip_preserves_pixels_and_clipped_offsets() {
+        let mut harness = GlesEffectTestHarness::new(10, 8);
+        harness.install_texture_backed_output();
+        let rects = [
+            PresentationRect::new(2.0, 1.0, 6.0, 6.0).expect("fully visible rectangle"),
+            PresentationRect::new(2.0, -2.0, 6.0, 6.0).expect("top-clipped rectangle"),
+            PresentationRect::new(2.0, 6.0, 6.0, 6.0).expect("bottom-clipped rectangle"),
+            PresentationRect::new(-2.0, 1.0, 6.0, 6.0).expect("left-clipped rectangle"),
+            PresentationRect::new(8.0, 1.0, 6.0, 6.0).expect("right-clipped rectangle"),
+        ];
+
+        for framebuffer_origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            for rect in rects {
+                let target = harness
+                    .renderer
+                    .effect_resources
+                    .acquire(&harness.gl, lifecycle_transfer_test_texture_key(6, 6))
+                    .expect("lifecycle backup texture allocates");
+                fill_lifecycle_transfer_test_pattern(&harness, framebuffer_origin);
+                harness.renderer.bind_active_output_framebuffer();
+                let before = read_effect_test_pixels(&harness.gl, 10, 8);
+                clear_effect_texture(&mut harness.renderer, &target)
+                    .expect("lifecycle backup texture clears");
+                copy_output_region_to_texture(
+                    &mut harness.renderer,
+                    &target,
+                    rect,
+                    framebuffer_origin,
+                )
+                .expect("lifecycle output region captures");
+
+                let captured = read_effect_texture_pixels(&mut harness, &target, 6, 6);
+                for texture_y in 0..6 {
+                    let logical_y = 5 - texture_y;
+                    for texture_x in 0..6 {
+                        let output_x = rect.x() as i32 + texture_x as i32;
+                        let output_y = rect.y() as i32 + logical_y as i32;
+                        let expected = if (0..10).contains(&output_x) && (0..8).contains(&output_y)
+                        {
+                            lifecycle_transfer_test_color(output_x as u32, output_y as u32)
+                        } else {
+                            [0, 0, 0, 0]
+                        };
+                        assert_effect_test_pixel(&captured, 6, texture_x, texture_y, expected);
+                    }
+                }
+
+                let logical_left = (rect.x() as i32).max(0);
+                let logical_top = (rect.y() as i32).max(0);
+                let logical_right = ((rect.x() + rect.width()) as i32).min(10);
+                let logical_bottom = ((rect.y() + rect.height()) as i32).min(8);
+                let gl_y = match framebuffer_origin {
+                    OutputFramebufferOrigin::BottomLeft => 8 - logical_bottom,
+                    OutputFramebufferOrigin::TopLeftScanout => logical_top,
+                };
+                harness.renderer.bind_active_output_framebuffer();
+                unsafe {
+                    harness.gl.enable(glow::SCISSOR_TEST);
+                    harness.gl.scissor(
+                        logical_left,
+                        gl_y,
+                        logical_right - logical_left,
+                        logical_bottom - logical_top,
+                    );
+                    harness.gl.clear_color(1.0, 0.0, 1.0, 1.0);
+                    harness.gl.clear(glow::COLOR_BUFFER_BIT);
+                    harness.gl.disable(glow::SCISSOR_TEST);
+                }
+                harness.renderer.establish_ordinary_scene_state();
+                restore_output_region_from_texture(
+                    &mut harness.renderer,
+                    &target,
+                    rect,
+                    framebuffer_origin,
+                )
+                .expect("lifecycle backup restores exactly");
+                harness.renderer.bind_active_output_framebuffer();
+                let after = read_effect_test_pixels(&harness.gl, 10, 8);
+                assert_eq!(
+                    after, before,
+                    "round trip changed pixels for {rect:?} / {framebuffer_origin:?}"
+                );
+                harness
+                    .renderer
+                    .effect_resources
+                    .release(target)
+                    .expect("lifecycle backup texture releases");
+            }
+        }
     }
 
     #[test]
@@ -12546,6 +12783,13 @@ mod tests {
         assert_eq!(&pixels[index..index + 4], &expected, "pixel ({x}, {y})");
     }
 
+    fn effect_test_pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let index = ((y * width + x) * 4) as usize;
+        pixels[index..index + 4]
+            .try_into()
+            .expect("RGBA test pixel has four channels")
+    }
+
     fn set_effect_test_uniform_i32(
         gl: &glow::Context,
         program: glow::Program,
@@ -13358,7 +13602,7 @@ mod tests {
                 parameter_block: EffectParameterBlock::default(),
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
-                visual_group: None,
+                visual_group: Some(VisualGroupId::new(1).expect("test visual group id")),
                 anchor_scope: compositor::EffectAnchorScope::VisualGroup,
                 scene_order: compositor::EffectSceneOrder::for_anchor(anchor),
             }],
@@ -13441,6 +13685,31 @@ mod tests {
             damage: RenderableSurfaceDamage::full(),
             opaque_region: SurfaceOpaqueRegion::None,
         }
+    }
+
+    fn lifecycle_test_surface_with_row_colors(
+        surface_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        row_colors: [u32; 3],
+        buffer_ids: &mut BufferIdAllocator,
+    ) -> RenderableSurface {
+        let mut surface =
+            lifecycle_test_surface(surface_id, x, y, width, height, row_colors[0], buffer_ids);
+        let pixels = (0..height)
+            .flat_map(|row| {
+                let band = ((row * 3) / height).min(2) as usize;
+                std::iter::repeat_n(row_colors[band], width as usize)
+            })
+            .collect();
+        surface.buffer = CommittedSurfaceBuffer::shm_snapshot(
+            buffer_ids.allocate().expect("test buffer identity"),
+            BufferSize::new(width, height).expect("test surface size"),
+            pixels,
+        );
+        surface
     }
 
     #[test]
@@ -13984,6 +14253,247 @@ mod tests {
         assert!(
             capture_failures[0].contains("error=MissingProgram("),
             "trace must identify the missing-program compile failure: {capture_failures:?}"
+        );
+    }
+
+    #[test]
+    fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() {
+        let mut harness = GlesEffectTestHarness::new(320, 200);
+        harness.install_texture_backed_output();
+        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+
+        let mut buffer_ids = BufferIdAllocator::default();
+        let background = lifecycle_test_surface_with_row_colors(
+            613,
+            0,
+            0,
+            320,
+            200,
+            [0xff30_6080, 0xff80_6040, 0xff60_3080],
+            &mut buffer_ids,
+        );
+        let mut retained_window = lifecycle_test_surface_with_row_colors(
+            614,
+            60,
+            40,
+            180,
+            110,
+            [0xffee_2211, 0xff12_ea14, 0xff12_22_ee],
+            &mut buffer_ids,
+        );
+        retained_window.placement = SurfacePlacement::absolute_root_at(0, 0);
+        let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+        let socket_name = format!("typhon-lifecycle-blur-top-left-egl-{}", std::process::id());
+        let mut server =
+            oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+                .expect("test compositor binds");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![background.clone()],
+            &[(background.surface_id, window_id)],
+            None,
+        );
+        let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+            &server,
+            AnimationTime::from_nanos(0),
+        );
+        resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+        resolved.lifecycle_surfaces = vec![retained_window];
+        resolved.lifecycle = lifecycle_effect_sample(
+            0.45,
+            LifecycleDirection::Minimize,
+            614,
+            1,
+            lifecycle_blur_effect_scene(
+                614,
+                oblivion_one::effects::builtin_background_blur_program_id(),
+            ),
+        );
+        let identity = resolved.lifecycle.lamps[0].presentation_identity;
+        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let input_state = crate::native_output::NativeInputState::new(320, 200);
+        let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let target = EglOutputRenderTarget {
+            framebuffer: harness
+                .test_output_framebuffer
+                .expect("output has an FBO-backed render target"),
+            sampleable_texture: harness.test_output_texture,
+            width: 320,
+            height: 200,
+            buffer_age: BufferAge::Unsupported,
+            framebuffer_origin: OutputFramebufferOrigin::TopLeftScanout,
+        };
+        effects::clear_effect_trace_test_events();
+        let outcome = harness
+            .renderer
+            .draw_scene_to_target(&harness.egl, harness.display, target, request)
+            .expect("native-origin lifecycle blur frame draws");
+        let evidence = match outcome {
+            EglFrameOutcome::Rendered {
+                lifecycle_evidence, ..
+            } => lifecycle_evidence,
+            EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+                panic!("valid native-origin lifecycle blur fell back: {fallbacks:?}")
+            }
+            EglFrameOutcome::Skipped { reason, .. } => {
+                panic!("full-damage native-origin lifecycle blur was skipped: {reason:?}")
+            }
+        };
+        assert!(evidence.contains(identity, payload_id, 614));
+        assert!(
+            harness
+                .renderer
+                .lifecycle_visual_source_is_ready(payload_id)
+        );
+        let trace = effects::take_effect_trace_test_events();
+        assert!(
+            trace
+                .iter()
+                .any(|event| event.starts_with("event=effect_graph_execute_end ")),
+            "TopLeftScanout lifecycle blur must execute its effect graph: {trace:?}"
+        );
+
+        let texture = harness
+            .renderer
+            .lifecycle_visual_resources
+            .get(&payload_id)
+            .expect("resolved lifecycle visual is retained")
+            .texture
+            .clone();
+        let source_commands = harness
+            .renderer
+            .lifecycle_source_commands
+            .get(&payload_id)
+            .expect("retained lifecycle source commands are prepared")
+            .clone();
+        assert!(
+            source_commands
+                .iter()
+                .any(|command| command.layer == EglDrawLayer::Surface(614)),
+            "the retained source includes its window surface draw command: {source_commands:?}"
+        );
+        let source_surface_command = source_commands
+            .iter()
+            .find(|command| command.layer == EglDrawLayer::Surface(614))
+            .expect("retained window draw command exists");
+        assert_eq!(
+            source_surface_command.bounds,
+            EglRect::new(60.0, 40.0, 180.0, 110.0)
+        );
+        let surface_texture = harness
+            .renderer
+            .surface_resources
+            .get(&614)
+            .expect("retained surface texture is realized")
+            .image
+            .texture;
+        let surface_framebuffer = unsafe {
+            harness
+                .gl
+                .create_framebuffer()
+                .expect("surface readback framebuffer creates")
+        };
+        unsafe {
+            harness
+                .gl
+                .bind_framebuffer(glow::FRAMEBUFFER, Some(surface_framebuffer));
+            harness.gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(surface_texture),
+                0,
+            );
+            assert_eq!(
+                harness.gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                glow::FRAMEBUFFER_COMPLETE,
+                "retained source readback framebuffer is complete"
+            );
+        }
+        let surface_pixels = read_effect_test_pixels(&harness.gl, 180, 110);
+        harness.renderer.establish_ordinary_scene_state();
+        unsafe { harness.gl.delete_framebuffer(surface_framebuffer) };
+        let source_top = effect_test_pixel(&surface_pixels, 180, 90, 5);
+        let source_middle = effect_test_pixel(&surface_pixels, 180, 90, 55);
+        let source_bottom = effect_test_pixel(&surface_pixels, 180, 90, 100);
+        assert!(
+            source_top[3] > 240 && source_middle[3] > 240 && source_bottom[3] > 240,
+            "retained source test surface must be opaque: top={source_top:?}, middle={source_middle:?}, bottom={source_bottom:?}"
+        );
+        assert!(source_top[0] > source_top[1] && source_top[0] > source_top[2]);
+        assert!(source_middle[1] > source_middle[0] && source_middle[1] > source_middle[2]);
+        assert!(source_bottom[2] > source_bottom[0] && source_bottom[2] > source_bottom[1]);
+        let resolved_pixels = read_effect_texture_pixels(
+            &mut harness,
+            &texture,
+            texture.key.width,
+            texture.key.height,
+        );
+        let sample_center_x = 90;
+        let top = effect_test_pixel(
+            &resolved_pixels,
+            texture.key.width,
+            sample_center_x,
+            109 - 10,
+        );
+        let middle = effect_test_pixel(
+            &resolved_pixels,
+            texture.key.width,
+            sample_center_x,
+            109 - 55,
+        );
+        let bottom = effect_test_pixel(
+            &resolved_pixels,
+            texture.key.width,
+            sample_center_x,
+            109 - 100,
+        );
+        assert!(
+            top[0] > top[1] && top[0] > top[2],
+            "resolved visual top should contain the red retained-window band: top={top:?}, middle={middle:?}, bottom={bottom:?}"
+        );
+        assert!(
+            middle[1] > middle[0] && middle[1] > middle[2],
+            "resolved visual middle should contain the green retained-window band: {middle:?}"
+        );
+        assert!(
+            bottom[2] > bottom[0] && bottom[2] > bottom[1],
+            "resolved visual bottom should contain the blue retained-window band: {bottom:?}"
+        );
+
+        harness.renderer.bind_active_output_framebuffer();
+        let output_pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+        let (mut red_y_sum, mut red_count, mut blue_y_sum, mut blue_count) =
+            (0_u64, 0_u64, 0_u64, 0_u64);
+        for y in 0..200 {
+            for x in 0..320 {
+                let pixel = effect_test_pixel(&output_pixels, 320, x, y);
+                if pixel[0] > pixel[1].saturating_mul(2) && pixel[0] > pixel[2].saturating_mul(2) {
+                    red_y_sum += u64::from(y);
+                    red_count += 1;
+                }
+                if pixel[2] > pixel[0].saturating_mul(2) && pixel[2] > pixel[1].saturating_mul(2) {
+                    blue_y_sum += u64::from(y);
+                    blue_count += 1;
+                }
+            }
+        }
+        assert!(red_count > 0, "Lamp output contains the retained red band");
+        assert!(
+            blue_count > 0,
+            "Lamp output contains the retained blue band"
+        );
+        assert!(
+            red_y_sum * blue_count < blue_y_sum * red_count,
+            "TopLeftScanout Lamp output must keep the red band above the blue band: red={red_y_sum}/{red_count}, blue={blue_y_sum}/{blue_count}"
         );
     }
 
