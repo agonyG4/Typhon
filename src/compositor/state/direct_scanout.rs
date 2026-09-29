@@ -586,7 +586,13 @@ impl CompositorState {
             && direct_scanout_probe_blockers_allow_scaling(&blockers)
             && self
                 .current_visual_root_window_geometry(root_surface_id)
-                .and_then(|geometry| self.presentation_rect_for_geometry(root_surface_id, geometry))
+                .and_then(|geometry| {
+                    self.presentation_rect_for_geometry_for_surfaces(
+                        active_surfaces,
+                        root_surface_id,
+                        geometry,
+                    )
+                })
                 .is_none()
         {
             blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
