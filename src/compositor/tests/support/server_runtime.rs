@@ -337,6 +337,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureInteractionCursorState(Sender<InteractionCursorStateSnapshot>),
     CaptureCursorHiddenByPointerLock(Sender<bool>),
     CaptureClipboardState(Sender<ClipboardStateSnapshot>),
+    CaptureDndActionSnapshot {
+        offer_id: u32,
+        reply: Sender<Option<DndActionSnapshot>>,
+    },
     CaptureXdgRoleSnapshot {
         surface_id: u32,
         reply: Sender<XdgRoleSnapshot>,
@@ -556,6 +560,20 @@ pub(in crate::compositor::tests) struct DirectScanoutCandidateSnapshot {
     pub(in crate::compositor::tests) output_size: BufferSize,
     pub(in crate::compositor::tests) format: DrmFormat,
     pub(in crate::compositor::tests) viewport_identity_metadata_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct DndActionSnapshot {
+    pub(in crate::compositor::tests) offer_phase: Option<DragOfferPhase>,
+    pub(in crate::compositor::tests) offer_selected_action: Option<u32>,
+    pub(in crate::compositor::tests) offer_destination_actions: Option<u32>,
+    pub(in crate::compositor::tests) offer_preferred_action: u32,
+    pub(in crate::compositor::tests) active_phase: Option<DragSessionPhase>,
+    pub(in crate::compositor::tests) active_selected_action: Option<u32>,
+    pub(in crate::compositor::tests) active_last_offer_action: Option<u32>,
+    pub(in crate::compositor::tests) active_last_source_action: Option<u32>,
+    pub(in crate::compositor::tests) offer_action_events: u64,
+    pub(in crate::compositor::tests) source_action_events: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1615,6 +1633,32 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             offer_count: server.state.data_offers.len(),
                         });
                     }
+                    ServerCommand::CaptureDndActionSnapshot { offer_id, reply } => {
+                        let offer = server
+                            .state
+                            .data_offers
+                            .values()
+                            .find(|offer| offer.offer.id().protocol_id() == offer_id);
+                        let active = server.state.active_drag.as_ref();
+                        let snapshot = offer.map(|offer| {
+                            let metrics = server.core_compliance_metrics();
+                            DndActionSnapshot {
+                                offer_phase: offer.drag_phase,
+                                offer_selected_action: offer.selected_action,
+                                offer_destination_actions: offer.destination_actions,
+                                offer_preferred_action: offer.preferred_action,
+                                active_phase: active.map(|active| active.phase),
+                                active_selected_action: active.map(|active| active.selected_action),
+                                active_last_offer_action: active
+                                    .and_then(|active| active.last_offer_action),
+                                active_last_source_action: active
+                                    .and_then(|active| active.last_source_action),
+                                offer_action_events: metrics.dnd_offer_action_events,
+                                source_action_events: metrics.dnd_source_action_events,
+                            }
+                        });
+                        let _ = reply.send(snapshot);
+                    }
                     ServerCommand::CaptureXdgRoleSnapshot { surface_id, reply } => {
                         let tracked_surface_id = if let Some((tracked_id, _)) = server
                             .state
@@ -2280,6 +2324,20 @@ pub(in crate::compositor::tests) fn capture_clipboard_state(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report clipboard state")
+}
+
+pub(in crate::compositor::tests) fn capture_dnd_action_snapshot(
+    commands: &Sender<ServerCommand>,
+    offer_id: u32,
+) -> Option<DndActionSnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureDndActionSnapshot { offer_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report DnD action state")
 }
 
 pub(in crate::compositor::tests) fn capture_render_generation(

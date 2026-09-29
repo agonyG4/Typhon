@@ -386,18 +386,37 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                     WEnum::Unknown(action) => action,
                 };
                 const VALID_ACTIONS: u32 = 1 | 2 | 4;
-                let Some(existing_offer) = state.data_offers.get(&resource.id()) else {
+                let Some((offer_kind, offer_phase, source_actions)) = state
+                    .data_offers
+                    .get(&resource.id())
+                    .map(|offer| (offer.kind, offer.drag_phase, offer.source_actions))
+                else {
                     return;
                 };
-                if existing_offer.kind != DataOfferKind::DragAndDrop
+                let dropped_drag_phase = if offer_phase == Some(DragOfferPhase::Dropped) {
+                    state.active_drag.as_ref().and_then(|drag| {
+                        drag.target
+                            .as_ref()
+                            .and_then(ActiveDragTarget::wayland_offer)
+                            .is_some_and(|current| same_wayland_resource(current, resource))
+                            .then_some(drag.phase)
+                    })
+                } else {
+                    None
+                };
+                if offer_kind != DataOfferKind::DragAndDrop
                     || matches!(
-                        existing_offer.drag_phase,
+                        offer_phase,
                         Some(DragOfferPhase::Finished | DragOfferPhase::Destroyed)
                     )
-                    || (existing_offer.drag_phase == Some(DragOfferPhase::Dropped)
-                        && state.active_drag.as_ref().is_none_or(|drag| {
-                            drag.phase != DragSessionPhase::DroppedAwaitingAskResolution
-                        }))
+                    || (offer_phase == Some(DragOfferPhase::Dropped)
+                        && !matches!(
+                            dropped_drag_phase,
+                            Some(
+                                DragSessionPhase::DroppedAwaitingFinish
+                                    | DragSessionPhase::DroppedAwaitingAskResolution
+                            )
+                        ))
                 {
                     state.post_protocol_error(
                         client,
@@ -419,7 +438,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                 if preferred != 0
                     && (preferred & !actions != 0
                         || preferred & (preferred - 1) != 0
-                        || preferred & !existing_offer.source_actions != 0)
+                        || preferred & !source_actions != 0)
                 {
                     state.post_protocol_error(
                         client,
@@ -429,11 +448,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                     );
                     return;
                 }
-                let offer_id = resource.clone();
-                if let Some(offer) = state.data_offers.get_mut(&resource.id()) {
-                    offer.selected_action = (preferred != 0).then_some(preferred);
-                }
-                state.update_drag_actions(&offer_id, actions, preferred);
+                state.apply_drag_offer_actions(resource, actions, preferred);
             }
             other => {
                 let _ = other;

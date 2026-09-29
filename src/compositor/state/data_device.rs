@@ -878,6 +878,26 @@ impl CompositorState {
         self.send_drag_action_if_changed();
     }
 
+    pub(in crate::compositor) fn apply_drag_offer_actions(
+        &mut self,
+        offer: &wl_data_offer::WlDataOffer,
+        destination_actions: u32,
+        preferred_action: u32,
+    ) {
+        let frozen_after_drop = self.active_drag.as_ref().is_some_and(|active| {
+            active.phase == DragSessionPhase::DroppedAwaitingFinish
+                && active
+                    .target
+                    .as_ref()
+                    .and_then(ActiveDragTarget::wayland_offer)
+                    .is_some_and(|current| same_wayland_resource(current, offer))
+        });
+        if frozen_after_drop {
+            return;
+        }
+        self.update_drag_actions(offer, destination_actions, preferred_action);
+    }
+
     pub(in crate::compositor) fn source_drag_actions_changed(
         &mut self,
         source: &wl_data_source::WlDataSource,

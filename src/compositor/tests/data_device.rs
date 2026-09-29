@@ -909,7 +909,7 @@ fn pre_v3_source_can_start_drag_without_set_actions() {
 }
 
 #[test]
-fn sourced_wire_drag_target_disconnect_after_drop_cancels_once() {
+fn sourced_wire_drag_post_drop_set_actions_preserves_frozen_action() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -1066,16 +1066,93 @@ fn sourced_wire_drag_target_disconnect_after_drop_cancels_once() {
     assert_eq!(target_state.data_device_drop_count, 1);
     assert_eq!(source_state.data_source_dnd_drop_performed_count, 1);
 
+    let offer_id = offer.id().protocol_id();
+    let before = capture_dnd_action_snapshot(&commands, offer_id)
+        .expect("the dropped offer must remain tracked until finish");
+    assert_eq!(before.offer_phase, Some(DragOfferPhase::Dropped));
+    assert_eq!(
+        before.active_phase,
+        Some(DragSessionPhase::DroppedAwaitingFinish)
+    );
+    assert_eq!(before.offer_selected_action, Some(2));
+    assert_eq!(before.offer_destination_actions, Some(1 | 2));
+    assert_eq!(before.offer_preferred_action, 2);
+    assert_eq!(before.active_selected_action, Some(2));
+    assert_eq!(before.active_last_offer_action, Some(2));
+    assert_eq!(before.active_last_source_action, Some(2));
+
+    // set_actions remains a valid request until finish. Choosing Copy here
+    // must not rewrite the Move action already frozen by the normal drop.
+    offer.set_actions(
+        client_wl_data_device_manager::DndAction::Copy
+            | client_wl_data_device_manager::DndAction::Move,
+        client_wl_data_device_manager::DndAction::Copy,
+    );
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        target_queue.roundtrip(&mut target_state).is_ok(),
+        "valid post-drop set_actions must not disconnect the destination"
+    );
+    source_queue.roundtrip(&mut source_state).unwrap();
+    assert_eq!(target_state.data_offer_actions, vec![2]);
+    assert_eq!(source_state.data_source_actions, vec![2]);
+
+    let after = capture_dnd_action_snapshot(&commands, offer_id)
+        .expect("the dropped offer must remain tracked after set_actions");
+    assert_eq!(after.offer_phase, before.offer_phase);
+    assert_eq!(after.active_phase, before.active_phase);
+    assert_eq!(after.offer_selected_action, before.offer_selected_action);
+    assert_eq!(
+        after.offer_destination_actions,
+        before.offer_destination_actions
+    );
+    assert_eq!(after.offer_preferred_action, before.offer_preferred_action);
+    assert_eq!(after.active_selected_action, before.active_selected_action);
+    assert_eq!(
+        after.active_last_offer_action,
+        before.active_last_offer_action
+    );
+    assert_eq!(
+        after.active_last_source_action,
+        before.active_last_source_action
+    );
+    assert_eq!(after.offer_action_events, before.offer_action_events);
+    assert_eq!(after.source_action_events, before.source_action_events);
+
+    offer.finish();
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    assert_eq!(source_state.data_source_actions, vec![2]);
+    assert_eq!(source_state.data_source_dnd_finished_count, 1);
+    assert_eq!(source_state.data_source_cancelled_count, 0);
+
+    // finish is terminal for all offer requests except destroy.
+    offer.set_actions(
+        client_wl_data_device_manager::DndAction::Copy
+            | client_wl_data_device_manager::DndAction::Move,
+        client_wl_data_device_manager::DndAction::Move,
+    );
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let protocol_error = expect_protocol_error(
+        &target_connection,
+        "wl_data_offer",
+        client_wl_data_offer::Error::InvalidOffer as u32,
+    );
+    assert_eq!(
+        protocol_error.message,
+        "selection offer cannot negotiate drag-and-drop actions"
+    );
+
     drop(target_state);
     drop(target_queue);
     drop(target_connection);
     wait_for_server_commands(&commands);
     source_queue.roundtrip(&mut source_state).unwrap();
-    assert_eq!(source_state.data_source_cancelled_count, 1);
-    assert_eq!(source_state.data_source_dnd_finished_count, 0);
-    wait_for_server_commands(&commands);
-    source_queue.roundtrip(&mut source_state).unwrap();
-    assert_eq!(source_state.data_source_cancelled_count, 1);
+    assert_eq!(source_state.data_source_cancelled_count, 0);
+    assert_eq!(source_state.data_source_dnd_finished_count, 1);
 
     let _server = stop_controllable_test_server(commands, server_thread);
     let _ = source_pointer;
@@ -1944,13 +2021,14 @@ impl ReferenceDndModel {
                 if self.active
                     && self.offer_alive
                     && (self.phase == ReferenceDndPhase::Dragging
-                        || self.phase == ReferenceDndPhase::Ask)
+                        || self.phase == ReferenceDndPhase::Ask
+                        || self.phase == ReferenceDndPhase::Dropped)
                     && actions <= 7
                     && (preferred == 0
                         || (preferred.count_ones() == 1 && actions & preferred != 0)) =>
             {
-                self.destination_actions = Some(actions);
                 if self.phase == ReferenceDndPhase::Dragging {
+                    self.destination_actions = Some(actions);
                     let common = self.source_actions & actions;
                     self.selected_action = if preferred != 0 && common & preferred != 0 {
                         preferred
@@ -1969,7 +2047,8 @@ impl ReferenceDndModel {
                         self.offer_action_events += 1;
                         self.source_action_events += 1;
                     }
-                } else if preferred != 0 {
+                } else if self.phase == ReferenceDndPhase::Ask {
+                    self.destination_actions = Some(actions);
                     let common = self.source_actions & actions;
                     if common & preferred != 0 {
                         self.selected_action = preferred;
@@ -2278,7 +2357,8 @@ impl ProductionDndModel {
             }
             DndModelOp::SetDestinationActions(actions, preferred) if actions <= 7 => {
                 if let Some(offer) = self.current_offer() {
-                    self.state.update_drag_actions(&offer, actions, preferred);
+                    self.state
+                        .apply_drag_offer_actions(&offer, actions, preferred);
                 }
             }
             DndModelOp::Receive => {
@@ -2302,7 +2382,7 @@ impl ProductionDndModel {
                         drag.phase == DragSessionPhase::DroppedAwaitingAskResolution
                     })
                 {
-                    self.state.update_drag_actions(&offer, 1 | 2, 1);
+                    self.state.apply_drag_offer_actions(&offer, 1 | 2, 1);
                 }
             }
             DndModelOp::Finish => {
