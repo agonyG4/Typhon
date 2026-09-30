@@ -525,6 +525,7 @@ pub(crate) struct EffectGlResourceCache {
     pool: EffectResourcePool,
     gl_textures: HashMap<u64, glow::Texture>,
     scratch_fbo: Option<glow::Framebuffer>,
+    lifecycle_composition_fbo: Option<glow::Framebuffer>,
     checkpoint_captures: HashMap<CheckpointCaptureCacheKey, CachedCheckpointCapture>,
     checkpoint_compatibility: Option<CheckpointCacheCompatibility>,
     checkpoint_frame_serial: u64,
@@ -537,6 +538,7 @@ impl EffectGlResourceCache {
             pool: EffectResourcePool::new(),
             gl_textures: HashMap::new(),
             scratch_fbo: None,
+            lifecycle_composition_fbo: None,
             checkpoint_captures: HashMap::new(),
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
@@ -548,6 +550,7 @@ impl EffectGlResourceCache {
             pool: EffectResourcePool::with_budget(budget_bytes)?,
             gl_textures: HashMap::new(),
             scratch_fbo: None,
+            lifecycle_composition_fbo: None,
             checkpoint_captures: HashMap::new(),
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
@@ -909,6 +912,21 @@ impl EffectGlResourceCache {
         self.bind_render_target_to(gl, texture, glow::DRAW_FRAMEBUFFER)
     }
 
+    pub(crate) fn bind_lifecycle_composition_target(
+        &mut self,
+        gl: &glow::Context,
+        texture: &PooledEffectTexture,
+    ) -> Result<glow::Framebuffer, Box<dyn std::error::Error>> {
+        let framebuffer = if let Some(framebuffer) = self.lifecycle_composition_fbo {
+            framebuffer
+        } else {
+            let framebuffer = unsafe { gl.create_framebuffer().map_err(io::Error::other)? };
+            self.lifecycle_composition_fbo = Some(framebuffer);
+            framebuffer
+        };
+        self.attach_render_target_to_framebuffer(gl, texture, glow::FRAMEBUFFER, framebuffer)
+    }
+
     pub(crate) fn bind_read_target(
         &mut self,
         gl: &glow::Context,
@@ -923,9 +941,6 @@ impl EffectGlResourceCache {
         texture: &PooledEffectTexture,
         framebuffer_target: u32,
     ) -> Result<glow::Framebuffer, Box<dyn std::error::Error>> {
-        let gl_texture = self
-            .texture(texture)
-            .ok_or_else(|| io::Error::other("effect texture was not realized"))?;
         let framebuffer = if let Some(framebuffer) = self.scratch_fbo {
             framebuffer
         } else {
@@ -933,6 +948,19 @@ impl EffectGlResourceCache {
             self.scratch_fbo = Some(framebuffer);
             framebuffer
         };
+        self.attach_render_target_to_framebuffer(gl, texture, framebuffer_target, framebuffer)
+    }
+
+    fn attach_render_target_to_framebuffer(
+        &self,
+        gl: &glow::Context,
+        texture: &PooledEffectTexture,
+        framebuffer_target: u32,
+        framebuffer: glow::Framebuffer,
+    ) -> Result<glow::Framebuffer, Box<dyn std::error::Error>> {
+        let gl_texture = self
+            .texture(texture)
+            .ok_or_else(|| io::Error::other("effect texture was not realized"))?;
         unsafe {
             gl.bind_framebuffer(framebuffer_target, Some(framebuffer));
             gl.framebuffer_texture_2d(
@@ -979,6 +1007,9 @@ impl EffectGlResourceCache {
             unsafe { gl.delete_texture(texture) };
         }
         if let Some(framebuffer) = self.scratch_fbo.take() {
+            unsafe { gl.delete_framebuffer(framebuffer) };
+        }
+        if let Some(framebuffer) = self.lifecycle_composition_fbo.take() {
             unsafe { gl.delete_framebuffer(framebuffer) };
         }
         self.pool.cleanup_size_history();

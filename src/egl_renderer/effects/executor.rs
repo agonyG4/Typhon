@@ -15,8 +15,9 @@ use super::super::geometry::{
     add_surface_consumers_for_command_range,
 };
 use super::super::{
-    GlesSceneFrameStats, GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult,
-    intersect_output_rect, output_rect_for_egl_clip,
+    EffectExecutionTargets, EffectFramebufferTarget, GlesSceneFrameStats, GlesSceneRenderer,
+    OutputFramebufferOrigin, OutputRect, RendererResult, intersect_output_rect,
+    output_rect_for_egl_clip,
 };
 use super::gpu_timing::{
     CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
@@ -1018,10 +1019,14 @@ fn execute_effect_graph_with_debug_config_internal(
     renderer
         .effect_trace
         .frame_boundary("effect_graph_execute", "begin", trace_summary);
+    let targets = EffectExecutionTargets::ordinary(EffectFramebufferTarget::new(
+        renderer.active_output_framebuffer,
+    ));
     let result = execute_graph_passes(
         renderer,
         graph,
         &mut textures,
+        targets,
         framebuffer_origin,
         Some(repaint_plan),
         None,
@@ -1067,6 +1072,7 @@ fn execute_effect_graph_with_debug_config_internal(
 pub(crate) fn execute_effect_graph_for_lifecycle(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
+    targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_rects: &[OutputRect],
     demand: &EffectExecutionDemand,
@@ -1090,6 +1096,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         renderer,
         graph,
         &mut textures,
+        targets,
         framebuffer_origin,
         None,
         Some(repaint_rects),
@@ -1107,7 +1114,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         .effect_trace
         .frame_boundary("effect_resource_sync", "end", trace_summary);
     if result.is_err() {
-        renderer.establish_ordinary_scene_state();
+        renderer.establish_effect_composition_state(targets.composition_draw);
         unsafe { renderer.gl.bind_texture(glow::TEXTURE_2D, None) };
     }
     renderer
@@ -1129,6 +1136,7 @@ fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: Option<&super::super::damage::RepaintPlan>,
     explicit_repaint_rects: Option<&[OutputRect]>,
@@ -1150,6 +1158,7 @@ fn execute_graph_passes(
         renderer,
         graph,
         textures,
+        targets,
         framebuffer_origin,
         repaint_plan,
         explicit_repaint_rects,
@@ -1213,6 +1222,7 @@ fn execute_graph_passes_inner(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: Option<&super::super::damage::RepaintPlan>,
     explicit_repaint_rects: Option<&[OutputRect]>,
@@ -1264,19 +1274,24 @@ fn execute_graph_passes_inner(
     let mut scene_valid_region = initial_scene_valid_region(scene_baseline_authority, &scene_work);
     let mut effect_valid_regions =
         std::collections::HashMap::<oblivion_one::effects::EffectInstanceId, EffectRegion>::new();
-    let mut scene_work_preservation = if !scene_work.extra_scene_work.is_empty() {
-        Some(capture_scene_work_preservation(
-            renderer,
-            output_size,
-            framebuffer_origin,
-            &scene_work.extra_scene_work,
-        )?)
-    } else {
-        None
-    };
+    let mut scene_work_preservation =
+        if !targets.uses_separate_targets() && !scene_work.extra_scene_work.is_empty() {
+            Some(capture_scene_work_preservation(
+                renderer,
+                output_size,
+                framebuffer_origin,
+                &scene_work.extra_scene_work,
+            )?)
+        } else {
+            None
+        };
     let execution_result = (|| -> RendererResult<EffectExecutionStats> {
         if reconstruct_internal_scene_work {
-            renderer.clear_effect_scene_work(scene_work_rects, framebuffer_origin)?;
+            renderer.clear_effect_scene_work(
+                scene_work_rects,
+                framebuffer_origin,
+                targets.composition_draw,
+            )?;
         }
         let mut scene_cursor = 0;
         for pass in &graph.passes {
@@ -1422,6 +1437,7 @@ fn execute_graph_passes_inner(
                         scene_cursor,
                         draw_end,
                         framebuffer_origin,
+                        targets.composition_draw,
                     )?;
                     scene_valid_region =
                         scene_valid_region_after_scene_advance(scene_work_state.active_work());
@@ -1505,6 +1521,7 @@ fn execute_graph_passes_inner(
                     scene_cursor,
                     draw_end,
                     framebuffer_origin,
+                    targets.composition_draw,
                 );
                 if let Some(replay_span) = composite_scene_replay {
                     let host_cpu_ns = monotonic_elapsed_ns(replay_host_start);
@@ -1726,6 +1743,7 @@ fn execute_graph_passes_inner(
                 graph,
                 textures,
                 pass,
+                targets,
                 framebuffer_origin,
                 &execution_damage.region,
                 scene_baseline_authority,
@@ -1867,6 +1885,7 @@ fn execute_graph_passes_inner(
             scene_cursor,
             final_scene_cursor_end,
             framebuffer_origin,
+            targets.composition_draw,
         )?;
         if renderer.effect_trace.enabled() {
             let metrics = scene_work_state.work_trace_metrics();
@@ -1901,7 +1920,7 @@ fn execute_graph_passes_inner(
                 renderer.effect_trace.overlay_boundary("end");
             }
         }
-        renderer.establish_ordinary_scene_state();
+        renderer.establish_effect_composition_state(targets.composition_draw);
         stats.instances = selection.executed_instances.len();
         stats.scene_replay_work_overflow_fallbacks =
             scene_work_state.normalization_overflow_fallbacks;
@@ -2915,6 +2934,7 @@ fn execute_pass(
     graph: &CompiledFrameGraph,
     textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
     scene_baseline_authority: SceneBaselineAuthority,
@@ -2930,6 +2950,7 @@ fn execute_pass(
                 graph,
                 textures,
                 pass,
+                targets,
                 framebuffer_origin,
                 execution_damage,
                 scene_baseline_authority,
@@ -2971,6 +2992,7 @@ fn execute_pass(
                 graph,
                 textures,
                 pass,
+                targets,
                 fragment,
                 framebuffer_origin,
                 true,
@@ -2992,6 +3014,7 @@ fn execute_pass(
                 graph,
                 textures,
                 pass,
+                targets,
                 NORMALIZE_FRAGMENT_SHADER,
                 framebuffer_origin,
                 false,
@@ -3027,6 +3050,7 @@ fn execute_pass(
                 graph,
                 textures,
                 pass,
+                targets,
                 stage,
                 fragment,
                 module,
@@ -3040,6 +3064,7 @@ fn execute_pass(
                 graph,
                 textures,
                 pass,
+                targets,
                 COMPOSITE_FRAGMENT_SHADER,
                 framebuffer_origin,
                 false,
@@ -3057,6 +3082,7 @@ fn execute_fullscreen_stage(
     graph: &CompiledFrameGraph,
     textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
     stage: &EffectNodeKind,
     fragment_shader: &str,
     module: u64,
@@ -3264,7 +3290,7 @@ fn execute_fullscreen_stage(
         renderer.gl.disable(glow::BLEND);
     }
     renderer.effect_resources.unbind_render_target(&renderer.gl);
-    renderer.bind_active_output_framebuffer();
+    renderer.establish_effect_composition_state(targets.composition_draw);
     restore_output_viewport(renderer);
     let _ = fragment_shader;
     Ok(())
@@ -3617,6 +3643,7 @@ fn execute_capture(
     graph: &CompiledFrameGraph,
     textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
     scene_baseline_authority: SceneBaselineAuthority,
@@ -3709,11 +3736,12 @@ fn execute_capture(
         stats.record_capture_execution_with_mode(pass, capture_plan.executed, physical_pixels, 0);
         match capture_plan.executed {
             CaptureTimingMode::FramebufferBlit => {
-                capture_output_region_to_graph_texture(
+                capture_output_region_to_graph_texture_with_targets(
                     renderer,
                     target,
                     target_plan,
                     framebuffer_origin,
+                    targets,
                 )?;
             }
             CaptureTimingMode::FramebufferShaderCopy => {
@@ -3724,13 +3752,14 @@ fn execute_capture(
                     let output_texture = renderer.active_output_texture.ok_or_else(|| {
                         io::Error::other("shader-copy capture has no sampleable output texture")
                     })?;
-                    capture_output_rects_to_graph_texture_shader_copy(
+                    capture_output_rects_to_graph_texture_shader_copy_with_targets(
                         renderer,
                         target,
                         target_plan,
                         framebuffer_origin,
                         output_texture,
                         &capture_texture_rects,
+                        targets,
                     )?;
                 }
                 if let Some(key) = checkpoint_cache_key.as_ref() {
@@ -3856,7 +3885,7 @@ fn execute_capture(
     renderer.capture_unclipped_presentation_owner = None;
     let mut detail = draw_result?;
     renderer.effect_resources.unbind_render_target(&renderer.gl);
-    renderer.bind_active_output_framebuffer();
+    renderer.establish_effect_composition_state(targets.composition_draw);
     restore_output_viewport(renderer);
     establish_effect_pass_blend_state(&renderer.gl, EffectPassBlendMode::Replace);
     detail.execution_pixels = physical_pixels;
@@ -4221,11 +4250,29 @@ fn shader_copy_source_texel(
 
 /// Capture a logical output domain into a graph texture with the canonical
 /// `GraphTextureOrigin::BottomLeft` orientation.
+#[cfg(test)]
 pub(crate) fn capture_output_region_to_graph_texture(
     renderer: &mut GlesSceneRenderer,
     target: &PooledEffectTexture,
     target_plan: &oblivion_one::effects::GraphTexturePlan,
     framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    let output = EffectFramebufferTarget::new(renderer.active_output_framebuffer);
+    capture_output_region_to_graph_texture_with_targets(
+        renderer,
+        target,
+        target_plan,
+        framebuffer_origin,
+        EffectExecutionTargets::ordinary(output),
+    )
+}
+
+fn capture_output_region_to_graph_texture_with_targets(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    target_plan: &oblivion_one::effects::GraphTexturePlan,
+    framebuffer_origin: OutputFramebufferOrigin,
+    targets: EffectExecutionTargets,
 ) -> RendererResult<()> {
     if target_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft {
         return Err(io::Error::other("direct capture target is not bottom-left oriented").into());
@@ -4238,11 +4285,10 @@ pub(crate) fn capture_output_region_to_graph_texture(
     )
     .ok_or_else(|| io::Error::other("direct capture domain is outside the output"))?;
     let result = (|| {
-        renderer.bind_active_output_framebuffer();
         let draw_framebuffer = renderer
             .effect_resources
             .bind_draw_target(&renderer.gl, target)?;
-        if renderer.active_output_framebuffer == Some(draw_framebuffer)
+        if targets.baseline_read.framebuffer == Some(draw_framebuffer)
             || target_plan.source == GraphTextureSource::Output
         {
             return Err(
@@ -4254,7 +4300,7 @@ pub(crate) fn capture_output_region_to_graph_texture(
             renderer.gl.disable(glow::SCISSOR_TEST);
             renderer
                 .gl
-                .bind_framebuffer(glow::READ_FRAMEBUFFER, renderer.active_output_framebuffer);
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, targets.baseline_read.framebuffer);
             renderer
                 .gl
                 .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
@@ -4273,7 +4319,7 @@ pub(crate) fn capture_output_region_to_graph_texture(
         }
         Ok(())
     })();
-    renderer.establish_ordinary_scene_state();
+    renderer.establish_effect_composition_state(targets.composition_draw);
     result
 }
 
@@ -4281,6 +4327,7 @@ pub(crate) fn capture_output_region_to_graph_texture(
 /// framebuffer-blit path. The output image is sampled as an integer texel
 /// source, while the graph target remains bottom-left oriented and local to
 /// the capture domain.
+#[cfg(test)]
 pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
     renderer: &mut GlesSceneRenderer,
     target: &PooledEffectTexture,
@@ -4302,6 +4349,7 @@ pub(crate) fn capture_output_region_to_graph_texture_shader_copy(
 /// Update only the supplied bottom-left-local rectangles in a graph capture
 /// target. The capture shader still samples the active output using the same
 /// output-space mapping as a full-domain capture.
+#[cfg(test)]
 pub(crate) fn capture_output_rects_to_graph_texture_shader_copy(
     renderer: &mut GlesSceneRenderer,
     target: &PooledEffectTexture,
@@ -4309,6 +4357,27 @@ pub(crate) fn capture_output_rects_to_graph_texture_shader_copy(
     framebuffer_origin: OutputFramebufferOrigin,
     output_texture: glow::Texture,
     target_rects: &[OutputRect],
+) -> RendererResult<()> {
+    let output = EffectFramebufferTarget::new(renderer.active_output_framebuffer);
+    capture_output_rects_to_graph_texture_shader_copy_with_targets(
+        renderer,
+        target,
+        target_plan,
+        framebuffer_origin,
+        output_texture,
+        target_rects,
+        EffectExecutionTargets::ordinary(output),
+    )
+}
+
+fn capture_output_rects_to_graph_texture_shader_copy_with_targets(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    target_plan: &oblivion_one::effects::GraphTexturePlan,
+    framebuffer_origin: OutputFramebufferOrigin,
+    output_texture: glow::Texture,
+    target_rects: &[OutputRect],
+    targets: EffectExecutionTargets,
 ) -> RendererResult<()> {
     if target_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft {
         return Err(io::Error::other("direct capture target is not bottom-left oriented").into());
@@ -4327,7 +4396,7 @@ pub(crate) fn capture_output_rects_to_graph_texture_shader_copy(
         // This is a hard guard against sampling from the image attached to the
         // current draw framebuffer. The output framebuffer is never bound as
         // DRAW for this path; only the pooled graph target is.
-        if renderer.active_output_framebuffer == Some(draw_framebuffer)
+        if targets.baseline_read.framebuffer == Some(draw_framebuffer)
             || target_plan.source == GraphTextureSource::Output
         {
             return Err(
@@ -4413,7 +4482,7 @@ pub(crate) fn capture_output_rects_to_graph_texture_shader_copy(
         }
         Ok(())
     })();
-    renderer.establish_ordinary_scene_state();
+    renderer.establish_effect_composition_state(targets.composition_draw);
     result
 }
 
@@ -4423,6 +4492,7 @@ fn execute_fullscreen_pass(
     graph: &CompiledFrameGraph,
     textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
     fragment_shader: &str,
     framebuffer_origin: OutputFramebufferOrigin,
     blur_shader: bool,
@@ -4452,6 +4522,9 @@ fn execute_fullscreen_pass(
                 .ok_or_else(|| io::Error::other("effect output texture is not allocated"))?,
         )
     };
+    if output_is_framebuffer {
+        renderer.establish_effect_composition_state(targets.composition_draw);
+    }
     if let Some(texture) = output_texture {
         renderer
             .effect_resources
@@ -4717,7 +4790,7 @@ fn execute_fullscreen_pass(
     }
     if output_texture.is_some() {
         renderer.effect_resources.unbind_render_target(&renderer.gl);
-        renderer.bind_active_output_framebuffer();
+        renderer.establish_effect_composition_state(targets.composition_draw);
         restore_output_viewport(renderer);
     }
     Ok(())

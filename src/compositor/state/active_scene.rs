@@ -469,8 +469,12 @@ impl CompositorState {
     ) {
         self.install_native_frame_test_scene(surfaces, windows, fullscreen_owner);
         for &(root_surface_id, _) in windows {
+            let mut decoration = WindowDecorationState::new();
+            decoration.apply_configured_mode(
+                crate::compositor::decoration::types::DecorationMode::ServerSide,
+            );
             self.xdg_decoration_states
-                .insert(root_surface_id, WindowDecorationState::new());
+                .insert(root_surface_id, decoration);
         }
         self.rebuild_active_scene_view();
     }

@@ -485,6 +485,36 @@ pub(crate) enum OutputFramebufferOrigin {
     TopLeftScanout,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EffectFramebufferTarget {
+    pub(crate) framebuffer: Option<glow::Framebuffer>,
+}
+
+impl EffectFramebufferTarget {
+    pub(crate) const fn new(framebuffer: Option<glow::Framebuffer>) -> Self {
+        Self { framebuffer }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EffectExecutionTargets {
+    pub(crate) baseline_read: EffectFramebufferTarget,
+    pub(crate) composition_draw: EffectFramebufferTarget,
+}
+
+impl EffectExecutionTargets {
+    pub(crate) const fn ordinary(output: EffectFramebufferTarget) -> Self {
+        Self {
+            baseline_read: output,
+            composition_draw: output,
+        }
+    }
+
+    pub(crate) fn uses_separate_targets(self) -> bool {
+        self.baseline_read.framebuffer != self.composition_draw.framebuffer
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EglSceneFrameCommit {
     repaint_plan: RepaintPlan,
@@ -564,14 +594,15 @@ struct LifecycleResolvedVisualResource {
 enum LifecycleSourceCaptureFailureStage {
     TargetAllocation,
     TargetClear,
-    BackupAllocation,
-    BackupCopy,
+    TargetRelease,
+    ScratchAllocation,
+    ScratchClear,
+    ScratchTarget,
     MissingSourceCommands,
     GraphCompile,
     EffectExecution,
     TargetCopy,
-    FramebufferRestore,
-    ResourceRelease,
+    ScratchRelease,
 }
 
 impl LifecycleSourceCaptureFailureStage {
@@ -579,14 +610,15 @@ impl LifecycleSourceCaptureFailureStage {
         match self {
             Self::TargetAllocation => "target_allocation",
             Self::TargetClear => "target_clear",
-            Self::BackupAllocation => "backup_allocation",
-            Self::BackupCopy => "backup_copy",
+            Self::TargetRelease => "target_release",
+            Self::ScratchAllocation => "scratch_allocation",
+            Self::ScratchClear => "scratch_clear",
+            Self::ScratchTarget => "scratch_target",
             Self::MissingSourceCommands => "missing_source_commands",
             Self::GraphCompile => "graph_compile",
             Self::EffectExecution => "effect_execution",
             Self::TargetCopy => "target_copy",
-            Self::FramebufferRestore => "framebuffer_restore",
-            Self::ResourceRelease => "resource_release",
+            Self::ScratchRelease => "scratch_release",
         }
     }
 }
@@ -1550,9 +1582,16 @@ impl GlesSceneRenderer {
     /// Restore the complete state expected by ordinary scene drawing after an
     /// effect or other offscreen pass has changed GL state.
     pub(crate) fn establish_ordinary_scene_state(&self) {
+        self.establish_scene_state_for_framebuffer(self.active_output_framebuffer);
+    }
+
+    pub(crate) fn establish_effect_composition_state(&self, target: EffectFramebufferTarget) {
+        self.establish_scene_state_for_framebuffer(target.framebuffer);
+    }
+
+    fn establish_scene_state_for_framebuffer(&self, framebuffer: Option<glow::Framebuffer>) {
         unsafe {
-            self.gl
-                .bind_framebuffer(glow::FRAMEBUFFER, self.active_output_framebuffer);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
             self.gl
                 .viewport(0, 0, self.current_size.0 as i32, self.current_size.1 as i32);
             self.gl.use_program(Some(self.program));
@@ -3987,7 +4026,7 @@ impl GlesSceneRenderer {
                 if let Err(release_error) = self.effect_resources.release(texture) {
                     self.record_lifecycle_source_capture_failure(
                         &LifecycleSourceCaptureFailure::new(
-                            LifecycleSourceCaptureFailureStage::ResourceRelease,
+                            LifecycleSourceCaptureFailureStage::TargetRelease,
                             Box::new(release_error),
                         ),
                     );
@@ -4048,30 +4087,48 @@ impl GlesSceneRenderer {
                 error,
             )
         })?;
-        let backup = self
+        let scratch_key = EffectTextureKey::new(
+            self.current_size.0.max(1),
+            self.current_size.1.max(1),
+            EffectTextureFormat::Rgba8,
+            EffectTextureFilter::Linear,
+            EffectWorkingSpace::OutputEncodedSrgb,
+        );
+        let scratch = self
             .effect_resources
-            .acquire(&self.gl, target.key)
+            .acquire(&self.gl, scratch_key)
             .map_err(|error| {
                 LifecycleSourceCaptureFailure::new(
-                    LifecycleSourceCaptureFailureStage::BackupAllocation,
+                    LifecycleSourceCaptureFailureStage::ScratchAllocation,
                     error,
                 )
             })?;
-        let mut backup_ready = false;
         let result = (|| {
-            copy_output_region_to_texture(
-                self,
-                &backup,
-                lamp.visual_group.presented_source_visual_rect,
-                framebuffer_origin,
-            )
-            .map_err(|error| {
+            clear_effect_texture(self, &scratch).map_err(|error| {
                 LifecycleSourceCaptureFailure::new(
-                    LifecycleSourceCaptureFailureStage::BackupCopy,
+                    LifecycleSourceCaptureFailureStage::ScratchClear,
                     error,
                 )
             })?;
-            backup_ready = true;
+            let scratch_framebuffer = self
+                .effect_resources
+                .bind_lifecycle_composition_target(&self.gl, &scratch)
+                .map_err(|error| {
+                    LifecycleSourceCaptureFailure::new(
+                        LifecycleSourceCaptureFailureStage::ScratchTarget,
+                        error,
+                    )
+                })?;
+            let targets = EffectExecutionTargets {
+                baseline_read: EffectFramebufferTarget::new(self.active_output_framebuffer),
+                composition_draw: EffectFramebufferTarget::new(Some(scratch_framebuffer)),
+            };
+            if !targets.uses_separate_targets() {
+                return Err(LifecycleSourceCaptureFailure::new(
+                    LifecycleSourceCaptureFailureStage::ScratchTarget,
+                    io::Error::other("lifecycle scratch aliases the active output framebuffer"),
+                ));
+            }
 
             let source_vertices = self
                 .lifecycle_source_vertices
@@ -4126,6 +4183,7 @@ impl GlesSceneRenderer {
                 effects::execute_effect_graph_for_lifecycle(
                     self,
                     &graph,
+                    targets,
                     framebuffer_origin,
                     &[lifecycle_visual_output_rect(
                         lamp.visual_group.presented_source_visual_rect,
@@ -4140,11 +4198,13 @@ impl GlesSceneRenderer {
                         error,
                     )
                 })?;
-                copy_output_region_to_texture(
+                copy_framebuffer_region_to_texture(
                     self,
                     &target,
                     lamp.visual_group.presented_source_visual_rect,
                     framebuffer_origin,
+                    targets.composition_draw,
+                    targets.composition_draw,
                 )
                 .map_err(|error| {
                     LifecycleSourceCaptureFailure::new(
@@ -4162,44 +4222,21 @@ impl GlesSceneRenderer {
             self.scene_geometry_dirty = true;
             draw_result
         })();
-
-        let restore_result = if backup_ready {
-            restore_output_region_from_texture(
-                self,
-                &backup,
-                lamp.visual_group.presented_source_visual_rect,
-                framebuffer_origin,
-            )
-            .map_err(|error| {
-                LifecycleSourceCaptureFailure::new(
-                    LifecycleSourceCaptureFailureStage::FramebufferRestore,
-                    error,
-                )
-            })
-        } else {
-            Ok(())
-        };
-        let release_result = self.effect_resources.release(backup).map_err(|error| {
+        self.establish_ordinary_scene_state();
+        let release_result = self.effect_resources.release(scratch).map_err(|error| {
             LifecycleSourceCaptureFailure::new(
-                LifecycleSourceCaptureFailureStage::ResourceRelease,
+                LifecycleSourceCaptureFailureStage::ScratchRelease,
                 Box::new(error),
             )
         });
-        if result.is_err()
-            && let Err(error) = &restore_result
-        {
-            self.record_lifecycle_source_capture_failure(error);
-        }
-        if (result.is_err() || restore_result.is_err())
-            && let Err(error) = &release_result
-        {
-            self.record_lifecycle_source_capture_failure(error);
-        }
-        match (result, restore_result, release_result) {
-            (Err(error), _, _) => Err(error),
-            (Ok(()), Err(error), _) => Err(error),
-            (Ok(()), Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
+        match (result, release_result) {
+            (Err(error), Err(release_error)) => {
+                self.record_lifecycle_source_capture_failure(&release_error);
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
     }
 
@@ -4566,8 +4603,9 @@ impl GlesSceneRenderer {
         &mut self,
         rects: &[OutputRect],
         framebuffer_origin: OutputFramebufferOrigin,
+        composition_draw: EffectFramebufferTarget,
     ) -> RendererResult<()> {
-        self.establish_ordinary_scene_state();
+        self.establish_effect_composition_state(composition_draw);
         unsafe {
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             self.gl.enable(glow::SCISSOR_TEST);
@@ -4595,6 +4633,7 @@ impl GlesSceneRenderer {
         start: usize,
         end: usize,
         framebuffer_origin: OutputFramebufferOrigin,
+        composition_draw: EffectFramebufferTarget,
     ) -> RendererResult<()> {
         let end = end.min(self.commands.len());
         let start = start.min(end);
@@ -4608,7 +4647,7 @@ impl GlesSceneRenderer {
                 OutputFramebufferOrigin::TopLeftScanout => rect.y,
             };
             unsafe {
-                self.establish_ordinary_scene_state();
+                self.establish_effect_composition_state(composition_draw);
                 self.gl.enable(glow::SCISSOR_TEST);
                 self.gl
                     .scissor(rect.x, y, rect.width as i32, rect.height as i32);
@@ -6279,11 +6318,24 @@ fn lifecycle_output_copy_region(
     Some(LifecycleOutputBlitPlan { output, texture })
 }
 
+#[cfg(test)]
 fn copy_output_region_to_texture(
     renderer: &mut GlesSceneRenderer,
     target: &PooledEffectTexture,
     rect: compositor::PresentationRect,
     framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    let output = EffectFramebufferTarget::new(renderer.active_output_framebuffer);
+    copy_framebuffer_region_to_texture(renderer, target, rect, framebuffer_origin, output, output)
+}
+
+fn copy_framebuffer_region_to_texture(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    rect: compositor::PresentationRect,
+    framebuffer_origin: OutputFramebufferOrigin,
+    source: EffectFramebufferTarget,
+    restore_target: EffectFramebufferTarget,
 ) -> RendererResult<()> {
     let Some(plan) = lifecycle_output_copy_region(
         renderer.current_size,
@@ -6294,103 +6346,61 @@ fn copy_output_region_to_texture(
     ) else {
         return Ok(());
     };
-    renderer.bind_active_output_framebuffer();
-    let draw_framebuffer = renderer
-        .effect_resources
-        .bind_draw_target(&renderer.gl, target)?;
-    if renderer.active_output_framebuffer == Some(draw_framebuffer) {
-        return Err(io::Error::other("lifecycle output and texture targets alias").into());
-    }
-    unsafe {
-        renderer.gl.disable(glow::SCISSOR_TEST);
-        renderer
-            .gl
-            .bind_framebuffer(glow::READ_FRAMEBUFFER, renderer.active_output_framebuffer);
-        renderer
-            .gl
-            .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
-        renderer.gl.blit_framebuffer(
-            plan.output.x0,
-            plan.output.y0,
-            plan.output.x1,
-            plan.output.y1,
-            plan.texture.x0,
-            plan.texture.y0,
-            plan.texture.x1,
-            plan.texture.y1,
-            glow::COLOR_BUFFER_BIT,
-            glow::NEAREST,
-        );
-    }
-    renderer.establish_ordinary_scene_state();
-    Ok(())
+    let result = (|| {
+        let draw_framebuffer = renderer
+            .effect_resources
+            .bind_draw_target(&renderer.gl, target)?;
+        if source.framebuffer == Some(draw_framebuffer) {
+            return Err(io::Error::other("lifecycle source and texture targets alias").into());
+        }
+        unsafe {
+            renderer.gl.disable(glow::SCISSOR_TEST);
+            renderer
+                .gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, source.framebuffer);
+            renderer
+                .gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
+            renderer.gl.blit_framebuffer(
+                plan.output.x0,
+                plan.output.y0,
+                plan.output.x1,
+                plan.output.y1,
+                plan.texture.x0,
+                plan.texture.y0,
+                plan.texture.x1,
+                plan.texture.y1,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+        }
+        Ok(())
+    })();
+    renderer.establish_effect_composition_state(restore_target);
+    result
 }
 
 fn clear_effect_texture(
     renderer: &mut GlesSceneRenderer,
     target: &PooledEffectTexture,
 ) -> RendererResult<()> {
-    renderer
-        .effect_resources
-        .bind_render_target(&renderer.gl, target)?;
-    unsafe {
+    let result = (|| {
         renderer
-            .gl
-            .viewport(0, 0, target.key.width as i32, target.key.height as i32);
-        renderer.gl.disable(glow::SCISSOR_TEST);
-        renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-        renderer.gl.clear(glow::COLOR_BUFFER_BIT);
-    }
-    renderer.effect_resources.unbind_render_target(&renderer.gl);
+            .effect_resources
+            .bind_render_target(&renderer.gl, target)?;
+        unsafe {
+            renderer
+                .gl
+                .viewport(0, 0, target.key.width as i32, target.key.height as i32);
+            renderer.gl.disable(glow::SCISSOR_TEST);
+            renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            renderer.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        renderer.effect_resources.unbind_render_target(&renderer.gl);
+        Ok(())
+    })();
     renderer.establish_ordinary_scene_state();
-    Ok(())
-}
-
-fn restore_output_region_from_texture(
-    renderer: &mut GlesSceneRenderer,
-    source: &PooledEffectTexture,
-    rect: compositor::PresentationRect,
-    framebuffer_origin: OutputFramebufferOrigin,
-) -> RendererResult<()> {
-    let Some(plan) = lifecycle_output_copy_region(
-        renderer.current_size,
-        rect,
-        (source.key.width, source.key.height),
-        f64::from(renderer.effect_output_scale),
-        framebuffer_origin,
-    ) else {
-        return Ok(());
-    };
-    renderer.bind_active_output_framebuffer();
-    let read_framebuffer = renderer
-        .effect_resources
-        .bind_read_target(&renderer.gl, source)?;
-    if renderer.active_output_framebuffer == Some(read_framebuffer) {
-        return Err(io::Error::other("lifecycle texture and output targets alias").into());
-    }
-    unsafe {
-        renderer.gl.disable(glow::SCISSOR_TEST);
-        renderer
-            .gl
-            .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read_framebuffer));
-        renderer
-            .gl
-            .bind_framebuffer(glow::DRAW_FRAMEBUFFER, renderer.active_output_framebuffer);
-        renderer.gl.blit_framebuffer(
-            plan.texture.x0,
-            plan.texture.y0,
-            plan.texture.x1,
-            plan.texture.y1,
-            plan.output.x0,
-            plan.output.y0,
-            plan.output.x1,
-            plan.output.y1,
-            glow::COLOR_BUFFER_BIT,
-            glow::NEAREST,
-        );
-    }
-    renderer.establish_ordinary_scene_state();
-    Ok(())
+    result
 }
 
 fn push_egl_render_plan(
@@ -9045,7 +9055,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_capture_and_restore_round_trip_preserves_pixels_and_clipped_offsets() {
+    fn lifecycle_output_capture_preserves_pixels_and_clipped_offsets() {
         let mut harness = GlesEffectTestHarness::new(10, 8);
         harness.install_texture_backed_output();
         let rects = [
@@ -9065,12 +9075,11 @@ mod tests {
                     .renderer
                     .effect_resources
                     .acquire(&harness.gl, lifecycle_transfer_test_texture_key(6, 6))
-                    .expect("lifecycle backup texture allocates");
+                    .expect("lifecycle capture texture allocates");
                 fill_lifecycle_transfer_test_pattern(&harness, framebuffer_origin);
                 harness.renderer.bind_active_output_framebuffer();
-                let before = read_effect_test_pixels(&harness.gl, 10, 8);
                 clear_effect_texture(&mut harness.renderer, &target)
-                    .expect("lifecycle backup texture clears");
+                    .expect("lifecycle capture texture clears");
                 copy_output_region_to_texture(
                     &mut harness.renderer,
                     &target,
@@ -9095,46 +9104,11 @@ mod tests {
                     }
                 }
 
-                let logical_left = (rect.x() as i32).max(0);
-                let logical_top = (rect.y() as i32).max(0);
-                let logical_right = ((rect.x() + rect.width()) as i32).min(10);
-                let logical_bottom = ((rect.y() + rect.height()) as i32).min(8);
-                let gl_y = match framebuffer_origin {
-                    OutputFramebufferOrigin::BottomLeft => 8 - logical_bottom,
-                    OutputFramebufferOrigin::TopLeftScanout => logical_top,
-                };
-                harness.renderer.bind_active_output_framebuffer();
-                unsafe {
-                    harness.gl.enable(glow::SCISSOR_TEST);
-                    harness.gl.scissor(
-                        logical_left,
-                        gl_y,
-                        logical_right - logical_left,
-                        logical_bottom - logical_top,
-                    );
-                    harness.gl.clear_color(1.0, 0.0, 1.0, 1.0);
-                    harness.gl.clear(glow::COLOR_BUFFER_BIT);
-                    harness.gl.disable(glow::SCISSOR_TEST);
-                }
-                harness.renderer.establish_ordinary_scene_state();
-                restore_output_region_from_texture(
-                    &mut harness.renderer,
-                    &target,
-                    rect,
-                    framebuffer_origin,
-                )
-                .expect("lifecycle backup restores exactly");
-                harness.renderer.bind_active_output_framebuffer();
-                let after = read_effect_test_pixels(&harness.gl, 10, 8);
-                assert_eq!(
-                    after, before,
-                    "round trip changed pixels for {rect:?} / {framebuffer_origin:?}"
-                );
                 harness
                     .renderer
                     .effect_resources
                     .release(target)
-                    .expect("lifecycle backup texture releases");
+                    .expect("lifecycle capture texture releases");
             }
         }
     }
@@ -13589,7 +13563,19 @@ mod tests {
         root_surface_id: u32,
         program: EffectProgramId,
     ) -> ResolvedEffectScene {
-        let region = EffectRegion::from_rect(EffectRect::new(60, 40, 180, 110).unwrap());
+        lifecycle_blur_effect_scene_for_rect(
+            root_surface_id,
+            program,
+            EffectRect::new(60, 40, 180, 110).unwrap(),
+        )
+    }
+
+    fn lifecycle_blur_effect_scene_for_rect(
+        root_surface_id: u32,
+        program: EffectProgramId,
+        owner_rect: EffectRect,
+    ) -> ResolvedEffectScene {
+        let region = EffectRegion::from_rect(owner_rect);
         let anchor = compositor::EffectAnchor::BeforeSurface(root_surface_id);
         ResolvedEffectScene::new(
             1,
@@ -14253,6 +14239,340 @@ mod tests {
         assert!(
             capture_failures[0].contains("error=MissingProgram("),
             "trace must identify the missing-program compile failure: {capture_failures:?}"
+        );
+    }
+
+    #[test]
+    fn egl_lifecycle_resolved_visual_leaves_unused_visual_bounds_transparent() {
+        for framebuffer_origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            assert_lifecycle_resolved_visual_isolation_for_origin(framebuffer_origin);
+        }
+    }
+
+    fn assert_lifecycle_resolved_visual_isolation_for_origin(
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) {
+        let mut harness = GlesEffectTestHarness::new(320, 200);
+        harness.install_texture_backed_output();
+
+        let mut buffer_ids = BufferIdAllocator::default();
+        let background = lifecycle_test_surface(613, 0, 0, 320, 200, 0xffff_00ff, &mut buffer_ids);
+        let mut retained_window =
+            lifecycle_test_surface(614, 60, 60, 180, 100, 0x8012_7514, &mut buffer_ids);
+        retained_window.placement = SurfacePlacement::absolute_root_at(0, 0);
+        let window_id = oblivion_one::compositor::WindowId::from_raw(3).expect("window id");
+        let socket_name = format!("typhon-lifecycle-isolation-egl-{}", std::process::id());
+        let mut server =
+            oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+                .expect("test compositor binds");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![retained_window.clone()],
+            &[(retained_window.surface_id, window_id)],
+            None,
+        );
+        let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+            &server,
+            AnimationTime::from_nanos(0),
+        );
+        resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+        resolved.lifecycle_surfaces = vec![retained_window];
+        resolved.lifecycle = lifecycle_effect_sample(
+            0.45,
+            LifecycleDirection::Minimize,
+            614,
+            1,
+            lifecycle_blur_effect_scene_for_rect(
+                614,
+                oblivion_one::effects::builtin_background_blur_program_id(),
+                EffectRect::new(60, 60, 180, 100).expect("blur owner rect"),
+            ),
+        );
+        resolved.lifecycle.lamps[0].window_id = window_id;
+        resolved.lifecycle.visual_sources[0].window_id = window_id;
+        resolved.lifecycle.lamps[0].visual_group = LifecycleVisualGroup::from_bounds(
+            PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("canonical client rect"),
+            PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
+            PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("presented client rect"),
+            PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect"),
+            320,
+            200,
+        )
+        .expect("expanded lifecycle visual group");
+        assert_eq!(
+            resolved.lifecycle.lamps[0]
+                .visual_group
+                .presented_source_visual_rect,
+            PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("expanded bounds"),
+        );
+        resolved.lifecycle_decorations =
+            server.native_decoration_render_instances(&resolved.lifecycle_surfaces);
+        assert_eq!(resolved.lifecycle_decorations.len(), 1);
+        let decoration = &resolved.lifecycle_decorations[0];
+        let (decoration_x, decoration_y, _, _) = decoration.scene_snapshot().bounds();
+        assert!(
+            decoration_x > 50,
+            "fixture has unused space beside its frozen SSD"
+        );
+        assert!(
+            decoration_y < 60,
+            "fixture SSD extends above the retained client: {decoration_y}"
+        );
+
+        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let input_state = crate::native_output::NativeInputState::new(320, 200);
+        let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let target = EglOutputRenderTarget {
+            framebuffer: harness
+                .test_output_framebuffer
+                .expect("output has an FBO-backed render target"),
+            sampleable_texture: harness.test_output_texture,
+            width: 320,
+            height: 200,
+            buffer_age: BufferAge::Unsupported,
+            framebuffer_origin,
+        };
+        let outcome = harness
+            .renderer
+            .draw_scene_to_target(&harness.egl, harness.display, target, request)
+            .expect("lifecycle isolation frame draws");
+        assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+
+        let texture = harness
+            .renderer
+            .lifecycle_visual_resources
+            .get(&payload_id)
+            .expect("resolved lifecycle visual is retained")
+            .texture
+            .clone();
+        // Supply a deterministic, opaque desktop baseline to the real output
+        // before re-running the retained source capture.
+        harness.renderer.bind_active_output_framebuffer();
+        unsafe {
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness.gl.disable(glow::BLEND);
+            harness.gl.clear_color(1.0, 0.0, 1.0, 1.0);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        let output_before = read_effect_test_pixels(&harness.gl, 320, 200);
+        let desktop_gl_y = match framebuffer_origin {
+            OutputFramebufferOrigin::BottomLeft => 200 - 1 - 30,
+            OutputFramebufferOrigin::TopLeftScanout => 30,
+        };
+        let desktop_pixel = effect_test_pixel(&output_before, 320, 50, desktop_gl_y);
+        assert_eq!(desktop_pixel, [255, 0, 255, 255]);
+        let source = harness
+            .renderer
+            .lifecycle_visual_sources
+            .values()
+            .next()
+            .expect("frozen lifecycle effect source is retained")
+            .clone();
+        let lamp = harness.renderer.lamp_samples[0];
+        harness
+            .renderer
+            .capture_lifecycle_visual_source(&source, lamp, texture.clone(), framebuffer_origin)
+            .expect("manual resolved-source recapture succeeds");
+        harness.renderer.bind_active_output_framebuffer();
+        let output_after = read_effect_test_pixels(&harness.gl, 320, 200);
+        assert_eq!(
+            output_after, output_before,
+            "lifecycle capture leaves output pixels unchanged"
+        );
+
+        let pixels = read_effect_texture_pixels(
+            &mut harness,
+            &texture,
+            texture.key.width,
+            texture.key.height,
+        );
+        // Output-space (50, 30) is within the 40,20–260,180 visual bounds,
+        // but above and outside the retained client/effect owner at 60,60–240,160.
+        let unused_bounds_pixel = effect_test_pixel(
+            &pixels,
+            texture.key.width,
+            50 - 40,
+            texture.key.height - 1 - (30 - 20),
+        );
+        assert_ne!(unused_bounds_pixel, desktop_pixel);
+        assert_eq!(
+            unused_bounds_pixel,
+            [0, 0, 0, 0],
+            "unused visual bounds must stay transparent instead of retaining the magenta desktop"
+        );
+        let owned_pixel = effect_test_pixel(
+            &pixels,
+            texture.key.width,
+            100 - 40,
+            texture.key.height - 1 - (100 - 20),
+        );
+        assert!(
+            owned_pixel[0] > 25 && owned_pixel[2] > 25 && owned_pixel[1] > 0,
+            "blur-owned content still includes the magenta backdrop input: {owned_pixel:?}"
+        );
+
+        // The frozen SSD's top extension is retained visual ownership even
+        // though it lies above the client. The adjacent unused bounds stay clear.
+        let ssd_output_x = decoration_x + 20;
+        let ssd_output_y = decoration_y + (60 - decoration_y) / 2;
+        assert!((40..260).contains(&ssd_output_x));
+        assert!((20..60).contains(&ssd_output_y));
+        let ssd_pixel = effect_test_pixel(
+            &pixels,
+            texture.key.width,
+            ssd_output_x as u32 - 40,
+            texture.key.height - 1 - (ssd_output_y as u32 - 20),
+        );
+        assert!(
+            ssd_pixel[3] > 0,
+            "frozen SSD titlebar must remain in the isolated lifecycle visual: {ssd_pixel:?}"
+        );
+        let unused_adjacent_pixel = effect_test_pixel(
+            &pixels,
+            texture.key.width,
+            50 - 40,
+            texture.key.height - 1 - (ssd_output_y as u32 - 20),
+        );
+        assert_eq!(
+            unused_adjacent_pixel,
+            [0, 0, 0, 0],
+            "unused visual bounds beside the SSD must remain transparent"
+        );
+    }
+
+    #[test]
+    fn egl_lifecycle_resolved_visual_preserves_premultiplied_alpha() {
+        let mut harness = GlesEffectTestHarness::new(320, 200);
+        harness.install_texture_backed_output();
+
+        let node_source = oblivion_one::effects::EffectNodeId::new(1).unwrap();
+        let program_id = EffectProgramId::new(9_002).expect("alpha test program id");
+        let alpha_program = oblivion_one::effects::EffectProgram {
+            id: program_id,
+            nodes: vec![oblivion_one::effects::EffectNode::source(
+                node_source,
+                oblivion_one::effects::EffectSource::TargetContent,
+            )],
+            output: node_source,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: oblivion_one::effects::EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        };
+        let mut registry = oblivion_one::effects::EffectRegistry::empty();
+        registry
+            .insert(oblivion_one::effects::validate_effect_program(alpha_program).unwrap())
+            .expect("alpha-preserving test program registers");
+        harness.renderer.set_effect_registry(registry);
+
+        let mut buffer_ids = BufferIdAllocator::default();
+        let background = lifecycle_test_surface(615, 0, 0, 320, 200, 0xff30_4050, &mut buffer_ids);
+        let mut retained_window =
+            lifecycle_test_surface(616, 60, 60, 180, 100, 0x8040_3030, &mut buffer_ids);
+        retained_window.placement = SurfacePlacement::absolute_root_at(0, 0);
+        let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+        let socket_name = format!("typhon-lifecycle-alpha-egl-{}", std::process::id());
+        let mut server =
+            oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+                .expect("test compositor binds");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![background.clone(), retained_window.clone()],
+            &[
+                (
+                    background.surface_id,
+                    oblivion_one::compositor::WindowId::from_raw(2).expect("background window id"),
+                ),
+                (retained_window.surface_id, window_id),
+            ],
+            None,
+        );
+        let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+            &server,
+            AnimationTime::from_nanos(0),
+        );
+        resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+        resolved.lifecycle_surfaces = vec![retained_window];
+        let alpha_scene = lifecycle_blur_effect_scene_for_rect(
+            616,
+            program_id,
+            EffectRect::new(60, 60, 180, 100).expect("alpha owner rect"),
+        );
+        resolved.lifecycle =
+            lifecycle_effect_sample(0.45, LifecycleDirection::Minimize, 616, 1, alpha_scene);
+        resolved.lifecycle.lamps[0].visual_group = LifecycleVisualGroup::from_bounds(
+            PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("canonical client rect"),
+            PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
+            PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("presented client rect"),
+            PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect"),
+            320,
+            200,
+        )
+        .expect("expanded alpha visual group");
+        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let input_state = crate::native_output::NativeInputState::new(320, 200);
+        let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let target = EglOutputRenderTarget {
+            framebuffer: harness
+                .test_output_framebuffer
+                .expect("output has an FBO-backed render target"),
+            sampleable_texture: harness.test_output_texture,
+            width: 320,
+            height: 200,
+            buffer_age: BufferAge::Unsupported,
+            framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+        };
+        let outcome = harness
+            .renderer
+            .draw_scene_to_target(&harness.egl, harness.display, target, request)
+            .expect("alpha-preserving lifecycle frame draws");
+        assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+        let texture = harness
+            .renderer
+            .lifecycle_visual_resources
+            .get(&payload_id)
+            .expect("alpha-preserving lifecycle resource is retained")
+            .texture
+            .clone();
+        let pixels = read_effect_texture_pixels(
+            &mut harness,
+            &texture,
+            texture.key.width,
+            texture.key.height,
+        );
+        let pixel = effect_test_pixel(
+            &pixels,
+            texture.key.width,
+            100 - 40,
+            texture.key.height - 1 - (100 - 20),
+        );
+        assert!(
+            pixel[3] > 0 && pixel[3] < 255,
+            "lifecycle capture must retain non-opaque source alpha: {pixel:?}"
+        );
+        assert!(
+            pixel[..3].iter().all(|channel| *channel <= pixel[3]),
+            "lifecycle capture must retain premultiplied RGB: {pixel:?}"
         );
     }
 
