@@ -1225,7 +1225,15 @@ fn x11_target_finish_does_not_require_a_mime() {
         wayland_source_x11_target_drag(XwaylandDndAction::Copy, WaylandDndAction::Copy.mask());
     let active = drag.state.active_drag.as_mut().expect("active drag");
     assert_eq!(active.accepted_mime, None);
-    active.phase = DragSessionPhase::DropPendingXwaylandTarget;
+    let _ = drag.source_events();
+    drag.state.drop_active_drag();
+    assert_eq!(
+        drag.state
+            .active_drag
+            .as_ref()
+            .map(|active| active.drop_action),
+        Some(Some(XwaylandDndAction::Copy))
+    );
 
     assert!(drag.state.finish_xwayland_drag_target(
         drag.session_id,
@@ -1300,31 +1308,112 @@ fn rejected_x11_status_clears_the_canonical_action() {
 }
 
 #[test]
-fn late_exact_x11_status_reconciles_while_physical_drop_is_pending() {
-    let mut drag = wayland_source_x11_target_drag(
-        XwaylandDndAction::Copy,
-        WaylandDndAction::Copy.mask() | WaylandDndAction::Move.mask(),
-    );
-    let _ = drag.source_events();
-    drag.state.drop_active_drag();
+fn non_ask_drop_action_is_frozen_against_late_status() {
+    let copy_mask = WaylandDndAction::Copy.mask();
+    let move_mask = WaylandDndAction::Move.mask();
+    for (frozen_action, late_action, expected_mask) in [
+        (XwaylandDndAction::Copy, XwaylandDndAction::Move, copy_mask),
+        (XwaylandDndAction::Move, XwaylandDndAction::Copy, move_mask),
+    ] {
+        let mut drag = wayland_source_x11_target_drag(frozen_action, copy_mask | move_mask);
+        let _ = drag.source_events();
+        drag.state.drop_active_drag();
+        assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
 
-    assert!(drag.state.update_xwayland_drag_target_status(
-        drag.session_id,
-        drag.target,
-        true,
-        Some(XwaylandDndAction::Move),
-    ));
-    assert_eq!(
-        drag.state.active_drag.as_ref().map(|active| active.phase),
-        Some(DragSessionPhase::DropPendingXwaylandTarget)
-    );
-    assert_eq!(
-        drag.state
-            .active_drag
-            .as_ref()
-            .and_then(|active| active.target_action),
-        Some(XwaylandDndAction::Move)
-    );
+        assert!(drag.state.update_xwayland_drag_target_status(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(late_action),
+        ));
+        let active = drag.state.active_drag.as_ref().expect("pending drop");
+        assert_eq!(active.id, drag.session_id);
+        assert!(matches!(
+            active.target.as_ref(),
+            Some(ActiveDragTarget::Xwayland { window }) if *window == drag.target
+        ));
+        assert_eq!(active.phase, DragSessionPhase::DropPendingXwaylandTarget);
+        assert_eq!(active.target_action, Some(frozen_action));
+        assert_eq!(active.drop_action, Some(frozen_action));
+        assert_eq!(active.selected_action, expected_mask);
+        assert!(!drag.state.update_xwayland_drag_target_status(
+            CanonicalDndSessionId::Wayland(NonZeroU64::new(999).unwrap()),
+            drag.target,
+            true,
+            Some(late_action),
+        ));
+        assert_eq!(
+            drag.state
+                .active_drag
+                .as_ref()
+                .and_then(|active| active.target_action),
+            Some(frozen_action)
+        );
+        assert_eq!(
+            drag.state
+                .active_drag
+                .as_ref()
+                .and_then(|active| active.drop_action),
+            Some(frozen_action)
+        );
+        assert!(drag.source_events().is_empty());
+
+        assert!(
+            drag.state
+                .finish_xwayland_drag_target(drag.session_id, drag.target, false, None,)
+        );
+        assert!(drag.state.active_drag.is_none());
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 0);
+        assert_eq!(drag.source_events(), [SourceWireEvent::Cancelled]);
+        assert!(!drag.state.finish_xwayland_drag_target(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(late_action),
+        ));
+        assert!(!drag.state.update_xwayland_drag_target_status(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(late_action),
+        ));
+        assert!(drag.source_events().is_empty());
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_cancelled, 1);
+    }
+}
+
+#[test]
+fn matching_late_non_ask_status_preserves_action_and_allows_terminal_success() {
+    let copy_mask = WaylandDndAction::Copy.mask();
+    let move_mask = WaylandDndAction::Move.mask();
+    for (action, action_mask) in [
+        (XwaylandDndAction::Copy, copy_mask),
+        (XwaylandDndAction::Move, move_mask),
+    ] {
+        let mut drag = wayland_source_x11_target_drag(action, copy_mask | move_mask);
+        let _ = drag.source_events();
+        drag.state.drop_active_drag();
+        assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+        assert!(drag.state.update_xwayland_drag_target_status(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(action),
+        ));
+        let active = drag.state.active_drag.as_ref().expect("pending drop");
+        assert_eq!(active.target_action, Some(action));
+        assert_eq!(active.selected_action, action_mask);
+        assert_eq!(active.drop_action, Some(action));
+        assert!(drag.state.finish_xwayland_drag_target(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(action),
+        ));
+        assert!(drag.state.active_drag.is_none());
+        assert_eq!(drag.state.compliance_metrics.dnd_sessions_finished, 1);
+    }
 }
 
 #[test]
@@ -1803,6 +1892,27 @@ fn ask_from_x11_target_finishes_only_after_source_supported_copy_or_move_feedbac
         let _ = drag.source_events();
         drag.state.drop_active_drag();
         assert_eq!(drag.source_events(), [SourceWireEvent::DropPerformed]);
+
+        assert!(drag.state.update_xwayland_drag_target_status(
+            drag.session_id,
+            drag.target,
+            true,
+            Some(final_action),
+        ));
+        assert_eq!(
+            drag.state
+                .active_drag
+                .as_ref()
+                .and_then(|active| active.target_action),
+            Some(XwaylandDndAction::Ask)
+        );
+        assert_eq!(
+            drag.state
+                .active_drag
+                .as_ref()
+                .and_then(|active| active.drop_action),
+            Some(XwaylandDndAction::Ask)
+        );
 
         assert!(drag.state.finish_xwayland_drag_target(
             drag.session_id,

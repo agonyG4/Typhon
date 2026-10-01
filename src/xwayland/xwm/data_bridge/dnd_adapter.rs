@@ -21,7 +21,7 @@ use super::{
         CoalescedPosition, DND_REPLY_BUDGET, DndFeedback, DndPendingReply, DndStatusFeedback,
         DndStatusResult, DndTerminalFeedback, DndWireProgress, PositionDisposition,
         SOURCE_OWNERSHIP_TIMEOUT_NS, SOURCE_TIMESTAMP_TIMEOUT_NS, TARGET_DISCOVERY_TIMEOUT_NS,
-        TARGET_FINISHED_TIMEOUT_NS, TARGET_STATUS_TIMEOUT_NS,
+        TARGET_FINISHED_TIMEOUT_NS, TARGET_STATUS_TIMEOUT_NS, status_action_authorizes_frozen_drop,
     },
 };
 use crate::xwayland::{
@@ -308,26 +308,30 @@ fn resolve_pending_drop(
     let Some(status) = session.last_status.filter(|status| status.accepted) else {
         return reject_pending_drop(xwm, id, target);
     };
-    let Some(action) = status.action else {
+    let Some(accepted_action) = status.action else {
         return reject_pending_drop(xwm, id, target);
     };
-    if session.pending_drop_action.is_none()
-        || !session.source_actions.contains(&action)
-        || action.to_wayland_action().is_none()
-        || (session
-            .target_version
-            .is_none_or(|version| version.get() < 5)
-            && action == XwaylandDndAction::Ask)
+    let (Some(pending_drop_action), Some(target_version)) =
+        (session.pending_drop_action, session.target_version)
+    else {
+        return reject_pending_drop(xwm, id, target);
+    };
+    if !session.source_actions.contains(&accepted_action)
+        || accepted_action.to_wayland_action().is_none()
+        || !status_action_authorizes_frozen_drop(
+            pending_drop_action,
+            accepted_action,
+            target_version,
+        )
     {
         return reject_pending_drop(xwm, id, target);
     }
-    let (Some(source_proxy), Some(recipient), Some(timestamp), Some(_version)) = (
+    let (Some(source_proxy), Some(recipient), Some(timestamp)) = (
         session.source_proxy,
         session.wire_recipient,
         session
             .ownership_timestamp
             .filter(|_| session.ownership_confirmed),
-        session.target_version,
     ) else {
         return reject_pending_drop(xwm, id, target);
     };
@@ -341,7 +345,7 @@ fn resolve_pending_drop(
     if !xwm
         .data_bridge
         .dnd
-        .mark_awaiting_finished(id, action, deadline_ns)
+        .mark_awaiting_finished(id, accepted_action, deadline_ns)
     {
         return Ok(());
     }

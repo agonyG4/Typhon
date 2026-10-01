@@ -45,6 +45,7 @@ pub struct DndSession {
     pub wire_recipient: Option<u32>,
     pub target_version: Option<XwaylandDndVersion>,
     pub progress: DndWireProgress,
+    /// Most recent source/user action requested in XdndPosition.
     pub action: Option<XwaylandDndAction>,
     pub x: i32,
     pub y: i32,
@@ -53,7 +54,11 @@ pub struct DndSession {
     pub coalesced_position: Option<CoalescedPosition>,
     pub latest_position: Option<CoalescedPosition>,
     pub(super) last_status: Option<DndStatusResult>,
+    /// Exact canonical action frozen by the physical DropRequested edge.
+    /// It remains unchanged while a final outstanding Status is reconciled.
     pub pending_drop_action: Option<XwaylandDndAction>,
+    /// Exact accepted Status action that authorized XdndDrop. For a frozen
+    /// Ask, this is Ask or the concrete Copy fallback selected by the target.
     pub authorized_drop_action: Option<XwaylandDndAction>,
     pub status_deadline_ns: Option<u64>,
     pub finished_deadline_ns: Option<u64>,
@@ -71,19 +76,23 @@ pub struct DndSession {
 pub struct CoalescedPosition {
     pub x: f64,
     pub y: f64,
+    /// Source/user action requested in this XdndPosition.
     pub action: Option<XwaylandDndAction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DndStatusResult {
     pub accepted: bool,
+    /// Action accepted by the target in this XdndStatus.
     pub action: Option<XwaylandDndAction>,
+    /// Source/user action from the exact XdndPosition acknowledged here.
     pub requested_action: Option<XwaylandDndAction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct StatusAcknowledgement {
     pub next_position: Option<CoalescedPosition>,
+    /// The unchanged canonical drop action awaiting final Status reconciliation.
     pub pending_drop_action: Option<XwaylandDndAction>,
 }
 
@@ -152,6 +161,7 @@ pub(crate) struct DndStatusFeedback {
     pub id: XwaylandDndAdapterId,
     pub target: X11WindowHandle,
     pub accepted: bool,
+    /// Action accepted by the target for the acknowledged Position.
     pub action: Option<XwaylandDndAction>,
 }
 
@@ -160,6 +170,7 @@ pub(crate) struct DndTerminalFeedback {
     pub id: XwaylandDndAdapterId,
     pub target: X11WindowHandle,
     pub accepted: bool,
+    /// Action performed at terminal completion; Ask may resolve to Copy/Move.
     pub action: Option<XwaylandDndAction>,
 }
 
@@ -180,6 +191,20 @@ pub(super) const DND_REPLY_BUDGET: usize = 64;
 pub(super) const MAX_PENDING_DND_REPLIES: usize = 128;
 pub(super) const MAX_MULTIPLE_PAIRS: usize = 64;
 const MAX_DND_FEEDBACK: usize = 2;
+
+pub(super) fn status_action_authorizes_frozen_drop(
+    pending_drop_action: XwaylandDndAction,
+    accepted_action: XwaylandDndAction,
+    target_version: XwaylandDndVersion,
+) -> bool {
+    match (pending_drop_action, accepted_action) {
+        (XwaylandDndAction::Copy, XwaylandDndAction::Copy)
+        | (XwaylandDndAction::Move, XwaylandDndAction::Move)
+        | (XwaylandDndAction::Ask, XwaylandDndAction::Copy) => true,
+        (XwaylandDndAction::Ask, XwaylandDndAction::Ask) => target_version.get() >= 5,
+        _ => false,
+    }
+}
 
 impl DndManager {
     pub(super) fn push_status_feedback(&mut self, feedback: DndStatusFeedback) {

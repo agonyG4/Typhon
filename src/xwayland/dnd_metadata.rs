@@ -355,6 +355,7 @@ pub enum XwaylandDndTransition {
         target: X11WindowHandle,
         x: f64,
         y: f64,
+        /// Source/user action requested in the outgoing XdndPosition.
         action: Option<XwaylandDndAction>,
         mime_types: XwaylandDndMimeCatalog,
         source_actions: Vec<XwaylandDndAction>,
@@ -366,6 +367,7 @@ pub enum XwaylandDndTransition {
     DropRequested {
         session_id: CanonicalDndSessionId,
         target: X11WindowHandle,
+        /// Target-accepted action frozen by physical release.
         action: XwaylandDndAction,
         mime_types: XwaylandDndMimeCatalog,
         source_actions: Vec<XwaylandDndAction>,
@@ -374,6 +376,7 @@ pub enum XwaylandDndTransition {
         session_id: CanonicalDndSessionId,
         target: X11WindowHandle,
         accepted: bool,
+        /// Concrete action performed at terminal completion; absent on reject.
         action: Option<XwaylandDndAction>,
     },
     SourceFeedback {

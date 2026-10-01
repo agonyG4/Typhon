@@ -180,7 +180,11 @@ pub(super) struct ActiveDrag {
     pub(super) icon_surface: Option<wl_surface::WlSurface>,
     pub(super) target: Option<ActiveDragTarget>,
     pub(super) accepted_mime: Option<String>,
+    /// Action accepted by the current target while the drag is in flight.
     pub(super) target_action: Option<crate::xwayland::XwaylandDndAction>,
+    /// Exact action frozen for an XWayland-target drop at physical release.
+    /// For an Ask drop, this remains Ask until terminal resolution.
+    pub(super) drop_action: Option<crate::xwayland::XwaylandDndAction>,
     pub(super) selected_action: u32,
     pub(super) destination_actions: Option<u32>,
     pub(super) last_offer_action: Option<u32>,

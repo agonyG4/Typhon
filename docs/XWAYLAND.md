@@ -43,13 +43,22 @@ source proxy, translates Enter/Position/Status/Leave, synchronizes physical
 Drop with the final Status, keeps `XdndSelection` available through
 `XdndFinished`, and retires the exact source proxy after canonical completion.
 TARGETS, TIMESTAMP, MULTIPLE, offered MIME requests, direct transfers, and INCR
-transfers are supported. Copy terminal completion is implemented. Move
-terminal completion is implemented when the target does not require the
-unsupported DELETE conversion. Ask terminal resolution is supported when an
-XDND v5 target reports final Copy or Move; unresolved Ask with earlier target
-versions is rejected. DELETE remains unsupported and is not advertised. X11 →
+transfers are supported. Copy terminal interoperability is implemented. Move
+terminal interoperability is implemented when the target does not require the
+unsupported DELETE conversion. XdndDrop/Finished terminal synchronization is
+implemented. The XDND v5 Ask terminal-resolution state machine is implemented
+and tested, but the current deterministic Wayland→XDND requested-action policy
+does not actively select Ask. Active Ask selection remains unqualified until a
+canonical user/modifier action policy exists. Synthetic Ask tests validate the
+terminal state machine, not production reachability or end-to-end active Ask
+interoperability. DELETE remains unsupported and is not advertised. X11 →
 Wayland XDND is not implemented. Real-application interoperability
 qualification remains pending F11-D.
+
+The `XdndFinished` deadline is currently a fixed 60 seconds, including while a
+large INCR transfer continues making progress. F11-C4 real-application
+qualification should determine whether active transfer progress should affect
+that terminal deadline.
 
 INCR teardown distinguishes source/session cancellation from an idle transfer
 deadline. Cancellation retires the exact transfer and may send the empty

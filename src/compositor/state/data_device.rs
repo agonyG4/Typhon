@@ -321,6 +321,7 @@ impl CompositorState {
             target: None,
             accepted_mime: None,
             target_action: None,
+            drop_action: None,
             selected_action: 0,
             destination_actions: None,
             last_offer_action: None,
@@ -980,7 +981,11 @@ impl CompositorState {
                 };
                 let action_supported = match &active.origin {
                     ActiveDragOrigin::WaylandSource { .. } => {
-                        action.to_wayland_action().is_some() && active.selected_action != 0
+                        action.to_wayland_action().is_some_and(|wayland_action| {
+                            active.selected_action == wayland_action.mask()
+                                && self.drag_source_actions(&active.origin) & wayland_action.mask()
+                                    != 0
+                        })
                     }
                     ActiveDragOrigin::Xwayland { offer } => {
                         offer.source_actions().contains(&action)
@@ -1012,14 +1017,15 @@ impl CompositorState {
                 ) {
                     return;
                 }
+                if let Some(active) = self.active_drag.as_mut() {
+                    active.drop_action = Some(action);
+                    active.phase = DragSessionPhase::DropPendingXwaylandTarget;
+                }
                 if let Some(source) = active.origin.wayland_source()
                     && source.version() >= 3
                     && source.is_alive()
                 {
                     let _ = source.send_event(wl_data_source::Event::DndDropPerformed);
-                }
-                if let Some(active) = self.active_drag.as_mut() {
-                    active.phase = DragSessionPhase::DropPendingXwaylandTarget;
                 }
             }
             ActiveDragTarget::Wayland {

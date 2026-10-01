@@ -6,6 +6,9 @@ use std::{
 use super::*;
 use crate::xwayland::{XwaylandDndAction, XwaylandDndMimeCatalog};
 
+#[path = "dnd_adapter_pending_drop_tests.rs"]
+mod pending_drop_tests;
+
 fn identity(generation: XwaylandGeneration, session: u64) -> XwaylandDndAdapterId {
     XwaylandDndAdapterId::new(
         CanonicalDndSessionId::Wayland(NonZeroU64::new(session).unwrap()),

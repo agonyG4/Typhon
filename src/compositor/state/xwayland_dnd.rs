@@ -150,7 +150,8 @@ impl CompositorState {
                 DragSessionPhase::Dragging | DragSessionPhase::DropPendingXwaylandTarget
             )
             || (active.phase == DragSessionPhase::DropPendingXwaylandTarget
-                && !matches!(&active.origin, ActiveDragOrigin::WaylandSource { .. }))
+                && (!matches!(&active.origin, ActiveDragOrigin::WaylandSource { .. })
+                    || active.drop_action.is_none()))
             || self
                 .xwayland
                 .client_identity
@@ -183,6 +184,11 @@ impl CompositorState {
         };
         if !action_supported {
             return false;
+        }
+        if active.phase == DragSessionPhase::DropPendingXwaylandTarget {
+            // Status after DndDropPerformed is reconciliation evidence only.
+            // The terminally significant action was frozen at physical drop.
+            return true;
         }
         let action_mask = action
             .and_then(crate::xwayland::XwaylandDndAction::to_wayland_action)
@@ -285,12 +291,15 @@ impl CompositorState {
         }
         let source_actions = self.drag_source_actions(&active.origin);
         let origin = active.origin.clone();
-        let negotiated_action = active.target_action;
+        let Some(frozen_drop_action) = active.drop_action else {
+            return false;
+        };
+        let operation_was_ask = frozen_drop_action == crate::xwayland::XwaylandDndAction::Ask;
         let action = if !accepted && matches!(&origin, ActiveDragOrigin::WaylandSource { .. }) {
             None
         } else if accepted
             && matches!(&origin, ActiveDragOrigin::WaylandSource { .. })
-            && negotiated_action == Some(crate::xwayland::XwaylandDndAction::Ask)
+            && operation_was_ask
         {
             match final_action {
                 Some(
@@ -300,7 +309,7 @@ impl CompositorState {
                 _ => return false,
             }
         } else {
-            final_action.or(active.target_action)
+            final_action.or(Some(frozen_drop_action))
         };
         if accepted {
             let Some(action) = action else {
@@ -317,8 +326,8 @@ impl CompositorState {
                 return false;
             }
             if matches!(&origin, ActiveDragOrigin::WaylandSource { .. })
-                && negotiated_action != Some(crate::xwayland::XwaylandDndAction::Ask)
-                && Some(action) != negotiated_action
+                && !operation_was_ask
+                && action != frozen_drop_action
             {
                 return false;
             }
@@ -352,7 +361,7 @@ impl CompositorState {
         }
         if let ActiveDragOrigin::WaylandSource { source, .. } = &origin {
             if accepted && source.version() >= 3 && source.is_alive() {
-                if negotiated_action == Some(crate::xwayland::XwaylandDndAction::Ask)
+                if operation_was_ask
                     && let Some(action) = action.and_then(|action| {
                         action
                             .to_wayland_action()

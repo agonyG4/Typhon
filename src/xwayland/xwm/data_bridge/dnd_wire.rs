@@ -303,6 +303,10 @@ mod tests {
             Some(XwaylandDndAction::Move)
         );
         assert_eq!(
+            requested_action(&[XwaylandDndAction::Ask, XwaylandDndAction::Copy]),
+            Some(XwaylandDndAction::Copy)
+        );
+        assert_eq!(
             requested_action(&[XwaylandDndAction::Link, XwaylandDndAction::Private]),
             None
         );
