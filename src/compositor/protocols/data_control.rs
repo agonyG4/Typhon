@@ -324,6 +324,9 @@ impl CompositorState {
             return;
         };
         if let Some(previous_key) = commit.replaced_source {
+            if kind == SelectionKind::Clipboard {
+                self.retire_wayland_clipboard_source(previous_key);
+            }
             self.cancel_selection_source(kind, previous_key);
         }
         self.selection_state.mark_source_used(binding.selection_key);

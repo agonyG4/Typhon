@@ -259,13 +259,14 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
             wl_surface::Request::Destroy => {
                 if !state.validate_surface_destroy(data.surface_id()) {
-                    state.post_protocol_error(
-                        client,
-                        resource,
-                        wl_surface::Error::DefunctRoleObject,
-                        "wl_surface destroyed before its role object".to_string(),
+                    state.record_lifecycle_compatibility_recovery(
+                        client.id(),
+                        resource.id().protocol_id(),
+                        "wl_surface",
+                        Some(data.surface_id()),
+                        LifecycleCompatibilityViolation::SurfaceDestroyedWithLiveRole,
+                        LifecycleCompatibilityAction::CanonicalSurfaceTeardown,
                     );
-                    return;
                 }
                 state.teardown_surface_resource(
                     data.surface_id(),

@@ -2,6 +2,58 @@ use super::*;
 use std::os::fd::AsRawFd;
 
 #[test]
+fn xdg_surface_destroy_with_live_popup_cleans_role_and_leaves_resource_inert() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let parent_surface = compositor.create_surface(&qh, ());
+    let parent_xdg_surface = wm_base.get_xdg_surface(&parent_surface, &qh, ());
+    let _parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
+
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_surface_id = popup_surface.id().protocol_id();
+    let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+    let popup = wm_base.create_positioner(&qh, ());
+    popup.set_size(80, 50);
+    popup.set_anchor_rect(10, 20, 30, 10);
+    let popup_role = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &popup, &qh, ());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    popup_xdg_surface.destroy();
+    popup_role.reposition(&popup, 17);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    connection
+        .roundtrip()
+        .expect("reposition on a retired popup role must be ignored");
+    popup_role.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    connection
+        .roundtrip()
+        .expect("late popup destruction must not disconnect the client");
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+    assert_eq!(
+        server
+            .state
+            .compliance_metrics
+            .lifecycle_xdg_surface_destroy_with_role_total,
+        1
+    );
+    assert!(!server.state.popup_surfaces.contains_key(&popup_surface_id));
+}
+
+#[test]
 fn unmapped_xdg_toplevel_does_not_establish_keyboard_focus_until_first_buffer_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

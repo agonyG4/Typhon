@@ -24,6 +24,10 @@ use crate::render_backend::buffer::{
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CoreComplianceMetrics {
     pub protocol_errors_total: u64,
+    pub lifecycle_compatibility_recoveries_total: u64,
+    pub lifecycle_surface_destroy_with_role_total: u64,
+    pub lifecycle_xdg_surface_destroy_with_role_total: u64,
+    pub lifecycle_active_clipboard_source_reuse_total: u64,
     pub supported_request_unhandled_total: u64,
     pub client_state_leaks_detected: u64,
     pub xdg_same_role_reassociations_total: u64,
@@ -77,6 +81,33 @@ pub(in crate::compositor) enum UnhandledRequestClass {
 impl CoreComplianceMetrics {
     pub(in crate::compositor) fn note_protocol_error(&mut self) {
         self.protocol_errors_total = self.protocol_errors_total.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_destroy_with_live_role(&mut self) {
+        self.lifecycle_compatibility_recoveries_total = self
+            .lifecycle_compatibility_recoveries_total
+            .saturating_add(1);
+        self.lifecycle_surface_destroy_with_role_total = self
+            .lifecycle_surface_destroy_with_role_total
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_xdg_surface_destroy_with_live_role(&mut self) {
+        self.lifecycle_compatibility_recoveries_total = self
+            .lifecycle_compatibility_recoveries_total
+            .saturating_add(1);
+        self.lifecycle_xdg_surface_destroy_with_role_total = self
+            .lifecycle_xdg_surface_destroy_with_role_total
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_active_clipboard_source_reuse(&mut self) {
+        self.lifecycle_compatibility_recoveries_total = self
+            .lifecycle_compatibility_recoveries_total
+            .saturating_add(1);
+        self.lifecycle_active_clipboard_source_reuse_total = self
+            .lifecycle_active_clipboard_source_reuse_total
+            .saturating_add(1);
     }
 
     pub(in crate::compositor) fn note_unhandled_request(

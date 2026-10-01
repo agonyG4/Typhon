@@ -296,6 +296,14 @@ impl OwnCompositorServer {
         if self.state.compliance_metrics.protocol_errors_total > 0 {
             self.state.protocol_error_trace.dump();
         }
+        if self
+            .state
+            .compliance_metrics
+            .lifecycle_compatibility_recoveries_total
+            > 0
+        {
+            self.state.lifecycle_compatibility_trace.dump();
+        }
         self.state.surface_pipeline_trace.dump();
     }
 

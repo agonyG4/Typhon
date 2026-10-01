@@ -78,6 +78,31 @@ pub(in crate::compositor) struct PendingClientResourceExhaustion {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn record_lifecycle_compatibility_recovery(
+        &mut self,
+        client_id: ClientId,
+        object_id: u32,
+        interface: &'static str,
+        surface_id: Option<u32>,
+        violation: LifecycleCompatibilityViolation,
+        action: LifecycleCompatibilityAction,
+    ) {
+        match violation {
+            LifecycleCompatibilityViolation::SurfaceDestroyedWithLiveRole => self
+                .compliance_metrics
+                .note_surface_destroy_with_live_role(),
+            LifecycleCompatibilityViolation::XdgSurfaceDestroyedWithLiveRole => self
+                .compliance_metrics
+                .note_xdg_surface_destroy_with_live_role(),
+            LifecycleCompatibilityViolation::ActiveClipboardSourceReused => {
+                self.compliance_metrics.note_active_clipboard_source_reuse()
+            }
+        }
+        self.lifecycle_compatibility_trace.record(
+            client_id, object_id, interface, surface_id, violation, action,
+        );
+    }
+
     pub(in crate::compositor) fn request_client_resource_exhaustion(
         &mut self,
         surface_id: u32,

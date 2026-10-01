@@ -1095,7 +1095,7 @@ fn role_switch_after_role_object_destroy_is_rejected() {
 }
 
 #[test]
-fn surface_destroy_with_live_role_posts_defunct_role_object() {
+fn surface_destroy_with_live_role_uses_canonical_teardown() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -1109,21 +1109,39 @@ fn surface_destroy_with_live_role_posts_defunct_role_object() {
     let surface = compositor.create_surface(&qh, ());
     let surface_id = surface.id().protocol_id();
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
     surface.commit();
     connection.flush().unwrap();
 
     surface.destroy();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    let observed = expect_protocol_error(
-        &connection,
-        "wl_surface",
-        client_wl_surface::Error::DefunctRoleObject as u32,
-    );
-    assert_eq!(observed.object_id, surface_id);
+    expect_roundtrip_alive(&connection);
 
-    let _server = stop_controllable_test_server(commands, server_thread);
+    // Both role resources can be destroyed after the surface has already
+    // gone away. They must remain inert and must not repeat the teardown.
+    toplevel.destroy();
+    xdg_surface.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    expect_roundtrip_alive(&connection);
+
+    let mut server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+    assert_eq!(
+        server
+            .state
+            .compliance_metrics
+            .lifecycle_surface_destroy_with_role_total,
+        1
+    );
+    assert!(!server.state.surface_resources.contains_key(&surface_id));
+    assert!(!server.state.toplevel_surfaces.contains_key(&surface_id));
+    let repeated = server
+        .state
+        .teardown_surface_resource(surface_id, SurfaceTeardownReason::ExplicitDestroy);
+    assert_eq!(repeated.removed_resource, false);
+    assert_eq!(repeated.removed_renderables, 0);
 }
 
 #[test]
@@ -1181,7 +1199,7 @@ fn surface_destroy_with_live_cursor_role_does_not_post_defunct_role_object() {
 }
 
 #[test]
-fn xdg_surface_destroy_with_live_role_posts_defunct_role_object() {
+fn xdg_surface_destroy_with_live_toplevel_cleans_role_and_leaves_resource_inert() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -1194,22 +1212,41 @@ fn xdg_surface_destroy_with_live_role_posts_defunct_role_object() {
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    let xdg_surface_id = xdg_surface.id().protocol_id();
-    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
     surface.commit();
     connection.flush().unwrap();
 
     xdg_surface.destroy();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    let observed = expect_protocol_error(
-        &connection,
-        "xdg_surface",
-        client_xdg_surface::Error::DefunctRoleObject as u32,
-    );
-    assert_eq!(observed.object_id, xdg_surface_id);
+    toplevel.set_title("late request on retired role".to_string());
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    expect_roundtrip_alive(&connection);
+    toplevel.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    expect_roundtrip_alive(&connection);
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    expect_roundtrip_alive(&connection);
 
-    let _server = stop_controllable_test_server(commands, server_thread);
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+    assert_eq!(
+        server
+            .state
+            .compliance_metrics
+            .lifecycle_xdg_surface_destroy_with_role_total,
+        1
+    );
+    assert!(
+        !server
+            .state
+            .toplevel_surfaces
+            .contains_key(&surface.id().protocol_id())
+    );
 }
 
 #[test]

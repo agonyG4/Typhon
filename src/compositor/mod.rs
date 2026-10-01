@@ -91,6 +91,7 @@ mod input;
 mod interaction;
 pub(crate) mod keyboard;
 mod layer_shell;
+mod lifecycle_compatibility;
 mod output;
 mod pacing;
 mod plan;
@@ -324,6 +325,9 @@ pub use crate::presentation_animation_policy::{
 };
 pub use decoration::render_plan::clipped_decoration_text_geometry;
 use layer_shell::{Layer, LayerSurfaceRole};
+use lifecycle_compatibility::{
+    LifecycleCompatibilityAction, LifecycleCompatibilityTrace, LifecycleCompatibilityViolation,
+};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
     send_output_done_if_supported, send_output_mode, send_output_scale,
@@ -999,6 +1003,7 @@ pub struct CompositorState {
     pending_process_launches: VecDeque<PendingProcessLaunch>,
     compliance_metrics: CoreComplianceMetrics,
     protocol_error_trace: ProtocolErrorTrace,
+    lifecycle_compatibility_trace: LifecycleCompatibilityTrace,
     surface_pipeline_trace: SurfacePipelineTrace,
 }
 

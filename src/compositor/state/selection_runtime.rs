@@ -35,6 +35,25 @@ impl CompositorState {
         );
     }
 
+    pub(in crate::compositor) fn retire_wayland_clipboard_source(
+        &mut self,
+        source_key: SelectionSourceKey,
+    ) {
+        if !matches!(
+            self.selection_state.source_backend(source_key),
+            Some(SelectionSourceBackend::WaylandClipboard { .. })
+        ) {
+            return;
+        }
+        if let Some(binding) = self
+            .data_sources
+            .values_mut()
+            .find(|binding| binding.selection_key == source_key)
+        {
+            binding.use_state = DataSourceUse::Retired;
+        }
+    }
+
     pub(in crate::compositor) fn offer_data_source_mime_type(
         &mut self,
         source: &wl_data_source::WlDataSource,
@@ -82,6 +101,7 @@ impl CompositorState {
                 return false;
             };
             if let Some(source_key) = clear.cleared_source {
+                self.retire_wayland_clipboard_source(source_key);
                 self.cancel_selection_source(SelectionKind::Clipboard, source_key);
             }
             if let Some(bridge) = self.clipboard_bridge.as_mut() {
@@ -99,6 +119,17 @@ impl CompositorState {
         if binding.client_id != *client_id || !source.is_alive() || binding.mime_types.is_empty() {
             return false;
         }
+        if self.is_active_clipboard_source_reuse(client_id, &source) {
+            self.record_lifecycle_compatibility_recovery(
+                client_id.clone(),
+                source.id().protocol_id(),
+                "wl_data_source",
+                None,
+                LifecycleCompatibilityViolation::ActiveClipboardSourceReused,
+                LifecycleCompatibilityAction::KeepActiveClipboardSelection,
+            );
+            return true;
+        }
         if binding.use_state != DataSourceUse::Unused {
             return false;
         }
@@ -111,6 +142,7 @@ impl CompositorState {
             return false;
         };
         if let Some(previous_source) = commit.replaced_source {
+            self.retire_wayland_clipboard_source(previous_source);
             self.cancel_selection_source(SelectionKind::Clipboard, previous_source);
         }
         self.selection_state.mark_source_used(binding.selection_key);
@@ -124,6 +156,24 @@ impl CompositorState {
         self.publish_clipboard_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Clipboard);
         true
+    }
+
+    pub(in crate::compositor) fn is_active_clipboard_source_reuse(
+        &self,
+        client_id: &ClientId,
+        source: &wl_data_source::WlDataSource,
+    ) -> bool {
+        self.data_sources.get(&source.id()).is_some_and(|binding| {
+            binding.client_id == *client_id
+                && binding.source.is_alive()
+                && !binding.actions_set
+                && !binding.mime_types.is_empty()
+                && binding.use_state == DataSourceUse::Selection
+                && self
+                    .selection_state
+                    .active_selection(SelectionKind::Clipboard)
+                    .is_some_and(|active| active.source_key == binding.selection_key)
+        })
     }
 
     pub(in crate::compositor) fn install_host_clipboard_selection(
@@ -159,6 +209,7 @@ impl CompositorState {
             return;
         };
         if let Some(previous_source) = commit.replaced_source {
+            self.retire_wayland_clipboard_source(previous_source);
             self.cancel_selection_source(SelectionKind::Clipboard, previous_source);
             if previous_source != source_key {
                 self.selection_state
@@ -250,6 +301,9 @@ impl CompositorState {
                     return;
                 };
                 if let Some(previous_source) = commit.replaced_source {
+                    if selection_kind == SelectionKind::Clipboard {
+                        self.retire_wayland_clipboard_source(previous_source);
+                    }
                     self.cancel_selection_source(selection_kind, previous_source);
                     if previous_source != source_key {
                         self.selection_state

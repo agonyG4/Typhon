@@ -64,6 +64,7 @@ impl Dispatch<wl_data_device::WlDataDevice, DataDeviceData> for CompositorState 
                     && state.data_sources.get(&source.id()).is_some_and(|source| {
                         source.use_state != DataSourceUse::Unused || source.actions_set
                     })
+                    && !state.is_active_clipboard_source_reuse(&data.client_id, source)
                 {
                     state.post_protocol_error(
                         client,

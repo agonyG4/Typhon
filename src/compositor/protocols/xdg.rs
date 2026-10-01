@@ -554,6 +554,13 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let surface_id = compositor_surface_id(&data.surface);
+        if !state
+            .xdg_surface_resources
+            .get(&surface_id)
+            .is_some_and(|current| same_wayland_resource(current, resource))
+        {
+            return;
+        }
         if !matches!(
             &request,
             xdg_surface::Request::GetToplevel { .. }
@@ -798,15 +805,16 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
             xdg_surface::Request::Destroy => {
                 let surface_id = compositor_surface_id(&data.surface);
                 if !state.validate_surface_destroy(surface_id) {
-                    state.post_protocol_error(
-                        client,
-                        resource,
-                        xdg_surface::Error::DefunctRoleObject,
-                        "xdg_surface destroyed before its role object".to_string(),
+                    state.record_lifecycle_compatibility_recovery(
+                        client.id(),
+                        resource.id().protocol_id(),
+                        "xdg_surface",
+                        Some(surface_id),
+                        LifecycleCompatibilityViolation::XdgSurfaceDestroyedWithLiveRole,
+                        LifecycleCompatibilityAction::CanonicalXdgRoleTeardown,
                     );
-                    return;
                 }
-                state.unregister_xdg_surface_role(compositor_surface_id(&data.surface));
+                state.unregister_xdg_surface_role(surface_id);
             }
             other => {
                 let _ = other;
@@ -830,6 +838,14 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        let surface_id = compositor_surface_id(&data.surface);
+        if !state
+            .toplevel_surfaces
+            .get(&surface_id)
+            .is_some_and(|current| same_wayland_resource(&current.toplevel, resource))
+        {
+            return;
+        }
         match request {
             xdg_toplevel::Request::SetTitle { title } => {
                 let surface_id = compositor_surface_id(&data.surface);
@@ -1097,6 +1113,14 @@ impl Dispatch<xdg_popup::XdgPopup, XdgPopupData> for CompositorState {
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        let surface_id = compositor_surface_id(&data.surface);
+        if !state
+            .popup_surfaces
+            .get(&surface_id)
+            .is_some_and(|current| same_wayland_resource(&current.popup, resource))
+        {
+            return;
+        }
         match request {
             xdg_popup::Request::Destroy => {
                 let surface_id = compositor_surface_id(&data.surface);
