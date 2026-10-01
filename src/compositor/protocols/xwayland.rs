@@ -133,6 +133,15 @@ impl Dispatch<xwayland_surface_v1::XwaylandSurfaceV1, XwaylandSurfaceData> for C
             );
             return;
         }
+        if !state.surface_resources.contains_key(&data.surface_id)
+            || state
+                .xwayland
+                .surface_resources
+                .get(&data.surface_id)
+                .is_none_or(|current| !same_wayland_resource(current, resource))
+        {
+            return;
+        }
         match request {
             xwayland_surface_v1::Request::SetSerial {
                 serial_lo,

@@ -323,6 +323,8 @@ impl CompositorState {
     }
 
     fn teardown_non_surface_resources_for_client(&mut self, client_id: &ClientId) {
+        self.xdg_surface_wm_bases
+            .retain(|_, wm_base| !resource_owned_by_client(wm_base, client_id));
         self.remove_keyboard_shortcut_inhibitors_for_client(client_id);
         self.remove_astrea_toplevel_client(client_id);
         if self.active_drag.as_ref().is_some_and(|drag| {

@@ -18,6 +18,7 @@ pub(crate) enum RequestClassification {
     BackendOwned,
     CapabilityRejected,
     ProtocolError,
+    CompatibilityRecovery,
     DestroyedResourceNoFurtherDispatch,
 }
 
@@ -79,7 +80,13 @@ pub(crate) const CORE_XDG_REQUEST_CONTRACTS: &[RequestContract] = &[
         DestroyedResourceNoFurtherDispatch,
         "shm_compliance"
     ),
-    contract!("wl_surface", "destroy", 1, ProtocolError, "role_lifecycle"),
+    contract!(
+        "wl_surface",
+        "destroy",
+        1,
+        CompatibilityRecovery,
+        "role_lifecycle"
+    ),
     contract!(
         "wl_surface",
         "attach",
@@ -399,7 +406,13 @@ pub(crate) const CORE_XDG_REQUEST_CONTRACTS: &[RequestContract] = &[
         Implemented,
         "xdg_compliance"
     ),
-    contract!("xdg_surface", "destroy", 1, ProtocolError, "xdg_compliance"),
+    contract!(
+        "xdg_surface",
+        "destroy",
+        1,
+        CompatibilityRecovery,
+        "xdg_compliance"
+    ),
     contract!(
         "xdg_surface",
         "get_toplevel",

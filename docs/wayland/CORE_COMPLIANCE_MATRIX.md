@@ -14,8 +14,8 @@ is retained as the human-auditable source; any future `Gap` row is an explicit
 remaining work item and is not claimed as compliant.
 
 Required classifications are exactly: `Implemented`, `ValidatedNoOp`,
-`BackendOwned`, `CapabilityRejected`, `ProtocolError`, and
-`DestroyedResourceNoFurtherDispatch`.
+`BackendOwned`, `CapabilityRejected`, `ProtocolError`, `CompatibilityRecovery`,
+and `DestroyedResourceNoFurtherDispatch`.
 
 ## Inventory counts
 
@@ -164,7 +164,7 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_data_device_manager` | 3 | request `create_data_source` | 1 | `protocols/data_device.rs` | Implemented | Implemented |
 | `wl_data_device_manager` | 3 | request `get_data_device` | 1 | `protocols/data_device.rs` | Implemented | Implemented |
 | `wl_data_device_manager` | 3 | request `release` | 2 | `protocols/data_device.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
-| `wl_surface` | 6 | request `destroy` | 1 | `protocols/core.rs` | ProtocolError | Partial |
+| `wl_surface` | 6 | request `destroy` | 1 | `protocols/core.rs` | CompatibilityRecovery | Partial |
 | `wl_surface` | 6 | request `attach` | 1 | `protocols/core.rs` | ProtocolError | Implemented |
 | `wl_surface` | 6 | request `damage` | 1 | `protocols/core.rs` | Implemented | Partial |
 | `wl_surface` | 6 | request `frame` | 1 | `protocols/core.rs` | Implemented | Implemented |
@@ -245,7 +245,7 @@ contract until the bound is upgraded, which this milestone forbids.
 | `xdg_positioner` | n/a | request `set_reactive` | 3 | `protocols/xdg.rs` | Implemented | Partial |
 | `xdg_positioner` | n/a | request `set_parent_size` | 3 | `protocols/xdg.rs` | Implemented | Partial |
 | `xdg_positioner` | n/a | request `set_parent_configure` | 3 | `protocols/xdg.rs` | Implemented | Implemented |
-| `xdg_surface` | n/a | request `destroy` | 1 | `protocols/xdg.rs` | ProtocolError | Implemented |
+| `xdg_surface` | n/a | request `destroy` | 1 | `protocols/xdg.rs` | CompatibilityRecovery | Partial |
 | `xdg_surface` | n/a | request `get_toplevel` | 1 | `protocols/xdg.rs` | ProtocolError | Partial |
 | `xdg_surface` | n/a | request `get_popup` | 1 | `protocols/xdg.rs` | ProtocolError | Partial |
 | `xdg_surface` | n/a | request `set_window_geometry` | 1 | `protocols/xdg.rs` | ProtocolError | Implemented |

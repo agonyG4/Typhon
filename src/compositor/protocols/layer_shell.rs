@@ -122,6 +122,13 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
         _data_init: &mut DataInit<'_, Self>,
     ) {
         let surface_id = compositor_surface_id(&data.surface);
+        if state
+            .surface_resources
+            .get(&surface_id)
+            .is_none_or(|current| !same_wayland_resource(current, &data.surface))
+        {
+            return;
+        }
         match request {
             zwlr_layer_surface_v1::Request::SetSize { width, height } => {
                 state.set_layer_surface_pending_size(surface_id, width, height);

@@ -17,6 +17,101 @@ fn identity_for_test(window_id: WindowId) -> PresentationRetainedVisualIdentity 
     )
 }
 
+#[test]
+fn surface_destroy_with_live_layer_surface_leaves_role_inert() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Overlay,
+        "surface-first-layer-destroy",
+    );
+    let surface_id = surface.id().protocol_id();
+    layer_surface.set_size(320, 240);
+    layer_surface
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let configure_serial = *state
+        .layer_surface_configure_serials
+        .last()
+        .expect("initial layer configure serial");
+    commit_test_buffered_surface(&surface, &shm, &qh, 320, 240).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(capture_surface_buffer_ownership(&commands, surface_id).current_surface_buffer);
+
+    surface.destroy();
+    connection.flush().unwrap();
+    connection
+        .roundtrip()
+        .expect("surface-first layer teardown keeps the client connected");
+    layer_surface.ack_configure(configure_serial);
+    connection.flush().unwrap();
+    connection
+        .roundtrip()
+        .expect("late layer requests are inert after surface teardown");
+    layer_surface.destroy();
+    connection.flush().unwrap();
+    connection
+        .roundtrip()
+        .expect("late layer resource destruction is idempotent");
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+    assert_eq!(
+        server
+            .state
+            .compliance_metrics
+            .lifecycle_surface_destroy_with_role_total,
+        1
+    );
+    assert!(!server.state.surface_resources.contains_key(&surface_id));
+    assert!(!server.state.layer_surfaces.contains_key(&surface_id));
+    assert!(
+        !server
+            .state
+            .current_surface_buffers
+            .contains_key(&surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .renderable_surfaces
+            .iter()
+            .any(|renderable| renderable.surface_id == surface_id)
+    );
+    assert!(
+        server
+            .state
+            .keyboard_surface
+            .as_ref()
+            .is_none_or(|focused| compositor_surface_id(focused) != surface_id)
+    );
+    assert!(
+        server
+            .state
+            .focused_surface
+            .as_ref()
+            .is_none_or(|focused| compositor_surface_id(focused) != surface_id)
+    );
+    assert!(
+        server
+            .state
+            .pointer_surface
+            .as_ref()
+            .is_none_or(|focused| compositor_surface_id(focused) != surface_id)
+    );
+}
+
 fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
     let visual_group = LifecycleVisualGroup::from_bounds(
         PresentationRect::new(100.0, 100.0, 400.0, 300.0).unwrap(),

@@ -1570,7 +1570,9 @@ impl CompositorState {
         self.remove_current_surface_buffer(surface_id);
         self.clear_xdg_window_geometry_state(surface_id);
         self.xdg_surface_resources.remove(&surface_id);
-        self.xdg_surface_wm_bases.remove(&surface_id);
+        if reason == SurfaceTeardownReason::ClientDisconnected {
+            self.xdg_surface_wm_bases.remove(&surface_id);
+        }
         self.xdg_surface_lifecycles.remove(&surface_id);
         self.scrub_surface_output_membership(surface_id);
         self.unregister_toplevel_surface(surface_id);

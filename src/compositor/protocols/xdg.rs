@@ -559,6 +559,9 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
             .get(&surface_id)
             .is_some_and(|current| same_wayland_resource(current, resource))
         {
+            if matches!(&request, xdg_surface::Request::Destroy) {
+                state.xdg_surface_wm_bases.remove(&surface_id);
+            }
             return;
         }
         if !matches!(

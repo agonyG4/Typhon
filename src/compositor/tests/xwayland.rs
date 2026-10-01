@@ -18,7 +18,7 @@ use wayland_client::protocol::{
     wl_seat as client_wl_seat, wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
     wl_surface as client_wl_surface,
 };
-use wayland_client::{Connection, EventQueue, globals::registry_queue_init};
+use wayland_client::{Connection, EventQueue, Proxy, globals::registry_queue_init};
 use wayland_protocols::xwayland::shell::v1::client::{
     xwayland_shell_v1 as client_xwayland_shell_v1,
     xwayland_surface_v1 as client_xwayland_surface_v1,
@@ -74,6 +74,128 @@ fn xwayland_shell_protocol_error_is_attributed() {
         Some(client_xwayland_surface_v1::Error::InvalidSerial as u32)
     );
     assert_eq!(record.xwayland_generation, Some(1));
+}
+
+#[test]
+fn surface_destroy_with_live_xwayland_role_leaves_role_inert() {
+    let socket_name = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).expect("nonzero generation"));
+    let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .expect("insert private XWayland client");
+    let (commands, server_thread) = super::spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(client_stream).expect("create Wayland client");
+    let (globals, mut queue) = registry_queue_init::<super::RegistryTestState>(&connection)
+        .expect("read compositor globals");
+    let qh = queue.handle();
+    let shell: client_xwayland_shell_v1::XwaylandShellV1 =
+        globals.bind(&qh, 1..=1, ()).expect("bind XWayland shell");
+    let compositor: client_wl_compositor::WlCompositor =
+        globals.bind(&qh, 1..=6, ()).expect("bind compositor");
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).expect("bind shm");
+    let surface = compositor.create_surface(&qh, ());
+    let surface_id = surface.id().protocol_id();
+    let xwayland_surface = shell.get_xwayland_surface(&surface, &qh, ());
+    xwayland_surface.set_serial(0x0123_4567, 0x89ab_cdef);
+    surface.commit();
+    connection.flush().expect("flush association");
+    queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete association");
+
+    let file = super::create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff])
+        .expect("create shm buffer");
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().expect("flush first buffer");
+    queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete first buffer commit");
+    assert!(super::capture_surface_buffer_ownership(&commands, surface_id).current_surface_buffer);
+
+    surface.destroy();
+    connection.flush().expect("flush surface destruction");
+    connection
+        .roundtrip()
+        .expect("surface-first XWayland teardown keeps the client connected");
+    xwayland_surface.set_serial(0x1111_2222, 0x3333_4444);
+    connection
+        .flush()
+        .expect("flush late XWayland role request");
+    connection
+        .roundtrip()
+        .expect("late XWayland role requests are inert after surface teardown");
+    xwayland_surface.destroy();
+    connection.flush().expect("flush role destruction");
+    connection
+        .roundtrip()
+        .expect("late XWayland role destruction is idempotent");
+
+    let server = super::stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+    assert_eq!(
+        server
+            .state
+            .compliance_metrics
+            .lifecycle_surface_destroy_with_role_total,
+        1
+    );
+    assert!(!server.state.surface_resources.contains_key(&surface_id));
+    assert!(
+        !server
+            .state
+            .xwayland
+            .surface_states
+            .contains_key(&surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .xwayland
+            .surface_resources
+            .contains_key(&surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .current_surface_buffers
+            .contains_key(&surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .renderable_surfaces
+            .iter()
+            .any(|renderable| renderable.surface_id == surface_id)
+    );
+    assert!(
+        server
+            .state
+            .focused_surface
+            .as_ref()
+            .is_none_or(|focused| super::compositor_surface_id(focused) != surface_id)
+    );
+    assert!(
+        server
+            .state
+            .keyboard_surface
+            .as_ref()
+            .is_none_or(|focused| super::compositor_surface_id(focused) != surface_id)
+    );
+    assert!(
+        server
+            .state
+            .pointer_surface
+            .as_ref()
+            .is_none_or(|focused| super::compositor_surface_id(focused) != surface_id)
+    );
 }
 
 #[path = "xwayland_admission.rs"]

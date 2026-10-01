@@ -499,16 +499,22 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        let surface_id = compositor_surface_id(&data.surface);
+        if state
+            .surface_resources
+            .get(&surface_id)
+            .is_none_or(|current| !same_wayland_resource(current, &data.surface))
+        {
+            return;
+        }
         match request {
             wl_subsurface::Request::SetPosition { x, y } => {
-                state.set_pending_subsurface_position(compositor_surface_id(&data.surface), x, y);
+                state.set_pending_subsurface_position(surface_id, x, y);
             }
             wl_subsurface::Request::Destroy => {
-                let surface_id = compositor_surface_id(&data.surface);
                 state.destroy_subsurface_role(surface_id);
             }
             wl_subsurface::Request::PlaceAbove { sibling } => {
-                let surface_id = compositor_surface_id(&data.surface);
                 let parent_id = compositor_surface_id(&data.parent);
                 let sibling_id = compositor_surface_id(&sibling);
                 if !state.restack_subsurface(surface_id, parent_id, sibling_id, true) {
@@ -521,7 +527,6 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
                 }
             }
             wl_subsurface::Request::PlaceBelow { sibling } => {
-                let surface_id = compositor_surface_id(&data.surface);
                 let parent_id = compositor_surface_id(&data.parent);
                 let sibling_id = compositor_surface_id(&sibling);
                 if !state.restack_subsurface(surface_id, parent_id, sibling_id, false) {
