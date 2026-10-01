@@ -405,6 +405,7 @@ pub struct CompiledFrameGraph {
 pub struct CompiledEffectInstance {
     pub id: EffectInstanceId,
     pub semantic_signature: u64,
+    pub frame_demand: EffectFrameDemand,
     pub output_influence_region: EffectRegion,
     pub capture_region: EffectRegion,
     pub dependencies: Vec<EffectInstanceId>,
@@ -2016,6 +2017,7 @@ pub fn compile_frame_execution_plan(
         compiled_instances.push(CompiledEffectInstance {
             id: instance.id,
             semantic_signature: instance.signature,
+            frame_demand: instance.frame_demand,
             output_influence_region: effect_damage.dependency_region.clone(),
             capture_region: effect_damage.capture_region,
             dependencies: dependency_instances,
@@ -3698,6 +3700,7 @@ mod tests {
         CompiledEffectInstance {
             semantic_signature: 0,
             id: EffectInstanceId::new(id).unwrap(),
+            frame_demand: EffectFrameDemand::OnDamage,
             output_influence_region,
             capture_region,
             dependencies,
@@ -6240,6 +6243,7 @@ mod tests {
             instances: vec![CompiledEffectInstance {
                 semantic_signature: 0,
                 id: instance,
+                frame_demand: EffectFrameDemand::OnDamage,
                 output_influence_region: visible.clone(),
                 capture_region: EffectRegion::from_rect(
                     EffectRect::new(476, 226, 849, 549).unwrap(),

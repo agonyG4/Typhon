@@ -3,8 +3,8 @@ use std::{io, time::Instant};
 use glow::HasContext;
 use oblivion_one::effects::{
     CompiledFrameGraph, CompiledRenderPass, EffectAlphaMode, EffectColorConversion,
-    EffectExecutionDemand, EffectNodeKind, EffectRegion, GraphPassId, GraphTextureId,
-    GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+    EffectExecutionDemand, EffectFrameDemand, EffectInstanceId, EffectNodeKind, EffectRegion,
+    GraphPassId, GraphTextureId, GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
     INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK,
     MAX_EFFECT_REGION_RECTS, RenderPassKind, ShaderModuleId, logical_rect_to_physical_coverage,
 };
@@ -440,6 +440,10 @@ pub(crate) struct EffectExecutionStats {
     pub checkpoint_cache_update_pixels: u64,
     pub checkpoint_cache_domain_pixels: u64,
     pub checkpoint_cache_saved_pixels: u64,
+    pub checkpoint_causal_proven_unchanged: usize,
+    pub checkpoint_causal_unproven: usize,
+    pub checkpoint_causal_dependency_changed: usize,
+    pub checkpoint_causal_scene_prefix_changed: usize,
     pub checkpoint_cache_entries: usize,
     pub checkpoint_cache_bytes: u64,
     pub blur_downsamples: usize,
@@ -483,6 +487,10 @@ impl EffectExecutionStats {
             checkpoint_cache_update_pixels: self.checkpoint_cache_update_pixels,
             checkpoint_cache_domain_pixels: self.checkpoint_cache_domain_pixels,
             checkpoint_cache_saved_pixels: self.checkpoint_cache_saved_pixels,
+            checkpoint_causal_proven_unchanged: self.checkpoint_causal_proven_unchanged,
+            checkpoint_causal_unproven: self.checkpoint_causal_unproven,
+            checkpoint_causal_dependency_changed: self.checkpoint_causal_dependency_changed,
+            checkpoint_causal_scene_prefix_changed: self.checkpoint_causal_scene_prefix_changed,
             checkpoint_cache_entries: self.checkpoint_cache_entries,
             checkpoint_cache_bytes: self.checkpoint_cache_bytes,
         }
@@ -1235,6 +1243,7 @@ fn execute_graph_passes_inner(
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
+    let checkpoint_causal_stability = checkpoint_causal_stability_plan(renderer, graph);
     #[cfg(any(debug_assertions, test))]
     // Validity belongs to this graph execution and logical texture ID. A
     // pooled physical allocation never carries validity into this map.
@@ -1749,6 +1758,7 @@ fn execute_graph_passes_inner(
                 scene_baseline_authority,
                 debug_config,
                 capture_plan,
+                &checkpoint_causal_stability,
                 graph_scope.is_some(),
                 &mut stats,
             );
@@ -2854,7 +2864,7 @@ fn composition_position(
     }
 }
 
-fn composition_range(
+pub(in crate::egl_renderer) fn composition_range(
     commands: &[super::super::geometry::EglDrawCommand],
     anchor: oblivion_one::compositor::EffectAnchor,
     visual_group: Option<oblivion_one::compositor::VisualGroupId>,
@@ -2940,6 +2950,7 @@ fn execute_pass(
     scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
     capture_plan: CheckpointCaptureExecutionPlan,
+    causal_stability: &CheckpointCausalStabilityPlan,
     host_timing_enabled: bool,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
@@ -2956,6 +2967,7 @@ fn execute_pass(
                 scene_baseline_authority,
                 debug_config,
                 capture_plan,
+                causal_stability,
                 host_timing_enabled,
                 stats,
             )?;
@@ -3649,6 +3661,7 @@ fn execute_capture(
     scene_baseline_authority: SceneBaselineAuthority,
     debug_config: EffectDebugConfig,
     capture_plan: CheckpointCaptureExecutionPlan,
+    causal_stability: &CheckpointCausalStabilityPlan,
     host_timing_enabled: bool,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
@@ -3678,6 +3691,33 @@ fn execute_capture(
             .effect_resources
             .checkpoint_capture_needs_full_refresh(key, frame_serial)
     });
+    let causal_capture = causal_stability.captures.get(&pass.id);
+    let causal_zero_copy = checkpoint_cache_key.is_some()
+        && !checkpoint_full_refresh
+        && causal_capture.is_some_and(|stability| stability.source_unchanged);
+    if checkpoint_cache_key.is_some()
+        && !checkpoint_full_refresh
+        && renderer.effect_gpu_profiler.cache_telemetry_enabled()
+    {
+        if causal_zero_copy {
+            stats.checkpoint_causal_proven_unchanged =
+                stats.checkpoint_causal_proven_unchanged.saturating_add(1);
+        } else {
+            stats.checkpoint_causal_unproven = stats.checkpoint_causal_unproven.saturating_add(1);
+            match causal_capture.map(|stability| stability.unproven_reason) {
+                Some(Some(CheckpointCausalUnprovenReason::ScenePrefixChanged)) => {
+                    stats.checkpoint_causal_scene_prefix_changed = stats
+                        .checkpoint_causal_scene_prefix_changed
+                        .saturating_add(1);
+                }
+                Some(Some(CheckpointCausalUnprovenReason::DependencyChanged)) => {
+                    stats.checkpoint_causal_dependency_changed =
+                        stats.checkpoint_causal_dependency_changed.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
     let materialization = if direct_capture {
         checkpoint_cache_key.as_ref().map(|_| {
             if checkpoint_full_refresh {
@@ -3686,6 +3726,11 @@ fn execute_capture(
                     Some(target_plan.domain),
                     renderer.current_size,
                 )
+            } else if causal_zero_copy {
+                CaptureMaterializationPlan {
+                    region: EffectRegion::empty(),
+                    output_rects: Vec::new(),
+                }
             } else {
                 checkpoint_update_materialization_plan(
                     &graph.final_damage,
@@ -5324,6 +5369,208 @@ fn materialized_target_rects(
     } else {
         output_rects.to_vec()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointCausalUnprovenReason {
+    NoPresentedHistory,
+    ScenePrefixChanged,
+    DependencyChanged,
+    UnsupportedTopology,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointCaptureCausalStability {
+    pub(crate) ordinary_prefix_unchanged: bool,
+    pub(crate) dependency_outputs_unchanged: bool,
+    pub(crate) source_unchanged: bool,
+    pub(crate) unproven_reason: Option<CheckpointCausalUnprovenReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectInstanceCausalStability {
+    pub(crate) ordinary_prefix_unchanged: bool,
+    pub(crate) dependency_outputs_unchanged: bool,
+    pub(crate) source_unchanged: bool,
+    pub(crate) output_unchanged: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CheckpointCausalStabilityPlan {
+    pub(crate) captures: std::collections::HashMap<GraphPassId, CheckpointCaptureCausalStability>,
+    pub(crate) instances:
+        std::collections::HashMap<EffectInstanceId, EffectInstanceCausalStability>,
+}
+
+pub(crate) fn checkpoint_causal_stability_plan(
+    renderer: &GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+) -> CheckpointCausalStabilityPlan {
+    let mut plan = CheckpointCausalStabilityPlan::default();
+    let presented = renderer.presented_checkpoint_causal_state.as_ref();
+    let current_scene = renderer.current_checkpoint_scene_causal_snapshot.as_ref();
+    let common_prefix_end = presented
+        .zip(current_scene)
+        .map(|(presented, current)| presented.scene.unchanged_command_prefix_len(current));
+    let passes_by_id = graph
+        .passes
+        .iter()
+        .map(|pass| (pass.id, pass))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for instance in &graph.instances {
+        let scene_captures = graph
+            .passes
+            .iter()
+            .filter(|pass| {
+                pass.instance == instance.id && pass.kind == RenderPassKind::SceneCapture
+            })
+            .collect::<Vec<_>>();
+        let has_surface_capture = graph.passes.iter().any(|pass| {
+            pass.instance == instance.id && pass.kind == RenderPassKind::SurfaceCapture
+        });
+        let supported_topology = scene_captures.len() == 1 && !has_surface_capture;
+        let previous_instance = presented.and_then(|state| state.effects.get(&instance.id));
+        let primary_capture = scene_captures.first().copied();
+        let dependency_ids = primary_capture.and_then(|pass| {
+            pass.checkpoint_dependencies
+                .iter()
+                .map(|dependency| {
+                    passes_by_id
+                        .get(dependency)
+                        .map(|dependency_pass| dependency_pass.instance)
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        let dependency_history_matches = previous_instance
+            .zip(dependency_ids.as_ref())
+            .is_some_and(|(previous, dependencies)| previous.dependencies == *dependencies);
+        let dependency_outputs_unchanged = dependency_history_matches
+            && dependency_ids.as_ref().is_some_and(|dependencies| {
+                dependencies.iter().all(|dependency| {
+                    plan.instances
+                        .get(dependency)
+                        .is_some_and(|stability| stability.output_unchanged)
+                })
+            });
+        let current_composition_boundary = primary_capture.map(|pass| {
+            let (draw_end, _) = composition_range(
+                &renderer.commands,
+                pass.anchor,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
+            (draw_end, pass.anchor, pass.visual_group, pass.anchor_scope)
+        });
+        let ordinary_prefix_unchanged =
+            current_composition_boundary.is_some_and(|(draw_end, _, _, _)| {
+                common_prefix_end.is_some_and(|common_prefix_end| draw_end <= common_prefix_end)
+            });
+        let composition_boundary_unchanged = previous_instance
+            .zip(current_composition_boundary.as_ref())
+            .is_some_and(|(previous, current)| {
+                previous.composition_boundary.as_ref() == Some(current)
+            });
+        let capture_owner_unchanged = primary_capture
+            .zip(previous_instance)
+            .zip(current_scene)
+            .is_some_and(|((pass, previous), current)| {
+                previous.capture_owner_root
+                    == current.presentation_owner_for_visual_group(pass.visual_group)
+            });
+        let source_unchanged = supported_topology
+            && ordinary_prefix_unchanged
+            && composition_boundary_unchanged
+            && capture_owner_unchanged
+            && dependency_outputs_unchanged;
+        let semantic_state_unchanged = previous_instance.is_some_and(|previous| {
+            previous.causal_backdrop_only
+                && supported_topology
+                && previous.semantic_signature == instance.semantic_signature
+                && previous.frame_demand == instance.frame_demand
+                && previous.frame_demand != EffectFrameDemand::Continuous
+        });
+        let output_unchanged = source_unchanged && semantic_state_unchanged;
+        let instance_stability = EffectInstanceCausalStability {
+            ordinary_prefix_unchanged,
+            dependency_outputs_unchanged,
+            source_unchanged,
+            output_unchanged,
+        };
+        plan.instances.insert(instance.id, instance_stability);
+
+        for pass in scene_captures {
+            let pass_dependency_ids = pass
+                .checkpoint_dependencies
+                .iter()
+                .map(|dependency| {
+                    passes_by_id
+                        .get(dependency)
+                        .map(|dependency_pass| dependency_pass.instance)
+                })
+                .collect::<Option<Vec<_>>>();
+            let pass_dependency_history_matches = previous_instance
+                .zip(pass_dependency_ids.as_ref())
+                .is_some_and(|(previous, dependencies)| previous.dependencies == *dependencies);
+            let pass_dependencies_unchanged = pass_dependency_history_matches
+                && pass_dependency_ids.as_ref().is_some_and(|dependencies| {
+                    dependencies.iter().all(|dependency| {
+                        plan.instances
+                            .get(dependency)
+                            .is_some_and(|stability| stability.output_unchanged)
+                    })
+                });
+            let (draw_end, _) = composition_range(
+                &renderer.commands,
+                pass.anchor,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
+            let pass_prefix_unchanged =
+                common_prefix_end.is_some_and(|common_prefix_end| draw_end <= common_prefix_end);
+            let pass_composition_boundary =
+                (draw_end, pass.anchor, pass.visual_group, pass.anchor_scope);
+            let pass_composition_boundary_unchanged = previous_instance.is_some_and(|previous| {
+                previous.composition_boundary == Some(pass_composition_boundary)
+            });
+            let pass_owner_unchanged =
+                previous_instance
+                    .zip(current_scene)
+                    .is_some_and(|(previous, current)| {
+                        previous.capture_owner_root
+                            == current.presentation_owner_for_visual_group(pass.visual_group)
+                    });
+            let pass_source_unchanged = supported_topology
+                && pass_prefix_unchanged
+                && pass_composition_boundary_unchanged
+                && pass_owner_unchanged
+                && pass_dependencies_unchanged;
+            let unproven_reason = if pass_source_unchanged {
+                None
+            } else if presented.is_none() || current_scene.is_none() {
+                Some(CheckpointCausalUnprovenReason::NoPresentedHistory)
+            } else if !pass_prefix_unchanged
+                || !pass_composition_boundary_unchanged
+                || !pass_owner_unchanged
+            {
+                Some(CheckpointCausalUnprovenReason::ScenePrefixChanged)
+            } else if !pass_dependencies_unchanged {
+                Some(CheckpointCausalUnprovenReason::DependencyChanged)
+            } else {
+                Some(CheckpointCausalUnprovenReason::UnsupportedTopology)
+            };
+            plan.captures.insert(
+                pass.id,
+                CheckpointCaptureCausalStability {
+                    ordinary_prefix_unchanged: pass_prefix_unchanged,
+                    dependency_outputs_unchanged: pass_dependencies_unchanged,
+                    source_unchanged: pass_source_unchanged,
+                    unproven_reason,
+                },
+            );
+        }
+    }
+    plan
 }
 
 fn checkpoint_update_materialization_plan(
@@ -6990,6 +7237,7 @@ mod tests {
             instances: vec![
                 oblivion_one::effects::CompiledEffectInstance {
                     semantic_signature: 0,
+                    frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                     id: earlier,
                     output_influence_region: EffectRegion::from_rect(earlier_influence),
                     capture_region: EffectRegion::from_rect(earlier_influence),
@@ -6997,6 +7245,7 @@ mod tests {
                 },
                 oblivion_one::effects::CompiledEffectInstance {
                     semantic_signature: 0,
+                    frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                     id: later,
                     output_influence_region: EffectRegion::from_rect(later_capture),
                     capture_region: EffectRegion::from_rect(later_capture),
@@ -7255,6 +7504,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7304,6 +7554,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7351,6 +7602,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7405,6 +7657,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7453,6 +7706,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: visible.clone(),
                 capture_region: visible.clone(),
@@ -7601,6 +7855,7 @@ mod tests {
             instances: vec![
                 oblivion_one::effects::CompiledEffectInstance {
                     semantic_signature: 0,
+                    frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                     id: first,
                     output_influence_region: EffectRegion::from_rect(
                         oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
@@ -7612,6 +7867,7 @@ mod tests {
                 },
                 oblivion_one::effects::CompiledEffectInstance {
                     semantic_signature: 0,
+                    frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                     id: second,
                     output_influence_region: EffectRegion::from_rect(
                         oblivion_one::effects::EffectRect::new(20, 0, 10, 10).unwrap(),
@@ -7673,6 +7929,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7716,6 +7973,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(visible),
                 capture_region: EffectRegion::from_rect(capture_domain),
@@ -7774,6 +8032,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: visible.clone(),
                 capture_region: visible.clone(),
@@ -7845,6 +8104,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7894,6 +8154,7 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(visible),
                 capture_region: EffectRegion::from_rect(domain),
@@ -7931,6 +8192,7 @@ mod tests {
             textures: vec![test_texture(1, GraphTextureSource::CapturedScene, domain)],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -8391,6 +8653,7 @@ mod tests {
             }],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(full),
                 capture_region: EffectRegion::from_rect(full),
@@ -8456,6 +8719,7 @@ mod tests {
             textures: vec![test_texture(1, GraphTextureSource::CapturedScene, domain)],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -8520,6 +8784,7 @@ mod tests {
             )],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(capture_domain),
                 capture_region: EffectRegion::from_rect(capture_domain),
@@ -8592,6 +8857,7 @@ mod tests {
             )],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(capture_domain),
                 capture_region: EffectRegion::from_rect(capture_domain),
@@ -8816,6 +9082,7 @@ mod tests {
         let instance = |id, output_x, capture_x, capture_width, dependencies| {
             oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id,
                 output_influence_region: EffectRegion::from_rect(
                     oblivion_one::effects::EffectRect::new(output_x, 0, 10, 10).unwrap(),

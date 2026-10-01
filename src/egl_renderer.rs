@@ -520,6 +520,7 @@ pub(crate) struct EglSceneFrameCommit {
     repaint_plan: RepaintPlan,
     damage_state: EglPresentedDamageState,
     scene_key: EglSceneCacheKey,
+    checkpoint_causal_state: Option<PresentedCheckpointCausalState>,
 }
 
 impl EglSceneFrameCommit {
@@ -551,6 +552,7 @@ impl EglSceneFrameCommit {
                 presentation_geometry_signature: 0,
                 framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
+            checkpoint_causal_state: None,
         }
     }
 }
@@ -710,6 +712,8 @@ pub(crate) struct GlesSceneRenderer {
     scene_visibility_plan: Vec<EglVisibilityDecision>,
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
+    current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
+    presented_checkpoint_causal_state: Option<PresentedCheckpointCausalState>,
     cursor_resource: Option<EglImageResource>,
     cursor_resource_stale: bool,
     surface_resources: HashMap<u32, EglSurfaceResource>,
@@ -747,6 +751,8 @@ struct CaptureRendererState {
     current_framebuffer_origin: OutputFramebufferOrigin,
     current_size: (u32, u32),
     presented_scene_key: Option<EglSceneCacheKey>,
+    current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
+    presented_checkpoint_causal_state: Option<PresentedCheckpointCausalState>,
     damage_tracker: EglOutputDamageTracker,
     repaint_planner: PartialRepaintPlanner,
     failed_effect_generation: Option<u64>,
@@ -776,6 +782,10 @@ impl CaptureRendererState {
             current_framebuffer_origin: renderer.current_framebuffer_origin,
             current_size: renderer.current_size,
             presented_scene_key: renderer.presented_scene_key,
+            current_checkpoint_scene_causal_snapshot: renderer
+                .current_checkpoint_scene_causal_snapshot
+                .clone(),
+            presented_checkpoint_causal_state: renderer.presented_checkpoint_causal_state.clone(),
             damage_tracker: renderer.damage_tracker.clone(),
             repaint_planner: renderer.repaint_planner.clone(),
             failed_effect_generation: renderer.failed_effect_generation,
@@ -801,6 +811,9 @@ impl CaptureRendererState {
         renderer.current_framebuffer_origin = self.current_framebuffer_origin;
         renderer.current_size = self.current_size;
         renderer.presented_scene_key = self.presented_scene_key;
+        renderer.current_checkpoint_scene_causal_snapshot =
+            self.current_checkpoint_scene_causal_snapshot;
+        renderer.presented_checkpoint_causal_state = self.presented_checkpoint_causal_state;
         renderer.damage_tracker = self.damage_tracker;
         renderer.repaint_planner = self.repaint_planner;
         renderer.failed_effect_generation = self.failed_effect_generation;
@@ -1508,6 +1521,8 @@ impl GlesSceneRenderer {
             scene_visibility_plan: Vec::new(),
             scene_cache_key: None,
             presented_scene_key: None,
+            current_checkpoint_scene_causal_snapshot: None,
+            presented_checkpoint_causal_state: None,
             cursor_resource: None,
             cursor_resource_stale: false,
             surface_resources: HashMap::new(),
@@ -2266,6 +2281,15 @@ impl GlesSceneRenderer {
             output_scale,
             framebuffer_origin,
         );
+        self.current_checkpoint_scene_causal_snapshot =
+            Some(EglCheckpointSceneCausalSnapshot::new(
+                (width, height),
+                &self.commands,
+                &self.vertices,
+                &surface_signatures,
+                &self.presentation_opacities,
+                &self.presentation_visual_group_owners,
+            ));
         self.rebuild_lamp_commands_if_needed(
             lifecycle,
             lifecycle_surfaces,
@@ -2497,6 +2521,8 @@ impl GlesSceneRenderer {
             "begin",
             self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
         );
+        let mut effect_graph_execution_succeeded =
+            matches!(&execution_plan, FrameExecutionPlan::LegacyScene);
         let draw_result = match &execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -2515,6 +2541,7 @@ impl GlesSceneRenderer {
                     selection,
                 ) {
                     Ok(execution_stats) => {
+                        effect_graph_execution_succeeded = true;
                         self.frame_stats.effect_instances_executed = execution_stats.instances;
                         self.frame_stats.effect_passes_executed = execution_stats.passes;
                         self.frame_stats.scene_replay_work_overflow_fallbacks =
@@ -2528,6 +2555,8 @@ impl GlesSceneRenderer {
                         Ok(())
                     }
                     Err(error) => {
+                        self.effect_resources
+                            .invalidate_checkpoint_capture_contents();
                         self.frame_stats.effect_fallbacks =
                             self.frame_stats.effect_fallbacks.saturating_add(1);
                         self.frame_stats.effect_instances_failed =
@@ -2573,11 +2602,15 @@ impl GlesSceneRenderer {
         }
         self.record_effect_resource_metrics();
         self.record_repaint_stats(&plan);
+        let checkpoint_causal_state = effect_graph_execution_succeeded
+            .then(|| self.checkpoint_causal_candidate_state(compiled_graph))
+            .flatten();
         Ok(EglFrameOutcome::Rendered {
             commit: EglSceneFrameCommit {
                 repaint_plan: plan,
                 damage_state,
                 scene_key: candidate_scene_key,
+                checkpoint_causal_state,
             },
             stats: self.frame_stats,
             lifecycle_evidence: self.lifecycle_render_evidence.clone(),
@@ -2593,7 +2626,17 @@ impl GlesSceneRenderer {
             .commit_presented_transition(presented_transition_damage);
         self.damage_tracker.commit_presented(frame.damage_state);
         self.presented_scene_key = Some(frame.scene_key);
+        self.presented_checkpoint_causal_state = frame.checkpoint_causal_state;
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
+    }
+
+    fn checkpoint_causal_candidate_state(
+        &self,
+        graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
+    ) -> Option<PresentedCheckpointCausalState> {
+        self.current_checkpoint_scene_causal_snapshot
+            .clone()
+            .map(|scene| PresentedCheckpointCausalState::new(scene, graph, &self.commands))
     }
 
     pub(crate) fn discard_rendered(&mut self, frame: EglSceneFrameCommit) {
@@ -5965,6 +6008,254 @@ struct EglSceneSurfaceSignature {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EglCheckpointRectBits([u32; 4]);
+
+impl EglCheckpointRectBits {
+    fn from_rect(rect: EglRect) -> Self {
+        Self([
+            rect.x().to_bits(),
+            rect.y().to_bits(),
+            rect.width().to_bits(),
+            rect.height().to_bits(),
+        ])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EglCheckpointPixelSourceIdentity {
+    Layer(EglDrawLayer),
+    Surface(EglSceneSurfaceSignature),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EglCheckpointCommandCausalSnapshot {
+    layer: EglDrawLayer,
+    visual_group: Option<VisualGroupId>,
+    bounds: EglCheckpointRectBits,
+    opaque_regions: Vec<EglCheckpointRectBits>,
+    presentation_clip: Option<EglCheckpointRectBits>,
+    vertex_start: u32,
+    vertex_count: u32,
+    sampling: SurfaceSampling,
+    presentation_opacity_bits: u32,
+    presentation_owner_root: Option<u32>,
+    vertices: Vec<[u32; 4]>,
+    pixel_source: Option<EglCheckpointPixelSourceIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EglCheckpointSceneCausalSnapshot {
+    output_size: (u32, u32),
+    commands: Vec<EglCheckpointCommandCausalSnapshot>,
+    presentation_visual_group_owners: HashMap<VisualGroupId, u32>,
+}
+
+impl EglCheckpointSceneCausalSnapshot {
+    fn new(
+        output_size: (u32, u32),
+        commands: &[EglDrawCommand],
+        vertices: &[EglTexturedVertex],
+        surface_signatures: &[EglSceneSurfaceSignature],
+        presentation_opacities: &[f32],
+        presentation_visual_group_owners: &HashMap<VisualGroupId, u32>,
+    ) -> Self {
+        let surface_signatures = surface_signatures
+            .iter()
+            .map(|signature| (signature.surface_id, *signature))
+            .collect::<HashMap<_, _>>();
+        let commands = commands
+            .iter()
+            .enumerate()
+            .map(|(command_index, command)| {
+                let start = usize::try_from(command.vertex_start).ok();
+                let end = start.and_then(|start| {
+                    usize::try_from(command.vertex_count)
+                        .ok()
+                        .and_then(|count| start.checked_add(count))
+                });
+                let command_vertices = start
+                    .zip(end)
+                    .and_then(|(start, end)| vertices.get(start..end))
+                    .map(|vertices| {
+                        vertices
+                            .iter()
+                            .map(|vertex| {
+                                [
+                                    vertex.position[0].to_bits(),
+                                    vertex.position[1].to_bits(),
+                                    vertex.uv[0].to_bits(),
+                                    vertex.uv[1].to_bits(),
+                                ]
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let vertex_range_is_valid = start
+                    .zip(end)
+                    .is_some_and(|(start, end)| vertices.get(start..end).is_some());
+                let pixel_source = match command.layer {
+                    EglDrawLayer::Surface(surface_id) => surface_signatures
+                        .get(&surface_id)
+                        .copied()
+                        .map(EglCheckpointPixelSourceIdentity::Surface),
+                    EglDrawLayer::Solid(_)
+                    | EglDrawLayer::SolidRgba(_)
+                    | EglDrawLayer::DecorationAsset(_) => {
+                        Some(EglCheckpointPixelSourceIdentity::Layer(command.layer))
+                    }
+                    EglDrawLayer::LifecycleResolvedVisual(_) | EglDrawLayer::Cursor => None,
+                };
+                EglCheckpointCommandCausalSnapshot {
+                    layer: command.layer,
+                    visual_group: command.visual_group,
+                    bounds: EglCheckpointRectBits::from_rect(command.bounds),
+                    opaque_regions: command
+                        .opaque_regions
+                        .iter()
+                        .copied()
+                        .map(EglCheckpointRectBits::from_rect)
+                        .collect(),
+                    presentation_clip: command
+                        .presentation_clip
+                        .map(EglCheckpointRectBits::from_rect),
+                    vertex_start: command.vertex_start,
+                    vertex_count: command.vertex_count,
+                    sampling: command.sampling,
+                    presentation_opacity_bits: presentation_opacities
+                        .get(command_index)
+                        .copied()
+                        .unwrap_or(1.0)
+                        .to_bits(),
+                    presentation_owner_root: command
+                        .visual_group
+                        .and_then(|group| presentation_visual_group_owners.get(&group).copied()),
+                    vertices: if vertex_range_is_valid {
+                        command_vertices
+                    } else {
+                        Vec::new()
+                    },
+                    pixel_source: pixel_source.filter(|_| vertex_range_is_valid),
+                }
+            })
+            .collect();
+        Self {
+            output_size,
+            commands,
+            presentation_visual_group_owners: presentation_visual_group_owners.clone(),
+        }
+    }
+
+    fn presentation_owner_for_visual_group(
+        &self,
+        visual_group: Option<VisualGroupId>,
+    ) -> Option<u32> {
+        visual_group.and_then(|group| self.presentation_visual_group_owners.get(&group).copied())
+    }
+
+    fn unchanged_command_prefix_len(&self, current: &Self) -> usize {
+        if self.output_size != current.output_size {
+            return 0;
+        }
+        self.commands
+            .iter()
+            .zip(&current.commands)
+            .take_while(|(previous, current)| {
+                previous.pixel_source.is_some()
+                    && current.pixel_source.is_some()
+                    && previous == current
+            })
+            .count()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PresentedCheckpointEffectCausalState {
+    semantic_signature: u64,
+    frame_demand: oblivion_one::effects::EffectFrameDemand,
+    causal_backdrop_only: bool,
+    capture_owner_root: Option<u32>,
+    composition_boundary: Option<(
+        usize,
+        oblivion_one::compositor::EffectAnchor,
+        Option<VisualGroupId>,
+        oblivion_one::compositor::EffectAnchorScope,
+    )>,
+    dependencies: Vec<oblivion_one::effects::EffectInstanceId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PresentedCheckpointCausalState {
+    scene: EglCheckpointSceneCausalSnapshot,
+    effects: HashMap<oblivion_one::effects::EffectInstanceId, PresentedCheckpointEffectCausalState>,
+}
+
+impl PresentedCheckpointCausalState {
+    fn new(
+        scene: EglCheckpointSceneCausalSnapshot,
+        graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
+        commands: &[EglDrawCommand],
+    ) -> Self {
+        let mut effects = HashMap::new();
+        if let Some(graph) = graph {
+            let passes_by_id = graph
+                .passes
+                .iter()
+                .map(|pass| (pass.id, pass))
+                .collect::<HashMap<_, _>>();
+            for instance in &graph.instances {
+                let scene_captures = graph
+                    .passes
+                    .iter()
+                    .filter(|pass| {
+                        pass.instance == instance.id
+                            && pass.kind == oblivion_one::effects::RenderPassKind::SceneCapture
+                    })
+                    .collect::<Vec<_>>();
+                let has_surface_capture = graph.passes.iter().any(|pass| {
+                    pass.instance == instance.id
+                        && pass.kind == oblivion_one::effects::RenderPassKind::SurfaceCapture
+                });
+                let capture_dependencies = scene_captures
+                    .first()
+                    .and_then(|pass| {
+                        pass.checkpoint_dependencies
+                            .iter()
+                            .map(|dependency| {
+                                passes_by_id
+                                    .get(dependency)
+                                    .map(|dependency_pass| dependency_pass.instance)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .unwrap_or_default();
+                effects.insert(
+                    instance.id,
+                    PresentedCheckpointEffectCausalState {
+                        semantic_signature: instance.semantic_signature,
+                        frame_demand: instance.frame_demand,
+                        causal_backdrop_only: scene_captures.len() == 1 && !has_surface_capture,
+                        capture_owner_root: scene_captures.first().and_then(|pass| {
+                            scene.presentation_owner_for_visual_group(pass.visual_group)
+                        }),
+                        composition_boundary: scene_captures.first().map(|pass| {
+                            let (draw_end, _) = effects::composition_range(
+                                commands,
+                                pass.anchor,
+                                pass.visual_group,
+                                pass.anchor_scope,
+                            );
+                            (draw_end, pass.anchor, pass.visual_group, pass.anchor_scope)
+                        }),
+                        dependencies: capture_dependencies,
+                    },
+                );
+            }
+        }
+        Self { scene, effects }
+    }
+}
+
 fn split_external_overlay_surfaces(
     surfaces: &[RenderableSurface],
     external_overlay_surface_ids: &[u32],
@@ -7668,6 +7959,239 @@ mod tests {
                     },
                 );
             }
+        }
+    }
+
+    mod checkpoint_causal_snapshot_tests {
+        use super::*;
+
+        fn surface_signature(surface_id: u32, generation: u64) -> EglSceneSurfaceSignature {
+            EglSceneSurfaceSignature {
+                surface_id,
+                commit_sequence: generation,
+                buffer_id: u64::from(surface_id) * 100 + generation,
+                buffer_width: 64,
+                buffer_height: 64,
+                buffer_scale: 1,
+                buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+                render_x: 0,
+                render_y: 0,
+                clip_x: 0,
+                clip_y: 0,
+                clip_width: 64,
+                clip_height: 64,
+                generation,
+            }
+        }
+
+        fn scene_commands() -> (Vec<EglDrawCommand>, Vec<EglTexturedVertex>) {
+            let mut commands = Vec::new();
+            let mut vertices = Vec::new();
+            for index in 0..3_u32 {
+                let vertex_start = vertices.len() as u32;
+                vertices.extend([
+                    EglTexturedVertex {
+                        position: [index as f32, 0.0],
+                        uv: [0.0, 0.0],
+                    },
+                    EglTexturedVertex {
+                        position: [index as f32 + 1.0, 0.0],
+                        uv: [1.0, 0.0],
+                    },
+                    EglTexturedVertex {
+                        position: [index as f32 + 1.0, 1.0],
+                        uv: [1.0, 1.0],
+                    },
+                    EglTexturedVertex {
+                        position: [index as f32, 1.0],
+                        uv: [0.0, 1.0],
+                    },
+                ]);
+                commands.push(EglDrawCommand {
+                    layer: EglDrawLayer::Surface(index + 1),
+                    visual_group: Some(VisualGroupId::new(index + 1).unwrap()),
+                    bounds: EglRect::new(index as f32, 0.0, 1.0, 1.0),
+                    opaque_regions: Vec::new(),
+                    presentation_clip: None,
+                    vertex_start,
+                    vertex_count: 4,
+                    sampling: SurfaceSampling::ExactNearest,
+                });
+            }
+            (commands, vertices)
+        }
+
+        fn snapshot(
+            commands: &[EglDrawCommand],
+            vertices: &[EglTexturedVertex],
+            signatures: &[EglSceneSurfaceSignature],
+            opacities: &HashMap<VisualGroupId, f32>,
+        ) -> EglCheckpointSceneCausalSnapshot {
+            snapshot_with_owners(commands, vertices, signatures, opacities, &HashMap::new())
+        }
+
+        fn snapshot_with_owners(
+            commands: &[EglDrawCommand],
+            vertices: &[EglTexturedVertex],
+            signatures: &[EglSceneSurfaceSignature],
+            opacities: &HashMap<VisualGroupId, f32>,
+            owners: &HashMap<VisualGroupId, u32>,
+        ) -> EglCheckpointSceneCausalSnapshot {
+            let presentation_opacities = commands
+                .iter()
+                .map(|command| {
+                    command
+                        .visual_group
+                        .and_then(|group| opacities.get(&group).copied())
+                        .unwrap_or(1.0)
+                })
+                .collect::<Vec<_>>();
+            EglCheckpointSceneCausalSnapshot::new(
+                (16, 16),
+                commands,
+                vertices,
+                signatures,
+                &presentation_opacities,
+                owners,
+            )
+        }
+
+        #[test]
+        fn later_source_change_preserves_the_exact_earlier_command_prefix() {
+            let (commands, vertices) = scene_commands();
+            let previous_signatures = (1..=3)
+                .map(|id| surface_signature(id, 1))
+                .collect::<Vec<_>>();
+            let current_signatures = vec![
+                surface_signature(1, 1),
+                surface_signature(2, 1),
+                surface_signature(3, 2),
+            ];
+            let previous = snapshot(&commands, &vertices, &previous_signatures, &HashMap::new());
+            let current = snapshot(&commands, &vertices, &current_signatures, &HashMap::new());
+
+            assert_eq!(previous.unchanged_command_prefix_len(&current), 2);
+        }
+
+        #[test]
+        fn same_geometry_with_new_surface_pixels_is_not_equal() {
+            let (commands, vertices) = scene_commands();
+            let previous_signatures = (1..=3)
+                .map(|id| surface_signature(id, 1))
+                .collect::<Vec<_>>();
+            let changed_signatures = vec![
+                surface_signature(1, 1),
+                surface_signature(2, 2),
+                surface_signature(3, 1),
+            ];
+            let previous = snapshot(&commands, &vertices, &previous_signatures, &HashMap::new());
+            let current = snapshot(&commands, &vertices, &changed_signatures, &HashMap::new());
+
+            assert_eq!(previous.unchanged_command_prefix_len(&current), 1);
+        }
+
+        #[test]
+        fn geometry_sampling_opacity_clip_and_uv_changes_break_prefix_equality() {
+            let (commands, vertices) = scene_commands();
+            let signatures = (1..=3)
+                .map(|id| surface_signature(id, 1))
+                .collect::<Vec<_>>();
+            let previous = snapshot(&commands, &vertices, &signatures, &HashMap::new());
+
+            let mut changed_commands = commands.clone();
+            changed_commands[1].bounds = EglRect::new(3.0, 0.0, 1.0, 1.0);
+            assert_eq!(
+                previous.unchanged_command_prefix_len(&snapshot(
+                    &changed_commands,
+                    &vertices,
+                    &signatures,
+                    &HashMap::new(),
+                )),
+                1
+            );
+
+            changed_commands.clone_from(&commands);
+            changed_commands[1].presentation_clip = Some(EglRect::new(2.0, 0.0, 0.5, 1.0));
+            changed_commands[1].opaque_regions = vec![EglRect::new(2.0, 0.0, 0.25, 1.0)];
+            changed_commands[1].sampling = SurfaceSampling::ScaledLinear;
+            assert_eq!(
+                previous.unchanged_command_prefix_len(&snapshot(
+                    &changed_commands,
+                    &vertices,
+                    &signatures,
+                    &HashMap::new(),
+                )),
+                1
+            );
+
+            let mut changed_vertices = vertices.clone();
+            changed_vertices[4].uv[0] = 0.25;
+            assert_eq!(
+                previous.unchanged_command_prefix_len(&snapshot(
+                    &commands,
+                    &changed_vertices,
+                    &signatures,
+                    &HashMap::new(),
+                )),
+                1
+            );
+
+            let mut changed_opacity = HashMap::new();
+            changed_opacity.insert(VisualGroupId::new(2).unwrap(), 0.5);
+            assert_eq!(
+                previous.unchanged_command_prefix_len(&snapshot(
+                    &commands,
+                    &vertices,
+                    &signatures,
+                    &changed_opacity,
+                )),
+                1
+            );
+        }
+
+        #[test]
+        fn presentation_owner_changes_break_command_prefix_equality() {
+            let (commands, vertices) = scene_commands();
+            let signatures = (1..=3)
+                .map(|id| surface_signature(id, 1))
+                .collect::<Vec<_>>();
+            let changed_group = VisualGroupId::new(2).unwrap();
+            let previous_owners = HashMap::from([(changed_group, 50)]);
+            let current_owners = HashMap::from([(changed_group, 51)]);
+            let previous = snapshot_with_owners(
+                &commands,
+                &vertices,
+                &signatures,
+                &HashMap::new(),
+                &previous_owners,
+            );
+            let current = snapshot_with_owners(
+                &commands,
+                &vertices,
+                &signatures,
+                &HashMap::new(),
+                &current_owners,
+            );
+
+            assert_eq!(previous.unchanged_command_prefix_len(&current), 1);
+        }
+
+        #[test]
+        fn unsupported_command_source_stops_the_common_prefix() {
+            let (commands, vertices) = scene_commands();
+            let signatures = (1..=3)
+                .map(|id| surface_signature(id, 1))
+                .collect::<Vec<_>>();
+            let previous = snapshot(&commands, &vertices, &signatures, &HashMap::new());
+            let mut current_commands = commands;
+            current_commands[1].layer = EglDrawLayer::Cursor;
+            let current = snapshot(&current_commands, &vertices, &signatures, &HashMap::new());
+
+            assert_eq!(previous.unchanged_command_prefix_len(&current), 1);
         }
     }
 
@@ -9572,6 +10096,7 @@ mod tests {
             textures: vec![target.clone()],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 semantic_signature: 0,
+                frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
                 id: instance,
                 output_influence_region: EffectRegion::from_rect(domain),
                 capture_region: EffectRegion::from_rect(domain),
@@ -9713,7 +10238,7 @@ mod tests {
         region: EffectRegion,
         conservative_full: bool,
         config: effects::EffectDebugConfig,
-    ) {
+    ) -> u64 {
         execute_diagnostic_frame_with_origin(
             harness,
             graph,
@@ -9722,7 +10247,7 @@ mod tests {
             conservative_full,
             config,
             OutputFramebufferOrigin::BottomLeft,
-        );
+        )
     }
 
     fn execute_diagnostic_frame_with_origin(
@@ -9733,7 +10258,7 @@ mod tests {
         conservative_full: bool,
         config: effects::EffectDebugConfig,
         framebuffer_origin: OutputFramebufferOrigin,
-    ) {
+    ) -> u64 {
         execute_diagnostic_frame_with_origin_and_scene_replay_mode(
             harness,
             graph,
@@ -9743,7 +10268,7 @@ mod tests {
             config,
             framebuffer_origin,
             None,
-        );
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9756,7 +10281,7 @@ mod tests {
         config: effects::EffectDebugConfig,
         framebuffer_origin: OutputFramebufferOrigin,
         scene_replay_work_mode: Option<effects::SceneReplayWorkMode>,
-    ) {
+    ) -> u64 {
         let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
             graph,
             &region,
@@ -9764,7 +10289,7 @@ mod tests {
             config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
         );
         let selection = effects::select_effect_execution(graph, &demand);
-        match scene_replay_work_mode {
+        let stats = match scene_replay_work_mode {
             Some(mode) => effects::execute_effect_graph_with_debug_config_and_scene_replay_mode(
                 &mut harness.renderer,
                 graph,
@@ -9786,6 +10311,7 @@ mod tests {
             ),
         }
         .expect("diagnostic frame renders");
+        stats.checkpoint_capture_execution_pixels
     }
 
     fn render_native_stacked_candidate(
@@ -11514,6 +12040,696 @@ mod tests {
                 && line.contains("kind=SceneCapture")
                 && line.contains("checkpoints=1")
                 && line.contains("capture_mode=framebuffer_blit")
+    mod checkpoint_causal_gles_tests {
+        use super::*;
+        use oblivion_one::effects::{EffectFrameDemand, EffectInstanceId, GraphPassId};
+
+        fn surface_signature(surface_id: u32, generation: u64) -> EglSceneSurfaceSignature {
+            EglSceneSurfaceSignature {
+                surface_id,
+                commit_sequence: generation,
+                buffer_id: u64::from(surface_id) * 100 + generation,
+                buffer_width: 160,
+                buffer_height: 120,
+                buffer_scale: 1,
+                buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+                x: 0,
+                y: 0,
+                width: 160,
+                height: 120,
+                render_x: 0,
+                render_y: 0,
+                clip_x: 0,
+                clip_y: 0,
+                clip_width: 160,
+                clip_height: 120,
+                generation,
+            }
+        }
+
+        fn signatures(
+            scene: NativeThreeCheckpointSceneSpec,
+            changed_surface: Option<u32>,
+        ) -> Vec<EglSceneSurfaceSignature> {
+            [
+                scene.background_surface,
+                scene.a_surface,
+                scene.c_surface,
+                scene.b_surface,
+            ]
+            .into_iter()
+            .map(|surface_id| {
+                surface_signature(
+                    surface_id,
+                    if changed_surface == Some(surface_id) {
+                        2
+                    } else {
+                        1
+                    },
+                )
+            })
+            .collect()
+        }
+
+        fn set_current_snapshot(
+            renderer: &mut GlesSceneRenderer,
+            surface_signatures: &[EglSceneSurfaceSignature],
+        ) {
+            let snapshot = EglCheckpointSceneCausalSnapshot::new(
+                renderer.current_size,
+                &renderer.commands,
+                &renderer.vertices,
+                surface_signatures,
+                &renderer.presentation_opacities,
+                &renderer.presentation_visual_group_owners,
+            );
+            renderer.current_checkpoint_scene_causal_snapshot = Some(snapshot);
+        }
+
+        fn commit_current_causal_state(
+            renderer: &mut GlesSceneRenderer,
+            graph: &oblivion_one::effects::CompiledFrameGraph,
+        ) {
+            let mut frame = EglSceneFrameCommit::empty_for_test();
+            frame.checkpoint_causal_state = Some(
+                renderer
+                    .checkpoint_causal_candidate_state(Some(graph))
+                    .expect("diagnostic scene has a causal snapshot"),
+            );
+            renderer.commit_presented(frame, OutputDamage::Empty);
+        }
+
+        fn cached_checkpoint_pixels(
+            harness: &mut GlesEffectTestHarness,
+            graph: &oblivion_one::effects::CompiledFrameGraph,
+            instance_id: u64,
+        ) -> Vec<u8> {
+            let instance = oblivion_one::effects::EffectInstanceId::new(instance_id).unwrap();
+            let pass = graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance == instance
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .expect("requested checkpoint capture exists");
+            let key = effects::checkpoint_capture_cache_key(graph, pass)
+                .expect("requested checkpoint has a semantic cache key");
+            let texture_plan = graph
+                .textures
+                .iter()
+                .find(|texture| Some(texture.id) == pass.output)
+                .expect("checkpoint capture has a texture plan");
+            let texture = harness
+                .renderer
+                .effect_resources
+                .checkpoint_capture_texture(&key)
+                .expect("checkpoint texture remains cache-owned");
+            read_effect_texture_pixels(harness, &texture, texture_plan.width, texture_plan.height)
+        }
+
+        fn fallback_checkpoint_pixels(
+            graph: &oblivion_one::effects::CompiledFrameGraph,
+            output_size: (u32, u32),
+        ) -> u64 {
+            graph
+                .passes
+                .iter()
+                .filter(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .map(|pass| {
+                    let texture_plan = graph
+                        .textures
+                        .iter()
+                        .find(|texture| Some(texture.id) == pass.output)
+                        .expect("checkpoint capture has a texture plan");
+                    let (rects, _) = effects::checkpoint_update_rects_for_test(
+                        &graph.final_damage,
+                        texture_plan.domain,
+                        output_size,
+                        texture_plan,
+                    );
+                    rects.iter().fold(0_u64, |pixels, rect| {
+                        pixels.saturating_add(
+                            u64::from(rect.width).saturating_mul(u64::from(rect.height)),
+                        )
+                    })
+                })
+                .sum()
+        }
+
+        #[test]
+        fn dependency_stability_propagates_and_fails_closed() {
+            let fixture = native_three_checkpoint_fixture();
+            let mut harness =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            install_native_three_checkpoint_diagnostic_scene(&mut harness, fixture.scene);
+            let graph = compile_native_three_checkpoint_graph(fixture, &EffectRegion::empty());
+            let initial_signatures = signatures(fixture.scene, None);
+            set_current_snapshot(&mut harness.renderer, &initial_signatures);
+            let presented_scene = harness
+                .renderer
+                .current_checkpoint_scene_causal_snapshot
+                .clone()
+                .expect("diagnostic scene has a current snapshot");
+            let no_history = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(
+                no_history.instances.values().all(|stability| {
+                    !stability.output_unchanged && !stability.source_unchanged
+                })
+            );
+            assert!(
+                no_history
+                    .captures
+                    .values()
+                    .all(|stability| !stability.source_unchanged)
+            );
+
+            let mut boundary_change = graph.clone();
+            boundary_change
+                .passes
+                .iter_mut()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance == EffectInstanceId::new(31).unwrap()
+                })
+                .expect("A capture exists")
+                .anchor_scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+            let boundary_change_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &boundary_change);
+            assert!(
+                !boundary_change_plan.instances[&EffectInstanceId::new(31).unwrap()]
+                    .source_unchanged
+            );
+
+            harness.renderer.presented_checkpoint_causal_state =
+                Some(PresentedCheckpointCausalState::new(
+                    presented_scene,
+                    Some(&graph),
+                    &harness.renderer.commands,
+                ));
+
+            let unchanged = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(
+                unchanged
+                    .instances
+                    .values()
+                    .all(|stability| stability.output_unchanged),
+                "unexpected unchanged graph stability: {:#?}",
+                unchanged.instances
+            );
+
+            let original_current_scene = harness
+                .renderer
+                .current_checkpoint_scene_causal_snapshot
+                .clone()
+                .expect("diagnostic scene has a current snapshot");
+            let changed_capture_owners = HashMap::from([(VisualGroupId::new(101).unwrap(), 900)]);
+            harness.renderer.current_checkpoint_scene_causal_snapshot =
+                Some(EglCheckpointSceneCausalSnapshot::new(
+                    harness.renderer.current_size,
+                    &harness.renderer.commands,
+                    &harness.renderer.vertices,
+                    &initial_signatures,
+                    &harness.renderer.presentation_opacities,
+                    &changed_capture_owners,
+                ));
+            let owner_change_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(
+                !owner_change_plan.instances[&EffectInstanceId::new(31).unwrap()].source_unchanged
+            );
+            harness.renderer.current_checkpoint_scene_causal_snapshot =
+                Some(original_current_scene);
+
+            let mut renumbered = graph.clone();
+            let pass_id_map = renumbered
+                .passes
+                .iter()
+                .map(|pass| {
+                    (
+                        pass.id,
+                        GraphPassId::new(pass.id.get().saturating_add(100)).unwrap(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            for pass in &mut renumbered.passes {
+                pass.id = pass_id_map[&pass.id];
+                pass.checkpoint_dependencies = pass
+                    .checkpoint_dependencies
+                    .iter()
+                    .map(|dependency| pass_id_map[dependency])
+                    .collect();
+            }
+            let renumbered_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &renumbered);
+            assert!(
+                renumbered_plan
+                    .instances
+                    .values()
+                    .all(|stability| stability.output_unchanged)
+            );
+
+            let mut semantic_change = graph.clone();
+            semantic_change.instances[0].semantic_signature = semantic_change.instances[0]
+                .semantic_signature
+                .wrapping_add(1);
+            let semantic_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &semantic_change);
+            assert!(!semantic_plan.instances[&EffectInstanceId::new(31).unwrap()].output_unchanged);
+            assert!(!semantic_plan.instances[&EffectInstanceId::new(32).unwrap()].output_unchanged);
+            assert!(!semantic_plan.instances[&EffectInstanceId::new(33).unwrap()].output_unchanged);
+
+            let mut continuous = graph.clone();
+            continuous.instances[0].frame_demand = EffectFrameDemand::Continuous;
+            let continuous_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &continuous);
+            assert!(
+                !continuous_plan.instances[&EffectInstanceId::new(31).unwrap()].output_unchanged
+            );
+            assert!(
+                !continuous_plan.instances[&EffectInstanceId::new(32).unwrap()].output_unchanged
+            );
+            assert!(
+                !continuous_plan.instances[&EffectInstanceId::new(33).unwrap()].output_unchanged
+            );
+
+            let mut changed_history = graph.clone();
+            let c_id = EffectInstanceId::new(32).unwrap();
+            let c_capture = changed_history
+                .passes
+                .iter_mut()
+                .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance == c_id)
+                .expect("C capture exists");
+            c_capture.checkpoint_dependencies.clear();
+            let history_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &changed_history);
+            assert!(!history_plan.instances[&c_id].source_unchanged);
+            assert!(!history_plan.instances[&EffectInstanceId::new(33).unwrap()].output_unchanged);
+
+            let mut unsupported = graph.clone();
+            let a_id = EffectInstanceId::new(31).unwrap();
+            let mut extra_capture = unsupported
+                .passes
+                .iter()
+                .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance == a_id)
+                .expect("A capture exists")
+                .clone();
+            let next_id = unsupported
+                .passes
+                .iter()
+                .map(|pass| pass.id.get())
+                .max()
+                .unwrap()
+                .saturating_add(1);
+            extra_capture.id = GraphPassId::new(next_id).unwrap();
+            extra_capture.kind = RenderPassKind::SurfaceCapture;
+            extra_capture.checkpoint_dependencies.clear();
+            unsupported.passes.push(extra_capture);
+            let unsupported_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &unsupported);
+            assert!(!unsupported_plan.instances[&a_id].output_unchanged);
+            assert!(
+                !unsupported_plan.instances[&EffectInstanceId::new(32).unwrap()].output_unchanged
+            );
+            assert!(
+                !unsupported_plan.instances[&EffectInstanceId::new(33).unwrap()].output_unchanged
+            );
+
+            let unsupported_presented_scene = harness
+                .renderer
+                .current_checkpoint_scene_causal_snapshot
+                .clone()
+                .expect("diagnostic scene has a current snapshot");
+            harness.renderer.presented_checkpoint_causal_state =
+                Some(PresentedCheckpointCausalState::new(
+                    unsupported_presented_scene,
+                    Some(&unsupported),
+                    &harness.renderer.commands,
+                ));
+            let unsupported_to_supported_plan =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(
+                unsupported_to_supported_plan
+                    .instances
+                    .values()
+                    .all(|stability| !stability.output_unchanged)
+            );
+        }
+
+        #[test]
+        fn later_overlapping_surface_change_zero_copies_earlier_checkpoints() {
+            let fixture = native_three_checkpoint_fixture();
+            let incremental_config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_capture_config = effects::EffectDebugConfig::new(
+                effects::EffectDebugCaptureMode::Framebuffer,
+                effects::EffectDebugKawaseMode::Partial,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let mut incremental =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            incremental.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+            let first_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            let initial_signatures = signatures(fixture.scene, None);
+            set_current_snapshot(&mut incremental.renderer, &initial_signatures);
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            execute_diagnostic_frame_with_origin(
+                &mut incremental,
+                &first_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(
+                    &[fixture.repair],
+                    true,
+                    fixture.output_size,
+                ),
+                full_region.clone(),
+                true,
+                incremental_config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            let previous = read_diagnostic_pixels(&incremental);
+            let cached_c_before = cached_checkpoint_pixels(&mut incremental, &first_graph, 32);
+            let cached_b_before = cached_checkpoint_pixels(&mut incremental, &first_graph, 33);
+            commit_current_causal_state(&mut incremental.renderer, &first_graph);
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.b_surface,
+                OutputRect::new(0, 0, 2, 2),
+                [236, 28, 42, 255],
+            );
+            let current_damage = diagnostic_region(fixture.repair);
+            let current_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let current_signatures = signatures(fixture.scene, Some(fixture.scene.b_surface));
+            set_current_snapshot(&mut incremental.renderer, &current_signatures);
+            let causal_plan =
+                effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
+            let c_capture = current_graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance
+                            == oblivion_one::effects::EffectInstanceId::new(32).unwrap()
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .expect("C is a persistent checkpoint");
+            assert!(causal_plan.captures[&c_capture.id].source_unchanged);
+            let c_domain = current_graph
+                .textures
+                .iter()
+                .find(|texture| Some(texture.id) == c_capture.output)
+                .expect("C checkpoint output plan");
+            assert!(
+                !current_graph
+                    .final_damage
+                    .intersect_rect(c_domain.domain)
+                    .is_empty(),
+                "later B damage overlaps the earlier C checkpoint domain"
+            );
+            let fallback_pixels = fallback_checkpoint_pixels(&current_graph, fixture.output_size);
+            assert!(
+                fallback_pixels > 0,
+                "the conservative fallback has physical work"
+            );
+
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            let update_pixels = execute_diagnostic_frame_with_origin(
+                &mut incremental,
+                &current_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(
+                    &[fixture.repair],
+                    false,
+                    fixture.output_size,
+                ),
+                current_damage,
+                false,
+                incremental_config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            assert_eq!(update_pixels, 0);
+            assert!(update_pixels < fallback_pixels);
+            assert_eq!(
+                cached_checkpoint_pixels(&mut incremental, &current_graph, 32),
+                cached_c_before,
+                "earlier checkpoint texture stays unchanged"
+            );
+            assert_eq!(
+                cached_checkpoint_pixels(&mut incremental, &current_graph, 33),
+                cached_b_before,
+                "B's backdrop source excludes its later surface command"
+            );
+            let actual = read_diagnostic_pixels(&incremental);
+
+            let presented_before_discard = incremental
+                .renderer
+                .presented_checkpoint_causal_state
+                .clone();
+            let mut discarded_frame = EglSceneFrameCommit::empty_for_test();
+            discarded_frame.checkpoint_causal_state = Some(
+                incremental
+                    .renderer
+                    .checkpoint_causal_candidate_state(Some(&current_graph))
+                    .expect("discarded render has a candidate causal state"),
+            );
+            incremental.renderer.discard_rendered(discarded_frame);
+            assert_eq!(
+                incremental.renderer.presented_checkpoint_causal_state, presented_before_discard,
+                "discarded frame never becomes the causal comparison baseline"
+            );
+            let c_key = effects::checkpoint_capture_cache_key(&current_graph, c_capture)
+                .expect("C checkpoint cache key remains stable");
+            assert!(
+                incremental
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_needs_full_refresh(
+                        &c_key,
+                        incremental
+                            .renderer
+                            .effect_resources
+                            .checkpoint_frame_serial(),
+                    )
+            );
+            set_current_snapshot(&mut incremental.renderer, &initial_signatures);
+            let restored_state_plan =
+                effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
+            assert!(restored_state_plan.captures[&c_capture.id].source_unchanged);
+            incremental.renderer.frame_swap_failed();
+            assert_eq!(
+                incremental.renderer.presented_checkpoint_causal_state, presented_before_discard,
+                "swap failure does not promote a candidate causal baseline"
+            );
+            drop(current_graph);
+            drop(first_graph);
+            drop(incremental);
+
+            let mut uncached_reference =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            uncached_reference.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(
+                &mut uncached_reference,
+                fixture.scene,
+            );
+            update_diagnostic_background_for_surface(
+                &uncached_reference,
+                fixture.scene.b_surface,
+                OutputRect::new(0, 0, 2, 2),
+                [236, 28, 42, 255],
+            );
+            let reference_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            uncached_reference
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            execute_diagnostic_frame_with_origin(
+                &mut uncached_reference,
+                &reference_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(
+                    &[fixture.repair],
+                    true,
+                    fixture.output_size,
+                ),
+                full_region,
+                true,
+                full_capture_config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            let full_current = read_diagnostic_pixels(&uncached_reference);
+            let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
+                &actual,
+                &previous,
+                &full_current,
+                fixture.output_size.0,
+                fixture.output_size.1,
+                &[fixture.repair],
+                0,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            assert_eq!(inside, 0, "incremental output matches full-current repair");
+            assert_eq!(outside, 0, "incremental output is stable outside repair");
+        }
+
+        #[test]
+        fn earlier_scene_source_change_uses_the_conservative_checkpoint_update() {
+            let fixture = native_three_checkpoint_fixture();
+            let incremental_config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_capture_config = effects::EffectDebugConfig::new(
+                effects::EffectDebugCaptureMode::Framebuffer,
+                effects::EffectDebugKawaseMode::Partial,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let mut incremental =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            incremental.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+            let first_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            let initial_signatures = signatures(fixture.scene, None);
+            set_current_snapshot(&mut incremental.renderer, &initial_signatures);
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            execute_diagnostic_frame_with_origin(
+                &mut incremental,
+                &first_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(
+                    &[fixture.repair],
+                    true,
+                    fixture.output_size,
+                ),
+                full_region.clone(),
+                true,
+                incremental_config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            let previous = read_diagnostic_pixels(&incremental);
+            commit_current_causal_state(&mut incremental.renderer, &first_graph);
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [236, 28, 42, 255],
+            );
+            let current_damage = diagnostic_region(fixture.repair);
+            let current_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let current_signatures =
+                signatures(fixture.scene, Some(fixture.scene.background_surface));
+            set_current_snapshot(&mut incremental.renderer, &current_signatures);
+            let causal_plan =
+                effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
+            for instance_id in [32, 33] {
+                let capture = current_graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.kind == RenderPassKind::SceneCapture
+                            && pass.instance == EffectInstanceId::new(instance_id).unwrap()
+                            && !pass.checkpoint_dependencies.is_empty()
+                    })
+                    .expect("dependent checkpoint capture exists");
+                assert!(
+                    !causal_plan.captures[&capture.id].source_unchanged,
+                    "earlier scene source change affects checkpoint {instance_id}"
+                );
+            }
+            let fallback_pixels = fallback_checkpoint_pixels(&current_graph, fixture.output_size);
+            assert!(
+                fallback_pixels > 0,
+                "the conservative fallback has physical work"
+            );
+
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            let update_pixels = execute_diagnostic_frame_with_origin(
+                &mut incremental,
+                &current_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(
+                    &[fixture.repair],
+                    false,
+                    fixture.output_size,
+                ),
+                current_damage,
+                false,
+                incremental_config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            assert_eq!(update_pixels, fallback_pixels);
+            let actual = read_diagnostic_pixels(&incremental);
+            drop(current_graph);
+            drop(first_graph);
+            drop(incremental);
+
+            let mut uncached_reference =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            uncached_reference.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(
+                &mut uncached_reference,
+                fixture.scene,
+            );
+            update_diagnostic_background_for_surface(
+                &uncached_reference,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [236, 28, 42, 255],
+            );
+            let reference_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            uncached_reference
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            execute_diagnostic_frame_with_origin(
+                &mut uncached_reference,
+                &reference_graph,
+                &diagnostic_repaint_plan_for_repairs_in_size(
+                    &[fixture.repair],
+                    true,
+                    fixture.output_size,
+                ),
+                full_region,
+                true,
+                full_capture_config,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            let full_current = read_diagnostic_pixels(&uncached_reference);
+            let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
+                &actual,
+                &previous,
+                &full_current,
+                fixture.output_size.0,
+                fixture.output_size.1,
+                &[fixture.repair],
+                0,
+                OutputFramebufferOrigin::TopLeftScanout,
+            );
+            assert_eq!(
+                inside, 0,
+                "incremental output matches the full-current reference"
+            );
+            assert_eq!(outside, 0, "incremental output is stable outside repair");
+        }
+    }
+
                 && line.contains("backdrop_capture_policy=replay")
                 && line.contains("kawase_execution_policy=full")
         }));
