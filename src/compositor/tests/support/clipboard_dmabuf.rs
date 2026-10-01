@@ -45,15 +45,9 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     source_connection.flush()?;
     wait_for_server_commands(commands);
     source_queue.roundtrip(&mut source_state)?;
-    commands.send(ServerCommand::KeyboardKey {
-        key: 30,
-        pressed: true,
-    })?;
-    wait_for_server_commands(commands);
-    source_queue.roundtrip(&mut source_state)?;
     let serial = source_state
-        .keyboard_key_serial
-        .ok_or_else(|| io::Error::other("keyboard serial was not delivered"))?;
+        .keyboard_enter_serial
+        .ok_or_else(|| io::Error::other("keyboard enter serial was not delivered"))?;
     source_data_device.set_selection(Some(&source_data_source), serial);
     source_connection.flush()?;
     source_connection.roundtrip()?;

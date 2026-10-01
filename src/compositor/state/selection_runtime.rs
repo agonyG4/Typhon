@@ -87,13 +87,17 @@ impl CompositorState {
         serial: u32,
     ) -> bool {
         if !self.client_has_keyboard_focus(client_id) {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::UnfocusedClient,
+            );
             return false;
         }
-        let Some(mutation_epoch) = self.selection_input_epoch(client_id, serial) else {
-            return false;
-        };
 
         let Some(source) = source else {
+            let mutation_epoch = self.selection_state.allocate_mutation_epoch();
             let Some(clear) = self
                 .selection_state
                 .clear_selection(SelectionKind::Clipboard, mutation_epoch)
@@ -114,9 +118,39 @@ impl CompositorState {
         };
 
         let Some(binding) = self.data_sources.get(&source.id()).cloned() else {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::ForeignSource,
+            );
             return false;
         };
-        if binding.client_id != *client_id || !source.is_alive() || binding.mime_types.is_empty() {
+        if binding.client_id != *client_id {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::ForeignSource,
+            );
+            return false;
+        }
+        if !source.is_alive() {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::DeadSource,
+            );
+            return false;
+        }
+        if binding.mime_types.is_empty() {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::EmptyMimeCatalog,
+            );
             return false;
         }
         if self.is_active_clipboard_source_reuse(client_id, &source) {
@@ -130,10 +164,28 @@ impl CompositorState {
             );
             return true;
         }
+        if binding.actions_set {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::InvalidSourcePurpose,
+            );
+            return false;
+        }
         if binding.use_state != DataSourceUse::Unused {
+            self.note_selection_admission_rejection(
+                SelectionKind::Clipboard,
+                client_id,
+                serial,
+                SelectionAdmissionRejection::UsedSource,
+            );
             return false;
         }
 
+        // Wire serial provenance is not the broker's mutation order. Allocate
+        // this only after the core selection request has passed admission.
+        let mutation_epoch = self.selection_state.allocate_mutation_epoch();
         let Some(commit) = self.selection_state.commit_selection(
             SelectionKind::Clipboard,
             binding.selection_key,
@@ -174,6 +226,57 @@ impl CompositorState {
                     .active_selection(SelectionKind::Clipboard)
                     .is_some_and(|active| active.source_key == binding.selection_key)
         })
+    }
+
+    pub(in crate::compositor) fn note_selection_admission_rejection(
+        &self,
+        kind: SelectionKind,
+        client_id: &ClientId,
+        serial: u32,
+        reason: SelectionAdmissionRejection,
+    ) {
+        eprintln!(
+            "oblivion-one selection: rejected {:?} set_selection client={client_id:?} serial={serial} reason={reason:?}",
+            kind
+        );
+    }
+
+    pub(in crate::compositor) fn publish_clipboard_clear_to_client(
+        &mut self,
+        client_id: &ClientId,
+    ) {
+        let devices = self
+            .data_devices
+            .iter()
+            .filter(|binding| {
+                binding.client_id == *client_id
+                    && binding.device.is_alive()
+                    && binding.seat_id.interface().name == "wl_seat"
+            })
+            .map(|binding| binding.device.clone())
+            .collect::<Vec<_>>();
+        for device in devices {
+            let _ = device.send_event(wl_data_device::Event::Selection { id: None });
+        }
+    }
+
+    pub(in crate::compositor) fn retire_clipboard_selection_offers_for_client(
+        &mut self,
+        client_id: &ClientId,
+    ) {
+        let mut retired = Vec::new();
+        self.data_offers.retain(|_, offer| {
+            let retire =
+                offer.kind == DataOfferKind::Selection && offer.target_client_id == *client_id;
+            if retire {
+                retired.extend(offer.broker_offer_id);
+            }
+            !retire
+        });
+        for offer_id in retired {
+            self.selection_state
+                .retire_offer(SelectionKind::Clipboard, offer_id);
+        }
     }
 
     pub(in crate::compositor) fn install_host_clipboard_selection(
@@ -829,7 +932,18 @@ impl CompositorState {
     }
 
     fn retire_clipboard_selection_offers(&mut self) {
-        self.data_offers
-            .retain(|_, offer| offer.kind == DataOfferKind::DragAndDrop && offer.offer.is_alive());
+        let mut retired = Vec::new();
+        self.data_offers.retain(|_, offer| {
+            if offer.kind == DataOfferKind::Selection {
+                retired.extend(offer.broker_offer_id);
+                false
+            } else {
+                offer.offer.is_alive()
+            }
+        });
+        for offer_id in retired {
+            self.selection_state
+                .retire_offer(SelectionKind::Clipboard, offer_id);
+        }
     }
 }

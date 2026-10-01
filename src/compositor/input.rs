@@ -5,8 +5,6 @@ use wayland_server::{
     protocol::{wl_pointer, wl_surface},
 };
 
-use super::selection::SelectionMutationEpoch;
-
 const WL_POINTER_FRAME_SINCE: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +25,6 @@ pub(super) enum InputSerialKind {
 #[derive(Debug, Clone)]
 pub(super) struct InputSerial {
     pub(super) serial: u32,
-    pub(super) epoch: SelectionMutationEpoch,
     pub(super) surface: wl_surface::WlSurface,
     pub(super) client_id: Option<wayland_server::backend::ClientId>,
     pub(super) root_surface_id: u32,

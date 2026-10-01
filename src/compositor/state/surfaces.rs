@@ -1254,12 +1254,10 @@ impl CompositorState {
     ) {
         let client_id = surface.client().map(|client| client.id());
         let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(&surface));
-        let epoch = self.selection_state.allocate_mutation_epoch();
         self.recent_input_serials
             .retain(|input| input.serial != serial);
         self.recent_input_serials.push(InputSerial {
             serial,
-            epoch,
             surface,
             client_id,
             root_surface_id,
@@ -1353,27 +1351,6 @@ impl CompositorState {
                 focus_generation: self.focus_generation,
             })
         })
-    }
-
-    pub(in crate::compositor) fn selection_input_epoch(
-        &self,
-        client_id: &ClientId,
-        serial: u32,
-    ) -> Option<SelectionMutationEpoch> {
-        self.recent_input_serials
-            .iter()
-            .find(|input| {
-                input.serial == serial
-                    && input.client_id.as_ref() == Some(client_id)
-                    && matches!(
-                        input.kind,
-                        InputSerialKind::PointerButtonPress { .. }
-                            | InputSerialKind::KeyboardKeyPress { .. }
-                            | InputSerialKind::TouchDown { .. }
-                    )
-                    && input.focus_generation == self.focus_generation
-            })
-            .map(|input| input.epoch)
     }
 
     pub(in crate::compositor) fn register_surface_resource(

@@ -34,21 +34,19 @@ fn primary_selection_real_client_pipe_transfer_and_reuse() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    commands
-        .send(ServerCommand::KeyboardKey {
-            key: 30,
-            pressed: true,
-        })
-        .unwrap();
-    wait_for_server_commands(&commands);
-    queue.roundtrip(&mut state).unwrap();
-    let serial = state.keyboard_key_serial.expect("focused keyboard serial");
+    let serial = state
+        .keyboard_enter_serial
+        .expect("focused keyboard enter serial");
 
     device.set_selection(Some(&source), serial);
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    assert_eq!(state.primary_selection_events, vec![true]);
+    assert_eq!(
+        state.primary_selection_events,
+        [false, true],
+        "focus gain publishes the empty channel before its first selection"
+    );
     assert_eq!(state.primary_offer_mime_types, ["text/plain", "text/html"]);
 
     let offer = state

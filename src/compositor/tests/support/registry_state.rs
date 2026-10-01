@@ -50,6 +50,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) frame_completion_event_log: Vec<&'static str>,
     pub(in crate::compositor::tests) keyboard_key: bool,
     pub(in crate::compositor::tests) keyboard_key_serial: Option<u32>,
+    pub(in crate::compositor::tests) keyboard_enter_serial: Option<u32>,
     pub(in crate::compositor::tests) keyboard_keys: Vec<u32>,
     pub(in crate::compositor::tests) keyboard_keymap: bool,
     pub(in crate::compositor::tests) keyboard_keymap_bytes: Vec<u8>,
@@ -240,6 +241,10 @@ pub(in crate::compositor::tests) struct RegistryTestState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct ClipboardStateSnapshot {
     pub(in crate::compositor::tests) active_source: bool,
+    pub(in crate::compositor::tests) generation: u64,
+    pub(in crate::compositor::tests) mutation_epoch: u64,
+    pub(in crate::compositor::tests) primary_generation: u64,
+    pub(in crate::compositor::tests) primary_mutation_epoch: u64,
     pub(in crate::compositor::tests) source_count: usize,
     pub(in crate::compositor::tests) offer_count: usize,
 }
@@ -1251,8 +1256,11 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            client_wl_keyboard::Event::Enter { surface, .. } => {
+            client_wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => {
                 let surface_id = surface.id().protocol_id();
+                state.keyboard_enter_serial = Some(serial);
                 state.keyboard_enter_surface_id = Some(surface_id);
                 state.keyboard_enter_count += 1;
                 state.keyboard_event_log.push("keyboard_enter");

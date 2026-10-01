@@ -721,7 +721,6 @@ impl CompositorState {
             return;
         }
 
-        let previous_client_id = self.keyboard_focused_client_id();
         self.clear_keyboard_focus();
         self.keyboard_resources.retain(Resource::is_alive);
         let keyboards = self
@@ -735,20 +734,12 @@ impl CompositorState {
         }
 
         let target_client_id = surface.client().map(|client| client.id());
-        if previous_client_id != target_client_id {
-            if let Some(previous_client_id) = previous_client_id.as_ref() {
-                self.publish_primary_clear_to_client(previous_client_id);
-            }
-            if let Some(target_client_id) = target_client_id.as_ref() {
-                self.publish_clipboard_to_client(target_client_id);
-                if self
-                    .selection_state
-                    .active_selection(SelectionKind::Primary)
-                    .is_some()
-                {
-                    self.publish_primary_to_client(target_client_id);
-                }
-            }
+        if let Some(target_client_id) = target_client_id.as_ref() {
+            // Canonical selections survive focus movement. Reoffer the current
+            // per-channel state to the newly focused recipient without
+            // creating a broker mutation or touching data-control clients.
+            self.publish_clipboard_to_client(target_client_id);
+            self.publish_primary_to_client(target_client_id);
         }
 
         let serialized_state = self.keyboard_serialized_state();
@@ -806,6 +797,12 @@ impl CompositorState {
         let Some(surface) = self.keyboard_surface.take() else {
             return;
         };
+        if let Some(client_id) = surface.client().map(|client| client.id()) {
+            self.retire_clipboard_selection_offers_for_client(&client_id);
+            self.retire_primary_selection_offers_for_client(&client_id);
+            self.publish_clipboard_clear_to_client(&client_id);
+            self.publish_primary_clear_to_client(&client_id);
+        }
         self.keyboard_resources.retain(Resource::is_alive);
         let keyboards = self
             .keyboard_resources

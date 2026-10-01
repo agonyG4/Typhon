@@ -57,7 +57,19 @@ impl Dispatch<wl_data_device::WlDataDevice, DataDeviceData> for CompositorState 
     ) {
         match request {
             wl_data_device::Request::SetSelection { source, serial } => {
-                if data.seat_id.interface().name != "wl_seat" {
+                let valid_seat_binding = data.seat_id.interface().name == "wl_seat"
+                    && state.data_devices.iter().any(|binding| {
+                        same_wayland_resource(&binding.device, resource)
+                            && binding.client_id == data.client_id
+                            && binding.seat_id == data.seat_id
+                    });
+                if !valid_seat_binding {
+                    state.note_selection_admission_rejection(
+                        SelectionKind::Clipboard,
+                        &data.client_id,
+                        serial,
+                        SelectionAdmissionRejection::InvalidSeat,
+                    );
                     return;
                 }
                 if let Some(source) = source.as_ref()
@@ -66,6 +78,20 @@ impl Dispatch<wl_data_device::WlDataDevice, DataDeviceData> for CompositorState 
                     })
                     && !state.is_active_clipboard_source_reuse(&data.client_id, source)
                 {
+                    state.note_selection_admission_rejection(
+                        SelectionKind::Clipboard,
+                        &data.client_id,
+                        serial,
+                        if state
+                            .data_sources
+                            .get(&source.id())
+                            .is_some_and(|binding| binding.actions_set)
+                        {
+                            SelectionAdmissionRejection::InvalidSourcePurpose
+                        } else {
+                            SelectionAdmissionRejection::UsedSource
+                        },
+                    );
                     state.post_protocol_error(
                         client,
                         resource,

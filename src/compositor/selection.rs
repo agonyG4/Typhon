@@ -15,6 +15,17 @@ impl SelectionMutationEpoch {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SelectionAdmissionRejection {
+    UnfocusedClient,
+    InvalidSeat,
+    ForeignSource,
+    DeadSource,
+    EmptyMimeCatalog,
+    UsedSource,
+    InvalidSourcePurpose,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SelectionSourceKey(pub u64);
 
@@ -329,6 +340,11 @@ impl SelectionState {
         self.channel(kind).mutation_watermark
     }
 
+    #[cfg(test)]
+    pub(super) fn latest_allocated_mutation_epoch(&self) -> SelectionMutationEpoch {
+        self.next_mutation_epoch
+    }
+
     pub fn register_offer(
         &mut self,
         kind: SelectionKind,
@@ -377,6 +393,10 @@ impl SelectionState {
             && offer.source_key == source_key
             && offer.source_key == selection.source_key
             && offer.mime_types.iter().any(|mime| mime == mime_type)
+    }
+
+    pub fn retire_offer(&mut self, kind: SelectionKind, offer_id: u64) {
+        self.channel_mut(kind).offers.remove(&offer_id);
     }
 
     pub fn remove_source_key(

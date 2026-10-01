@@ -203,6 +203,10 @@ fn clipboard_source_disconnect_clears_focused_target_selection() {
         clipboard_state,
         ClipboardStateSnapshot {
             active_source: false,
+            generation: 2,
+            mutation_epoch: 2,
+            primary_generation: 0,
+            primary_mutation_epoch: 0,
             source_count: 0,
             offer_count: 0,
         },

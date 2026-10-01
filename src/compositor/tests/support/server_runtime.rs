@@ -1629,6 +1629,24 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .selection_state
                                 .active_selection(SelectionKind::Clipboard)
                                 .is_some(),
+                            generation: server
+                                .state
+                                .selection_state
+                                .current_generation(SelectionKind::Clipboard),
+                            mutation_epoch: server
+                                .state
+                                .selection_state
+                                .latest_allocated_mutation_epoch()
+                                .0,
+                            primary_generation: server
+                                .state
+                                .selection_state
+                                .current_generation(SelectionKind::Primary),
+                            primary_mutation_epoch: server
+                                .state
+                                .selection_state
+                                .current_mutation_epoch(SelectionKind::Primary)
+                                .0,
                             source_count: server.state.data_sources.len(),
                             offer_count: server.state.data_offers.len(),
                         });

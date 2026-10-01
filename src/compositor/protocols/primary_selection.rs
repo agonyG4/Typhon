@@ -127,28 +127,70 @@ impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, Prim
     ) {
         match request {
             zwp_primary_selection_device_v1::Request::SetSelection { source, serial } => {
-                if data.seat_id.interface().name != "wl_seat"
-                    || !state.client_has_keyboard_focus(&data.client_id)
-                {
+                let valid_seat_binding = data.seat_id.interface().name == "wl_seat"
+                    && state.primary_devices.iter().any(|binding| {
+                        same_wayland_resource(&binding.device, resource)
+                            && binding.client_id == data.client_id
+                            && binding.seat_id == data.seat_id
+                    });
+                if !valid_seat_binding {
+                    state.note_selection_admission_rejection(
+                        SelectionKind::Primary,
+                        &data.client_id,
+                        serial,
+                        SelectionAdmissionRejection::InvalidSeat,
+                    );
                     return;
                 }
-                let Some(selection_epoch) = state.selection_input_epoch(&data.client_id, serial)
-                else {
+                if !state.client_has_keyboard_focus(&data.client_id) {
+                    state.note_selection_admission_rejection(
+                        SelectionKind::Primary,
+                        &data.client_id,
+                        serial,
+                        SelectionAdmissionRejection::UnfocusedClient,
+                    );
                     return;
-                };
+                }
                 if let Some(source) = source {
                     let Some(binding) = state.primary_sources.get(&source.id()).cloned() else {
+                        state.note_selection_admission_rejection(
+                            SelectionKind::Primary,
+                            &data.client_id,
+                            serial,
+                            SelectionAdmissionRejection::ForeignSource,
+                        );
                         return;
                     };
-                    if binding.client_id != data.client_id
-                        || !source.is_alive()
-                        || binding.mime_types.is_empty()
-                    {
+                    if binding.client_id != data.client_id {
+                        state.note_selection_admission_rejection(
+                            SelectionKind::Primary,
+                            &data.client_id,
+                            serial,
+                            SelectionAdmissionRejection::ForeignSource,
+                        );
                         return;
                     }
-                    state.set_primary_selection_from_source(binding.selection_key, selection_epoch);
+                    if !source.is_alive() {
+                        state.note_selection_admission_rejection(
+                            SelectionKind::Primary,
+                            &data.client_id,
+                            serial,
+                            SelectionAdmissionRejection::DeadSource,
+                        );
+                        return;
+                    }
+                    if binding.mime_types.is_empty() {
+                        state.note_selection_admission_rejection(
+                            SelectionKind::Primary,
+                            &data.client_id,
+                            serial,
+                            SelectionAdmissionRejection::EmptyMimeCatalog,
+                        );
+                        return;
+                    }
+                    state.set_primary_selection_from_source(binding.selection_key, serial);
                 } else {
-                    state.clear_primary_selection(selection_epoch);
+                    state.clear_primary_selection(serial);
                 }
             }
             zwp_primary_selection_device_v1::Request::Destroy => {
@@ -277,8 +319,9 @@ impl CompositorState {
     pub(in crate::compositor) fn set_primary_selection_from_source(
         &mut self,
         source_key: SelectionSourceKey,
-        selection_epoch: SelectionMutationEpoch,
+        _serial: u32,
     ) {
+        let selection_epoch = self.selection_state.allocate_mutation_epoch();
         let Some(commit) = self.selection_state.commit_selection(
             SelectionKind::Primary,
             source_key,
@@ -290,14 +333,13 @@ impl CompositorState {
             self.cancel_selection_source(SelectionKind::Primary, replaced_source);
         }
         self.selection_state.mark_source_used(source_key);
+        self.retire_primary_selection_offers();
         self.publish_primary_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Primary);
     }
 
-    pub(in crate::compositor) fn clear_primary_selection(
-        &mut self,
-        mutation_epoch: SelectionMutationEpoch,
-    ) {
+    pub(in crate::compositor) fn clear_primary_selection(&mut self, _serial: u32) {
+        let mutation_epoch = self.selection_state.allocate_mutation_epoch();
         let Some(clear) = self
             .selection_state
             .clear_selection(SelectionKind::Primary, mutation_epoch)
@@ -307,6 +349,7 @@ impl CompositorState {
         if let Some(source_key) = clear.cleared_source {
             self.cancel_selection_source(SelectionKind::Primary, source_key);
         }
+        self.retire_primary_selection_offers();
         self.publish_primary_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Primary);
     }
@@ -323,6 +366,7 @@ impl CompositorState {
             .selection_state
             .remove_source_key(binding.selection_key, mutation_epoch);
         if cleared.contains(&SelectionKind::Primary) {
+            self.retire_primary_selection_offers();
             self.publish_primary_to_keyboard_focused_client();
             self.publish_data_control_selection(SelectionKind::Primary);
         }
@@ -372,6 +416,36 @@ impl CompositorState {
         for device in devices {
             let _ =
                 device.send_event(zwp_primary_selection_device_v1::Event::Selection { id: None });
+        }
+    }
+
+    pub(in crate::compositor) fn retire_primary_selection_offers_for_client(
+        &mut self,
+        client_id: &ClientId,
+    ) {
+        let mut retired = Vec::new();
+        self.primary_offers.retain(|_, offer| {
+            let retire = offer.target_client_id == *client_id;
+            if retire {
+                retired.push(offer.broker_offer_id);
+            }
+            !retire
+        });
+        for offer_id in retired {
+            self.selection_state
+                .retire_offer(SelectionKind::Primary, offer_id);
+        }
+    }
+
+    fn retire_primary_selection_offers(&mut self) {
+        let mut retired = Vec::new();
+        self.primary_offers.retain(|_, offer| {
+            retired.push(offer.broker_offer_id);
+            false
+        });
+        for offer_id in retired {
+            self.selection_state
+                .retire_offer(SelectionKind::Primary, offer_id);
         }
     }
 
