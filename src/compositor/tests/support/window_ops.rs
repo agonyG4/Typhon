@@ -268,7 +268,13 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_toggle_fullscr
     create_buffered_toplevel_then_window_commands(
         socket_path,
         commands,
-        &[ServerCommand::ToggleFullscreenFocused],
+        &[
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
+            ServerCommand::ToggleFullscreenFocused,
+        ],
     )
 }
 

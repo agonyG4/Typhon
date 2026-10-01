@@ -2,6 +2,7 @@ use super::*;
 use crate::compositor::{
     CurrentSurfaceBuffer, WindowGeometry, WindowInteractionKind, WindowInteractionSource,
 };
+use crate::presentation_animation::AnimationTime as TestTime;
 use crate::render_backend::buffer::BufferSize;
 
 #[test]
@@ -1414,7 +1415,7 @@ fn xwayland_mode_transition_uses_the_fullscreen_policy_curve() {
         .server
         .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
     let _ = fixture.server.take_xwayland_backend_commands(0);
-
+    (&mut fixture.server).publish_test_presentation_at(1, TestTime::from_nanos(u64::MAX));
     fixture
         .server
         .apply_xwayland_window_event(XwmEvent::StateRequested {
@@ -1576,7 +1577,7 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
         .state
         .presentation_animator
         .cancel_geometry(scene_node_id);
-
+    (&mut fixture.server).publish_test_presentation_at(1, TestTime::from_nanos(u64::MAX));
     fixture
         .server
         .apply_xwayland_window_event(XwmEvent::StateRequested {

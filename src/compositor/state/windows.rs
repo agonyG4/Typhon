@@ -1704,6 +1704,17 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn mode_transition_presentation(
+        &self,
+        root_surface_id: u32,
+    ) -> ModeTransitionPresentation {
+        if self.presented_window_geometry(root_surface_id).is_some() {
+            ModeTransitionPresentation::Presented
+        } else {
+            ModeTransitionPresentation::Unpresented
+        }
+    }
+
     pub(in crate::compositor) fn set_root_window_mode(
         &mut self,
         surface_id: u32,
@@ -1749,11 +1760,12 @@ impl CompositorState {
             .and_then(|window_id| self.window(window_id))
             .map(|window| window.state.mode())
             .unwrap_or(ToplevelMode::Normal);
-        let animation_kind = mode_transition_animation_kind(previous_mode, mode);
         let source_geometry = self
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+        let presentation = self.mode_transition_presentation(surface_id);
+        let window_open_geometry_was_active = self.window_open_geometry_track_active(surface_id);
         let observed_normal_geometry =
             self.observed_normal_restore_geometry(surface_id, source_geometry.placement);
         self.clear_resize_state_for_surfaces_with_reason(
@@ -1800,17 +1812,17 @@ impl CompositorState {
             geometry.placement,
             RenderGenerationCause::WindowMode,
         );
-        let transition = animation_kind.map_or(VisualGeometryTransition::Immediate, |kind| {
-            VisualGeometryTransition::Animated {
-                source: source_geometry,
-                kind,
-            }
-        });
+        let transition = mode_visual_transition(presentation, previous_mode, mode, source_geometry);
         self.install_xdg_mode_transition_visual_geometry(
             surface_id,
             geometry,
             transition,
             configure_serial,
+        );
+        self.retarget_window_open_after_mode_transition(
+            surface_id,
+            presentation,
+            window_open_geometry_was_active,
         );
         configured
     }
@@ -1861,6 +1873,8 @@ impl CompositorState {
             .and_then(|window_id| self.window(window_id))
             .map(|window| window.state.mode())
             .unwrap_or(ToplevelMode::Normal);
+        let presentation = self.mode_transition_presentation(surface_id);
+        let window_open_geometry_was_active = self.window_open_geometry_track_active(surface_id);
         let source_geometry = self
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))
@@ -1938,12 +1952,11 @@ impl CompositorState {
                 let transition = if interaction_geometry.is_some() {
                     VisualGeometryTransition::Immediate
                 } else {
-                    mode_transition_animation_kind(previous_mode, ToplevelMode::Normal).map_or(
-                        VisualGeometryTransition::Immediate,
-                        |kind| VisualGeometryTransition::Animated {
-                            source: source_geometry,
-                            kind,
-                        },
+                    mode_visual_transition(
+                        presentation,
+                        previous_mode,
+                        ToplevelMode::Normal,
+                        source_geometry,
                     )
                 };
                 self.install_xdg_mode_transition_visual_geometry(
@@ -1952,6 +1965,13 @@ impl CompositorState {
                     transition,
                     configure_serial,
                 );
+                if interaction_geometry.is_none() {
+                    self.retarget_window_open_after_mode_transition(
+                        surface_id,
+                        presentation,
+                        window_open_geometry_was_active,
+                    );
+                }
                 if configured && let Some(window) = self.toplevel_window_state_mut(surface_id) {
                     let _ = window.take_normal_restore_target();
                 }
@@ -2183,6 +2203,30 @@ impl CompositorState {
         height: u32,
     ) -> bool {
         self.send_resize_root_window_to(surface_id, width, height)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum ModeTransitionPresentation {
+    Unpresented,
+    Presented,
+}
+
+pub(in crate::compositor) fn mode_visual_transition(
+    presentation: ModeTransitionPresentation,
+    previous: ToplevelMode,
+    target: ToplevelMode,
+    source_geometry: WindowGeometry,
+) -> VisualGeometryTransition {
+    match presentation {
+        ModeTransitionPresentation::Unpresented => VisualGeometryTransition::Immediate,
+        ModeTransitionPresentation::Presented => mode_transition_animation_kind(previous, target)
+            .map_or(VisualGeometryTransition::Immediate, |kind| {
+                VisualGeometryTransition::Animated {
+                    source: source_geometry,
+                    kind,
+                }
+            }),
     }
 }
 

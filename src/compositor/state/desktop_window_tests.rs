@@ -2574,29 +2574,92 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
     let mut snapshot = x11_snapshot(generation, 113, 64);
     snapshot.state.fullscreen = true;
-    let id = state.allocate_window_id().expect("window id");
+    let id = insert_x11(&mut state, snapshot.clone());
+    let placement = state.surface_placement(snapshot.surface_id);
+    state.append_renderable_surface(x11_shm_surface(
+        snapshot.surface_id,
+        snapshot.geometry.width,
+        snapshot.geometry.height,
+        placement,
+    ));
     state
-        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
-        .expect("insert X11 window");
+        .surface_presentation_generations
+        .insert(snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(id)
+        .expect("window group node");
+    let target_geometry =
+        state.window_geometry_for_surface_mode(snapshot.surface_id, ToplevelMode::Fullscreen);
+    let target_rect = state
+        .presentation_rect_for_geometry(snapshot.surface_id, target_geometry)
+        .expect("fullscreen target rect");
+    assert!(
+        state
+            .presented_window_geometry(snapshot.surface_id)
+            .is_none()
+    );
 
     assert!(state.apply_initial_x11_state(snapshot.handle, snapshot.state, snapshot.geometry));
+    assert!(
+        state
+            .fullscreen_presentation
+            .is_some_and(|owner| owner.owner_root_surface_id == snapshot.surface_id)
+    );
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id),
+        "an initial Fullscreen mode has no presented source and must not own geometry animation"
+    );
     assert_eq!(
         state.window(id).expect("window").state.mode(),
         ToplevelMode::Fullscreen
     );
     assert_eq!(
+        state
+            .window(id)
+            .expect("window")
+            .x11_geometry
+            .map(|geometry| geometry.frame),
+        Some(target_geometry)
+    );
+    assert_eq!(
         state.surface_placement(snapshot.surface_id),
-        state.fullscreen_window_geometry().placement
+        target_geometry.placement
     );
     assert!(state.take_backend_commands().iter().any(|command| matches!(
         command,
         crate::compositor::window_backend::WindowBackendCommand::Configure {
             window,
+            geometry,
             mode: ToplevelMode::Fullscreen,
             resizing: false,
             ..
-        } if *window == id
+        } if *window == id && *geometry == target_geometry
     )));
+    assert!(state.maybe_begin_window_open_animation(snapshot.surface_id));
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+            .expect("WindowOpen sample")
+            .rect,
+        target_rect
+    );
     assert!(state.restore_normal_root_window(snapshot.surface_id));
     assert_eq!(
         state.window(id).expect("window").state.mode(),
@@ -2609,6 +2672,165 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
             crate::compositor::render::FIRST_SURFACE_OFFSET.1,
         )
     );
+    assert_eq!(
+        state
+            .window(id)
+            .expect("restored X11 window")
+            .x11_geometry
+            .map(|geometry| geometry.frame),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(
+                crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+                crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+            ),
+            snapshot.geometry.width,
+            snapshot.geometry.height,
+        ))
+    );
+}
+
+#[test]
+fn unpresented_x11_mode_change_retargets_active_window_open_geometry() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 116, 67);
+    let id = insert_x11(&mut state, snapshot.clone());
+    let placement = state.surface_placement(snapshot.surface_id);
+    state.append_renderable_surface(x11_shm_surface(
+        snapshot.surface_id,
+        snapshot.geometry.width,
+        snapshot.geometry.height,
+        placement,
+    ));
+    state
+        .surface_presentation_generations
+        .insert(snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(id)
+        .expect("window group node");
+    let mut fullscreen_state = snapshot.state;
+    fullscreen_state.fullscreen = true;
+    let target_geometry =
+        state.window_geometry_for_surface_mode(snapshot.surface_id, ToplevelMode::Fullscreen);
+
+    assert!(state.maybe_begin_window_open_animation(snapshot.surface_id));
+    let open_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("initial WindowOpen geometry transaction");
+    assert_eq!(
+        Some(open_transaction),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert!(
+        state
+            .presented_window_geometry(snapshot.surface_id)
+            .is_none()
+    );
+
+    assert!(state.apply_x11_published_state(snapshot.handle, fullscreen_state));
+
+    assert_eq!(
+        state.window(id).expect("X11 window").state.mode(),
+        ToplevelMode::Fullscreen
+    );
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    let retargeted_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("retargeted WindowOpen geometry transaction");
+    assert_ne!(retargeted_transaction, open_transaction);
+    assert_eq!(
+        Some(retargeted_transaction),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+            .expect("retargeted WindowOpen sample")
+            .rect,
+        state
+            .presentation_rect_for_geometry(snapshot.surface_id, target_geometry)
+            .expect("fullscreen target rect")
+    );
+}
+
+#[test]
+fn physically_presented_x11_mode_changes_keep_enter_and_exit_animations() {
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    for (xid, surface_id, mode, enter, exit) in [
+        (
+            117,
+            68,
+            ToplevelMode::Fullscreen,
+            PresentationAnimationKind::FullscreenEnter,
+            PresentationAnimationKind::FullscreenExit,
+        ),
+        (
+            118,
+            69,
+            ToplevelMode::Maximized,
+            PresentationAnimationKind::MaximizeEnter,
+            PresentationAnimationKind::MaximizeExit,
+        ),
+    ] {
+        let mut state = CompositorState::new(None);
+        let snapshot = x11_snapshot(generation, xid, surface_id);
+        let id = insert_x11(&mut state, snapshot.clone());
+        let placement = state.surface_placement(surface_id);
+        state.append_renderable_surface(x11_shm_surface(
+            surface_id,
+            snapshot.geometry.width,
+            snapshot.geometry.height,
+            placement,
+        ));
+        state.surface_presentation_generations.insert(surface_id, 1);
+        state.rebuild_active_scene_view();
+        state.presentation_animator.set_enabled(true);
+        let scene_node_id = state
+            .scene_node_id_for_window_group(id)
+            .expect("window group node");
+        let presented_rect = state
+            .current_presentation_rect_for_root(surface_id)
+            .expect("normal presentation rect");
+        state.publish_presented_window_geometry(
+            1,
+            PresentedWindowGeometry::new(surface_id, presented_rect),
+        );
+        assert_eq!(
+            state.mode_transition_presentation(surface_id),
+            ModeTransitionPresentation::Presented
+        );
+
+        let mut published_state = snapshot.state;
+        published_state.fullscreen = mode == ToplevelMode::Fullscreen;
+        published_state.maximized = mode == ToplevelMode::Maximized;
+        let enter_curve = state.animation_control.curve_for(enter);
+        assert!(state.apply_x11_published_state(snapshot.handle, published_state));
+        assert_eq!(
+            state.presentation_animator.track_curve(scene_node_id),
+            enter_curve
+        );
+
+        let exit_curve = state.animation_control.curve_for(exit);
+        assert!(state.apply_x11_published_state(snapshot.handle, X11PublishedState::default()));
+        assert_eq!(
+            state.presentation_animator.track_curve(scene_node_id),
+            exit_curve
+        );
+    }
 }
 
 #[test]
@@ -2640,19 +2862,106 @@ fn pre_map_maximized_snapshot_uses_usable_output_geometry() {
             maximized_snapshot.clone(),
         ))
         .expect("insert maximized X11 window");
+    let maximized_placement = state.surface_placement(maximized_snapshot.surface_id);
+    state.append_renderable_surface(x11_shm_surface(
+        maximized_snapshot.surface_id,
+        maximized_snapshot.geometry.width,
+        maximized_snapshot.geometry.height,
+        maximized_placement,
+    ));
+    state
+        .surface_presentation_generations
+        .insert(maximized_snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let maximized_scene_node_id = state
+        .scene_node_id_for_window_group(maximized_id)
+        .expect("maximized window group node");
+    let maximized_geometry = state
+        .window_geometry_for_surface_mode(maximized_snapshot.surface_id, ToplevelMode::Maximized);
     assert!(state.apply_initial_x11_state(
         maximized_snapshot.handle,
         maximized_snapshot.state,
         maximized_snapshot.geometry
     ));
     assert_eq!(
-        state.surface_placement(maximized_snapshot.surface_id),
         state
-            .window_geometry_for_surface_mode(
-                maximized_snapshot.surface_id,
-                ToplevelMode::Maximized,
-            )
-            .placement
+            .window(maximized_id)
+            .expect("maximized X11 window")
+            .state
+            .mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state
+            .window(maximized_id)
+            .expect("maximized X11 window")
+            .x11_geometry
+            .map(|geometry| geometry.frame),
+        Some(maximized_geometry)
+    );
+    assert_eq!(
+        state.surface_placement(maximized_snapshot.surface_id),
+        maximized_geometry.placement
+    );
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(maximized_scene_node_id),
+        "an initial Maximized mode must not own a mode geometry track"
+    );
+    assert!(state.take_backend_commands().iter().any(|command| matches!(
+        command,
+        crate::compositor::window_backend::WindowBackendCommand::Configure {
+            window,
+            geometry,
+            mode: ToplevelMode::Maximized,
+            resizing: false,
+            ..
+        } if *window == maximized_id && *geometry == maximized_geometry
+    )));
+    let maximized_rect = state
+        .presentation_rect_for_geometry(maximized_snapshot.surface_id, maximized_geometry)
+        .expect("maximized target rect");
+    assert!(state.maybe_begin_window_open_animation(maximized_snapshot.surface_id));
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(maximized_scene_node_id)
+    );
+    assert!(
+        state
+            .presentation_animator
+            .has_opacity_track(maximized_scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .track_transaction(maximized_scene_node_id),
+        state
+            .presentation_animator
+            .opacity_track_transaction(maximized_scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(maximized_scene_node_id, AnimationTime::from_nanos(u64::MAX),)
+            .expect("WindowOpen sample")
+            .rect,
+        maximized_rect
+    );
+    assert!(state.restore_normal_root_window(maximized_snapshot.surface_id));
+    assert_eq!(
+        state
+            .window(maximized_id)
+            .expect("restored X11 window")
+            .x11_geometry
+            .map(|geometry| geometry.frame),
+        Some(WindowGeometry::new(
+            maximized_placement,
+            maximized_snapshot.geometry.width,
+            maximized_snapshot.geometry.height,
+        ))
     );
 }
 

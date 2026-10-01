@@ -336,6 +336,10 @@ fn fullscreen_transition_starts_from_pre_mutation_geometry_when_visual_history_i
                 width: 800,
                 height: 600,
             },
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleFullscreenFocused,
         ],
     )
@@ -381,6 +385,10 @@ fn maximize_transition_starts_from_pre_mutation_geometry_when_visual_history_is_
                 width: 800,
                 height: 600,
             },
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleMaximizeFocused,
         ],
     )
@@ -418,7 +426,15 @@ fn restore_transition_starts_from_previous_mode_geometry_when_visual_history_is_
                 width: 800,
                 height: 600,
             },
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleMaximizeFocused,
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 2,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::DropFocusedToplevelVisualGeometry,
             ServerCommand::SetFocusedRootVisualGeometry {
                 placement: SurfacePlacement::absolute_root_at(0, 0),
@@ -458,6 +474,10 @@ fn window_maximize_entry_uses_the_kde_policy_curve_through_real_state() {
         &commands,
         &[
             ServerCommand::CancelFocusedPresentationTransition,
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleMaximizeFocused,
         ],
     )
@@ -486,7 +506,15 @@ fn window_maximize_exit_uses_the_kde_policy_curve_through_real_state() {
         &commands,
         &[
             ServerCommand::CancelFocusedPresentationTransition,
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleMaximizeFocused,
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 2,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleMaximizeFocused,
         ],
     )
@@ -537,7 +565,15 @@ fn window_fullscreen_exit_uses_the_kde_policy_curve_through_real_state() {
         &socket_path,
         &commands,
         &[
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleFullscreenFocused,
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 2,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
             ServerCommand::ToggleFullscreenFocused,
         ],
     )

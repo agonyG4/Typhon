@@ -349,6 +349,7 @@ impl CompositorState {
                 )
             }
         };
+        let previous_visual_geometry = self.current_visual_root_window_geometry(root_surface_id);
         let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         self.pending_normal_restores.remove(&root_surface_id);
         if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
@@ -358,6 +359,10 @@ impl CompositorState {
         self.update_toplevel_visual_render_assignment_after_root_commit(
             root_surface_id,
             response_commit_sequence,
+        );
+        self.retarget_window_open_after_pending_normal_restore(
+            root_surface_id,
+            previous_visual_geometry != Some(target),
         );
         self.refresh_pointer_focus_after_geometry_change(
             true,

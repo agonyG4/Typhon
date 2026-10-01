@@ -1014,7 +1014,7 @@ impl CompositorState {
     pub(in crate::compositor) fn finish_surface_tree_publication(&mut self) {
         self.finish_surface_tree_xdg_geometry_publication();
         self.finish_surface_tree_resize_completions();
-        let pending_window_open_animations =
+        let mut pending_window_open_animations =
             std::mem::take(&mut self.surface_tree_pending_window_open_animations);
         let pending_roots = self
             .pending_normal_restores
@@ -1028,6 +1028,12 @@ impl CompositorState {
             .collect::<Vec<_>>();
         for root_surface_id in pending_roots {
             self.finalize_pending_normal_restore_at_surface_tree_boundary(root_surface_id);
+        }
+        for root_surface_id in std::mem::take(&mut self.surface_tree_pending_window_open_animations)
+        {
+            if !pending_window_open_animations.contains(&root_surface_id) {
+                pending_window_open_animations.push(root_surface_id);
+            }
         }
         self.surface_tree_generation = None;
         if std::mem::take(&mut self.surface_tree_confined_region_refresh_pending) {

@@ -81,6 +81,58 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn window_open_geometry_track_active(
+        &self,
+        root_surface_id: u32,
+    ) -> bool {
+        self.window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.scene_node_id_for_window_group(window_id))
+            .is_some_and(|scene_node_id| {
+                self.presentation_animator.has_geometry_track(scene_node_id)
+            })
+    }
+
+    pub(in crate::compositor) fn retarget_window_open_after_mode_transition(
+        &mut self,
+        root_surface_id: u32,
+        presentation: ModeTransitionPresentation,
+        geometry_track_was_active: bool,
+    ) {
+        if presentation != ModeTransitionPresentation::Unpresented
+            || !geometry_track_was_active
+            || self.window_open_geometry_track_active(root_surface_id)
+        {
+            return;
+        }
+
+        self.begin_window_open_animation_after_surface_tree_publication(root_surface_id);
+    }
+
+    pub(in crate::compositor) fn retarget_window_open_after_pending_normal_restore(
+        &mut self,
+        root_surface_id: u32,
+        target_geometry_changed: bool,
+    ) {
+        if !target_geometry_changed
+            || self.mode_transition_presentation(root_surface_id)
+                != ModeTransitionPresentation::Unpresented
+        {
+            return;
+        }
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return;
+        };
+        let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
+            return;
+        };
+        if !self.presentation_animator.has_geometry_track(scene_node_id) {
+            return;
+        }
+
+        self.presentation_animator.cancel_geometry(scene_node_id);
+        self.begin_window_open_animation_after_surface_tree_publication(root_surface_id);
+    }
+
     pub(in crate::compositor) fn maybe_begin_window_open_animation(
         &mut self,
         root_surface_id: u32,
@@ -129,6 +181,7 @@ impl CompositorState {
             .x11_geometry
             .as_ref()
             .map(|geometry| geometry.frame)
+            .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
             .or_else(|| self.current_root_window_geometry(root_surface_id));
         let Some(target) = canonical_geometry
             .and_then(|geometry| self.presentation_rect_for_geometry(root_surface_id, geometry))

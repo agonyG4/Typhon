@@ -368,7 +368,42 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
     );
     state.store_surface_placement(root_surface_id, physical.placement);
     state.install_toplevel_visual_geometry(root_surface_id, physical);
+    state
+        .surface_presentation_generations
+        .insert(root_surface_id, 1);
+    state
+        .surface_presentation_generations
+        .insert(child_surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    assert!(state.maybe_begin_window_open_animation(root_surface_id));
+    let open_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("WindowOpen geometry transaction");
+    let initial_open_target = state
+        .presentation_rect_for_geometry(root_surface_id, physical)
+        .expect("initial WindowOpen target");
     state.install_xdg_mode_transition_response_fence(root_surface_id, physical, 91);
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id),
+        "installing the configure response fence for unchanged geometry must preserve WindowOpen"
+    );
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        Some(open_transaction)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id),
+        Some(open_transaction)
+    );
     state
         .toplevel_visual_geometries
         .get_mut(&root_surface_id)
@@ -440,6 +475,36 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
             600,
             420,
         ))
+    );
+    let final_geometry = WindowGeometry::new(SurfacePlacement::absolute_root_at(72, 72), 600, 420);
+    let final_target = state
+        .presentation_rect_for_geometry(root_surface_id, final_geometry)
+        .expect("final WindowOpen target");
+    assert_ne!(final_target, initial_open_target);
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    let final_open_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("retargeted WindowOpen geometry transaction");
+    assert_ne!(final_open_transaction, open_transaction);
+    assert_eq!(
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id),
+        Some(final_open_transaction)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+            .expect("retargeted WindowOpen sample")
+            .rect,
+        final_target
     );
     assert_eq!(
         state

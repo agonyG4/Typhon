@@ -1,6 +1,57 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
+fn assert_pre_map_xdg_mode_configure(mode: crate::compositor::ToplevelMode) {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    let expected_state = match mode {
+        crate::compositor::ToplevelMode::Fullscreen => {
+            toplevel.set_fullscreen(None);
+            client_xdg_toplevel::State::Fullscreen
+        }
+        crate::compositor::ToplevelMode::Maximized => {
+            toplevel.set_maximized();
+            client_xdg_toplevel::State::Maximized
+        }
+        _ => unreachable!("test only covers initial Fullscreen and Maximized requests"),
+    };
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut client_state = RegistryTestState::default();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut client_state).unwrap();
+    assert!(client_state.toplevel_configured);
+    assert!(client_state.toplevel_has_state(expected_state));
+    assert!(client_state.toplevel_width > 0);
+    assert!(client_state.toplevel_height > 0);
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+}
+
+#[test]
+fn pre_map_set_fullscreen_advertises_state_without_mode_animation() {
+    assert_pre_map_xdg_mode_configure(crate::compositor::ToplevelMode::Fullscreen);
+}
+
+#[test]
+fn pre_map_set_maximized_advertises_state_without_mode_animation() {
+    assert_pre_map_xdg_mode_configure(crate::compositor::ToplevelMode::Maximized);
+}
+
 #[test]
 fn xdg_surface_destroy_with_live_popup_cleans_role_and_leaves_resource_inert() {
     let socket_name = unique_socket_name();

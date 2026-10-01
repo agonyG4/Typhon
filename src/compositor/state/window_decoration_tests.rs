@@ -158,6 +158,336 @@ fn acknowledge_test_xdg_configure(state: &mut CompositorState, surface_id: u32, 
     state.ack_xdg_surface_configure(surface_id, acknowledgement);
 }
 
+fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode: ToplevelMode) {
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let target_geometry = state.window_geometry_for_surface_mode(surface_id, mode);
+
+    assert!(state.presented_window_geometry(surface_id).is_none());
+    assert!(state.set_root_window_mode(surface_id, mode));
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        mode
+    );
+    let visual = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .expect("XDG mode visual remains installed behind its response fence");
+    assert!(visual.mode_transition);
+    let fence = visual
+        .xdg_mode_transition_fence
+        .expect("mode configure response fence");
+    assert_eq!(
+        Some(fence.configure_serial),
+        state
+            .xdg_configure_serials
+            .get(&surface_id)
+            .map(|serials| serials.latest_sent)
+    );
+    assert_eq!(visual.window_geometry(), target_geometry);
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id),
+        "an unpresented XDG mode request must not install a mode geometry track"
+    );
+
+    let target_rect = state
+        .presentation_rect_for_geometry(surface_id, target_geometry)
+        .expect("final XDG mode target rect");
+    assert!(state.maybe_begin_window_open_animation(surface_id));
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+            .expect("WindowOpen sample")
+            .rect,
+        target_rect
+    );
+}
+
+#[test]
+fn unpresented_xdg_fullscreen_admission_uses_window_open_geometry() {
+    assert_unpresented_xdg_mode_admission_uses_window_open(90, ToplevelMode::Fullscreen);
+}
+
+#[test]
+fn unpresented_xdg_maximized_admission_uses_window_open_geometry() {
+    assert_unpresented_xdg_mode_admission_uses_window_open(91, ToplevelMode::Maximized);
+}
+
+#[test]
+fn unpresented_xdg_mode_change_retargets_active_window_open_geometry() {
+    let surface_id = 92;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let target_geometry =
+        state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Fullscreen);
+
+    assert!(state.maybe_begin_window_open_animation(surface_id));
+    let open_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("initial WindowOpen geometry transaction");
+    assert_eq!(
+        Some(open_transaction),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert!(state.presented_window_geometry(surface_id).is_none());
+
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    let retargeted_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("retargeted WindowOpen geometry transaction");
+    assert_ne!(retargeted_transaction, open_transaction);
+    assert_eq!(
+        Some(retargeted_transaction),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+            .expect("retargeted WindowOpen sample")
+            .rect,
+        state
+            .presentation_rect_for_geometry(surface_id, target_geometry)
+            .expect("fullscreen target rect")
+    );
+}
+
+#[test]
+fn unpresented_xdg_fullscreen_then_normal_is_an_admission_correction() {
+    let surface_id = 93;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let normal_geometry = state
+        .current_visual_root_window_geometry(surface_id)
+        .expect("initial normal geometry");
+
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        ToplevelMode::Fullscreen
+    );
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.restore_normal_root_window(surface_id));
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        ToplevelMode::Normal
+    );
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(normal_geometry)
+    );
+}
+
+#[test]
+fn unpresented_xdg_maximized_then_fullscreen_opens_on_fullscreen_geometry() {
+    let surface_id = 94;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Maximized));
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        ToplevelMode::Fullscreen
+    );
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    let final_geometry =
+        state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Fullscreen);
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(final_geometry)
+    );
+    let target_rect = state
+        .presentation_rect_for_geometry(surface_id, final_geometry)
+        .expect("fullscreen target rect");
+
+    assert!(state.maybe_begin_window_open_animation(surface_id));
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id)
+    );
+    assert_eq!(
+        state
+            .presentation_animator
+            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+            .expect("WindowOpen sample")
+            .rect,
+        target_rect
+    );
+}
+
+#[test]
+fn physically_presented_xdg_mode_changes_keep_enter_and_exit_animations() {
+    for (surface_id, mode, enter, exit) in [
+        (
+            95,
+            ToplevelMode::Fullscreen,
+            PresentationAnimationKind::FullscreenEnter,
+            PresentationAnimationKind::FullscreenExit,
+        ),
+        (
+            96,
+            ToplevelMode::Maximized,
+            PresentationAnimationKind::MaximizeEnter,
+            PresentationAnimationKind::MaximizeExit,
+        ),
+    ] {
+        let mut state = xdg_state(
+            test_surface(surface_id),
+            DecorationPreference::ServerSide,
+            ToplevelMode::Normal,
+        );
+        state.set_test_effective_xdg_window_geometry(
+            surface_id,
+            XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+        );
+        state.xdg_surface_lifecycles.entry(surface_id).or_default();
+        let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+        state.presentation_animator.set_enabled(true);
+        let window_id = state
+            .window_id_for_surface(surface_id)
+            .expect("test window");
+        let scene_node_id = state
+            .scene_node_id_for_window_group(window_id)
+            .expect("window group node");
+        let presented_rect = state
+            .current_presentation_rect_for_root(surface_id)
+            .expect("normal presentation rect");
+        state.publish_presented_window_geometry(
+            1,
+            PresentedWindowGeometry::new(surface_id, presented_rect),
+        );
+        assert!(state.set_root_window_mode(surface_id, mode));
+        assert_eq!(
+            state.presentation_animator.track_curve(scene_node_id),
+            state.animation_control.curve_for(enter)
+        );
+        assert!(state.restore_normal_root_window(surface_id));
+        assert_eq!(
+            state.presentation_animator.track_curve(scene_node_id),
+            state.animation_control.curve_for(exit)
+        );
+    }
+}
+
 fn x11_state(surface: RenderableSurface) -> CompositorState {
     let mut state = CompositorState::new(None);
     let window_id = state.allocate_window_id().expect("window id");

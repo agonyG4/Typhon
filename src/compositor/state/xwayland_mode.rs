@@ -61,6 +61,9 @@ impl CompositorState {
             .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
             .or_else(|| self.current_root_window_geometry(root_surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(root_surface_id), 1, 1));
+        let presentation = self.mode_transition_presentation(root_surface_id);
+        let window_open_geometry_was_active =
+            self.window_open_geometry_track_active(root_surface_id);
         let restore_geometry = if mode_changed && mode != ToplevelMode::Normal {
             Some(source_geometry)
         } else {
@@ -116,15 +119,7 @@ impl CompositorState {
 
         let geometry_changed = current_geometry != Some(target_geometry);
         let transition = interaction_target.map_or_else(
-            || {
-                mode_transition_animation_kind(current_mode, mode).map_or(
-                    VisualGeometryTransition::Immediate,
-                    |kind| VisualGeometryTransition::Animated {
-                        source: source_geometry,
-                        kind,
-                    },
-                )
-            },
+            || mode_visual_transition(presentation, current_mode, mode, source_geometry),
             |(_, transition)| transition,
         );
         if geometry_changed || mode_changed || minimized_changed {
@@ -139,6 +134,13 @@ impl CompositorState {
                 target_geometry,
                 transition,
             );
+            if interaction_target.is_none() {
+                self.retarget_window_open_after_mode_transition(
+                    root_surface_id,
+                    presentation,
+                    window_open_geometry_was_active,
+                );
+            }
         }
 
         if minimized
