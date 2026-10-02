@@ -260,6 +260,576 @@ fn source_less_wire_drag_with_icon_reserves_a_permanent_drag_icon_role() {
 }
 
 #[test]
+fn sourced_wayland_drag_hands_pointer_routing_to_dnd_and_restores_after_drop() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let source = manager.create_data_source(&qh, ());
+    source.offer("text/plain".to_string());
+    source.set_actions(client_wl_data_device_manager::DndAction::Copy);
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let surface_id = surface.id().protocol_id();
+    focus_root_window(&commands, surface_id);
+    let pointer_x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0;
+    let pointer_y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x,
+            y: pointer_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("start_drag must use a real pointer press serial");
+    let pointer_motion_count_before_drag = state.pointer_motion_count;
+    let pointer_enter_count_before_drag = state.pointer_enter_count;
+    state.event_timeline.clear();
+
+    device.start_drag(Some(&source), &surface, None, serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let mut failures = Vec::new();
+    let start_timeline = state.event_timeline.clone();
+    let pointer_leave_at = start_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::PointerLeave { surface_id: id } if *id == surface_id)
+    });
+    let data_offer_at = start_timeline
+        .iter()
+        .position(|event| matches!(event, TestWaylandEvent::DataOffer));
+    let data_enter_at = start_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::DataDeviceEnter { surface_id: id } if *id == surface_id)
+    });
+    if state.pointer_leave_count == 0 || pointer_leave_at.is_none() {
+        failures.push("start_drag did not retire normal wl_pointer focus".to_string());
+    }
+    if state.data_device_enter_count != 1 || data_enter_at.is_none() {
+        failures.push(format!(
+            "start_drag did not immediately enter the current DnD target (count {})",
+            state.data_device_enter_count
+        ));
+    }
+    if let (Some(leave), Some(enter)) = (pointer_leave_at, data_enter_at) {
+        if leave >= enter {
+            failures.push("wl_pointer.leave did not precede wl_data_device.enter".to_string());
+        }
+    }
+    if let (Some(offer), Some(enter)) = (data_offer_at, data_enter_at) {
+        if offer >= enter {
+            failures.push("wl_data_device.data_offer did not precede enter".to_string());
+        }
+    }
+    if start_timeline
+        .iter()
+        .any(|event| matches!(event, TestWaylandEvent::PointerMotion))
+    {
+        failures.push("start_drag required or emitted ordinary pointer motion".to_string());
+    }
+    if state.pointer_motion_count != pointer_motion_count_before_drag {
+        failures.push("start_drag emitted ordinary wl_pointer.motion".to_string());
+    }
+    if state.pointer_enter_count != pointer_enter_count_before_drag
+        || state.pointer_enter_surface_id.is_some()
+    {
+        failures.push("normal pointer focus remained active during the DnD grab".to_string());
+    }
+    if state.data_device_enter_count > 0
+        && (state.data_device_enter_surface_id != Some(surface_id)
+            || state.data_device_enter_x != Some(20.0)
+            || state.data_device_enter_y != Some(20.0))
+    {
+        failures.push(format!(
+            "initial DnD enter did not use current surface-local coordinates: surface={:?} xy=({:?},{:?})",
+            state.data_device_enter_surface_id, state.data_device_enter_x, state.data_device_enter_y
+        ));
+    }
+
+    // Keep checking the rest of the wire contract against the old path too:
+    // if the initial target was missing, this motion only lets the test
+    // negotiate and reach the independent motion/release regressions below.
+    if state.data_device_drag_offer.is_none() {
+        commands
+            .send(ServerCommand::PointerMotion {
+                x: pointer_x + 1.0,
+                y: pointer_y + 1.0,
+            })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+    }
+    let offer = state
+        .data_device_drag_offer
+        .clone()
+        .expect("the sourced drag must eventually create a destination offer");
+    let enter_serial = state
+        .data_device_enter_serial
+        .expect("the destination must receive an enter serial");
+    offer.accept(enter_serial, Some("text/plain".to_string()));
+    offer.set_actions(
+        client_wl_data_device_manager::DndAction::Copy,
+        client_wl_data_device_manager::DndAction::Copy,
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let data_motion_count_before = state.data_device_motion_count;
+    let pointer_motion_count_before = state.pointer_motion_count;
+    let pointer_enter_count_before = state.pointer_enter_count;
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 4.0,
+            y: pointer_y + 4.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    if state.data_device_motion_count != data_motion_count_before + 1 {
+        failures.push("physical motion did not reach wl_data_device.motion".to_string());
+    }
+    if state.pointer_motion_count != pointer_motion_count_before {
+        failures.push("native DnD motion also reached wl_pointer.motion".to_string());
+    }
+    if state.pointer_enter_count != pointer_enter_count_before {
+        failures.push("normal pointer focus was re-entered during the DnD grab".to_string());
+    }
+    if state.event_timeline.iter().any(|event| {
+        matches!(
+            event,
+            TestWaylandEvent::PointerMotion | TestWaylandEvent::PointerEnter { .. }
+        )
+    }) {
+        failures.push("normal pointer motion/focus events leaked during DnD motion".to_string());
+    }
+
+    let axis_count_before = state.pointer_axis_times.len();
+    let frame_count_before_axis = state.pointer_frame_count;
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerAxisFrame(PointerAxisFrame {
+            timestamp_usec: 123_456_000,
+            source: PointerAxisSource::Wheel,
+            horizontal: PointerAxisComponent::absent(),
+            vertical: PointerAxisComponent {
+                continuous: Some(12.0),
+                value120: None,
+                discrete: Some(1),
+                stopped: false,
+            },
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    if state.pointer_axis_times.len() != axis_count_before {
+        failures.push("wl_pointer.axis leaked through the native DnD route".to_string());
+    }
+    if state.pointer_frame_count != frame_count_before_axis {
+        failures.push("a suppressed axis event emitted a normal pointer frame".to_string());
+    }
+    if state.event_timeline.iter().any(|event| {
+        matches!(
+            event,
+            TestWaylandEvent::PointerAxis
+                | TestWaylandEvent::PointerAxisSource
+                | TestWaylandEvent::PointerAxisDiscrete
+                | TestWaylandEvent::PointerAxisValue120
+                | TestWaylandEvent::PointerAxisStop
+                | TestWaylandEvent::PointerFrame
+        )
+    }) {
+        failures.push("normal pointer axis/frame events appeared in the wire timeline".to_string());
+    }
+
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let terminal_timeline = state.event_timeline.clone();
+    let drop_at = terminal_timeline
+        .iter()
+        .position(|event| matches!(event, TestWaylandEvent::DataDeviceDrop));
+    let leave_at = terminal_timeline
+        .iter()
+        .position(|event| matches!(event, TestWaylandEvent::DataDeviceLeave));
+    let pointer_enter_at = terminal_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::PointerEnter { surface_id: id } if *id == surface_id)
+    });
+    if terminal_timeline
+        .iter()
+        .any(|event| matches!(event, TestWaylandEvent::PointerButtonReleased))
+    {
+        failures.push(
+            "ordinary wl_pointer.button(RELEASED) preceded the DnD terminal event".to_string(),
+        );
+    }
+    if state.data_device_drop_count != 1 || drop_at.is_none() {
+        failures.push(format!(
+            "physical release did not produce exactly one wl_data_device.drop (count {})",
+            state.data_device_drop_count
+        ));
+    }
+    if state.data_device_leave_count != 1 || leave_at.is_none() {
+        failures.push(format!(
+            "successful drop did not send one terminal wl_data_device.leave (count {})",
+            state.data_device_leave_count
+        ));
+    }
+    if let (Some(drop), Some(leave), Some(pointer_enter)) = (drop_at, leave_at, pointer_enter_at) {
+        if !(drop < leave && leave < pointer_enter) {
+            failures.push(
+                "terminal event order was not drop < DnD leave < pointer re-enter".to_string(),
+            );
+        }
+    } else {
+        failures.push(
+            "terminal timeline lacked drop, DnD leave, or normal pointer re-enter".to_string(),
+        );
+    }
+    if state.pointer_enter_surface_id != Some(surface_id) {
+        failures.push(
+            "normal pointer focus was not restored to the surface under the pointer".to_string(),
+        );
+    }
+    if state.data_source_dnd_drop_performed_count != 1 {
+        failures.push("source did not receive exactly one dnd_drop_performed".to_string());
+    }
+
+    let (read_fd, write_fd) = owned_pipe().unwrap();
+    offer.receive("text/plain".to_string(), write_fd.as_fd());
+    connection.flush().unwrap();
+    drop(write_fd);
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let mut payload = String::new();
+    File::from(read_fd).read_to_string(&mut payload).unwrap();
+    assert_eq!(payload, "clipboard payload");
+    offer.finish();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    if state.data_source_dnd_finished_count != 1 {
+        failures.push(
+            "retained dropped offer did not complete with exactly one dnd_finished".to_string(),
+        );
+    }
+    if state.data_source_cancelled_count != 0 {
+        failures.push("successful native DnD spuriously cancelled its source".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "wire-level DnD ownership failures: {failures:#?}"
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn source_less_wayland_drag_hands_off_pointer_and_stays_private_to_initiator() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (origin, origin_xdg, _origin_toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    origin.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&origin_xdg);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let other_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (other_globals, mut other_queue) =
+        registry_queue_init::<RegistryTestState>(&other_connection).unwrap();
+    let other_qh = other_queue.handle();
+    let other_compositor: client_wl_compositor::WlCompositor =
+        other_globals.bind(&other_qh, 1..=6, ()).unwrap();
+    let other_wm_base: client_xdg_wm_base::XdgWmBase =
+        other_globals.bind(&other_qh, 1..=6, ()).unwrap();
+    let other_shm: client_wl_shm::WlShm = other_globals.bind(&other_qh, 1..=1, ()).unwrap();
+    let other_seat: client_wl_seat::WlSeat = other_globals.bind(&other_qh, 1..=7, ()).unwrap();
+    let other_pointer = other_seat.get_pointer(&other_qh, ());
+    let other_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        other_globals.bind(&other_qh, 1..=3, ()).unwrap();
+    let _other_device = other_manager.get_data_device(&other_seat, &other_qh, ());
+    let (other_surface, other_xdg, _other_toplevel) = create_test_buffered_toplevel(
+        &other_compositor,
+        &other_wm_base,
+        &other_shm,
+        &other_qh,
+        160,
+        120,
+    )
+    .unwrap();
+    other_surface.commit();
+    other_connection.flush().unwrap();
+    let mut other_state = RegistryTestState::default();
+    other_queue.roundtrip(&mut other_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&other_xdg);
+    other_connection.flush().unwrap();
+    other_queue.roundtrip(&mut other_state).unwrap();
+
+    focus_root_window(&commands, other_surface.id().protocol_id());
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(300, 200),
+        160,
+        120,
+    );
+    focus_root_window(&commands, origin.id().protocol_id());
+    let origin_id = origin.id().protocol_id();
+    let pointer_x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0;
+    let pointer_y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x,
+            y: pointer_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    other_queue.roundtrip(&mut other_state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("source-less drag must use a real pointer press serial");
+    let pointer_motion_count_before_drag = state.pointer_motion_count;
+    state.event_timeline.clear();
+    other_state.event_timeline.clear();
+
+    device.start_drag(None, &origin, None, serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    other_queue.roundtrip(&mut other_state).unwrap();
+
+    let mut failures = Vec::new();
+    let start_timeline = state.event_timeline.clone();
+    let pointer_leave_at = start_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::PointerLeave { surface_id } if *surface_id == origin_id)
+    });
+    let data_enter_at = start_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::DataDeviceEnter { surface_id } if *surface_id == origin_id)
+    });
+    if state.data_device_enter_count != 1 || data_enter_at.is_none() {
+        failures.push(
+            "source-less start_drag did not immediately enter the initiating client".to_string(),
+        );
+    }
+    if start_timeline
+        .iter()
+        .any(|event| matches!(event, TestWaylandEvent::DataOffer))
+    {
+        failures.push("source-less DnD unexpectedly created a data offer".to_string());
+    }
+    if let (Some(leave), Some(enter)) = (pointer_leave_at, data_enter_at) {
+        if leave >= enter {
+            failures.push("source-less wl_pointer.leave did not precede DnD enter".to_string());
+        }
+    } else {
+        failures.push("source-less start_drag did not hand focus from pointer to DnD".to_string());
+    }
+    if state.pointer_motion_count != pointer_motion_count_before_drag {
+        failures.push("source-less start_drag emitted ordinary pointer motion".to_string());
+    }
+    if state.data_device_drag_offer.is_some() || !state.data_offer_mime_types.is_empty() {
+        failures.push("source-less DnD exposed a data offer".to_string());
+    }
+
+    if state.data_device_enter_count == 0 {
+        commands
+            .send(ServerCommand::PointerMotion {
+                x: pointer_x + 1.0,
+                y: pointer_y + 1.0,
+            })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+    }
+    let pointer_motion_count_before_move = state.pointer_motion_count;
+    let data_motion_count_before_move = state.data_device_motion_count;
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 4.0,
+            y: pointer_y + 4.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    if state.pointer_motion_count != pointer_motion_count_before_move {
+        failures.push("source-less DnD motion also reached wl_pointer.motion".to_string());
+    }
+    if state.data_device_motion_count != data_motion_count_before_move + 1 {
+        failures
+            .push("source-less drag motion did not reach the initiating data device".to_string());
+    }
+    if state
+        .event_timeline
+        .iter()
+        .any(|event| matches!(event, TestWaylandEvent::PointerMotion))
+    {
+        failures.push("ordinary pointer motion leaked during source-less DnD".to_string());
+    }
+
+    commands
+        .send(ServerCommand::PointerMotion { x: 320.0, y: 220.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    other_queue.roundtrip(&mut other_state).unwrap();
+    if other_state.data_device_enter_count != 0 || other_state.data_device_motion_count != 0 {
+        failures.push("source-less DnD leaked to another client's data device".to_string());
+    }
+    if other_state.pointer_enter_count != 0 || other_state.pointer_motion_count != 0 {
+        failures.push(
+            "normal pointer events reached the foreign client during source-less DnD".to_string(),
+        );
+    }
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 30.0,
+            y: pointer_y + 30.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    other_queue.roundtrip(&mut other_state).unwrap();
+    if state.data_device_enter_count != 2 {
+        failures.push(format!(
+            "returning to the initiating surface did not restore source-less DnD focus (count {})",
+            state.data_device_enter_count
+        ));
+    }
+    if state.data_device_enter_surface_id != Some(origin_id) {
+        failures.push("source-less DnD focus left the initiating surface".to_string());
+    }
+    if other_state.data_device_enter_count != 0 {
+        failures.push("another client received a source-less data-device enter".to_string());
+    }
+
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let terminal_timeline = state.event_timeline.clone();
+    let drop_at = terminal_timeline
+        .iter()
+        .position(|event| matches!(event, TestWaylandEvent::DataDeviceDrop));
+    let leave_at = terminal_timeline
+        .iter()
+        .position(|event| matches!(event, TestWaylandEvent::DataDeviceLeave));
+    let pointer_enter_at = terminal_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::PointerEnter { surface_id } if *surface_id == origin_id)
+    });
+    if terminal_timeline
+        .iter()
+        .any(|event| matches!(event, TestWaylandEvent::PointerButtonReleased))
+    {
+        failures
+            .push("source-less terminal release leaked wl_pointer.button(RELEASED)".to_string());
+    }
+    if state.data_device_drop_count != 1 || state.data_device_leave_count != 2 {
+        failures.push(format!(
+            "source-less release must produce one drop and terminal leave (drop {}, leave {})",
+            state.data_device_drop_count, state.data_device_leave_count
+        ));
+    }
+    if let (Some(drop), Some(leave), Some(pointer_enter)) = (drop_at, leave_at, pointer_enter_at) {
+        if !(drop < leave && leave < pointer_enter) {
+            failures.push(
+                "source-less terminal order was not drop < leave < pointer re-enter".to_string(),
+            );
+        }
+    } else {
+        failures.push(
+            "source-less terminal timeline lacked drop, leave, or pointer re-enter".to_string(),
+        );
+    }
+    if state.pointer_enter_surface_id != Some(origin_id) {
+        failures.push("pointer focus was not restored to the current scene target".to_string());
+    }
+    if other_state.data_device_enter_count != 0 {
+        failures
+            .push("source-less drag exposed its data-device focus to another client".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "source-less wire DnD failures: {failures:#?}"
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let _ = pointer;
+    let _ = other_pointer;
+}
+
+#[test]
 fn destroying_active_drag_icon_keeps_drag_session_and_client_alive() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

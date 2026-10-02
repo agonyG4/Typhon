@@ -1613,6 +1613,9 @@ impl CompositorState {
         position: OutputPosition,
         origin: PointerWarpOrigin,
     ) {
+        if self.wayland_pointer_dnd_routing_active() {
+            return;
+        }
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log(format!(
                 "pointer.reposition delivery suppressed origin={} reason=active_lock",

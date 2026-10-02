@@ -304,6 +304,28 @@ impl CompositorState {
             DragLifecycleDriver::WaylandImplicitPointerGrab,
             icon_surface,
         );
+
+        // State-level DnD tests can create a canonical drag without a physical
+        // pointer grab. Only a real Wayland pointer grab transfers client input
+        // routing and establishes its initial DnD target here.
+        if !self.wayland_pointer_dnd_routing_active() {
+            return;
+        }
+
+        let constraint_surface_id = self
+            .active_locked_pointer_binding()
+            .map(|active| compositor_surface_id(&active.surface))
+            .or_else(|| {
+                self.active_confined_pointer_binding()
+                    .map(|active| compositor_surface_id(&active.surface))
+            });
+        if let Some(surface_id) = constraint_surface_id {
+            self.deactivate_pointer_constraints_for_surface_focus_loss(surface_id, true);
+        }
+
+        self.clear_pointer_focus();
+        self.update_active_drag_icon_position();
+        self.update_drag_target_at(self.last_pointer_x, self.last_pointer_y);
     }
 
     pub(super) fn begin_drag_with_origin(
@@ -1099,6 +1121,10 @@ impl CompositorState {
                 {
                     binding.drag_phase = Some(DragOfferPhase::Dropped);
                 }
+                // Keep the exact target and dropped offer in ActiveDrag for
+                // receive/finish and post-drop Ask resolution. This leave ends
+                // DnD pointer focus only; it must not withdraw the offer.
+                let _ = device.send_event(wl_data_device::Event::Leave);
                 if sourceless {
                     if let Some(active) = self.active_drag.as_mut() {
                         active.phase = DragSessionPhase::Finished;

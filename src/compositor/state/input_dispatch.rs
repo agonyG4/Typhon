@@ -149,6 +149,11 @@ impl CompositorState {
         }
         self.retain_live_relative_pointer_resources();
         let live_relative_count = self.relative_pointer_resources.len();
+        if self.wayland_pointer_dnd_routing_active() {
+            self.relative_motion_debug
+                .note_drop("native Wayland DnD owns pointer routing".to_owned());
+            return;
+        }
         if let Some(active) = self.active_locked_pointer_binding() {
             self.pin_locked_pointer_focus(&active);
             self.dispatch_locked_relative_pointer_motion(
@@ -616,6 +621,7 @@ impl CompositorState {
     }
 
     fn send_pointer_release_to_surface(&mut self, surface: &wl_surface::WlSurface, button: u32) {
+        let wayland_dnd_routing_active = self.wayland_pointer_dnd_routing_active();
         let state = wl_pointer::ButtonState::Released;
         let serial = self.next_configure_serial();
         let time = wayland_event_time();
@@ -627,18 +633,20 @@ impl CompositorState {
         {
             self.last_pointer_press = None;
         }
-        for pointer in self
-            .pointer_resources
-            .iter()
-            .filter(|pointer| resource_belongs_to_surface_client(*pointer, surface))
-        {
-            let _ = pointer.send_event(wl_pointer::Event::Button {
-                serial,
-                time,
-                button,
-                state: WEnum::Value(state),
-            });
-            send_pointer_frame_if_supported(pointer);
+        if !wayland_dnd_routing_active {
+            for pointer in self
+                .pointer_resources
+                .iter()
+                .filter(|pointer| resource_belongs_to_surface_client(*pointer, surface))
+            {
+                let _ = pointer.send_event(wl_pointer::Event::Button {
+                    serial,
+                    time,
+                    button,
+                    state: WEnum::Value(state),
+                });
+                send_pointer_frame_if_supported(pointer);
+            }
         }
         if self.held_pointer_buttons.is_empty() && self.implicit_pointer_grab.is_some() {
             let old_surface_id = self
@@ -841,6 +849,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
+        let wayland_dnd_routing_active = self.wayland_pointer_dnd_routing_active();
         let ordinary_scene_input = self.locked_pointer_input_surface().is_none()
             && self
                 .implicit_pointer_grab_surface("surface-destroyed")
@@ -861,9 +870,11 @@ impl CompositorState {
                     .field("pressed", pressed)
                     .field("surface_id", compositor_surface_id(&locked_surface))
             });
-            self.ensure_pointer_focus(&locked_surface);
-            if let Some(active) = self.active_locked_pointer_binding() {
-                self.pin_locked_pointer_focus(&active);
+            if !wayland_dnd_routing_active {
+                self.ensure_pointer_focus(&locked_surface);
+                if let Some(active) = self.active_locked_pointer_binding() {
+                    self.pin_locked_pointer_focus(&active);
+                }
             }
             let surface = locked_surface;
             let state = if pressed {
@@ -917,20 +928,29 @@ impl CompositorState {
                 && self.held_pointer_buttons.is_empty()
                 && self.implicit_pointer_grab.is_some()
             {
+                let old_surface_id = self
+                    .implicit_pointer_grab
+                    .as_ref()
+                    .map(|grab| compositor_surface_id(&grab.surface));
                 self.end_implicit_pointer_grab("last-release");
+                if wayland_dnd_routing_active {
+                    self.refresh_pointer_focus_after_implicit_grab(old_surface_id);
+                }
             }
-            for pointer in self
-                .pointer_resources
-                .iter()
-                .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
-            {
-                let _ = pointer.send_event(wl_pointer::Event::Button {
-                    serial,
-                    time,
-                    button,
-                    state: WEnum::Value(state),
-                });
-                send_pointer_frame_if_supported(pointer);
+            if !wayland_dnd_routing_active {
+                for pointer in self
+                    .pointer_resources
+                    .iter()
+                    .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
+                {
+                    let _ = pointer.send_event(wl_pointer::Event::Button {
+                        serial,
+                        time,
+                        button,
+                        state: WEnum::Value(state),
+                    });
+                    send_pointer_frame_if_supported(pointer);
+                }
             }
             return;
         }
@@ -1057,18 +1077,20 @@ impl CompositorState {
             self.forget_held_pointer_button(button);
         }
 
-        for pointer in self
-            .pointer_resources
-            .iter()
-            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
-        {
-            let _ = pointer.send_event(wl_pointer::Event::Button {
-                serial,
-                time,
-                button,
-                state: WEnum::Value(state),
-            });
-            send_pointer_frame_if_supported(pointer);
+        if !wayland_dnd_routing_active {
+            for pointer in self
+                .pointer_resources
+                .iter()
+                .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
+            {
+                let _ = pointer.send_event(wl_pointer::Event::Button {
+                    serial,
+                    time,
+                    button,
+                    state: WEnum::Value(state),
+                });
+                send_pointer_frame_if_supported(pointer);
+            }
         }
         pointer_debug_log(format!(
             "implicit grab button surface={} button={} state={} held={}",
@@ -1112,6 +1134,10 @@ impl CompositorState {
             .compliance_metrics
             .pointer_axis_frames
             .saturating_add(1);
+
+        if self.wayland_pointer_dnd_routing_active() {
+            return;
+        }
 
         if let Some(surface) = self.locked_pointer_input_surface() {
             if let Some(active) = self.active_locked_pointer_binding() {

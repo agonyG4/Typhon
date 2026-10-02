@@ -34,6 +34,22 @@ mod registry_pointer;
 pub(in crate::compositor::tests) enum TestWaylandEvent {
     DataOffer,
     DataOfferMime(String),
+    DataDeviceEnter { surface_id: u32 },
+    DataDeviceLeave,
+    DataDeviceMotion,
+    DataDeviceDrop,
+    PointerEnter { surface_id: u32 },
+    PointerLeave { surface_id: u32 },
+    PointerMotion,
+    PointerButtonPressed,
+    PointerButtonReleased,
+    PointerAxis,
+    PointerAxisSource,
+    PointerAxisDiscrete,
+    PointerAxisValue120,
+    PointerAxisStop,
+    PointerFrame,
+    RelativeMotion,
     SelectionSome,
     SelectionNone,
     KeyboardEnter { surface_id: u32 },
@@ -203,6 +219,9 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) data_device_motion_count: usize,
     pub(in crate::compositor::tests) data_device_drop_count: usize,
     pub(in crate::compositor::tests) data_device_enter_serial: Option<u32>,
+    pub(in crate::compositor::tests) data_device_enter_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) data_device_enter_x: Option<f64>,
+    pub(in crate::compositor::tests) data_device_enter_y: Option<f64>,
     pub(in crate::compositor::tests) data_device_drag_offer:
         Option<client_wl_data_offer::WlDataOffer>,
     pub(in crate::compositor::tests) data_offer_mime_types: Vec<String>,
@@ -886,19 +905,38 @@ impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
             client_wl_data_device::Event::DataOffer { .. } => {
                 state.event_timeline.push(TestWaylandEvent::DataOffer);
             }
-            client_wl_data_device::Event::Enter { serial, id, .. } => {
+            client_wl_data_device::Event::Enter {
+                serial,
+                surface,
+                x,
+                y,
+                id,
+            } => {
                 state.data_device_enter_count += 1;
                 state.data_device_enter_serial = Some(serial);
+                state.data_device_enter_surface_id = Some(surface.id().protocol_id());
+                state.data_device_enter_x = Some(x);
+                state.data_device_enter_y = Some(y);
                 state.data_device_drag_offer = id;
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::DataDeviceEnter {
+                        surface_id: surface.id().protocol_id(),
+                    });
             }
             client_wl_data_device::Event::Leave => {
                 state.data_device_leave_count += 1;
+                state.event_timeline.push(TestWaylandEvent::DataDeviceLeave);
             }
             client_wl_data_device::Event::Motion { .. } => {
                 state.data_device_motion_count += 1;
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::DataDeviceMotion);
             }
             client_wl_data_device::Event::Drop => {
                 state.data_device_drop_count += 1;
+                state.event_timeline.push(TestWaylandEvent::DataDeviceDrop);
             }
             client_wl_data_device::Event::Selection { id } => {
                 state.data_device_selection_events.push(id.is_some());
@@ -1432,6 +1470,7 @@ impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Regi
             state.relative_motion_dy_unaccel = Some(dy_unaccel);
             state.sdl_pending_relative_motion_count += 1;
             state.pointer_event_log.push("relative");
+            state.event_timeline.push(TestWaylandEvent::RelativeMotion);
         }
     }
 }

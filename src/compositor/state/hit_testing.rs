@@ -827,6 +827,9 @@ impl CompositorState {
         &mut self,
         visual_root_surface_id: Option<u32>,
     ) {
+        if self.wayland_pointer_dnd_routing_active() {
+            return;
+        }
         if self.workspace_scene_transition_active {
             return;
         }
@@ -951,6 +954,9 @@ impl CompositorState {
         &mut self,
         old_surface_id: Option<u32>,
     ) {
+        if self.wayland_pointer_dnd_routing_active() {
+            return;
+        }
         let terminal_visual_root_surface_id = if self.window_interaction_terminal_refresh_pending {
             self.window_interaction_terminal_refresh_pending = false;
             self.window_interaction_release_metrics

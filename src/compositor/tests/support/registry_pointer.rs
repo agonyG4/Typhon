@@ -2,6 +2,8 @@ use super::RegistryTestState;
 use wayland_client::protocol::wl_pointer as client_wl_pointer;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 
+use super::TestWaylandEvent;
+
 impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
     fn event(
         state: &mut Self,
@@ -23,11 +25,17 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                     .push((proxy.id().protocol_id(), serial));
                 state.pointer_enter_surface_id = Some(surface.id().protocol_id());
                 state.pointer_event_log.push("enter");
+                state.event_timeline.push(TestWaylandEvent::PointerEnter {
+                    surface_id: surface.id().protocol_id(),
+                });
             }
-            client_wl_pointer::Event::Leave { .. } => {
+            client_wl_pointer::Event::Leave { surface, .. } => {
                 state.pointer_leave_count += 1;
                 state.pointer_enter_surface_id = None;
                 state.pointer_event_log.push("leave");
+                state.event_timeline.push(TestWaylandEvent::PointerLeave {
+                    surface_id: surface.id().protocol_id(),
+                });
             }
             client_wl_pointer::Event::Motion {
                 surface_x,
@@ -42,6 +50,7 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 state.pointer_surface_x = Some(surface_x);
                 state.pointer_surface_y = Some(surface_y);
                 state.pointer_event_log.push("motion");
+                state.event_timeline.push(TestWaylandEvent::PointerMotion);
             }
             client_wl_pointer::Event::Warp {
                 surface_x,
@@ -68,9 +77,15 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 match button_state {
                     WEnum::Value(client_wl_pointer::ButtonState::Pressed) => {
                         state.pointer_event_log.push("button_pressed");
+                        state
+                            .event_timeline
+                            .push(TestWaylandEvent::PointerButtonPressed);
                     }
                     WEnum::Value(client_wl_pointer::ButtonState::Released) => {
                         state.pointer_event_log.push("button_released");
+                        state
+                            .event_timeline
+                            .push(TestWaylandEvent::PointerButtonReleased);
                     }
                     _ => state.pointer_event_log.push("button"),
                 }
@@ -92,6 +107,7 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 }
                 state.pointer_axis_times.push(time);
                 state.pointer_event_log.push("axis");
+                state.event_timeline.push(TestWaylandEvent::PointerAxis);
             }
             client_wl_pointer::Event::AxisSource { axis_source } => {
                 let source = match axis_source {
@@ -104,6 +120,9 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 };
                 state.pointer_axis_sources.push(source);
                 state.pointer_event_log.push("axis_source");
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::PointerAxisSource);
             }
             client_wl_pointer::Event::AxisDiscrete { axis, discrete } => {
                 let axis = match axis {
@@ -114,6 +133,9 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 };
                 state.pointer_axis_discrete.push((axis, discrete));
                 state.pointer_event_log.push("axis_discrete");
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::PointerAxisDiscrete);
             }
             client_wl_pointer::Event::AxisValue120 { axis, value120 } => {
                 let axis = match axis {
@@ -124,6 +146,9 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 };
                 state.pointer_axis_value120.push((axis, value120));
                 state.pointer_event_log.push("axis_value120");
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::PointerAxisValue120);
             }
             client_wl_pointer::Event::AxisStop { time, axis } => {
                 let axis = match axis {
@@ -134,6 +159,7 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 };
                 state.pointer_axis_stops.push((time, axis));
                 state.pointer_event_log.push("axis_stop");
+                state.event_timeline.push(TestWaylandEvent::PointerAxisStop);
             }
             client_wl_pointer::Event::Frame => {
                 state.pointer_frame_count += 1;
@@ -148,6 +174,7 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                     state.sdl_pending_relative_motion_count = 0;
                 }
                 state.pointer_event_log.push("frame");
+                state.event_timeline.push(TestWaylandEvent::PointerFrame);
                 if state.pointer_event_log.contains(&"enter")
                     && !state
                         .pointer_event_log
