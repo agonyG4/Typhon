@@ -19,6 +19,8 @@ pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;
 #[cfg(test)]
 pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_SHADER;
 #[cfg(test)]
+pub(crate) use executor::EffectExecutionStats;
+#[cfg(test)]
 pub(crate) use executor::checkpoint_causal_stability_plan;
 pub(super) use executor::composition_range;
 #[cfg(test)]

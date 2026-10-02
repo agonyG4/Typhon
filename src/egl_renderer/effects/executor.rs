@@ -1071,7 +1071,10 @@ fn execute_effect_graph_with_debug_config_internal(
         effect_trace_summary(renderer, graph, Some(repaint_plan), selection),
     );
     match (result, release_result) {
-        (Ok(stats), Ok(())) => Ok(stats),
+        (Ok(stats), Ok(())) => {
+            renderer.promote_checkpoint_cache_causal_state(graph);
+            Ok(stats)
+        }
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
@@ -5373,7 +5376,7 @@ fn materialized_target_rects(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CheckpointCausalUnprovenReason {
-    NoPresentedHistory,
+    NoCacheBaseline,
     ScenePrefixChanged,
     DependencyChanged,
     UnsupportedTopology,
@@ -5407,11 +5410,14 @@ pub(crate) fn checkpoint_causal_stability_plan(
     graph: &CompiledFrameGraph,
 ) -> CheckpointCausalStabilityPlan {
     let mut plan = CheckpointCausalStabilityPlan::default();
-    let presented = renderer.presented_checkpoint_causal_state.as_ref();
+    let frame_serial = renderer.effect_resources.checkpoint_frame_serial();
+    let cache_baseline = renderer
+        .effect_resources
+        .checkpoint_causal_state_for_frame(frame_serial);
     let current_scene = renderer.current_checkpoint_scene_causal_snapshot.as_ref();
-    let common_prefix_end = presented
+    let common_prefix_end = cache_baseline
         .zip(current_scene)
-        .map(|(presented, current)| presented.scene.unchanged_command_prefix_len(current));
+        .map(|(baseline, current)| baseline.scene.unchanged_command_prefix_len(current));
     let passes_by_id = graph
         .passes
         .iter()
@@ -5430,7 +5436,7 @@ pub(crate) fn checkpoint_causal_stability_plan(
             pass.instance == instance.id && pass.kind == RenderPassKind::SurfaceCapture
         });
         let supported_topology = scene_captures.len() == 1 && !has_surface_capture;
-        let previous_instance = presented.and_then(|state| state.effects.get(&instance.id));
+        let previous_instance = cache_baseline.and_then(|state| state.effects.get(&instance.id));
         let primary_capture = scene_captures.first().copied();
         let dependency_ids = primary_capture.and_then(|pass| {
             pass.checkpoint_dependencies
@@ -5547,8 +5553,8 @@ pub(crate) fn checkpoint_causal_stability_plan(
                 && pass_dependencies_unchanged;
             let unproven_reason = if pass_source_unchanged {
                 None
-            } else if presented.is_none() || current_scene.is_none() {
-                Some(CheckpointCausalUnprovenReason::NoPresentedHistory)
+            } else if cache_baseline.is_none() || current_scene.is_none() {
+                Some(CheckpointCausalUnprovenReason::NoCacheBaseline)
             } else if !pass_prefix_unchanged
                 || !pass_composition_boundary_unchanged
                 || !pass_owner_unchanged

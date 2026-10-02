@@ -11,6 +11,7 @@ use oblivion_one::effects::{
     GraphTextureSource, RenderPassKind,
 };
 
+use super::super::CheckpointCausalState;
 use super::metrics::EffectResourceMetrics;
 
 pub const DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -277,6 +278,12 @@ struct CachedCheckpointCapture {
     last_populated_frame_serial: Option<u64>,
 }
 
+#[derive(Debug)]
+struct CheckpointCacheCausalBaseline {
+    frame_serial: u64,
+    state: CheckpointCausalState,
+}
+
 const MAX_CHECKPOINT_CACHE_ENTRIES: usize = 32;
 
 #[derive(Debug)]
@@ -529,6 +536,7 @@ pub(crate) struct EffectGlResourceCache {
     checkpoint_captures: HashMap<CheckpointCaptureCacheKey, CachedCheckpointCapture>,
     checkpoint_compatibility: Option<CheckpointCacheCompatibility>,
     checkpoint_frame_serial: u64,
+    checkpoint_causal_baseline: Option<CheckpointCacheCausalBaseline>,
 }
 
 #[allow(dead_code)]
@@ -542,6 +550,7 @@ impl EffectGlResourceCache {
             checkpoint_captures: HashMap::new(),
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
+            checkpoint_causal_baseline: None,
         }
     }
 
@@ -554,6 +563,7 @@ impl EffectGlResourceCache {
             checkpoint_captures: HashMap::new(),
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
+            checkpoint_causal_baseline: None,
         })
     }
 
@@ -668,6 +678,36 @@ impl EffectGlResourceCache {
 
     pub(crate) fn checkpoint_frame_serial(&self) -> u64 {
         self.checkpoint_frame_serial
+    }
+
+    pub(crate) fn checkpoint_causal_state_for_frame(
+        &self,
+        frame_serial: u64,
+    ) -> Option<&CheckpointCausalState> {
+        self.checkpoint_causal_baseline
+            .as_ref()
+            .filter(|baseline| baseline.frame_serial.checked_add(1) == Some(frame_serial))
+            .map(|baseline| &baseline.state)
+    }
+
+    pub(crate) fn promote_checkpoint_causal_state(
+        &mut self,
+        frame_serial: u64,
+        state: CheckpointCausalState,
+    ) -> bool {
+        if frame_serial != self.checkpoint_frame_serial {
+            self.invalidate_checkpoint_causal_state();
+            return false;
+        }
+        self.checkpoint_causal_baseline = Some(CheckpointCacheCausalBaseline {
+            frame_serial,
+            state,
+        });
+        true
+    }
+
+    pub(crate) fn invalidate_checkpoint_causal_state(&mut self) {
+        self.checkpoint_causal_baseline = None;
     }
 
     pub(crate) fn checkpoint_cache_stats(&self) -> (usize, u64) {
@@ -823,12 +863,14 @@ impl EffectGlResourceCache {
     }
 
     pub(crate) fn invalidate_checkpoint_capture_contents(&mut self) {
+        self.invalidate_checkpoint_causal_state();
         for cached in self.checkpoint_captures.values_mut() {
             cached.last_populated_frame_serial = None;
         }
     }
 
     pub(crate) fn clear_checkpoint_capture_cache(&mut self) {
+        self.invalidate_checkpoint_causal_state();
         let entries = std::mem::take(&mut self.checkpoint_captures);
         for cached in entries.into_values() {
             let _ = self.release(cached.texture);

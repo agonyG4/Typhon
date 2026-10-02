@@ -520,7 +520,6 @@ pub(crate) struct EglSceneFrameCommit {
     repaint_plan: RepaintPlan,
     damage_state: EglPresentedDamageState,
     scene_key: EglSceneCacheKey,
-    checkpoint_causal_state: Option<PresentedCheckpointCausalState>,
 }
 
 impl EglSceneFrameCommit {
@@ -552,7 +551,6 @@ impl EglSceneFrameCommit {
                 presentation_geometry_signature: 0,
                 framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
-            checkpoint_causal_state: None,
         }
     }
 }
@@ -713,7 +711,6 @@ pub(crate) struct GlesSceneRenderer {
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
     current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
-    presented_checkpoint_causal_state: Option<PresentedCheckpointCausalState>,
     cursor_resource: Option<EglImageResource>,
     cursor_resource_stale: bool,
     surface_resources: HashMap<u32, EglSurfaceResource>,
@@ -752,7 +749,6 @@ struct CaptureRendererState {
     current_size: (u32, u32),
     presented_scene_key: Option<EglSceneCacheKey>,
     current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
-    presented_checkpoint_causal_state: Option<PresentedCheckpointCausalState>,
     damage_tracker: EglOutputDamageTracker,
     repaint_planner: PartialRepaintPlanner,
     failed_effect_generation: Option<u64>,
@@ -785,7 +781,6 @@ impl CaptureRendererState {
             current_checkpoint_scene_causal_snapshot: renderer
                 .current_checkpoint_scene_causal_snapshot
                 .clone(),
-            presented_checkpoint_causal_state: renderer.presented_checkpoint_causal_state.clone(),
             damage_tracker: renderer.damage_tracker.clone(),
             repaint_planner: renderer.repaint_planner.clone(),
             failed_effect_generation: renderer.failed_effect_generation,
@@ -813,7 +808,6 @@ impl CaptureRendererState {
         renderer.presented_scene_key = self.presented_scene_key;
         renderer.current_checkpoint_scene_causal_snapshot =
             self.current_checkpoint_scene_causal_snapshot;
-        renderer.presented_checkpoint_causal_state = self.presented_checkpoint_causal_state;
         renderer.damage_tracker = self.damage_tracker;
         renderer.repaint_planner = self.repaint_planner;
         renderer.failed_effect_generation = self.failed_effect_generation;
@@ -1522,7 +1516,6 @@ impl GlesSceneRenderer {
             scene_cache_key: None,
             presented_scene_key: None,
             current_checkpoint_scene_causal_snapshot: None,
-            presented_checkpoint_causal_state: None,
             cursor_resource: None,
             cursor_resource_stale: false,
             surface_resources: HashMap::new(),
@@ -2521,8 +2514,6 @@ impl GlesSceneRenderer {
             "begin",
             self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
         );
-        let mut effect_graph_execution_succeeded =
-            matches!(&execution_plan, FrameExecutionPlan::LegacyScene);
         let draw_result = match &execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -2541,7 +2532,6 @@ impl GlesSceneRenderer {
                     selection,
                 ) {
                     Ok(execution_stats) => {
-                        effect_graph_execution_succeeded = true;
                         self.frame_stats.effect_instances_executed = execution_stats.instances;
                         self.frame_stats.effect_passes_executed = execution_stats.passes;
                         self.frame_stats.scene_replay_work_overflow_fallbacks =
@@ -2602,15 +2592,11 @@ impl GlesSceneRenderer {
         }
         self.record_effect_resource_metrics();
         self.record_repaint_stats(&plan);
-        let checkpoint_causal_state = effect_graph_execution_succeeded
-            .then(|| self.checkpoint_causal_candidate_state(compiled_graph))
-            .flatten();
         Ok(EglFrameOutcome::Rendered {
             commit: EglSceneFrameCommit {
                 repaint_plan: plan,
                 damage_state,
                 scene_key: candidate_scene_key,
-                checkpoint_causal_state,
             },
             stats: self.frame_stats,
             lifecycle_evidence: self.lifecycle_render_evidence.clone(),
@@ -2626,17 +2612,29 @@ impl GlesSceneRenderer {
             .commit_presented_transition(presented_transition_damage);
         self.damage_tracker.commit_presented(frame.damage_state);
         self.presented_scene_key = Some(frame.scene_key);
-        self.presented_checkpoint_causal_state = frame.checkpoint_causal_state;
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
+    }
+
+    pub(crate) fn promote_checkpoint_cache_causal_state(
+        &mut self,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+    ) {
+        let frame_serial = self.effect_resources.checkpoint_frame_serial();
+        if let Some(state) = self.checkpoint_causal_candidate_state(Some(graph)) {
+            self.effect_resources
+                .promote_checkpoint_causal_state(frame_serial, state);
+        } else {
+            self.effect_resources.invalidate_checkpoint_causal_state();
+        }
     }
 
     fn checkpoint_causal_candidate_state(
         &self,
         graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
-    ) -> Option<PresentedCheckpointCausalState> {
+    ) -> Option<CheckpointCausalState> {
         self.current_checkpoint_scene_causal_snapshot
             .clone()
-            .map(|scene| PresentedCheckpointCausalState::new(scene, graph, &self.commands))
+            .map(|scene| CheckpointCausalState::new(scene, graph, &self.commands))
     }
 
     pub(crate) fn discard_rendered(&mut self, frame: EglSceneFrameCommit) {
@@ -6170,7 +6168,7 @@ impl EglCheckpointSceneCausalSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PresentedCheckpointEffectCausalState {
+struct CheckpointEffectCausalState {
     semantic_signature: u64,
     frame_demand: oblivion_one::effects::EffectFrameDemand,
     causal_backdrop_only: bool,
@@ -6185,12 +6183,12 @@ struct PresentedCheckpointEffectCausalState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PresentedCheckpointCausalState {
+pub(crate) struct CheckpointCausalState {
     scene: EglCheckpointSceneCausalSnapshot,
-    effects: HashMap<oblivion_one::effects::EffectInstanceId, PresentedCheckpointEffectCausalState>,
+    effects: HashMap<oblivion_one::effects::EffectInstanceId, CheckpointEffectCausalState>,
 }
 
-impl PresentedCheckpointCausalState {
+impl CheckpointCausalState {
     fn new(
         scene: EglCheckpointSceneCausalSnapshot,
         graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
@@ -6231,7 +6229,7 @@ impl PresentedCheckpointCausalState {
                     .unwrap_or_default();
                 effects.insert(
                     instance.id,
-                    PresentedCheckpointEffectCausalState {
+                    CheckpointEffectCausalState {
                         semantic_signature: instance.semantic_signature,
                         frame_demand: instance.frame_demand,
                         causal_backdrop_only: scene_captures.len() == 1 && !has_surface_capture,
@@ -12106,17 +12104,11 @@ mod tests {
             renderer.current_checkpoint_scene_causal_snapshot = Some(snapshot);
         }
 
-        fn commit_current_causal_state(
+        fn promote_current_cache_causal_state(
             renderer: &mut GlesSceneRenderer,
             graph: &oblivion_one::effects::CompiledFrameGraph,
         ) {
-            let mut frame = EglSceneFrameCommit::empty_for_test();
-            frame.checkpoint_causal_state = Some(
-                renderer
-                    .checkpoint_causal_candidate_state(Some(graph))
-                    .expect("diagnostic scene has a causal snapshot"),
-            );
-            renderer.commit_presented(frame, OutputDamage::Empty);
+            renderer.promote_checkpoint_cache_causal_state(graph);
         }
 
         fn cached_checkpoint_pixels(
@@ -12181,6 +12173,95 @@ mod tests {
                 .sum()
         }
 
+        fn render_checkpoint_test_frame(
+            harness: &mut GlesEffectTestHarness,
+            graph: &oblivion_one::effects::CompiledFrameGraph,
+            surface_signatures: &[EglSceneSurfaceSignature],
+            repair: OutputRect,
+            output_size: (u32, u32),
+            region: EffectRegion,
+            full: bool,
+            config: effects::EffectDebugConfig,
+        ) -> u64 {
+            render_checkpoint_test_frame_with_stats(
+                harness,
+                graph,
+                surface_signatures,
+                repair,
+                output_size,
+                region,
+                full,
+                config,
+            )
+            .checkpoint_capture_execution_pixels
+        }
+
+        fn render_checkpoint_test_frame_with_stats(
+            harness: &mut GlesEffectTestHarness,
+            graph: &oblivion_one::effects::CompiledFrameGraph,
+            surface_signatures: &[EglSceneSurfaceSignature],
+            repair: OutputRect,
+            output_size: (u32, u32),
+            region: EffectRegion,
+            full: bool,
+            config: effects::EffectDebugConfig,
+        ) -> effects::EffectExecutionStats {
+            set_current_snapshot(&mut harness.renderer, surface_signatures);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+                graph,
+                &region,
+                full,
+                config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
+            );
+            let selection = effects::select_effect_execution(graph, &demand);
+            effects::execute_effect_graph_with_debug_config(
+                &mut harness.renderer,
+                graph,
+                OutputFramebufferOrigin::TopLeftScanout,
+                &diagnostic_repaint_plan_for_repairs_in_size(&[repair], full, output_size),
+                &demand,
+                &selection,
+                config,
+            )
+            .expect("diagnostic frame renders")
+        }
+
+        fn full_current_checkpoint_reference(
+            fixture: NativeThreeCheckpointFixture,
+            signatures: &[EglSceneSurfaceSignature],
+            source_color: [u8; 4],
+            config: effects::EffectDebugConfig,
+        ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let current_damage = diagnostic_region(fixture.repair);
+            let graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let mut reference =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            reference.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut reference, fixture.scene);
+            update_diagnostic_background_for_surface(
+                &reference,
+                fixture.scene.background_surface,
+                fixture.repair,
+                source_color,
+            );
+            render_checkpoint_test_frame(
+                &mut reference,
+                &graph,
+                signatures,
+                fixture.repair,
+                fixture.output_size,
+                full_region,
+                true,
+                config,
+            );
+            let output = read_diagnostic_pixels(&reference);
+            let checkpoint_c = cached_checkpoint_pixels(&mut reference, &graph, 32);
+            let checkpoint_b = cached_checkpoint_pixels(&mut reference, &graph, 33);
+            (output, checkpoint_c, checkpoint_b)
+        }
+
         #[test]
         fn dependency_stability_propagates_and_fails_closed() {
             let fixture = native_three_checkpoint_fixture();
@@ -12190,11 +12271,6 @@ mod tests {
             let graph = compile_native_three_checkpoint_graph(fixture, &EffectRegion::empty());
             let initial_signatures = signatures(fixture.scene, None);
             set_current_snapshot(&mut harness.renderer, &initial_signatures);
-            let presented_scene = harness
-                .renderer
-                .current_checkpoint_scene_causal_snapshot
-                .clone()
-                .expect("diagnostic scene has a current snapshot");
             let no_history = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(
                 no_history.instances.values().all(|stability| {
@@ -12225,12 +12301,9 @@ mod tests {
                     .source_unchanged
             );
 
-            harness.renderer.presented_checkpoint_causal_state =
-                Some(PresentedCheckpointCausalState::new(
-                    presented_scene,
-                    Some(&graph),
-                    &harness.renderer.commands,
-                ));
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            promote_current_cache_causal_state(&mut harness.renderer, &graph);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
 
             let unchanged = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(
@@ -12359,17 +12432,8 @@ mod tests {
                 !unsupported_plan.instances[&EffectInstanceId::new(33).unwrap()].output_unchanged
             );
 
-            let unsupported_presented_scene = harness
-                .renderer
-                .current_checkpoint_scene_causal_snapshot
-                .clone()
-                .expect("diagnostic scene has a current snapshot");
-            harness.renderer.presented_checkpoint_causal_state =
-                Some(PresentedCheckpointCausalState::new(
-                    unsupported_presented_scene,
-                    Some(&unsupported),
-                    &harness.renderer.commands,
-                ));
+            promote_current_cache_causal_state(&mut harness.renderer, &unsupported);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
             let unsupported_to_supported_plan =
                 effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(
@@ -12420,7 +12484,6 @@ mod tests {
             let previous = read_diagnostic_pixels(&incremental);
             let cached_c_before = cached_checkpoint_pixels(&mut incremental, &first_graph, 32);
             let cached_b_before = cached_checkpoint_pixels(&mut incremental, &first_graph, 33);
-            commit_current_causal_state(&mut incremental.renderer, &first_graph);
 
             update_diagnostic_background_for_surface(
                 &incremental,
@@ -12432,6 +12495,10 @@ mod tests {
             let current_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
             let current_signatures = signatures(fixture.scene, Some(fixture.scene.b_surface));
             set_current_snapshot(&mut incremental.renderer, &current_signatures);
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
             let causal_plan =
                 effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
             let c_capture = current_graph
@@ -12463,10 +12530,6 @@ mod tests {
                 "the conservative fallback has physical work"
             );
 
-            incremental
-                .renderer
-                .effect_resources
-                .begin_checkpoint_frame();
             let update_pixels = execute_diagnostic_frame_with_origin(
                 &mut incremental,
                 &current_graph,
@@ -12494,22 +12557,9 @@ mod tests {
             );
             let actual = read_diagnostic_pixels(&incremental);
 
-            let presented_before_discard = incremental
+            incremental
                 .renderer
-                .presented_checkpoint_causal_state
-                .clone();
-            let mut discarded_frame = EglSceneFrameCommit::empty_for_test();
-            discarded_frame.checkpoint_causal_state = Some(
-                incremental
-                    .renderer
-                    .checkpoint_causal_candidate_state(Some(&current_graph))
-                    .expect("discarded render has a candidate causal state"),
-            );
-            incremental.renderer.discard_rendered(discarded_frame);
-            assert_eq!(
-                incremental.renderer.presented_checkpoint_causal_state, presented_before_discard,
-                "discarded frame never becomes the causal comparison baseline"
-            );
+                .discard_rendered(EglSceneFrameCommit::empty_for_test());
             let c_key = effects::checkpoint_capture_cache_key(&current_graph, c_capture)
                 .expect("C checkpoint cache key remains stable");
             assert!(
@@ -12527,12 +12577,11 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &initial_signatures);
             let restored_state_plan =
                 effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
-            assert!(restored_state_plan.captures[&c_capture.id].source_unchanged);
+            assert!(!restored_state_plan.captures[&c_capture.id].source_unchanged);
             incremental.renderer.frame_swap_failed();
-            assert_eq!(
-                incremental.renderer.presented_checkpoint_causal_state, presented_before_discard,
-                "swap failure does not promote a candidate causal baseline"
-            );
+            let swap_failed_plan =
+                effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
+            assert!(!swap_failed_plan.captures[&c_capture.id].source_unchanged);
             drop(current_graph);
             drop(first_graph);
             drop(incremental);
@@ -12621,7 +12670,6 @@ mod tests {
                 OutputFramebufferOrigin::TopLeftScanout,
             );
             let previous = read_diagnostic_pixels(&incremental);
-            commit_current_causal_state(&mut incremental.renderer, &first_graph);
 
             update_diagnostic_background_for_surface(
                 &incremental,
@@ -12634,6 +12682,10 @@ mod tests {
             let current_signatures =
                 signatures(fixture.scene, Some(fixture.scene.background_surface));
             set_current_snapshot(&mut incremental.renderer, &current_signatures);
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
             let causal_plan =
                 effects::checkpoint_causal_stability_plan(&incremental.renderer, &current_graph);
             for instance_id in [32, 33] {
@@ -12657,10 +12709,6 @@ mod tests {
                 "the conservative fallback has physical work"
             );
 
-            incremental
-                .renderer
-                .effect_resources
-                .begin_checkpoint_frame();
             let update_pixels = execute_diagnostic_frame_with_origin(
                 &mut incremental,
                 &current_graph,
@@ -12727,6 +12775,359 @@ mod tests {
                 "incremental output matches the full-current reference"
             );
             assert_eq!(outside, 0, "incremental output is stable outside repair");
+        }
+
+        #[test]
+        fn unpresented_intermediate_render_cannot_reuse_stale_presented_checkpoint_pixels() {
+            let fixture = native_three_checkpoint_fixture();
+            let config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let current_damage = diagnostic_region(fixture.repair);
+            let initial_signatures = signatures(fixture.scene, None);
+            let intermediate_signatures =
+                signatures(fixture.scene, Some(fixture.scene.background_surface));
+            let mut incremental =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            incremental.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [30, 50, 70, 255],
+            );
+
+            let presented_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &presented_graph,
+                &initial_signatures,
+                fixture.repair,
+                fixture.output_size,
+                full_region.clone(),
+                true,
+                config,
+            );
+            incremental
+                .renderer
+                .commit_presented(EglSceneFrameCommit::empty_for_test(), OutputDamage::Empty);
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [220, 24, 36, 255],
+            );
+            let render_a_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &render_a_graph,
+                &intermediate_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+            // Render A remains unpresented; its textures now contain Y.
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [30, 50, 70, 255],
+            );
+            let render_b_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let fallback_pixels = fallback_checkpoint_pixels(&render_b_graph, fixture.output_size);
+            assert!(fallback_pixels > 0);
+            let update_stats = render_checkpoint_test_frame_with_stats(
+                &mut incremental,
+                &render_b_graph,
+                &initial_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage,
+                false,
+                config,
+            );
+            assert_eq!(
+                update_stats.checkpoint_capture_execution_pixels, fallback_pixels,
+                "B must update from its current X source instead of zero-copying A's Y cache"
+            );
+            assert_eq!(update_stats.checkpoint_cache_zero_copy_hits, 0);
+            assert!(update_stats.checkpoint_causal_unproven > 0);
+
+            let actual_output = read_diagnostic_pixels(&incremental);
+            let actual_checkpoint_c =
+                cached_checkpoint_pixels(&mut incremental, &render_b_graph, 32);
+            let actual_checkpoint_b =
+                cached_checkpoint_pixels(&mut incremental, &render_b_graph, 33);
+            let (reference_output, reference_checkpoint_c, reference_checkpoint_b) =
+                full_current_checkpoint_reference(
+                    fixture,
+                    &initial_signatures,
+                    [30, 50, 70, 255],
+                    config,
+                );
+            assert_eq!(actual_output, reference_output);
+            assert_eq!(actual_checkpoint_c, reference_checkpoint_c);
+            assert_eq!(actual_checkpoint_b, reference_checkpoint_b);
+        }
+
+        #[test]
+        fn unpresented_immediately_previous_render_can_zero_copy_unchanged_checkpoints() {
+            let fixture = native_three_checkpoint_fixture();
+            let config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let current_damage = diagnostic_region(fixture.repair);
+            let initial_signatures = signatures(fixture.scene, None);
+            let intermediate_signatures =
+                signatures(fixture.scene, Some(fixture.scene.background_surface));
+            let mut incremental =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            incremental.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [30, 50, 70, 255],
+            );
+
+            let presented_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &presented_graph,
+                &initial_signatures,
+                fixture.repair,
+                fixture.output_size,
+                full_region.clone(),
+                true,
+                config,
+            );
+            incremental
+                .renderer
+                .commit_presented(EglSceneFrameCommit::empty_for_test(), OutputDamage::Empty);
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [220, 24, 36, 255],
+            );
+            let render_a_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let render_a_pixels = render_checkpoint_test_frame(
+                &mut incremental,
+                &render_a_graph,
+                &intermediate_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+            assert!(render_a_pixels > 0);
+            // Render A remains unpresented. Render B sees the same Y as A.
+
+            let render_b_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let fallback_pixels = fallback_checkpoint_pixels(&render_b_graph, fixture.output_size);
+            assert!(fallback_pixels > 0);
+            let update_stats = render_checkpoint_test_frame_with_stats(
+                &mut incremental,
+                &render_b_graph,
+                &intermediate_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage,
+                false,
+                config,
+            );
+            assert_eq!(update_stats.checkpoint_capture_execution_pixels, 0);
+            assert!(update_stats.checkpoint_cache_zero_copy_hits > 0);
+            assert!(update_stats.checkpoint_causal_proven_unchanged > 0);
+
+            let actual_output = read_diagnostic_pixels(&incremental);
+            let actual_checkpoint_c =
+                cached_checkpoint_pixels(&mut incremental, &render_b_graph, 32);
+            let actual_checkpoint_b =
+                cached_checkpoint_pixels(&mut incremental, &render_b_graph, 33);
+            let (reference_output, reference_checkpoint_c, reference_checkpoint_b) =
+                full_current_checkpoint_reference(
+                    fixture,
+                    &intermediate_signatures,
+                    [220, 24, 36, 255],
+                    config,
+                );
+            assert_eq!(actual_output, reference_output);
+            assert_eq!(actual_checkpoint_c, reference_checkpoint_c);
+            assert_eq!(actual_checkpoint_b, reference_checkpoint_b);
+        }
+
+        #[test]
+        fn late_presentation_of_older_render_cannot_rewind_checkpoint_cache_causality() {
+            let fixture = native_three_checkpoint_fixture();
+            let config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let current_damage = diagnostic_region(fixture.repair);
+            let initial_signatures = signatures(fixture.scene, None);
+            let render_a_signatures =
+                signatures(fixture.scene, Some(fixture.scene.background_surface));
+            let mut render_b_signatures = render_a_signatures.clone();
+            let changed_background = render_b_signatures
+                .iter_mut()
+                .find(|signature| signature.surface_id == fixture.scene.background_surface)
+                .expect("background surface signature exists");
+            changed_background.commit_sequence = 3;
+            changed_background.buffer_id = u64::from(fixture.scene.background_surface) * 100 + 3;
+            changed_background.generation = 3;
+            let mut incremental =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            incremental.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+
+            let presented_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &presented_graph,
+                &initial_signatures,
+                fixture.repair,
+                fixture.output_size,
+                full_region.clone(),
+                true,
+                config,
+            );
+            incremental
+                .renderer
+                .commit_presented(EglSceneFrameCommit::empty_for_test(), OutputDamage::Empty);
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [220, 24, 36, 255],
+            );
+            let render_a_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &render_a_graph,
+                &render_a_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+            let late_render_a_commit = EglSceneFrameCommit::empty_for_test();
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [170, 40, 210, 255],
+            );
+            let render_b_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &render_b_graph,
+                &render_b_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+
+            incremental
+                .renderer
+                .commit_presented(late_render_a_commit, OutputDamage::Empty);
+            set_current_snapshot(&mut incremental.renderer, &render_b_signatures);
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            let next_plan =
+                effects::checkpoint_causal_stability_plan(&incremental.renderer, &render_b_graph);
+            let b_capture = render_b_graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance == EffectInstanceId::new(32).unwrap()
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .expect("B frame includes the persistent checkpoint");
+            assert!(
+                next_plan.captures[&b_capture.id].source_unchanged,
+                "the next comparison must use render B's cache causal baseline"
+            );
+        }
+
+        #[test]
+        fn checkpoint_causal_invalidation_and_serial_gaps_fail_closed() {
+            let fixture = native_three_checkpoint_fixture();
+            let mut harness =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            install_native_three_checkpoint_diagnostic_scene(&mut harness, fixture.scene);
+            let graph = compile_native_three_checkpoint_graph(
+                fixture,
+                &EffectRegion::from_rect(fixture.output_bounds),
+            );
+            let surface_signatures = signatures(fixture.scene, None);
+            set_current_snapshot(&mut harness.renderer, &surface_signatures);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            promote_current_cache_causal_state(&mut harness.renderer, &graph);
+
+            let capture = graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance == EffectInstanceId::new(32).unwrap()
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .expect("checkpoint capture exists");
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            let adjacent = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(adjacent.captures[&capture.id].source_unchanged);
+
+            harness
+                .renderer
+                .discard_rendered(EglSceneFrameCommit::empty_for_test());
+            let discarded = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(!discarded.captures[&capture.id].source_unchanged);
+
+            promote_current_cache_causal_state(&mut harness.renderer, &graph);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            assert!(
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &graph).captures
+                    [&capture.id]
+                    .source_unchanged
+            );
+            harness
+                .renderer
+                .effect_resources
+                .clear_checkpoint_capture_cache();
+            let cleared = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(!cleared.captures[&capture.id].source_unchanged);
+
+            promote_current_cache_causal_state(&mut harness.renderer, &graph);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            let skipped_serial =
+                effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
+            assert!(!skipped_serial.captures[&capture.id].source_unchanged);
         }
     }
 
