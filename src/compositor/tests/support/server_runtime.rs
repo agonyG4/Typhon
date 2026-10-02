@@ -223,8 +223,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     CancelActiveDragForTest,
     CaptureActiveDragIconSurface(Sender<Option<u32>>),
+    ResolveInternalSurfaceId {
+        protocol_surface_id: u32,
+        reply: Sender<Option<u32>>,
+    },
     CaptureSurfaceRoleState {
-        surface_id: u32,
+        internal_surface_id: u32,
         reply: Sender<(String, bool)>,
     },
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
@@ -256,7 +260,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureSurfaceBufferOwnership {
-        surface_id: u32,
+        internal_surface_id: u32,
         reply: Sender<SurfaceBufferOwnershipSnapshot>,
     },
     CaptureSubsurfaceStackState {
@@ -969,11 +973,30 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureActiveDragIconSurface(reply) => {
                         let _ = reply.send(server.state.active_drag_icon_surface_id());
                     }
-                    ServerCommand::CaptureSurfaceRoleState { surface_id, reply } => {
-                        let role = server.state.surface_role(surface_id).label().to_string();
+                    ServerCommand::ResolveInternalSurfaceId {
+                        protocol_surface_id,
+                        reply,
+                    } => {
+                        let internal_surface_id = server.state.surface_resources.iter().find_map(
+                            |(internal_surface_id, surface)| {
+                                (surface.id().protocol_id() == protocol_surface_id)
+                                    .then_some(*internal_surface_id)
+                            },
+                        );
+                        let _ = reply.send(internal_surface_id);
+                    }
+                    ServerCommand::CaptureSurfaceRoleState {
+                        internal_surface_id,
+                        reply,
+                    } => {
+                        let role = server
+                            .state
+                            .surface_role(internal_surface_id)
+                            .label()
+                            .to_string();
                         let active = server
                             .state
-                            .surface_role_lifecycle(surface_id)
+                            .surface_role_lifecycle(internal_surface_id)
                             .live_instance
                             .is_some();
                         let _ = reply.send((role, active));
@@ -1183,22 +1206,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .collect(),
                         );
                     }
-                    ServerCommand::CaptureSurfaceBufferOwnership { surface_id, reply } => {
-                        let tracked_surface_id = server
-                            .state
-                            .surface_resources
-                            .iter()
-                            .find(|(_, surface)| surface.id().protocol_id() == surface_id)
-                            .map_or(surface_id, |(tracked_id, _)| *tracked_id);
+                    ServerCommand::CaptureSurfaceBufferOwnership {
+                        internal_surface_id,
+                        reply,
+                    } => {
                         let _ = reply.send(SurfaceBufferOwnershipSnapshot {
                             current_surface_buffer: server
                                 .state
                                 .current_surface_buffers
-                                .contains_key(&tracked_surface_id),
+                                .contains_key(&internal_surface_id),
                             active_dmabuf: server
                                 .state
                                 .active_dmabuf_buffers
-                                .contains_key(&tracked_surface_id),
+                                .contains_key(&internal_surface_id),
                             pending_dmabuf_releases: server
                                 .state
                                 .pending_dmabuf_buffer_releases
@@ -2469,15 +2489,35 @@ pub(in crate::compositor::tests) fn capture_active_drag_icon_surface(
 
 pub(in crate::compositor::tests) fn capture_surface_role_state(
     commands: &Sender<ServerCommand>,
-    surface_id: u32,
+    internal_surface_id: u32,
 ) -> (String, bool) {
     let (reply, receiver) = mpsc::channel();
     commands
-        .send(ServerCommand::CaptureSurfaceRoleState { surface_id, reply })
+        .send(ServerCommand::CaptureSurfaceRoleState {
+            internal_surface_id,
+            reply,
+        })
         .unwrap();
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report surface role state")
+}
+
+pub(in crate::compositor::tests) fn resolve_internal_surface_id(
+    commands: &Sender<ServerCommand>,
+    protocol_surface_id: u32,
+) -> u32 {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::ResolveInternalSurfaceId {
+            protocol_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should resolve the Wayland surface resource")
+        .expect("Wayland surface resource should still be alive")
 }
 
 pub(in crate::compositor::tests) fn capture_last_pointer_position(
@@ -2612,15 +2652,26 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(
 
 pub(in crate::compositor::tests) fn capture_surface_buffer_ownership(
     commands: &Sender<ServerCommand>,
-    surface_id: u32,
+    internal_surface_id: u32,
 ) -> SurfaceBufferOwnershipSnapshot {
     let (reply, receiver) = mpsc::channel();
     commands
-        .send(ServerCommand::CaptureSurfaceBufferOwnership { surface_id, reply })
+        .send(ServerCommand::CaptureSurfaceBufferOwnership {
+            internal_surface_id,
+            reply,
+        })
         .unwrap();
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report surface buffer ownership")
+}
+
+pub(in crate::compositor::tests) fn capture_surface_buffer_ownership_for_protocol_surface(
+    commands: &Sender<ServerCommand>,
+    protocol_surface_id: u32,
+) -> SurfaceBufferOwnershipSnapshot {
+    let internal_surface_id = resolve_internal_surface_id(commands, protocol_surface_id);
+    capture_surface_buffer_ownership(commands, internal_surface_id)
 }
 
 pub(in crate::compositor::tests) fn capture_layer_surface_commit_state(

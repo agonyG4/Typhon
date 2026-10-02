@@ -98,7 +98,7 @@ fn surface_destroy_with_live_xwayland_role_leaves_role_inert() {
         globals.bind(&qh, 1..=6, ()).expect("bind compositor");
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).expect("bind shm");
     let surface = compositor.create_surface(&qh, ());
-    let surface_id = surface.id().protocol_id();
+    let protocol_surface_id = surface.id().protocol_id();
     let xwayland_surface = shell.get_xwayland_surface(&surface, &qh, ());
     xwayland_surface.set_serial(0x0123_4567, 0x89ab_cdef);
     surface.commit();
@@ -118,7 +118,11 @@ fn surface_destroy_with_live_xwayland_role_leaves_role_inert() {
     queue
         .roundtrip(&mut super::RegistryTestState::default())
         .expect("complete first buffer commit");
-    assert!(super::capture_surface_buffer_ownership(&commands, surface_id).current_surface_buffer);
+    let internal_surface_id = super::resolve_internal_surface_id(&commands, protocol_surface_id);
+    assert!(
+        super::capture_surface_buffer_ownership(&commands, internal_surface_id)
+            .current_surface_buffer
+    );
 
     surface.destroy();
     connection.flush().expect("flush surface destruction");
@@ -147,54 +151,59 @@ fn surface_destroy_with_live_xwayland_role_leaves_role_inert() {
             .lifecycle_surface_destroy_with_role_total,
         1
     );
-    assert!(!server.state.surface_resources.contains_key(&surface_id));
+    assert!(
+        !server
+            .state
+            .surface_resources
+            .contains_key(&internal_surface_id)
+    );
     assert!(
         !server
             .state
             .xwayland
             .surface_states
-            .contains_key(&surface_id)
+            .contains_key(&internal_surface_id)
     );
     assert!(
         !server
             .state
             .xwayland
             .surface_resources
-            .contains_key(&surface_id)
+            .contains_key(&internal_surface_id)
     );
     assert!(
         !server
             .state
             .current_surface_buffers
-            .contains_key(&surface_id)
+            .contains_key(&internal_surface_id)
     );
     assert!(
         !server
             .state
             .renderable_surfaces
             .iter()
-            .any(|renderable| renderable.surface_id == surface_id)
+            .any(|renderable| renderable.surface_id == internal_surface_id)
     );
     assert!(
         server
             .state
             .focused_surface
             .as_ref()
-            .is_none_or(|focused| super::compositor_surface_id(focused) != surface_id)
+            .is_none_or(|focused| super::compositor_surface_id(focused) != internal_surface_id)
     );
     assert!(
         server
             .state
             .keyboard_surface
             .as_ref()
-            .is_none_or(|focused| super::compositor_surface_id(focused) != surface_id)
+            .is_none_or(|focused| super::compositor_surface_id(focused) != internal_surface_id)
     );
     assert!(
         server
             .state
             .pointer_surface
             .as_ref()
-            .is_none_or(|focused| super::compositor_surface_id(focused) != surface_id)
+            .is_none_or(|focused| super::compositor_surface_id(focused) != internal_surface_id)
     );
 }
 

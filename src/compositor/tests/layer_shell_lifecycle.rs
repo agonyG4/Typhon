@@ -32,7 +32,7 @@ fn surface_destroy_with_live_layer_surface_leaves_role_inert() {
         client_zwlr_layer_shell_v1::Layer::Overlay,
         "surface-first-layer-destroy",
     );
-    let surface_id = surface.id().protocol_id();
+    let protocol_surface_id = surface.id().protocol_id();
     layer_surface.set_size(320, 240);
     layer_surface
         .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
@@ -47,7 +47,10 @@ fn surface_destroy_with_live_layer_surface_leaves_role_inert() {
     commit_test_buffered_surface(&surface, &shm, &qh, 320, 240).unwrap();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
-    assert!(capture_surface_buffer_ownership(&commands, surface_id).current_surface_buffer);
+    let internal_surface_id = resolve_internal_surface_id(&commands, protocol_surface_id);
+    assert!(
+        capture_surface_buffer_ownership(&commands, internal_surface_id).current_surface_buffer
+    );
 
     surface.destroy();
     connection.flush().unwrap();
@@ -74,41 +77,51 @@ fn surface_destroy_with_live_layer_surface_leaves_role_inert() {
             .lifecycle_surface_destroy_with_role_total,
         1
     );
-    assert!(!server.state.surface_resources.contains_key(&surface_id));
-    assert!(!server.state.layer_surfaces.contains_key(&surface_id));
+    assert!(
+        !server
+            .state
+            .surface_resources
+            .contains_key(&internal_surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .layer_surfaces
+            .contains_key(&internal_surface_id)
+    );
     assert!(
         !server
             .state
             .current_surface_buffers
-            .contains_key(&surface_id)
+            .contains_key(&internal_surface_id)
     );
     assert!(
         !server
             .state
             .renderable_surfaces
             .iter()
-            .any(|renderable| renderable.surface_id == surface_id)
+            .any(|renderable| renderable.surface_id == internal_surface_id)
     );
     assert!(
         server
             .state
             .keyboard_surface
             .as_ref()
-            .is_none_or(|focused| compositor_surface_id(focused) != surface_id)
+            .is_none_or(|focused| compositor_surface_id(focused) != internal_surface_id)
     );
     assert!(
         server
             .state
             .focused_surface
             .as_ref()
-            .is_none_or(|focused| compositor_surface_id(focused) != surface_id)
+            .is_none_or(|focused| compositor_surface_id(focused) != internal_surface_id)
     );
     assert!(
         server
             .state
             .pointer_surface
             .as_ref()
-            .is_none_or(|focused| compositor_surface_id(focused) != surface_id)
+            .is_none_or(|focused| compositor_surface_id(focused) != internal_surface_id)
     );
 }
 

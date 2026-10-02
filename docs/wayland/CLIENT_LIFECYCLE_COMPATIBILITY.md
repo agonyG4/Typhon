@@ -66,12 +66,16 @@ sessions.
 
 ## Protocol and compositor comparison
 
-The protocol baseline remains strict: destroying `wl_surface` before its role,
-destroying `xdg_surface` before its role, and destroying a non-topmost nested
-popup are specified protocol errors. Reusing a `wl_data_source` is also
-specified to raise `used_source`. Typhon's three recovery cases are deliberate
-compatibility exceptions to those protocol requirements; they are safe only
-because teardown leaves no live compositor ownership behind. ([Wayland core](https://wayland.app/protocols/wayland), [xdg-shell](https://wayland.app/protocols/xdg-shell))
+The protocol baseline remains strict: destroying `wl_surface` before its role
+is the defined `wl_surface.defunct_role_object` protocol error; destroying
+`xdg_surface` before its role and destroying a non-topmost nested popup are
+also specified protocol errors. Attempting to reuse a previously-used source
+may send `wl_data_device.used_source`. Typhon deliberately recovers only the
+narrow case where the same source is still the active clipboard selection.
+The protocol-defined violation describes the request's validity; it does not
+require every compositor to apply the same fatal or recovery policy. Typhon's
+choice is safe because the active selection and source ownership remain
+unambiguous. ([Wayland core](https://wayland.app/protocols/wayland), [xdg-shell](https://wayland.app/protocols/xdg-shell))
 
 | Implementation | Source observation | Classification |
 | --- | --- | --- |

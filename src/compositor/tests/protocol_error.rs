@@ -1109,7 +1109,7 @@ fn surface_destroy_with_live_role_uses_canonical_teardown() {
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let (surface, xdg_surface, toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 64, 48).unwrap();
-    let surface_id = surface.id().protocol_id();
+    let protocol_surface_id = surface.id().protocol_id();
     surface.commit();
     connection.flush().unwrap();
     let mut state = RegistryTestState::default();
@@ -1117,7 +1117,10 @@ fn surface_destroy_with_live_role_uses_canonical_teardown() {
     commit_registered_initial_xdg_test_buffer(&xdg_surface);
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
-    assert!(capture_surface_buffer_ownership(&commands, surface_id).current_surface_buffer);
+    let internal_surface_id = resolve_internal_surface_id(&commands, protocol_surface_id);
+    assert!(
+        capture_surface_buffer_ownership(&commands, internal_surface_id).current_surface_buffer
+    );
 
     surface.destroy();
     connection.flush().unwrap();
@@ -1148,47 +1151,67 @@ fn surface_destroy_with_live_role_uses_canonical_teardown() {
             .lifecycle_surface_destroy_with_role_total,
         1
     );
-    assert!(!server.state.surface_resources.contains_key(&surface_id));
-    assert!(!server.state.toplevel_surfaces.contains_key(&surface_id));
-    assert!(!server.state.xdg_surface_resources.contains_key(&surface_id));
-    assert!(!server.state.xdg_surface_wm_bases.contains_key(&surface_id));
+    assert!(
+        !server
+            .state
+            .surface_resources
+            .contains_key(&internal_surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .toplevel_surfaces
+            .contains_key(&internal_surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .xdg_surface_resources
+            .contains_key(&internal_surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .xdg_surface_wm_bases
+            .contains_key(&internal_surface_id)
+    );
     assert!(
         !server
             .state
             .current_surface_buffers
-            .contains_key(&surface_id)
+            .contains_key(&internal_surface_id)
     );
     assert!(
         !server
             .state
             .renderable_surfaces
             .iter()
-            .any(|surface| surface.surface_id == surface_id)
+            .any(|surface| surface.surface_id == internal_surface_id)
     );
     assert!(
         server
             .state
             .focused_surface
             .as_ref()
-            .is_none_or(|surface| compositor_surface_id(surface) != surface_id)
+            .is_none_or(|surface| compositor_surface_id(surface) != internal_surface_id)
     );
     assert!(
         server
             .state
             .keyboard_surface
             .as_ref()
-            .is_none_or(|surface| compositor_surface_id(surface) != surface_id)
+            .is_none_or(|surface| compositor_surface_id(surface) != internal_surface_id)
     );
     assert!(
         server
             .state
             .pointer_surface
             .as_ref()
-            .is_none_or(|surface| compositor_surface_id(surface) != surface_id)
+            .is_none_or(|surface| compositor_surface_id(surface) != internal_surface_id)
     );
     let repeated = server
         .state
-        .teardown_surface_resource(surface_id, SurfaceTeardownReason::ExplicitDestroy);
+        .teardown_surface_resource(internal_surface_id, SurfaceTeardownReason::ExplicitDestroy);
     assert_eq!(repeated.removed_resource, false);
     assert_eq!(repeated.removed_renderables, 0);
 }
@@ -1207,12 +1230,13 @@ fn xdg_wm_base_destroy_remains_fatal_while_inert_xdg_surface_is_live() {
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base_id = wm_base.id().protocol_id();
     let surface = compositor.create_surface(&qh, ());
-    let surface_id = surface.id().protocol_id();
+    let protocol_surface_id = surface.id().protocol_id();
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
     surface.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let internal_surface_id = resolve_internal_surface_id(&commands, protocol_surface_id);
 
     surface.destroy();
     connection.flush().unwrap();
@@ -1238,8 +1262,18 @@ fn xdg_wm_base_destroy_remains_fatal_while_inert_xdg_surface_is_live() {
             .lifecycle_surface_destroy_with_role_total,
         1
     );
-    assert!(!server.state.surface_resources.contains_key(&surface_id));
-    assert!(!server.state.xdg_surface_wm_bases.contains_key(&surface_id));
+    assert!(
+        !server
+            .state
+            .surface_resources
+            .contains_key(&internal_surface_id)
+    );
+    assert!(
+        !server
+            .state
+            .xdg_surface_wm_bases
+            .contains_key(&internal_surface_id)
+    );
 }
 
 #[test]
@@ -1260,8 +1294,8 @@ fn surface_destroy_with_live_subsurface_tears_down_and_leaves_role_inert() {
     let (parent, parent_xdg_surface, _parent_toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 64, 48).unwrap();
     let child = compositor.create_surface(&qh, ());
-    let child_id = child.id().protocol_id();
-    let parent_id = parent.id().protocol_id();
+    let child_protocol_id = child.id().protocol_id();
+    let parent_protocol_id = parent.id().protocol_id();
     let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
     child_subsurface.set_position(12, 8);
 
@@ -1277,6 +1311,8 @@ fn surface_destroy_with_live_subsurface_tears_down_and_leaves_role_inert() {
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
+    let child_id = resolve_internal_surface_id(&commands, child_protocol_id);
+    let parent_id = resolve_internal_surface_id(&commands, parent_protocol_id);
     assert!(capture_surface_buffer_ownership(&commands, child_id).current_surface_buffer);
     assert_eq!(
         capture_surface_role_state(&commands, child_id),
@@ -1326,6 +1362,7 @@ fn surface_destroy_with_live_subsurface_tears_down_and_leaves_role_inert() {
     assert!(!server.state.surface_role_lifecycles.contains_key(&child_id));
     assert_eq!(server.state.subsurface_transactions.parent(child_id), None);
     assert!(!server.state.current_surface_buffers.contains_key(&child_id));
+    assert!(!server.state.active_dmabuf_buffers.contains_key(&child_id));
     assert!(
         !server
             .state
@@ -1380,7 +1417,7 @@ fn surface_destroy_with_live_xdg_popup_tears_down_and_leaves_role_inert() {
     queue.roundtrip(&mut state).unwrap();
 
     let popup_surface = compositor.create_surface(&qh, ());
-    let popup_surface_id = popup_surface.id().protocol_id();
+    let popup_protocol_surface_id = popup_surface.id().protocol_id();
     let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
     let positioner = wm_base.create_positioner(&qh, ());
     positioner.set_size(24, 18);
@@ -1393,9 +1430,14 @@ fn surface_destroy_with_live_xdg_popup_tears_down_and_leaves_role_inert() {
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     positioner.destroy();
-    assert!(capture_surface_buffer_ownership(&commands, popup_surface_id).current_surface_buffer);
+    let popup_internal_surface_id =
+        resolve_internal_surface_id(&commands, popup_protocol_surface_id);
+    assert!(
+        capture_surface_buffer_ownership(&commands, popup_internal_surface_id)
+            .current_surface_buffer
+    );
     assert_eq!(
-        capture_surface_role_state(&commands, popup_surface_id),
+        capture_surface_role_state(&commands, popup_internal_surface_id),
         ("xdg_popup".to_string(), true)
     );
 
@@ -1423,42 +1465,47 @@ fn surface_destroy_with_live_xdg_popup_tears_down_and_leaves_role_inert() {
         !server
             .state
             .surface_resources
-            .contains_key(&popup_surface_id)
+            .contains_key(&popup_internal_surface_id)
     );
-    assert!(!server.state.popup_surfaces.contains_key(&popup_surface_id));
+    assert!(
+        !server
+            .state
+            .popup_surfaces
+            .contains_key(&popup_internal_surface_id)
+    );
     assert!(
         !server
             .state
             .current_surface_buffers
-            .contains_key(&popup_surface_id)
+            .contains_key(&popup_internal_surface_id)
     );
     assert!(
         !server
             .state
             .renderable_surfaces
             .iter()
-            .any(|renderable| renderable.surface_id == popup_surface_id)
+            .any(|renderable| renderable.surface_id == popup_internal_surface_id)
     );
     assert!(
         server
             .state
             .focused_surface
             .as_ref()
-            .is_none_or(|focused| compositor_surface_id(focused) != popup_surface_id)
+            .is_none_or(|focused| compositor_surface_id(focused) != popup_internal_surface_id)
     );
     assert!(
         server
             .state
             .keyboard_surface
             .as_ref()
-            .is_none_or(|focused| compositor_surface_id(focused) != popup_surface_id)
+            .is_none_or(|focused| compositor_surface_id(focused) != popup_internal_surface_id)
     );
     assert!(
         server
             .state
             .pointer_surface
             .as_ref()
-            .is_none_or(|focused| compositor_surface_id(focused) != popup_surface_id)
+            .is_none_or(|focused| compositor_surface_id(focused) != popup_internal_surface_id)
     );
 }
 

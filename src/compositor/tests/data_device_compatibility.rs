@@ -56,12 +56,25 @@ fn active_clipboard_source_reuse_is_tolerated_then_clear_retires_it() {
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     let repeated_serial = state.keyboard_key_serial.expect("fresh focused key serial");
+    let clipboard_before_reuse = capture_clipboard_state(&commands);
+    let cancellations_before_reuse = state.data_source_cancelled_count;
+    let selection_events_before_reuse = state.data_device_selection_events.len();
+    assert_eq!(cancellations_before_reuse, 0);
     device.set_selection(Some(&source), repeated_serial);
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue
         .roundtrip(&mut state)
         .expect("reselecting the active clipboard source must be recoverable");
+    assert_eq!(capture_clipboard_state(&commands), clipboard_before_reuse);
+    assert_eq!(
+        state.data_source_cancelled_count,
+        cancellations_before_reuse
+    );
+    assert_eq!(
+        state.data_device_selection_events.len(),
+        selection_events_before_reuse
+    );
     assert_eq!(state.data_device_selection_events, [false, true]);
 
     commands
@@ -177,10 +190,27 @@ fn replaced_clipboard_source_reuse_remains_a_wire_protocol_error() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.data_device_selection_events, [false, true, true]);
     assert_eq!(
-        state.data_device_selection_events,
-        [false, true, false, true]
+        state.data_source_cancelled_count, 1,
+        "replacing source A retires it exactly once"
     );
+    let selection_some_indices: Vec<_> = state
+        .event_timeline
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event, TestWaylandEvent::SelectionSome).then_some(index)
+        })
+        .collect();
+    assert_eq!(selection_some_indices.len(), 2);
+    let between_selections =
+        &state.event_timeline[selection_some_indices[0] + 1..selection_some_indices[1]];
+    assert!(
+        between_selections.contains(&TestWaylandEvent::DataOffer),
+        "the replacement offer must be introduced before its selection event"
+    );
+    assert!(!between_selections.contains(&TestWaylandEvent::SelectionNone));
 
     commands
         .send(ServerCommand::KeyboardKey {

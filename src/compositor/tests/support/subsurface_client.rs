@@ -974,12 +974,12 @@ pub(in crate::compositor::tests) fn capture_destroyed_dmabuf_subsurface(
     queue.roundtrip(&mut RegistryTestState::default())?;
 
     let child_id = child.id().protocol_id();
-    let before_destroy = capture_surface_buffer_ownership(commands, child_id);
+    let before_destroy = capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     child_subsurface.destroy();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    let after_destroy = capture_surface_buffer_ownership(commands, child_id);
+    let after_destroy = capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     let second_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff44_5566)?;
     child.attach(Some(&second_buffer), 0, 0);
@@ -987,13 +987,14 @@ pub(in crate::compositor::tests) fn capture_destroyed_dmabuf_subsurface(
     child.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    let after_dormant_replacement = capture_surface_buffer_ownership(commands, child_id);
+    let after_dormant_replacement =
+        capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     let _recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
     parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    let after_recreate = capture_surface_buffer_ownership(commands, child_id);
+    let after_recreate = capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     Ok(DestroyedDmabufSubsurfaceSnapshots {
         before_destroy,
@@ -1455,21 +1456,26 @@ pub(in crate::compositor::tests) fn capture_dmabuf_subsurface_ownership_across_p
 
     let parent_id = parent.id().protocol_id();
     let child_id = child.id().protocol_id();
-    let before_parent_null = capture_surface_buffer_ownership(commands, parent_id);
-    let before_parent_null_child = capture_surface_buffer_ownership(commands, child_id);
+    let before_parent_null =
+        capture_surface_buffer_ownership_for_protocol_surface(commands, parent_id);
+    let before_parent_null_child =
+        capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     parent.attach(None, 0, 0);
     parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    let after_parent_null = capture_surface_buffer_ownership(commands, parent_id);
-    let after_parent_null_child = capture_surface_buffer_ownership(commands, child_id);
+    let after_parent_null =
+        capture_surface_buffer_ownership_for_protocol_surface(commands, parent_id);
+    let after_parent_null_child =
+        capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     child.attach(None, 0, 0);
     child.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    let after_child_null = capture_surface_buffer_ownership(commands, child_id);
+    let after_child_null =
+        capture_surface_buffer_ownership_for_protocol_surface(commands, child_id);
 
     Ok(DmabufSubsurfaceOwnershipSnapshots {
         before_parent_null,

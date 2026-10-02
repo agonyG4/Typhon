@@ -1826,7 +1826,8 @@ fn subsurface_destruction_publishes_topology_and_effective_geometry_immediately(
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
-    let popup_id = popup_surface.id().protocol_id();
+    let popup_protocol_surface_id = popup_surface.id().protocol_id();
+    let popup_id = resolve_internal_surface_id(&commands, popup_protocol_surface_id);
     let popup_before = capture_renderable_surface_snapshot(&commands)
         .into_iter()
         .find(|surface| surface.surface_id == popup_id)
