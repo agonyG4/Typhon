@@ -3,6 +3,39 @@ use crate::native_output::runtime::settle_failed_output_transaction;
 use oblivion_one::native::kms::AtomicFlipRequest;
 use oblivion_one::native::sync_file::SyncFileDeadlineHint;
 
+const ADAPTIVE_ASYNC_FALLBACKS: &[OutputPresentationMode] = &[
+    OutputPresentationMode::AdaptiveSync,
+    OutputPresentationMode::Async,
+    OutputPresentationMode::Vsync,
+];
+const FIXED_REFRESH_FALLBACK: &[OutputPresentationMode] = &[OutputPresentationMode::Vsync];
+const NO_PRESENTATION_FALLBACKS: &[OutputPresentationMode] = &[];
+
+fn presentation_fallback_candidates(
+    mode: OutputPresentationMode,
+) -> &'static [OutputPresentationMode] {
+    match mode {
+        OutputPresentationMode::AdaptiveAsync => ADAPTIVE_ASYNC_FALLBACKS,
+        OutputPresentationMode::AdaptiveSync | OutputPresentationMode::Async => {
+            FIXED_REFRESH_FALLBACK
+        }
+        OutputPresentationMode::Vsync => NO_PRESENTATION_FALLBACKS,
+    }
+}
+
+fn strongest_qualified_fallback(
+    mode: OutputPresentationMode,
+    qualified_modes: &[OutputPresentationMode],
+) -> OutputPresentationMode {
+    presentation_fallback_candidates(mode)
+        .iter()
+        .find(|candidate| {
+            **candidate == OutputPresentationMode::Vsync || qualified_modes.contains(candidate)
+        })
+        .copied()
+        .unwrap_or(OutputPresentationMode::Vsync)
+}
+
 fn adaptive_async_blockers(
     adaptive_sync_qualified: bool,
     async_qualified: bool,
@@ -135,18 +168,7 @@ impl AtomicEglGbmScanout {
         let ready_framebuffer = self.framebuffer(ready_slot)?;
         let test_token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
-        let mut fallback_candidates = Vec::new();
-        match presentation_mode {
-            OutputPresentationMode::AdaptiveAsync => fallback_candidates.extend([
-                OutputPresentationMode::AdaptiveSync,
-                OutputPresentationMode::Async,
-                OutputPresentationMode::Vsync,
-            ]),
-            OutputPresentationMode::AdaptiveSync | OutputPresentationMode::Async => {
-                fallback_candidates.push(OutputPresentationMode::Vsync)
-            }
-            OutputPresentationMode::Vsync => {}
-        }
+        let fallback_candidates = presentation_fallback_candidates(presentation_mode).to_vec();
         let original_mode = presentation_mode;
         let original_qualified = if original_mode == OutputPresentationMode::Vsync {
             true
@@ -191,10 +213,13 @@ impl AtomicEglGbmScanout {
             if let Some(key) = presentation_validation_key {
                 self.note_composited_presentation_validation(key, false);
             }
-            let (fallback_mode, fallback_key) = qualified_fallbacks
-                .first()
-                .copied()
-                .unwrap_or((OutputPresentationMode::Vsync, None));
+            let qualified_modes: Vec<_> =
+                qualified_fallbacks.iter().map(|(mode, _)| *mode).collect();
+            let fallback_mode = strongest_qualified_fallback(original_mode, &qualified_modes);
+            let fallback_key = qualified_fallbacks
+                .iter()
+                .find(|(mode, _)| *mode == fallback_mode)
+                .and_then(|(_, key)| *key);
             presentation_mode = fallback_mode;
             presentation_validation_key = fallback_key;
             let (vrr_blocker, async_blocker) = match original_mode {
@@ -590,5 +615,49 @@ mod adaptive_async_blocker_tests {
             )
         );
         assert_eq!(adaptive_async_blockers(true, true), (None, None));
+    }
+
+    #[test]
+    fn kms_rejection_fallback_order_keeps_the_strongest_qualified_mode() {
+        assert_eq!(
+            presentation_fallback_candidates(OutputPresentationMode::AdaptiveAsync),
+            &[
+                OutputPresentationMode::AdaptiveSync,
+                OutputPresentationMode::Async,
+                OutputPresentationMode::Vsync,
+            ]
+        );
+        assert_eq!(
+            strongest_qualified_fallback(
+                OutputPresentationMode::AdaptiveAsync,
+                &[OutputPresentationMode::Async, OutputPresentationMode::Vsync]
+            ),
+            OutputPresentationMode::Async
+        );
+        assert_eq!(
+            strongest_qualified_fallback(
+                OutputPresentationMode::AdaptiveAsync,
+                &[
+                    OutputPresentationMode::AdaptiveSync,
+                    OutputPresentationMode::Async,
+                    OutputPresentationMode::Vsync,
+                ]
+            ),
+            OutputPresentationMode::AdaptiveSync
+        );
+        assert_eq!(
+            strongest_qualified_fallback(
+                OutputPresentationMode::AdaptiveSync,
+                &[OutputPresentationMode::Vsync]
+            ),
+            OutputPresentationMode::Vsync
+        );
+        assert_eq!(
+            strongest_qualified_fallback(
+                OutputPresentationMode::Async,
+                &[OutputPresentationMode::Vsync]
+            ),
+            OutputPresentationMode::Vsync
+        );
     }
 }
