@@ -1,8 +1,9 @@
 use super::*;
 use crate::xwayland::{
     CanonicalDndSessionId, MAX_PENDING_XWAYLAND_DND_TRANSITIONS, WaylandDndAction, X11WindowHandle,
-    XwaylandDndAction, XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId,
-    XwaylandDndOutbox, XwaylandDndTransition, XwaylandDndVersion, XwaylandGeneration,
+    XwaylandDndAction, XwaylandDndIncomingPositionId, XwaylandDndMimeCatalog, XwaylandDndOffer,
+    XwaylandDndOfferId, XwaylandDndOutbox, XwaylandDndTransition, XwaylandDndVersion,
+    XwaylandGeneration,
 };
 use std::{
     io::Read,
@@ -131,6 +132,7 @@ fn xwayland_dnd_outbox_keeps_edges_ordered_and_preserves_source_finish() {
     let generation = generation(82);
     let session = CanonicalDndSessionId::Wayland(NonZeroU64::new(3).unwrap());
     let offer_id = XwaylandDndOfferId::new(generation, NonZeroU64::new(4).unwrap());
+    let position_id = XwaylandDndIncomingPositionId::new(offer_id, NonZeroU64::new(7).unwrap());
     let target_a = X11WindowHandle::new(generation, 0x820);
     let target_b = X11WindowHandle::new(generation, 0x821);
     let mime_types = XwaylandDndMimeCatalog::default();
@@ -180,6 +182,7 @@ fn xwayland_dnd_outbox_keeps_edges_ordered_and_preserves_source_finish() {
         },
         XwaylandDndTransition::SourceFeedback {
             offer_id,
+            position_id,
             accepted_mime: Some("text/plain".to_owned()),
             action: Some(XwaylandDndAction::Copy),
         },
@@ -225,50 +228,6 @@ fn xwayland_dnd_outbox_keeps_edges_ordered_and_preserves_source_finish() {
     );
     assert!(
         matches!(transitions[8], XwaylandDndTransition::Retired { session_id: current, generation: current_generation } if current == session && current_generation == generation)
-    );
-}
-
-#[test]
-fn xwayland_dnd_outbox_coalesces_feedback_only_for_the_exact_offer() {
-    let offer_generation = generation(83);
-    let offer_id = XwaylandDndOfferId::new(offer_generation, NonZeroU64::new(1).unwrap());
-    let replacement_offer_id = XwaylandDndOfferId::new(generation(84), NonZeroU64::new(1).unwrap());
-    let mut outbox = XwaylandDndOutbox::default();
-    for transition in [
-        XwaylandDndTransition::SourceFeedback {
-            offer_id,
-            accepted_mime: Some("text/plain".to_owned()),
-            action: Some(XwaylandDndAction::Copy),
-        },
-        XwaylandDndTransition::SourceFeedback {
-            offer_id,
-            accepted_mime: None,
-            action: None,
-        },
-        XwaylandDndTransition::SourceFeedback {
-            offer_id: replacement_offer_id,
-            accepted_mime: Some("text/uri-list".to_owned()),
-            action: Some(XwaylandDndAction::Move),
-        },
-        XwaylandDndTransition::SourceFinished {
-            offer_id: replacement_offer_id,
-            accepted: true,
-            action: Some(XwaylandDndAction::Move),
-        },
-    ] {
-        outbox.push(transition).unwrap();
-    }
-
-    let transitions = outbox.drain();
-    assert_eq!(transitions.len(), 3);
-    assert!(
-        matches!(transitions[0], XwaylandDndTransition::SourceFeedback { offer_id: current, accepted_mime: None, .. } if current == offer_id)
-    );
-    assert!(
-        matches!(transitions[1], XwaylandDndTransition::SourceFeedback { offer_id: current, .. } if current == replacement_offer_id)
-    );
-    assert!(
-        matches!(transitions[2], XwaylandDndTransition::SourceFinished { offer_id: current, accepted: true, .. } if current == replacement_offer_id)
     );
 }
 

@@ -33,10 +33,11 @@ pub use dnd_metadata::{
     MAX_XWAYLAND_DND_MIME_TYPE_BYTES, MAX_XWAYLAND_DND_MIME_TYPES, WaylandDndAction,
     XWAYLAND_DND_INCOMING_IDLE_TIMEOUT_NS, XwaylandDndAction, XwaylandDndAdapterId,
     XwaylandDndDataRequest, XwaylandDndFeedback, XwaylandDndIncomingEvent,
-    XwaylandDndIncomingTransferId, XwaylandDndMetadataError, XwaylandDndMimeCatalog,
-    XwaylandDndOffer, XwaylandDndOfferId, XwaylandDndOutbox, XwaylandDndSourceDataRequest,
-    XwaylandDndSourceProxyId, XwaylandDndSourceTransferId, XwaylandDndTransition,
-    XwaylandDndVersion, negotiate_incoming_root_version, unpack_root_coordinates,
+    XwaylandDndIncomingPositionId, XwaylandDndIncomingTransferId, XwaylandDndMetadataError,
+    XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId, XwaylandDndOutbox,
+    XwaylandDndSourceDataRequest, XwaylandDndSourceProxyId, XwaylandDndSourceTransferId,
+    XwaylandDndTransition, XwaylandDndVersion, negotiate_incoming_root_version,
+    unpack_root_coordinates,
 };
 pub use generation::XwaylandGeneration;
 pub use readiness::XwaylandReadinessSnapshot;

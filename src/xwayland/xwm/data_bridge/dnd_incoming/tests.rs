@@ -88,7 +88,7 @@ fn xwm_has_readable_bytes(xwm: &Xwm) -> bool {
 
 fn client_message(
     xwm: &Xwm,
-    target_proxy: Window,
+    logical_target: Window,
     message_type: XwmAtomName,
     data: [u32; 5],
 ) -> xproto::ClientMessageEvent {
@@ -96,7 +96,7 @@ fn client_message(
         response_type: xproto::CLIENT_MESSAGE_EVENT,
         format: 32,
         sequence: 0,
-        window: target_proxy,
+        window: logical_target,
         type_: xwm.atoms.get(message_type),
         data: xproto::ClientMessageData::from(data),
     }
@@ -105,6 +105,64 @@ fn client_message(
 fn inject_client_message(xwm: &mut Xwm, peer: &mut UnixStream, event: xproto::ClientMessageEvent) {
     peer.write_all(&event.serialize()).unwrap();
     assert_eq!(xwm.drain_events(8).unwrap().events_processed, 1);
+}
+
+fn status_messages(bytes: &[u8], xwm: &Xwm) -> Vec<(Window, [u32; 5])> {
+    bytes
+        .windows(32)
+        .filter(|event| {
+            event[0] & 0x7f == xproto::CLIENT_MESSAGE_EVENT
+                && u32::from_ne_bytes(event[8..12].try_into().unwrap())
+                    == xwm.atoms.get(XwmAtomName::XdndStatus)
+        })
+        .map(|event| {
+            let data = std::array::from_fn(|index| {
+                let start = 12 + index * 4;
+                u32::from_ne_bytes(event[start..start + 4].try_into().unwrap())
+            });
+            (u32::from_ne_bytes(event[4..8].try_into().unwrap()), data)
+        })
+        .collect()
+}
+
+fn inject_position(
+    xwm: &mut Xwm,
+    peer: &mut UnixStream,
+    source: Window,
+    timestamp: u32,
+    action: Atom,
+    packed_coordinates: u32,
+    server_sequence: u16,
+) {
+    let root = xwm.root;
+    let mut position = client_message(
+        xwm,
+        root,
+        XwmAtomName::XdndPosition,
+        [source, packed_coordinates, timestamp, action, 0],
+    );
+    position.sequence = server_sequence;
+    inject_client_message(xwm, peer, position);
+}
+
+fn inject_copy_position(
+    xwm: &mut Xwm,
+    peer: &mut UnixStream,
+    timestamp: u32,
+    x: i16,
+    server_sequence: u16,
+) {
+    let copy = xwm.atoms.get(XwmAtomName::XdndActionCopy);
+    let coordinates = (u32::from(x as u16) << 16) | u32::from((-7_i16) as u16);
+    inject_position(
+        xwm,
+        peer,
+        0x441,
+        timestamp,
+        copy,
+        coordinates,
+        server_sequence,
+    );
 }
 
 fn get_property_reply(sequence: u16, type_atom: Atom, format: u8, value: &[u8]) -> Vec<u8> {
@@ -203,7 +261,7 @@ fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Win
     let timestamp = 0x1234_5678;
     let enter = client_message(
         &xwm,
-        target_proxy,
+        xwm.root,
         XwmAtomName::XdndEnter,
         [source, 5 << 24, mime_atom, 0, 0],
     );
@@ -227,7 +285,7 @@ fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Win
     let packed = (12_i16 as u16 as u32) << 16 | (-7_i16 as u16 as u32);
     let position = client_message(
         &xwm,
-        target_proxy,
+        xwm.root,
         XwmAtomName::XdndPosition,
         [
             source,
@@ -284,13 +342,38 @@ fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Win
     )
 }
 
-fn start_fake_selection_transfer(
+fn begin_fake_selection_transfer(
     xwm: &mut Xwm,
     peer: &mut UnixStream,
     offer_id: XwaylandDndOfferId,
     mime_atom: Atom,
     timestamp: u32,
     server_sequence: &mut u16,
+) -> (
+    UnixStream,
+    crate::xwayland::XwaylandDndIncomingTransferId,
+    Window,
+    Atom,
+) {
+    begin_fake_selection_transfer_at(
+        xwm,
+        peer,
+        offer_id,
+        mime_atom,
+        timestamp,
+        server_sequence,
+        20,
+    )
+}
+
+fn begin_fake_selection_transfer_at(
+    xwm: &mut Xwm,
+    peer: &mut UnixStream,
+    offer_id: XwaylandDndOfferId,
+    mime_atom: Atom,
+    timestamp: u32,
+    server_sequence: &mut u16,
+    started_at_ns: u64,
 ) -> (
     UnixStream,
     crate::xwayland::XwaylandDndIncomingTransferId,
@@ -308,7 +391,7 @@ fn start_fake_selection_transfer(
             mime_type: "text/plain".to_owned(),
             sink: writer.into(),
         },
-        20,
+        started_at_ns,
     )
     .unwrap()
     .expect("exact live offer starts one incoming transfer");
@@ -320,13 +403,56 @@ fn start_fake_selection_transfer(
     assert_ne!(transfer.selection_timestamp, x11rb::CURRENT_TIME);
     let requestor = transfer.requestor;
     let property = transfer.property;
+    (reader, transfer_id, requestor, property)
+}
+
+fn start_fake_selection_transfer(
+    xwm: &mut Xwm,
+    peer: &mut UnixStream,
+    offer_id: XwaylandDndOfferId,
+    mime_atom: Atom,
+    timestamp: u32,
+    server_sequence: &mut u16,
+) -> (
+    UnixStream,
+    crate::xwayland::XwaylandDndIncomingTransferId,
+    Window,
+    Atom,
+) {
+    let (reader, transfer_id, requestor, property) =
+        begin_fake_selection_transfer(xwm, peer, offer_id, mime_atom, timestamp, server_sequence);
+    notify_fake_selection_transfer(
+        xwm,
+        peer,
+        transfer_id,
+        mime_atom,
+        timestamp,
+        requestor,
+        property,
+        *server_sequence,
+        server_sequence,
+    );
+    (reader, transfer_id, requestor, property)
+}
+
+fn notify_fake_selection_transfer(
+    xwm: &mut Xwm,
+    peer: &mut UnixStream,
+    transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
+    mime_atom: Atom,
+    timestamp: u32,
+    requestor: Window,
+    property: Atom,
+    event_sequence: u16,
+    server_sequence: &mut u16,
+) {
     peer.write_all(&selection_notify(
         requestor,
         xwm.atoms.get(XwmAtomName::XdndSelection),
         mime_atom,
         property,
         timestamp,
-        *server_sequence,
+        event_sequence,
     ))
     .unwrap();
     assert!(xwm.drain_events(32).unwrap().events_processed >= 1);
@@ -343,16 +469,25 @@ fn start_fake_selection_transfer(
             .any(|chunk| chunk[0] == xproto::GET_PROPERTY_REQUEST),
         "the fake server observes the pending XGetProperty request: {property_read:?}"
     );
-    (reader, transfer_id, requestor, property)
+    *server_sequence = server_sequence.wrapping_add(count_requests(&property_read));
 }
 
 #[test]
 fn fake_x_hover_status_direct_payload_and_leave_follow_the_incoming_bridge() {
-    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, target_proxy, mut server_sequence) =
+    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, _target_proxy, mut server_sequence) =
         fake_incoming_hover();
+    let position_id = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap()
+        .position_id;
     super::source_feedback(
         &mut xwm,
         offer_id,
+        position_id,
         Some("text/plain".to_owned()),
         Some(crate::xwayland::XwaylandDndAction::Copy),
     )
@@ -411,12 +546,7 @@ fn fake_x_hover_status_direct_payload_and_leave_follow_the_incoming_bridge() {
     );
     let _ = (requestor, property);
 
-    let leave = client_message(
-        &xwm,
-        target_proxy,
-        XwmAtomName::XdndLeave,
-        [0x441, 0, 0, 0, 0],
-    );
+    let leave = client_message(&xwm, xwm.root, XwmAtomName::XdndLeave, [0x441, 0, 0, 0, 0]);
     inject_client_message(&mut xwm, &mut peer, leave);
     assert!(xwm.data_bridge.dnd.incoming_session().is_none());
     assert!(matches!(
@@ -431,15 +561,491 @@ fn fake_x_hover_status_direct_payload_and_leave_follow_the_incoming_bridge() {
 }
 
 #[test]
-fn fake_x_hover_incr_payload_reads_next_chunk_only_after_sink_delivery() {
-    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, _target_proxy, mut server_sequence) =
+fn inbound_proxy_uses_root_as_logical_target_and_consumes_proxy_window_traffic() {
+    let (mut xwm, mut peer, offer_id, _, timestamp, target_proxy, _) = fake_incoming_hover();
+    let root = xwm.root;
+    let first_position = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    assert_ne!(root, target_proxy);
+    assert_eq!(
+        xwm.data_bridge
+            .dnd
+            .incoming_session()
+            .unwrap()
+            .logical_target_root,
+        root
+    );
+    assert_eq!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().target_proxy,
+        target_proxy
+    );
+
+    inject_copy_position(&mut xwm, &mut peer, timestamp + 1, 13, 0);
+    let second_position = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    assert_eq!(second_position.position_id.offer_id(), offer_id);
+    assert_ne!(second_position.position_id, first_position.position_id);
+    assert_eq!(second_position.timestamp, timestamp + 1);
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.take_events().as_slice(),
+        [XwaylandDndIncomingEvent::Position { position_id, .. }]
+            if *position_id == second_position.position_id
+    ));
+
+    let malformed_proxy_message = client_message(
+        &xwm,
+        target_proxy,
+        XwmAtomName::XdndPosition,
+        [
+            0x441,
+            0,
+            timestamp + 2,
+            xwm.atoms.get(XwmAtomName::XdndActionCopy),
+            0,
+        ],
+    );
+    assert!(!super::is_logical_root_target(
+        &xwm,
+        &malformed_proxy_message
+    ));
+    assert!(super::super::dnd::client_message(&mut xwm, malformed_proxy_message, 50).unwrap());
+    let unchanged = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    assert_eq!(unchanged.position_id, second_position.position_id);
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+    xwm.connection.flush().unwrap();
+    assert!(status_messages(&read_peer(&mut peer), &xwm).is_empty());
+}
+
+#[test]
+fn first_unsupported_position_sends_one_root_targeted_rejection_without_begin() {
+    let generation = XwaylandGeneration::new(NonZeroU64::new(82).unwrap());
+    let (mut xwm, mut peer) = super::super::super::test_fixture_for_tests(generation);
+    super::initialize_target_proxy(&mut xwm).unwrap();
+    xwm.connection.flush().unwrap();
+    let _proxy_setup = read_peer(&mut peer);
+
+    let source = 0x442;
+    let enter = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndEnter,
+        [source, 5 << 24, 0x552, 0, 0],
+    );
+    inject_client_message(&mut xwm, &mut peer, enter);
+    let offer_id = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .expect("Enter creates the provisional source session")
+        .offer_id;
+
+    let unsupported_action = 0xfeed_cafe;
+    inject_position(
+        &mut xwm,
+        &mut peer,
+        source,
+        0x1234,
+        unsupported_action,
+        0,
+        0,
+    );
+    xwm.connection.flush().unwrap();
+    let statuses = status_messages(&read_peer(&mut peer), &xwm);
+    assert_eq!(statuses.len(), 1);
+    let (recipient, data) = statuses[0];
+    assert_eq!(recipient, source);
+    assert_eq!(data[0], xwm.root);
+    assert_eq!(data[1] & 1, 0, "unsupported action must be rejected");
+    assert_eq!(data[4], 0, "rejection has no fabricated action atom");
+    let session = xwm.data_bridge.dnd.incoming_session().unwrap();
+    assert_eq!(session.offer_id, offer_id);
+    assert!(session.latest_position.is_none());
+    assert!(!session.canonical_started);
+    assert!(!session.status_pending);
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+}
+
+#[test]
+fn status_action_compatibility_is_typed_and_rejects_illegal_fallbacks() {
+    use crate::xwayland::XwaylandDndAction as Action;
+
+    let cases = [
+        (Action::Copy, Action::Copy, vec![Action::Copy], true),
+        (
+            Action::Copy,
+            Action::Move,
+            vec![Action::Copy, Action::Move],
+            false,
+        ),
+        (Action::Move, Action::Move, vec![Action::Move], true),
+        (
+            Action::Move,
+            Action::Copy,
+            vec![Action::Move, Action::Copy],
+            true,
+        ),
+        (
+            Action::Move,
+            Action::Ask,
+            vec![Action::Move, Action::Ask, Action::Copy],
+            false,
+        ),
+        (
+            Action::Ask,
+            Action::Ask,
+            vec![Action::Ask, Action::Copy],
+            true,
+        ),
+        (
+            Action::Ask,
+            Action::Copy,
+            vec![Action::Ask, Action::Copy],
+            true,
+        ),
+        (
+            Action::Ask,
+            Action::Move,
+            vec![Action::Ask, Action::Move, Action::Copy],
+            false,
+        ),
+        (Action::Link, Action::Copy, vec![Action::Copy], true),
+        (Action::Private, Action::Copy, vec![Action::Copy], true),
+    ];
+
+    for (requested, selected, source_actions, accepted) in cases {
+        let (mut xwm, mut peer, offer_id, _, _, _, _) = fake_incoming_hover();
+        let position_id = {
+            let session = xwm.data_bridge.dnd.incoming_session_mut().unwrap();
+            let mut position = session.latest_position.unwrap();
+            position.requested_action = requested;
+            session.latest_position = Some(position);
+            session.source_actions = source_actions;
+            position.position_id
+        };
+        super::source_feedback(
+            &mut xwm,
+            offer_id,
+            position_id,
+            Some("text/plain".to_owned()),
+            Some(selected),
+        )
+        .unwrap();
+        xwm.connection.flush().unwrap();
+        let statuses = status_messages(&read_peer(&mut peer), &xwm);
+        assert_eq!(statuses.len(), 1, "{requested:?} with {selected:?}");
+        let (recipient, data) = statuses[0];
+        assert_eq!(recipient, 0x441);
+        assert_eq!(data[0], xwm.root);
+        assert_eq!(
+            data[1] & 1 != 0,
+            accepted,
+            "{requested:?} with {selected:?}"
+        );
+        let expected_atom = if accepted {
+            match selected {
+                Action::Copy => xwm.atoms.get(XwmAtomName::XdndActionCopy),
+                Action::Move => xwm.atoms.get(XwmAtomName::XdndActionMove),
+                Action::Ask => xwm.atoms.get(XwmAtomName::XdndActionAsk),
+                Action::Link | Action::Private => unreachable!("unrepresentable XdndStatus action"),
+            }
+        } else {
+            0
+        };
+        assert_eq!(data[4], expected_atom, "{requested:?} with {selected:?}");
+    }
+}
+
+#[test]
+fn direct_selection_conversion_survives_a_later_position() {
+    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, _, mut server_sequence) =
         fake_incoming_hover();
-    let (mut reader, transfer_id, requestor, property) = start_fake_selection_transfer(
+    let p1 = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    let (mut reader, transfer_id, requestor, property) = begin_fake_selection_transfer(
         &mut xwm,
         &mut peer,
         offer_id,
         mime_atom,
         timestamp,
+        &mut server_sequence,
+    );
+
+    inject_copy_position(&mut xwm, &mut peer, timestamp + 1, 22, server_sequence);
+    let p2 = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    assert_ne!(p1.position_id, p2.position_id);
+    assert_eq!(p2.timestamp, timestamp + 1);
+    assert_eq!(
+        xwm.data_bridge.dnd_incoming.transfers[&transfer_id].selection_timestamp,
+        timestamp
+    );
+
+    notify_fake_selection_transfer(
+        &mut xwm,
+        &mut peer,
+        transfer_id,
+        mime_atom,
+        timestamp,
+        requestor,
+        property,
+        server_sequence,
+        &mut server_sequence,
+    );
+    let sequence = xwm.data_bridge.dnd_incoming.transfers[&transfer_id]
+        .pending_reply
+        .unwrap() as u16;
+    peer.write_all(&get_property_reply(sequence, mime_atom, 8, b"P1 direct"))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let mut received = [0; 9];
+    reader.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"P1 direct");
+    assert!(
+        !xwm.data_bridge
+            .dnd_incoming
+            .transfers
+            .contains_key(&transfer_id)
+    );
+}
+
+#[test]
+fn replacement_enter_retires_transfer_before_late_selection_notify() {
+    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, _, mut server_sequence) =
+        fake_incoming_hover();
+    let (_, transfer_id, requestor, property) = begin_fake_selection_transfer(
+        &mut xwm,
+        &mut peer,
+        offer_id,
+        mime_atom,
+        timestamp,
+        &mut server_sequence,
+    );
+    let replacement_source = 0x442;
+    let replacement_enter = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndEnter,
+        [replacement_source, 5 << 24, 0x552, 0, 0],
+    );
+    inject_client_message(&mut xwm, &mut peer, replacement_enter);
+    let replacement = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .expect("replacement Enter owns the new session")
+        .offer_id;
+    assert_ne!(replacement, offer_id);
+    assert!(
+        !xwm.data_bridge
+            .dnd_incoming
+            .transfers
+            .contains_key(&transfer_id)
+    );
+    xwm.connection.flush().unwrap();
+    let replacement_requests = take_requests(&mut peer, &mut server_sequence);
+    assert!(!replacement_requests.is_empty());
+
+    let stale_position =
+        crate::xwayland::XwaylandDndIncomingPositionId::new(offer_id, NonZeroU64::new(1).unwrap());
+    super::source_feedback(
+        &mut xwm,
+        offer_id,
+        stale_position,
+        Some("text/plain".to_owned()),
+        Some(crate::xwayland::XwaylandDndAction::Copy),
+    )
+    .unwrap();
+    xwm.connection.flush().unwrap();
+    assert!(
+        read_peer(&mut peer).is_empty(),
+        "old offer feedback is inert"
+    );
+
+    peer.write_all(&selection_notify(
+        requestor,
+        xwm.atoms.get(XwmAtomName::XdndSelection),
+        mime_atom,
+        property,
+        timestamp,
+        server_sequence,
+    ))
+    .unwrap();
+    let _ = xwm.drain_events(32).unwrap();
+    assert_eq!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().offer_id,
+        replacement
+    );
+    assert!(
+        !xwm.data_bridge
+            .dnd_incoming
+            .transfers
+            .contains_key(&transfer_id)
+    );
+    xwm.connection.flush().unwrap();
+    let late_requests = read_peer(&mut peer);
+    assert!(
+        !late_requests
+            .chunks_exact(4)
+            .any(|chunk| chunk[0] == xproto::GET_PROPERTY_REQUEST)
+    );
+}
+
+#[test]
+fn timeout_then_p2_feedback_keeps_p1_selection_authority_separate() {
+    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, _, mut server_sequence) =
+        fake_incoming_hover();
+    let p1 = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    let status_deadline = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .pending_status_deadline_ns
+        .unwrap();
+    let transfer_started_at = status_deadline.saturating_sub(super::TARGET_STATUS_TIMEOUT_NS);
+    let (mut reader, transfer_id, requestor, property) = begin_fake_selection_transfer_at(
+        &mut xwm,
+        &mut peer,
+        offer_id,
+        mime_atom,
+        timestamp,
+        &mut server_sequence,
+        transfer_started_at,
+    );
+
+    super::expire_deadlines(&mut xwm, status_deadline).unwrap();
+    xwm.connection.flush().unwrap();
+    let timeout_status = read_peer(&mut peer);
+    let statuses = status_messages(&timeout_status, &xwm);
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].1[0], xwm.root);
+    assert_eq!(statuses[0].1[1] & 1, 0, "P1 deadline rejects P1");
+    server_sequence = server_sequence.wrapping_add(count_requests(&timeout_status));
+
+    inject_copy_position(&mut xwm, &mut peer, timestamp + 1, 31, server_sequence);
+    let p2 = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap();
+    assert_ne!(p1.position_id, p2.position_id);
+    assert_eq!(p2.timestamp, timestamp + 1);
+
+    super::source_feedback(
+        &mut xwm,
+        offer_id,
+        p1.position_id,
+        Some("text/plain".to_owned()),
+        Some(crate::xwayland::XwaylandDndAction::Copy),
+    )
+    .unwrap();
+    xwm.connection.flush().unwrap();
+    assert!(
+        read_peer(&mut peer).is_empty(),
+        "late SourceFeedback(P1) cannot answer pending P2"
+    );
+
+    notify_fake_selection_transfer(
+        &mut xwm,
+        &mut peer,
+        transfer_id,
+        mime_atom,
+        timestamp,
+        requestor,
+        property,
+        server_sequence,
+        &mut server_sequence,
+    );
+    assert_eq!(
+        xwm.data_bridge.dnd_incoming.transfers[&transfer_id].phase,
+        IncomingTransferPhase::ReadingProperty,
+        "P1's original SelectionNotify remains authorized after P2"
+    );
+    let sequence = xwm.data_bridge.dnd_incoming.transfers[&transfer_id]
+        .pending_reply
+        .unwrap() as u16;
+    peer.write_all(&get_property_reply(sequence, mime_atom, 8, b"P1 payload"))
+        .unwrap();
+    xwm.drain_events(32).unwrap();
+    let mut received = [0; 10];
+    reader.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"P1 payload");
+
+    super::source_feedback(
+        &mut xwm,
+        offer_id,
+        p2.position_id,
+        Some("text/plain".to_owned()),
+        Some(crate::xwayland::XwaylandDndAction::Copy),
+    )
+    .unwrap();
+    xwm.connection.flush().unwrap();
+    let p2_status = status_messages(&read_peer(&mut peer), &xwm);
+    assert_eq!(p2_status.len(), 1);
+    assert_eq!(p2_status[0].1[0], xwm.root);
+    assert_eq!(p2_status[0].1[1] & 1, 1, "P2 receives its own acceptance");
+    assert_eq!(
+        p2_status[0].1[4],
+        xwm.atoms.get(XwmAtomName::XdndActionCopy)
+    );
+}
+
+#[test]
+fn fake_x_hover_incr_payload_reads_next_chunk_only_after_sink_delivery() {
+    let (mut xwm, mut peer, offer_id, mime_atom, timestamp, _target_proxy, mut server_sequence) =
+        fake_incoming_hover();
+    let (mut reader, transfer_id, requestor, property) = begin_fake_selection_transfer(
+        &mut xwm,
+        &mut peer,
+        offer_id,
+        mime_atom,
+        timestamp,
+        &mut server_sequence,
+    );
+    inject_copy_position(&mut xwm, &mut peer, timestamp + 1, 44, server_sequence);
+    notify_fake_selection_transfer(
+        &mut xwm,
+        &mut peer,
+        transfer_id,
+        mime_atom,
+        timestamp,
+        requestor,
+        property,
+        server_sequence,
         &mut server_sequence,
     );
     let incr = xwm.atoms.get(XwmAtomName::Incr);
@@ -534,22 +1140,41 @@ fn incoming_positions_coalesce_only_for_the_exact_offer() {
     let generation = XwaylandGeneration::new(NonZeroU64::new(9).unwrap());
     let first = offer_id(generation, 1);
     let second = offer_id(generation, 2);
+    let first_survivor =
+        crate::xwayland::XwaylandDndIncomingPositionId::new(first, NonZeroU64::new(2).unwrap());
+    let replacement_position =
+        crate::xwayland::XwaylandDndIncomingPositionId::new(second, NonZeroU64::new(1).unwrap());
+    assert_ne!(
+        crate::xwayland::XwaylandDndIncomingPositionId::new(first, NonZeroU64::new(1).unwrap(),),
+        replacement_position,
+        "the same serial remains distinct across replacement offers"
+    );
     let mut manager = DndIncomingManager::default();
-    let event = |offer_id, x| XwaylandDndIncomingEvent::Position {
+    let event = |offer_id, position_id, x| XwaylandDndIncomingEvent::Position {
         offer_id,
+        position_id,
         x,
         y: 4.0,
         requested_action: crate::xwayland::XwaylandDndAction::Copy,
         source_actions: vec![crate::xwayland::XwaylandDndAction::Copy],
         x_timestamp: x as u32,
     };
-    assert!(manager.push_event(event(first, 1.0)));
-    assert!(manager.push_event(event(first, 2.0)));
-    assert!(manager.push_event(event(second, 3.0)));
+    assert!(manager.push_event(event(
+        first,
+        crate::xwayland::XwaylandDndIncomingPositionId::new(first, NonZeroU64::new(1).unwrap(),),
+        1.0,
+    )));
+    assert!(manager.push_event(event(first, first_survivor, 2.0)));
+    assert!(manager.push_event(event(second, replacement_position, 3.0)));
     assert_eq!(manager.events.len(), 2);
     assert!(matches!(
         manager.events.front(),
         Some(XwaylandDndIncomingEvent::Position { x: 2.0, .. })
+    ));
+    assert!(matches!(
+        manager.events.get(1),
+        Some(XwaylandDndIncomingEvent::Position { position_id, .. })
+            if *position_id == replacement_position
     ));
 }
 
@@ -569,6 +1194,10 @@ fn incoming_mailbox_reserves_terminal_leave_capacity_for_each_begin() {
     let mut manager = DndIncomingManager::default();
     assert!(manager.push_event(XwaylandDndIncomingEvent::Begin {
         offer,
+        position_id: crate::xwayland::XwaylandDndIncomingPositionId::new(
+            first_id,
+            NonZeroU64::new(1).unwrap(),
+        ),
         x: 0.0,
         y: 0.0,
         requested_action: crate::xwayland::XwaylandDndAction::Copy,
@@ -578,6 +1207,10 @@ fn incoming_mailbox_reserves_terminal_leave_capacity_for_each_begin() {
         let id = offer_id(generation, serial);
         assert!(manager.push_event(XwaylandDndIncomingEvent::Position {
             offer_id: id,
+            position_id: crate::xwayland::XwaylandDndIncomingPositionId::new(
+                id,
+                NonZeroU64::new(1).unwrap(),
+            ),
             x: serial as f64,
             y: 0.0,
             requested_action: crate::xwayland::XwaylandDndAction::Copy,

@@ -1116,6 +1116,7 @@ mod tests {
             action_list_queried: false,
             action_list_complete: true,
             latest_position: None,
+            next_position_serial: 0,
             canonical_started: false,
             pending_status_deadline_ns: None,
             status_pending: false,

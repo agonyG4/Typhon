@@ -322,6 +322,7 @@ impl CompositorState {
         self.active_drag = Some(ActiveDrag {
             id,
             xwayland_dnd_generation: origin.xwayland_offer().map(|offer| offer.id().generation()),
+            xwayland_incoming_position_id: None,
             origin,
             lifecycle_driver,
             icon_surface,
@@ -730,10 +731,13 @@ impl CompositorState {
                             None
                         }
                         ActiveDragOrigin::Xwayland { offer } => {
-                            Some(crate::xwayland::XwaylandDndTransition::SourceFeedback {
-                                offer_id: offer.id(),
-                                accepted_mime: None,
-                                action: None,
+                            active.xwayland_incoming_position_id.map(|position_id| {
+                                crate::xwayland::XwaylandDndTransition::SourceFeedback {
+                                    offer_id: offer.id(),
+                                    position_id,
+                                    accepted_mime: None,
+                                    action: None,
+                                }
                             })
                         }
                         ActiveDragOrigin::WaylandSource { .. }
@@ -781,6 +785,7 @@ impl CompositorState {
             .cloned();
         let source = active.origin.wayland_source().cloned();
         let xwayland_offer_id = active.origin.xwayland_offer().map(|offer| offer.id());
+        let xwayland_position_id = active.xwayland_incoming_position_id;
         let xwayland_action = active
             .target_action
             .or_else(|| xdnd_action_from_wayland_mask(active.selected_action));
@@ -791,8 +796,9 @@ impl CompositorState {
         let send_source = source.as_ref().is_some_and(|source| {
             source.version() >= 3 && active.last_source_action != Some(action)
         });
-        let send_xwayland =
-            xwayland_offer_id.is_some() && active.last_source_action != Some(action);
+        let send_xwayland = xwayland_offer_id.is_some()
+            && xwayland_position_id.is_some()
+            && active.last_source_action != Some(action);
         if let Some(active) = self.active_drag.as_mut() {
             if send_offer {
                 active.last_offer_action = Some(action);
@@ -819,10 +825,13 @@ impl CompositorState {
                 .dnd_source_action_events
                 .saturating_add(1);
         }
-        if send_xwayland && let Some(offer_id) = xwayland_offer_id {
+        if send_xwayland
+            && let (Some(offer_id), Some(position_id)) = (xwayland_offer_id, xwayland_position_id)
+        {
             let _ = self.queue_xwayland_dnd_transition(
                 crate::xwayland::XwaylandDndTransition::SourceFeedback {
                     offer_id,
+                    position_id,
                     accepted_mime,
                     action: xwayland_action,
                 },
@@ -854,10 +863,13 @@ impl CompositorState {
                     None
                 }
                 ActiveDragOrigin::Xwayland { offer } => {
-                    Some(crate::xwayland::XwaylandDndTransition::SourceFeedback {
-                        offer_id: offer.id(),
-                        accepted_mime: mime_type,
-                        action: xdnd_action_from_wayland_mask(active.selected_action),
+                    active.xwayland_incoming_position_id.map(|position_id| {
+                        crate::xwayland::XwaylandDndTransition::SourceFeedback {
+                            offer_id: offer.id(),
+                            position_id,
+                            accepted_mime: mime_type,
+                            action: xdnd_action_from_wayland_mask(active.selected_action),
+                        }
                     })
                 }
                 ActiveDragOrigin::WaylandSource { .. }

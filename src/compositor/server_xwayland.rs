@@ -84,6 +84,7 @@ impl OwnCompositorServer {
         match event {
             crate::xwayland::XwaylandDndIncomingEvent::Begin {
                 offer,
+                position_id,
                 x,
                 y,
                 requested_action: _,
@@ -94,10 +95,14 @@ impl OwnCompositorServer {
                     return false;
                 }
                 self.state
-                    .update_incoming_xwayland_drag_position(offer_id, x, y)
+                    .update_xwayland_drag_position_id(offer_id, position_id)
+                    && self
+                        .state
+                        .update_incoming_xwayland_drag_position(offer_id, x, y)
             }
             crate::xwayland::XwaylandDndIncomingEvent::Position {
                 offer_id,
+                position_id,
                 x,
                 y,
                 requested_action: _,
@@ -105,7 +110,10 @@ impl OwnCompositorServer {
                 x_timestamp: _,
             } => {
                 self.state
-                    .update_xwayland_drag_source_actions(offer_id, source_actions)
+                    .update_xwayland_drag_position_id(offer_id, position_id)
+                    && self
+                        .state
+                        .update_xwayland_drag_source_actions(offer_id, source_actions)
                     && self
                         .state
                         .update_incoming_xwayland_drag_position(offer_id, x, y)

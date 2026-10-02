@@ -223,11 +223,9 @@ pub(crate) fn apply_transitions(
                     retire_session_for_canonical_retirement(xwm, id)?;
                 }
             }
-            XwaylandDndTransition::SourceFeedback {
-                offer_id,
-                accepted_mime,
-                action,
-            } => super::dnd_incoming::source_feedback(xwm, offer_id, accepted_mime, action)?,
+            feedback @ XwaylandDndTransition::SourceFeedback { .. } => {
+                super::dnd_incoming::apply_source_feedback_transition(xwm, feedback)?
+            }
             XwaylandDndTransition::SourceFinished { .. } => {}
         }
     }

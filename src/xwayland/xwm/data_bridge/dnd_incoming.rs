@@ -16,7 +16,8 @@ use x11rb::{
 
 use super::super::{X11WindowHandle, XwaylandGeneration, Xwm, XwmError, atoms::XwmAtomName};
 use crate::xwayland::{
-    MAX_PENDING_XWAYLAND_DND_INCOMING_EVENTS, XwaylandDndIncomingEvent, XwaylandDndOfferId,
+    MAX_PENDING_XWAYLAND_DND_INCOMING_EVENTS, XwaylandDndIncomingEvent,
+    XwaylandDndIncomingPositionId, XwaylandDndOfferId,
 };
 
 pub(crate) const TARGET_STATUS_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -34,8 +35,10 @@ const MAX_EINTR_RETRIES_PER_DISPATCH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct IncomingPosition {
+    pub(crate) position_id: XwaylandDndIncomingPositionId,
     pub(crate) root_x: f64,
     pub(crate) root_y: f64,
+    /// Exact X timestamp used for XdndSelection conversion authority.
     pub(crate) timestamp: u32,
     pub(crate) requested_action: crate::xwayland::XwaylandDndAction,
 }
@@ -64,6 +67,7 @@ pub(crate) struct IncomingDndSession {
     pub(crate) action_list_queried: bool,
     pub(crate) action_list_complete: bool,
     pub(crate) latest_position: Option<IncomingPosition>,
+    pub(crate) next_position_serial: u64,
     pub(crate) canonical_started: bool,
     pub(crate) pending_status_deadline_ns: Option<u64>,
     pub(crate) status_pending: bool,
@@ -486,8 +490,14 @@ pub(crate) fn release_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
     }
 }
 
-pub(crate) fn owns_message_target(xwm: &Xwm, message: &xproto::ClientMessageEvent) -> bool {
-    target_proxy(xwm) == Some(message.window)
+pub(crate) fn is_logical_root_target(xwm: &Xwm, message: &xproto::ClientMessageEvent) -> bool {
+    target_proxy(xwm).is_some() && message.window == xwm.root
+}
+
+fn is_internal_proxy_target(xwm: &Xwm, message: &xproto::ClientMessageEvent) -> bool {
+    target_proxy(xwm).is_some_and(|proxy| {
+        proxy == message.window && xwm.data_bridge.dnd.internal_windows.contains(&proxy)
+    })
 }
 
 pub(crate) fn is_exact_source(
@@ -557,10 +567,14 @@ pub(crate) fn client_message(
     if !is_incoming {
         return Ok(false);
     }
-    // These messages are consumed before generic ClientMessage normalization,
-    // including malformed or misaddressed messages, so a source XID can never
-    // be adopted as an ordinary DesktopWindow through XDND traffic.
-    if !owns_message_target(xwm, &event) {
+    // A conforming root-proxy source sends to the proxy but keeps the actual
+    // logical target in ClientMessage.window. The proxy XID is infrastructure,
+    // never the protocol target. Consume malformed traffic addressed to our
+    // private proxy before generic application-window adoption.
+    if is_internal_proxy_target(xwm, &event) {
+        return Ok(true);
+    }
+    if !is_logical_root_target(xwm, &event) {
         return Ok(false);
     }
     if event.format != 32 {
@@ -588,7 +602,11 @@ mod transfer;
 
 #[cfg(test)]
 use metadata::representable_source_actions;
-pub(crate) use metadata::{expire_deadlines, next_deadline_ns, poll_replies, source_feedback};
+#[cfg(test)]
+pub(crate) use metadata::source_feedback;
+pub(crate) use metadata::{
+    apply_source_feedback_transition, expire_deadlines, next_deadline_ns, poll_replies,
+};
 pub(crate) use transfer::{
     canonical_retired, handle_sink_ready, property_notify, requestor_destroyed, selection_notify,
     source_destroyed, start_data_request,

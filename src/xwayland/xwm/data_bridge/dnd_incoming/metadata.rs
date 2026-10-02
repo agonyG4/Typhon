@@ -61,6 +61,7 @@ pub(super) fn begin_enter(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<
         action_list_queried: false,
         action_list_complete: true,
         latest_position: None,
+        next_position_serial: 0,
         canonical_started: false,
         pending_status_deadline_ns: None,
         status_pending: false,
@@ -214,8 +215,12 @@ pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(),
     }
     let offer_id = session.offer_id;
     let (x, y) = crate::xwayland::unpack_root_coordinates(data[1]);
+    let Some(position_id) = allocate_position_id(xwm, offer_id) else {
+        retire_incoming(xwm, offer_id);
+        return Ok(());
+    };
     let Some(requested_action) = action_from_atom(xwm, data[3]) else {
-        send_status(xwm, offer_id, false, None)?;
+        send_rejected_wire_position(xwm, offer_id)?;
         return Ok(());
     };
     if let Some(session) = xwm
@@ -225,6 +230,7 @@ pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(),
         .filter(|session| session.offer_id == offer_id)
     {
         session.latest_position = Some(IncomingPosition {
+            position_id,
             root_x: x,
             root_y: y,
             timestamp: data[2],
@@ -255,6 +261,69 @@ pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(),
         issue_property_read(xwm, offer_id, XwmAtomName::XdndActionList, PendingPropertyKind::ActionList)?;
     }
     settle_metadata_and_position(xwm, offer_id, now_ns)
+}
+
+fn allocate_position_id(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+) -> Option<crate::xwayland::XwaylandDndIncomingPositionId> {
+    let session = xwm
+        .data_bridge
+        .dnd
+        .incoming_session_mut()
+        .filter(|session| session.offer_id == offer_id && session.generation == xwm.generation)?;
+    session.next_position_serial = session.next_position_serial.checked_add(1)?;
+    std::num::NonZeroU64::new(session.next_position_serial)
+        .map(|serial| crate::xwayland::XwaylandDndIncomingPositionId::new(offer_id, serial))
+}
+
+fn send_rejected_wire_position(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+) -> Result<(), XwmError> {
+    let Some((source, logical_target_root)) = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .filter(|session| {
+            session.offer_id == offer_id
+                && session.generation == xwm.generation
+                && session.logical_target_root == xwm.root
+                && Some(session.target_proxy) == target_proxy(xwm)
+        })
+        .map(|session| (session.source.xid(), session.logical_target_root))
+    else {
+        return Ok(());
+    };
+    let event = xproto::ClientMessageEvent::new(
+        32,
+        source,
+        xwm.atoms.get(XwmAtomName::XdndStatus),
+        [
+            logical_target_root,
+            XDND_STATUS_WANT_POSITION_UPDATES,
+            0,
+            0,
+            0,
+        ],
+    );
+    let cookie = xwm
+        .connection
+        .send_event(false, source, xproto::EventMask::NO_EVENT, event)
+        .map_err(XwmError::Connection)?;
+    std::mem::forget(cookie);
+    if let Some(session) = xwm
+        .data_bridge
+        .dnd
+        .incoming_session_mut()
+        .filter(|session| session.offer_id == offer_id)
+    {
+        session.status_pending = false;
+        session.pending_status_deadline_ns = None;
+        session.accepted_mime = None;
+        session.selected_action = None;
+    }
+    Ok(())
 }
 
 fn action_from_atom(xwm: &Xwm, atom: Atom) -> Option<crate::xwayland::XwaylandDndAction> {
@@ -352,12 +421,12 @@ fn settle_metadata_and_position(
         return Ok(());
     };
     if mime_types.is_empty() {
-        send_status(xwm, offer_id, false, None)?;
+        send_status(xwm, offer_id, position.position_id, false, None)?;
         return Ok(());
     }
     let actions = representable_source_actions(position.requested_action, &available_actions);
     if actions.is_empty() {
-        send_status(xwm, offer_id, false, None)?;
+        send_status(xwm, offer_id, position.position_id, false, None)?;
         return Ok(());
     }
     let catalog = match crate::xwayland::XwaylandDndMimeCatalog::try_new(mime_types.clone()) {
@@ -379,6 +448,7 @@ fn settle_metadata_and_position(
         if !xwm.data_bridge.dnd_incoming.push_event(
             crate::xwayland::XwaylandDndIncomingEvent::Position {
                 offer_id,
+                position_id: position.position_id,
                 x: position.root_x,
                 y: position.root_y,
                 requested_action: position.requested_action,
@@ -401,6 +471,7 @@ fn settle_metadata_and_position(
         .dnd_incoming
         .push_event(crate::xwayland::XwaylandDndIncomingEvent::Begin {
             offer,
+            position_id: position.position_id,
             x: position.root_x,
             y: position.root_y,
             requested_action: position.requested_action,
@@ -463,13 +534,14 @@ pub(super) fn leave_offer(xwm: &mut Xwm, offer_id: XwaylandDndOfferId) -> bool {
 }
 
 fn retire_incoming(xwm: &mut Xwm, offer_id: XwaylandDndOfferId) -> bool {
-    if xwm
+    let pending_position = xwm
         .data_bridge
         .dnd
         .incoming_session()
-        .is_some_and(|session| session.offer_id == offer_id && session.status_pending)
-    {
-        let _ = send_status(xwm, offer_id, false, None);
+        .filter(|session| session.offer_id == offer_id && session.status_pending)
+        .and_then(|session| session.latest_position.map(|position| position.position_id));
+    if let Some(position_id) = pending_position {
+        let _ = send_status(xwm, offer_id, position_id, false, None);
     }
     let canonical_started = xwm
         .data_bridge
@@ -538,42 +610,42 @@ pub(super) fn cancel_metadata_replies(xwm: &mut Xwm, offer_id: Option<XwaylandDn
 fn send_status(
     xwm: &mut Xwm,
     offer_id: XwaylandDndOfferId,
+    position_id: crate::xwayland::XwaylandDndIncomingPositionId,
     accepted: bool,
     action: Option<crate::xwayland::XwaylandDndAction>,
 ) -> Result<(), XwmError> {
-    let Some(session) = xwm
-        .data_bridge
-        .dnd
-        .incoming_session()
-        .filter(|session| session.offer_id == offer_id)
-    else {
+    let Some(session) = xwm.data_bridge.dnd.incoming_session().filter(|session| {
+        session.offer_id == offer_id
+            && session.generation == xwm.generation
+            && position_id.offer_id() == offer_id
+            && session.status_pending
+            && session.logical_target_root == xwm.root
+            && Some(session.target_proxy) == target_proxy(xwm)
+    }) else {
         return Ok(());
     };
-    let Some(position) = session.latest_position else {
+    let Some(position) = session
+        .latest_position
+        .filter(|position| position.position_id == position_id)
+    else {
         return Ok(());
     };
     let valid_action = action.filter(|action| {
         use crate::xwayland::XwaylandDndAction as Action;
-        match position.requested_action {
-            Action::Copy => *action == Action::Copy,
-            Action::Move | Action::Ask => {
-                matches!(*action, Action::Move | Action::Ask | Action::Copy)
-                    && (session.source_actions.contains(action)
-                        || (position.requested_action == Action::Move && *action == Action::Copy))
+        match (position.requested_action, *action) {
+            (Action::Copy, Action::Copy) => true,
+            (Action::Move, Action::Move) => session.source_actions.contains(action),
+            // A canonical Wayland target may choose Copy as XDND's permitted
+            // fallback for a source that requested Move.
+            (Action::Move, Action::Copy) => true,
+            (Action::Ask, Action::Ask | Action::Copy) => session.source_actions.contains(action),
+            (Action::Link | Action::Private, Action::Copy) => {
+                session.source_actions.contains(&Action::Copy)
             }
-            Action::Link | Action::Private => *action == Action::Copy,
+            _ => false,
         }
     });
-    let accepted = accepted
-        && session.accepted_mime.is_some()
-        && valid_action.is_some()
-        && !matches!(
-            valid_action,
-            Some(
-                crate::xwayland::XwaylandDndAction::Link
-                    | crate::xwayland::XwaylandDndAction::Private
-            )
-        );
+    let accepted = accepted && session.accepted_mime.is_some() && valid_action.is_some();
     let selected_atom = if accepted {
         match valid_action {
             Some(crate::xwayland::XwaylandDndAction::Copy) => {
@@ -595,7 +667,7 @@ fn send_status(
         session.source.xid(),
         xwm.atoms.get(XwmAtomName::XdndStatus),
         [
-            xwm.root,
+            session.logical_target_root,
             u32::from(accepted) | XDND_STATUS_WANT_POSITION_UPDATES,
             0,
             0,
@@ -616,7 +688,12 @@ fn send_status(
         .data_bridge
         .dnd
         .incoming_session_mut()
-        .filter(|session| session.offer_id == offer_id)
+        .filter(|session| {
+            session.offer_id == offer_id
+                && session
+                    .latest_position
+                    .is_some_and(|position| position.position_id == position_id)
+        })
     {
         session.status_pending = false;
         session.pending_status_deadline_ns = None;
@@ -840,9 +917,13 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
                     .pending_status_deadline_ns
                     .is_some_and(|deadline| now_ns >= deadline)
         })
-        .map(|session| session.offer_id);
-    if let Some(offer_id) = status_timeout {
-        send_status(xwm, offer_id, false, None)?;
+        .and_then(|session| {
+            session
+                .latest_position
+                .map(|position| (session.offer_id, position.position_id))
+        });
+    if let Some((offer_id, position_id)) = status_timeout {
+        send_status(xwm, offer_id, position_id, false, None)?;
     }
     let expired = xwm
         .data_bridge
@@ -902,6 +983,7 @@ pub(crate) fn next_deadline_ns(xwm: &Xwm) -> Option<u64> {
 pub(crate) fn source_feedback(
     xwm: &mut Xwm,
     offer_id: XwaylandDndOfferId,
+    position_id: crate::xwayland::XwaylandDndIncomingPositionId,
     accepted_mime: Option<String>,
     action: Option<crate::xwayland::XwaylandDndAction>,
 ) -> Result<(), XwmError> {
@@ -910,7 +992,15 @@ pub(crate) fn source_feedback(
             .data_bridge
             .dnd
             .incoming_session_mut()
-            .filter(|session| session.offer_id == offer_id && session.canonical_started)
+            .filter(|session| {
+                session.offer_id == offer_id
+                    && session.generation == xwm.generation
+                    && session.canonical_started
+                    && position_id.offer_id() == offer_id
+                    && session
+                        .latest_position
+                        .is_some_and(|position| position.position_id == position_id)
+            })
         else {
             return Ok(());
         };
@@ -926,7 +1016,29 @@ pub(crate) fn source_feedback(
         )
     };
     if feedback_is_complete || explicit_rejection {
-        send_status(xwm, offer_id, feedback_is_complete, selected_action)?;
+        send_status(
+            xwm,
+            offer_id,
+            position_id,
+            feedback_is_complete,
+            selected_action,
+        )?;
     }
     Ok(())
+}
+
+pub(crate) fn apply_source_feedback_transition(
+    xwm: &mut Xwm,
+    transition: crate::xwayland::XwaylandDndTransition,
+) -> Result<(), XwmError> {
+    let crate::xwayland::XwaylandDndTransition::SourceFeedback {
+        offer_id,
+        position_id,
+        accepted_mime,
+        action,
+    } = transition
+    else {
+        return Ok(());
+    };
+    source_feedback(xwm, offer_id, position_id, accepted_mime, action)
 }

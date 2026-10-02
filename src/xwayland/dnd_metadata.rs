@@ -63,6 +63,28 @@ impl XwaylandDndOfferId {
     }
 }
 
+/// Internal identity of one semantic incoming Position. Its serial is scoped
+/// by the offer and is intentionally independent of the X selection timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct XwaylandDndIncomingPositionId {
+    offer_id: XwaylandDndOfferId,
+    serial: NonZeroU64,
+}
+
+impl XwaylandDndIncomingPositionId {
+    pub const fn new(offer_id: XwaylandDndOfferId, serial: NonZeroU64) -> Self {
+        Self { offer_id, serial }
+    }
+
+    pub const fn offer_id(self) -> XwaylandDndOfferId {
+        self.offer_id
+    }
+
+    pub const fn serial(self) -> u64 {
+        self.serial.get()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CanonicalDndSessionId {
     Wayland(NonZeroU64),
@@ -371,6 +393,7 @@ impl XwaylandDndIncomingTransferId {
 pub enum XwaylandDndIncomingEvent {
     Begin {
         offer: XwaylandDndOffer,
+        position_id: XwaylandDndIncomingPositionId,
         x: f64,
         y: f64,
         requested_action: XwaylandDndAction,
@@ -378,6 +401,7 @@ pub enum XwaylandDndIncomingEvent {
     },
     Position {
         offer_id: XwaylandDndOfferId,
+        position_id: XwaylandDndIncomingPositionId,
         x: f64,
         y: f64,
         requested_action: XwaylandDndAction,
@@ -475,6 +499,7 @@ pub enum XwaylandDndTransition {
     },
     SourceFeedback {
         offer_id: XwaylandDndOfferId,
+        position_id: XwaylandDndIncomingPositionId,
         accepted_mime: Option<String>,
         action: Option<XwaylandDndAction>,
     },
@@ -551,10 +576,15 @@ impl XwaylandDndOutbox {
             (
                 Some(XwaylandDndTransition::SourceFeedback {
                     offer_id: old_offer,
+                    position_id: old_position,
                     ..
                 }),
-                XwaylandDndTransition::SourceFeedback { offer_id, .. },
-            ) => old_offer == offer_id,
+                XwaylandDndTransition::SourceFeedback {
+                    offer_id,
+                    position_id,
+                    ..
+                },
+            ) => old_offer == offer_id && old_position == position_id,
             _ => false,
         };
 

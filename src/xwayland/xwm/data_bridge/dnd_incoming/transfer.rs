@@ -154,14 +154,13 @@ pub(crate) fn selection_notify(
             session.generation == transfer.generation
                 && session.offer_id == transfer.offer_id
                 && session.source.xid() == transfer.source
-                && session
-                    .latest_position
-                    .is_some_and(|position| position.timestamp == transfer.selection_timestamp)
+                && session.canonical_started
         });
     if transfer.generation != xwm.generation
         || transfer.offer_id != id.offer_id()
         || !exact_session
         || transfer.phase != IncomingTransferPhase::AwaitSelectionNotify
+        || event.requestor != transfer.requestor
         || event.target != transfer.target
         || event.time != transfer.selection_timestamp
         || (!none && event.property != transfer.property)

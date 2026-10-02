@@ -274,6 +274,37 @@ impl CompositorState {
         true
     }
 
+    pub(in crate::compositor) fn update_xwayland_drag_position_id(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        position_id: crate::xwayland::XwaylandDndIncomingPositionId,
+    ) -> bool {
+        let Some(active) = self.active_drag.as_mut() else {
+            return false;
+        };
+        if active.id != CanonicalDndSessionId::Xwayland(offer_id)
+            || active.lifecycle_driver != DragLifecycleDriver::Xwayland
+            || active.phase != DragSessionPhase::Dragging
+            || position_id.offer_id() != offer_id
+            || active
+                .origin
+                .xwayland_offer()
+                .is_none_or(|offer| offer.id() != offer_id)
+            || self
+                .xwayland
+                .client_identity
+                .as_ref()
+                .is_none_or(|identity| identity.generation != offer_id.generation())
+        {
+            return false;
+        }
+        active.xwayland_incoming_position_id = Some(position_id);
+        // A repeated canonical action at the new Position still needs a
+        // feedback snapshot qualified by the new semantic identity.
+        active.last_source_action = None;
+        true
+    }
+
     /// Replace the representable source action set for one exact incoming
     /// XWayland offer without replacing the canonical drag or its Wayland
     /// offer resource.

@@ -185,6 +185,10 @@ pub(super) struct ActiveDrag {
     /// Exact XWayland generation whose adapter state has participated in this
     /// canonical drag, retained across temporary moves onto Wayland targets.
     pub(super) xwayland_dnd_generation: Option<crate::xwayland::XwaylandGeneration>,
+    /// Current raw incoming XDND Position represented by this canonical
+    /// XWayland-origin drag. This identity is distinct from its X timestamp.
+    pub(super) xwayland_incoming_position_id:
+        Option<crate::xwayland::XwaylandDndIncomingPositionId>,
     pub(super) icon_surface: Option<wl_surface::WlSurface>,
     pub(super) target: Option<ActiveDragTarget>,
     pub(super) accepted_mime: Option<String>,
