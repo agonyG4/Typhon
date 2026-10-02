@@ -15,7 +15,7 @@ client connection.
 | Repeating `wl_data_device.set_selection` with the same source that is still the active clipboard source | `RECOVERABLE_LIFECYCLE` | Record a bounded diagnostic and preserve the current selection without another cancellation or generation change. |
 | Reusing a source after selection clear/replacement, configuring an active clipboard source for DnD, using a clipboard source for DnD, or reusing a drag source | `FATAL` | Keep `wl_data_device.used_source` and `wl_data_source.invalid_source` fatal. Retired sources cannot be made active again. |
 | Invalid data-offer lifecycle requests, including `finish` before a valid drop, selection-offer DnD requests, or receives after a drag offer is terminal | `FATAL` | Keep `invalid_finish` and `invalid_offer` errors. Invalid MIME offers, action masks, and preferred actions remain fatal too. |
-| `wl_subsurface`, layer-surface, or XWayland role requests after their underlying `wl_surface` has been destroyed | `WARN_AND_CONTINUE` | The old role resource has no live surface identity and cannot mutate compositor state. Its normal destroy request is inert. |
+| `wl_subsurface`, layer-surface, or XWayland role requests after their underlying `wl_surface` has been destroyed | `INERT` | The handler returns when the matching live surface resource is gone; it posts no protocol error and cannot mutate compositor state. Normal role-resource destruction remains idempotent. |
 | `xdg_wm_base.destroy` with live `xdg_surface` objects, toplevel destruction with a live decoration object, or popup destruction out of stack order | `FATAL` | Preserve `defunct_surfaces`, `orphaned`, and `not_the_topmost_popup` protocol errors. An inert XDG surface left by surface-first recovery still counts as live until that XDG resource is destroyed or its client disconnects. |
 | Cross-client object references, invalid object references, invalid configure acknowledgements, role reassignment, invalid popup parents, invalid DND action masks, and buffer ownership violations | `FATAL` | Keep existing protocol errors and client termination. |
 
@@ -29,6 +29,22 @@ recovery action. Counters are separate for surface teardown, XDG role teardown,
 and active clipboard source reuse. No client name changes the recovery rules.
 Client disconnect cleanup removes any retained XDG base ownership entry for an
 inert surface, along with the rest of that client's resources.
+
+## Native-client qualification status
+
+**Not run on 2026-10-02.** The active seat is a Wayland session on `tty1`, and
+Hyprland (PID 2150) owns `/dev/dri/card1`; `/sys/class/tty/tty0/active` reports
+`tty1`. The other logged-in session is an inactive text session on `tty3`, and
+`/dev/tty2` is root-owned with mode `0600`. Starting Typhon through its native
+TTY/DRM launcher would require taking over the active seat, so it was not
+started. Firefox was not launched, `TYPHON_WAYLAND_COMPAT_TRACE=1` was not set
+for a compositor process, and there is no native Firefox trace or survival
+result to claim.
+
+The focused lifecycle tests are synthetic wire tests against Typhon's in-process
+test compositor. They are separate evidence from native-client or
+cross-compositor runs. No native Firefox, GTK, or other external Wayland client
+was exercised in this qualification session.
 
 ## Why these cases are recoverable
 
