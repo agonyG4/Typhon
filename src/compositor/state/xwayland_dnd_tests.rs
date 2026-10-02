@@ -860,6 +860,7 @@ fn implicit_grab_terminal_does_not_drive_xwayland_drag() {
     state.implicit_pointer_grab = Some(ImplicitPointerGrab {
         surface: target.clone(),
         root_surface_id: compositor_surface_id(&target),
+        routing: ImplicitPointerRouting::Normal,
     });
 
     state.end_implicit_pointer_grab("last-release");

@@ -563,6 +563,318 @@ fn sourced_wayland_drag_hands_pointer_routing_to_dnd_and_restores_after_drop() {
 }
 
 #[test]
+fn sourced_wayland_drag_cancellation_keeps_pointer_routing_until_release() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        relative_pointer: true,
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    let source = manager.create_data_source(&qh, ());
+    source.offer("text/plain".to_string());
+    source.set_actions(client_wl_data_device_manager::DndAction::Copy);
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let surface_id = surface.id().protocol_id();
+    focus_root_window(&commands, surface_id);
+    let pointer_x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0;
+    let pointer_y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x,
+            y: pointer_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _confined = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let initial_constraint_requests = capture_pointer_constraint_backend_requests(&commands);
+    let constraint_id = initial_constraint_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("confined pointer should request backend activation");
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(
+            constraint_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.confined_count, 1);
+
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state
+        .pointer_button_serial
+        .expect("start_drag must use a real pointer press serial");
+    state.event_timeline.clear();
+
+    device.start_drag(Some(&source), &surface, None, serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let start_timeline = state.event_timeline.clone();
+    let pointer_leave_at = start_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::PointerLeave { surface_id: id } if *id == surface_id)
+    });
+    let data_enter_at = start_timeline.iter().position(|event| {
+        matches!(event, TestWaylandEvent::DataDeviceEnter { surface_id: id } if *id == surface_id)
+    });
+    assert!(
+        matches!((pointer_leave_at, data_enter_at), (Some(leave), Some(enter)) if leave < enter),
+        "native DnD handoff must send pointer leave before immediate data-device enter: {start_timeline:#?}"
+    );
+    assert_eq!(state.unconfined_count, 1);
+    let handoff_constraint_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(handoff_constraint_requests.iter().any(|request| {
+        matches!(request, PointerConstraintBackendRequest::Deactivate { id, .. } if *id == constraint_id)
+    }));
+    let offer = state
+        .data_device_drag_offer
+        .clone()
+        .expect("initiating surface should immediately receive its DnD offer");
+
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x111,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x111,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(
+        state.event_timeline.iter().all(|event| !matches!(
+            event,
+            TestWaylandEvent::PointerButtonPressed | TestWaylandEvent::PointerButtonReleased
+        )),
+        "additional physical buttons must not create normal pointer events: {:#?}",
+        state.event_timeline
+    );
+
+    let relative_motion_count_during_dnd = state.relative_motion_count;
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 0x1_0000_0003,
+            absolute: None,
+            relative: Some(RelativePointerMotion {
+                dx: 1.25,
+                dy: -0.75,
+                dx_unaccelerated: 1.5,
+                dy_unaccelerated: -1.0,
+            }),
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.relative_motion_count,
+        relative_motion_count_during_dnd
+    );
+    assert!(
+        state.event_timeline.is_empty(),
+        "relative pointer motion leaked while native DnD owned routing: {:#?}",
+        state.event_timeline
+    );
+
+    state.event_timeline.clear();
+    offer.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.data_device_leave_count, 1);
+    assert_eq!(state.data_source_cancelled_count, 1);
+    assert_eq!(state.data_device_drop_count, 0);
+    assert!(
+        state
+            .event_timeline
+            .iter()
+            .any(|event| matches!(event, TestWaylandEvent::DataDeviceLeave))
+    );
+    assert!(
+        !state
+            .event_timeline
+            .iter()
+            .any(|event| matches!(event, TestWaylandEvent::DataDeviceDrop))
+    );
+
+    let pointer_enter_count_after_handoff = state.pointer_enter_count;
+    let pointer_motion_count_after_handoff = state.pointer_motion_count;
+    let pointer_axis_count_after_handoff = state.pointer_axis_times.len();
+    let relative_motion_count_after_handoff = state.relative_motion_count;
+    let data_motion_count_after_handoff = state.data_device_motion_count;
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 0x1_0000_0002,
+            absolute: Some(OutputPosition {
+                x: pointer_x + 12.0,
+                y: pointer_y + 12.0,
+            }),
+            relative: Some(RelativePointerMotion {
+                dx: 3.5,
+                dy: -2.25,
+                dx_unaccelerated: 4.0,
+                dy_unaccelerated: -3.0,
+            }),
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerAxisFrame(PointerAxisFrame {
+            timestamp_usec: 0x1_0000_1000,
+            source: PointerAxisSource::Wheel,
+            horizontal: PointerAxisComponent::absent(),
+            vertical: PointerAxisComponent {
+                continuous: Some(8.0),
+                value120: None,
+                discrete: Some(1),
+                stopped: false,
+            },
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(
+        state.event_timeline.is_empty(),
+        "pointer or DnD routing leaked after cancellation while BTN_LEFT remained held: {:#?}",
+        state.event_timeline
+    );
+    assert_eq!(state.pointer_enter_count, pointer_enter_count_after_handoff);
+    assert_eq!(
+        state.pointer_motion_count,
+        pointer_motion_count_after_handoff
+    );
+    assert_eq!(
+        state.pointer_axis_times.len(),
+        pointer_axis_count_after_handoff
+    );
+    assert_eq!(
+        state.relative_motion_count,
+        relative_motion_count_after_handoff
+    );
+    assert_eq!(
+        state.data_device_motion_count,
+        data_motion_count_after_handoff
+    );
+    assert_eq!(state.unconfined_count, 1);
+    assert!(
+        !capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .any(|request| matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateConfined { .. }
+            ))
+    );
+
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let terminal_timeline = state.event_timeline.clone();
+    assert!(terminal_timeline.iter().any(|event| {
+        matches!(event, TestWaylandEvent::PointerEnter { surface_id: id } if *id == surface_id)
+    }));
+    assert!(
+        !terminal_timeline
+            .iter()
+            .any(|event| matches!(event, TestWaylandEvent::PointerButtonReleased))
+    );
+    assert!(
+        !terminal_timeline
+            .iter()
+            .any(|event| matches!(event, TestWaylandEvent::DataDeviceDrop))
+    );
+    assert_eq!(state.data_device_drop_count, 0);
+    assert_eq!(state.data_source_cancelled_count, 1);
+    let terminal_constraint_requests = capture_pointer_constraint_backend_requests(&commands);
+    let reactivated_constraint_id = terminal_constraint_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect(
+            "normal pointer focus should make the persistent constraint eligible after release",
+        );
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(
+            reactivated_constraint_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.confined_count, 2);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn source_less_wayland_drag_hands_off_pointer_and_stays_private_to_initiator() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

@@ -308,7 +308,15 @@ impl CompositorState {
         // State-level DnD tests can create a canonical drag without a physical
         // pointer grab. Only a real Wayland pointer grab transfers client input
         // routing and establishes its initial DnD target here.
-        if !self.wayland_pointer_dnd_routing_active() {
+        let pointer_driven_wayland_drag = self.active_drag.as_ref().is_some_and(|drag| {
+            matches!(&drag.id, CanonicalDndSessionId::Wayland(_))
+                && drag.lifecycle_driver == DragLifecycleDriver::WaylandImplicitPointerGrab
+                && drag.phase == DragSessionPhase::Dragging
+        });
+        if pointer_driven_wayland_drag && let Some(grab) = self.implicit_pointer_grab.as_mut() {
+            grab.routing = ImplicitPointerRouting::WaylandDnd;
+        }
+        if !self.wayland_pointer_dnd_session_active() {
             return;
         }
 

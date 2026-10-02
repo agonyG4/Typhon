@@ -1151,10 +1151,17 @@ struct PendingLockedPointerReveal {
     backend_settled_dispatch_epoch: Option<u64>,
     client_warp_position: Option<OutputPosition>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitPointerRouting {
+    Normal,
+    WaylandDnd,
+}
 #[derive(Debug, Clone)]
 struct ImplicitPointerGrab {
     surface: wl_surface::WlSurface,
     root_surface_id: u32,
+    // Client routing belongs to the physical grab through DnD cancellation.
+    routing: ImplicitPointerRouting,
 }
 #[derive(Debug, Default)]
 struct RelativeMotionDebugState {

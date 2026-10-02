@@ -682,6 +682,7 @@ impl CompositorState {
         self.implicit_pointer_grab = Some(ImplicitPointerGrab {
             surface: press.surface.clone(),
             root_surface_id: press.root_surface_id,
+            routing: ImplicitPointerRouting::Normal,
         });
         pointer_debug_log(format!(
             "implicit grab begin surface={} button={}",
@@ -849,6 +850,52 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
+        if self.wayland_pointer_dnd_routing_active() {
+            if self
+                .implicit_pointer_grab_surface("surface-destroyed")
+                .is_none()
+            {
+                return;
+            }
+
+            if pressed {
+                let Some((surface, root_surface_id)) = self
+                    .implicit_pointer_grab
+                    .as_ref()
+                    .map(|grab| (grab.surface.clone(), grab.root_surface_id))
+                else {
+                    return;
+                };
+                self.remember_held_pointer_button(PointerPress {
+                    serial: 0,
+                    button,
+                    surface,
+                    root_surface_id,
+                    window_id: self.window_id_for_surface(root_surface_id),
+                    output_x: self.last_pointer_x,
+                    output_y: self.last_pointer_y,
+                });
+            } else {
+                self.forget_held_pointer_button(button);
+                if self
+                    .last_pointer_press
+                    .as_ref()
+                    .is_some_and(|press| press.button == button)
+                {
+                    self.last_pointer_press = None;
+                }
+                if self.held_pointer_buttons.is_empty() && self.implicit_pointer_grab.is_some() {
+                    let old_surface_id = self
+                        .implicit_pointer_grab
+                        .as_ref()
+                        .map(|grab| compositor_surface_id(&grab.surface));
+                    self.end_implicit_pointer_grab("last-release");
+                    self.refresh_pointer_focus_after_implicit_grab(old_surface_id);
+                }
+            }
+            return;
+        }
+
         let wayland_dnd_routing_active = self.wayland_pointer_dnd_routing_active();
         let ordinary_scene_input = self.locked_pointer_input_surface().is_none()
             && self

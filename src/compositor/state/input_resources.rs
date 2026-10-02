@@ -55,7 +55,13 @@ fn map_keyboard_configuration_error(error: String) -> KeyboardConfigurationContr
 
 impl CompositorState {
     pub(in crate::compositor) fn wayland_pointer_dnd_routing_active(&self) -> bool {
-        self.implicit_pointer_grab.is_some()
+        self.implicit_pointer_grab
+            .as_ref()
+            .is_some_and(|grab| grab.routing == ImplicitPointerRouting::WaylandDnd)
+    }
+
+    pub(in crate::compositor) fn wayland_pointer_dnd_session_active(&self) -> bool {
+        self.wayland_pointer_dnd_routing_active()
             && self.active_drag.as_ref().is_some_and(|drag| {
                 matches!(
                     &drag.id,
@@ -849,9 +855,11 @@ impl CompositorState {
             .saturating_add(1);
         if self.wayland_pointer_dnd_routing_active() {
             self.update_pointer_position_state(x, y);
-            let hit = self.pointer_scene_hit_at(x, y);
-            self.update_drag_target_at(x, y);
-            self.update_decoration_hover_for_scene_hit(&hit);
+            if self.wayland_pointer_dnd_session_active() {
+                let hit = self.pointer_scene_hit_at(x, y);
+                self.update_drag_target_at(x, y);
+                self.update_decoration_hover_for_scene_hit(&hit);
+            }
             return;
         }
         if let Some(active) = self.active_locked_pointer_binding() {
