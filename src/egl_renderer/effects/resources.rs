@@ -278,6 +278,33 @@ struct CachedCheckpointCapture {
     last_populated_frame_serial: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CheckpointCacheAdmissionStats {
+    pub(crate) candidates_total: usize,
+    pub(crate) candidates_considered: usize,
+    pub(crate) resident_candidates: usize,
+    pub(crate) newly_admitted_candidates: usize,
+    pub(crate) skipped_entry_limit: usize,
+    pub(crate) skipped_graph_peak_unknown: usize,
+    pub(crate) skipped_graph_pressure: usize,
+    pub(crate) skipped_budget: usize,
+    pub(crate) skipped_size: usize,
+    pub(crate) skipped_allocation: usize,
+    pub(crate) skipped_budget_bytes: u64,
+    pub(crate) graph_peak_known: bool,
+    pub(crate) graph_peak_bytes: u64,
+    pub(crate) base_checked_out_bytes: u64,
+    pub(crate) budget_bytes: u64,
+    pub(crate) additional_budget_needed_for_all_candidates_bytes: u64,
+    pub(crate) additional_budget_needed_known: bool,
+    pub(crate) cache_cleared_for_graph_pressure: bool,
+}
+
+pub(crate) struct PreparedCheckpointCaptures {
+    pub(crate) bindings: HashMap<GraphTextureId, GraphTextureBinding>,
+    pub(crate) admission: CheckpointCacheAdmissionStats,
+}
+
 #[derive(Debug)]
 struct CheckpointCacheCausalBaseline {
     frame_serial: u64,
@@ -726,18 +753,33 @@ impl EffectGlResourceCache {
         compatibility: CheckpointCacheCompatibility,
         graph_peak_bytes: Option<u64>,
         candidates: &[(CheckpointCaptureCacheKey, GraphTexturePlan)],
-    ) -> HashMap<GraphTextureId, GraphTextureBinding> {
+    ) -> PreparedCheckpointCaptures {
+        let candidates_considered = candidates.len().min(MAX_CHECKPOINT_CACHE_ENTRIES);
+        let mut admission = CheckpointCacheAdmissionStats {
+            candidates_total: candidates.len(),
+            candidates_considered,
+            skipped_entry_limit: candidates.len().saturating_sub(candidates_considered),
+            graph_peak_known: graph_peak_bytes.is_some(),
+            graph_peak_bytes: graph_peak_bytes.unwrap_or_default(),
+            budget_bytes: self.pool.budget_bytes(),
+            ..Default::default()
+        };
         self.update_checkpoint_compatibility(compatibility);
         self.retain_checkpoint_captures(
             candidates
                 .iter()
-                .take(MAX_CHECKPOINT_CACHE_ENTRIES)
+                .take(candidates_considered)
                 .map(|(key, _)| key),
         );
 
         let Some(graph_peak_bytes) = graph_peak_bytes else {
             self.clear_checkpoint_capture_cache();
-            return HashMap::new();
+            admission.skipped_graph_peak_unknown = candidates_considered;
+            admission.base_checked_out_bytes = self.pool.checked_out_bytes();
+            return PreparedCheckpointCaptures {
+                bindings: HashMap::new(),
+                admission,
+            };
         };
         if self
             .pool
@@ -745,23 +787,50 @@ impl EffectGlResourceCache {
             .saturating_add(graph_peak_bytes)
             > self.pool.budget_bytes()
         {
+            admission.cache_cleared_for_graph_pressure = true;
             self.clear_checkpoint_capture_cache();
         }
-        if self
-            .pool
-            .checked_out_bytes()
-            .saturating_add(graph_peak_bytes)
-            > self.pool.budget_bytes()
-        {
-            return HashMap::new();
+
+        let base_checked_out_bytes = self.pool.checked_out_bytes();
+        admission.base_checked_out_bytes = base_checked_out_bytes;
+        let mut required_bytes_for_all_candidates =
+            base_checked_out_bytes.checked_add(graph_peak_bytes);
+        for (key, plan) in candidates.iter().take(candidates_considered) {
+            if self.checkpoint_captures.contains_key(key) {
+                continue;
+            }
+            match texture_key(plan).estimated_bytes() {
+                Ok(bytes) => {
+                    required_bytes_for_all_candidates = required_bytes_for_all_candidates
+                        .and_then(|required| required.checked_add(bytes));
+                }
+                Err(_) => required_bytes_for_all_candidates = None,
+            }
+        }
+        if let Some(required_bytes) = required_bytes_for_all_candidates {
+            admission.additional_budget_needed_for_all_candidates_bytes =
+                required_bytes.saturating_sub(admission.budget_bytes);
+            admission.additional_budget_needed_known = true;
+        }
+
+        if base_checked_out_bytes.saturating_add(graph_peak_bytes) > self.pool.budget_bytes() {
+            admission.skipped_graph_pressure = candidates_considered;
+            return PreparedCheckpointCaptures {
+                bindings: HashMap::new(),
+                admission,
+            };
         }
 
         let mut bindings = HashMap::new();
-        for (key, plan) in candidates.iter().take(MAX_CHECKPOINT_CACHE_ENTRIES) {
-            if !self.checkpoint_captures.contains_key(key) {
+        for (key, plan) in candidates.iter().take(candidates_considered) {
+            let was_resident = self.checkpoint_captures.contains_key(key);
+            if !was_resident {
                 let bytes = match texture_key(plan).estimated_bytes() {
                     Ok(bytes) => bytes,
-                    Err(_) => continue,
+                    Err(_) => {
+                        admission.skipped_size = admission.skipped_size.saturating_add(1);
+                        continue;
+                    }
                 };
                 if self
                     .pool
@@ -770,11 +839,18 @@ impl EffectGlResourceCache {
                     .saturating_add(bytes)
                     > self.pool.budget_bytes()
                 {
+                    admission.skipped_budget = admission.skipped_budget.saturating_add(1);
+                    admission.skipped_budget_bytes =
+                        admission.skipped_budget_bytes.saturating_add(bytes);
                     continue;
                 }
                 let texture = match self.acquire_plan(gl, plan) {
                     Ok(texture) => texture,
-                    Err(_) => continue,
+                    Err(_) => {
+                        admission.skipped_allocation =
+                            admission.skipped_allocation.saturating_add(1);
+                        continue;
+                    }
                 };
                 self.checkpoint_captures.insert(
                     key.clone(),
@@ -783,6 +859,10 @@ impl EffectGlResourceCache {
                         last_populated_frame_serial: None,
                     },
                 );
+                admission.newly_admitted_candidates =
+                    admission.newly_admitted_candidates.saturating_add(1);
+            } else {
+                admission.resident_candidates = admission.resident_candidates.saturating_add(1);
             }
             if let Some(cached) = self.checkpoint_captures.get(key) {
                 bindings.insert(
@@ -791,7 +871,10 @@ impl EffectGlResourceCache {
                 );
             }
         }
-        bindings
+        PreparedCheckpointCaptures {
+            bindings,
+            admission,
+        }
     }
 
     fn update_checkpoint_compatibility(
@@ -1317,6 +1400,44 @@ mod tests {
             },
         );
         cache
+    }
+
+    fn first_checkpoint_candidate(
+        graph: &CompiledFrameGraph,
+    ) -> (CheckpointCaptureCacheKey, GraphTexturePlan) {
+        let pass = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .unwrap();
+        let key = checkpoint_capture_cache_key(graph, pass).unwrap();
+        let plan = graph
+            .textures
+            .iter()
+            .find(|texture| Some(texture.id) == pass.output)
+            .unwrap()
+            .clone();
+        (key, plan)
+    }
+
+    fn assert_checkpoint_admission_partition(admission: CheckpointCacheAdmissionStats) {
+        assert_eq!(
+            admission.candidates_considered + admission.skipped_entry_limit,
+            admission.candidates_total
+        );
+        assert_eq!(
+            admission.resident_candidates
+                + admission.newly_admitted_candidates
+                + admission.skipped_graph_peak_unknown
+                + admission.skipped_graph_pressure
+                + admission.skipped_budget
+                + admission.skipped_size
+                + admission.skipped_allocation,
+            admission.candidates_considered
+        );
     }
 
     fn sample_checkpoint_key() -> CheckpointCaptureCacheKey {
@@ -2006,7 +2127,7 @@ mod tests {
         cache.checkpoint_compatibility = Some(compatibility);
         let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
 
-        let bindings = cache.prepare_checkpoint_captures(
+        let prepared = cache.prepare_checkpoint_captures(
             &gl,
             compatibility,
             Some(graph_peak),
@@ -2014,9 +2135,32 @@ mod tests {
         );
 
         assert!(
-            bindings.is_empty(),
+            prepared.bindings.is_empty(),
             "cache lease must be bypassed under pressure"
         );
+        assert_eq!(prepared.admission.candidates_total, 1);
+        assert_eq!(prepared.admission.candidates_considered, 1);
+        assert_eq!(prepared.admission.resident_candidates, 0);
+        assert_eq!(prepared.admission.newly_admitted_candidates, 0);
+        assert_eq!(prepared.admission.skipped_graph_peak_unknown, 0);
+        assert_eq!(prepared.admission.skipped_graph_pressure, 0);
+        assert_eq!(prepared.admission.skipped_budget, 1);
+        assert_eq!(prepared.admission.skipped_budget_bytes, checkpoint_bytes);
+        assert_eq!(prepared.admission.skipped_size, 0);
+        assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert!(prepared.admission.graph_peak_known);
+        assert_eq!(prepared.admission.graph_peak_bytes, graph_peak);
+        assert_eq!(prepared.admission.base_checked_out_bytes, 0);
+        assert_eq!(prepared.admission.budget_bytes, budget);
+        assert_eq!(
+            prepared
+                .admission
+                .additional_budget_needed_for_all_candidates_bytes,
+            1
+        );
+        assert!(prepared.admission.additional_budget_needed_known);
+        assert!(prepared.admission.cache_cleared_for_graph_pressure);
+        assert_checkpoint_admission_partition(prepared.admission);
         assert!(cache.checkpoint_captures.is_empty());
         assert_eq!(cache.pool.checked_out_bytes(), 0);
         assert!(cache.pool.budget_bytes() >= graph_peak);
@@ -2026,6 +2170,268 @@ mod tests {
             "the released cache lease is reusable"
         );
         cache.pool.return_texture(transient).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_graph_pressure_clear_reports_post_clear_reservation() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let graph_peak = estimate_graph_peak_bytes(&graph).unwrap();
+        let budget = graph_peak.saturating_sub(1).max(1);
+        assert!(
+            budget >= key(8, 8).estimated_bytes().unwrap() + key(1, 1).estimated_bytes().unwrap()
+        );
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = EffectGlResourceCache::with_budget(budget).unwrap();
+        let checkpoint_lease = cache.pool.checkout(key(8, 8)).unwrap();
+        cache.checkpoint_captures.insert(
+            cache_key.clone(),
+            CachedCheckpointCapture {
+                texture: checkpoint_lease.clone(),
+                last_populated_frame_serial: Some(1),
+            },
+        );
+        let mandatory_lease = cache.pool.checkout(key(1, 1)).unwrap();
+        let initial_checked_out = checkpoint_lease.bytes + mandatory_lease.bytes;
+        assert!(initial_checked_out.saturating_add(graph_peak) > budget);
+        cache.checkpoint_compatibility = Some(compatibility);
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak),
+            &[(cache_key, plan)],
+        );
+
+        assert!(prepared.bindings.is_empty());
+        assert!(prepared.admission.cache_cleared_for_graph_pressure);
+        assert_eq!(
+            prepared.admission.base_checked_out_bytes,
+            mandatory_lease.bytes
+        );
+        assert_eq!(cache.pool.checked_out_bytes(), mandatory_lease.bytes);
+        assert!(cache.checkpoint_captures.is_empty());
+        assert_eq!(prepared.admission.graph_peak_bytes, graph_peak);
+        assert_eq!(prepared.admission.budget_bytes, budget);
+        assert_eq!(prepared.admission.skipped_graph_pressure, 1);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.admission.skipped_size, 0);
+        assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert_checkpoint_admission_partition(prepared.admission);
+        assert!(cache.pool.is_checked_out(mandatory_lease.id));
+        cache.pool.return_texture(mandatory_lease).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_unknown_graph_peak_clears_cache_and_has_separate_attribution() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = resource_cache_with_checkpoint(cache_key.clone(), Some(1));
+        cache.checkpoint_compatibility = Some(compatibility);
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared =
+            cache.prepare_checkpoint_captures(&gl, compatibility, None, &[(cache_key, plan)]);
+
+        assert!(prepared.bindings.is_empty());
+        assert!(cache.checkpoint_captures.is_empty());
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+        assert_eq!(prepared.admission.skipped_graph_peak_unknown, 1);
+        assert_eq!(prepared.admission.skipped_graph_pressure, 0);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert!(!prepared.admission.graph_peak_known);
+        assert_eq!(prepared.admission.graph_peak_bytes, 0);
+        assert_eq!(prepared.admission.base_checked_out_bytes, 0);
+        assert!(!prepared.admission.additional_budget_needed_known);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_size_overflow_is_attributed_without_binding() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, mut plan) = first_checkpoint_candidate(&graph);
+        plan.width = u32::MAX;
+        plan.height = u32::MAX;
+        let mut cache = EffectGlResourceCache::with_budget(1024).unwrap();
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared =
+            cache.prepare_checkpoint_captures(&gl, compatibility, Some(0), &[(cache_key, plan)]);
+
+        assert!(prepared.bindings.is_empty());
+        assert_eq!(prepared.admission.skipped_size, 1);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert!(!prepared.admission.additional_budget_needed_known);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_entry_limit_reports_ignored_candidates_without_reordering() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let candidates = (0..=MAX_CHECKPOINT_CACHE_ENTRIES)
+            .map(|candidate_index| {
+                let mut candidate_key = cache_key.clone();
+                candidate_key.consumer_semantic_signature = candidate_key
+                    .consumer_semantic_signature
+                    .wrapping_add(candidate_index as u64);
+                (candidate_key, plan.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut cache = EffectGlResourceCache::with_budget(1).unwrap();
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared = cache.prepare_checkpoint_captures(&gl, compatibility, Some(0), &candidates);
+
+        assert!(prepared.bindings.is_empty());
+        assert_eq!(
+            prepared.admission.candidates_total,
+            MAX_CHECKPOINT_CACHE_ENTRIES + 1
+        );
+        assert_eq!(
+            prepared.admission.candidates_considered,
+            MAX_CHECKPOINT_CACHE_ENTRIES
+        );
+        assert_eq!(prepared.admission.skipped_entry_limit, 1);
+        assert_eq!(
+            prepared.admission.skipped_budget,
+            MAX_CHECKPOINT_CACHE_ENTRIES
+        );
+        assert_eq!(
+            prepared.admission.skipped_budget_bytes,
+            bytes.saturating_mul(MAX_CHECKPOINT_CACHE_ENTRIES as u64)
+        );
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_resident_candidate_keeps_its_physical_binding() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let graph_peak = estimate_graph_peak_bytes(&graph).unwrap();
+        let checkpoint_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = EffectGlResourceCache::with_budget(graph_peak + checkpoint_bytes).unwrap();
+        let lease = cache.pool.checkout(texture_key(&plan)).unwrap();
+        let lease_id = lease.id;
+        cache.checkpoint_captures.insert(
+            cache_key.clone(),
+            CachedCheckpointCapture {
+                texture: lease,
+                last_populated_frame_serial: Some(1),
+            },
+        );
+        cache.checkpoint_compatibility = Some(compatibility);
+        let allocations_before = cache.pool.metrics().allocation_count;
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak),
+            &[(cache_key, plan.clone())],
+        );
+
+        assert_eq!(prepared.admission.resident_candidates, 1);
+        assert_eq!(prepared.admission.newly_admitted_candidates, 0);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.bindings[&plan.id].texture.id, lease_id);
+        assert_eq!(cache.pool.metrics().allocation_count, allocations_before);
+        assert_eq!(prepared.admission.base_checked_out_bytes, checkpoint_bytes);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_new_admission_reports_the_successful_candidate() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let checkpoint_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = EffectGlResourceCache::with_budget(checkpoint_bytes).unwrap();
+        let texture_id = 77;
+        cache.pool.next_id = texture_id;
+        cache.gl_textures.insert(
+            texture_id,
+            glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        );
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(cache_key, plan.clone())],
+        );
+
+        assert_eq!(prepared.admission.candidates_total, 1);
+        assert_eq!(prepared.admission.resident_candidates, 0);
+        assert_eq!(prepared.admission.newly_admitted_candidates, 1);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert!(prepared.admission.additional_budget_needed_known);
+        assert_eq!(
+            prepared
+                .admission
+                .additional_budget_needed_for_all_candidates_bytes,
+            0
+        );
+        assert_eq!(prepared.bindings[&plan.id].texture.id, texture_id);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_allocation_failure_is_not_reported_as_budget_pressure() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let checkpoint_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let mut cache = EffectGlResourceCache::with_budget(checkpoint_bytes).unwrap();
+        cache.pool.next_id = u64::MAX;
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+
+        let prepared =
+            cache.prepare_checkpoint_captures(&gl, compatibility, Some(0), &[(cache_key, plan)]);
+
+        assert!(prepared.bindings.is_empty());
+        assert_eq!(prepared.admission.skipped_allocation, 1);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.admission.skipped_size, 0);
+        assert_eq!(prepared.admission.newly_admitted_candidates, 0);
+        assert_checkpoint_admission_partition(prepared.admission);
     }
 
     #[test]

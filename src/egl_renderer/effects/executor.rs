@@ -28,9 +28,10 @@ use super::{
     CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
     EffectDebugKawaseMode, FrameTraceSummary, PassTraceSummary, blur, capture, effect_debug_config,
     resources::{
-        CheckpointCacheCompatibility, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
-        GraphTextureBinding, PooledEffectTexture, checkpoint_capture_cache_key,
-        estimate_graph_peak_bytes, release_dead_graph_textures,
+        CheckpointCacheAdmissionStats, CheckpointCacheCompatibility, EffectTextureFilter,
+        EffectTextureFormat, EffectTextureKey, GraphTextureBinding, PooledEffectTexture,
+        PreparedCheckpointCaptures, checkpoint_capture_cache_key, estimate_graph_peak_bytes,
+        release_dead_graph_textures,
     },
     shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
@@ -446,6 +447,7 @@ pub(crate) struct EffectExecutionStats {
     pub checkpoint_causal_scene_prefix_changed: usize,
     pub checkpoint_cache_entries: usize,
     pub checkpoint_cache_bytes: u64,
+    pub checkpoint_cache_admission: CheckpointCacheAdmissionStats,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
@@ -493,6 +495,7 @@ impl EffectExecutionStats {
             checkpoint_causal_scene_prefix_changed: self.checkpoint_causal_scene_prefix_changed,
             checkpoint_cache_entries: self.checkpoint_cache_entries,
             checkpoint_cache_bytes: self.checkpoint_cache_bytes,
+            checkpoint_cache_admission: self.checkpoint_cache_admission,
         }
     }
 
@@ -964,7 +967,7 @@ fn prepare_checkpoint_cache_bindings(
     graph: &CompiledFrameGraph,
     framebuffer_origin: OutputFramebufferOrigin,
     debug_config: EffectDebugConfig,
-) -> std::collections::HashMap<GraphTextureId, GraphTextureBinding> {
+) -> PreparedCheckpointCaptures {
     let mut candidates = Vec::new();
     if debug_config.capture_mode() == EffectDebugCaptureMode::Replay {
         for pass in &graph.passes {
@@ -998,11 +1001,11 @@ fn prepare_checkpoint_cache_bindings(
         framebuffer_origin_top_left: framebuffer_origin == OutputFramebufferOrigin::TopLeftScanout,
         effect_registry_generation: renderer.effect_registry_generation,
     };
-    let peak_bytes = estimate_graph_peak_bytes(graph).ok();
+    let graph_peak_bytes = estimate_graph_peak_bytes(graph).ok();
     renderer.effect_resources.prepare_checkpoint_captures(
         &renderer.gl,
         compatibility,
-        peak_bytes,
+        graph_peak_bytes,
         &candidates,
     )
 }
@@ -1018,8 +1021,10 @@ fn execute_effect_graph_with_debug_config_internal(
     debug_config: EffectDebugConfig,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
 ) -> RendererResult<EffectExecutionStats> {
-    let mut textures =
+    let prepared =
         prepare_checkpoint_cache_bindings(renderer, graph, framebuffer_origin, debug_config);
+    let checkpoint_cache_admission = prepared.admission;
+    let mut textures = prepared.bindings;
     let trace_summary = effect_trace_summary(renderer, graph, Some(repaint_plan), selection);
     renderer
         .effect_trace
@@ -1034,6 +1039,7 @@ fn execute_effect_graph_with_debug_config_internal(
         renderer,
         graph,
         &mut textures,
+        checkpoint_cache_admission,
         targets,
         framebuffer_origin,
         Some(repaint_plan),
@@ -1107,6 +1113,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         renderer,
         graph,
         &mut textures,
+        CheckpointCacheAdmissionStats::default(),
         targets,
         framebuffer_origin,
         None,
@@ -1147,6 +1154,7 @@ fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    checkpoint_cache_admission: CheckpointCacheAdmissionStats,
     targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: Option<&super::super::damage::RepaintPlan>,
@@ -1181,6 +1189,9 @@ fn execute_graph_passes(
         scene_replay_work_mode_override,
         graph_scope,
     );
+    if let Ok(stats) = &mut result {
+        stats.checkpoint_cache_admission = checkpoint_cache_admission;
+    }
     let graph_timing_finished = renderer
         .effect_gpu_profiler
         .end_graph(&renderer.gl, graph_scope);
@@ -8375,6 +8386,20 @@ mod tests {
 
     #[test]
     fn checkpoint_cache_timing_uses_bounded_frame_aggregates() {
+        let admission = CheckpointCacheAdmissionStats {
+            candidates_total: 9,
+            candidates_considered: 9,
+            resident_candidates: 7,
+            skipped_budget: 2,
+            skipped_budget_bytes: 6_291_456,
+            graph_peak_known: true,
+            graph_peak_bytes: 12_000_000,
+            base_checked_out_bytes: 31_285_016,
+            budget_bytes: 64 * 1024 * 1024,
+            additional_budget_needed_for_all_candidates_bytes: 6_291_456,
+            additional_budget_needed_known: true,
+            ..Default::default()
+        };
         let stats = EffectExecutionStats {
             checkpoint_cache_hits: 4,
             checkpoint_cache_full_refreshes: 1,
@@ -8384,6 +8409,7 @@ mod tests {
             checkpoint_cache_saved_pixels: 1_880,
             checkpoint_cache_entries: 5,
             checkpoint_cache_bytes: 80_000,
+            checkpoint_cache_admission: admission,
             ..Default::default()
         };
 
@@ -8397,6 +8423,7 @@ mod tests {
         assert_eq!(summary.checkpoint_cache_saved_pixels, 1_880);
         assert_eq!(summary.checkpoint_cache_entries, 5);
         assert_eq!(summary.checkpoint_cache_bytes, 80_000);
+        assert_eq!(summary.checkpoint_cache_admission, admission);
     }
 
     #[test]
