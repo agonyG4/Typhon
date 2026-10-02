@@ -1647,6 +1647,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .selection_state
                                 .current_mutation_epoch(SelectionKind::Primary)
                                 .0,
+                            clipboard_broker_offer_count: server
+                                .state
+                                .selection_state
+                                .test_offer_count(SelectionKind::Clipboard),
+                            primary_broker_offer_count: server
+                                .state
+                                .selection_state
+                                .test_offer_count(SelectionKind::Primary),
                             source_count: server.state.data_sources.len(),
                             offer_count: server.state.data_offers.len(),
                         });

@@ -195,6 +195,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) fractional_preferred_scales: Vec<u32>,
     pub(in crate::compositor::tests) data_device_selection_offer:
         Option<client_wl_data_offer::WlDataOffer>,
+    pub(in crate::compositor::tests) data_device_selection_offers:
+        Vec<(u32, Option<client_wl_data_offer::WlDataOffer>)>,
     pub(in crate::compositor::tests) data_device_selection_events: Vec<bool>,
     pub(in crate::compositor::tests) data_device_enter_count: usize,
     pub(in crate::compositor::tests) data_device_leave_count: usize,
@@ -216,6 +218,10 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) primary_selection_events: Vec<bool>,
     pub(in crate::compositor::tests) primary_selection_offer:
         Option<client_zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
+    pub(in crate::compositor::tests) primary_selection_offers: Vec<(
+        u32,
+        Option<client_zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
+    )>,
     pub(in crate::compositor::tests) primary_offer_mime_types: Vec<String>,
     pub(in crate::compositor::tests) primary_source_send_mime_types: Vec<String>,
     pub(in crate::compositor::tests) primary_source_cancelled_count: usize,
@@ -223,8 +229,16 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) data_control_primary_selection_events: Vec<bool>,
     pub(in crate::compositor::tests) data_control_clipboard_offer:
         Option<client_ext_data_control_offer_v1::ExtDataControlOfferV1>,
+    pub(in crate::compositor::tests) data_control_clipboard_offers: Vec<(
+        u32,
+        Option<client_ext_data_control_offer_v1::ExtDataControlOfferV1>,
+    )>,
     pub(in crate::compositor::tests) data_control_primary_offer:
         Option<client_ext_data_control_offer_v1::ExtDataControlOfferV1>,
+    pub(in crate::compositor::tests) data_control_primary_offers: Vec<(
+        u32,
+        Option<client_ext_data_control_offer_v1::ExtDataControlOfferV1>,
+    )>,
     pub(in crate::compositor::tests) data_control_offer_mime_types: Vec<String>,
     pub(in crate::compositor::tests) data_control_source_send_mime_types: Vec<String>,
     pub(in crate::compositor::tests) data_control_source_cancelled_count: usize,
@@ -245,6 +259,8 @@ pub(in crate::compositor::tests) struct ClipboardStateSnapshot {
     pub(in crate::compositor::tests) mutation_epoch: u64,
     pub(in crate::compositor::tests) primary_generation: u64,
     pub(in crate::compositor::tests) primary_mutation_epoch: u64,
+    pub(in crate::compositor::tests) clipboard_broker_offer_count: usize,
+    pub(in crate::compositor::tests) primary_broker_offer_count: usize,
     pub(in crate::compositor::tests) source_count: usize,
     pub(in crate::compositor::tests) offer_count: usize,
 }
@@ -860,7 +876,7 @@ impl Dispatch<client_wl_data_device_manager::WlDataDeviceManager, ()> for Regist
 impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
     fn event(
         state: &mut Self,
-        _proxy: &client_wl_data_device::WlDataDevice,
+        proxy: &client_wl_data_device::WlDataDevice,
         event: client_wl_data_device::Event,
         _data: &(),
         _conn: &Connection,
@@ -886,6 +902,9 @@ impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
             }
             client_wl_data_device::Event::Selection { id } => {
                 state.data_device_selection_events.push(id.is_some());
+                state
+                    .data_device_selection_offers
+                    .push((proxy.id().protocol_id(), id.clone()));
                 state.data_device_selection_offer = id;
                 state
                     .event_timeline
@@ -1013,7 +1032,7 @@ impl Dispatch<client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV
 {
     fn event(
         state: &mut Self,
-        _proxy: &client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        proxy: &client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
         event: client_zwp_primary_selection_device_v1::Event,
         _data: &(),
         _conn: &Connection,
@@ -1025,6 +1044,9 @@ impl Dispatch<client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV
             }
             client_zwp_primary_selection_device_v1::Event::Selection { id } => {
                 state.primary_selection_events.push(id.is_some());
+                state
+                    .primary_selection_offers
+                    .push((proxy.id().protocol_id(), id.clone()));
                 state.primary_selection_offer = id;
             }
             _ => {}
@@ -1097,24 +1119,28 @@ impl Dispatch<client_ext_data_control_manager_v1::ExtDataControlManagerV1, ()>
 impl Dispatch<client_ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for RegistryTestState {
     fn event(
         state: &mut Self,
-        _proxy: &client_ext_data_control_device_v1::ExtDataControlDeviceV1,
+        proxy: &client_ext_data_control_device_v1::ExtDataControlDeviceV1,
         event: client_ext_data_control_device_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            client_ext_data_control_device_v1::Event::DataOffer { id } => {
-                state.data_control_clipboard_offer = Some(id);
-            }
+            client_ext_data_control_device_v1::Event::DataOffer { id: _ } => {}
             client_ext_data_control_device_v1::Event::Selection { id } => {
                 state.data_control_selection_events.push(id.is_some());
+                state
+                    .data_control_clipboard_offers
+                    .push((proxy.id().protocol_id(), id.clone()));
                 state.data_control_clipboard_offer = id;
             }
             client_ext_data_control_device_v1::Event::PrimarySelection { id } => {
                 state
                     .data_control_primary_selection_events
                     .push(id.is_some());
+                state
+                    .data_control_primary_offers
+                    .push((proxy.id().protocol_id(), id.clone()));
                 state.data_control_primary_offer = id;
             }
             client_ext_data_control_device_v1::Event::Finished => {}

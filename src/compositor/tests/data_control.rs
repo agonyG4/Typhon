@@ -1,4 +1,136 @@
 use super::*;
+
+#[test]
+fn data_control_offer_and_device_lifetimes_are_exact_and_do_not_leak() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let manager: client_ext_data_control_manager_v1::ExtDataControlManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let device_a = manager.get_data_device(&seat, &qh, ());
+    let source = manager.create_data_source(&qh, ());
+    source.offer("text/plain".to_string());
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    device_a.set_selection(Some(&source));
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let device_b = manager.get_data_device(&seat, &qh, ());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let offer_for_device = |state: &RegistryTestState, device_id| {
+        state
+            .data_control_clipboard_offers
+            .iter()
+            .rev()
+            .find_map(|(id, offer)| (*id == device_id).then(|| offer.clone()).flatten())
+            .expect("data-control device receives the current clipboard offer")
+    };
+    let offer_a = offer_for_device(&state, device_a.id().protocol_id());
+    let offer_b = offer_for_device(&state, device_b.id().protocol_id());
+    let selection_before_removal = capture_clipboard_state(&commands);
+    assert_eq!(selection_before_removal.clipboard_broker_offer_count, 2);
+    assert_eq!(selection_before_removal.primary_broker_offer_count, 0);
+
+    device_a.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_device_a_destroy = capture_clipboard_state(&commands);
+    assert_eq!(after_device_a_destroy.clipboard_broker_offer_count, 1);
+    assert_eq!(after_device_a_destroy.primary_broker_offer_count, 0);
+    assert_eq!(
+        after_device_a_destroy.generation,
+        selection_before_removal.generation
+    );
+    assert_eq!(
+        after_device_a_destroy.mutation_epoch,
+        selection_before_removal.mutation_epoch
+    );
+
+    let (stale_read_fd, stale_write_fd) = owned_pipe().unwrap();
+    offer_a.receive("text/plain".to_string(), stale_write_fd.as_fd());
+    connection.flush().unwrap();
+    drop(stale_write_fd);
+    queue.roundtrip(&mut state).unwrap();
+    let mut stale_payload = String::new();
+    File::from(stale_read_fd)
+        .read_to_string(&mut stale_payload)
+        .unwrap();
+    assert!(stale_payload.is_empty());
+    assert!(state.data_control_source_send_mime_types.is_empty());
+
+    let (read_fd, write_fd) = owned_pipe().unwrap();
+    offer_b.receive("text/plain".to_string(), write_fd.as_fd());
+    connection.flush().unwrap();
+    drop(write_fd);
+    queue.roundtrip(&mut state).unwrap();
+    let mut live_payload = String::new();
+    File::from(read_fd)
+        .read_to_string(&mut live_payload)
+        .unwrap();
+    assert_eq!(live_payload, "data-control payload");
+    assert_eq!(state.data_control_source_send_mime_types, ["text/plain"]);
+
+    offer_b.destroy();
+    device_b.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_clipboard_state(&commands).clipboard_broker_offer_count,
+        0
+    );
+
+    for _ in 0..4 {
+        let device = manager.get_data_device(&seat, &qh, ());
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        let offer = offer_for_device(&state, device.id().protocol_id());
+        let before_destroy = capture_clipboard_state(&commands);
+        assert_eq!(before_destroy.clipboard_broker_offer_count, 1);
+        assert_eq!(
+            before_destroy.generation,
+            selection_before_removal.generation
+        );
+        assert_eq!(
+            before_destroy.mutation_epoch,
+            selection_before_removal.mutation_epoch
+        );
+
+        device.destroy();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        let after_destroy = capture_clipboard_state(&commands);
+        assert_eq!(after_destroy.clipboard_broker_offer_count, 0);
+        assert_eq!(
+            after_destroy.generation,
+            selection_before_removal.generation
+        );
+        assert_eq!(
+            after_destroy.mutation_epoch,
+            selection_before_removal.mutation_epoch
+        );
+
+        offer.destroy();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        assert_eq!(
+            capture_clipboard_state(&commands).clipboard_broker_offer_count,
+            0
+        );
+    }
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
 use std::{fs::File, io::Read};
 
 #[test]

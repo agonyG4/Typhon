@@ -144,6 +144,7 @@ pub(super) enum ActiveDragTarget {
     Wayland {
         surface: wl_surface::WlSurface,
         client_id: ClientId,
+        device_id: u32,
         offer: Option<wl_data_offer::WlDataOffer>,
     },
     Xwayland {
@@ -164,6 +165,13 @@ impl ActiveDragTarget {
     pub(super) fn wayland_client(&self) -> Option<&ClientId> {
         match self {
             Self::Wayland { client_id, .. } => Some(client_id),
+            Self::Xwayland { .. } => None,
+        }
+    }
+
+    pub(super) fn wayland_device_id(&self) -> Option<u32> {
+        match self {
+            Self::Wayland { device_id, .. } => Some(*device_id),
             Self::Xwayland { .. } => None,
         }
     }

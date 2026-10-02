@@ -240,9 +240,12 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_data_offer(&mut self, offer: &wl_data_offer::WlDataOffer) {
-        if let Some(binding) = self.data_offers.get_mut(&offer.id()) {
+        let broker_offer_id = if let Some(binding) = self.data_offers.get_mut(&offer.id()) {
             binding.drag_phase = Some(DragOfferPhase::Destroyed);
-        }
+            binding.broker_offer_id
+        } else {
+            None
+        };
         if self.active_drag.as_ref().is_some_and(|drag| {
             drag.target
                 .as_ref()
@@ -252,6 +255,10 @@ impl CompositorState {
             self.cancel_drag_session("offer_destroyed");
         }
         self.data_offers.remove(&offer.id());
+        if let Some(broker_offer_id) = broker_offer_id {
+            self.selection_state
+                .retire_offer(SelectionKind::Clipboard, broker_offer_id);
+        }
     }
 
     pub(in crate::compositor) fn note_dnd_duplicate_terminal_attempt(&mut self) {
@@ -582,6 +589,7 @@ impl CompositorState {
             active.target = Some(ActiveDragTarget::Wayland {
                 surface: target.surface.clone(),
                 client_id: target_client,
+                device_id: device.id().protocol_id(),
                 offer,
             });
             active.target_action = None;
@@ -644,11 +652,19 @@ impl CompositorState {
             return;
         };
         match active.target.as_ref() {
-            Some(ActiveDragTarget::Wayland { client_id, .. }) => {
+            Some(ActiveDragTarget::Wayland {
+                client_id,
+                device_id,
+                ..
+            }) => {
                 let Some(device) = self
                     .data_devices
                     .iter()
-                    .find(|binding| &binding.client_id == client_id && binding.device.is_alive())
+                    .find(|binding| {
+                        &binding.client_id == client_id
+                            && binding.device.id().protocol_id() == *device_id
+                            && binding.device.is_alive()
+                    })
                     .map(|binding| binding.device.clone())
                 else {
                     return;
@@ -687,12 +703,19 @@ impl CompositorState {
             };
             let transition = match target {
                 ActiveDragTarget::Wayland {
-                    client_id, offer, ..
+                    client_id,
+                    device_id,
+                    offer,
+                    ..
                 } => {
                     if let Some(device) = self
                         .data_devices
                         .iter()
-                        .find(|binding| binding.client_id == client_id && binding.device.is_alive())
+                        .find(|binding| {
+                            binding.client_id == client_id
+                                && binding.device.id().protocol_id() == device_id
+                                && binding.device.is_alive()
+                        })
                         .map(|binding| binding.device.clone())
                     {
                         let _ = device.send_event(wl_data_device::Event::Leave);
@@ -1029,12 +1052,19 @@ impl CompositorState {
                 }
             }
             ActiveDragTarget::Wayland {
-                client_id, offer, ..
+                client_id,
+                device_id,
+                offer,
+                ..
             } => {
                 let Some(device) = self
                     .data_devices
                     .iter()
-                    .find(|binding| binding.client_id == client_id && binding.device.is_alive())
+                    .find(|binding| {
+                        binding.client_id == client_id
+                            && binding.device.id().protocol_id() == device_id
+                            && binding.device.is_alive()
+                    })
                     .map(|binding| binding.device.clone())
                 else {
                     self.cancel_drag_session("target_device_gone");

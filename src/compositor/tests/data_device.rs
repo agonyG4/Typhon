@@ -883,6 +883,345 @@ fn clipboard_selection_after_unrelated_input_uses_a_fresh_mutation_epoch() {
 }
 
 #[test]
+fn client_teardown_retires_its_core_primary_and_data_control_offers() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let source_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (source_globals, mut source_queue) =
+        registry_queue_init::<RegistryTestState>(&source_connection).unwrap();
+    let source_qh = source_queue.handle();
+    let source_compositor: client_wl_compositor::WlCompositor =
+        source_globals.bind(&source_qh, 1..=6, ()).unwrap();
+    let source_wm_base: client_xdg_wm_base::XdgWmBase =
+        source_globals.bind(&source_qh, 1..=6, ()).unwrap();
+    let source_shm: client_wl_shm::WlShm = source_globals.bind(&source_qh, 1..=1, ()).unwrap();
+    let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ()).unwrap();
+    let _source_keyboard = source_seat.get_keyboard(&source_qh, ());
+    let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        source_globals.bind(&source_qh, 1..=3, ()).unwrap();
+    let source_device = source_manager.get_data_device(&source_seat, &source_qh, ());
+    let source_primary_manager: client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
+        source_globals.bind(&source_qh, 1..=1, ()).unwrap();
+    let source_primary_device = source_primary_manager.get_device(&source_seat, &source_qh, ());
+    let clipboard_source = source_manager.create_data_source(&source_qh, ());
+    clipboard_source.offer("text/plain".to_string());
+    let primary_source = source_primary_manager.create_source(&source_qh, ());
+    primary_source.offer("text/plain".to_string());
+    let (source_surface, source_xdg_surface, _source_toplevel) = create_test_buffered_toplevel(
+        &source_compositor,
+        &source_wm_base,
+        &source_shm,
+        &source_qh,
+        160,
+        120,
+    )
+    .unwrap();
+    source_surface.commit();
+    source_connection.flush().unwrap();
+    let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&source_xdg_surface);
+    source_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    let source_serial = source_state
+        .keyboard_enter_serial
+        .expect("source owner is initially focused");
+    source_device.set_selection(Some(&clipboard_source), source_serial);
+    source_primary_device.set_selection(Some(&primary_source), source_serial);
+    source_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+
+    let selection_before_disconnect = {
+        let target_connection =
+            Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+        let (target_globals, mut target_queue) =
+            registry_queue_init::<RegistryTestState>(&target_connection).unwrap();
+        let target_qh = target_queue.handle();
+        let target_compositor: client_wl_compositor::WlCompositor =
+            target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+        let target_wm_base: client_xdg_wm_base::XdgWmBase =
+            target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+        let target_shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+        let target_seat: client_wl_seat::WlSeat =
+            target_globals.bind(&target_qh, 1..=7, ()).unwrap();
+        let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
+        let target_data_manager: client_wl_data_device_manager::WlDataDeviceManager =
+            target_globals.bind(&target_qh, 1..=3, ()).unwrap();
+        let _target_device = target_data_manager.get_data_device(&target_seat, &target_qh, ());
+        let target_primary_manager: client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
+            target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+        let _target_primary_device =
+            target_primary_manager.get_device(&target_seat, &target_qh, ());
+        let target_data_control_manager: client_ext_data_control_manager_v1::ExtDataControlManagerV1 =
+            target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+        let _target_control_device =
+            target_data_control_manager.get_data_device(&target_seat, &target_qh, ());
+        let (target_surface, target_xdg_surface, _target_toplevel) = create_test_buffered_toplevel(
+            &target_compositor,
+            &target_wm_base,
+            &target_shm,
+            &target_qh,
+            160,
+            120,
+        )
+        .unwrap();
+        target_surface.commit();
+        target_connection.flush().unwrap();
+        let mut target_state = RegistryTestState::default();
+        target_queue.roundtrip(&mut target_state).unwrap();
+        commit_registered_initial_xdg_test_buffer(&target_xdg_surface);
+        target_connection.flush().unwrap();
+        focus_root_window(&commands, target_surface.id().protocol_id());
+        wait_for_server_commands(&commands);
+        target_queue.roundtrip(&mut target_state).unwrap();
+        source_queue.roundtrip(&mut source_state).unwrap();
+
+        let before_disconnect = capture_clipboard_state(&commands);
+        assert_eq!(before_disconnect.clipboard_broker_offer_count, 2);
+        assert_eq!(before_disconnect.primary_broker_offer_count, 2);
+        assert!(target_state.data_device_selection_offer.is_some());
+        assert!(target_state.primary_selection_offer.is_some());
+        assert!(target_state.data_control_clipboard_offer.is_some());
+        assert!(target_state.data_control_primary_offer.is_some());
+        before_disconnect
+    };
+
+    wait_for_server_commands(&commands);
+    let after_disconnect = capture_clipboard_state(&commands);
+    assert_eq!(after_disconnect.clipboard_broker_offer_count, 0);
+    assert_eq!(after_disconnect.primary_broker_offer_count, 0);
+    assert!(after_disconnect.active_source);
+    assert_eq!(
+        after_disconnect.generation,
+        selection_before_disconnect.generation
+    );
+    assert_eq!(
+        after_disconnect.mutation_epoch,
+        selection_before_disconnect.mutation_epoch
+    );
+    assert_eq!(
+        after_disconnect.primary_generation,
+        selection_before_disconnect.primary_generation
+    );
+    assert_eq!(
+        after_disconnect.primary_mutation_epoch,
+        selection_before_disconnect.primary_mutation_epoch
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn removing_one_core_device_preserves_sibling_offers_and_transfers() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device_a = manager.get_data_device(&seat, &qh, ());
+    let device_b = manager.get_data_device(&seat, &qh, ());
+    let source = manager.create_data_source(&qh, ());
+    source.offer("text/plain".to_string());
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let serial = state
+        .keyboard_enter_serial
+        .expect("focused client receives a keyboard enter serial");
+    device_a.set_selection(Some(&source), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let offer_for_device = |state: &RegistryTestState, device_id| {
+        state
+            .data_device_selection_offers
+            .iter()
+            .rev()
+            .find_map(|(id, offer)| (*id == device_id).then(|| offer.clone()).flatten())
+            .expect("core data device receives the current clipboard offer")
+    };
+    let offer_a = offer_for_device(&state, device_a.id().protocol_id());
+    let offer_b = offer_for_device(&state, device_b.id().protocol_id());
+    let before = capture_clipboard_state(&commands);
+    assert_eq!(before.clipboard_broker_offer_count, 2);
+
+    device_a.release();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_device_a_destroy = capture_clipboard_state(&commands);
+    assert_eq!(after_device_a_destroy.clipboard_broker_offer_count, 1);
+    assert_eq!(after_device_a_destroy.primary_broker_offer_count, 0);
+    assert_eq!(after_device_a_destroy.generation, before.generation);
+    assert_eq!(after_device_a_destroy.mutation_epoch, before.mutation_epoch);
+
+    let (stale_read_fd, stale_write_fd) = owned_pipe().unwrap();
+    offer_a.receive("text/plain".to_string(), stale_write_fd.as_fd());
+    connection.flush().unwrap();
+    drop(stale_write_fd);
+    queue.roundtrip(&mut state).unwrap();
+    let mut stale_payload = String::new();
+    File::from(stale_read_fd)
+        .read_to_string(&mut stale_payload)
+        .unwrap();
+    assert!(stale_payload.is_empty());
+    assert!(state.data_source_send_mime_types.is_empty());
+
+    let (read_fd, write_fd) = owned_pipe().unwrap();
+    offer_b.receive("text/plain".to_string(), write_fd.as_fd());
+    connection.flush().unwrap();
+    drop(write_fd);
+    queue.roundtrip(&mut state).unwrap();
+    let mut live_payload = String::new();
+    File::from(read_fd)
+        .read_to_string(&mut live_payload)
+        .unwrap();
+    assert_eq!(live_payload, "clipboard payload");
+    assert_eq!(state.data_source_send_mime_types, ["text/plain"]);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn destroying_selection_offers_retires_only_the_broker_offer() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let data_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let data_device = data_manager.get_data_device(&seat, &qh, ());
+    let primary_manager: client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let primary_device = primary_manager.get_device(&seat, &qh, ());
+    let data_control_manager: client_ext_data_control_manager_v1::ExtDataControlManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let _data_control_device = data_control_manager.get_data_device(&seat, &qh, ());
+    let clipboard_source = data_manager.create_data_source(&qh, ());
+    clipboard_source.offer("text/plain".to_string());
+    let primary_source = primary_manager.create_source(&qh, ());
+    primary_source.offer("text/plain".to_string());
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let serial = state
+        .keyboard_enter_serial
+        .expect("the focused client receives a keyboard enter serial");
+    data_device.set_selection(Some(&clipboard_source), serial);
+    primary_device.set_selection(Some(&primary_source), serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let clipboard_offer = state
+        .data_device_selection_offer
+        .clone()
+        .expect("core data device receives the clipboard offer");
+    let primary_offer = state
+        .primary_selection_offer
+        .clone()
+        .expect("primary device receives the PRIMARY offer");
+    let control_clipboard_offer = state
+        .data_control_clipboard_offer
+        .clone()
+        .expect("data-control device receives the clipboard offer");
+    let control_primary_offer = state
+        .data_control_primary_offer
+        .clone()
+        .expect("data-control device receives the PRIMARY offer");
+    let before = capture_clipboard_state(&commands);
+    assert_eq!(before.clipboard_broker_offer_count, 2);
+    assert_eq!(before.primary_broker_offer_count, 2);
+
+    clipboard_offer.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_core_destroy = capture_clipboard_state(&commands);
+    assert_eq!(after_core_destroy.clipboard_broker_offer_count, 1);
+    assert_eq!(after_core_destroy.primary_broker_offer_count, 2);
+
+    primary_offer.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_primary_destroy = capture_clipboard_state(&commands);
+    assert_eq!(after_primary_destroy.clipboard_broker_offer_count, 1);
+    assert_eq!(after_primary_destroy.primary_broker_offer_count, 1);
+
+    control_clipboard_offer.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_control_clipboard_destroy = capture_clipboard_state(&commands);
+    assert_eq!(
+        after_control_clipboard_destroy.clipboard_broker_offer_count,
+        0
+    );
+    assert_eq!(
+        after_control_clipboard_destroy.primary_broker_offer_count,
+        1
+    );
+
+    control_primary_offer.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after_control_destroy = capture_clipboard_state(&commands);
+    assert_eq!(after_control_destroy.clipboard_broker_offer_count, 0);
+    assert_eq!(after_control_destroy.primary_broker_offer_count, 0);
+    for after in [
+        after_core_destroy,
+        after_primary_destroy,
+        after_control_destroy,
+    ] {
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.mutation_epoch, before.mutation_epoch);
+        assert_eq!(after.primary_generation, before.primary_generation);
+        assert_eq!(after.primary_mutation_epoch, before.primary_mutation_epoch);
+    }
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn focus_transfer_retires_old_core_offers_without_mutating_selections() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -3076,4 +3415,34 @@ fn dnd_production_state_seeded_model_runs_100_000_transitions() {
             &format!("seed={SEED:#x} operation={operation}"),
         );
     }
+}
+
+#[test]
+fn removing_unrelated_same_client_data_device_keeps_drag_offer_alive() {
+    let mut model = ProductionDndModel::new();
+    model.apply(DndModelOp::CreateSource);
+    model.apply(DndModelOp::OfferMime);
+    model.apply(DndModelOp::SetSourceActions(1));
+    model.apply(DndModelOp::StartDrag(true));
+    model.apply(DndModelOp::Enter);
+
+    let offer = model
+        .current_offer()
+        .expect("the active drag has a Wayland target offer");
+    let binding = model
+        .state
+        .data_offers
+        .get(&offer.id())
+        .expect("the active drag offer has a protocol binding");
+    assert_eq!(binding.target_id, model.target_device.id().protocol_id());
+    assert_eq!(
+        model.same_client_device.client().unwrap().id(),
+        model.target_device.client().unwrap().id()
+    );
+
+    model.state.remove_data_device(&model.same_client_device);
+
+    assert!(model.state.active_drag.is_some());
+    assert!(model.state.data_offers.contains_key(&offer.id()));
+    assert_eq!(model.state.compliance_metrics.dnd_sessions_cancelled, 0);
 }

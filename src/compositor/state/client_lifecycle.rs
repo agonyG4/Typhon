@@ -364,10 +364,19 @@ impl CompositorState {
         self.forget_output_bindings_for_client(client_id);
         self.data_devices
             .retain(|device| device.client_id != *client_id);
+        let mut clipboard_offer_ids = Vec::new();
         self.data_offers.retain(|_, offer| {
-            offer.target_client_id != *client_id
-                && !resource_owned_by_client(&offer.offer, client_id)
+            let remove = offer.target_client_id == *client_id
+                || resource_owned_by_client(&offer.offer, client_id);
+            if remove && offer.kind == DataOfferKind::Selection {
+                clipboard_offer_ids.extend(offer.broker_offer_id);
+            }
+            !remove
         });
+        for offer_id in clipboard_offer_ids {
+            self.selection_state
+                .retire_offer(SelectionKind::Clipboard, offer_id);
+        }
         self.activation_tokens
             .retain(|_, token| token.client_id != *client_id);
         self.pending_activation_tokens
@@ -385,10 +394,19 @@ impl CompositorState {
 
         self.primary_devices
             .retain(|device| device.client_id != *client_id);
+        let mut primary_offer_ids = Vec::new();
         self.primary_offers.retain(|_, offer| {
-            offer.target_client_id != *client_id
-                && !resource_owned_by_client(&offer.offer, client_id)
+            let remove = offer.target_client_id == *client_id
+                || resource_owned_by_client(&offer.offer, client_id);
+            if remove {
+                primary_offer_ids.push(offer.broker_offer_id);
+            }
+            !remove
         });
+        for offer_id in primary_offer_ids {
+            self.selection_state
+                .retire_offer(SelectionKind::Primary, offer_id);
+        }
         let primary_sources = self
             .primary_sources
             .values()
@@ -401,10 +419,18 @@ impl CompositorState {
 
         self.data_control_devices
             .retain(|device| device.client_id != *client_id);
+        let mut data_control_offer_ids = Vec::new();
         self.data_control_offers.retain(|_, offer| {
-            offer.target_client_id != *client_id
-                && !resource_owned_by_client(&offer.offer, client_id)
+            let remove = offer.target_client_id == *client_id
+                || resource_owned_by_client(&offer.offer, client_id);
+            if remove {
+                data_control_offer_ids.push((offer.kind, offer.broker_offer_id));
+            }
+            !remove
         });
+        for (kind, offer_id) in data_control_offer_ids {
+            self.selection_state.retire_offer(kind, offer_id);
+        }
         let data_control_sources = self
             .data_control_sources
             .values()

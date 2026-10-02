@@ -207,6 +207,8 @@ fn clipboard_source_disconnect_clears_focused_target_selection() {
             mutation_epoch: 2,
             primary_generation: 0,
             primary_mutation_epoch: 0,
+            clipboard_broker_offer_count: 0,
+            primary_broker_offer_count: 0,
             source_count: 0,
             offer_count: 0,
         },

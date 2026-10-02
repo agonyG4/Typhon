@@ -513,21 +513,47 @@ impl CompositorState {
         &mut self,
         device: &wl_data_device::WlDataDevice,
     ) {
-        if let Some(client_id) = device.client().map(|client| client.id())
+        let target_id = device.id().protocol_id();
+        let target_client_id = self
+            .data_devices
+            .iter()
+            .find(|binding| same_wayland_resource(&binding.device, device))
+            .map(|binding| binding.client_id.clone())
+            .or_else(|| device.client().map(|client| client.id()));
+        if let Some(client_id) = target_client_id.as_ref()
             && self.active_drag.as_ref().is_some_and(|drag| {
                 drag.target
                     .as_ref()
-                    .and_then(ActiveDragTarget::wayland_client)
-                    == Some(&client_id)
+                    .and_then(ActiveDragTarget::wayland_device_id)
+                    == Some(target_id)
+                    && drag
+                        .target
+                        .as_ref()
+                        .and_then(ActiveDragTarget::wayland_client)
+                        == Some(client_id)
             })
         {
             self.cancel_drag_session("data_device_destroyed");
         }
         self.data_devices
             .retain(|binding| !same_wayland_resource(&binding.device, device));
+        let mut retired = Vec::new();
         self.data_offers.retain(|_, offer| {
-            offer.offer.is_alive() && !offer.offer.id().same_client_as(&device.id())
+            let belongs_to_device = offer.target_id == target_id
+                && target_client_id.as_ref() == Some(&offer.target_client_id);
+            if belongs_to_device {
+                if offer.kind == DataOfferKind::Selection {
+                    retired.extend(offer.broker_offer_id);
+                }
+                false
+            } else {
+                true
+            }
         });
+        for broker_offer_id in retired {
+            self.selection_state
+                .retire_offer(SelectionKind::Clipboard, broker_offer_id);
+        }
     }
 
     pub(in crate::compositor) fn remove_data_source(
@@ -809,6 +835,8 @@ impl CompositorState {
                 },
             )
         else {
+            self.selection_state
+                .retire_offer(SelectionKind::Clipboard, broker_offer_id);
             return;
         };
         self.data_offers.insert(

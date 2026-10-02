@@ -263,7 +263,11 @@ impl Dispatch<ext_data_control_offer_v1::ExtDataControlOfferV1, DataControlOffer
         resource: &ext_data_control_offer_v1::ExtDataControlOfferV1,
         _data: &DataControlOfferData,
     ) {
-        state.data_control_offers.remove(&resource.id());
+        if let Some(binding) = state.data_control_offers.remove(&resource.id()) {
+            state
+                .selection_state
+                .retire_offer(binding.kind, binding.broker_offer_id);
+        }
     }
 }
 
@@ -375,11 +379,29 @@ impl CompositorState {
         &mut self,
         device: &ext_data_control_device_v1::ExtDataControlDeviceV1,
     ) {
+        let target_id = device.id().protocol_id();
+        let target_client_id = self
+            .data_control_devices
+            .iter()
+            .find(|binding| same_wayland_resource(&binding.device, device))
+            .map(|binding| binding.client_id.clone())
+            .or_else(|| device.client().map(|client| client.id()));
         self.data_control_devices
             .retain(|binding| !same_wayland_resource(&binding.device, device));
+        let mut retired = Vec::new();
         self.data_control_offers.retain(|_, offer| {
-            offer.offer.is_alive() && !offer.offer.id().same_client_as(&device.id())
+            let belongs_to_device = offer.target_id == target_id
+                && target_client_id.as_ref() == Some(&offer.target_client_id);
+            if belongs_to_device {
+                retired.push((offer.kind, offer.broker_offer_id));
+                false
+            } else {
+                true
+            }
         });
+        for (kind, broker_offer_id) in retired {
+            self.selection_state.retire_offer(kind, broker_offer_id);
+        }
     }
 
     fn publish_data_control_to_device(
@@ -443,6 +465,7 @@ impl CompositorState {
                 source_key: selection.source_key,
             },
         ) else {
+            self.selection_state.retire_offer(kind, broker_offer_id);
             return;
         };
         self.data_control_offers.insert(

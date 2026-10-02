@@ -345,6 +345,11 @@ impl SelectionState {
         self.next_mutation_epoch
     }
 
+    #[cfg(test)]
+    pub(in crate::compositor) fn test_offer_count(&self, kind: SelectionKind) -> usize {
+        self.channel(kind).offers.len()
+    }
+
     pub fn register_offer(
         &mut self,
         kind: SelectionKind,

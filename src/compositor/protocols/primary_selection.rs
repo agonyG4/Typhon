@@ -311,7 +311,11 @@ impl Dispatch<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, Primar
         resource: &zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
         _data: &PrimaryOfferData,
     ) {
-        state.primary_offers.remove(&resource.id());
+        if let Some(binding) = state.primary_offers.remove(&resource.id()) {
+            state
+                .selection_state
+                .retire_offer(SelectionKind::Primary, binding.broker_offer_id);
+        }
     }
 }
 
@@ -376,11 +380,30 @@ impl CompositorState {
         &mut self,
         device: &zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
     ) {
+        let target_id = device.id().protocol_id();
+        let target_client_id = self
+            .primary_devices
+            .iter()
+            .find(|binding| same_wayland_resource(&binding.device, device))
+            .map(|binding| binding.client_id.clone())
+            .or_else(|| device.client().map(|client| client.id()));
         self.primary_devices
             .retain(|binding| !same_wayland_resource(&binding.device, device));
+        let mut retired = Vec::new();
         self.primary_offers.retain(|_, offer| {
-            offer.offer.is_alive() && !offer.offer.id().same_client_as(&device.id())
+            let belongs_to_device = offer.target_id == target_id
+                && target_client_id.as_ref() == Some(&offer.target_client_id);
+            if belongs_to_device {
+                retired.push(offer.broker_offer_id);
+                false
+            } else {
+                true
+            }
         });
+        for broker_offer_id in retired {
+            self.selection_state
+                .retire_offer(SelectionKind::Primary, broker_offer_id);
+        }
     }
 
     pub(in crate::compositor) fn publish_primary_to_keyboard_focused_client(&mut self) {
@@ -495,6 +518,8 @@ impl CompositorState {
                 source_key: selection.source_key,
             },
         ) else {
+            self.selection_state
+                .retire_offer(SelectionKind::Primary, broker_offer_id);
             return;
         };
         self.primary_offers.insert(
