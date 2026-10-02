@@ -211,6 +211,8 @@ pub struct PlanePropertyId(pub PropertyId);
 #[derive(Debug, Clone)]
 pub struct AtomicConnectorProperties {
     pub crtc_id: ConnectorPropertyId,
+    pub vrr_capable: Option<ConnectorPropertyId>,
+    pub vrr_capable_value: Option<u64>,
     pub content_type: Option<ConnectorPropertyId>,
     pub content_type_value: Option<u64>,
     pub content_type_enums: Option<Vec<DrmPropertyEnum>>,
@@ -222,8 +224,13 @@ impl AtomicConnectorProperties {
         let content_type_property = properties
             .iter()
             .find(|property| property.name().eq_ignore_ascii_case("content type"));
+        let vrr_capable_property = properties
+            .iter()
+            .find(|property| property.name().eq_ignore_ascii_case("vrr_capable"));
         Ok(Self {
             crtc_id: ConnectorPropertyId(set.required("CRTC_ID")?),
+            vrr_capable: vrr_capable_property.map(|property| ConnectorPropertyId(property.id())),
+            vrr_capable_value: vrr_capable_property.map(|property| property.value),
             content_type: content_type_property.map(|property| ConnectorPropertyId(property.id())),
             content_type_value: content_type_property.map(|property| property.value),
             content_type_enums: content_type_property.map(|property| property.enums.clone()),

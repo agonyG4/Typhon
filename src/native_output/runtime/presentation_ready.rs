@@ -446,8 +446,8 @@ pub(super) fn submit_ready_frame(
                 cursor_epoch,
                 *frame_index,
                 Some(kms_backend),
-                |scanout, presentation_mode| {
-                    scanout.present(kms_backend, cursor, presentation_mode)
+                |scanout, presentation_mode, content_type| {
+                    scanout.present(kms_backend, cursor, presentation_mode, content_type)
                 },
             );
             match result {

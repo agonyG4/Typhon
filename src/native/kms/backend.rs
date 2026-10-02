@@ -43,6 +43,20 @@ pub struct AtomicDiscovery {
     pub cursor_height: u32,
 }
 
+impl AtomicDiscovery {
+    /// The connector property is a capability bit, while CRTC VRR_ENABLED is
+    /// the atomic control used by this backend. Both are required.
+    pub fn vrr_capable(&self) -> bool {
+        self.pipeline.connector_props.vrr_capable.is_some()
+            && self
+                .pipeline
+                .connector_props
+                .vrr_capable_value
+                .is_some_and(|value| value != 0)
+            && self.pipeline.crtc_props.vrr_enabled.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AtomicDiscoveryRequest {
     connector: ConnectorId,
@@ -323,6 +337,7 @@ impl AtomicDiscovery {
             connector_content_type: connector_props.content_type_value,
             crtc_active: required_value(&crtc_entries, "ACTIVE", DrmObjectKind::Crtc)?,
             crtc_mode_id: required_value(&crtc_entries, "MODE_ID", DrmObjectKind::Crtc)?,
+            crtc_vrr_enabled: property_value(&crtc_entries, "VRR_ENABLED"),
             plane_fb_id: required_value(&plane_entries, "FB_ID", DrmObjectKind::PrimaryPlane)?,
             plane_crtc_id: required_value(&plane_entries, "CRTC_ID", DrmObjectKind::PrimaryPlane)?,
             src_x: required_value(&plane_entries, "SRC_X", DrmObjectKind::PrimaryPlane)?,
@@ -696,8 +711,13 @@ impl DrmAtomicBackend {
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
     ) -> Result<(), AtomicKmsError> {
-        let request =
+        let mut request =
             AtomicRequest::primary_flip_with_cursor(&self.discovery.pipeline, framebuffer, cursor)?;
+        request.set_presentation_state(
+            &self.discovery.pipeline,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )?;
         let submission = AtomicSubmission::page_flip(request, token);
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         submit_atomic(
@@ -713,7 +733,12 @@ impl DrmAtomicBackend {
         cursor: Option<&AtomicCursorVisualState>,
         token: PageFlipToken,
     ) -> Result<(), AtomicKmsError> {
-        let request = AtomicRequest::cursor_only(&self.discovery.pipeline, cursor)?;
+        let mut request = AtomicRequest::cursor_only(&self.discovery.pipeline, cursor)?;
+        request.set_presentation_state(
+            &self.discovery.pipeline,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )?;
         let submission = AtomicSubmission::page_flip(request, token);
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         submit_atomic(
@@ -728,7 +753,12 @@ impl DrmAtomicBackend {
         &self,
         cursor: Option<&AtomicCursorVisualState>,
     ) -> Result<(), AtomicKmsError> {
-        let request = AtomicRequest::cursor_only(&self.discovery.pipeline, cursor)?;
+        let mut request = AtomicRequest::cursor_only(&self.discovery.pipeline, cursor)?;
+        request.set_presentation_state(
+            &self.discovery.pipeline,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )?;
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         submit_atomic(
             fd,
@@ -886,17 +916,53 @@ impl Drop for DrmAtomicBackend {
 }
 
 impl KmsBackendSelection {
+    pub fn test_flip_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.commit_submitter().test_primary_with_presentation(
+                    framebuffer,
+                    token,
+                    cursor,
+                    presentation_mode,
+                    content_type,
+                )
+            }
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot TEST_ONLY an Adaptive Sync presentation",
+            )),
+        }
+    }
+
     pub fn submit_flip_with_presentation(
         &self,
         framebuffer: FramebufferId,
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
         presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
     ) -> Result<(), AtomicKmsError> {
         match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => {
-                backend.submit_flip_with_cursor(framebuffer, token, cursor)
-            }
+            KmsDisplayBackend::Atomic(backend) => backend
+                .commit_submitter()
+                .submit_primary_with_presentation(
+                    framebuffer,
+                    token,
+                    cursor,
+                    None,
+                    false,
+                    false,
+                    presentation_mode,
+                    content_type,
+                )
+                .map(|_| ()),
             KmsDisplayBackend::Legacy(backend) => backend.submit_flip_with_mode(
                 framebuffer,
                 token,
@@ -1267,6 +1333,38 @@ impl KmsBackendSelection {
         }
     }
 
+    /// Atomic VRR needs both the live connector capability value and the CRTC
+    /// programming property. Legacy KMS has no independently qualified path.
+    pub fn atomic_vrr_capable(&self) -> bool {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.discovery().vrr_capable(),
+            KmsDisplayBackend::Legacy(_) => false,
+        }
+    }
+
+    pub fn atomic_connector_vrr_capable(&self) -> bool {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                let properties = &backend.discovery().pipeline.connector_props;
+                properties.vrr_capable.is_some()
+                    && properties.vrr_capable_value.is_some_and(|value| value != 0)
+            }
+            KmsDisplayBackend::Legacy(_) => false,
+        }
+    }
+
+    pub fn atomic_crtc_vrr_property_available(&self) -> bool {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend
+                .discovery()
+                .pipeline
+                .crtc_props
+                .vrr_enabled
+                .is_some(),
+            KmsDisplayBackend::Legacy(_) => false,
+        }
+    }
+
     pub fn resolved_content_type(&self, requested: DrmContentType) -> DrmContentType {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend)
@@ -1341,6 +1439,44 @@ impl KmsBackendSelection {
             KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
                 AtomicKmsErrorKind::Unsupported,
                 "legacy KMS cannot test an Atomic cursor-plane update",
+            )),
+        }
+    }
+
+    pub fn test_atomic_cursor_flip_with_presentation(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+        mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend
+                    .commit_submitter()
+                    .test_cursor(cursor, mode, content_type)
+            }
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot TEST_ONLY an Atomic cursor update",
+            )),
+        }
+    }
+
+    pub fn submit_cursor_flip_with_presentation(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+        token: PageFlipToken,
+        mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend
+                .commit_submitter()
+                .submit_cursor(cursor, token, false, mode, content_type)
+                .map(|_| ()),
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot submit an Atomic cursor update",
             )),
         }
     }

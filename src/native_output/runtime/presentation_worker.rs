@@ -288,8 +288,13 @@ pub(super) fn present_composited_compatibility_frame(
         cursor_epoch,
         frame_id,
         Some(kms_backend),
-        |scanout, presentation_mode| {
-            scanout.present(kms_backend, effective_cursor, presentation_mode)
+        |scanout, presentation_mode, content_type| {
+            scanout.present(
+                kms_backend,
+                effective_cursor,
+                presentation_mode,
+                content_type,
+            )
         },
     );
     if result.is_err() {
@@ -815,6 +820,7 @@ pub(super) fn present_cursor_for_presentation(
             Some(kms_backend),
             output_generation,
             pacing_mode,
+            true,
         );
         let trace_snapshot = if crate::pointer_debug::cursor_presentation_trace_enabled() {
             let trace_state = desired.clone().unwrap_or_else(|| {
@@ -997,10 +1003,10 @@ pub(super) fn submit_explicit_ready_for_presentation(
                 .transaction(transaction_id)
                 .is_some_and(|transaction| {
                     let descriptor = transaction.descriptor();
-                    descriptor.presentation_mode().is_async()
+                    descriptor.presentation_mode() != OutputPresentationMode::Vsync
                         && descriptor
-                            .async_validation_key()
-                            .map(|key| !explicit.async_validation_is_accepted(key))
+                            .presentation_validation_key()
+                            .map(|key| !explicit.presentation_validation_is_accepted(key))
                             .unwrap_or(true)
                 });
         let result = match queue_explicit_ready_for_presentation(

@@ -30,18 +30,18 @@ use khronos_egl as egl;
 #[cfg(test)]
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
-    AcquireWatchChange, AstreaShortcutPhase, AsyncEligibility, DecorationSceneSnapshot,
-    DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
-    DesktopVisualState, DrmContentType, EffectivePresentation, FramePresentation,
-    FullscreenPresentationRejection, KeyboardShortcutInhibitionSnapshot,
+    AcquireWatchChange, AstreaShortcutPhase, AsyncBlocker, AsyncEligibility,
+    DecorationSceneSnapshot, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
+    DesktopSceneRenderer, DesktopVisualState, DrmContentType, EffectivePresentation,
+    FramePresentation, FullscreenPresentationRejection, KeyboardShortcutInhibitionSnapshot,
     OutputPosition as CompositorOutputPosition, OutputPresentationMode, OutputRegion,
     OwnCompositorServer, PointerAxisComponent, PointerAxisFrame, PointerAxisSource,
     PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
     PointerConstraintRegionResolutionTiming, PointerMotionSample as CompositorPointerMotionSample,
     PresentationClock, RelativePointerMotion as CompositorRelativePointerMotion,
     RenderGenerationCause, RenderSceneElement, RenderSceneElementId, RenderableSurface,
-    ResolvedPointerConstraintBackendRequest, TearingPolicy, WindowId,
-    render_scene_elements_for_surfaces, resize_debug_log,
+    ResolvedPointerConstraintBackendRequest, TearingPolicy, VrrBlocker, VrrEligibility, VrrPolicy,
+    WindowId, render_scene_elements_for_surfaces, resize_debug_log,
 };
 use oblivion_one::core::{OutputId, SceneNodeId};
 use oblivion_one::native::kms::{

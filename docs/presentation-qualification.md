@@ -35,8 +35,42 @@ Each phase writes bounded, labeled artifacts under
 `~/.local/state/oblivion-one/qualifications/<timestamp>/`, including the
 session log, trace placeholder, metrics placeholder, environment snapshot,
 and summary. The summary reports trace drops when the running compositor emits
-that metric. The tool does not enable VRR or tearing and does not change the
-default direct policy.
+that metric. The tool does not change the default direct policy or silently
+enable a presentation policy. Adaptive Sync and tearing qualification must be
+selected explicitly for the live phase being run.
+
+## Adaptive Sync Phase 1 qualification
+
+Adaptive Sync uses `OBLIVION_ONE_VRR=off|auto|on`. `off` never requests it;
+`auto` requires the compositor's solitary-fullscreen candidate; `on` requests
+it for a capable Atomic output path. Capability comes from the live DRM
+connector `vrr_capable` property being nonzero and the CRTC `VRR_ENABLED`
+property being present. Sysfs may be recorded as a cross-check but cannot
+override those DRM properties. Legacy KMS is not VRR capable.
+
+For each live TTY/DRM run, record the configured policy, connector and CRTC
+property observations, output/DRM generation, effective mode and blockers,
+submitted mode, and matching pageflip-confirmed mode. Confirm that the initial
+state sets `VRR_ENABLED=0`, that every Adaptive transaction includes the exact
+requested VRR state in both TEST_ONLY and real requests, and that shutdown and
+session recovery restore the value captured during discovery. A pageflip
+confirms only that the KMS request was committed; it does not prove that a
+physical monitor changed its refresh interval on that frame.
+
+Unit tests cover property discovery, request parity, transaction ownership,
+fallback, confirmation, and restoration. They do not qualify a real driver or
+monitor. A real TTY/DRM qualification must separately exercise `off`, `auto`,
+and `on`, fullscreen entry/exit, modes with a cursor and plane activity,
+TEST_ONLY and real-submit rejection fallback, session suspend/resume, and
+shutdown restore on the target kernel, driver, connector, and monitor.
+
+Phase 1 deliberately keeps Adaptive Sync on conservative `ReactiveDouble`
+pacing; it does not implement the final phase-free VRR scheduler. VRR
+range/min-refresh handling, overlay coalescing, cursor timing optimization,
+anti-flicker cadence ownership, and VRR-specific late rendering belong to the
+next scheduler phase. Fixed-refresh VSync, Async, FIFO, Commit Timing,
+Predictive O1, and presentation-feedback ownership must continue to pass their
+existing tests independently of physical hardware qualification.
 
 Each live phase must exercise and inspect:
 

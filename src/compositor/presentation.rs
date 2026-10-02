@@ -1,5 +1,7 @@
 use std::io;
 
+use super::presentation_modes::OutputPresentationMode;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PresentationClock {
     #[default]
@@ -99,6 +101,7 @@ pub struct FramePresentation {
     pub sequence: u64,
     pub kind: PresentationKind,
     pub zero_copy: bool,
+    pub presentation_mode: OutputPresentationMode,
 }
 
 impl FramePresentation {
@@ -114,6 +117,7 @@ impl FramePresentation {
             sequence: u64::from(sequence),
             kind: PresentationKind::Synchronized,
             zero_copy: false,
+            presentation_mode: OutputPresentationMode::Vsync,
         })
     }
 
@@ -140,6 +144,7 @@ impl FramePresentation {
             sequence: u64::from(sequence),
             kind: PresentationKind::Tearing,
             zero_copy: false,
+            presentation_mode: OutputPresentationMode::Async,
         })
     }
 
@@ -161,7 +166,21 @@ impl FramePresentation {
             sequence: 0,
             kind: PresentationKind::Software,
             zero_copy: false,
+            presentation_mode: OutputPresentationMode::Vsync,
         })
+    }
+
+    pub fn with_presentation_mode(mut self, mode: OutputPresentationMode) -> Self {
+        self.presentation_mode = mode;
+        self
+    }
+
+    pub const fn feedback_refresh_nsec(self, fixed_refresh_nsec: u32) -> u32 {
+        if self.presentation_mode.uses_vrr() {
+            0
+        } else {
+            fixed_refresh_nsec
+        }
     }
 }
 
@@ -219,5 +238,15 @@ mod tests {
         let timestamp = PresentationTimestamp::from_microseconds(7, 0).unwrap();
 
         assert_eq!(timestamp.nanoseconds(), 0);
+    }
+
+    #[test]
+    fn variable_refresh_feedback_reports_zero_refresh_and_fixed_modes_keep_rate() {
+        let fixed = FramePresentation::synchronized(PresentationClock::Monotonic, 1, 0, 1).unwrap();
+        let adaptive = fixed.with_presentation_mode(OutputPresentationMode::AdaptiveSync);
+        let adaptive_tearing = fixed.with_presentation_mode(OutputPresentationMode::AdaptiveAsync);
+        assert_eq!(fixed.feedback_refresh_nsec(16_666_666), 16_666_666);
+        assert_eq!(adaptive.feedback_refresh_nsec(16_666_666), 0);
+        assert_eq!(adaptive_tearing.feedback_refresh_nsec(16_666_666), 0);
     }
 }

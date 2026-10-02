@@ -189,6 +189,7 @@ impl AtomicEglGbmScanout {
         };
         let effective_presentation = EffectivePresentation::decide(
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+            VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref()),
             candidate.presentation,
             AsyncEligibility {
                 solitary_fullscreen: server
@@ -223,6 +224,17 @@ impl AtomicEglGbmScanout {
                     .resolved_content_type(candidate.presentation.content_type.drm_value())
                     != confirmed_content_type,
                 ..AsyncEligibility::default()
+            },
+            VrrEligibility {
+                auto_candidate: server
+                    .direct_scanout_solitary_fullscreen(candidate.root_surface_id),
+                backend_capable: kms.effective_kind()
+                    == oblivion_one::native::kms::KmsBackendKind::Atomic,
+                connector_capable: kms.atomic_connector_vrr_capable(),
+                crtc_property_available: kms.atomic_crtc_vrr_property_available(),
+                output_generation_qualified: candidate.generation == self.direct.drm_generation,
+                exact_kms_qualified: true,
+                transition_supported: true,
             },
         );
         let presentation_mode = effective_presentation.mode;

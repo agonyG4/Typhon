@@ -12,7 +12,7 @@ static CONTENT_TYPE_FALLBACK_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(fa
 
 pub const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AtomicCursorVisualState {
     pub visible: bool,
     pub x: i32,
@@ -367,6 +367,31 @@ impl AtomicRequest {
         Ok(true)
     }
 
+    /// Add the requested CRTC VRR state to this presentation request.
+    /// Missing optional properties safely leave the request unchanged.
+    pub fn set_crtc_vrr_enabled(
+        &mut self,
+        pipeline: &AtomicPipelineProperties,
+        enabled: bool,
+    ) -> Result<bool, AtomicKmsError> {
+        let Some(property) = pipeline.crtc_props.vrr_enabled else {
+            return Ok(false);
+        };
+        self.set_crtc(pipeline.crtc, property, u64::from(enabled))?;
+        Ok(true)
+    }
+
+    pub fn set_presentation_state(
+        &mut self,
+        pipeline: &AtomicPipelineProperties,
+        presentation_mode: crate::compositor::OutputPresentationMode,
+        content_type: crate::compositor::DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        self.set_connector_content_type(pipeline, content_type.as_str())?;
+        self.set_crtc_vrr_enabled(pipeline, presentation_mode.uses_vrr())?;
+        Ok(())
+    }
+
     pub fn set_crtc(
         &mut self,
         object: CrtcId,
@@ -437,6 +462,9 @@ impl AtomicRequest {
         request.set_connector(connector, connector_props.crtc_id, u64::from(crtc.get()))?;
         request.set_crtc(crtc, crtc_props.mode_id, u64::from(mode_blob.get()))?;
         request.set_crtc(crtc, crtc_props.active, 1)?;
+        if let Some(property) = crtc_props.vrr_enabled {
+            request.set_crtc(crtc, property, 0)?;
+        }
         request.set_plane(plane, plane_props.fb_id, u64::from(framebuffer.get()))?;
         request.set_plane(plane, plane_props.crtc_id, u64::from(crtc.get()))?;
         request.set_plane(plane, plane_props.src_x, geometry.src_x)?;
@@ -647,6 +675,9 @@ impl AtomicRequest {
         request.set_connector(pipeline.connector, pipeline.connector_props.crtc_id, 0)?;
         request.set_crtc(pipeline.crtc, pipeline.crtc_props.active, 0)?;
         request.set_crtc(pipeline.crtc, pipeline.crtc_props.mode_id, 0)?;
+        if let Some(property) = pipeline.crtc_props.vrr_enabled {
+            request.set_crtc(pipeline.crtc, property, 0)?;
+        }
         request.set_plane(pipeline.plane, pipeline.plane_props.fb_id, 0)?;
         request.set_plane(pipeline.plane, pipeline.plane_props.crtc_id, 0)?;
         append_cursor_plane_state(&mut request, pipeline, None)?;
@@ -756,6 +787,7 @@ pub struct AtomicPipelineSnapshot {
     pub connector_content_type: Option<u64>,
     pub crtc_active: u64,
     pub crtc_mode_id: u64,
+    pub crtc_vrr_enabled: Option<u64>,
     pub plane_fb_id: u64,
     pub plane_crtc_id: u64,
     pub src_x: u64,
@@ -792,6 +824,11 @@ impl AtomicPipelineSnapshot {
             pipeline.crtc_props.mode_id,
             self.crtc_mode_id,
         )?;
+        if let (Some(property), Some(value)) =
+            (pipeline.crtc_props.vrr_enabled, self.crtc_vrr_enabled)
+        {
+            request.set_crtc(pipeline.crtc, property, value)?;
+        }
         request.set_plane(pipeline.plane, pipeline.plane_props.fb_id, self.plane_fb_id)?;
         request.set_plane(
             pipeline.plane,
@@ -1003,15 +1040,11 @@ impl AtomicCommitFlags {
         mode: crate::compositor::OutputPresentationMode,
         test_only: bool,
     ) -> Self {
-        match (mode, test_only) {
-            (crate::compositor::OutputPresentationMode::Async, true) => {
-                Self::test_only_async_page_flip()
-            }
-            (crate::compositor::OutputPresentationMode::Async, false) => Self::async_page_flip(),
-            (crate::compositor::OutputPresentationMode::Vsync, true) => {
-                Self::test_only_no_modeset()
-            }
-            (crate::compositor::OutputPresentationMode::Vsync, false) => Self::page_flip(),
+        match (mode.is_async(), test_only) {
+            (true, true) => Self::test_only_async_page_flip(),
+            (true, false) => Self::async_page_flip(),
+            (false, true) => Self::test_only_no_modeset(),
+            (false, false) => Self::page_flip(),
         }
     }
 

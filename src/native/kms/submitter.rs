@@ -191,7 +191,11 @@ impl AtomicCommitSubmitter {
     ) -> Result<(), AtomicKmsError> {
         let mut request =
             AtomicRequest::primary_flip_with_geometry(&self.pipeline, framebuffer, geometry)?;
-        request.set_connector_content_type(&self.pipeline, content_type.as_str())?;
+        request.set_presentation_state(
+            &self.pipeline,
+            OutputPresentationMode::Vsync,
+            content_type,
+        )?;
         request.set_test_input_fence_none(&self.pipeline)?;
         let submission = AtomicSubmission::test_only(request);
         self.submit_request(
@@ -238,7 +242,7 @@ impl AtomicCommitSubmitter {
             }
             request
         };
-        request.set_connector_content_type(&self.pipeline, content_type.as_str())?;
+        request.set_presentation_state(&self.pipeline, presentation_mode, content_type)?;
         if presentation_mode.is_async() && touch_cursor {
             return Err(AtomicKmsError::new(
                 AtomicKmsErrorKind::Unsupported,
@@ -297,8 +301,17 @@ impl AtomicCommitSubmitter {
         cursor: Option<&AtomicCursorVisualState>,
         token: PageFlipToken,
         test_only: bool,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
-        let request = AtomicRequest::cursor_only(&self.pipeline, cursor)?;
+        if presentation_mode.is_async() {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "Async pageflip cannot mutate cursor-plane state",
+            ));
+        }
+        let mut request = AtomicRequest::cursor_only(&self.pipeline, cursor)?;
+        request.set_presentation_state(&self.pipeline, presentation_mode, content_type)?;
         let submission = if test_only {
             AtomicSubmission::test_only(request)
         } else {
@@ -327,8 +340,17 @@ impl AtomicCommitSubmitter {
     pub fn test_cursor(
         &self,
         cursor: Option<&AtomicCursorVisualState>,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
     ) -> Result<(), AtomicKmsError> {
-        let request = AtomicRequest::cursor_only(&self.pipeline, cursor)?;
+        if presentation_mode.is_async() {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "Async TEST_ONLY cannot mutate cursor-plane state",
+            ));
+        }
+        let mut request = AtomicRequest::cursor_only(&self.pipeline, cursor)?;
+        request.set_presentation_state(&self.pipeline, presentation_mode, content_type)?;
         let submission = AtomicSubmission::test_only(request);
         // SAFETY: the runtime owns the DRM fd and joins the worker before the
         // fd can be closed, revoked, restored, or replaced.

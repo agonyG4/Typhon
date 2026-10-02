@@ -1313,6 +1313,7 @@ impl CompatibilityPresentationHarness {
         &mut self,
         result: io::Result<NativePresentResult>,
     ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
+        let mut result = Some(result);
         super::present_compatibility_frame(
             &mut self.scanout,
             &mut self.server,
@@ -1326,7 +1327,11 @@ impl CompatibilityPresentationHarness {
             1,
             1,
             None,
-            |_, _| result,
+            |_, _, _| {
+                result
+                    .take()
+                    .expect("compatibility presentation is attempted once")
+            },
         )
     }
 

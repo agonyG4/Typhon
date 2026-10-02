@@ -176,6 +176,7 @@ pub(crate) enum OutputTransactionError {
         stage: OutputTransactionFailureStage,
     },
     PresentationTargetMismatch,
+    PresentationStateAlreadyOwned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1147,15 +1148,42 @@ impl OutputTransactionLedger {
         &mut self,
         id: OutputTransactionId,
     ) -> Result<(), OutputTransactionError> {
+        let content_type = self
+            .transaction(id)
+            .ok_or(OutputTransactionError::UnknownTransaction)?
+            .descriptor()
+            .content_type();
+        self.replace_presentation_state_before_submit(
+            id,
+            OutputPresentationMode::Vsync,
+            content_type,
+            None,
+        )
+    }
+
+    pub(crate) fn replace_presentation_state_before_submit(
+        &mut self,
+        id: OutputTransactionId,
+        mode: OutputPresentationMode,
+        content_type: oblivion_one::compositor::DrmContentType,
+        validation_key: Option<super::async_validation::CompositedPresentationValidationKey>,
+    ) -> Result<(), OutputTransactionError> {
         let record = self
             .active
             .get_mut(&id)
             .ok_or(OutputTransactionError::UnknownTransaction)?;
+        if !matches!(
+            record.state,
+            OutputTransactionState::Built
+                | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::ReadyUnbound { .. }
+        ) {
+            return Err(OutputTransactionError::PresentationStateAlreadyOwned);
+        }
         let descriptor = record.descriptor.clone();
-        let content_type = descriptor.content_type();
         record.descriptor = descriptor
-            .with_presentation_state(OutputPresentationMode::Vsync, content_type)
-            .with_async_validation_key(None);
+            .with_presentation_state(mode, content_type)
+            .with_presentation_validation_key(validation_key);
         Ok(())
     }
 

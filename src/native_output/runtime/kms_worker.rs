@@ -992,6 +992,55 @@ impl NativeRuntime {
         Self::finish_submitted_worker_pacing(&mut self.frame_pacing, pacing, result)
     }
 
+    fn qualify_presentation_fallback_modes_after_rejection(
+        &mut self,
+        job: &KmsCommitJob,
+        rejected_key: crate::native_output::presentation::async_validation::CompositedPresentationValidationKey,
+    ) -> NativeResult<()> {
+        if rejected_key.presentation_mode != OutputPresentationMode::AdaptiveAsync {
+            return Ok(());
+        }
+        let KmsPrimaryUpdate::Framebuffer { framebuffer, .. } = &job.primary else {
+            return Ok(());
+        };
+        let (touch_cursor, cursor) = match &job.cursor {
+            KmsCursorUpdate::Unchanged => (false, None),
+            KmsCursorUpdate::Disable => (true, None),
+            KmsCursorUpdate::Set(state) => (true, Some(state)),
+        };
+        let submitter = self.kms_backend.atomic_commit_submitter().ok_or_else(|| {
+            io::Error::other("presentation fallback validation requires Atomic KMS")
+        })?;
+        let test_token = PageFlipToken::new(allocate_native_page_flip_token())
+            .expect("allocated native pageflip token is nonzero");
+        for mode in [
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::Async,
+        ] {
+            let mut key = rejected_key;
+            key.presentation_mode = mode;
+            let result = if touch_cursor {
+                submitter.test_primary_with_presentation(
+                    *framebuffer,
+                    test_token,
+                    cursor,
+                    mode,
+                    job.content_type(),
+                )
+            } else {
+                submitter.test_primary_without_cursor_with_presentation(
+                    *framebuffer,
+                    test_token,
+                    mode,
+                    job.content_type(),
+                )
+            };
+            self.scanout
+                .note_composited_presentation_validation(key, result.is_ok());
+        }
+        Ok(())
+    }
+
     fn process_kms_worker_event_inner(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
         match event {
             KmsWorkerEvent::Submitted { ownership } => {
@@ -1019,9 +1068,10 @@ impl NativeRuntime {
                     .job
                     .owners
                     .primary()
-                    .and_then(|owner| owner.transaction.async_validation_key())
+                    .and_then(|owner| owner.transaction.presentation_validation_key())
                 {
-                    self.scanout.note_composited_async_validation(key, true);
+                    self.scanout
+                        .note_composited_presentation_validation(key, true);
                 }
                 let trace_snapshot = ownership.job.owners.trace_reveal();
                 let trace_identity = crate::native_output::CursorRevealPhysicalIdentity {
@@ -1517,9 +1567,11 @@ impl NativeRuntime {
                     && let Some(key) = job
                         .owners
                         .primary()
-                        .and_then(|owner| owner.transaction.async_validation_key())
+                        .and_then(|owner| owner.transaction.presentation_validation_key())
                 {
-                    self.scanout.note_composited_async_validation(key, false);
+                    self.scanout
+                        .note_composited_presentation_validation(key, false);
+                    self.qualify_presentation_fallback_modes_after_rejection(&job, key)?;
                     self.queued_redraw_requested = true;
                 }
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
@@ -1529,15 +1581,16 @@ impl NativeRuntime {
                 }
                 self.fail_queued_worker_job(job, error, WorkerRejectionKind::TestOnly)?;
             }
-            KmsWorkerEvent::SubmitRejected { job, error }
-            | KmsWorkerEvent::BusyExhausted { job, error } => {
+            KmsWorkerEvent::SubmitRejected { job, error } => {
                 if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
                     && let Some(key) = job
                         .owners
                         .primary()
-                        .and_then(|owner| owner.transaction.async_validation_key())
+                        .and_then(|owner| owner.transaction.presentation_validation_key())
                 {
-                    self.scanout.note_composited_async_validation(key, false);
+                    self.scanout
+                        .note_composited_presentation_validation(key, false);
+                    self.qualify_presentation_fallback_modes_after_rejection(&job, key)?;
                     self.queued_redraw_requested = true;
                 }
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
@@ -1546,6 +1599,13 @@ impl NativeRuntime {
                     {
                         self.scanout.note_direct_test_only(duration_ns, false);
                     }
+                    self.scanout.note_direct_real_submit_attempt(true);
+                }
+                self.fail_queued_worker_job(job, error, WorkerRejectionKind::RealSubmit)?;
+            }
+            KmsWorkerEvent::BusyExhausted { job, error } => {
+                self.queued_redraw_requested = true;
+                if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
                     self.scanout.note_direct_real_submit_attempt(true);
                 }
                 self.fail_queued_worker_job(job, error, WorkerRejectionKind::RealSubmit)?;

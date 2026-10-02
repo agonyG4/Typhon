@@ -15,7 +15,7 @@ use oblivion_one::native::presentation_deadline::{
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
-use super::async_validation::CompositedAsyncValidationKey;
+use super::async_validation::CompositedPresentationValidationKey;
 use super::plane::{CursorSidecarId, PlaneWriteSet};
 use crate::native_output::scanout::{CursorContentKey, OutputSlotId};
 
@@ -399,10 +399,11 @@ pub(crate) struct OutputTransaction {
     output_generation: u64,
     created_at: MonotonicTimestampNs,
     reservation: FramePresentationReservation,
+    selected_pacing_mode: NativeOutputPacingMode,
     pacing_mode: NativeOutputPacingMode,
     presentation_mode: OutputPresentationMode,
     content_type: DrmContentType,
-    async_validation_key: Option<CompositedAsyncValidationKey>,
+    presentation_validation_key: Option<CompositedPresentationValidationKey>,
     content: OutputTransactionContent,
     planes: OutputPlanePlan,
     synchronization: OutputSynchronizationPlan,
@@ -784,10 +785,11 @@ impl OutputTransaction {
             output_generation,
             created_at,
             reservation,
+            selected_pacing_mode: pacing_mode,
             pacing_mode,
             presentation_mode: OutputPresentationMode::Vsync,
             content_type: DrmContentType::Graphics,
-            async_validation_key: None,
+            presentation_validation_key: None,
             content,
             planes,
             synchronization,
@@ -870,17 +872,19 @@ impl OutputTransaction {
     ) -> Self {
         self.presentation_mode = presentation_mode;
         self.content_type = content_type;
-        if presentation_mode.is_async() {
-            self.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
-        }
+        self.pacing_mode = if presentation_mode.is_async() || presentation_mode.uses_vrr() {
+            NativeOutputPacingMode::ReactiveDouble
+        } else {
+            self.selected_pacing_mode
+        };
         self
     }
 
-    pub(crate) fn with_async_validation_key(
+    pub(crate) fn with_presentation_validation_key(
         mut self,
-        key: Option<CompositedAsyncValidationKey>,
+        key: Option<CompositedPresentationValidationKey>,
     ) -> Self {
-        self.async_validation_key = key;
+        self.presentation_validation_key = key;
         self
     }
 
@@ -931,8 +935,10 @@ impl OutputTransaction {
         self.surface_damage.as_ref()
     }
 
-    pub(crate) const fn async_validation_key(&self) -> Option<CompositedAsyncValidationKey> {
-        self.async_validation_key
+    pub(crate) const fn presentation_validation_key(
+        &self,
+    ) -> Option<CompositedPresentationValidationKey> {
+        self.presentation_validation_key
     }
 
     pub(crate) const fn content(&self) -> OutputTransactionContent {
@@ -1201,6 +1207,54 @@ mod tests {
                 .bind_deferred_o1(claim, MonotonicTimestampNs::new(17_681_818))
                 .unwrap_err(),
             FramePresentationBindingError::NotDeferred
+        );
+    }
+
+    #[test]
+    fn only_non_vsync_modes_override_and_then_restore_selected_pacing() {
+        let frame_batch_id =
+            CompositorFrameBatchId::new(NonZeroU64::new(15).expect("test frame batch ID"));
+        let base = OutputTransaction::compatibility_composited(
+            OutputId::from_raw(1).expect("test output id"),
+            OutputTransactionId::new(NonZeroU64::new(14).expect("test transaction ID")),
+            7,
+            MonotonicTimestampNs::new(1),
+            target(),
+            NativeOutputPacingMode::PredictiveTriple,
+            16,
+            1,
+            88,
+            None,
+            frame_batch_id,
+        )
+        .expect("compatibility transaction");
+
+        for mode in [
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::Async,
+            OutputPresentationMode::AdaptiveAsync,
+        ] {
+            assert_eq!(
+                base.clone()
+                    .with_presentation_state(mode, DrmContentType::Graphics)
+                    .pacing_mode(),
+                NativeOutputPacingMode::ReactiveDouble
+            );
+        }
+        assert_eq!(
+            base.clone()
+                .with_presentation_state(
+                    OutputPresentationMode::AdaptiveSync,
+                    DrmContentType::Graphics,
+                )
+                .with_presentation_state(OutputPresentationMode::Vsync, DrmContentType::Graphics)
+                .pacing_mode(),
+            NativeOutputPacingMode::PredictiveTriple
+        );
+        assert_eq!(
+            base.with_presentation_state(OutputPresentationMode::Vsync, DrmContentType::Graphics)
+                .pacing_mode(),
+            NativeOutputPacingMode::PredictiveTriple
         );
     }
 }

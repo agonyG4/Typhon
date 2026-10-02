@@ -486,6 +486,12 @@ pub(crate) struct ConfirmedOutputPresentationState {
     pub(crate) output_generation: u64,
 }
 
+impl ConfirmedOutputPresentationState {
+    pub(crate) const fn vrr_request_confirmed_for(self, output_generation: u64) -> bool {
+        self.output_generation == output_generation && self.mode.uses_vrr()
+    }
+}
+
 impl Default for ConfirmedOutputPresentationState {
     fn default() -> Self {
         Self {
@@ -493,6 +499,35 @@ impl Default for ConfirmedOutputPresentationState {
             content_type: DrmContentType::Graphics,
             output_generation: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod confirmed_output_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn only_current_generation_pageflip_confirmed_adaptive_modes_report_vrr() {
+        for mode in [
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::AdaptiveAsync,
+        ] {
+            let confirmed = ConfirmedOutputPresentationState {
+                mode,
+                content_type: DrmContentType::Graphics,
+                output_generation: 7,
+            };
+            assert!(confirmed.vrr_request_confirmed_for(7));
+            assert!(!confirmed.vrr_request_confirmed_for(8));
+        }
+
+        let confirmed_vsync = ConfirmedOutputPresentationState {
+            mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
+            output_generation: 7,
+        };
+        assert!(!confirmed_vsync.vrr_request_confirmed_for(7));
+        assert!(!ConfirmedOutputPresentationState::default().vrr_request_confirmed_for(0));
     }
 }
 
@@ -594,7 +629,7 @@ pub(crate) struct NativeRuntime {
     dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry,
     control_server: NativeControlServer,
     started_at: Instant,
-    vrr_plan: NativeVrrPlan,
+    vrr_preference: NativeVrrPreference,
     xwayland: XwaylandService,
     xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
     xwayland_reactor_generation: u64,

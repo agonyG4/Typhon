@@ -5,6 +5,8 @@ use std::{
     time::Instant,
 };
 
+use crate::compositor::DrmContentType;
+
 use super::*;
 
 fn property(id: u32, name: &str, value: u64) -> DrmProperty {
@@ -55,30 +57,44 @@ fn legacy_kms_never_enables_explicit_triple_buffering() {
 
 #[test]
 fn presentation_flag_contract_is_identical_for_test_only_and_real_submissions() {
+    use crate::compositor::OutputPresentationMode::{AdaptiveAsync, AdaptiveSync, Async, Vsync};
     assert_eq!(
-        AtomicCommitFlags::for_presentation(
-            crate::compositor::OutputPresentationMode::Vsync,
-            false,
-        ),
+        AtomicCommitFlags::for_presentation(Vsync, false,),
         AtomicCommitFlags::page_flip()
     );
     assert_eq!(
-        AtomicCommitFlags::for_presentation(
-            crate::compositor::OutputPresentationMode::Async,
-            false,
-        ),
+        AtomicCommitFlags::for_presentation(Async, false,),
         AtomicCommitFlags::async_page_flip()
     );
     assert_eq!(
-        AtomicCommitFlags::for_presentation(crate::compositor::OutputPresentationMode::Vsync, true,),
+        AtomicCommitFlags::for_presentation(Vsync, true,),
         AtomicCommitFlags::test_only_no_modeset()
     );
-    let async_test =
-        AtomicCommitFlags::for_presentation(crate::compositor::OutputPresentationMode::Async, true);
+    let async_test = AtomicCommitFlags::for_presentation(Async, true);
     assert!(async_test.contains_test_only());
     assert!(async_test.contains_pageflip_async());
     assert!(!async_test.contains_allow_modeset());
     assert!(!async_test.contains_nonblock());
+    for adaptive_sync in [AdaptiveSync] {
+        assert_eq!(
+            AtomicCommitFlags::for_presentation(adaptive_sync, false),
+            AtomicCommitFlags::page_flip()
+        );
+        assert_eq!(
+            AtomicCommitFlags::for_presentation(adaptive_sync, true),
+            AtomicCommitFlags::test_only_no_modeset()
+        );
+    }
+    for adaptive_async in [AdaptiveAsync] {
+        assert_eq!(
+            AtomicCommitFlags::for_presentation(adaptive_async, false),
+            AtomicCommitFlags::async_page_flip()
+        );
+        assert_eq!(
+            AtomicCommitFlags::for_presentation(adaptive_async, true),
+            AtomicCommitFlags::test_only_async_page_flip()
+        );
+    }
 }
 
 #[test]
@@ -115,6 +131,41 @@ fn property_discovery_requires_exact_object_specific_names() {
     let mut missing = complete_plane_properties();
     missing.retain(|entry| entry.name() != "SRC_W");
     assert!(AtomicPlaneProperties::discover(&missing).is_err());
+}
+
+#[test]
+fn connector_vrr_capability_is_optional_and_preserves_identity_and_value() {
+    let missing = AtomicConnectorProperties::discover(&complete_connector_properties()).unwrap();
+    assert_eq!(missing.vrr_capable, None);
+    assert_eq!(missing.vrr_capable_value, None);
+
+    for value in [0, 1] {
+        let mut properties = complete_connector_properties();
+        properties.push(property(20, "vrr_capable", value));
+        let discovered = AtomicConnectorProperties::discover(&properties).unwrap();
+        assert_eq!(discovered.vrr_capable.unwrap().0.get(), 20);
+        assert_eq!(discovered.vrr_capable_value, Some(value));
+    }
+}
+
+#[test]
+fn atomic_vrr_requires_connector_true_and_crtc_property() {
+    let mut discovered = discovery();
+    assert!(!discovered.vrr_capable());
+
+    let connector = AtomicConnectorProperties::discover(&[
+        property(1, "CRTC_ID", 42),
+        property(20, "vrr_capable", 1),
+    ])
+    .unwrap();
+    discovered.pipeline.connector_props = connector;
+    assert!(discovered.vrr_capable());
+
+    discovered.pipeline.connector_props.vrr_capable_value = Some(0);
+    assert!(!discovered.vrr_capable());
+    discovered.pipeline.connector_props.vrr_capable_value = Some(1);
+    discovered.pipeline.crtc_props.vrr_enabled = None;
+    assert!(!discovered.vrr_capable());
 }
 
 #[test]
@@ -568,6 +619,140 @@ fn explicit_fence_pipeline() -> AtomicPipelineProperties {
     }
 }
 
+fn presentation_state_pipeline() -> AtomicPipelineProperties {
+    let (connector, crtc, plane, _, crtc_props, plane_props) = ids();
+    let connector_props = AtomicConnectorProperties::discover(&[
+        property(1, "CRTC_ID", 42),
+        property(20, "vrr_capable", 1),
+        DrmProperty::with_metadata(
+            PropertyId::new(21).unwrap(),
+            "Content Type",
+            0,
+            Vec::new(),
+            vec![
+                DrmPropertyEnum {
+                    value: 0,
+                    name: "Graphics".to_string(),
+                },
+                DrmPropertyEnum {
+                    value: 3,
+                    name: "Game".to_string(),
+                },
+            ],
+        ),
+    ])
+    .unwrap();
+    AtomicPipelineProperties {
+        connector,
+        crtc,
+        plane,
+        connector_props,
+        crtc_props,
+        plane_props,
+        cursor_plane: None,
+    }
+}
+
+#[test]
+fn adaptive_sync_allows_cursor_mutation_but_adaptive_async_rejects_it() {
+    use crate::compositor::OutputPresentationMode::{AdaptiveAsync, AdaptiveSync};
+
+    let mut pipeline = explicit_fence_pipeline();
+    pipeline.cursor_plane = Some(cursor_properties());
+    let cursor = visible_cursor();
+    let called = Cell::new(false);
+    let vrr_property = pipeline.crtc_props.vrr_enabled.unwrap().0.get();
+    super::submission::submit_atomic_flip_with(
+        &pipeline,
+        AtomicFlipRequest {
+            framebuffer: FramebufferId::new(81).unwrap(),
+            token: PageFlipToken::new(82).unwrap(),
+            in_fence: pipe_read_end(),
+            cursor: Some(cursor.clone()),
+            presentation_mode: AdaptiveSync,
+            content_type: DrmContentType::Graphics,
+        },
+        |submission| {
+            called.set(true);
+            assert!(!submission.flags.contains_pageflip_async());
+            let serialized = submission.request.serialize();
+            let assignments = serialized
+                .properties
+                .iter()
+                .copied()
+                .zip(serialized.values.iter().copied())
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(assignments[&vrr_property], 1);
+            assert!(
+                submission
+                    .request
+                    .touches_object_kind(DrmObjectKind::CursorPlane)
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(called.get());
+
+    let called = Cell::new(false);
+    let error = super::submission::submit_atomic_flip_with(
+        &pipeline,
+        AtomicFlipRequest {
+            framebuffer: FramebufferId::new(81).unwrap(),
+            token: PageFlipToken::new(83).unwrap(),
+            in_fence: pipe_read_end(),
+            cursor: Some(cursor),
+            presentation_mode: AdaptiveAsync,
+            content_type: DrmContentType::Graphics,
+        },
+        |_| {
+            called.set(true);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, AtomicKmsErrorKind::Unsupported);
+    assert!(!called.get());
+}
+
+#[test]
+fn atomic_presentation_state_and_test_only_real_requests_match_for_all_modes() {
+    use crate::compositor::OutputPresentationMode::{AdaptiveAsync, AdaptiveSync, Async, Vsync};
+
+    let pipeline = presentation_state_pipeline();
+    let vrr_property = pipeline.crtc_props.vrr_enabled.unwrap().0.get();
+    let content_property = pipeline.connector_props.content_type.unwrap().0.get();
+    for (mode, expected_vrr, expected_flags) in [
+        (Vsync, 0, AtomicCommitFlags::page_flip()),
+        (AdaptiveSync, 1, AtomicCommitFlags::page_flip()),
+        (Async, 0, AtomicCommitFlags::async_page_flip()),
+        (AdaptiveAsync, 1, AtomicCommitFlags::async_page_flip()),
+    ] {
+        let mut request = AtomicRequest::new();
+        request
+            .set_presentation_state(&pipeline, mode, DrmContentType::Game)
+            .unwrap();
+        let serialized = request.serialize();
+        let values = serialized
+            .properties
+            .iter()
+            .copied()
+            .zip(serialized.values.iter().copied())
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values[&vrr_property], expected_vrr);
+        assert_eq!(values[&content_property], 3);
+
+        let token = PageFlipToken::new(55).unwrap();
+        let test = AtomicSubmission::for_presentation(request.clone(), token, mode, true);
+        let real = AtomicSubmission::for_presentation(request, token, mode, false);
+        assert_eq!(test.request, real.request);
+        assert_eq!(real.flags, expected_flags);
+        assert!(test.flags.contains_test_only());
+        assert_eq!(test.flags.contains_pageflip_async(), mode.is_async());
+        assert!(!test.flags.contains_allow_modeset());
+    }
+}
+
 fn pipe_read_end() -> OwnedFd {
     let mut pipe = [-1; 2];
     assert_eq!(
@@ -607,6 +792,7 @@ fn discovery() -> AtomicDiscovery {
             connector_content_type: None,
             crtc_active: 0,
             crtc_mode_id: 0,
+            crtc_vrr_enabled: Some(0),
             plane_fb_id: 0,
             plane_crtc_id: 0,
             src_x: 0,
@@ -778,7 +964,7 @@ fn initial_request_contains_exact_connector_crtc_and_primary_plane_state() {
     )
     .unwrap();
 
-    assert_eq!(request.assignment_count(), 13);
+    assert_eq!(request.assignment_count(), 14);
     assert_eq!(request.serialize().objects, vec![1, 2, 3]);
     assert!(!request.touches_object_kind(DrmObjectKind::CursorPlane));
 }
@@ -1075,7 +1261,7 @@ fn resume_modeset_rebuilds_complete_pipeline_with_allow_modeset() {
     .unwrap();
     let submission = AtomicSubmission::resume_modeset(request);
 
-    assert_eq!(submission.request.assignment_count(), 13);
+    assert_eq!(submission.request.assignment_count(), 14);
     assert!(submission.flags.contains_allow_modeset());
     assert!(!submission.flags.contains_nonblock());
     assert!(!submission.flags.contains_pageflip_event());
@@ -1232,6 +1418,7 @@ fn restore_and_safe_disable_requests_restore_cursor_plane() {
         connector_content_type: None,
         crtc_active: 1,
         crtc_mode_id: 44,
+        crtc_vrr_enabled: Some(1),
         plane_fb_id: 55,
         plane_crtc_id: 12,
         src_x: 0,
@@ -1259,10 +1446,28 @@ fn restore_and_safe_disable_requests_restore_cursor_plane() {
     };
 
     let restore = snapshot.restore_request(&pipeline).unwrap();
+    let vrr_property = pipeline.crtc_props.vrr_enabled.unwrap().0.get();
+    let restore_values = restore
+        .serialize()
+        .properties
+        .into_iter()
+        .zip(restore.serialize().values)
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(restore_values[&vrr_property], 1);
+    let mut fixed_snapshot = snapshot;
+    fixed_snapshot.crtc_vrr_enabled = Some(0);
+    let fixed_restore = fixed_snapshot.restore_request(&pipeline).unwrap();
+    let fixed_values = fixed_restore
+        .serialize()
+        .properties
+        .into_iter()
+        .zip(fixed_restore.serialize().values)
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(fixed_values[&vrr_property], 0);
     let disable = AtomicRequest::safe_disable(&pipeline).unwrap();
     assert!(restore.touches_object_kind(DrmObjectKind::CursorPlane));
     assert!(disable.touches_object_kind(DrmObjectKind::CursorPlane));
-    assert_eq!(disable.serialize().values.len(), 7);
+    assert_eq!(disable.serialize().values.len(), 8);
     assert!(disable.serialize().values.iter().all(|value| *value == 0));
 }
 

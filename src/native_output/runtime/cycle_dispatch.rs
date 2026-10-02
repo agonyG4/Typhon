@@ -1364,11 +1364,14 @@ impl NativeRuntime {
                     ),
                     doctor_check(
                         "vrr.state",
-                        vrr_doctor_severity(self.vrr_plan.requested, self.vrr_plan.supported),
+                        vrr_doctor_severity(
+                            self.vrr_preference,
+                            self.kms_backend.atomic_vrr_capable(),
+                        ),
                         format!(
-                            "requested={} supported={}",
-                            self.vrr_plan.requested.as_str(),
-                            self.vrr_plan.supported
+                            "policy={} atomic_capable={}",
+                            self.vrr_preference.as_str(),
+                            self.kms_backend.atomic_vrr_capable()
                         ),
                     ),
                 ];
@@ -3863,10 +3866,14 @@ impl NativeRuntime {
 
     fn control_output_snapshot(&self) -> OutputSnapshot {
         let direct_state = self.direct_scanout_state();
-        let vrr_state = if !self.vrr_plan.supported {
+        let vrr_capable = self.kms_backend.atomic_vrr_capable();
+        let vrr_confirmed = self
+            .confirmed_output_presentation
+            .vrr_request_confirmed_for(self.drm_file_generation);
+        let vrr_state = if !vrr_capable {
             FeatureState::Unavailable
-        } else if self.vrr_plan.planned_enabled {
-            FeatureState::Configured
+        } else if vrr_confirmed {
+            FeatureState::Active
         } else {
             FeatureState::Available
         };

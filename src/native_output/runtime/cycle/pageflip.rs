@@ -661,6 +661,7 @@ impl NativeRuntime {
             scheduled_presentation_target,
             render_journal,
             adaptive_buffering,
+            vrr_preference,
             pending_proven_deadline_miss,
             effective_app_gpu_policy: _,
             last_primary_presented_at_ns,
@@ -995,9 +996,9 @@ impl NativeRuntime {
                     let cursor_surface_damage = output_transactions.surface_damage(transaction_id);
                     let cursor_presentation = output_transactions
                         .transaction(transaction_id)
-                        .map(|record| record.descriptor().presentation_mode())
-                        .map(|presentation_mode| {
-                            if presentation_mode.is_async() {
+                        .map(|record| {
+                            let presentation_mode = record.descriptor().presentation_mode();
+                            let presentation = if presentation_mode.is_async() {
                                 FramePresentation::tearing(
                                     *presentation_clock,
                                     pageflip.timestamp.seconds,
@@ -1011,7 +1012,10 @@ impl NativeRuntime {
                                     pageflip.timestamp.microseconds,
                                     pageflip.sequence,
                                 )
-                            }
+                            };
+                            presentation.map(|presentation| {
+                                presentation.with_presentation_mode(presentation_mode)
+                            })
                         })
                         .transpose()?;
                     complete_presented_output_transaction(
@@ -1161,7 +1165,24 @@ impl NativeRuntime {
                     content_type: presentation_content_type,
                     output_generation: *drm_file_generation,
                 };
-                let presentation = if presentation_mode.is_async() && direct_pending {
+                perf.log("native.output_presentation_confirmed", || {
+                    vec![
+                        NativePerfField::str("configured_policy", vrr_preference.as_str()),
+                        NativePerfField::bool(
+                            "drm_connector_capable",
+                            kms_backend.atomic_connector_vrr_capable(),
+                        ),
+                        NativePerfField::bool(
+                            "crtc_vrr_property_available",
+                            kms_backend.atomic_crtc_vrr_property_available(),
+                        ),
+                        NativePerfField::str("effective_mode", presentation_mode.as_str()),
+                        NativePerfField::str("submitted_mode", presentation_mode.as_str()),
+                        NativePerfField::str("pageflip_confirmed_mode", presentation_mode.as_str()),
+                        NativePerfField::u64("output_generation", *drm_file_generation),
+                    ]
+                });
+                let presentation = (if presentation_mode.is_async() && direct_pending {
                     FramePresentation::tearing_zero_copy(
                         *presentation_clock,
                         pageflip.timestamp.seconds,
@@ -1189,7 +1210,8 @@ impl NativeRuntime {
                         pageflip.timestamp.microseconds,
                         pageflip.sequence,
                     )?
-                };
+                })
+                .with_presentation_mode(presentation_mode);
                 pageflip_presentation = Some(presentation);
                 let compositor_receive_us = sample_clock_microseconds(*drm_timestamp_clock)?;
                 let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)

@@ -55,7 +55,10 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                     presentation_mode,
                     content_type,
                 ),
-            KmsPrimaryUpdate::Unchanged => self.submitter.test_cursor(cursor),
+            KmsPrimaryUpdate::Unchanged => {
+                self.submitter
+                    .test_cursor(cursor, presentation_mode, content_type)
+            }
         };
         test.map(|_| ())
             .map_err(|error| KmsWorkerSubmitFailure { error })
@@ -157,7 +160,13 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                     presentation_mode,
                     content_type,
                 ),
-            KmsPrimaryUpdate::Unchanged => self.submitter.submit_cursor(cursor, job.token, false),
+            KmsPrimaryUpdate::Unchanged => self.submitter.submit_cursor(
+                cursor,
+                job.token,
+                false,
+                presentation_mode,
+                content_type,
+            ),
         };
         submission
             .map(|submission| KmsWorkerSubmission {

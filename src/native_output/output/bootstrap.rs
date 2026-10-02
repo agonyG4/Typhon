@@ -60,27 +60,12 @@ impl NativeVrrPreference {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeVrrPlan {
-    pub(crate) requested: NativeVrrPreference,
-    pub(crate) supported: bool,
-    pub(crate) planned_enabled: bool,
-}
-
-impl NativeVrrPlan {
-    pub(crate) fn choose(
-        requested: NativeVrrPreference,
-        connector_vrr_capable: Option<bool>,
-    ) -> Self {
-        let supported = connector_vrr_capable.unwrap_or(false);
-        let planned_enabled = match requested {
-            NativeVrrPreference::Auto | NativeVrrPreference::On => supported,
-            NativeVrrPreference::Off => false,
-        };
-        Self {
-            requested,
-            supported,
-            planned_enabled,
+impl From<NativeVrrPreference> for oblivion_one::compositor::VrrPolicy {
+    fn from(value: NativeVrrPreference) -> Self {
+        match value {
+            NativeVrrPreference::Auto => Self::Auto,
+            NativeVrrPreference::On => Self::On,
+            NativeVrrPreference::Off => Self::Off,
         }
     }
 }
@@ -105,7 +90,7 @@ mod doctor_tests {
     use oblivion_one::control_snapshots::DoctorSeverity;
 
     #[test]
-    fn doctor_severity_matches_vrr_policy_matrix() {
+    fn doctor_severity_reports_only_hard_capability_unavailability_for_on() {
         for supported in [false, true] {
             assert_eq!(
                 vrr_doctor_severity(NativeVrrPreference::Off, supported),

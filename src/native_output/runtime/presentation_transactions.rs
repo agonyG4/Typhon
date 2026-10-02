@@ -4,7 +4,9 @@ use super::*;
 use crate::native_output::presentation::plane::PresentedCursorDelivery;
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::{TerminalCallbackDisposition, TerminalCallbackOwnership};
-use oblivion_one::native::kms::{KmsBackendKind, KmsBackendSelection};
+use oblivion_one::native::kms::{
+    AtomicKmsError, AtomicKmsErrorKind, FramebufferId, KmsBackendKind, KmsBackendSelection,
+};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,7 @@ pub(crate) fn effective_output_presentation(
     kms_backend: Option<&KmsBackendSelection>,
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
+    cursor_transition_pending: bool,
 ) -> (OutputPresentationMode, DrmContentType) {
     let metadata = server
         .fullscreen_tree_presentation_metadata()
@@ -35,6 +38,7 @@ pub(crate) fn effective_output_presentation(
     let metrics = server.fullscreen_render_plan_metrics();
     let effective = EffectivePresentation::decide(
         TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+        VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref()),
         metadata,
         AsyncEligibility {
             solitary_fullscreen: metrics.solitary_tree_active,
@@ -55,9 +59,49 @@ pub(crate) fn effective_output_presentation(
                 kms.effective_kind() == KmsBackendKind::Legacy && kms.async_page_flip_capable()
             }),
             cursor_visible,
+            cursor_transition_pending,
             ..AsyncEligibility::default()
         },
+        VrrEligibility {
+            auto_candidate: metrics.solitary_tree_active,
+            backend_capable: kms_backend
+                .is_some_and(|kms| kms.effective_kind() == KmsBackendKind::Atomic),
+            connector_capable: kms_backend
+                .is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
+            crtc_property_available: kms_backend
+                .is_some_and(KmsBackendSelection::atomic_crtc_vrr_property_available),
+            output_generation_qualified: output_generation != 0,
+            exact_kms_qualified: true,
+            transition_supported: true,
+        },
     );
+    NativePerfLogger::from_env().log("native.output_presentation_policy", || {
+        vec![
+            NativePerfField::str(
+                "configured_policy",
+                VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
+                    .as_str(),
+            ),
+            NativePerfField::bool(
+                "drm_connector_capable",
+                kms_backend.is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
+            ),
+            NativePerfField::bool(
+                "crtc_vrr_property_available",
+                kms_backend.is_some_and(KmsBackendSelection::atomic_crtc_vrr_property_available),
+            ),
+            NativePerfField::str("effective_mode", effective.mode.as_str()),
+            NativePerfField::str(
+                "vrr_blocker",
+                effective.vrr_blocker.map_or("none", VrrBlocker::as_str),
+            ),
+            NativePerfField::str(
+                "async_blocker",
+                effective.async_blocker.map_or("none", AsyncBlocker::as_str),
+            ),
+            NativePerfField::u64("output_generation", output_generation),
+        ]
+    });
     (
         effective.mode,
         kms_backend.map_or_else(
@@ -703,6 +747,7 @@ pub(super) fn build_compatibility_transaction(
         kms_backend,
         output_generation,
         pacing_mode,
+        cursor.is_some(),
     );
     let frame_batch_id = server
         .prepared_frame_batch_id()
@@ -766,9 +811,10 @@ pub(super) fn present_compatibility_frame(
     cursor_epoch: u64,
     frame_index: u64,
     kms_backend: Option<&KmsBackendSelection>,
-    present: impl FnOnce(
+    mut present: impl FnMut(
         &mut NativeScanoutBackend,
         OutputPresentationMode,
+        DrmContentType,
     ) -> io::Result<NativePresentResult>,
 ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
     let transaction_id = build_compatibility_transaction(
@@ -783,11 +829,135 @@ pub(super) fn present_compatibility_frame(
         cursor_epoch,
         kms_backend,
     )?;
-    let presentation_mode = transaction_id
+    let (mut presentation_mode, content_type) = transaction_id
         .and_then(|transaction_id| output_transactions.transaction(transaction_id))
-        .map(|record| record.descriptor().presentation_mode())
-        .unwrap_or_default();
-    let result = present(scanout, presentation_mode).map_err(|error| {
+        .map(|record| {
+            (
+                record.descriptor().presentation_mode(),
+                record.descriptor().content_type(),
+            )
+        })
+        .unwrap_or((OutputPresentationMode::Vsync, DrmContentType::Graphics));
+
+    if presentation_mode.uses_vrr() {
+        let test_only = scanout
+            .compatibility_framebuffer_id()
+            .and_then(FramebufferId::new)
+            .ok_or_else(|| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "Adaptive Sync requires a compatibility framebuffer for exact TEST_ONLY",
+                )
+            })
+            .and_then(|framebuffer| {
+                let token = PageFlipToken::new(allocate_native_page_flip_token())
+                    .expect("allocated native pageflip token is nonzero");
+                kms_backend
+                    .ok_or_else(|| {
+                        AtomicKmsError::new(
+                            AtomicKmsErrorKind::Unsupported,
+                            "Adaptive Sync compatibility presentation has no KMS backend",
+                        )
+                    })?
+                    .test_flip_with_presentation(
+                        framebuffer,
+                        token,
+                        cursor,
+                        presentation_mode,
+                        content_type,
+                    )
+            });
+        if let Err(error) = test_only {
+            let blocker = if error.kind == AtomicKmsErrorKind::Unsupported {
+                VrrBlocker::UnsupportedTransition
+            } else {
+                VrrBlocker::ExactKmsQualificationRejected
+            };
+            if let Some(transaction_id) = transaction_id {
+                output_transactions
+                    .replace_presentation_state_before_submit(
+                        transaction_id,
+                        OutputPresentationMode::Vsync,
+                        content_type,
+                        None,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+            NativePerfLogger::from_env().log("native.output_presentation_qualification", || {
+                vec![
+                    NativePerfField::str(
+                        "configured_policy",
+                        VrrPolicy::from_environment(
+                            std::env::var("OBLIVION_ONE_VRR").ok().as_deref(),
+                        )
+                        .as_str(),
+                    ),
+                    NativePerfField::bool(
+                        "drm_connector_capable",
+                        kms_backend.is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
+                    ),
+                    NativePerfField::bool(
+                        "crtc_vrr_property_available",
+                        kms_backend
+                            .is_some_and(KmsBackendSelection::atomic_crtc_vrr_property_available),
+                    ),
+                    NativePerfField::str("effective_mode", "vsync"),
+                    NativePerfField::str("vrr_blocker", blocker.as_str()),
+                    NativePerfField::str("async_blocker", "none"),
+                    NativePerfField::u64("output_generation", output_generation),
+                ]
+            });
+            presentation_mode = OutputPresentationMode::Vsync;
+        }
+    }
+
+    let mut result = present(scanout, presentation_mode, content_type);
+    if presentation_mode.uses_vrr()
+        && let Err(error) = &result
+        && error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<AtomicKmsError>())
+            .is_some_and(|error| error.kind == AtomicKmsErrorKind::FlipRejected)
+    {
+        if let Some(transaction_id) = transaction_id {
+            output_transactions
+                .replace_presentation_state_before_submit(
+                    transaction_id,
+                    OutputPresentationMode::Vsync,
+                    content_type,
+                    None,
+                )
+                .map_err(io::Error::other)?;
+        }
+        NativePerfLogger::from_env().log("native.output_presentation_qualification", || {
+            vec![
+                NativePerfField::str(
+                    "configured_policy",
+                    VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
+                        .as_str(),
+                ),
+                NativePerfField::bool(
+                    "drm_connector_capable",
+                    kms_backend.is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
+                ),
+                NativePerfField::bool(
+                    "crtc_vrr_property_available",
+                    kms_backend
+                        .is_some_and(KmsBackendSelection::atomic_crtc_vrr_property_available),
+                ),
+                NativePerfField::str("effective_mode", "vsync"),
+                NativePerfField::str(
+                    "vrr_blocker",
+                    VrrBlocker::ExactKmsQualificationRejected.as_str(),
+                ),
+                NativePerfField::str("async_blocker", "none"),
+                NativePerfField::u64("output_generation", output_generation),
+            ]
+        });
+        presentation_mode = OutputPresentationMode::Vsync;
+        result = present(scanout, presentation_mode, content_type);
+    }
+    let result = result.map_err(|error| {
         native_runtime_error(
             NativeRuntimeStage::Present,
             scanout.kind(),
@@ -802,10 +972,19 @@ pub(super) fn present_compatibility_frame(
             framebuffer_id,
             ..
         }) => Ok((
-            NativePresentResult::AsyncSubmitted {
-                token,
-                framebuffer_id,
-                transaction_id,
+            {
+                NativePerfLogger::from_env().log("native.output_presentation_submitted", || {
+                    vec![
+                        NativePerfField::str("mode", presentation_mode.as_str()),
+                        NativePerfField::str("content_type", content_type.as_str()),
+                        NativePerfField::u64("output_generation", output_generation),
+                    ]
+                });
+                NativePresentResult::AsyncSubmitted {
+                    token,
+                    framebuffer_id,
+                    transaction_id,
+                }
             },
             transaction_id,
         )),
@@ -1016,10 +1195,22 @@ pub(super) fn submit_plane_delta(
     server: &mut OwnCompositorServer,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
 ) -> NativeResult<SchedulerDecision> {
+    let (presentation_mode, content_type) = effective_output_presentation(
+        server,
+        desired.as_ref().is_some_and(|state| state.visible),
+        Some(kms_backend),
+        output_generation,
+        pacing_mode,
+        true,
+    );
     let cursor_capability_key = desired
         .as_ref()
         .and_then(|state| cursor.capability_key_for(state));
-    match kms_backend.test_atomic_cursor_flip(desired.as_ref()) {
+    match kms_backend.test_atomic_cursor_flip_with_presentation(
+        desired.as_ref(),
+        presentation_mode,
+        content_type,
+    ) {
         Ok(()) => {
             let submitted_delivery = if desired.as_ref().is_some_and(|state| state.visible) {
                 PresentedCursorDelivery::Hardware
@@ -1038,13 +1229,6 @@ pub(super) fn submit_plane_delta(
                         oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
                     )
                 });
-            let (presentation_mode, content_type) = effective_output_presentation(
-                server,
-                desired.as_ref().is_some_and(|state| state.visible),
-                Some(kms_backend),
-                output_generation,
-                pacing_mode,
-            );
             let presentation_feedback_batch_id = take_client_cursor_presentation_feedback_batch(
                 server,
                 client_cursor_presentation_key,
@@ -1114,7 +1298,12 @@ pub(super) fn submit_plane_delta(
                 submitted_delivery,
                 Some(cursor_source_for_trace(cursor)),
             );
-            match kms_backend.submit_cursor_flip(desired.as_ref(), token) {
+            match kms_backend.submit_cursor_flip_with_presentation(
+                desired.as_ref(),
+                token,
+                presentation_mode,
+                content_type,
+            ) {
                 Ok(()) => {
                     if let Some(submitter) = kms_backend.atomic_commit_submitter() {
                         trace_cursor_kms_submit(

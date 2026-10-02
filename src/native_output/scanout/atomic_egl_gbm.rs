@@ -43,7 +43,7 @@ use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
-use crate::native_output::presentation::async_validation::CompositedAsyncValidationKey;
+use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
 use crate::native_output::presentation::transaction::O1PrepareIntent;
 
 #[cfg(test)]
@@ -79,12 +79,14 @@ pub(crate) struct AtomicEglGbmScanout {
     counters: ExplicitOutputCounters,
     async_page_flip_capable: bool,
     async_format_capable: bool,
+    vrr_connector_capable: bool,
+    vrr_crtc_property_available: bool,
     connector_content_types: HashSet<DrmContentType>,
     async_crtc_id: u32,
     async_primary_plane_id: u32,
     async_output_generation: u64,
-    async_validation_accepted: HashSet<CompositedAsyncValidationKey>,
-    async_validation_rejected: HashSet<CompositedAsyncValidationKey>,
+    presentation_validation_accepted: HashSet<CompositedPresentationValidationKey>,
+    presentation_validation_rejected: HashSet<CompositedPresentationValidationKey>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -347,29 +349,39 @@ impl AtomicEglGbmScanout {
         self.direct.last_debug_candidate = None;
         self.dmabuf_scanout_capabilities.output_generation = generation;
         self.async_output_generation = generation;
-        self.async_validation_accepted.clear();
-        self.async_validation_rejected.clear();
+        self.presentation_validation_accepted.clear();
+        self.presentation_validation_rejected.clear();
         self.scene.invalidate_presented_damage_history();
     }
 
-    pub(crate) fn composited_async_validation_key(
+    pub(crate) fn composited_presentation_validation_key(
         &self,
         output_generation: u64,
+        presentation_mode: OutputPresentationMode,
         cursor_visible: bool,
+        cursor_state: Option<AtomicCursorVisualState>,
+        cursor_transition_pending: bool,
+        non_primary_plane_active: bool,
+        explicit_sync_ready: bool,
         content_type: oblivion_one::compositor::DrmContentType,
         acquire_strategy: u8,
-    ) -> Option<CompositedAsyncValidationKey> {
-        (self.async_page_flip_capable
-            && self.async_format_capable
-            && self.async_output_generation == output_generation)
-            .then_some(CompositedAsyncValidationKey::new(
+    ) -> Option<CompositedPresentationValidationKey> {
+        (self.async_output_generation == output_generation
+            && (!presentation_mode.is_async()
+                || (self.async_page_flip_capable && self.async_format_capable)))
+            .then_some(CompositedPresentationValidationKey::new(
                 self.direct.output_id,
                 output_generation,
                 self.async_crtc_id,
                 self.async_primary_plane_id,
                 self.format_modifier,
+                presentation_mode,
                 acquire_strategy,
                 cursor_visible,
+                cursor_state,
+                cursor_transition_pending,
+                non_primary_plane_active,
+                explicit_sync_ready,
                 content_type,
             ))
     }
@@ -382,25 +394,31 @@ impl AtomicEglGbmScanout {
         }
     }
 
-    pub(crate) fn async_validation_is_accepted(&self, key: CompositedAsyncValidationKey) -> bool {
-        self.async_validation_accepted.contains(&key)
+    pub(crate) fn presentation_validation_is_accepted(
+        &self,
+        key: CompositedPresentationValidationKey,
+    ) -> bool {
+        self.presentation_validation_accepted.contains(&key)
     }
 
-    pub(crate) fn async_validation_is_rejected(&self, key: CompositedAsyncValidationKey) -> bool {
-        self.async_validation_rejected.contains(&key)
+    pub(crate) fn presentation_validation_is_rejected(
+        &self,
+        key: CompositedPresentationValidationKey,
+    ) -> bool {
+        self.presentation_validation_rejected.contains(&key)
     }
 
-    pub(crate) fn note_composited_async_validation(
+    pub(crate) fn note_composited_presentation_validation(
         &mut self,
-        key: CompositedAsyncValidationKey,
+        key: CompositedPresentationValidationKey,
         accepted: bool,
     ) {
         if accepted {
-            self.async_validation_rejected.remove(&key);
-            self.async_validation_accepted.insert(key);
+            self.presentation_validation_rejected.remove(&key);
+            self.presentation_validation_accepted.insert(key);
         } else {
-            self.async_validation_accepted.remove(&key);
-            self.async_validation_rejected.insert(key);
+            self.presentation_validation_accepted.remove(&key);
+            self.presentation_validation_rejected.insert(key);
         }
     }
 
@@ -647,6 +665,13 @@ impl AtomicEglGbmScanout {
                 async_format_capable: discovery
                     .plane_async_scanout_formats
                     .contains(&format_modifier),
+                vrr_connector_capable: discovery.pipeline.connector_props.vrr_capable.is_some()
+                    && discovery
+                        .pipeline
+                        .connector_props
+                        .vrr_capable_value
+                        .is_some_and(|value| value != 0),
+                vrr_crtc_property_available: discovery.pipeline.crtc_props.vrr_enabled.is_some(),
                 connector_content_types: [
                     DrmContentType::Graphics,
                     DrmContentType::Photo,
@@ -665,8 +690,8 @@ impl AtomicEglGbmScanout {
                 async_crtc_id: discovery.pipeline.crtc.get(),
                 async_primary_plane_id: discovery.pipeline.plane.get(),
                 async_output_generation: pool_generation,
-                async_validation_accepted: HashSet::new(),
-                async_validation_rejected: HashSet::new(),
+                presentation_validation_accepted: HashSet::new(),
+                presentation_validation_rejected: HashSet::new(),
             }),
             Err(error) => {
                 let _ = egl.make_current(egl_display, None, None, None);
@@ -896,8 +921,13 @@ impl AtomicEglGbmScanout {
                 ..
             }) if state.visible
         );
+        let cursor_state = match cursor.as_ref() {
+            Some(CursorPlaneAssignment::Atomic { state, .. }) => state.clone(),
+            Some(CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled) | None => None,
+        };
         let effective_presentation = EffectivePresentation::decide(
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+            VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref()),
             metadata,
             AsyncEligibility {
                 solitary_fullscreen: metrics.solitary_tree_active,
@@ -908,24 +938,94 @@ impl AtomicEglGbmScanout {
                 explicit_sync_ready: self.swapchain.is_some(),
                 commit_timing_safe: pacing_mode == NativeOutputPacingMode::ReactiveDouble,
                 kms_lane_free: async_policy_inputs.kms_lane_free,
-                async_test_only_accepted: self
-                    .composited_async_validation_key(
-                        output_generation,
-                        cursor_visible,
-                        resolved_content_type,
-                        acquire_strategy,
-                    )
-                    .map(|key| !self.async_validation_is_rejected(key))
-                    .unwrap_or(true),
+                async_test_only_accepted: true,
                 modeset_required: resolved_content_type
                     != async_policy_inputs.confirmed_content_type,
                 cursor_visible,
                 cursor_transition_pending: async_policy_inputs.cursor_transition_pending,
                 ..AsyncEligibility::default()
             },
+            VrrEligibility {
+                auto_candidate: metrics.solitary_tree_active,
+                backend_capable: true,
+                connector_capable: self.vrr_connector_capable,
+                crtc_property_available: self.vrr_crtc_property_available,
+                output_generation_qualified: self.async_output_generation == output_generation,
+                exact_kms_qualified: true,
+                transition_supported: true,
+            },
         );
-        let presentation_mode = effective_presentation.mode;
+        let mut presentation_mode = effective_presentation.mode;
         let content_type = resolved_content_type;
+        let mut vrr_blocker = effective_presentation.vrr_blocker;
+        let mut async_blocker = effective_presentation.async_blocker;
+        if presentation_mode != OutputPresentationMode::Vsync
+            && let Some(mut rejected_key) = self.composited_presentation_validation_key(
+                output_generation,
+                presentation_mode,
+                cursor_visible,
+                cursor_state.clone(),
+                async_policy_inputs.cursor_transition_pending,
+                false,
+                self.swapchain.is_some(),
+                content_type,
+                acquire_strategy,
+            )
+            && self.presentation_validation_is_rejected(rejected_key)
+        {
+            match presentation_mode {
+                OutputPresentationMode::AdaptiveAsync => {
+                    rejected_key.presentation_mode = OutputPresentationMode::AdaptiveSync;
+                    let adaptive_sync_key = rejected_key;
+                    rejected_key.presentation_mode = OutputPresentationMode::Async;
+                    let async_key = rejected_key;
+                    if self.presentation_validation_is_accepted(adaptive_sync_key) {
+                        presentation_mode = OutputPresentationMode::AdaptiveSync;
+                        async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
+                    } else if self.presentation_validation_is_accepted(async_key) {
+                        presentation_mode = OutputPresentationMode::Async;
+                        vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
+                    } else {
+                        presentation_mode = OutputPresentationMode::Vsync;
+                        vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
+                        async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
+                    }
+                }
+                OutputPresentationMode::AdaptiveSync => {
+                    presentation_mode = OutputPresentationMode::Vsync;
+                    vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
+                }
+                OutputPresentationMode::Async => {
+                    presentation_mode = OutputPresentationMode::Vsync;
+                    async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
+                }
+                OutputPresentationMode::Vsync => {}
+            }
+        }
+        NativePerfLogger::from_env().log("native.output_presentation_policy", || {
+            vec![
+                NativePerfField::str(
+                    "configured_policy",
+                    VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
+                        .as_str(),
+                ),
+                NativePerfField::bool("drm_connector_capable", self.vrr_connector_capable),
+                NativePerfField::bool(
+                    "crtc_vrr_property_available",
+                    self.vrr_crtc_property_available,
+                ),
+                NativePerfField::str("effective_mode", presentation_mode.as_str()),
+                NativePerfField::str(
+                    "vrr_blocker",
+                    vrr_blocker.map_or("none", VrrBlocker::as_str),
+                ),
+                NativePerfField::str(
+                    "async_blocker",
+                    async_blocker.map_or("none", AsyncBlocker::as_str),
+                ),
+                NativePerfField::u64("output_generation", output_generation),
+            ]
+        });
         let pacing_mode = if presentation_mode.is_async() {
             NativeOutputPacingMode::ReactiveDouble
         } else {
@@ -992,18 +1092,21 @@ impl AtomicEglGbmScanout {
                 return Err(io::Error::other(error));
             }
         };
-        let async_validation_key = presentation_mode.is_async().then(|| {
-            CompositedAsyncValidationKey::new(
-                self.direct.output_id,
-                output_generation,
-                self.async_crtc_id,
-                self.async_primary_plane_id,
-                self.format_modifier,
-                acquire_strategy,
-                cursor_visible,
-                content_type,
-            )
-        });
+        let presentation_validation_key = (presentation_mode != OutputPresentationMode::Vsync)
+            .then(|| {
+                self.composited_presentation_validation_key(
+                    output_generation,
+                    presentation_mode,
+                    cursor_visible,
+                    cursor_state,
+                    async_policy_inputs.cursor_transition_pending,
+                    false,
+                    self.swapchain.is_some(),
+                    content_type,
+                    acquire_strategy,
+                )
+            })
+            .flatten();
         let prepare_intent = if render_ahead {
             Some(O1PrepareIntent::from_target(
                 target,
@@ -1056,7 +1159,7 @@ impl AtomicEglGbmScanout {
         let transaction = match transaction_result {
             Ok(transaction) => transaction
                 .with_presentation_state(presentation_mode, content_type)
-                .with_async_validation_key(async_validation_key)
+                .with_presentation_validation_key(presentation_validation_key)
                 .with_client_cursor_presentation_key(hardware_cursor_presentation_key),
 
             Err(error) => {

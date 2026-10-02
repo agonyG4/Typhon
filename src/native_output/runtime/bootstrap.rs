@@ -48,7 +48,7 @@ pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
     bootstrap: &NativeOutputBootstrap,
     session_probe: &NativeSessionProbe,
-    vrr_plan: NativeVrrPlan,
+    vrr_preference: NativeVrrPreference,
     startup_app: Option<&Vec<String>>,
     perf: NativePerfLogger,
 ) {
@@ -86,16 +86,8 @@ pub(super) fn log_native_runtime_bootstrap(
     } else {
         println!("connected output: missing");
     }
-    println!(
-        "native VRR target: {} (supported {}, planned {})",
-        vrr_plan.requested.as_str(),
-        if vrr_plan.supported { "yes" } else { "no" },
-        if vrr_plan.planned_enabled {
-            "yes"
-        } else {
-            "no"
-        }
-    );
+    println!("native VRR policy: {}", vrr_preference.as_str());
+    println!("native VRR capability: pending live atomic DRM discovery");
     match bootstrap.kms_resources.as_ref() {
         Ok(Some(resources)) => {
             println!(
@@ -144,9 +136,16 @@ pub(super) fn log_native_runtime_bootstrap(
                 "render_device",
                 display_optional_path(bootstrap.render_device.as_deref()),
             ),
-            NativePerfField::str("vrr_policy", vrr_plan.requested.as_str()),
-            NativePerfField::bool("vrr_supported", vrr_plan.supported),
-            NativePerfField::bool("vrr_planned", vrr_plan.planned_enabled),
+            NativePerfField::str("vrr_policy", vrr_preference.as_str()),
+            NativePerfField::str(
+                "vrr_sysfs_observation",
+                bootstrap
+                    .connector
+                    .as_ref()
+                    .and_then(|connector| connector.vrr_capable)
+                    .map(|value| if value { "yes" } else { "no" })
+                    .unwrap_or("unknown"),
+            ),
             NativePerfField::str("input_target", session_probe.plan.input_strategy.as_str()),
             NativePerfField::str("output_target", session_probe.plan.output_strategy.as_str()),
         ]
@@ -227,7 +226,7 @@ struct NativeRuntimeBootstrapTail {
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
-    vrr_plan: NativeVrrPlan,
+    vrr_preference: NativeVrrPreference,
     initial_presented_scene: NativeFrameSceneSnapshot,
 }
 impl NativeRuntime {
@@ -263,7 +262,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
-            vrr_plan,
+            vrr_preference,
             initial_presented_scene,
         } = parts;
         let mut legacy_cursor = pre_kms_legacy_cursor;
@@ -314,6 +313,7 @@ impl NativeRuntime {
                     &kms_backend,
                     None,
                     oblivion_one::compositor::OutputPresentationMode::Vsync,
+                    oblivion_one::compositor::DrmContentType::Graphics,
                 )?;
                 perf.log("native.cursor", || {
                     vec![
@@ -692,7 +692,7 @@ impl NativeRuntime {
             dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
             started_at: Instant::now(),
-            vrr_plan,
+            vrr_preference,
             xwayland,
             xwayland_reactor_tokens,
             xwayland_reactor_generation: 0,
@@ -813,18 +813,11 @@ impl NativeRuntime {
         let bootstrap = NativeOutputBootstrap::discover();
         let session_probe = NativeSessionProbe::detect();
         let vrr_preference = NativeVrrPreference::from_env();
-        let vrr_plan = NativeVrrPlan::choose(
-            vrr_preference,
-            bootstrap
-                .connector
-                .as_ref()
-                .and_then(|connector| connector.vrr_capable),
-        );
         log_native_runtime_bootstrap(
             &server,
             &bootstrap,
             &session_probe,
-            vrr_plan,
+            vrr_preference,
             startup_app.as_ref(),
             perf,
         );
@@ -1538,6 +1531,33 @@ impl NativeRuntime {
             }
             fields
         });
+        perf.log("native.vrr_capability", || {
+            vec![
+                NativePerfField::str("configured_policy", vrr_preference.as_str()),
+                NativePerfField::bool(
+                    "drm_connector_capable",
+                    kms_backend.atomic_connector_vrr_capable(),
+                ),
+                NativePerfField::bool(
+                    "crtc_vrr_property_available",
+                    kms_backend.atomic_crtc_vrr_property_available(),
+                ),
+                NativePerfField::bool("atomic_vrr_capable", kms_backend.atomic_vrr_capable()),
+                NativePerfField::str("effective_mode", "vsync"),
+                NativePerfField::str(
+                    "vrr_blocker",
+                    if kms_backend.atomic_vrr_capable() {
+                        "initial_fixed_refresh_baseline"
+                    } else {
+                        "atomic_capability_unavailable"
+                    },
+                ),
+                NativePerfField::str("async_blocker", "not_requested_at_bootstrap"),
+                NativePerfField::str("submitted_mode", "vsync"),
+                NativePerfField::str("pageflip_confirmed_mode", "unconfirmed"),
+                NativePerfField::u64("output_generation", drm_file_generation),
+            ]
+        });
         Self::finish_bootstrap(NativeRuntimeBootstrapTail {
             server,
             output_id,
@@ -1569,7 +1589,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
-            vrr_plan,
+            vrr_preference,
             initial_presented_scene,
         })
     }

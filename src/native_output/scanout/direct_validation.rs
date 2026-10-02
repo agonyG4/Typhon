@@ -325,6 +325,22 @@ mod tests {
         let mut height_changed = key(1);
         height_changed.mode_height = 1440;
         assert_ne!(key(1), height_changed);
+
+        let base = key(1);
+        let presentation_keys = [
+            OutputPresentationMode::Vsync,
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::Async,
+            OutputPresentationMode::AdaptiveAsync,
+        ]
+        .map(|mode| base.with_presentation_state(mode, DrmContentType::Graphics));
+        assert_eq!(
+            presentation_keys
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
     }
 
     #[test]

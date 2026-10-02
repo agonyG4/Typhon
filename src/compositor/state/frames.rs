@@ -286,7 +286,7 @@ impl CompositorState {
                 tv_sec_hi,
                 tv_sec_lo,
                 timestamp.nanoseconds(),
-                self.output_refresh.presentation_refresh_nsec(),
+                presentation.feedback_refresh_nsec(self.output_refresh.presentation_refresh_nsec()),
                 (sequence >> 32) as u32,
                 sequence as u32,
                 flags,

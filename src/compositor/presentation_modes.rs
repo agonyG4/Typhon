@@ -169,6 +169,34 @@ pub enum TearingPolicy {
     Auto,
 }
 
+/// User configuration for Adaptive Sync. This remains independent from
+/// connector/CRTC support and the per-transaction qualification result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VrrPolicy {
+    Off,
+    #[default]
+    Auto,
+    On,
+}
+
+impl VrrPolicy {
+    pub fn from_environment(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("off") => Self::Off,
+            Some("on") => Self::On,
+            _ => Self::Auto,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::On => "on",
+        }
+    }
+}
+
 /// Name used by the native output policy. `TearingPolicy` remains the
 /// compositor-facing spelling for callers that do not care about the layer.
 pub type NativeTearingPreference = TearingPolicy;
@@ -203,6 +231,33 @@ pub enum AsyncBlocker {
     AsyncFormatUnsupported,
     AsyncSubmitRejected,
     ModesetRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VrrBlocker {
+    PolicyDisabled,
+    AutoCandidateIneligible,
+    BackendCapabilityUnavailable,
+    ConnectorCapabilityUnavailable,
+    CrtcPropertyUnavailable,
+    OutputGenerationUnqualified,
+    ExactKmsQualificationRejected,
+    UnsupportedTransition,
+}
+
+impl VrrBlocker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyDisabled => "policy_disabled",
+            Self::AutoCandidateIneligible => "auto_candidate_ineligible",
+            Self::BackendCapabilityUnavailable => "backend_capability_unavailable",
+            Self::ConnectorCapabilityUnavailable => "connector_capability_unavailable",
+            Self::CrtcPropertyUnavailable => "crtc_property_unavailable",
+            Self::OutputGenerationUnqualified => "output_generation_unqualified",
+            Self::ExactKmsQualificationRejected => "exact_kms_qualification_rejected",
+            Self::UnsupportedTransition => "unsupported_transition",
+        }
+    }
 }
 
 impl AsyncBlocker {
@@ -244,16 +299,53 @@ pub struct AsyncEligibility {
     pub modeset_required: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VrrEligibility {
+    /// Phase 1's conservative Auto candidate: a solitary fullscreen tree.
+    pub auto_candidate: bool,
+    pub backend_capable: bool,
+    pub connector_capable: bool,
+    pub crtc_property_available: bool,
+    pub output_generation_qualified: bool,
+    pub exact_kms_qualified: bool,
+    pub transition_supported: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum OutputPresentationMode {
     #[default]
     Vsync,
+    AdaptiveSync,
     Async,
+    AdaptiveAsync,
 }
 
 impl OutputPresentationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vsync => "vsync",
+            Self::AdaptiveSync => "adaptive_sync",
+            Self::Async => "async",
+            Self::AdaptiveAsync => "adaptive_async",
+        }
+    }
+
     pub const fn is_async(self) -> bool {
-        matches!(self, Self::Async)
+        matches!(self, Self::Async | Self::AdaptiveAsync)
+    }
+
+    pub const fn uses_vrr(self) -> bool {
+        matches!(self, Self::AdaptiveSync | Self::AdaptiveAsync)
+    }
+
+    pub const fn presentation_domain(self) -> crate::native::buffering::PresentationDomain {
+        match self {
+            Self::Vsync => crate::native::buffering::PresentationDomain::FixedVsync,
+            Self::AdaptiveSync | Self::AdaptiveAsync => {
+                crate::native::buffering::PresentationDomain::VrrWindow
+            }
+            Self::Async => crate::native::buffering::PresentationDomain::AsyncImmediate,
+        }
     }
 }
 
@@ -261,21 +353,38 @@ impl OutputPresentationMode {
 pub struct EffectivePresentation {
     pub mode: OutputPresentationMode,
     pub content_type: SurfaceContentType,
-    pub blocker: Option<AsyncBlocker>,
+    pub vrr_blocker: Option<VrrBlocker>,
+    pub async_blocker: Option<AsyncBlocker>,
 }
 
 impl EffectivePresentation {
     pub fn decide(
         policy: TearingPolicy,
+        vrr_policy: VrrPolicy,
         metadata: SurfacePresentationMetadata,
         eligibility: AsyncEligibility,
+        vrr_eligibility: VrrEligibility,
     ) -> Self {
-        let mut result = Self {
-            mode: OutputPresentationMode::Vsync,
-            content_type: metadata.content_type,
-            blocker: None,
+        let vrr_blocker = if matches!(vrr_policy, VrrPolicy::Off) {
+            Some(VrrBlocker::PolicyDisabled)
+        } else if matches!(vrr_policy, VrrPolicy::Auto) && !vrr_eligibility.auto_candidate {
+            Some(VrrBlocker::AutoCandidateIneligible)
+        } else if !vrr_eligibility.backend_capable {
+            Some(VrrBlocker::BackendCapabilityUnavailable)
+        } else if !vrr_eligibility.connector_capable {
+            Some(VrrBlocker::ConnectorCapabilityUnavailable)
+        } else if !vrr_eligibility.crtc_property_available {
+            Some(VrrBlocker::CrtcPropertyUnavailable)
+        } else if !vrr_eligibility.output_generation_qualified {
+            Some(VrrBlocker::OutputGenerationUnqualified)
+        } else if !vrr_eligibility.exact_kms_qualified {
+            Some(VrrBlocker::ExactKmsQualificationRejected)
+        } else if !vrr_eligibility.transition_supported {
+            Some(VrrBlocker::UnsupportedTransition)
+        } else {
+            None
         };
-        let blocker = if !policy.allows_async_request() {
+        let async_blocker = if !policy.allows_async_request() {
             Some(AsyncBlocker::PolicyDisabled)
         } else if !eligibility.solitary_fullscreen {
             Some(AsyncBlocker::NotSolitaryFullscreen)
@@ -306,11 +415,20 @@ impl EffectivePresentation {
         } else {
             None
         };
-        if blocker.is_none() {
-            result.mode = OutputPresentationMode::Async;
+        let uses_vrr = vrr_blocker.is_none();
+        let is_async = async_blocker.is_none();
+        let mode = match (uses_vrr, is_async) {
+            (false, false) => OutputPresentationMode::Vsync,
+            (true, false) => OutputPresentationMode::AdaptiveSync,
+            (false, true) => OutputPresentationMode::Async,
+            (true, true) => OutputPresentationMode::AdaptiveAsync,
+        };
+        Self {
+            mode,
+            content_type: metadata.content_type,
+            vrr_blocker,
+            async_blocker,
         }
-        result.blocker = blocker;
-        result
     }
 }
 
@@ -453,6 +571,7 @@ mod tests {
     fn game_content_does_not_enable_async_by_itself() {
         let result = EffectivePresentation::decide(
             TearingPolicy::Auto,
+            VrrPolicy::Off,
             SurfacePresentationMetadata {
                 hint: SurfacePresentationHint::Vsync,
                 content_type: SurfaceContentType::Game,
@@ -467,15 +586,17 @@ mod tests {
                 async_test_only_accepted: true,
                 ..AsyncEligibility::default()
             },
+            VrrEligibility::default(),
         );
         assert_eq!(result.mode, OutputPresentationMode::Vsync);
-        assert_eq!(result.blocker, Some(AsyncBlocker::SurfaceHintMissing));
+        assert_eq!(result.async_blocker, Some(AsyncBlocker::SurfaceHintMissing));
     }
 
     #[test]
     fn borderless_scanout_candidate_remains_vsync_only_under_auto_tearing() {
         let result = EffectivePresentation::decide(
             TearingPolicy::Auto,
+            VrrPolicy::Off,
             SurfacePresentationMetadata {
                 hint: SurfacePresentationHint::Async,
                 content_type: SurfaceContentType::None,
@@ -492,16 +613,21 @@ mod tests {
                 async_format_supported: true,
                 ..AsyncEligibility::default()
             },
+            VrrEligibility::default(),
         );
 
         assert_eq!(result.mode, OutputPresentationMode::Vsync);
-        assert_eq!(result.blocker, Some(AsyncBlocker::NotSolitaryFullscreen));
+        assert_eq!(
+            result.async_blocker,
+            Some(AsyncBlocker::NotSolitaryFullscreen)
+        );
     }
 
     #[test]
     fn solitary_fullscreen_scanout_candidate_remains_async_eligible() {
         let result = EffectivePresentation::decide(
             TearingPolicy::Auto,
+            VrrPolicy::Off,
             SurfacePresentationMetadata {
                 hint: SurfacePresentationHint::Async,
                 content_type: SurfaceContentType::None,
@@ -518,16 +644,18 @@ mod tests {
                 async_format_supported: true,
                 ..AsyncEligibility::default()
             },
+            VrrEligibility::default(),
         );
 
         assert_eq!(result.mode, OutputPresentationMode::Async);
-        assert_eq!(result.blocker, None);
+        assert_eq!(result.async_blocker, None);
     }
 
     #[test]
     fn async_format_compatibility_is_an_explicit_blocker() {
         let result = EffectivePresentation::decide(
             TearingPolicy::Auto,
+            VrrPolicy::Off,
             SurfacePresentationMetadata {
                 hint: SurfacePresentationHint::Async,
                 content_type: SurfaceContentType::None,
@@ -544,9 +672,13 @@ mod tests {
                 async_format_supported: false,
                 ..AsyncEligibility::default()
             },
+            VrrEligibility::default(),
         );
         assert_eq!(result.mode, OutputPresentationMode::Vsync);
-        assert_eq!(result.blocker, Some(AsyncBlocker::AsyncFormatUnsupported));
+        assert_eq!(
+            result.async_blocker,
+            Some(AsyncBlocker::AsyncFormatUnsupported)
+        );
     }
 
     #[test]
@@ -559,5 +691,195 @@ mod tests {
             SurfaceContentType::Video.drm_value(),
             DrmContentType::Cinema
         );
+    }
+}
+
+#[cfg(test)]
+mod vrr_phase1_regression_tests {
+    use super::*;
+
+    fn async_eligible() -> AsyncEligibility {
+        AsyncEligibility {
+            solitary_fullscreen: true,
+            async_hint: true,
+            backend_capable: true,
+            output_generation_qualified: true,
+            cursor_visible: false,
+            cursor_transition_pending: false,
+            non_primary_plane_active: false,
+            explicit_sync_ready: true,
+            commit_timing_safe: true,
+            kms_lane_free: true,
+            async_test_only_accepted: true,
+            async_format_supported: true,
+            modeset_required: false,
+        }
+    }
+
+    fn vrr_eligible() -> VrrEligibility {
+        VrrEligibility {
+            auto_candidate: true,
+            backend_capable: true,
+            connector_capable: true,
+            crtc_property_available: true,
+            output_generation_qualified: true,
+            exact_kms_qualified: true,
+            transition_supported: true,
+        }
+    }
+
+    fn decide(vrr: bool, async_mode: bool) -> EffectivePresentation {
+        let mut vrr_eligibility = vrr_eligible();
+        if !vrr {
+            vrr_eligibility.exact_kms_qualified = false;
+        }
+        let mut async_eligibility = async_eligible();
+        if !async_mode {
+            async_eligibility.async_test_only_accepted = false;
+        }
+        EffectivePresentation::decide(
+            TearingPolicy::Auto,
+            VrrPolicy::On,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Async,
+                content_type: SurfaceContentType::Game,
+            },
+            async_eligibility,
+            vrr_eligibility,
+        )
+    }
+
+    #[test]
+    fn output_modes_map_independent_vrr_and_async_qualification() {
+        for (vrr, async_mode, expected) in [
+            (false, false, OutputPresentationMode::Vsync),
+            (true, false, OutputPresentationMode::AdaptiveSync),
+            (false, true, OutputPresentationMode::Async),
+            (true, true, OutputPresentationMode::AdaptiveAsync),
+        ] {
+            assert_eq!(decide(vrr, async_mode).mode, expected);
+        }
+    }
+
+    #[test]
+    fn vrr_and_async_failures_keep_independent_blockers() {
+        let vrr_failed = decide(false, true);
+        assert_eq!(vrr_failed.mode, OutputPresentationMode::Async);
+        assert!(vrr_failed.vrr_blocker.is_some());
+        assert_eq!(vrr_failed.async_blocker, None);
+
+        let async_failed = decide(true, false);
+        assert_eq!(async_failed.mode, OutputPresentationMode::AdaptiveSync);
+        assert_eq!(async_failed.vrr_blocker, None);
+        assert!(async_failed.async_blocker.is_some());
+
+        let both_failed = decide(false, false);
+        assert_eq!(both_failed.mode, OutputPresentationMode::Vsync);
+        assert!(both_failed.vrr_blocker.is_some());
+        assert!(both_failed.async_blocker.is_some());
+    }
+
+    #[test]
+    fn auto_requires_the_solitary_fullscreen_candidate_but_on_does_not() {
+        let mut eligibility = vrr_eligible();
+        eligibility.auto_candidate = false;
+        let auto = EffectivePresentation::decide(
+            TearingPolicy::Off,
+            VrrPolicy::Auto,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Vsync,
+                content_type: SurfaceContentType::Game,
+            },
+            AsyncEligibility::default(),
+            eligibility,
+        );
+        assert_eq!(auto.mode, OutputPresentationMode::Vsync);
+        assert_eq!(auto.vrr_blocker, Some(VrrBlocker::AutoCandidateIneligible));
+
+        let on = EffectivePresentation::decide(
+            TearingPolicy::Off,
+            VrrPolicy::On,
+            SurfacePresentationMetadata::default(),
+            AsyncEligibility::default(),
+            eligibility,
+        );
+        assert_eq!(on.mode, OutputPresentationMode::AdaptiveSync);
+        assert_eq!(on.vrr_blocker, None);
+
+        let off = EffectivePresentation::decide(
+            TearingPolicy::Off,
+            VrrPolicy::Off,
+            SurfacePresentationMetadata::default(),
+            AsyncEligibility::default(),
+            vrr_eligible(),
+        );
+        assert_eq!(off.mode, OutputPresentationMode::Vsync);
+        assert_eq!(off.vrr_blocker, Some(VrrBlocker::PolicyDisabled));
+    }
+
+    #[test]
+    fn environment_vrr_policy_keeps_auto_on_and_off_distinct() {
+        assert_eq!(VrrPolicy::from_environment(Some("auto")), VrrPolicy::Auto);
+        assert_eq!(VrrPolicy::from_environment(Some("on")), VrrPolicy::On);
+        assert_eq!(VrrPolicy::from_environment(Some("off")), VrrPolicy::Off);
+        assert_eq!(VrrPolicy::from_environment(None), VrrPolicy::Auto);
+    }
+
+    #[test]
+    fn visible_hardware_cursor_does_not_block_adaptive_sync() {
+        let mut async_eligibility = async_eligible();
+        async_eligibility.cursor_visible = true;
+        let effective = EffectivePresentation::decide(
+            TearingPolicy::Auto,
+            VrrPolicy::On,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Async,
+                content_type: SurfaceContentType::None,
+            },
+            async_eligibility,
+            vrr_eligible(),
+        );
+        assert_eq!(effective.mode, OutputPresentationMode::AdaptiveSync);
+        assert_eq!(effective.vrr_blocker, None);
+        assert_eq!(
+            effective.async_blocker,
+            Some(AsyncBlocker::HardwareCursorVisible)
+        );
+    }
+
+    #[test]
+    fn presentation_mode_semantics_cover_four_transaction_modes() {
+        use crate::native::buffering::PresentationDomain;
+
+        for (mode, is_async, uses_vrr, domain) in [
+            (
+                OutputPresentationMode::Vsync,
+                false,
+                false,
+                PresentationDomain::FixedVsync,
+            ),
+            (
+                OutputPresentationMode::AdaptiveSync,
+                false,
+                true,
+                PresentationDomain::VrrWindow,
+            ),
+            (
+                OutputPresentationMode::Async,
+                true,
+                false,
+                PresentationDomain::AsyncImmediate,
+            ),
+            (
+                OutputPresentationMode::AdaptiveAsync,
+                true,
+                true,
+                PresentationDomain::VrrWindow,
+            ),
+        ] {
+            assert_eq!(mode.is_async(), is_async);
+            assert_eq!(mode.uses_vrr(), uses_vrr);
+            assert_eq!(mode.presentation_domain(), domain);
+        }
     }
 }

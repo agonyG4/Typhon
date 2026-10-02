@@ -263,6 +263,7 @@ impl NativeRuntime {
             render_journal,
             adaptive_buffering,
             triple_buffer_policy,
+            vrr_preference,
             pending_proven_deadline_miss: _,
             effective_app_gpu_policy: _,
             last_rendered_scene_generation,
@@ -492,6 +493,24 @@ impl NativeRuntime {
         frame_pacing.note_prediction(prediction);
         let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
+        let vrr_policy: VrrPolicy = (*vrr_preference).into();
+        let tearing_policy = oblivion_one::compositor::TearingPolicy::from_environment(
+            std::env::var("OBLIVION_ONE_TEARING").ok().as_deref(),
+        );
+        let solitary_fullscreen = server.fullscreen_render_plan_metrics().solitary_tree_active;
+        let surface_async_hint = server
+            .fullscreen_tree_presentation_metadata()
+            .is_some_and(|metadata| metadata.hint.is_async());
+        let adaptive_sync_candidate = kms_backend.atomic_vrr_capable()
+            && match vrr_policy {
+                VrrPolicy::Off => false,
+                VrrPolicy::Auto => solitary_fullscreen,
+                VrrPolicy::On => true,
+            };
+        let async_candidate =
+            tearing_policy.allows_async_request() && solitary_fullscreen && surface_async_hint;
+        let reactive_presentation_candidate =
+            phase1_reactive_pacing_candidate(adaptive_sync_candidate, async_candidate);
         let pending_target = if explicit_output {
             pending_target_for_scanout(scanout)?
         } else {
@@ -531,7 +550,10 @@ impl NativeRuntime {
             overlap_required_for_current_opportunity(pending_target, refresh_interval, estimate);
         let o1_demand =
             observe_current_o1_opportunity(adaptive_buffering, pending_target, overlap_required_ns);
-        let desired_credit = o1_demand.desired_credit_after;
+        let desired_credit = phase1_desired_primary_credit(
+            reactive_presentation_candidate,
+            o1_demand.desired_credit_after,
+        );
         let render_ahead_allowed = desired_credit > 1;
         *scheduled_presentation_target =
             prepare_presentation_target(*scheduled_presentation_target);
@@ -548,7 +570,11 @@ impl NativeRuntime {
             *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force,
             *scheduled_presentation_target,
         );
-        let pacing_mode = pacing_mode_for_target(*scheduled_presentation_target);
+        let pacing_mode = if reactive_presentation_candidate {
+            NativeOutputPacingMode::ReactiveDouble
+        } else {
+            pacing_mode_for_target(*scheduled_presentation_target)
+        };
         let effective_render_target_available = if explicit_output {
             scanout.render_target_available_for_limit(desired_credit)
         } else {
@@ -2419,5 +2445,38 @@ impl NativeRuntime {
         cycle.record_presentation_result(frame_completed, frame_rendered, frame_submitted);
         self.update_cycle_metrics(cycle, scheduler_decision)?;
         Ok(())
+    }
+}
+
+fn phase1_reactive_pacing_candidate(adaptive_sync_candidate: bool, async_candidate: bool) -> bool {
+    adaptive_sync_candidate || async_candidate
+}
+
+fn phase1_desired_primary_credit(reactive_candidate: bool, requested_credit: u8) -> u8 {
+    if reactive_candidate {
+        1
+    } else {
+        requested_credit
+    }
+}
+
+#[cfg(test)]
+mod phase1_presentation_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn every_non_vsync_candidate_disables_render_ahead_in_phase_one() {
+        for (adaptive_sync, async_mode, expected_reactive) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let reactive = phase1_reactive_pacing_candidate(adaptive_sync, async_mode);
+            assert_eq!(reactive, expected_reactive);
+            let desired_credit = phase1_desired_primary_credit(reactive, 3);
+            assert_eq!(desired_credit, if expected_reactive { 1 } else { 3 });
+            assert_eq!(desired_credit > 1, !expected_reactive);
+        }
     }
 }

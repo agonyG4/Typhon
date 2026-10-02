@@ -49,26 +49,54 @@ in the sampled tree.
 
 ## Policy and effective mode
 
-The native policy is `OBLIVION_ONE_TEARING=off|auto`, defaulting to `off`.
-Unknown values also resolve to `off`. There is no force mode. In `auto`, an
-Async request is accepted only for a solitary fullscreen presentation after
-the compositor has checked the output generation, cursor state, plane use,
-explicit synchronization, commit timing, KMS lane, and Async TEST_ONLY
-qualification. Ordinary tiled/windowed desktop frames remain VSync.
+The native tearing policy is `OBLIVION_ONE_TEARING=off|auto`, defaulting to
+`off`. Unknown values also resolve to `off`. Adaptive Sync has its separate
+compatibility setting `OBLIVION_ONE_VRR=off|auto|on`, defaulting to `auto`.
+These settings describe policy; neither one is proof that KMS accepted a
+request or that a monitor varied its refresh rate.
 
-`OutputTransaction` freezes both `OutputPresentationMode` and DRM content type.
-The transaction also forces `ReactiveDouble` pacing for Async so the scheduler
-does not use predictive triple buffering for a tearing frame. A mode or content
-transition therefore cannot be silently changed after KMS ownership is
-transferred.
+The output transaction freezes one of four effective modes:
+
+| Mode | VRR requested | Async page flip | Presentation domain | Phase 1 pacing |
+| --- | --- | --- | --- | --- |
+| `Vsync` | no | no | `FixedVsync` | existing selection |
+| `AdaptiveSync` | yes | no | `VrrWindow` | `ReactiveDouble` |
+| `Async` | no | yes | `AsyncImmediate` | `ReactiveDouble` |
+| `AdaptiveAsync` | yes | yes | `VrrWindow` | `ReactiveDouble` |
+
+Async remains independently qualified by the tearing policy, surface hint,
+fullscreen state, cursor and plane state, synchronization readiness, commit
+timing, KMS lane, format support, and exact TEST_ONLY result. Adaptive Sync is
+qualified independently: `Off` never requests it, `Auto` requires the
+compositor's solitary-fullscreen candidate, and `On` requests it whenever the
+atomic output path and both DRM properties are capable. Both policies remain
+subject to exact KMS qualification and safe transaction state. Content Type
+such as `Game` does not activate VRR.
+
+`OutputPresentationMode` is the transaction's single presentation authority;
+DRM content type remains separate metadata. All three non-VSync modes force
+`ReactiveDouble` in Phase 1, so Adaptive Sync does not enter Predictive Triple
+render-ahead. A mode may be replaced only before the transaction transfers to
+KMS ownership.
 
 ## KMS contract
 
-Atomic VSync commits use `NONBLOCK | PAGE_FLIP_EVENT`. Atomic Async commits use
-those flags plus `PAGE_FLIP_ASYNC`. Async TEST_ONLY uses `TEST_ONLY |
-PAGE_FLIP_ASYNC` and never `ALLOW_MODESET`; modesets never use Async. Legacy
-page flips have explicit VSync and Async submission modes, with Async enabled
-only after the legacy capability is available.
+Atomic `Vsync` and `AdaptiveSync` commits use `NONBLOCK | PAGE_FLIP_EVENT`.
+`Async` and `AdaptiveAsync` add `PAGE_FLIP_ASYNC`; VRR by itself never requests
+tearing. TEST_ONLY and real requests program the same Content Type and
+`VRR_ENABLED` values. Adaptive Async TEST_ONLY uses `TEST_ONLY |
+PAGE_FLIP_ASYNC`; all steady-state presentation commits omit `ALLOW_MODESET`.
+Legacy KMS may qualify Async through its existing path, but it is never treated
+as VRR capable.
+
+Atomic VRR capability requires connector `vrr_capable` to exist and be nonzero,
+CRTC `VRR_ENABLED` to exist, and Typhon to use its Atomic backend. The live DRM
+atomic connector property is authoritative; sysfs is diagnostic only. The
+initial output state explicitly disables VRR while the discovery snapshot
+retains the original CRTC value for exact shutdown/session restore. A VRR
+transition that fails the no-modeset TEST_ONLY check falls back before submit;
+Typhon does not add `ALLOW_MODESET` to a normal presentation commit. Any future
+modeset transition needs a separate full-state, TEST_ONLY-validated path.
 
 For composited Async, render-fence readiness is checked nonblocking from the
 event loop before submission and the primary `IN_FENCE_FD` is omitted. VSync
@@ -84,11 +112,12 @@ transition.
 
 ## Feedback and FIFO
 
-VSync hardware feedback is reported as `Kind::Vsync`; Async hardware feedback
-is reported as tearing and is never mislabeled as synchronized. Direct Scanout
-adds the existing zero-copy flag. A completed Async presentation does not
-clear a FIFO barrier. A later valid non-tearing latch or surface teardown is
-responsible for retiring that barrier.
+VSync and Adaptive Sync feedback retain `Kind::Vsync`; `Async` and
+`AdaptiveAsync` feedback are tearing and do not set that flag. Variable-refresh
+feedback reports `refresh = 0`, since the next physical interval is not known.
+Direct Scanout adds the existing zero-copy flag. A completed tearing
+presentation does not clear a FIFO barrier. A later valid non-tearing latch or
+surface teardown is responsible for retiring that barrier.
 
 Direct Scanout validation includes presentation mode and content type. A
 composited Async candidate must be present in the driver’s `IN_FORMATS_ASYNC`
@@ -97,10 +126,17 @@ qualification keeps the frame on VSync. The TEST_ONLY result is cached only
 for the exact output generation, CRTC, primary plane, format/modifier, acquire
 strategy, cursor state, and content type that were tested.
 
-## Qualification boundary
+## Phase 1 qualification boundary
 
-The implementation does not enable VRR or write `VRR_ENABLED`. Native tearing
-is qualified independently through the page-flip capability, exact Atomic
-TEST_ONLY contract, generation-aware validation cache, and real-submit failure
-fallback. Hardware qualification remains required before changing the default
-policy from `off`.
+Phase 1 carries the four-mode transaction state through policy, exact KMS
+validation/submission, matching pageflip confirmation, feedback, and recovery.
+Confirmation means the pageflip completed for a transaction that requested
+`VRR_ENABLED`; it does not establish that the monitor physically varied on
+that frame. Direct Scanout and composited validation include the presentation
+mode, so their proofs cannot alias across modes or output generations.
+
+The existing fixed-refresh `PresentationDeadlinePlanner` and Predictive O1
+physical opportunity model remain unchanged. Adaptive presentations use
+conservative `ReactiveDouble` pacing. Phase 2 owns phase-free `VrrWindow`
+scheduling, VRR range/min-refresh handling, overlay coalescing, cursor timing
+optimization, anti-flicker cadence ownership, and VRR-specific late rendering.

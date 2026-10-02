@@ -234,23 +234,13 @@ fn native_vrr_preference_parses_policy_values() {
 }
 
 #[test]
-fn native_vrr_plan_auto_enables_only_when_connector_is_capable() {
+fn native_vrr_preference_is_configuration_only() {
     assert_eq!(
-        NativeVrrPlan::choose(NativeVrrPreference::Auto, Some(true)),
-        NativeVrrPlan {
-            requested: NativeVrrPreference::Auto,
-            supported: true,
-            planned_enabled: true,
-        }
+        NativeVrrPreference::parse("auto"),
+        NativeVrrPreference::Auto
     );
-    assert_eq!(
-        NativeVrrPlan::choose(NativeVrrPreference::Auto, Some(false)),
-        NativeVrrPlan {
-            requested: NativeVrrPreference::Auto,
-            supported: false,
-            planned_enabled: false,
-        }
-    );
+    assert_eq!(NativeVrrPreference::parse("on"), NativeVrrPreference::On);
+    assert_eq!(NativeVrrPreference::parse("off"), NativeVrrPreference::Off);
 }
 
 #[test]

@@ -237,6 +237,7 @@ impl NativeGbmScanout {
         kms: &KmsBackendSelection,
         cursor: Option<&AtomicCursorVisualState>,
         presentation_mode: oblivion_one::compositor::OutputPresentationMode,
+        content_type: oblivion_one::compositor::DrmContentType,
     ) -> io::Result<Option<(u64, u32)>> {
         if self.page_flip.is_pending() {
             return Ok(None);
@@ -254,7 +255,13 @@ impl NativeGbmScanout {
         self.page_flip
             .begin(token, framebuffer, self.backend_generation, Instant::now())
             .map_err(io::Error::other)?;
-        match kms.submit_flip_with_presentation(framebuffer, token, cursor, presentation_mode) {
+        match kms.submit_flip_with_presentation(
+            framebuffer,
+            token,
+            cursor,
+            presentation_mode,
+            content_type,
+        ) {
             Ok(()) => {
                 self.pending_index = Some(index);
                 Ok(Some((token.get(), framebuffer.get())))

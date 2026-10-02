@@ -10,6 +10,12 @@ pub(crate) fn submit_atomic_flip_with(
     request: AtomicFlipRequest,
     submit: impl FnOnce(&AtomicSubmission) -> Result<(), AtomicKmsError>,
 ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+    if request.presentation_mode.is_async() && request.cursor.is_some() {
+        return Err(AtomicKmsError::new(
+            AtomicKmsErrorKind::Unsupported,
+            "Async pageflip cannot mutate cursor-plane state",
+        ));
+    }
     let mut out_fence_storage = -1i32;
     let out_fence_ptr = pipeline
         .crtc_props
@@ -30,7 +36,11 @@ pub(crate) fn submit_atomic_flip_with(
         request.framebuffer,
         request.cursor.as_ref(),
     )?;
-    atomic_request.set_connector_content_type(pipeline, request.content_type.as_str())?;
+    atomic_request.set_presentation_state(
+        pipeline,
+        request.presentation_mode,
+        request.content_type,
+    )?;
     if let Some(in_fence_property) = in_fence_property {
         atomic_request.set_plane(
             pipeline.plane,
