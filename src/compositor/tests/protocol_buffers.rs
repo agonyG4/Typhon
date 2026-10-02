@@ -163,8 +163,11 @@ fn clipboard_ready_wayland_clients_transfer_selection_without_compositor_bufferi
             TestWaylandEvent::KeyboardModifiers,
         ]
     );
-    assert_eq!(source_state.data_source_send_mime_types, ["text/plain"]);
-    assert_eq!(received, "clipboard payload");
+    assert_eq!(
+        source_state.data_source_send_mime_types,
+        ["text/plain", "text/html"]
+    );
+    assert_eq!(received, ["clipboard payload", "clipboard payload"]);
 }
 
 #[test]

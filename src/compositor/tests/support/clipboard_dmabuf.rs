@@ -13,7 +13,7 @@ pub(in crate::compositor::tests) struct ClipboardDisconnectResult {
 pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
-) -> Result<(RegistryTestState, RegistryTestState, String), Box<dyn std::error::Error>> {
+) -> Result<(RegistryTestState, RegistryTestState, Vec<String>), Box<dyn std::error::Error>> {
     let source_stream = UnixStream::connect(socket_path)?;
     let source_connection = Connection::from_socket(source_stream)?;
     let (source_globals, mut source_queue) =
@@ -85,15 +85,19 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
         .data_device_selection_offer
         .clone()
         .ok_or_else(|| io::Error::other("target did not receive a clipboard selection offer"))?;
-    let (read_fd, write_fd) = owned_pipe()?;
-    offer.receive("text/plain".to_string(), write_fd.as_fd());
-    target_connection.flush()?;
-    drop(write_fd);
-    target_connection.roundtrip()?;
-    source_queue.roundtrip(&mut source_state)?;
+    let mut received = Vec::new();
+    for mime_type in ["text/plain", "text/html"] {
+        let (read_fd, write_fd) = owned_pipe()?;
+        offer.receive(mime_type.to_string(), write_fd.as_fd());
+        target_connection.flush()?;
+        drop(write_fd);
+        target_connection.roundtrip()?;
+        source_queue.roundtrip(&mut source_state)?;
 
-    let mut received = String::new();
-    File::from(read_fd).read_to_string(&mut received)?;
+        let mut payload = String::new();
+        File::from(read_fd).read_to_string(&mut payload)?;
+        received.push(payload);
+    }
 
     Ok((source_state, target_state, received))
 }

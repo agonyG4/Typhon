@@ -33,13 +33,12 @@ inert surface, along with the rest of that client's resources.
 ## Native-client qualification status
 
 **Not run on 2026-10-02.** The active seat is a Wayland session on `tty1`, and
-Hyprland (PID 2150) owns `/dev/dri/card1`; `/sys/class/tty/tty0/active` reports
-`tty1`. The other logged-in session is an inactive text session on `tty3`, and
-`/dev/tty2` is root-owned with mode `0600`. Starting Typhon through its native
-TTY/DRM launcher would require taking over the active seat, so it was not
-started. Firefox was not launched, `TYPHON_WAYLAND_COMPAT_TRACE=1` was not set
-for a compositor process, and there is no native Firefox trace or survival
-result to claim.
+Hyprland (PID 1030) owns `/dev/dri/card1`; `/sys/class/tty/tty0/active` reports
+`tty1`. Starting Typhon through its native TTY/DRM launcher would require
+taking over the active seat, so it was not started. No Typhon or Firefox
+process was running during this qualification check. Firefox was not launched,
+`TYPHON_WAYLAND_COMPAT_TRACE=1` was not set for a compositor process, and there
+is no native Firefox trace or survival result to claim.
 
 The focused lifecycle tests are synthetic wire tests against Typhon's in-process
 test compositor. They are separate evidence from native-client or
