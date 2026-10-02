@@ -165,8 +165,11 @@ fn send_accepted_drop(
         status_action,
         source_actions.clone(),
     );
-    xwm.data_bridge.dnd.active.as_mut().unwrap().target_version =
-        Some(XwaylandDndVersion::new(target_version).unwrap());
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .target_version = Some(XwaylandDndVersion::new(target_version).unwrap());
     xwm.flush().unwrap();
     let _position = read_peer(peer);
     inject_status_message(xwm, peer, source_proxy, target, true, status_action);
@@ -561,7 +564,11 @@ fn ready_target_receives_enter_then_initial_position() {
             .confirm_source_ownership(id, 0x880, 1234)
     );
     assert!(
-        xwm.data_bridge.dnd.active.as_mut().unwrap().mime_atoms[0]
+        xwm.data_bridge
+            .dnd
+            .outgoing_session_mut()
+            .unwrap()
+            .mime_atoms[0]
             .replace(77)
             .is_none()
     );
@@ -571,7 +578,11 @@ fn ready_target_receives_enter_then_initial_position() {
         recipient,
         XwaylandDndVersion::new(5).unwrap(),
     ));
-    xwm.data_bridge.dnd.active.as_mut().unwrap().latest_position = Some(CoalescedPosition {
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .latest_position = Some(CoalescedPosition {
         x: 10.5,
         y: 20.0,
         action: Some(XwaylandDndAction::Copy),
@@ -725,7 +736,11 @@ fn accepted_physical_drop_sends_xdnd_drop_without_leave() {
         XwaylandDndVersion::new(5).unwrap(),
     ));
     assert!(xwm.data_bridge.dnd.mark_entered(id));
-    xwm.data_bridge.dnd.active.as_mut().unwrap().mime_atoms[0] = Some(99);
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .mime_atoms[0] = Some(99);
     assert!(
         xwm.data_bridge
             .dnd
@@ -1468,8 +1483,11 @@ fn pre_v5_ask_is_rejected_before_drop_without_guessing_an_action() {
         XwaylandDndAction::Ask,
         actions.clone(),
     );
-    xwm.data_bridge.dnd.active.as_mut().unwrap().target_version =
-        Some(XwaylandDndVersion::new(4).unwrap());
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .target_version = Some(XwaylandDndVersion::new(4).unwrap());
     xwm.flush().unwrap();
     let _position = read_peer(&mut peer);
     apply_transitions(

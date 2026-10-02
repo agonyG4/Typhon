@@ -51,9 +51,19 @@ and tested, but the current deterministic Wayland→XDND requested-action policy
 does not actively select Ask. Active Ask selection remains unqualified until a
 canonical user/modifier action policy exists. Synthetic Ask tests validate the
 terminal state machine, not production reachability or end-to-end active Ask
-interoperability. DELETE remains unsupported and is not advertised. X11 →
-Wayland XDND is not implemented. Real-application interoperability
-qualification remains pending F11-D.
+interoperability. DELETE remains unsupported and is not advertised. Real-
+application interoperability qualification remains pending F11-D.
+
+F11-C3-A implements and deterministically tests the canonical X11 → Wayland
+XDND hover and data bridge: incoming Enter/Position/Leave metadata, Wayland
+offer delivery, XdndStatus feedback, and direct/INCR XdndSelection payload
+reads into Wayland-provided descriptors. The generation-owned target proxy
+is internal protocol infrastructure and is not published as the root
+`XdndProxy` in production. Real X11 applications therefore do not discover
+Typhon as a root XDND target until F11-C3-B closes Drop/Finished handling.
+Successful X11 → Wayland Drop interoperability is not claimed. XDND action
+descriptions have no Wayland core equivalent, and the current root-coordinate
+mapping is 1:1 pending a future output-layout mapping for multi-output support.
 
 The `XdndFinished` deadline is currently a fixed 60 seconds, including while a
 large INCR transfer continues making progress. F11-C4 real-application

@@ -600,6 +600,151 @@ impl CompositorState {
         }
     }
 
+    /// Update the target for an incoming XWayland root-proxy drag. Unlike the
+    /// native Wayland drag path, an X11-backed desktop window is deliberately
+    /// treated as no target so an X11 source never loops back through C2.
+    pub(in crate::compositor) fn update_incoming_xwayland_drag_target_at(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        x: f64,
+        y: f64,
+    ) {
+        let Some(active) = self.active_drag.as_ref().filter(|active| {
+            active.id == crate::xwayland::CanonicalDndSessionId::Xwayland(offer_id)
+                && active.phase == DragSessionPhase::Dragging
+                && active.lifecycle_driver == DragLifecycleDriver::Xwayland
+                && active
+                    .origin
+                    .xwayland_offer()
+                    .is_some_and(|offer| offer.id() == offer_id)
+        }) else {
+            return;
+        };
+        let previous_target = active.target.clone();
+        let target = self.pointer_target_at(x, y);
+        let Some(target) = target else {
+            self.leave_drag_target();
+            return;
+        };
+        let surface_id = compositor_surface_id(&target.surface);
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        let x11_window = self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .and_then(|window| match window.backend {
+                WindowBackend::X11(handle) => Some(handle),
+                WindowBackend::Xdg(_) => None,
+            })
+            .filter(|handle| {
+                self.xwayland
+                    .client_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.generation == handle.generation())
+            });
+        if x11_window.is_some() {
+            self.leave_drag_target();
+            return;
+        }
+        if previous_target.as_ref().is_some_and(|previous| {
+            matches!(previous, ActiveDragTarget::Wayland { surface, .. } if same_surface_resource(surface, &target.surface))
+        }) {
+            self.send_drag_motion_to_current_target(Some(&target));
+            return;
+        }
+        self.leave_drag_target();
+        if !self.active_drag.as_ref().is_some_and(|active| {
+            active.id == crate::xwayland::CanonicalDndSessionId::Xwayland(offer_id)
+                && active.phase == DragSessionPhase::Dragging
+        }) {
+            return;
+        }
+        let Some(target_client) = target.surface.client().map(|client| client.id()) else {
+            return;
+        };
+        let Some(device) = self
+            .data_devices
+            .iter()
+            .find(|binding| binding.client_id == target_client && binding.device.is_alive())
+            .map(|binding| binding.device.clone())
+        else {
+            return;
+        };
+        let Some(active) = self.active_drag.as_ref() else {
+            return;
+        };
+        let mime_types = self.drag_source_mime_types(&active.origin);
+        let source_actions = self.drag_source_actions(&active.origin);
+        let Some(client) = device.client() else {
+            return;
+        };
+        let Some(handle) = device.handle().upgrade() else {
+            return;
+        };
+        let display = DisplayHandle::from(handle);
+        let Ok(offer) = client
+            .create_resource::<wl_data_offer::WlDataOffer, DataOfferData, CompositorState>(
+                &display,
+                device.version().min(3),
+                DataOfferData {
+                    target_client_id: target_client.clone(),
+                    source_generation: 0,
+                    kind: DataOfferKind::DragAndDrop,
+                },
+            )
+        else {
+            return;
+        };
+        self.data_offers.insert(
+            offer.id(),
+            ClipboardDataOffer {
+                offer: offer.clone(),
+                target_client_id: target_client.clone(),
+                target_id: device.id().protocol_id(),
+                source_generation: 0,
+                broker_offer_id: None,
+                source_key: None,
+                mime_types: mime_types.clone(),
+                kind: DataOfferKind::DragAndDrop,
+                accepted_mime: None,
+                selected_action: None,
+                drag_phase: Some(DragOfferPhase::Entered),
+                source_actions,
+                destination_actions: None,
+                preferred_action: 0,
+            },
+        );
+        let _ = device.send_event(wl_data_device::Event::DataOffer { id: offer.clone() });
+        for mime_type in mime_types {
+            let _ = offer.send_event(wl_data_offer::Event::Offer { mime_type });
+        }
+        if offer.version() >= 3 {
+            let _ = offer.send_event(wl_data_offer::Event::SourceActions {
+                source_actions: WEnum::Unknown(source_actions),
+            });
+        }
+        let serial = self.next_configure_serial();
+        let _ = device.send_event(wl_data_device::Event::Enter {
+            serial,
+            surface: target.surface.clone(),
+            x: target.surface_x,
+            y: target.surface_y,
+            id: Some(offer.clone()),
+        });
+        if let Some(active) = self.active_drag.as_mut() {
+            active.target = Some(ActiveDragTarget::Wayland {
+                surface: target.surface,
+                client_id: target_client,
+                device_id: device.id().protocol_id(),
+                offer: Some(offer),
+            });
+            active.target_action = None;
+            active.selected_action = 0;
+            active.destination_actions = None;
+            active.last_offer_action = None;
+            active.last_source_action = None;
+        }
+    }
+
     fn queue_xwayland_dnd_position(
         &mut self,
         session_id: crate::xwayland::CanonicalDndSessionId,

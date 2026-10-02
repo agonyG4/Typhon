@@ -555,6 +555,7 @@ impl Xwm {
     }
 
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
+        data_bridge::dnd_incoming::retire_proxy(self, generation);
         let _ = data_bridge::dnd::retire_generation(self, generation);
         self.windows.clear_generation(generation);
         self.adoption.clear_generation(generation);

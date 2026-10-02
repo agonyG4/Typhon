@@ -265,6 +265,16 @@ impl NativeRuntime {
             return Ok(());
         };
 
+        let mut incoming_wayland_events = false;
+        for event in self.xwayland.take_managed_incoming_dnd_events() {
+            incoming_wayland_events |= self.server.apply_xwayland_dnd_incoming_event(event);
+        }
+        if incoming_wayland_events {
+            // Deliver data_offer/enter/motion/source_actions before feeding the
+            // resulting canonical SourceFeedback back to the XWM.
+            self.server.flush_wayland_clients()?;
+        }
+
         let transitions = self.server.take_xwayland_dnd_transitions();
         let current_transitions = transitions
             .into_iter()
@@ -293,6 +303,11 @@ impl NativeRuntime {
         }
         self.xwayland
             .resolve_managed_dnd_source_data_requests(results, &mut self.process_supervisor)?;
+        let incoming_data_requests = self.server.take_xwayland_dnd_data_requests();
+        self.xwayland.submit_managed_incoming_dnd_data_requests(
+            incoming_data_requests,
+            &mut self.process_supervisor,
+        )?;
         self.sync_xwayland_reactor_sources()?;
         Ok(())
     }

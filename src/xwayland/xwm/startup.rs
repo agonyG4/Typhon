@@ -1371,6 +1371,9 @@ impl XwmStartup {
             supporting_wm_check,
             raw_fd,
         };
+        // C3-A creates private target infrastructure but intentionally leaves
+        // root.XdndProxy unpublished until the terminal path is implemented.
+        let _ = super::data_bridge::dnd_incoming::initialize_target_proxy(&mut xwm);
         for adopted in self.adopted_windows.drain(..) {
             let handle = crate::xwayland::X11WindowHandle::new(self.generation, adopted.xid);
             if xwm

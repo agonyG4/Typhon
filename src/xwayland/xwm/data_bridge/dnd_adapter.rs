@@ -77,8 +77,7 @@ pub(crate) fn apply_transitions(
                 if let Some(session) = xwm
                     .data_bridge
                     .dnd
-                    .active
-                    .as_mut()
+                    .outgoing_session_mut()
                     .filter(|session| session.id == id)
                 {
                     session.latest_position = Some(super::dnd::CoalescedPosition {
@@ -104,8 +103,7 @@ pub(crate) fn apply_transitions(
                     let Some(session) = xwm
                         .data_bridge
                         .dnd
-                        .active
-                        .as_mut()
+                        .outgoing_session_mut()
                         .filter(|session| session.id == id)
                     else {
                         continue;
@@ -219,11 +217,18 @@ pub(crate) fn apply_transitions(
                 if generation == xwm.generation
                     && let Some(id) = XwaylandDndAdapterId::new(session_id, generation)
                 {
+                    if let CanonicalDndSessionId::Xwayland(offer_id) = session_id {
+                        super::dnd_incoming::canonical_retired(xwm, offer_id);
+                    }
                     retire_session_for_canonical_retirement(xwm, id)?;
                 }
             }
-            XwaylandDndTransition::SourceFeedback { .. }
-            | XwaylandDndTransition::SourceFinished { .. } => {}
+            XwaylandDndTransition::SourceFeedback {
+                offer_id,
+                accepted_mime,
+                action,
+            } => super::dnd_incoming::source_feedback(xwm, offer_id, accepted_mime, action)?,
+            XwaylandDndTransition::SourceFinished { .. } => {}
         }
     }
     Ok(())
@@ -568,8 +573,7 @@ fn leave_target(
     let manager = &mut xwm.data_bridge.dnd;
     let _ = manager.leave_target(id, target);
     if let Some(session) = manager
-        .active
-        .as_mut()
+        .outgoing_session_mut()
         .filter(|session| session.id == id && session.discovery_target == Some(target))
     {
         session.discovery_target = None;
@@ -631,8 +635,7 @@ fn reject_target(xwm: &mut Xwm, id: XwaylandDndAdapterId, target: X11WindowHandl
     if let Some(session) = xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
+        .outgoing_session_mut()
         .filter(|session| session.id == id && session.discovery_target == Some(target))
     {
         session.discovery_target = None;
@@ -804,8 +807,7 @@ pub(crate) fn property_notify(
     if let Some(session) = xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
+        .outgoing_session_mut()
         .filter(|session| session.id == id && session.source_proxy == Some(source_proxy))
     {
         session.ownership_timestamp = Some(event.time);
@@ -1034,8 +1036,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                 if let Some(session) = xwm
                     .data_bridge
                     .dnd
-                    .active
-                    .as_mut()
+                    .outgoing_session_mut()
                     .filter(|session| session.id == id && session.discovery_serial == serial)
                 {
                     session.discovery_recipient = Some(recipient);
@@ -1072,8 +1073,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                     let session = &mut xwm
                         .data_bridge
                         .dnd
-                        .active
-                        .as_mut()
+                        .outgoing_session_mut()
                         .expect("current discovery session");
                     session.discovery_target = None;
                     session.discovery_recipient = None;
@@ -1128,8 +1128,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                 if let Some(session) = xwm
                     .data_bridge
                     .dnd
-                    .active
-                    .as_mut()
+                    .outgoing_session_mut()
                     .filter(|session| session.id == id && ordinal < session.mime_atoms.len())
                 {
                     session.mime_atoms[ordinal] = Some(reply.atom);
@@ -1166,9 +1165,14 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                             && session.ownership_claim_issued
                     });
                 if confirmed {
-                    if let Some(session) = xwm.data_bridge.dnd.active.as_mut().filter(|session| {
-                        session.id == id && session.source_proxy == Some(source_proxy)
-                    }) {
+                    if let Some(session) =
+                        xwm.data_bridge
+                            .dnd
+                            .outgoing_session_mut()
+                            .filter(|session| {
+                                session.id == id && session.source_proxy == Some(source_proxy)
+                            })
+                    {
                         session.ownership_confirmed = true;
                         session.ownership_deadline_ns = None;
                     }

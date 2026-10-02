@@ -21,6 +21,12 @@ impl Xwm {
         super::data_bridge::dnd::take_feedback(self)
     }
 
+    pub(crate) fn take_incoming_dnd_events(
+        &mut self,
+    ) -> Vec<crate::xwayland::XwaylandDndIncomingEvent> {
+        self.data_bridge.dnd_incoming.take_events()
+    }
+
     pub(crate) fn handle_dnd_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         super::data_bridge::dnd::handle_deadline(self, now_ns)
     }
@@ -76,6 +82,7 @@ impl Xwm {
             .chain(selection_proxy::next_deadline_ns(self))
             .chain(self.data_bridge.selection_outgoing.next_deadline_ns())
             .chain(self.data_bridge.dnd.next_deadline_ns())
+            .chain(super::data_bridge::dnd_incoming::next_deadline_ns(self))
             .chain(self.data_bridge.dnd_outgoing.next_deadline_ns())
             .min()
     }
@@ -440,8 +447,14 @@ impl Xwm {
                     dnd_budget,
                     crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
                 )?;
-                selection_replies_processed = selection_replies_processed.saturating_add(processed);
-                Some(processed)
+                let incoming_processed = super::data_bridge::dnd_incoming::poll_replies(
+                    self,
+                    dnd_budget.saturating_sub(processed),
+                    crate::native::event_loop::monotonic_now_ns().unwrap_or_default(),
+                )?;
+                let total = processed.saturating_add(incoming_processed);
+                selection_replies_processed = selection_replies_processed.saturating_add(total);
+                Some(total)
             };
             if event_drain.is_none_or(|drain| drain.processed == 0)
                 && reply_drain.is_none_or(|drain| drain.processed == 0)

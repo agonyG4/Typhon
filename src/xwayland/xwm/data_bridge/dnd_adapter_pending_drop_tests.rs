@@ -242,8 +242,11 @@ fn late_ask_status_requires_v5_before_drop() {
             XwaylandDndAction::Ask,
         ],
     );
-    xwm.data_bridge.dnd.active.as_mut().unwrap().target_version =
-        Some(XwaylandDndVersion::new(4).unwrap());
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .target_version = Some(XwaylandDndVersion::new(4).unwrap());
     xwm.flush().unwrap();
     let _position = read_peer(&mut peer);
     apply_transitions(

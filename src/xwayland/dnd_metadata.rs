@@ -15,8 +15,35 @@ pub const MAX_XWAYLAND_DND_MIME_TYPES: usize = 64;
 pub const MAX_XWAYLAND_DND_MIME_TYPE_BYTES: usize = 255;
 pub const MAX_XWAYLAND_DND_ACTIONS: usize = 5;
 pub const MAX_PENDING_XWAYLAND_DND_TRANSITIONS: usize = 64;
+pub const MAX_PENDING_XWAYLAND_DND_INCOMING_EVENTS: usize = 32;
+pub const MAX_XWAYLAND_DND_INCOMING_TRANSFERS: usize = 16;
+pub const MAX_XWAYLAND_DND_INCOMING_CHUNK_BYTES: usize = 64 * 1024;
+pub const XWAYLAND_DND_INCOMING_IDLE_TIMEOUT_NS: u64 = 30_000_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Incoming root-bridge sources must support the XdndProxy extension (v4).
+/// The general version type remains unchanged for the existing C2 path.
+pub const fn negotiate_incoming_root_version(source_version: u32) -> Option<XwaylandDndVersion> {
+    if source_version < 4 {
+        return None;
+    }
+    let version = if source_version >= 5 {
+        5
+    } else {
+        source_version as u8
+    };
+    XwaylandDndVersion::new(version)
+}
+
+/// Decode XDND's packed pair of signed 16-bit root coordinates. The current
+/// single-output compositor maps root coordinates 1:1; a future output layout
+/// transform belongs at the runtime/compositor boundary.
+pub const fn unpack_root_coordinates(packed: u32) -> (f64, f64) {
+    let x = (packed >> 16) as u16 as i16;
+    let y = packed as u16 as i16;
+    (x as f64, y as f64)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct XwaylandDndOfferId {
     generation: XwaylandGeneration,
     serial: NonZeroU64,
@@ -268,12 +295,34 @@ impl XwaylandDndOffer {
         &self.source_actions
     }
 
+    pub fn replace_source_actions(
+        &mut self,
+        source_actions: Vec<XwaylandDndAction>,
+    ) -> Result<(), XwaylandDndMetadataError> {
+        validate_source_actions(&source_actions)?;
+        self.source_actions = source_actions;
+        Ok(())
+    }
+
     pub fn wayland_source_actions_mask(&self) -> u32 {
         self.source_actions
             .iter()
             .filter_map(|action| action.to_wayland_action())
             .fold(0, |mask, action| mask | action.mask())
     }
+}
+
+fn validate_source_actions(
+    source_actions: &[XwaylandDndAction],
+) -> Result<(), XwaylandDndMetadataError> {
+    if source_actions.len() > MAX_XWAYLAND_DND_ACTIONS {
+        return Err(XwaylandDndMetadataError::TooManyActions);
+    }
+    let mut seen = HashSet::with_capacity(source_actions.len());
+    if source_actions.iter().any(|action| !seen.insert(*action)) {
+        return Err(XwaylandDndMetadataError::DuplicateAction);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +342,51 @@ pub struct XwaylandDndDataRequest {
     pub offer_id: XwaylandDndOfferId,
     pub mime_type: String,
     pub sink: OwnedFd,
+}
+
+/// Generation-qualified identity for one incoming XdndSelection payload read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct XwaylandDndIncomingTransferId {
+    offer_id: XwaylandDndOfferId,
+    serial: NonZeroU64,
+}
+
+impl XwaylandDndIncomingTransferId {
+    pub const fn new(offer_id: XwaylandDndOfferId, serial: NonZeroU64) -> Self {
+        Self { offer_id, serial }
+    }
+
+    pub const fn offer_id(self) -> XwaylandDndOfferId {
+        self.offer_id
+    }
+
+    pub const fn serial(self) -> u64 {
+        self.serial.get()
+    }
+}
+
+/// Direction-specific semantic events from the XWM's root target proxy.
+/// They contain no raw X11 protocol values except the exact source timestamp.
+#[derive(Debug, Clone, PartialEq)]
+pub enum XwaylandDndIncomingEvent {
+    Begin {
+        offer: XwaylandDndOffer,
+        x: f64,
+        y: f64,
+        requested_action: XwaylandDndAction,
+        x_timestamp: u32,
+    },
+    Position {
+        offer_id: XwaylandDndOfferId,
+        x: f64,
+        y: f64,
+        requested_action: XwaylandDndAction,
+        source_actions: Vec<XwaylandDndAction>,
+        x_timestamp: u32,
+    },
+    Leave {
+        offer_id: XwaylandDndOfferId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -521,7 +615,7 @@ impl XwaylandDndOutbox {
 
 #[cfg(test)]
 mod xdnd_version_tests {
-    use super::XwaylandDndVersion;
+    use super::{XwaylandDndVersion, negotiate_incoming_root_version, unpack_root_coordinates};
 
     #[test]
     fn target_version_negotiation_rejects_old_and_caps_future_versions() {
@@ -550,5 +644,28 @@ mod xdnd_version_tests {
         assert_eq!(XwaylandDndVersion::new(3).map(|v| v.get()), Some(3));
         assert_eq!(XwaylandDndVersion::new(5).map(|v| v.get()), Some(5));
         assert!(XwaylandDndVersion::new(6).is_none());
+    }
+
+    #[test]
+    fn incoming_root_bridge_requires_v4_and_caps_at_v5() {
+        assert_eq!(negotiate_incoming_root_version(3), None);
+        assert_eq!(
+            negotiate_incoming_root_version(4).map(|version| version.get()),
+            Some(4)
+        );
+        assert_eq!(
+            negotiate_incoming_root_version(5).map(|version| version.get()),
+            Some(5)
+        );
+        assert_eq!(
+            negotiate_incoming_root_version(12).map(|version| version.get()),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn incoming_root_coordinates_preserve_signed_i16_halves() {
+        let packed = (u32::from(i16::MIN as u16) << 16) | u32::from((-1_i16) as u16);
+        assert_eq!(unpack_root_coordinates(packed), (-32768.0, -1.0));
     }
 }

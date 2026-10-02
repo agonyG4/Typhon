@@ -6,6 +6,7 @@
 
 pub mod dnd;
 pub(crate) mod dnd_adapter;
+pub(crate) mod dnd_incoming;
 pub(crate) mod dnd_selection;
 pub(crate) mod dnd_wire;
 pub mod selection;
@@ -60,6 +61,7 @@ pub struct DataBridge {
     pub(crate) selection_outgoing: super::selection_outgoing::SelectionOutgoingManager,
     pub transfers: transfer::TransferManager,
     pub dnd: dnd::DndManager,
+    pub(crate) dnd_incoming: dnd_incoming::DndIncomingManager,
     pub(crate) dnd_outgoing: super::dnd_outgoing::DndOutgoingManager,
 }
 
@@ -75,6 +77,7 @@ impl DataBridge {
             .extend(self.selection_outgoing.clear_generation(bridge_generation));
         self.transfers.clear_generation(bridge_generation);
         self.dnd.clear_generation(generation);
+        self.dnd_incoming.clear_generation(generation);
         self.dnd_outgoing.clear_generation(generation);
         pending_selection_replies
     }

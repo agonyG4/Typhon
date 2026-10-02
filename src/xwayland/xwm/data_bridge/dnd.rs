@@ -105,11 +105,50 @@ pub enum PositionDisposition {
 
 #[derive(Debug, Default)]
 pub struct DndManager {
-    pub(super) active: Option<DndSession>,
+    pub(super) active: Option<DndAdapterSession>,
     pub(super) internal_windows: HashSet<u32>,
     pub(super) pending_replies: BTreeMap<SequenceNumber, DndPendingReply>,
     pub(super) feedback: VecDeque<DndFeedback>,
     pub(super) next_discovery_serial: u64,
+}
+
+/// The seat/generation has one XDND adapter owner at a time. The direction is
+/// represented in the type so an outgoing source session cannot coexist with
+/// an incoming target session.
+#[derive(Debug)]
+pub(crate) enum DndAdapterSession {
+    WaylandToX11(DndSession),
+    X11ToWayland(super::dnd_incoming::IncomingDndSession),
+}
+
+impl DndAdapterSession {
+    fn outgoing(&self) -> Option<&DndSession> {
+        match self {
+            Self::WaylandToX11(session) => Some(session),
+            Self::X11ToWayland(_) => None,
+        }
+    }
+
+    fn outgoing_mut(&mut self) -> Option<&mut DndSession> {
+        match self {
+            Self::WaylandToX11(session) => Some(session),
+            Self::X11ToWayland(_) => None,
+        }
+    }
+
+    pub(crate) fn incoming(&self) -> Option<&super::dnd_incoming::IncomingDndSession> {
+        match self {
+            Self::WaylandToX11(_) => None,
+            Self::X11ToWayland(session) => Some(session),
+        }
+    }
+
+    pub(crate) fn incoming_mut(&mut self) -> Option<&mut super::dnd_incoming::IncomingDndSession> {
+        match self {
+            Self::WaylandToX11(_) => None,
+            Self::X11ToWayland(session) => Some(session),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,8 +246,55 @@ pub(super) fn status_action_authorizes_frozen_drop(
 }
 
 impl DndManager {
+    pub(super) fn outgoing_session(&self) -> Option<&DndSession> {
+        self.active.as_ref()?.outgoing()
+    }
+
+    pub(super) fn outgoing_session_mut(&mut self) -> Option<&mut DndSession> {
+        self.active.as_mut()?.outgoing_mut()
+    }
+
+    pub(crate) fn incoming_session(&self) -> Option<&super::dnd_incoming::IncomingDndSession> {
+        self.active.as_ref()?.incoming()
+    }
+
+    pub(crate) fn incoming_session_mut(
+        &mut self,
+    ) -> Option<&mut super::dnd_incoming::IncomingDndSession> {
+        self.active.as_mut()?.incoming_mut()
+    }
+
+    pub(crate) fn install_incoming_session(
+        &mut self,
+        session: super::dnd_incoming::IncomingDndSession,
+    ) -> bool {
+        if matches!(
+            self.active.as_ref(),
+            Some(DndAdapterSession::WaylandToX11(_))
+        ) {
+            return false;
+        }
+        self.active = Some(DndAdapterSession::X11ToWayland(session));
+        self.feedback.clear();
+        true
+    }
+
+    pub(crate) fn retire_incoming_session(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+    ) -> bool {
+        if self
+            .incoming_session()
+            .is_some_and(|session| session.offer_id == offer_id)
+        {
+            self.active = None;
+            true
+        } else {
+            false
+        }
+    }
     pub(super) fn push_status_feedback(&mut self, feedback: DndStatusFeedback) {
-        if !self.active.as_ref().is_some_and(|session| {
+        if !self.outgoing_session().is_some_and(|session| {
             session.id == feedback.id
                 && (session.target == Some(feedback.target)
                     || session.discovery_target == Some(feedback.target))
@@ -271,7 +357,11 @@ impl DndManager {
             .feedback
             .iter()
             .any(|entry| matches!(entry, DndFeedback::Terminal(_)))
-            || self.active.as_ref().is_some_and(|session| {
+            || matches!(
+                self.active.as_ref(),
+                Some(DndAdapterSession::X11ToWayland(_))
+            )
+            || self.outgoing_session().is_some_and(|session| {
                 session.id == id
                     || matches!(
                         session.progress,
@@ -295,7 +385,7 @@ impl DndManager {
         if !source_matches {
             return false;
         }
-        self.active = Some(DndSession {
+        self.active = Some(DndAdapterSession::WaylandToX11(DndSession {
             id,
             source,
             source_proxy: None,
@@ -327,7 +417,7 @@ impl DndManager {
             ownership_deadline_ns: None,
             discovery_deadline_ns: None,
             discovery_serial: 0,
-        });
+        }));
         self.feedback.clear();
         true
     }
@@ -341,13 +431,16 @@ impl DndManager {
         if !matches!(id.session_id(), CanonicalDndSessionId::Wayland(_)) {
             return false;
         }
-        if self.active.as_ref().is_some_and(|session| session.id == id) {
+        if self
+            .outgoing_session()
+            .is_some_and(|session| session.id == id)
+        {
             return true;
         }
         if !self.install_canonical_session(id, None) {
             return false;
         }
-        if let Some(session) = self.active.as_mut() {
+        if let Some(session) = self.outgoing_session_mut() {
             session.mime_types = mime_types;
             session.source_actions = super::dnd_wire::wayland_actions(&source_actions)
                 .into_iter()
@@ -373,7 +466,7 @@ impl DndManager {
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        let session_deadline = self.active.as_ref().and_then(|session| {
+        let session_deadline = self.outgoing_session().and_then(|session| {
             [
                 session.timestamp_deadline_ns,
                 session.ownership_deadline_ns,
@@ -401,7 +494,10 @@ impl DndManager {
     }
 
     pub fn bind_source_proxy(&mut self, id: XwaylandDndAdapterId, window: u32) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if !matches!(id.session_id(), CanonicalDndSessionId::Wayland(_))
@@ -420,7 +516,10 @@ impl DndManager {
         window: u32,
         timestamp: u32,
     ) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if session.source_proxy != Some(window) || timestamp == 0 || session.ownership_confirmed {
@@ -438,7 +537,10 @@ impl DndManager {
         recipient: u32,
         version: XwaylandDndVersion,
     ) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if actual.generation() != id.generation()
@@ -456,7 +558,10 @@ impl DndManager {
     }
 
     pub fn mark_entered(&mut self, id: XwaylandDndAdapterId) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if session.progress != DndWireProgress::AwaitingEnter {
@@ -474,7 +579,10 @@ impl DndManager {
         y: i32,
         action: Option<XwaylandDndAction>,
     ) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if target.generation() != id.generation()
@@ -509,7 +617,10 @@ impl DndManager {
         target: X11WindowHandle,
         position: CoalescedPosition,
     ) -> PositionDisposition {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return PositionDisposition::Stale;
         };
         if session.target != Some(target) {
@@ -543,7 +654,10 @@ impl DndManager {
         id: XwaylandDndAdapterId,
         position: CoalescedPosition,
     ) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if session.progress != DndWireProgress::Positioned || session.outstanding_position.is_some()
@@ -565,7 +679,7 @@ impl DndManager {
         recipient: u32,
         status: DndStatusResult,
     ) -> Option<StatusAcknowledgement> {
-        let session = self.active.as_mut().filter(|session| {
+        let session = self.outgoing_session_mut().filter(|session| {
             session.id == id
                 && session.source_proxy == Some(source_proxy)
                 && session.target == Some(actual_target)
@@ -608,8 +722,7 @@ impl DndManager {
     /// active for a later target enter.
     pub fn leave_target(&mut self, id: XwaylandDndAdapterId, target: X11WindowHandle) -> bool {
         let Some(session) = self
-            .active
-            .as_mut()
+            .outgoing_session_mut()
             .filter(|session| session.id == id && session.target == Some(target))
         else {
             return false;
@@ -643,7 +756,10 @@ impl DndManager {
     }
 
     pub fn status_timed_out(&mut self, id: XwaylandDndAdapterId, now_ns: u64) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if !matches!(
@@ -662,7 +778,7 @@ impl DndManager {
     }
 
     pub fn set_status_deadline(&mut self, id: XwaylandDndAdapterId, deadline_ns: u64) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| {
+        let Some(session) = self.outgoing_session_mut().filter(|session| {
             session.id == id
                 && matches!(
                     session.progress,
@@ -681,7 +797,10 @@ impl DndManager {
         target: X11WindowHandle,
         action: XwaylandDndAction,
     ) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         let awaiting_status = session.progress == DndWireProgress::AwaitingStatus;
@@ -716,7 +835,10 @@ impl DndManager {
         accepted_action: XwaylandDndAction,
         deadline_ns: u64,
     ) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if session.progress != DndWireProgress::DropPending {
@@ -731,7 +853,10 @@ impl DndManager {
     /// Consume one exact wire terminal edge without completing canonical drag
     /// state. Runtime submits the result back to the compositor for authority.
     pub fn consume_terminal_result(&mut self, id: XwaylandDndAdapterId) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if !matches!(
@@ -755,7 +880,10 @@ impl DndManager {
     /// current wire hover. This is a fail-closed adapter result, not canonical
     /// completion; the compositor still validates the feedback identity.
     pub fn consume_drop_rejection(&mut self, id: XwaylandDndAdapterId) -> bool {
-        let Some(session) = self.active.as_mut().filter(|session| session.id == id) else {
+        let Some(session) = self
+            .outgoing_session_mut()
+            .filter(|session| session.id == id)
+        else {
             return false;
         };
         if session.progress == DndWireProgress::TerminalConsumed {
@@ -772,8 +900,7 @@ impl DndManager {
 
     pub fn mark_source_proxy_destroyed(&mut self, id: XwaylandDndAdapterId, window: u32) -> bool {
         let Some(session) = self
-            .active
-            .as_mut()
+            .outgoing_session_mut()
             .filter(|session| session.id == id && session.source_proxy == Some(window))
         else {
             return false;
@@ -783,7 +910,7 @@ impl DndManager {
     }
 
     pub fn awaiting_status(&self, id: XwaylandDndAdapterId) -> bool {
-        self.active.as_ref().is_some_and(|session| {
+        self.outgoing_session().is_some_and(|session| {
             session.id == id
                 && matches!(
                     session.progress,
@@ -793,7 +920,10 @@ impl DndManager {
     }
 
     pub fn retire(&mut self, id: XwaylandDndAdapterId) -> bool {
-        if self.active.as_ref().is_some_and(|session| session.id == id) {
+        if self
+            .outgoing_session()
+            .is_some_and(|session| session.id == id)
+        {
             self.active = None;
             true
         } else {
@@ -802,39 +932,40 @@ impl DndManager {
     }
 
     pub fn active_id(&self) -> Option<XwaylandDndAdapterId> {
-        self.active.as_ref().map(|session| session.id)
+        self.outgoing_session().map(|session| session.id)
     }
 
     pub fn active_session(&self) -> Option<&DndSession> {
-        self.active.as_ref()
+        self.outgoing_session()
     }
 
     pub fn is_internal_window(&self, window: u32) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|session| session.source_proxy == Some(window))
+        self.internal_windows.contains(&window)
+            || self
+                .outgoing_session()
+                .is_some_and(|session| session.source_proxy == Some(window))
     }
 
     pub fn progress(&self, id: XwaylandDndAdapterId) -> Option<DndWireProgress> {
-        self.active
-            .as_ref()
+        self.outgoing_session()
             .filter(|session| session.id == id)
             .map(|session| session.progress)
     }
 
     pub fn terminal_event_consumed(&self, id: XwaylandDndAdapterId) -> bool {
-        self.active
-            .as_ref()
+        self.outgoing_session()
             .filter(|session| session.id == id)
             .is_some_and(|session| session.progress == DndWireProgress::TerminalConsumed)
     }
 
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|session| session.id.generation() == generation)
-        {
+        let outgoing_matches = self
+            .outgoing_session()
+            .is_some_and(|session| session.id.generation() == generation);
+        let incoming_matches = self
+            .incoming_session()
+            .is_some_and(|session| session.generation == generation);
+        if outgoing_matches || incoming_matches {
             self.active = None;
         }
         self.pending_replies.retain(|_, reply| match reply {
@@ -854,10 +985,59 @@ impl DndManager {
 }
 
 pub(crate) use super::dnd_adapter::{
-    apply_transitions, client_message, destroy_notify, handle_deadline, is_internal_window,
-    poll_replies, property_notify, retire_generation, selection_clear, take_feedback,
+    apply_transitions, destroy_notify as outgoing_destroy_notify,
+    handle_deadline as outgoing_handle_deadline, is_internal_window as outgoing_is_internal_window,
+    poll_replies, property_notify as outgoing_property_notify, retire_generation, selection_clear,
+    take_feedback,
 };
 pub(crate) use super::dnd_selection::selection_request;
+
+pub(crate) fn client_message(
+    xwm: &mut super::super::Xwm,
+    event: x11rb::protocol::xproto::ClientMessageEvent,
+    now_ns: u64,
+) -> Result<bool, super::super::XwmError> {
+    if super::dnd_incoming::client_message(xwm, event, now_ns)? {
+        return Ok(true);
+    }
+    super::dnd_adapter::client_message(xwm, event, now_ns)
+}
+
+pub(crate) fn destroy_notify(
+    xwm: &mut super::super::Xwm,
+    window: u32,
+) -> Result<bool, super::super::XwmError> {
+    if super::dnd_incoming::source_destroyed(xwm, window)? {
+        return Ok(true);
+    }
+    if super::dnd_incoming::requestor_destroyed(xwm, window) {
+        return Ok(true);
+    }
+    outgoing_destroy_notify(xwm, window)
+}
+
+pub(crate) fn is_internal_window(xwm: &super::super::Xwm, window: u32) -> bool {
+    outgoing_is_internal_window(xwm, window) || xwm.data_bridge.dnd_incoming.owns_requestor(window)
+}
+
+pub(crate) fn property_notify(
+    xwm: &mut super::super::Xwm,
+    event: x11rb::protocol::xproto::PropertyNotifyEvent,
+    now_ns: u64,
+) -> Result<bool, super::super::XwmError> {
+    if super::dnd_incoming::property_notify(xwm, event, now_ns)? {
+        return Ok(true);
+    }
+    outgoing_property_notify(xwm, event, now_ns)
+}
+
+pub(crate) fn handle_deadline(
+    xwm: &mut super::super::Xwm,
+    now_ns: u64,
+) -> Result<(), super::super::XwmError> {
+    super::dnd_incoming::expire_deadlines(xwm, now_ns)?;
+    outgoing_handle_deadline(xwm, now_ns)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +1086,64 @@ mod tests {
         assert!(manager.mark_entered(id));
         assert!(manager.position(id, target, 1, 2, Some(XwaylandDndAction::Copy)));
         (manager, id, target)
+    }
+
+    fn incoming_session_for_test(
+        generation: XwaylandGeneration,
+        serial: u64,
+    ) -> super::super::dnd_incoming::IncomingDndSession {
+        super::super::dnd_incoming::IncomingDndSession {
+            generation,
+            offer_id: crate::xwayland::XwaylandDndOfferId::new(
+                generation,
+                NonZeroU64::new(serial).unwrap(),
+            ),
+            source: X11WindowHandle::new(generation, 0x991),
+            logical_target_root: 1,
+            target_proxy: 2,
+            version: XwaylandDndVersion::new(5).unwrap(),
+            inline_mime_atoms: Vec::new(),
+            mime_atoms: Vec::new(),
+            more_types: false,
+            type_list_complete: true,
+            pending_atom_names: 0,
+            metadata_complete: false,
+            mime_types: Vec::new(),
+            atom_to_mime: Default::default(),
+            source_actions: Vec::new(),
+            available_actions: Vec::new(),
+            action_list_required: false,
+            action_list_queried: false,
+            action_list_complete: true,
+            latest_position: None,
+            canonical_started: false,
+            pending_status_deadline_ns: None,
+            status_pending: false,
+            accepted_mime: None,
+            selected_action: None,
+            metadata_deadline_ns: 0,
+        }
+    }
+
+    #[test]
+    fn outgoing_and_incoming_adapters_cannot_coexist() {
+        let (mut outgoing, _, _) = new_manager();
+        let generation = XwaylandGeneration::new(NonZeroU64::new(72).unwrap());
+        assert!(!outgoing.install_incoming_session(incoming_session_for_test(generation, 1)));
+        assert!(outgoing.outgoing_session().is_some());
+        assert!(outgoing.incoming_session().is_none());
+
+        let mut incoming = DndManager::default();
+        assert!(incoming.install_incoming_session(incoming_session_for_test(generation, 2)));
+        let catalog = XwaylandDndMimeCatalog::try_new(vec!["text/plain".to_owned()]).unwrap();
+        let adapter = XwaylandDndAdapterId::new(
+            CanonicalDndSessionId::Wayland(NonZeroU64::new(9010).unwrap()),
+            generation,
+        )
+        .unwrap();
+        assert!(!incoming.install_wayland_session(adapter, catalog, vec![XwaylandDndAction::Copy]));
+        assert!(incoming.incoming_session().is_some());
+        assert!(incoming.outgoing_session().is_none());
     }
 
     #[test]
@@ -1002,7 +1240,7 @@ mod tests {
     #[test]
     fn target_left_before_enter_clears_discovered_target_for_reentry() {
         let (mut manager, id, target_a) = new_manager();
-        let session = manager.active.as_mut().unwrap();
+        let session = manager.outgoing_session_mut().unwrap();
         session.progress = DndWireProgress::AwaitingEnter;
         session.target = None;
         assert!(manager.set_discovered_target(

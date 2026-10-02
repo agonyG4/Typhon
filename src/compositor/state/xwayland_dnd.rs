@@ -129,6 +129,100 @@ impl CompositorState {
         true
     }
 
+    /// Replace the representable source action set for one exact incoming
+    /// XWayland offer without replacing the canonical drag or its Wayland
+    /// offer resource.
+    pub(in crate::compositor) fn update_xwayland_drag_source_actions(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        source_actions: Vec<crate::xwayland::XwaylandDndAction>,
+    ) -> bool {
+        let Some(active) = self.active_drag.as_mut() else {
+            return false;
+        };
+        if active.id != CanonicalDndSessionId::Xwayland(offer_id)
+            || active.lifecycle_driver != DragLifecycleDriver::Xwayland
+            || active.phase != DragSessionPhase::Dragging
+            || self
+                .xwayland
+                .client_identity
+                .as_ref()
+                .is_none_or(|identity| identity.generation != offer_id.generation())
+        {
+            return false;
+        }
+        let ActiveDragOrigin::Xwayland {
+            offer: source_offer,
+        } = &mut active.origin
+        else {
+            return false;
+        };
+        if source_offer.id() != offer_id
+            || source_offer.replace_source_actions(source_actions).is_err()
+        {
+            return false;
+        }
+        let source_actions_mask = source_offer.wayland_source_actions_mask();
+        let wayland_offer = active
+            .target
+            .as_ref()
+            .and_then(ActiveDragTarget::wayland_offer)
+            .cloned();
+        if let Some(offer) = wayland_offer.as_ref()
+            && let Some(binding) = self.data_offers.get_mut(&offer.id())
+        {
+            binding.source_actions = source_actions_mask;
+            let selected = binding
+                .destination_actions
+                .map_or(0, |destination_actions| {
+                    select_dnd_action(
+                        source_actions_mask,
+                        destination_actions,
+                        binding.preferred_action,
+                    )
+                });
+            binding.selected_action = (selected != 0).then_some(selected);
+            active.selected_action = selected;
+        }
+        if let Some(offer) = wayland_offer
+            && offer.version() >= 3
+        {
+            let _ = offer.send_event(
+                wayland_server::protocol::wl_data_offer::Event::SourceActions {
+                    source_actions: WEnum::Unknown(source_actions_mask),
+                },
+            );
+        }
+        self.send_drag_action_if_changed();
+        true
+    }
+
+    pub(in crate::compositor) fn update_incoming_xwayland_drag_position(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        if !self.active_drag.as_ref().is_some_and(|active| {
+            active.id == CanonicalDndSessionId::Xwayland(offer_id)
+                && active.lifecycle_driver == DragLifecycleDriver::Xwayland
+                && active.phase == DragSessionPhase::Dragging
+                && active
+                    .origin
+                    .xwayland_offer()
+                    .is_some_and(|offer| offer.id() == offer_id)
+                && self
+                    .xwayland
+                    .client_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.generation == offer_id.generation())
+        }) {
+            return false;
+        }
+        self.update_incoming_xwayland_drag_target_at(offer_id, x, y);
+        true
+    }
+
     pub(in crate::compositor) fn update_xwayland_drag_target_status(
         &mut self,
         session_id: CanonicalDndSessionId,
@@ -221,10 +315,10 @@ impl CompositorState {
             return false;
         };
         if active.lifecycle_driver != DragLifecycleDriver::Xwayland
-            || !active
+            || active
                 .origin
                 .xwayland_offer()
-                .is_some_and(|offer| offer.id() == offer_id)
+                .is_none_or(|offer| offer.id() != offer_id)
             || self
                 .xwayland
                 .client_identity
@@ -444,10 +538,10 @@ impl CompositorState {
             return false;
         };
         if active.lifecycle_driver != DragLifecycleDriver::Xwayland
-            || !active
+            || active
                 .origin
                 .xwayland_offer()
-                .is_some_and(|offer| offer.id() == offer_id)
+                .is_none_or(|offer| offer.id() != offer_id)
             || self
                 .xwayland
                 .client_identity
@@ -516,10 +610,10 @@ impl CompositorState {
         let Some(active) = self.active_drag.as_ref() else {
             return;
         };
-        if !active
+        if active
             .origin
             .xwayland_offer()
-            .is_some_and(|offer| offer.id() == offer_id)
+            .is_none_or(|offer| offer.id() != offer_id)
             || !matches!(
                 active.phase,
                 DragSessionPhase::DroppedAwaitingFinish

@@ -77,6 +77,45 @@ impl OwnCompositorServer {
         self.state.begin_xwayland_drag_session(offer)
     }
 
+    pub fn apply_xwayland_dnd_incoming_event(
+        &mut self,
+        event: crate::xwayland::XwaylandDndIncomingEvent,
+    ) -> bool {
+        match event {
+            crate::xwayland::XwaylandDndIncomingEvent::Begin {
+                offer,
+                x,
+                y,
+                requested_action: _,
+                x_timestamp: _,
+            } => {
+                let offer_id = offer.id();
+                if !self.state.begin_xwayland_drag_session(offer) {
+                    return false;
+                }
+                self.state
+                    .update_incoming_xwayland_drag_position(offer_id, x, y)
+            }
+            crate::xwayland::XwaylandDndIncomingEvent::Position {
+                offer_id,
+                x,
+                y,
+                requested_action: _,
+                source_actions,
+                x_timestamp: _,
+            } => {
+                self.state
+                    .update_xwayland_drag_source_actions(offer_id, source_actions)
+                    && self
+                        .state
+                        .update_incoming_xwayland_drag_position(offer_id, x, y)
+            }
+            crate::xwayland::XwaylandDndIncomingEvent::Leave { offer_id } => {
+                self.state.cancel_xwayland_drag(offer_id)
+            }
+        }
+    }
+
     /// Apply a terminal event only to the exact current XWayland-origin drag.
     pub fn drop_xwayland_dnd(&mut self, offer_id: crate::xwayland::XwaylandDndOfferId) -> bool {
         self.state.drop_xwayland_drag(offer_id)

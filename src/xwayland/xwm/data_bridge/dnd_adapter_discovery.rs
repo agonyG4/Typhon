@@ -37,7 +37,7 @@ pub(super) fn create_source_proxy(
         let _ = xwm.connection.destroy_window(window);
         return Ok(());
     }
-    if let Some(session) = xwm.data_bridge.dnd.active.as_mut() {
+    if let Some(session) = xwm.data_bridge.dnd.outgoing_session_mut() {
         session.timestamp_deadline_ns = Some(now_ns.saturating_add(SOURCE_TIMESTAMP_TIMEOUT_NS));
     }
     let property_cookie = xwm
@@ -103,7 +103,7 @@ pub(super) fn start_target_discovery(
     }) {
         return Ok(());
     }
-    if let Some(session) = xwm.data_bridge.dnd.active.as_ref()
+    if let Some(session) = xwm.data_bridge.dnd.outgoing_session()
         && session.target == Some(actual)
         && session.progress == DndWireProgress::Positioned
     {
@@ -130,8 +130,7 @@ pub(super) fn start_target_discovery(
     let Some(session) = xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
+        .outgoing_session_mut()
         .filter(|session| session.id == id)
     else {
         return Ok(());
@@ -391,8 +390,7 @@ pub(super) fn publish_source_metadata_and_claim(
         if let Some(session) = xwm
             .data_bridge
             .dnd
-            .active
-            .as_mut()
+            .outgoing_session_mut()
             .filter(|session| session.id == id && session.source_proxy == Some(source_proxy))
         {
             session.ownership_claim_issued = true;

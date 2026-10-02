@@ -27,11 +27,16 @@ pub use association::{
 };
 pub use config::{XwaylandConfig, XwaylandMode, XwaylandProfile, XwaylandStartPolicy};
 pub use dnd_metadata::{
-    CanonicalDndSessionId, MAX_PENDING_XWAYLAND_DND_TRANSITIONS, WaylandDndAction,
-    XwaylandDndAction, XwaylandDndAdapterId, XwaylandDndDataRequest, XwaylandDndFeedback,
-    XwaylandDndMetadataError, XwaylandDndMimeCatalog, XwaylandDndOffer, XwaylandDndOfferId,
-    XwaylandDndOutbox, XwaylandDndSourceDataRequest, XwaylandDndSourceProxyId,
-    XwaylandDndSourceTransferId, XwaylandDndTransition, XwaylandDndVersion,
+    CanonicalDndSessionId, MAX_PENDING_XWAYLAND_DND_INCOMING_EVENTS,
+    MAX_PENDING_XWAYLAND_DND_TRANSITIONS, MAX_XWAYLAND_DND_ACTIONS,
+    MAX_XWAYLAND_DND_INCOMING_CHUNK_BYTES, MAX_XWAYLAND_DND_INCOMING_TRANSFERS,
+    MAX_XWAYLAND_DND_MIME_TYPE_BYTES, MAX_XWAYLAND_DND_MIME_TYPES, WaylandDndAction,
+    XWAYLAND_DND_INCOMING_IDLE_TIMEOUT_NS, XwaylandDndAction, XwaylandDndAdapterId,
+    XwaylandDndDataRequest, XwaylandDndFeedback, XwaylandDndIncomingEvent,
+    XwaylandDndIncomingTransferId, XwaylandDndMetadataError, XwaylandDndMimeCatalog,
+    XwaylandDndOffer, XwaylandDndOfferId, XwaylandDndOutbox, XwaylandDndSourceDataRequest,
+    XwaylandDndSourceProxyId, XwaylandDndSourceTransferId, XwaylandDndTransition,
+    XwaylandDndVersion, negotiate_incoming_root_version, unpack_root_coordinates,
 };
 pub use generation::XwaylandGeneration;
 pub use readiness::XwaylandReadinessSnapshot;

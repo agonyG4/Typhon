@@ -136,7 +136,11 @@ fn active_fixture(
     let mime_atoms = (0..mime_types.len())
         .map(|index| Some(99 + index as u32))
         .collect();
-    xwm.data_bridge.dnd.active.as_mut().unwrap().mime_atoms = mime_atoms;
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .mime_atoms = mime_atoms;
     assert!(xwm.data_bridge.dnd.set_discovered_target(
         id,
         target,
@@ -163,8 +167,7 @@ fn mark_drop_awaiting_finished(
     let session = xwm
         .data_bridge
         .dnd
-        .active
-        .as_mut()
+        .outgoing_session_mut()
         .filter(|session| session.id == id)
         .expect("exact active XDND session");
     session.last_status = Some(DndStatusResult {
@@ -266,7 +269,11 @@ fn offered_mime_request_after_drop_queues_one_exact_source_read() {
             .dnd
             .confirm_source_ownership(id, source_proxy, 1234)
     );
-    xwm.data_bridge.dnd.active.as_mut().unwrap().mime_atoms[0] = Some(99);
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .mime_atoms[0] = Some(99);
     assert!(xwm.data_bridge.dnd.set_discovered_target(
         id,
         target,
@@ -393,7 +400,11 @@ fn pending_source_read_started_before_drop_completes_after_drop() {
         "the asynchronous source read owns exact transfer state before Drop"
     );
 
-    xwm.data_bridge.dnd.active.as_mut().unwrap().last_status = Some(DndStatusResult {
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .last_status = Some(DndStatusResult {
         accepted: true,
         action: Some(XwaylandDndAction::Copy),
         requested_action: Some(XwaylandDndAction::Copy),
@@ -504,7 +515,11 @@ fn targets_and_timestamp_requests_return_the_exact_current_catalog_and_owner_tim
             .dnd
             .confirm_source_ownership(id, source_proxy, 1234)
     );
-    xwm.data_bridge.dnd.active.as_mut().unwrap().mime_atoms = vec![Some(99), Some(100)];
+    xwm.data_bridge
+        .dnd
+        .outgoing_session_mut()
+        .unwrap()
+        .mime_atoms = vec![Some(99), Some(100)];
     assert!(xwm.data_bridge.dnd.set_discovered_target(
         id,
         target,

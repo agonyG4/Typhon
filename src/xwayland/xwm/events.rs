@@ -491,7 +491,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::PropertyNotify(event) => normalize_property_change(xwm, event)?,
         Event::SelectionNotify(event) => {
             let now_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
-            if !super::selection_payload::selection_notify(xwm, event, now_ns)? {
+            if !super::data_bridge::dnd_incoming::selection_notify(xwm, event, now_ns)?
+                && !super::selection_payload::selection_notify(xwm, event, now_ns)?
+            {
                 super::selection_wire::selection_notify(xwm, event)?;
             }
         }

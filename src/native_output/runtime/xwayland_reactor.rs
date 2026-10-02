@@ -57,6 +57,7 @@ pub(crate) fn sync_xwayland_reactor_sources_with_generation(
             XwaylandReactorPurpose::SelectionSink(_) => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::SelectionSource(_) => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::DndSource(_) => NativeEventSource::XwaylandXwm,
+            XwaylandReactorPurpose::DndSink(_) => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
         };
         let events = if matches!(
@@ -64,10 +65,11 @@ pub(crate) fn sync_xwayland_reactor_sources_with_generation(
             XwaylandReactorPurpose::SelectionSink(_)
                 | XwaylandReactorPurpose::SelectionSource(_)
                 | XwaylandReactorPurpose::DndSource(_)
+                | XwaylandReactorPurpose::DndSink(_)
         ) {
             let direction = if matches!(
                 registration.purpose,
-                XwaylandReactorPurpose::SelectionSink(_)
+                XwaylandReactorPurpose::SelectionSink(_) | XwaylandReactorPurpose::DndSink(_)
             ) {
                 libc::EPOLLOUT
             } else {
