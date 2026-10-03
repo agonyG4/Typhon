@@ -1,10 +1,12 @@
 use super::{
-    ContentEpochId, DirectContentDisposition, DirectPlaneValidationKey, DirectScanoutCandidateKey,
+    ContentEpochId, DirectContentDisposition, DirectPlaneValidationKey,
+    DirectPresentationStateDisposition, DirectScanoutCandidateKey,
     DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability, OutputContentKey,
-    OutputReleasePlan, OutputTransaction, OutputTransactionError, OutputTransactionFailureStage,
-    OutputTransactionId, OutputTransactionLedger, OutputTransactionState,
-    OutputTransactionTerminal, PrimaryPlaneAssignment, classify_direct_content,
-    feedback_capabilities_changed,
+    OutputPresentationStateKey, OutputReleasePlan, OutputTransaction, OutputTransactionError,
+    OutputTransactionFailureStage, OutputTransactionId, OutputTransactionLedger,
+    OutputTransactionState, OutputTransactionTerminal, PrimaryPlaneAssignment,
+    classify_direct_content, classify_direct_presentation_state, feedback_capabilities_changed,
+    first_qualified_direct_presentation_state,
 };
 use oblivion_one::compositor::{CompositorFrameBatchId, DrmContentType, OutputPresentationMode};
 use oblivion_one::native::kms::PageFlipToken;
@@ -67,6 +69,18 @@ fn test_frame_batch_id(value: u64) -> CompositorFrameBatchId {
     CompositorFrameBatchId::new(NonZeroU64::new(value).expect("frame batch id"))
 }
 
+fn physical_state(
+    mode: OutputPresentationMode,
+    content_type: DrmContentType,
+    output_generation: u64,
+) -> OutputPresentationStateKey {
+    OutputPresentationStateKey {
+        mode,
+        content_type,
+        output_generation,
+    }
+}
+
 #[test]
 fn direct_transaction_uses_client_primary_assignment() {
     let key = test_direct_key(3);
@@ -126,6 +140,280 @@ fn same_buffer_and_same_content_epoch_does_not_submit() {
     assert_eq!(
         classify_direct_content(candidate, Some(candidate), None),
         DirectContentDisposition::MatchesPresented
+    );
+}
+
+#[test]
+fn same_direct_visual_assignment_requires_each_physical_state_transition() {
+    let candidate = test_direct_key(3);
+    assert_eq!(
+        classify_direct_content(candidate, Some(candidate), None),
+        DirectContentDisposition::MatchesPresented,
+        "physical presentation state is not part of visual identity",
+    );
+
+    for (confirmed, desired) in [
+        (
+            physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1),
+            physical_state(
+                OutputPresentationMode::AdaptiveSync,
+                DrmContentType::Graphics,
+                1,
+            ),
+        ),
+        (
+            physical_state(
+                OutputPresentationMode::AdaptiveSync,
+                DrmContentType::Graphics,
+                1,
+            ),
+            physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1),
+        ),
+        (
+            physical_state(
+                OutputPresentationMode::AdaptiveSync,
+                DrmContentType::Graphics,
+                1,
+            ),
+            physical_state(
+                OutputPresentationMode::AdaptiveAsync,
+                DrmContentType::Graphics,
+                1,
+            ),
+        ),
+        (
+            physical_state(
+                OutputPresentationMode::AdaptiveAsync,
+                DrmContentType::Graphics,
+                1,
+            ),
+            physical_state(
+                OutputPresentationMode::AdaptiveSync,
+                DrmContentType::Graphics,
+                1,
+            ),
+        ),
+        (
+            physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1),
+            physical_state(OutputPresentationMode::Vsync, DrmContentType::Game, 1),
+        ),
+    ] {
+        assert_eq!(
+            classify_direct_presentation_state(desired, confirmed, None),
+            DirectPresentationStateDisposition::TransitionRequired,
+            "{confirmed:?} -> {desired:?} must reach KMS",
+        );
+    }
+}
+
+#[test]
+fn same_direct_visual_assignment_is_suppressed_only_for_matching_physical_state() {
+    let candidate = test_direct_key(3);
+    let state = physical_state(
+        OutputPresentationMode::AdaptiveSync,
+        DrmContentType::Game,
+        1,
+    );
+
+    assert_eq!(
+        classify_direct_content(candidate, Some(candidate), None),
+        DirectContentDisposition::MatchesPresented
+    );
+    assert_eq!(
+        classify_direct_presentation_state(state, state, None),
+        DirectPresentationStateDisposition::AlreadyRepresented
+    );
+}
+
+#[test]
+fn pending_direct_state_change_waits_for_pageflip_without_claiming_no_visual_change() {
+    let candidate = test_direct_key(3);
+    let confirmed = physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1);
+    let submitted = physical_state(
+        OutputPresentationMode::AdaptiveSync,
+        DrmContentType::Graphics,
+        1,
+    );
+    let desired = physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1);
+
+    assert_eq!(
+        classify_direct_content(candidate, None, Some(candidate)),
+        DirectContentDisposition::MatchesQueuedOrSubmitted
+    );
+    assert_eq!(
+        classify_direct_presentation_state(desired, confirmed, Some(submitted)),
+        DirectPresentationStateDisposition::DeferUntilPageflip
+    );
+    assert_eq!(
+        classify_direct_presentation_state(submitted, confirmed, Some(submitted)),
+        DirectPresentationStateDisposition::AlreadyRepresented
+    );
+    assert_eq!(
+        classify_direct_presentation_state(desired, submitted, None),
+        DirectPresentationStateDisposition::TransitionRequired,
+        "after pageflip confirms the submitted state, retry the still-desired state change",
+    );
+}
+
+#[test]
+fn queued_and_submitted_direct_state_changes_defer_without_mutating_owned_transaction() {
+    let key = test_direct_key(3);
+    let id = test_transaction_id(45);
+    let token = PageFlipToken::new(46).expect("pageflip token");
+    let adaptive = physical_state(
+        OutputPresentationMode::AdaptiveSync,
+        DrmContentType::Graphics,
+        1,
+    );
+    let vsync = physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1);
+    let transaction = OutputTransaction::direct(
+        key.output_id,
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        21,
+        key,
+        92,
+        None,
+        test_frame_batch_id(11),
+        7,
+        OutputReleasePlan::Pageflip,
+    )
+    .expect("Direct transaction")
+    .with_presentation_state(adaptive.mode, adaptive.content_type)
+    .expect("Adaptive Direct transaction");
+    let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
+    ledger
+        .insert(transaction)
+        .expect("insert Direct transaction");
+    ledger
+        .mark_ready(id, MonotonicTimestampNs::new(11))
+        .expect("ready Direct transaction");
+    ledger
+        .mark_queued(id, 1, MonotonicTimestampNs::new(12))
+        .expect("queue Direct transaction");
+
+    assert!(ledger.has_queued_direct_candidate(key));
+    assert_eq!(ledger.pending_direct_presentation_state(key), None);
+
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(13))
+        .expect("KMS owns Direct transaction");
+    assert_eq!(
+        ledger.pending_direct_presentation_state(key),
+        Some(adaptive)
+    );
+    assert_eq!(
+        classify_direct_presentation_state(vsync, vsync, Some(adaptive)),
+        DirectPresentationStateDisposition::DeferUntilPageflip,
+    );
+    assert_eq!(
+        ledger
+            .transaction(id)
+            .expect("submitted Direct transaction remains active")
+            .descriptor()
+            .presentation_state_key(),
+        adaptive,
+    );
+    assert_eq!(
+        ledger.replace_presentation_state_before_submit(
+            id,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+            None,
+        ),
+        Err(OutputTransactionError::PresentationStateAlreadyOwned),
+    );
+
+    ledger
+        .mark_presented(id, token, 1, MonotonicTimestampNs::new(14), Some(2))
+        .expect("matching pageflip confirms the submitted state");
+    assert_eq!(
+        classify_direct_presentation_state(vsync, adaptive, None),
+        DirectPresentationStateDisposition::TransitionRequired,
+        "retry after confirmation must submit the still-desired Vsync state",
+    );
+}
+
+#[test]
+fn output_generation_invalidates_matching_physical_presentation_state() {
+    let confirmed = physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 1);
+    let desired = physical_state(OutputPresentationMode::Vsync, DrmContentType::Graphics, 2);
+
+    assert_eq!(
+        classify_direct_presentation_state(desired, confirmed, None),
+        DirectPresentationStateDisposition::TransitionRequired
+    );
+}
+
+#[test]
+fn direct_adaptive_test_only_fallback_keeps_same_buffer_and_requires_vsync_commit() {
+    let key = test_direct_key(3);
+    let confirmed = physical_state(
+        OutputPresentationMode::AdaptiveSync,
+        DrmContentType::Graphics,
+        1,
+    );
+    let mut tested = Vec::new();
+    let (qualified_state, disposition) = first_qualified_direct_presentation_state(
+        OutputPresentationMode::AdaptiveSync,
+        DrmContentType::Graphics,
+        1,
+        confirmed,
+        |mode| {
+            tested.push(mode);
+            mode == OutputPresentationMode::Vsync
+        },
+    )
+    .expect("the exact Vsync TEST_ONLY candidate is accepted");
+
+    assert_eq!(
+        tested,
+        [
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::Vsync
+        ]
+    );
+    assert_eq!(
+        classify_direct_content(key, Some(key), None),
+        DirectContentDisposition::MatchesPresented
+    );
+    assert_eq!(qualified_state.mode, OutputPresentationMode::Vsync);
+    assert_eq!(
+        disposition,
+        DirectPresentationStateDisposition::TransitionRequired
+    );
+
+    let transaction = OutputTransaction::direct(
+        key.output_id,
+        test_transaction_id(44),
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        21,
+        key,
+        92,
+        None,
+        test_frame_batch_id(11),
+        7,
+        OutputReleasePlan::Pageflip,
+    )
+    .expect("same Direct assignment remains valid")
+    .with_presentation_state(qualified_state.mode, qualified_state.content_type)
+    .expect("qualified Vsync state is valid");
+    assert_eq!(
+        transaction.presentation_mode(),
+        OutputPresentationMode::Vsync
+    );
+    assert_eq!(
+        transaction.planes().primary(),
+        PrimaryPlaneAssignment::ClientFramebuffer {
+            key,
+            framebuffer_id: 92,
+        }
     );
 }
 

@@ -44,7 +44,9 @@ use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
-use crate::native_output::presentation::transaction::O1PrepareIntent;
+use crate::native_output::presentation::transaction::{
+    O1PrepareIntent, OutputPresentationStateKey, kms_presentation_state_is_represented,
+};
 
 #[cfg(test)]
 mod confirmed_pageflip_tests;
@@ -93,7 +95,8 @@ pub(crate) struct AtomicEglGbmScanout {
 pub(crate) struct AtomicAsyncPolicyInputs {
     pub(crate) cursor_transition_pending: bool,
     pub(crate) kms_lane_free: bool,
-    pub(crate) confirmed_content_type: oblivion_one::compositor::DrmContentType,
+    pub(crate) confirmed_presentation_state: OutputPresentationStateKey,
+    pub(crate) pending_presentation_state: Option<OutputPresentationStateKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,16 +107,31 @@ pub(crate) enum DeferredO1BindingResult {
     Stale(DeferredO1BindingFailure),
 }
 
+fn damage_for_physical_presentation_state(
+    damage: &crate::native_output::NativeOutputDamage,
+    presentation_state_transition_required: bool,
+    output_width: u32,
+    output_height: u32,
+) -> crate::native_output::NativeOutputDamage {
+    if damage.is_empty() && presentation_state_transition_required {
+        crate::native_output::NativeOutputDamage::full_output(output_width, output_height)
+    } else {
+        damage.clone()
+    }
+}
+
 impl AtomicAsyncPolicyInputs {
     pub(crate) const fn new(
         cursor_transition_pending: bool,
         kms_lane_free: bool,
-        confirmed_content_type: oblivion_one::compositor::DrmContentType,
+        confirmed_presentation_state: OutputPresentationStateKey,
+        pending_presentation_state: Option<OutputPresentationStateKey>,
     ) -> Self {
         Self {
             cursor_transition_pending,
             kms_lane_free,
-            confirmed_content_type,
+            confirmed_presentation_state,
+            pending_presentation_state,
         }
     }
 }
@@ -398,6 +416,79 @@ impl AtomicEglGbmScanout {
             requested
         } else {
             DrmContentType::Graphics
+        }
+    }
+
+    fn effective_presentation_for_scene(
+        &self,
+        server: &OwnCompositorServer,
+        output_generation: u64,
+        pacing_mode: NativeOutputPacingMode,
+        async_policy_inputs: AtomicAsyncPolicyInputs,
+        cursor_visible: bool,
+        vrr_policy: VrrPolicy,
+    ) -> (DrmContentType, EffectivePresentation) {
+        let metadata = server
+            .fullscreen_tree_presentation_metadata()
+            .unwrap_or_default();
+        let metrics = server.fullscreen_render_plan_metrics();
+        let content_type = self.resolve_connector_content_type(metadata.content_type.drm_value());
+        let effective = EffectivePresentation::decide(
+            TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+            vrr_policy,
+            metadata,
+            AsyncEligibility {
+                solitary_fullscreen: metrics.solitary_tree_active,
+                async_hint: metadata.hint.is_async(),
+                backend_capable: self.async_page_flip_capable,
+                async_format_supported: self.async_format_capable,
+                output_generation_qualified: self.async_output_generation == output_generation,
+                explicit_sync_ready: self.swapchain.is_some(),
+                commit_timing_safe: pacing_mode == NativeOutputPacingMode::ReactiveDouble,
+                kms_lane_free: async_policy_inputs.kms_lane_free,
+                async_test_only_accepted: true,
+                modeset_required: content_type
+                    != async_policy_inputs
+                        .confirmed_presentation_state
+                        .content_type,
+                cursor_visible,
+                cursor_transition_pending: async_policy_inputs.cursor_transition_pending,
+                ..AsyncEligibility::default()
+            },
+            VrrEligibility {
+                auto_candidate: metrics.solitary_tree_active,
+                backend_capable: true,
+                connector_capable: self.vrr_connector_capable,
+                crtc_property_available: self.vrr_crtc_property_available,
+                output_generation_qualified: self.async_output_generation == output_generation,
+                exact_kms_qualified: true,
+                transition_supported: true,
+            },
+        );
+        (content_type, effective)
+    }
+
+    pub(crate) fn requested_presentation_state_key(
+        &self,
+        server: &OwnCompositorServer,
+        output_generation: u64,
+        pacing_mode: NativeOutputPacingMode,
+        async_policy_inputs: AtomicAsyncPolicyInputs,
+        cursor_visible: bool,
+        vrr_policy: VrrPolicy,
+    ) -> OutputPresentationStateKey {
+        let (content_type, effective) = self.effective_presentation_for_scene(
+            server,
+            output_generation,
+            pacing_mode,
+            async_policy_inputs,
+            cursor_visible,
+            vrr_policy,
+        );
+        OutputPresentationStateKey {
+            mode: effective.mode,
+            content_type,
+            output_generation,
         }
     }
 
@@ -912,12 +1003,6 @@ impl AtomicEglGbmScanout {
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
         vrr_policy: VrrPolicy,
     ) -> io::Result<AtomicFrameRenderOutcome> {
-        let metadata = server
-            .fullscreen_tree_presentation_metadata()
-            .unwrap_or_default();
-        let metrics = server.fullscreen_render_plan_metrics();
-        let resolved_content_type =
-            self.resolve_connector_content_type(metadata.content_type.drm_value());
         let cursor_visible = matches!(
             cursor.as_ref(),
             Some(CursorPlaneAssignment::Atomic {
@@ -929,36 +1014,15 @@ impl AtomicEglGbmScanout {
             Some(CursorPlaneAssignment::Atomic { state, .. }) => state.clone(),
             Some(CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled) | None => None,
         };
-        let effective_presentation = EffectivePresentation::decide(
-            TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
-            vrr_policy,
-            metadata,
-            AsyncEligibility {
-                solitary_fullscreen: metrics.solitary_tree_active,
-                async_hint: metadata.hint.is_async(),
-                backend_capable: self.async_page_flip_capable,
-                async_format_supported: self.async_format_capable,
-                output_generation_qualified: self.async_output_generation == output_generation,
-                explicit_sync_ready: self.swapchain.is_some(),
-                commit_timing_safe: pacing_mode == NativeOutputPacingMode::ReactiveDouble,
-                kms_lane_free: async_policy_inputs.kms_lane_free,
-                async_test_only_accepted: true,
-                modeset_required: resolved_content_type
-                    != async_policy_inputs.confirmed_content_type,
+        let (resolved_content_type, effective_presentation) = self
+            .effective_presentation_for_scene(
+                server,
+                output_generation,
+                pacing_mode,
+                async_policy_inputs,
                 cursor_visible,
-                cursor_transition_pending: async_policy_inputs.cursor_transition_pending,
-                ..AsyncEligibility::default()
-            },
-            VrrEligibility {
-                auto_candidate: metrics.solitary_tree_active,
-                backend_capable: true,
-                connector_capable: self.vrr_connector_capable,
-                crtc_property_available: self.vrr_crtc_property_available,
-                output_generation_qualified: self.async_output_generation == output_generation,
-                exact_kms_qualified: true,
-                transition_supported: true,
-            },
-        );
+                vrr_policy,
+            );
         let mut presentation_mode = effective_presentation.mode;
         let mut pacing_mode = pacing_mode;
         let mut render_ahead = render_ahead;
@@ -1018,6 +1082,22 @@ impl AtomicEglGbmScanout {
                 OutputPresentationMode::Vsync => {}
             }
         }
+        let qualified_presentation_state = OutputPresentationStateKey {
+            mode: presentation_mode,
+            content_type,
+            output_generation,
+        };
+        let presentation_state_transition_required = !kms_presentation_state_is_represented(
+            qualified_presentation_state,
+            async_policy_inputs.confirmed_presentation_state,
+            async_policy_inputs.pending_presentation_state,
+        );
+        let render_damage = damage_for_physical_presentation_state(
+            damage,
+            presentation_state_transition_required,
+            self.width,
+            self.height,
+        );
         NativePerfLogger::from_env().log("native.output_presentation_policy", || {
             vec![
                 NativePerfField::str("configured_policy", vrr_policy.as_str()),
@@ -1304,7 +1384,7 @@ impl AtomicEglGbmScanout {
                 &*server,
                 input_state,
                 cursor_mode,
-                damage,
+                &render_damage,
                 &mut gpu_sampling_started,
             );
             (
@@ -1323,6 +1403,42 @@ impl AtomicEglGbmScanout {
                 reason,
                 render_us,
             }) => {
+                if presentation_state_transition_required {
+                    if gpu_sampling_started {
+                        // A renderer skip can still follow partial GLES work.
+                        // Complete it before restoring any sampled client
+                        // buffers or recycling this compositor slot.
+                        unsafe { self.gl.finish() };
+                    }
+                    settle_failed_output_transaction(
+                        output_transactions,
+                        transaction_id,
+                        if gpu_sampling_started {
+                            OutputTransactionFailureStage::RenderExecution
+                        } else {
+                            OutputTransactionFailureStage::RenderPreparation
+                        },
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        |obligations| {
+                            restore_presentation_feedback_obligation(server, obligations);
+                            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                                io::Error::other(
+                                    "presentation-state retry transaction has no frame batch",
+                                )
+                            })?;
+                            server.set_frame_batch_surface_damage(batch_id, surface_damage);
+                            server.restore_frame_batch_after_render_failure(batch_id);
+                            if gpu_sampling_started {
+                                self.complete_unpresented_render(slot)?;
+                            } else {
+                                self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                    return Ok(AtomicFrameRenderOutcome::RetryPresentationState { render_us });
+                }
                 let release_fence = if dmabuf_gpu_release_lease_id.is_some()
                     && server.frame_batch_dmabuf_release_count(protocol_batch_id) > 0
                     && dmabuf_gpu_release_safety.permits_compositor_gpu_release()
@@ -1953,6 +2069,9 @@ pub(crate) enum AtomicFrameRenderOutcome {
             NativeRenderFence,
         )>,
     },
+    RetryPresentationState {
+        render_us: u64,
+    },
     LifecycleFallback {
         fallbacks: LifecycleRenderFallbacks,
         render_us: u64,
@@ -2094,6 +2213,74 @@ impl Drop for AtomicEglGbmScanout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_composited_damage_is_forced_for_unrepresented_kms_state() {
+        let vsync = OutputPresentationStateKey {
+            mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
+            output_generation: 7,
+        };
+        let adaptive = OutputPresentationStateKey {
+            mode: OutputPresentationMode::AdaptiveSync,
+            ..vsync
+        };
+        let transitions = [
+            (vsync, adaptive),
+            (adaptive, vsync),
+            (
+                vsync,
+                OutputPresentationStateKey {
+                    content_type: DrmContentType::Game,
+                    ..vsync
+                },
+            ),
+        ];
+
+        for (confirmed, desired) in transitions {
+            let transition_required =
+                !kms_presentation_state_is_represented(desired, confirmed, None);
+            assert!(transition_required);
+            let damage = damage_for_physical_presentation_state(
+                &crate::native_output::NativeOutputDamage::empty(),
+                transition_required,
+                1920,
+                1080,
+            );
+            assert_eq!(
+                damage.kind,
+                crate::native_output::NativeDamageKind::FullOutput
+            );
+            assert_eq!(damage.pixels, 1920 * 1080);
+        }
+    }
+
+    #[test]
+    fn empty_composited_damage_stays_suppressed_when_state_is_confirmed_or_pending() {
+        let confirmed = OutputPresentationStateKey {
+            mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
+            output_generation: 7,
+        };
+        let adaptive = OutputPresentationStateKey {
+            mode: OutputPresentationMode::AdaptiveAsync,
+            ..confirmed
+        };
+
+        for pending in [None, Some(confirmed), Some(adaptive)] {
+            let desired = pending.unwrap_or(confirmed);
+            assert!(kms_presentation_state_is_represented(
+                desired, confirmed, pending
+            ));
+            let damage = damage_for_physical_presentation_state(
+                &crate::native_output::NativeOutputDamage::empty(),
+                false,
+                1920,
+                1080,
+            );
+            assert!(damage.is_empty());
+        }
+    }
 
     #[test]
     fn direct_scanout_capability_filter_keeps_exact_opaque_rgb_pairs() {

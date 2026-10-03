@@ -489,6 +489,16 @@ pub(crate) struct ConfirmedKmsPresentationState {
 }
 
 impl ConfirmedKmsPresentationState {
+    pub(crate) const fn presentation_state_key(
+        self,
+    ) -> crate::native_output::presentation::transaction::OutputPresentationStateKey {
+        crate::native_output::presentation::transaction::OutputPresentationStateKey {
+            mode: self.mode,
+            content_type: self.content_type,
+            output_generation: self.output_generation,
+        }
+    }
+
     pub(crate) const fn vrr_request_confirmed_for(self, output_generation: u64) -> bool {
         self.output_generation == output_generation && self.mode.uses_vrr()
     }
@@ -519,6 +529,14 @@ mod confirmed_kms_presentation_tests {
                 content_type: DrmContentType::Graphics,
                 output_generation: 7,
             };
+            assert_eq!(
+                confirmed.presentation_state_key(),
+                crate::native_output::presentation::transaction::OutputPresentationStateKey {
+                    mode,
+                    content_type: DrmContentType::Graphics,
+                    output_generation: 7,
+                }
+            );
             assert!(confirmed.vrr_request_confirmed_for(7));
             assert!(!confirmed.vrr_request_confirmed_for(8));
         }

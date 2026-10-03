@@ -29,10 +29,14 @@ pub(crate) fn native_vrr_policy_from_environment() -> VrrPolicy {
     };
     let value = value.to_string_lossy();
     let policy = VrrPolicy::from_environment(Some(&value));
-    if policy == VrrPolicy::Auto && !value.eq_ignore_ascii_case("auto") {
+    if should_warn_unknown_vrr_policy(&value, policy) {
         eprintln!("native KMS: unknown OBLIVION_ONE_VRR={value:?}; using auto");
     }
     policy
+}
+
+fn should_warn_unknown_vrr_policy(value: &str, policy: VrrPolicy) -> bool {
+    policy == VrrPolicy::Auto && !value.trim().eq_ignore_ascii_case("auto")
 }
 
 pub(crate) const fn vrr_doctor_severity(
@@ -69,6 +73,18 @@ mod doctor_tests {
             vrr_doctor_severity(VrrPolicy::On, false),
             DoctorSeverity::Warning
         );
+    }
+
+    #[test]
+    fn trimmed_auto_vrr_policy_is_not_diagnosed_as_unknown() {
+        for value in ["auto", " AUTO ", " auto "] {
+            let policy = VrrPolicy::from_environment(Some(value));
+            assert_eq!(policy, VrrPolicy::Auto);
+            assert!(!should_warn_unknown_vrr_policy(value, policy));
+        }
+
+        let policy = VrrPolicy::from_environment(Some(" automatic "));
+        assert!(should_warn_unknown_vrr_policy(" automatic ", policy));
     }
 }
 

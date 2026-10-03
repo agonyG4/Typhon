@@ -1191,7 +1191,7 @@ impl NativeRuntime {
                         frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
                         cursor_epoch,
                         pacing_mode,
-                        confirmed_kms_presentation.content_type,
+                        confirmed_kms_presentation.presentation_state_key(),
                         kms_commit_worker.as_ref(),
                         vrr_policy,
                     )? {
@@ -1348,6 +1348,37 @@ impl NativeRuntime {
                     target.width,
                     target.height,
                 );
+                let confirmed_presentation_state =
+                    confirmed_kms_presentation.presentation_state_key();
+                let pending_presentation_state = output_transactions.submitted_presentation_state();
+                let kms_lane_free =
+                    !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued();
+                let async_policy_inputs = AtomicAsyncPolicyInputs::new(
+                    cursor_state_changed,
+                    kms_lane_free,
+                    confirmed_presentation_state,
+                    pending_presentation_state,
+                );
+                let physical_state_may_change = match &**scanout {
+                    NativeScanoutBackend::AtomicEglGbm(explicit) => {
+                        let desired_state = explicit.requested_presentation_state_key(
+                            server,
+                            *drm_file_generation,
+                            pacing_mode,
+                            async_policy_inputs,
+                            effective_cursor
+                                .as_ref()
+                                .is_some_and(|cursor| cursor.visible),
+                            vrr_policy,
+                        );
+                        !kms_presentation_state_is_represented(
+                            desired_state,
+                            confirmed_presentation_state,
+                            pending_presentation_state,
+                        )
+                    }
+                    _ => false,
+                };
                 if let Some(start_ns) = scene_resolve_started_at_ns {
                     slow_cycle_trace.record_phase(
                         SlowCyclePhase::SceneResolveAndDamage,
@@ -1358,7 +1389,8 @@ impl NativeRuntime {
                 let no_primary_work = output_damage.is_empty()
                     && !effective_redraw_requested
                     && !effect_demand.continuous_visible
-                    && !interactive_visual_applied;
+                    && !interactive_visual_applied
+                    && !physical_state_may_change;
                 if no_primary_work {
                     let surface_damage = scene_changed.then(|| {
                         let sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
@@ -1570,7 +1602,12 @@ impl NativeRuntime {
                             ),
                             frozen_cursor_plane_owner,
                             frozen_cursor_trace_reveal,
-                            AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_kms_presentation.content_type),
+                            AtomicAsyncPolicyInputs::new(
+                                cursor_state_changed,
+                                atomic_kms_lane_free,
+                                confirmed_presentation_state,
+                                pending_presentation_state,
+                            ),
                             release_safety,
                             dmabuf_gpu_release_lease_id,
                             vrr_policy,
@@ -1590,6 +1627,7 @@ impl NativeRuntime {
                             let render_call_ns = render_finished_at_ns.saturating_sub(start_ns);
                             let renderer_ns = match &render_outcome {
                                 AtomicFrameRenderOutcome::Skipped { render_us, .. }
+                                | AtomicFrameRenderOutcome::RetryPresentationState { render_us }
                                 | AtomicFrameRenderOutcome::Rendered { render_us, .. }
                                 | AtomicFrameRenderOutcome::LifecycleFallback {
                                     render_us, ..
@@ -1699,6 +1737,24 @@ impl NativeRuntime {
                                             pending_frame_work,
                                         ),
                                         NativePerfField::str("output_damage", "empty"),
+                                    ]
+                                });
+                            }
+                            AtomicFrameRenderOutcome::RetryPresentationState { render_us } => {
+                                frame_pacing.note_predictive_o1_other_safe_abandonment();
+                                frame_pacing.cancel_unsubmitted_render();
+                                render_telemetry.record_skipped(render_us);
+                                frame_scheduler.note_immediate_completion();
+                                frame_completed = true;
+                                *queued_redraw_requested = true;
+                                *last_acquire_ready_at_ns = None;
+                                presentation_deadline.clear_scheduled_target();
+                                *scheduled_presentation_target = None;
+                                perf.log("native.atomic_presentation_state_retry", || {
+                                    vec![
+                                        NativePerfField::u64("render_us", render_us),
+                                        NativePerfField::u64("scene_generation", scene_generation),
+                                        NativePerfField::str("output_damage", "forced-full"),
                                     ]
                                 });
                             }

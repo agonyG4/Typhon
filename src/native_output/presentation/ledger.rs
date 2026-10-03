@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use super::transaction::{
-    FramePresentationBindingError, OutputTransaction, OutputTransactionContent, OutputTransactionId,
+    DirectScanoutCandidateKey, FramePresentationBindingError, OutputPresentationStateKey,
+    OutputTransaction, OutputTransactionContent, OutputTransactionId,
 };
 use oblivion_one::compositor::OutputPresentationMode;
 use oblivion_one::compositor::SurfaceDamagePresentation;
@@ -1349,6 +1350,39 @@ impl OutputTransactionLedger {
                     } if submitted_token == token
                 ))
             .then_some(record.descriptor.id())
+        })
+    }
+
+    pub(crate) fn pending_direct_presentation_state(
+        &self,
+        candidate: DirectScanoutCandidateKey,
+    ) -> Option<OutputPresentationStateKey> {
+        self.active.values().find_map(|record| {
+            (matches!(record.state, OutputTransactionState::Submitted { .. })
+                && record.descriptor.direct_candidate_key() == Some(candidate))
+            .then(|| record.descriptor.presentation_state_key())
+        })
+    }
+
+    pub(crate) fn submitted_direct_presentation_state(&self) -> Option<OutputPresentationStateKey> {
+        self.active.values().find_map(|record| {
+            (matches!(record.state, OutputTransactionState::Submitted { .. })
+                && record.descriptor.direct_candidate_key().is_some())
+            .then(|| record.descriptor.presentation_state_key())
+        })
+    }
+
+    pub(crate) fn has_queued_direct_candidate(&self, candidate: DirectScanoutCandidateKey) -> bool {
+        self.active.values().any(|record| {
+            matches!(record.state, OutputTransactionState::Queued { .. })
+                && record.descriptor.direct_candidate_key() == Some(candidate)
+        })
+    }
+
+    pub(crate) fn submitted_presentation_state(&self) -> Option<OutputPresentationStateKey> {
+        self.active.values().find_map(|record| {
+            matches!(record.state, OutputTransactionState::Submitted { .. })
+                .then(|| record.descriptor.presentation_state_key())
         })
     }
 

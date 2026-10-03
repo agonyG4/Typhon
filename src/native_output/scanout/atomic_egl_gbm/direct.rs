@@ -1,6 +1,10 @@
 use super::*;
 use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::presentation::transaction::{
+    DirectPresentationStateDisposition, OutputPresentationStateKey,
+    classify_direct_presentation_state,
+};
 use crate::native_output::runtime::{
     discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
     take_client_cursor_presentation_feedback_batch,
@@ -130,7 +134,7 @@ impl AtomicEglGbmScanout {
         cursor_revision: Option<CursorRevision>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
-        confirmed_content_type: DrmContentType,
+        confirmed_presentation_state: OutputPresentationStateKey,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
         vrr_policy: VrrPolicy,
     ) -> io::Result<DirectScanoutAttempt> {
@@ -223,7 +227,7 @@ impl AtomicEglGbmScanout {
                 cursor_visible: cursor.is_some_and(|state| state.visible),
                 modeset_required: kms
                     .resolved_content_type(candidate.presentation.content_type.drm_value())
-                    != confirmed_content_type,
+                    != confirmed_presentation_state.content_type,
                 ..AsyncEligibility::default()
             },
             VrrEligibility {
@@ -257,6 +261,9 @@ impl AtomicEglGbmScanout {
             },
             DirectSyncReadiness::Unsupported(_) => unreachable!("checked above"),
         };
+        if output_transactions.has_queued_direct_candidate(candidate_key) {
+            return Ok(DirectScanoutAttempt::TimingDeferred);
+        }
         let presented_key = self
             .direct
             .ownership
@@ -269,32 +276,83 @@ impl AtomicEglGbmScanout {
             .submitted
             .as_ref()
             .map(|frame| frame.lease.key());
-        let disposition = classify_direct_content(candidate_key, presented_key, submitted_key);
-        if disposition != DirectContentDisposition::NewContent {
-            self.direct.counters.same_buffer_suppressed = self
-                .direct
-                .counters
-                .same_buffer_suppressed
-                .saturating_add(1);
-            if !settle_no_visual_change_transaction(
-                self,
-                server,
-                output_transactions,
-                self.direct.drm_generation,
-                target,
-                pacing_mode,
-                candidate_key,
-                0,
-                cursor,
-                cursor_epoch,
-                candidate.surface_id,
-                release,
-                presentation_mode,
-                content_type,
-            )? {
-                return Ok(DirectScanoutAttempt::TimingDeferred);
+        let pending_direct_state = output_transactions
+            .pending_direct_presentation_state(candidate_key)
+            .or_else(|| {
+                self.direct
+                    .ownership
+                    .submitted
+                    .as_ref()
+                    .filter(|frame| frame.lease.key() == candidate_key)
+                    .map(|frame| {
+                        let validation = frame.lease.validation_key();
+                        OutputPresentationStateKey {
+                            mode: validation.presentation_mode,
+                            content_type: validation.content_type,
+                            output_generation: validation.output_generation,
+                        }
+                    })
+            });
+        let has_submitted_direct_assignment = output_transactions
+            .submitted_direct_presentation_state()
+            .is_some()
+            || self.direct.ownership.submitted.is_some();
+        let pending_key = pending_direct_state
+            .map(|_| candidate_key)
+            .or(submitted_key);
+        let disposition = classify_direct_content(candidate_key, presented_key, pending_key);
+        let same_visual_assignment = disposition != DirectContentDisposition::NewContent;
+        let requested_state = OutputPresentationStateKey {
+            mode: presentation_mode,
+            content_type,
+            output_generation: self.direct.drm_generation,
+        };
+        if same_visual_assignment {
+            let state_disposition = if disposition
+                == DirectContentDisposition::MatchesQueuedOrSubmitted
+                && pending_direct_state.is_none()
+                || has_submitted_direct_assignment && pending_direct_state.is_none()
+            {
+                DirectPresentationStateDisposition::DeferUntilPageflip
+            } else {
+                classify_direct_presentation_state(
+                    requested_state,
+                    confirmed_presentation_state,
+                    pending_direct_state,
+                )
+            };
+            match state_disposition {
+                DirectPresentationStateDisposition::AlreadyRepresented => {
+                    self.direct.counters.same_buffer_suppressed = self
+                        .direct
+                        .counters
+                        .same_buffer_suppressed
+                        .saturating_add(1);
+                    if !settle_no_visual_change_transaction(
+                        self,
+                        server,
+                        output_transactions,
+                        self.direct.drm_generation,
+                        target,
+                        pacing_mode,
+                        candidate_key,
+                        0,
+                        cursor,
+                        cursor_epoch,
+                        candidate.surface_id,
+                        release,
+                        presentation_mode,
+                        content_type,
+                    )? {
+                        return Ok(DirectScanoutAttempt::TimingDeferred);
+                    }
+                    return Ok(DirectScanoutAttempt::Unchanged);
+                }
+                DirectPresentationStateDisposition::DeferUntilPageflip => {
+                    return Ok(DirectScanoutAttempt::TimingDeferred);
+                }
+                DirectPresentationStateDisposition::TransitionRequired => {}
             }
-            return Ok(DirectScanoutAttempt::Unchanged);
         }
         if candidate.buffer.planes().is_empty() {
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
@@ -404,57 +462,63 @@ impl AtomicEglGbmScanout {
         let test_token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native TEST_ONLY pageflip token is nonzero");
         let mut qualified_validation_key = None;
-        let Some(qualified_mode) =
-            first_qualified_direct_presentation_mode(requested_presentation_mode, |mode| {
-                let key = validation_key.with_presentation_state(mode, content_type);
-                let qualified = if self.direct.validation_cache.contains(key) {
-                    self.direct.counters.validation_cache_hits =
-                        self.direct.counters.validation_cache_hits.saturating_add(1);
-                    true
-                } else {
-                    self.direct.counters.validation_cache_misses = self
-                        .direct
-                        .counters
-                        .validation_cache_misses
-                        .saturating_add(1);
-                    let result = if let Some(cursor) = cursor {
-                        kms.test_flip_with_presentation(
-                            framebuffer.framebuffer,
-                            test_token,
-                            Some(cursor),
-                            mode,
-                            content_type,
-                        )
+        let Some((qualified_state, qualified_state_disposition)) =
+            first_qualified_direct_presentation_state(
+                requested_presentation_mode,
+                content_type,
+                self.direct.drm_generation,
+                confirmed_presentation_state,
+                |mode| {
+                    let key = validation_key.with_presentation_state(mode, content_type);
+                    let qualified = if self.direct.validation_cache.contains(key) {
+                        self.direct.counters.validation_cache_hits =
+                            self.direct.counters.validation_cache_hits.saturating_add(1);
+                        true
                     } else {
-                        kms.test_flip_without_cursor_with_presentation(
-                            framebuffer.framebuffer,
-                            test_token,
-                            mode,
-                            content_type,
-                        )
+                        self.direct.counters.validation_cache_misses = self
+                            .direct
+                            .counters
+                            .validation_cache_misses
+                            .saturating_add(1);
+                        let result = if let Some(cursor) = cursor {
+                            kms.test_flip_with_presentation(
+                                framebuffer.framebuffer,
+                                test_token,
+                                Some(cursor),
+                                mode,
+                                content_type,
+                            )
+                        } else {
+                            kms.test_flip_without_cursor_with_presentation(
+                                framebuffer.framebuffer,
+                                test_token,
+                                mode,
+                                content_type,
+                            )
+                        };
+                        if result.is_ok() {
+                            self.direct.validation_cache.record_success(key);
+                        } else {
+                            direct_scanout_debug(format_args!(
+                                "exact presentation TEST_ONLY rejected mode={}",
+                                mode.as_str()
+                            ));
+                        }
+                        result.is_ok()
                     };
-                    if result.is_ok() {
-                        self.direct.validation_cache.record_success(key);
-                    } else {
-                        direct_scanout_debug(format_args!(
-                            "exact presentation TEST_ONLY rejected mode={}",
-                            mode.as_str()
-                        ));
+                    if qualified {
+                        qualified_validation_key = Some(key);
                     }
-                    result.is_ok()
-                };
-                if qualified {
-                    qualified_validation_key = Some(key);
-                }
-                qualified
-            })
+                    qualified
+                },
+            )
         else {
             self.note_direct_rejection(true, cursor.is_some());
             return Ok(DirectScanoutAttempt::Fallback(
                 "presentation_test_only_rejected",
             ));
         };
-        presentation_mode = qualified_mode;
+        presentation_mode = qualified_state.mode;
         let validation_key = qualified_validation_key
             .expect("qualified direct presentation mode retains its exact validation key");
         if presentation_mode != requested_presentation_mode {
@@ -462,6 +526,35 @@ impl AtomicEglGbmScanout {
                 "kept direct assignment with weaker presentation mode={}",
                 presentation_mode.as_str()
             ));
+        }
+        if same_visual_assignment {
+            if qualified_state_disposition == DirectPresentationStateDisposition::AlreadyRepresented
+            {
+                self.direct.counters.same_buffer_suppressed = self
+                    .direct
+                    .counters
+                    .same_buffer_suppressed
+                    .saturating_add(1);
+                if !settle_no_visual_change_transaction(
+                    self,
+                    server,
+                    output_transactions,
+                    self.direct.drm_generation,
+                    target,
+                    pacing_mode,
+                    candidate_key,
+                    0,
+                    cursor,
+                    cursor_epoch,
+                    candidate.surface_id,
+                    release,
+                    presentation_mode,
+                    content_type,
+                )? {
+                    return Ok(DirectScanoutAttempt::TimingDeferred);
+                }
+                return Ok(DirectScanoutAttempt::Unchanged);
+            }
         }
         // Every chosen exact direct state was either tested here or has a
         // matching successful mode-specific validation-cache entry.
@@ -588,6 +681,33 @@ impl AtomicEglGbmScanout {
             Err(crate::native_output::kms_worker::KmsWorkerAdmissionError::DuplicateCandidate) => {
                 self.note_direct_worker_admission_rejected(false);
                 self.note_direct_same_buffer_resubmission();
+                if qualified_state_disposition
+                    == DirectPresentationStateDisposition::TransitionRequired
+                {
+                    let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+                        server,
+                        transaction_id,
+                        obligations,
+                        DirectTerminalCallbackDisposition::Retryable,
+                    );
+                    settle_failed_output_transaction(
+                        output_transactions,
+                        transaction_id,
+                        OutputTransactionFailureStage::KmsSubmit,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        |obligations| {
+                            restore_presentation_feedback_obligation(server, obligations);
+                            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                                io::Error::other("deferred direct transaction has no frame batch")
+                            })?;
+                            server.restore_frame_batch_after_render_failure(batch_id);
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                    self.note_direct_callback_owner_leaks(callback_owner_leaks);
+                    return Ok(DirectScanoutAttempt::TimingDeferred);
+                }
                 let callback_owner_leaks = direct_terminal_callback_owner_leaks(
                     server,
                     transaction_id,

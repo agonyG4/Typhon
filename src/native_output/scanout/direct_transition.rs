@@ -170,7 +170,8 @@ impl NativeScanoutBackend {
         cursor_revision: Option<crate::native_output::presentation::plane::CursorRevision>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
-        confirmed_content_type: oblivion_one::compositor::DrmContentType,
+        confirmed_presentation_state:
+            crate::native_output::presentation::transaction::OutputPresentationStateKey,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
         vrr_policy: oblivion_one::compositor::VrrPolicy,
     ) -> io::Result<DirectScanoutAttempt> {
@@ -185,7 +186,7 @@ impl NativeScanoutBackend {
                 cursor_revision,
                 cursor_epoch,
                 pacing_mode,
-                confirmed_content_type,
+                confirmed_presentation_state,
                 worker,
                 vrr_policy,
             ),

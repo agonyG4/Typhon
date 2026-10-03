@@ -5,6 +5,10 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use crate::native_output::presentation::transaction::{
+    DirectPresentationStateDisposition, OutputPresentationStateKey,
+    classify_direct_presentation_state,
+};
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
 const DIRECT_ADAPTIVE_ASYNC_CANDIDATES: &[OutputPresentationMode] = &[
@@ -35,6 +39,26 @@ pub(crate) fn first_qualified_direct_presentation_mode(
         .iter()
         .copied()
         .find(|candidate| qualifies(*candidate))
+}
+
+pub(crate) fn first_qualified_direct_presentation_state(
+    requested: OutputPresentationMode,
+    content_type: DrmContentType,
+    output_generation: u64,
+    confirmed: OutputPresentationStateKey,
+    qualifies: impl FnMut(OutputPresentationMode) -> bool,
+) -> Option<(
+    OutputPresentationStateKey,
+    DirectPresentationStateDisposition,
+)> {
+    let mode = first_qualified_direct_presentation_mode(requested, qualifies)?;
+    let state = OutputPresentationStateKey {
+        mode,
+        content_type,
+        output_generation,
+    };
+    let disposition = classify_direct_presentation_state(state, confirmed, None);
+    Some((state, disposition))
 }
 
 pub(crate) fn direct_cursor_content_key(

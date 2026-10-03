@@ -651,7 +651,12 @@ fn visible_cursor() -> AtomicCursorVisualState {
 }
 
 fn explicit_fence_pipeline() -> AtomicPipelineProperties {
-    let (connector, crtc, plane, connector_props, _, _) = ids();
+    let (connector, crtc, plane, _, _, _) = ids();
+    let connector_props = AtomicConnectorProperties::discover(&[
+        property(1, "CRTC_ID", 42),
+        property(20, "vrr_capable", 1),
+    ])
+    .unwrap();
     let mut crtc_properties = complete_crtc_properties();
     crtc_properties.push(property(5, "OUT_FENCE_PTR", 0));
     let mut plane_properties = complete_plane_properties();
@@ -799,6 +804,63 @@ fn atomic_presentation_state_and_test_only_real_requests_match_for_all_modes() {
         assert_eq!(test.flags.contains_pageflip_async(), mode.is_async());
         assert!(!test.flags.contains_allow_modeset());
     }
+}
+
+#[test]
+fn adaptive_presentation_requires_vrr_capability_and_programs_the_crtc_property() {
+    use crate::compositor::OutputPresentationMode::{AdaptiveAsync, AdaptiveSync};
+
+    let mut missing_property = presentation_state_pipeline();
+    missing_property.crtc_props.vrr_enabled = None;
+    let error = AtomicRequest::new()
+        .set_presentation_state(&missing_property, AdaptiveSync, DrmContentType::Graphics)
+        .unwrap_err();
+    assert_eq!(error.kind, AtomicKmsErrorKind::MissingProperty);
+
+    let mut unsupported_connector = presentation_state_pipeline();
+    unsupported_connector.connector_props.vrr_capable_value = Some(0);
+    let error = AtomicRequest::new()
+        .set_presentation_state(
+            &unsupported_connector,
+            AdaptiveAsync,
+            DrmContentType::Graphics,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, AtomicKmsErrorKind::Unsupported);
+
+    let pipeline = presentation_state_pipeline();
+    let vrr_property = pipeline.crtc_props.vrr_enabled.unwrap().0.get();
+    let mut request = AtomicRequest::new();
+    request
+        .set_presentation_state(&pipeline, AdaptiveSync, DrmContentType::Graphics)
+        .unwrap();
+    let serialized = request.serialize();
+    let submitted_vrr_value = serialized
+        .properties
+        .iter()
+        .copied()
+        .zip(serialized.values.iter().copied())
+        .find_map(|(property, value)| (property == vrr_property).then_some(value));
+    assert_eq!(submitted_vrr_value, Some(1));
+}
+
+#[test]
+fn vsync_presentation_allows_missing_optional_vrr_enabled() {
+    let mut pipeline = presentation_state_pipeline();
+    let vrr_property = pipeline.crtc_props.vrr_enabled.unwrap().0.get();
+    pipeline.crtc_props.vrr_enabled = None;
+
+    let mut request = AtomicRequest::new();
+    request
+        .set_presentation_state(
+            &pipeline,
+            crate::compositor::OutputPresentationMode::Vsync,
+            DrmContentType::Game,
+        )
+        .unwrap();
+    let serialized = request.serialize();
+    assert!(!serialized.values.is_empty());
+    assert!(!serialized.properties.contains(&vrr_property));
 }
 
 fn pipe_read_end() -> OwnedFd {

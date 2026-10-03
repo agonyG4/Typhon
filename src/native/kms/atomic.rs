@@ -388,7 +388,25 @@ impl AtomicRequest {
         content_type: crate::compositor::DrmContentType,
     ) -> Result<(), AtomicKmsError> {
         self.set_connector_content_type(pipeline, content_type.as_str())?;
-        self.set_crtc_vrr_enabled(pipeline, presentation_mode.uses_vrr())?;
+        if presentation_mode.uses_vrr() {
+            if pipeline.connector_props.vrr_capable.is_none()
+                || pipeline.connector_props.vrr_capable_value != Some(1)
+            {
+                return Err(AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "Adaptive presentation requires a live connector vrr_capable value of true",
+                ));
+            }
+            let Some(property) = pipeline.crtc_props.vrr_enabled else {
+                return Err(AtomicKmsError::new(
+                    AtomicKmsErrorKind::MissingProperty,
+                    "Adaptive presentation requires the CRTC VRR_ENABLED property",
+                ));
+            };
+            self.set_crtc(pipeline.crtc, property, 1)?;
+        } else {
+            self.set_crtc_vrr_enabled(pipeline, false)?;
+        }
         Ok(())
     }
 

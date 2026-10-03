@@ -866,6 +866,14 @@ impl OutputTransaction {
         self.content_type
     }
 
+    pub(crate) const fn presentation_state_key(&self) -> OutputPresentationStateKey {
+        OutputPresentationStateKey {
+            mode: self.presentation_mode,
+            content_type: self.content_type,
+            output_generation: self.output_generation,
+        }
+    }
+
     pub(crate) fn with_presentation_state(
         mut self,
         presentation_mode: OutputPresentationMode,
@@ -952,6 +960,15 @@ impl OutputTransaction {
 
     pub(crate) const fn content(&self) -> OutputTransactionContent {
         self.content
+    }
+
+    pub(crate) const fn direct_candidate_key(&self) -> Option<DirectScanoutCandidateKey> {
+        match self.content {
+            OutputTransactionContent::Direct { key, .. } => Some(key),
+            OutputTransactionContent::Composited { .. }
+            | OutputTransactionContent::CompatibilityImmediate { .. }
+            | OutputTransactionContent::PlaneDelta { .. } => None,
+        }
     }
 
     pub(crate) const fn equivalent_direct_key(&self) -> Option<DirectScanoutCandidateKey> {
@@ -1115,6 +1132,48 @@ impl DirectScanoutCandidateKey {
             cursor_content_key,
             color_epoch,
         })
+    }
+}
+
+/// Identity for the physical KMS presentation state requested by an output
+/// transaction. This deliberately remains separate from visual/content keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OutputPresentationStateKey {
+    pub(crate) mode: OutputPresentationMode,
+    pub(crate) content_type: DrmContentType,
+    pub(crate) output_generation: u64,
+}
+
+pub(crate) fn kms_presentation_state_is_represented(
+    desired: OutputPresentationStateKey,
+    confirmed: OutputPresentationStateKey,
+    pending: Option<OutputPresentationStateKey>,
+) -> bool {
+    match pending {
+        Some(pending) => pending == desired,
+        None => confirmed == desired,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectPresentationStateDisposition {
+    AlreadyRepresented,
+    TransitionRequired,
+    DeferUntilPageflip,
+}
+
+pub(crate) fn classify_direct_presentation_state(
+    desired: OutputPresentationStateKey,
+    confirmed: OutputPresentationStateKey,
+    submitted: Option<OutputPresentationStateKey>,
+) -> DirectPresentationStateDisposition {
+    match submitted {
+        Some(submitted) if submitted == desired => {
+            DirectPresentationStateDisposition::AlreadyRepresented
+        }
+        Some(_) => DirectPresentationStateDisposition::DeferUntilPageflip,
+        None if desired == confirmed => DirectPresentationStateDisposition::AlreadyRepresented,
+        None => DirectPresentationStateDisposition::TransitionRequired,
     }
 }
 
