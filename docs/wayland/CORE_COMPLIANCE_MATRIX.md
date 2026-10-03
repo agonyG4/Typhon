@@ -135,7 +135,7 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_shm_pool` | n/a | request `resize` | 1 | `protocols/buffers.rs` | ProtocolError | Implemented |
 | `wl_buffer` | n/a | request `destroy` | 1 | `protocols/buffers.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
 | `wl_buffer` | n/a | event `release` | 1 | frame-owned release path | BackendOwned | Implemented |
-| `wl_data_offer` | n/a | request `accept` | 1 | `protocols/data_device.rs` | Implemented | Partial |
+| `wl_data_offer` | n/a | request `accept` | 1 | `protocols/data_device.rs` | CompatibilityRecovery | Implemented |
 | `wl_data_offer` | n/a | request `receive` | 1 | `protocols/data_device.rs` | Implemented | Partial |
 | `wl_data_offer` | n/a | request `destroy` | 1 | `protocols/data_device.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
 | `wl_data_offer` | n/a | event `offer` | 1 | data-device state | Implemented | Implemented |
@@ -310,6 +310,7 @@ the inventory.
 | `wl_shm_pool.create_buffer` | `protocols/buffers.rs` | `wl_shm_pool_resize_growth_enables_buffer_above_initial_size` | `wl_shm.invalid_format`, `invalid_stride`, `invalid_fd` | 2 | Implemented | only advertised formats are accepted |
 | `wl_data_source.set_actions` | `protocols/data_device.rs` | `sourced_wire_drag_ask_resolves_to_copy_before_finished`, `v3_start_drag_without_set_actions_is_a_wire_protocol_error`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_source.invalid_action_mask`, `invalid_source` | 3 | Implemented | modifier-driven action overrides remain optional policy |
 | `wl_data_source.offer` | `protocols/data_device.rs`, `state/selection_runtime.rs` | `v3_source_can_offer_mime_after_start_drag_before_target_enter`, `data_source_mime_offers_are_deduplicated_bounded_and_ordered` | none | 3 | Implemented | late offers update the bounded source catalog; later DnD target offers snapshot it at entry; `DataSourceUse` continues to guard reuse |
+| `wl_data_offer.accept` | `protocols/data_device.rs`, `state/selection_runtime.rs` | `clipboard_selection_accept_then_receive_survives_exact_firefox_mime`, `clipboard_selection_accept_with_unoffered_mime_is_ignored`, `clipboard_selection_offer_keeps_set_actions_and_finish_fatal`, `clipboard_selection_receive_with_unoffered_mime_still_does_not_transfer`, `sourced_wire_drag_accept_rejects_unoffered_mime`, `sourced_wire_drag_accept_after_finish_is_fatal` | DnD invalid MIME/terminal offer: `wl_data_offer.invalid_offer`; selection accept: none | 1 | Implemented | selection `accept` is ignored as an interoperability recovery; transfer still uses `receive`, and DnD validation remains strict |
 | `wl_data_offer.set_actions` | `protocols/data_device.rs`, `state/data_device.rs` | `sourced_wire_drag_post_drop_set_actions_preserves_frozen_action`, `sourced_wire_drag_ask_resolves_to_copy_before_finished`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_offer.invalid_offer`, `invalid_action_mask`, `invalid_action` | 3 | Implemented | valid requests remain accepted until finish; normal post-drop actions stay frozen, while ASK can still resolve |
 | `wl_data_offer.finish` | `protocols/data_device.rs`, `state/data_device.rs` | `sourced_wire_drag_ask_resolves_to_copy_before_finished`, `sourced_wire_drag_target_disconnect_after_drop_cancels_once`, `sourced_wire_drag_offer_destroy_after_drop_cancels_once`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_offer.invalid_finish` | 3 | Implemented | native toolkit coverage remains required; deterministic normal, ASK, destruction, and disconnect paths are covered |
 | `wl_data_device.start_drag` | `protocols/data_device.rs`, `state/data_device.rs` | `sourced_wire_drag_target_disconnect_before_drop_cancels_once`, `sourced_wire_drag_target_disconnect_while_ask_is_unresolved_cancels_once`, `source_less_wire_drag_with_icon_reserves_a_permanent_drag_icon_role`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_device.used_source`, `wl_data_device.role`, `wl_data_source.invalid_source` | 3 | Implemented | source-less, icon, source-use, post-drop cancellation, and teardown transitions are covered; native toolkit validation remains required |
@@ -329,6 +330,12 @@ the inventory.
 not republish active clipboard selections: selection metadata and each existing
 `wl_data_offer` retain their publication-time MIME snapshots. Live post-selection
 MIME publication is a separate compliance follow-up.
+
+`wl_data_offer.accept` is defined primarily for drag-and-drop negotiation.
+Typhon's selection-offer behavior is an interoperability recovery for clients
+that send it while consuming clipboard data; it does not claim that the protocol
+permits selection `accept`. The request is ignored, and the transfer proceeds
+through `wl_data_offer.receive`. The recovery does not change DnD validation.
 
 `configure_bounds` is `Not applicable`: Typhon deliberately does not
 advertise a bounds preference, so it does not send this optional event.

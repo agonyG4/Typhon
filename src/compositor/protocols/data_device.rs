@@ -341,6 +341,25 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                 serial: _,
                 mime_type,
             } => {
+                let Some(offer_kind) = state
+                    .data_offers
+                    .get(&resource.id())
+                    .map(|offer| offer.kind)
+                else {
+                    return;
+                };
+                if offer_kind == DataOfferKind::Selection {
+                    let client_id = client.id();
+                    state.trace_clipboard_selection_accept_ignored(
+                        &client_id,
+                        &data.target_client_id,
+                        resource,
+                        data.source_generation,
+                        mime_type.as_deref(),
+                    );
+                    return;
+                }
+
                 let Some(offer) = state.data_offers.get_mut(&resource.id()) else {
                     return;
                 };

@@ -280,6 +280,39 @@ impl CompositorState {
         );
     }
 
+    pub(in crate::compositor) fn trace_clipboard_selection_accept_ignored(
+        &mut self,
+        client_id: &ClientId,
+        expected_target_client_id: &ClientId,
+        offer: &wl_data_offer::WlDataOffer,
+        source_generation: u64,
+        mime_type: Option<&str>,
+    ) {
+        if !self.lifecycle_compatibility_trace.clipboard_trace_enabled() {
+            return;
+        }
+
+        let binding = self.data_offers.get(&offer.id()).cloned();
+        self.trace_clipboard_diagnostic(
+            "selection_accept_ignored",
+            ClipboardTraceEvent {
+                client_id: Some(client_id),
+                expected_target_client_id: Some(expected_target_client_id),
+                target_client_matches: Some(client_id == expected_target_client_id),
+                offer_protocol_id: Some(offer.id().protocol_id()),
+                broker_offer_id: binding.as_ref().and_then(|binding| binding.broker_offer_id),
+                target_device_id: binding.as_ref().map(|binding| binding.target_id),
+                source_key: binding.as_ref().and_then(|binding| binding.source_key),
+                source_generation: Some(source_generation),
+                mime_type,
+                offer_kind: Some(DataOfferKind::Selection),
+                data_offer_binding_present: Some(binding.is_some()),
+                reason: Some("selection_accept_ignored"),
+                ..ClipboardTraceEvent::default()
+            },
+        );
+    }
+
     fn trace_clipboard_offer_validation(
         &mut self,
         stage: &'static str,

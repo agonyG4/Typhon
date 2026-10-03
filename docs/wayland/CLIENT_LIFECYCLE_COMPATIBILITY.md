@@ -13,8 +13,9 @@ client connection.
 | `wl_surface.destroy` while an XDG toplevel, XDG popup, subsurface, layer surface, or XWayland role is live | `RECOVERABLE_LIFECYCLE` | Record a bounded diagnostic, then run `teardown_surface_resource` once. That path removes scene state, pending commits, buffers, role registrations, focus, and ownership maps. Role resources that remain on the wire become inert. Cursor and drag-icon roles do not trigger this compatibility path. |
 | `xdg_surface.destroy` while its toplevel or popup object is live | `RECOVERABLE_LIFECYCLE` | Record a bounded diagnostic, then run `unregister_xdg_surface_role`. It retires the role and associated popup/configure/decoration state. Later role requests are ignored and their normal destroy requests are harmless. |
 | Repeating `wl_data_device.set_selection` with the same source that is still the active clipboard source | `RECOVERABLE_LIFECYCLE` | Record a bounded diagnostic and preserve the current selection without another cancellation or generation change. |
+| `wl_data_offer.accept` on a clipboard selection offer | `CompatibilityRecovery` | Ignore the request and emit the bounded `selection_accept_ignored` clipboard diagnostic when `TYPHON_CLIPBOARD_TRACE=1`. This does not mutate the selection or DnD state; clipboard data still transfers through `receive`. |
 | Reusing a source after selection clear/replacement, configuring an active clipboard source for DnD, using a clipboard source for DnD, or reusing a drag source | `FATAL` | Keep `wl_data_device.used_source` and `wl_data_source.invalid_source` fatal. Retired sources cannot be made active again. |
-| Invalid data-offer lifecycle requests, including `finish` before a valid drop, selection-offer DnD requests, or receives after a drag offer is terminal | `FATAL` | Keep `invalid_finish` and `invalid_offer` errors. Invalid MIME offers, action masks, and preferred actions remain fatal too. |
+| Invalid data-offer lifecycle requests, including `finish` before a valid drop, selection-offer `set_actions` and `finish`, or receives after a drag offer is terminal | `FATAL` | Keep `invalid_finish` and `invalid_offer` errors. Invalid DnD accept MIME types, action masks, and preferred actions remain fatal too. |
 | `wl_subsurface`, layer-surface, or XWayland role requests after their underlying `wl_surface` has been destroyed | `INERT` | The handler returns when the matching live surface resource is gone; it posts no protocol error and cannot mutate compositor state. Normal role-resource destruction remains idempotent. |
 | `xdg_wm_base.destroy` with live `xdg_surface` objects, toplevel destruction with a live decoration object, or popup destruction out of stack order | `FATAL` | Preserve `defunct_surfaces`, `orphaned`, and `not_the_topmost_popup` protocol errors. An inert XDG surface left by surface-first recovery still counts as live until that XDG resource is destroyed or its client disconnects. |
 | Cross-client object references, invalid object references, invalid configure acknowledgements, role reassignment, invalid popup parents, invalid DND action masks, and buffer ownership violations | `FATAL` | Keep existing protocol errors and client termination. |
@@ -30,15 +31,24 @@ and active clipboard source reuse. No client name changes the recovery rules.
 Client disconnect cleanup removes any retained XDG base ownership entry for an
 inert surface, along with the rest of that client's resources.
 
+The Wayland protocol defines `wl_data_offer.accept` primarily for
+drag-and-drop negotiation. Some clients also send it while consuming a
+clipboard selection offer. Typhon treats only this selection-offer request as
+an interoperability recovery: it ignores the request instead of disconnecting
+the client. The actual clipboard transfer still happens through `receive`.
+This does not make selection `set_actions` or `finish` permissive, and DnD
+offer validation remains strict.
+
 ## Native-client qualification status
 
-**Not run on 2026-10-02.** The active seat is a Wayland session on `tty1`, and
-Hyprland (PID 1030) owns `/dev/dri/card1`; `/sys/class/tty/tty0/active` reports
-`tty1`. Starting Typhon through its native TTY/DRM launcher would require
-taking over the active seat, so it was not started. No Typhon or Firefox
-process was running during this qualification check. Firefox was not launched,
-`TYPHON_WAYLAND_COMPAT_TRACE=1` was not set for a compositor process, and there
-is no native Firefox trace or survival result to claim.
+**Post-fix native run not performed on 2026-10-03.** The original Firefox
+failure is present in the supplied `WAYLAND_DEBUG` trace: selection-offer
+`accept(130, "text/plain;charset=utf-8")` is followed by `receive`, then
+`wl_data_offer.invalid_offer` before Typhon's receive-stage trace. In the
+current session Hyprland (PID 996) owns `/dev/dri/card1` on active `tty1`; no
+Typhon or Firefox process is running. Typhon ignores `WAYLAND_DISPLAY` for
+runtime selection and requires the native seat, so starting it here would take
+over the active seat. No post-fix native Firefox survival result is claimed.
 
 The focused lifecycle tests are synthetic wire tests against Typhon's in-process
 test compositor. They are separate evidence from native-client or
@@ -85,9 +95,10 @@ unambiguous. ([Wayland core](https://wayland.app/protocols/wayland), [xdg-shell]
 | Smithay | The inspected selection code separates clipboard selection and DnD machinery, but did not establish an exception matching Typhon's active-source predicate. ([data-device source](https://docs.rs/smithay/0.7.0/src/smithay/wayland/selection/data_device/mod.rs.html)) | `Unknown` for identical source-reuse behavior; no broader reuse policy is inferred. |
 
 These were source comparisons, not runtime controls. Hyprland and KWin were not
-started in this session, and no Firefox request trace was available to compare
-against them. In particular, KWin and Hyprland's observed recovery behavior is
-an interoperability convention, not a reason to relax unrelated validation.
+started as comparison targets, and no post-fix Firefox run was available to
+compare against them. In particular, KWin and Hyprland's observed recovery
+behavior is an interoperability convention, not a reason to relax unrelated
+validation.
 
 Typhon therefore recovers only lifecycle orderings for which it can perform
 complete, deterministic cleanup and retain unambiguous ownership. It does not

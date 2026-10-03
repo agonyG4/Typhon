@@ -10,10 +10,51 @@ pub(in crate::compositor::tests) struct ClipboardDisconnectResult {
     pub(in crate::compositor::tests) clipboard_state: ClipboardStateSnapshot,
 }
 
+pub(in crate::compositor::tests) struct ClipboardSelectionAcceptTransfer {
+    pub(in crate::compositor::tests) source_state: RegistryTestState,
+    pub(in crate::compositor::tests) target_state: RegistryTestState,
+    pub(in crate::compositor::tests) received: Vec<String>,
+    pub(in crate::compositor::tests) offer_protocol_id: u32,
+    pub(in crate::compositor::tests) selection_generation_before_accept: u64,
+    pub(in crate::compositor::tests) selection_generation_after_accept: u64,
+    pub(in crate::compositor::tests) selection_generation_after_receive: u64,
+}
+
 pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<(RegistryTestState, RegistryTestState, Vec<String>), Box<dyn std::error::Error>> {
+    let result = forward_clipboard_between_two_clients_with_options(
+        socket_path,
+        commands,
+        &["text/plain", "text/html"],
+        None,
+        &["text/plain", "text/html"],
+    )?;
+    Ok((result.source_state, result.target_state, result.received))
+}
+
+pub(in crate::compositor::tests) fn forward_clipboard_with_selection_accept(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    accept_mime_type: &str,
+) -> Result<ClipboardSelectionAcceptTransfer, Box<dyn std::error::Error>> {
+    forward_clipboard_between_two_clients_with_options(
+        socket_path,
+        commands,
+        &["text/plain;charset=utf-8"],
+        Some(accept_mime_type),
+        &["text/plain;charset=utf-8"],
+    )
+}
+
+fn forward_clipboard_between_two_clients_with_options(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    source_mime_types: &[&str],
+    accept_mime_type: Option<&str>,
+    receive_mime_types: &[&str],
+) -> Result<ClipboardSelectionAcceptTransfer, Box<dyn std::error::Error>> {
     let source_stream = UnixStream::connect(socket_path)?;
     let source_connection = Connection::from_socket(source_stream)?;
     let (source_globals, mut source_queue) =
@@ -30,8 +71,9 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
         source_globals.bind(&source_qh, 1..=3, ())?;
     let _source_keyboard = source_seat.get_keyboard(&source_qh, ());
     let source_data_source = source_manager.create_data_source(&source_qh, ());
-    source_data_source.offer("text/plain".to_string());
-    source_data_source.offer("text/html".to_string());
+    for mime_type in source_mime_types {
+        source_data_source.offer((*mime_type).to_string());
+    }
     let source_data_device = source_manager.get_data_device(&source_seat, &source_qh, ());
     let source_surface = source_compositor.create_surface(&source_qh, ());
     let source_xdg_surface = source_wm_base.get_xdg_surface(&source_surface, &source_qh, ());
@@ -85,10 +127,19 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
         .data_device_selection_offer
         .clone()
         .ok_or_else(|| io::Error::other("target did not receive a clipboard selection offer"))?;
+    let offer_protocol_id = offer.id().protocol_id();
+    let selection_generation_before_accept = capture_clipboard_state(commands).generation;
+    if let Some(mime_type) = accept_mime_type {
+        offer.accept(130, Some(mime_type.to_string()));
+        target_connection.flush()?;
+        target_connection.roundtrip()?;
+    }
+    let selection_generation_after_accept = capture_clipboard_state(commands).generation;
+
     let mut received = Vec::new();
-    for mime_type in ["text/plain", "text/html"] {
+    for mime_type in receive_mime_types {
         let (read_fd, write_fd) = owned_pipe()?;
-        offer.receive(mime_type.to_string(), write_fd.as_fd());
+        offer.receive((*mime_type).to_string(), write_fd.as_fd());
         target_connection.flush()?;
         drop(write_fd);
         target_connection.roundtrip()?;
@@ -99,7 +150,17 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
         received.push(payload);
     }
 
-    Ok((source_state, target_state, received))
+    let selection_generation_after_receive = capture_clipboard_state(commands).generation;
+
+    Ok(ClipboardSelectionAcceptTransfer {
+        source_state,
+        target_state,
+        received,
+        offer_protocol_id,
+        selection_generation_before_accept,
+        selection_generation_after_accept,
+        selection_generation_after_receive,
+    })
 }
 
 const FIREFOX_TEXT_MIME_TYPES: [&str; 4] = [

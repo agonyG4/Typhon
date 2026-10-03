@@ -7,6 +7,13 @@ struct RawSurfaceFocusSnapshot {
     keyboard_focus: Option<u32>,
 }
 
+#[derive(Clone, Copy)]
+enum SelectionOfferRequest {
+    SetActions,
+    Finish,
+    ReceiveInvalidMime,
+}
+
 #[test]
 fn clipboard_ready_wayland_client_can_create_data_device() {
     let socket_name = unique_socket_name();
@@ -168,6 +175,252 @@ fn clipboard_ready_wayland_clients_transfer_selection_without_compositor_bufferi
         ["text/plain", "text/html"]
     );
     assert_eq!(received, ["clipboard payload", "clipboard payload"]);
+}
+
+#[test]
+fn clipboard_selection_accept_then_receive_survives_exact_firefox_mime() {
+    let (transfer, dnd_state) = run_clipboard_selection_accept_case("text/plain;charset=utf-8");
+
+    assert_eq!(
+        transfer.target_state.data_offer_mime_types,
+        ["text/plain;charset=utf-8"]
+    );
+    assert_eq!(
+        transfer.source_state.data_source_send_mime_types,
+        ["text/plain;charset=utf-8"]
+    );
+    assert_eq!(transfer.received, ["clipboard payload"]);
+    assert_eq!(
+        transfer.selection_generation_after_accept,
+        transfer.selection_generation_before_accept
+    );
+    assert_eq!(
+        transfer.selection_generation_after_receive,
+        transfer.selection_generation_before_accept
+    );
+    assert!(
+        transfer
+            .source_state
+            .data_source_target_mime_types
+            .is_empty()
+    );
+    assert_eq!(dnd_state.offer_phase, None);
+    assert_eq!(dnd_state.active_phase, None);
+    assert_eq!(dnd_state.offer_action_events, 0);
+    assert_eq!(dnd_state.source_action_events, 0);
+}
+
+#[test]
+fn clipboard_selection_accept_with_unoffered_mime_is_ignored() {
+    let (transfer, dnd_state) = run_clipboard_selection_accept_case("application/x-unoffered");
+
+    assert_eq!(transfer.received, ["clipboard payload"]);
+    assert_eq!(
+        transfer.source_state.data_source_send_mime_types,
+        ["text/plain;charset=utf-8"]
+    );
+    assert_eq!(
+        transfer.selection_generation_after_accept,
+        transfer.selection_generation_before_accept
+    );
+    assert!(
+        transfer
+            .source_state
+            .data_source_target_mime_types
+            .is_empty()
+    );
+    assert_eq!(dnd_state.offer_phase, None);
+    assert_eq!(dnd_state.active_phase, None);
+    assert_eq!(dnd_state.offer_action_events, 0);
+    assert_eq!(dnd_state.source_action_events, 0);
+}
+
+fn run_clipboard_selection_accept_case(
+    accept_mime_type: &str,
+) -> (ClipboardSelectionAcceptTransfer, DndActionSnapshot) {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_selection_capabilities(
+        &socket_name,
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let transfer =
+        forward_clipboard_with_selection_accept(&socket_path, &commands, accept_mime_type).unwrap();
+    let dnd_state = capture_dnd_action_snapshot(&commands, transfer.offer_protocol_id)
+        .expect("selection offer must remain tracked without DnD state");
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    (transfer, dnd_state)
+}
+
+#[test]
+fn clipboard_selection_offer_keeps_set_actions_and_finish_fatal() {
+    let set_actions = selection_offer_request(SelectionOfferRequest::SetActions)
+        .expect("selection offer set_actions must remain fatal");
+    assert_eq!(
+        set_actions.code,
+        client_wl_data_offer::Error::InvalidOffer as u32
+    );
+    assert_eq!(
+        set_actions.message,
+        "selection offer cannot negotiate drag-and-drop actions"
+    );
+
+    let finish = selection_offer_request(SelectionOfferRequest::Finish)
+        .expect("selection offer finish must remain fatal");
+    assert_eq!(
+        finish.code,
+        client_wl_data_offer::Error::InvalidFinish as u32
+    );
+    assert_eq!(
+        finish.message,
+        "data offer finish was not preceded by a valid drop"
+    );
+}
+
+#[test]
+fn clipboard_selection_receive_with_unoffered_mime_still_does_not_transfer() {
+    assert!(selection_offer_request(SelectionOfferRequest::ReceiveInvalidMime).is_none());
+}
+
+fn selection_offer_request(request: SelectionOfferRequest) -> Option<ProtocolErrorObservation> {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_selection_capabilities(
+        &socket_name,
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let source_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (source_globals, mut source_queue) =
+        registry_queue_init::<RegistryTestState>(&source_connection).unwrap();
+    let source_qh = source_queue.handle();
+    let source_compositor: client_wl_compositor::WlCompositor =
+        source_globals.bind(&source_qh, 1..=6, ()).unwrap();
+    let source_wm_base: client_xdg_wm_base::XdgWmBase =
+        source_globals.bind(&source_qh, 1..=6, ()).unwrap();
+    let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ()).unwrap();
+    let source_shm: client_wl_shm::WlShm = source_globals.bind(&source_qh, 1..=1, ()).unwrap();
+    let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        source_globals.bind(&source_qh, 1..=3, ()).unwrap();
+    let _source_keyboard = source_seat.get_keyboard(&source_qh, ());
+    let source = source_manager.create_data_source(&source_qh, ());
+    source.offer("text/plain;charset=utf-8".to_string());
+    let source_device = source_manager.get_data_device(&source_seat, &source_qh, ());
+    let source_surface = source_compositor.create_surface(&source_qh, ());
+    let source_xdg_surface = source_wm_base.get_xdg_surface(&source_surface, &source_qh, ());
+    let _source_toplevel = source_xdg_surface.get_toplevel(&source_qh, ());
+    source_surface.commit();
+    source_connection.flush().unwrap();
+
+    let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state).unwrap();
+    commit_test_buffered_surface(&source_surface, &source_shm, &source_qh, 32, 32).unwrap();
+    source_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    let serial = source_state
+        .keyboard_enter_serial
+        .expect("clipboard source must receive keyboard focus");
+    source_device.set_selection(Some(&source), serial);
+    source_connection.flush().unwrap();
+    source_connection.roundtrip().unwrap();
+
+    let target_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (target_globals, mut target_queue) =
+        registry_queue_init::<RegistryTestState>(&target_connection).unwrap();
+    let target_qh = target_queue.handle();
+    let target_compositor: client_wl_compositor::WlCompositor =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let target_wm_base: client_xdg_wm_base::XdgWmBase =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ()).unwrap();
+    let target_shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+    let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        target_globals.bind(&target_qh, 1..=3, ()).unwrap();
+    let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
+    let _target_device = target_manager.get_data_device(&target_seat, &target_qh, ());
+    let target_surface = target_compositor.create_surface(&target_qh, ());
+    let target_xdg_surface = target_wm_base.get_xdg_surface(&target_surface, &target_qh, ());
+    let _target_toplevel = target_xdg_surface.get_toplevel(&target_qh, ());
+    target_surface.commit();
+    target_connection.flush().unwrap();
+
+    let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    commit_test_buffered_surface(&target_surface, &target_shm, &target_qh, 32, 32).unwrap();
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    let offer = target_state
+        .data_device_selection_offer
+        .as_ref()
+        .expect("target must receive a clipboard selection offer");
+
+    let observed = match request {
+        SelectionOfferRequest::SetActions => {
+            offer.set_actions(
+                client_wl_data_device_manager::DndAction::Copy,
+                client_wl_data_device_manager::DndAction::Copy,
+            );
+            target_connection.flush().unwrap();
+            wait_for_server_commands(&commands);
+            Some(expect_protocol_error(
+                &target_connection,
+                "wl_data_offer",
+                client_wl_data_offer::Error::InvalidOffer as u32,
+            ))
+        }
+        SelectionOfferRequest::Finish => {
+            offer.finish();
+            target_connection.flush().unwrap();
+            wait_for_server_commands(&commands);
+            Some(expect_protocol_error(
+                &target_connection,
+                "wl_data_offer",
+                client_wl_data_offer::Error::InvalidFinish as u32,
+            ))
+        }
+        SelectionOfferRequest::ReceiveInvalidMime => {
+            let (read_fd, write_fd) = owned_pipe().unwrap();
+            offer.receive("application/x-unoffered".to_string(), write_fd.as_fd());
+            target_connection.flush().unwrap();
+            drop(write_fd);
+            target_connection
+                .roundtrip()
+                .expect("invalid selection receive MIME must not disconnect the client");
+            let mut payload = Vec::new();
+            File::from(read_fd).read_to_end(&mut payload).unwrap();
+            assert!(payload.is_empty());
+            source_queue.roundtrip(&mut source_state).unwrap();
+            assert!(source_state.data_source_send_mime_types.is_empty());
+            None
+        }
+    };
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+    drop(source_queue);
+    drop(source_connection);
+
+    observed
 }
 
 #[test]
