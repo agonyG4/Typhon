@@ -14,9 +14,9 @@ use super::planner::{
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
-    DirectPresentationInputs, inspect_direct_presentation,
-    interactive_visual_render_admission_allowed, log_prepared_primary_arbitration,
-    suppress_direct_render_ahead,
+    CompositedPrimaryAdmission, DirectPresentationInputs, composited_primary_admission,
+    inspect_direct_presentation, interactive_visual_render_admission_allowed,
+    log_prepared_primary_arbitration, suppress_direct_render_ahead,
 };
 use super::presentation_metrics::{
     PipelineSchedulingDiagnostics, build_render_begin_fields, finish_no_primary_work,
@@ -1386,12 +1386,14 @@ impl NativeRuntime {
                         monotonic_now_ns()?,
                     );
                 }
-                let no_primary_work = output_damage.is_empty()
-                    && !effective_redraw_requested
-                    && !effect_demand.continuous_visible
-                    && !interactive_visual_applied
-                    && !physical_state_may_change;
-                if no_primary_work {
+                let primary_admission = composited_primary_admission(
+                    output_damage.is_empty(),
+                    effective_redraw_requested,
+                    effect_demand.continuous_visible,
+                    interactive_visual_applied,
+                    physical_state_may_change,
+                );
+                if primary_admission == CompositedPrimaryAdmission::NoPrimaryWork {
                     let surface_damage = scene_changed.then(|| {
                         let sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
                         let exact_cursor_commit = cursor_render_mode

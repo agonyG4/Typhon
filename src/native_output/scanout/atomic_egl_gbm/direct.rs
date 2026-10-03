@@ -2,13 +2,170 @@ use super::*;
 use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::presentation::transaction::{
-    DirectPresentationStateDisposition, OutputPresentationStateKey,
+    DirectContentDisposition, DirectPresentationStateDisposition, OutputPresentationStateKey,
+    OutputProtocolObligations, OutputTransactionBuildError, classify_direct_content,
     classify_direct_presentation_state,
 };
 use crate::native_output::runtime::{
     discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
     take_client_cursor_presentation_feedback_batch,
 };
+use crate::native_output::scanout::direct_validation::first_qualified_direct_presentation_state;
+
+struct DirectCandidatePresentationFlow {
+    same_visual_assignment: bool,
+    confirmed_state: OutputPresentationStateKey,
+    requested_state: OutputPresentationStateKey,
+    initial_state_disposition: Option<DirectPresentationStateDisposition>,
+}
+
+enum DirectPresentationQualification<F> {
+    DeferUntilPageflip,
+    PresentationRejected,
+    TransactionRequired {
+        framebuffer: F,
+        state: OutputPresentationStateKey,
+        state_disposition: DirectPresentationStateDisposition,
+    },
+}
+
+impl DirectCandidatePresentationFlow {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        candidate_key: DirectScanoutCandidateKey,
+        presented_key: Option<DirectScanoutCandidateKey>,
+        pending_key: Option<DirectScanoutCandidateKey>,
+        confirmed_state: OutputPresentationStateKey,
+        requested_state: OutputPresentationStateKey,
+        pending_state: Option<OutputPresentationStateKey>,
+        has_submitted_direct_assignment: bool,
+    ) -> Self {
+        let content_disposition =
+            classify_direct_content(candidate_key, presented_key, pending_key);
+        let same_visual_assignment = content_disposition != DirectContentDisposition::NewContent;
+        let initial_state_disposition = same_visual_assignment.then(|| {
+            if (content_disposition == DirectContentDisposition::MatchesQueuedOrSubmitted
+                || has_submitted_direct_assignment)
+                && pending_state.is_none()
+            {
+                DirectPresentationStateDisposition::DeferUntilPageflip
+            } else {
+                classify_direct_presentation_state(requested_state, confirmed_state, pending_state)
+            }
+        });
+
+        Self {
+            same_visual_assignment,
+            confirmed_state,
+            requested_state,
+            initial_state_disposition,
+        }
+    }
+
+    fn same_visual_assignment(&self) -> bool {
+        self.same_visual_assignment
+    }
+
+    fn initial_state_disposition(&self) -> Option<DirectPresentationStateDisposition> {
+        self.initial_state_disposition
+    }
+
+    fn qualify<F, E>(
+        &self,
+        import_framebuffer: impl FnOnce() -> Result<F, E>,
+        mut qualifies: impl FnMut(&F, OutputPresentationMode) -> bool,
+    ) -> Result<DirectPresentationQualification<F>, E> {
+        if self.initial_state_disposition
+            == Some(DirectPresentationStateDisposition::DeferUntilPageflip)
+        {
+            return Ok(DirectPresentationQualification::DeferUntilPageflip);
+        }
+
+        let framebuffer = import_framebuffer()?;
+        let Some((state, state_disposition)) = first_qualified_direct_presentation_state(
+            self.requested_state.mode,
+            self.requested_state.content_type,
+            self.requested_state.output_generation,
+            self.confirmed_state,
+            |mode| qualifies(&framebuffer, mode),
+        ) else {
+            return Ok(DirectPresentationQualification::PresentationRejected);
+        };
+
+        Ok(DirectPresentationQualification::TransactionRequired {
+            framebuffer,
+            state,
+            state_disposition,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum DirectTransactionInsertError {
+    Insert(OutputTransactionError),
+}
+
+fn insert_direct_transaction_and_reserve<A>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction: OutputTransaction,
+    candidate_key: DirectScanoutCandidateKey,
+    reserve: impl FnOnce(
+        DirectScanoutCandidateKey,
+    ) -> Result<A, crate::native_output::kms_worker::KmsWorkerAdmissionError>,
+) -> Result<
+    (
+        Result<A, crate::native_output::kms_worker::KmsWorkerAdmissionError>,
+        OutputProtocolObligations,
+    ),
+    DirectTransactionInsertError,
+> {
+    let transaction_id = transaction.id();
+    output_transactions
+        .insert(transaction)
+        .map_err(DirectTransactionInsertError::Insert)?;
+    let obligations = output_transactions
+        .transaction(transaction_id)
+        .expect("direct transaction was just inserted")
+        .descriptor()
+        .obligations();
+    Ok((reserve(candidate_key), obligations))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_direct_output_transaction(
+    output_id: OutputId,
+    transaction_id: OutputTransactionId,
+    output_generation: u64,
+    created_at: MonotonicTimestampNs,
+    target: PresentationTarget,
+    pacing_mode: NativeOutputPacingMode,
+    frame_id: u64,
+    candidate_key: DirectScanoutCandidateKey,
+    framebuffer_id: u32,
+    cursor_assignment: Option<CursorPlaneAssignment>,
+    protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId,
+    direct_surface_id: u32,
+    release: OutputReleasePlan,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
+) -> Result<OutputTransaction, OutputTransactionBuildError> {
+    OutputTransaction::direct(
+        output_id,
+        transaction_id,
+        output_generation,
+        created_at,
+        target,
+        pacing_mode,
+        frame_id,
+        candidate_key,
+        framebuffer_id,
+        cursor_assignment,
+        protocol_batch_id,
+        direct_surface_id,
+        release,
+    )
+    .and_then(|transaction| transaction.with_presentation_state(presentation_mode, content_type))
+}
 
 #[allow(clippy::too_many_arguments)]
 fn settle_no_visual_change_transaction(
@@ -300,59 +457,25 @@ impl AtomicEglGbmScanout {
         let pending_key = pending_direct_state
             .map(|_| candidate_key)
             .or(submitted_key);
-        let disposition = classify_direct_content(candidate_key, presented_key, pending_key);
-        let same_visual_assignment = disposition != DirectContentDisposition::NewContent;
         let requested_state = OutputPresentationStateKey {
             mode: presentation_mode,
             content_type,
             output_generation: self.direct.drm_generation,
         };
-        if same_visual_assignment {
-            let state_disposition = if disposition
-                == DirectContentDisposition::MatchesQueuedOrSubmitted
-                && pending_direct_state.is_none()
-                || has_submitted_direct_assignment && pending_direct_state.is_none()
-            {
-                DirectPresentationStateDisposition::DeferUntilPageflip
-            } else {
-                classify_direct_presentation_state(
-                    requested_state,
-                    confirmed_presentation_state,
-                    pending_direct_state,
-                )
-            };
-            match state_disposition {
-                DirectPresentationStateDisposition::AlreadyRepresented => {
-                    self.direct.counters.same_buffer_suppressed = self
-                        .direct
-                        .counters
-                        .same_buffer_suppressed
-                        .saturating_add(1);
-                    if !settle_no_visual_change_transaction(
-                        self,
-                        server,
-                        output_transactions,
-                        self.direct.drm_generation,
-                        target,
-                        pacing_mode,
-                        candidate_key,
-                        0,
-                        cursor,
-                        cursor_epoch,
-                        candidate.surface_id,
-                        release,
-                        presentation_mode,
-                        content_type,
-                    )? {
-                        return Ok(DirectScanoutAttempt::TimingDeferred);
-                    }
-                    return Ok(DirectScanoutAttempt::Unchanged);
-                }
-                DirectPresentationStateDisposition::DeferUntilPageflip => {
-                    return Ok(DirectScanoutAttempt::TimingDeferred);
-                }
-                DirectPresentationStateDisposition::TransitionRequired => {}
-            }
+        let presentation_flow = DirectCandidatePresentationFlow::new(
+            candidate_key,
+            presented_key,
+            pending_key,
+            confirmed_presentation_state,
+            requested_state,
+            pending_direct_state,
+            has_submitted_direct_assignment,
+        );
+        let same_visual_assignment = presentation_flow.same_visual_assignment();
+        if presentation_flow.initial_state_disposition()
+            == Some(DirectPresentationStateDisposition::DeferUntilPageflip)
+        {
+            return Ok(DirectScanoutAttempt::TimingDeferred);
         }
         if candidate.buffer.planes().is_empty() {
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
@@ -436,87 +559,97 @@ impl AtomicEglGbmScanout {
             ));
             self.direct.identity_viewport_metadata_logged = true;
         }
-        self.direct.counters.import_attempts += 1;
-        let (framebuffer, cache_hit) = match self
-            .direct
-            .framebuffer_cache
-            .get_or_import(&candidate.buffer_identity, &candidate.buffer)
-        {
-            Ok(imported) => imported,
-            Err(error) => {
-                self.direct.counters.import_failures += 1;
-                eprintln!("direct scanout: dma-buf import rejected: {error}");
-                return Ok(DirectScanoutAttempt::Fallback("import_failed"));
-            }
-        };
-        if cache_hit {
-            self.direct.counters.import_cache_hits += 1;
-        }
-        direct_scanout_debug(if cache_hit {
-            "import cache hit".to_string()
-        } else {
-            "imported dma-buf framebuffer".to_string()
-        });
-
         let requested_presentation_mode = presentation_mode;
         let test_token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native TEST_ONLY pageflip token is nonzero");
         let mut qualified_validation_key = None;
-        let Some((qualified_state, qualified_state_disposition)) =
-            first_qualified_direct_presentation_state(
-                requested_presentation_mode,
-                content_type,
-                self.direct.drm_generation,
-                confirmed_presentation_state,
-                |mode| {
-                    let key = validation_key.with_presentation_state(mode, content_type);
-                    let qualified = if self.direct.validation_cache.contains(key) {
-                        self.direct.counters.validation_cache_hits =
-                            self.direct.counters.validation_cache_hits.saturating_add(1);
-                        true
-                    } else {
-                        self.direct.counters.validation_cache_misses = self
-                            .direct
-                            .counters
-                            .validation_cache_misses
-                            .saturating_add(1);
-                        let result = if let Some(cursor) = cursor {
-                            kms.test_flip_with_presentation(
-                                framebuffer.framebuffer,
-                                test_token,
-                                Some(cursor),
-                                mode,
-                                content_type,
-                            )
-                        } else {
-                            kms.test_flip_without_cursor_with_presentation(
-                                framebuffer.framebuffer,
-                                test_token,
-                                mode,
-                                content_type,
-                            )
-                        };
-                        if result.is_ok() {
-                            self.direct.validation_cache.record_success(key);
-                        } else {
-                            direct_scanout_debug(format_args!(
-                                "exact presentation TEST_ONLY rejected mode={}",
-                                mode.as_str()
-                            ));
+        let import_attempts = &mut self.direct.counters.import_attempts;
+        let import_failures = &mut self.direct.counters.import_failures;
+        let import_cache_hits = &mut self.direct.counters.import_cache_hits;
+        let framebuffer_cache = &mut self.direct.framebuffer_cache;
+        let validation_cache_hits = &mut self.direct.counters.validation_cache_hits;
+        let validation_cache_misses = &mut self.direct.counters.validation_cache_misses;
+        let validation_cache = &mut self.direct.validation_cache;
+        let qualification = presentation_flow.qualify(
+            || {
+                *import_attempts = import_attempts.saturating_add(1);
+                match framebuffer_cache.get_or_import(&candidate.buffer_identity, &candidate.buffer)
+                {
+                    Ok((framebuffer, cache_hit)) => {
+                        if cache_hit {
+                            *import_cache_hits = import_cache_hits.saturating_add(1);
                         }
-                        result.is_ok()
-                    };
-                    if qualified {
-                        qualified_validation_key = Some(key);
+                        direct_scanout_debug(if cache_hit {
+                            "import cache hit".to_string()
+                        } else {
+                            "imported dma-buf framebuffer".to_string()
+                        });
+                        Ok(framebuffer)
                     }
-                    qualified
-                },
-            )
-        else {
-            self.note_direct_rejection(true, cursor.is_some());
-            return Ok(DirectScanoutAttempt::Fallback(
-                "presentation_test_only_rejected",
-            ));
+                    Err(error) => {
+                        *import_failures = import_failures.saturating_add(1);
+                        Err(error)
+                    }
+                }
+            },
+            |framebuffer, mode| {
+                let key = validation_key.with_presentation_state(mode, content_type);
+                let qualified = if validation_cache.contains(key) {
+                    *validation_cache_hits = validation_cache_hits.saturating_add(1);
+                    true
+                } else {
+                    *validation_cache_misses = validation_cache_misses.saturating_add(1);
+                    let result = if let Some(cursor) = cursor {
+                        kms.test_flip_with_presentation(
+                            framebuffer.framebuffer,
+                            test_token,
+                            Some(cursor),
+                            mode,
+                            content_type,
+                        )
+                    } else {
+                        kms.test_flip_without_cursor_with_presentation(
+                            framebuffer.framebuffer,
+                            test_token,
+                            mode,
+                            content_type,
+                        )
+                    };
+                    if result.is_ok() {
+                        validation_cache.record_success(key);
+                    } else {
+                        direct_scanout_debug(format_args!(
+                            "exact presentation TEST_ONLY rejected mode={}",
+                            mode.as_str()
+                        ));
+                    }
+                    result.is_ok()
+                };
+                if qualified {
+                    qualified_validation_key = Some(key);
+                }
+                qualified
+            },
+        );
+        let (framebuffer, qualified_state, qualified_state_disposition) = match qualification {
+            Ok(DirectPresentationQualification::DeferUntilPageflip) => {
+                return Ok(DirectScanoutAttempt::TimingDeferred);
+            }
+            Ok(DirectPresentationQualification::PresentationRejected) => {
+                self.note_direct_rejection(true, cursor.is_some());
+                return Ok(DirectScanoutAttempt::Fallback(
+                    "presentation_test_only_rejected",
+                ));
+            }
+            Ok(DirectPresentationQualification::TransactionRequired {
+                framebuffer,
+                state,
+                state_disposition,
+            }) => (framebuffer, state, state_disposition),
+            Err(error) => {
+                eprintln!("direct scanout: dma-buf import rejected: {error}");
+                return Ok(DirectScanoutAttempt::Fallback("import_failed"));
+            }
         };
         presentation_mode = qualified_state.mode;
         let validation_key = qualified_validation_key
@@ -613,7 +746,7 @@ impl AtomicEglGbmScanout {
                 return Err(io::Error::other(error));
             }
         };
-        let transaction = match OutputTransaction::direct(
+        let transaction = match build_direct_output_transaction(
             self.direct.output_id,
             transaction_id,
             self.direct.drm_generation,
@@ -630,13 +763,11 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             candidate.surface_id,
             release,
+            presentation_mode,
+            content_type,
         )
-        .and_then(|transaction| {
-            transaction
-                .with_presentation_state(presentation_mode, content_type)
-                .map(|transaction| {
-                    transaction.with_client_cursor_presentation_key(client_cursor_presentation_key)
-                })
+        .map(|transaction| {
+            transaction.with_client_cursor_presentation_key(client_cursor_presentation_key)
         }) {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -663,20 +794,23 @@ impl AtomicEglGbmScanout {
             },
             None => transaction,
         };
-        if let Err(error) = output_transactions.insert(transaction) {
-            server.restore_frame_batch_after_render_failure(protocol_batch_id);
-            if let Some(batch_id) = cursor_presentation_batch_id {
-                server.restore_presentation_feedback_batch_after_failure(batch_id);
+        let (admission, obligations) = match insert_direct_transaction_and_reserve(
+            output_transactions,
+            transaction,
+            candidate_key,
+            |key| worker.try_reserve_direct_admission(key),
+        ) {
+            Ok(admitted) => admitted,
+            Err(DirectTransactionInsertError::Insert(error)) => {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                if let Some(batch_id) = cursor_presentation_batch_id {
+                    server.restore_presentation_feedback_batch_after_failure(batch_id);
+                }
+                drop(surface_damage);
+                return Err(io::Error::other(error));
             }
-            drop(surface_damage);
-            return Err(io::Error::other(error));
-        }
-        let obligations = output_transactions
-            .transaction(transaction_id)
-            .expect("direct transaction was just inserted")
-            .descriptor()
-            .obligations();
-        let admission = match worker.try_reserve_direct_admission(candidate_key) {
+        };
+        let admission = match admission {
             Ok(admission) => admission,
             Err(crate::native_output::kms_worker::KmsWorkerAdmissionError::DuplicateCandidate) => {
                 self.note_direct_worker_admission_rejected(false);
@@ -1160,7 +1294,278 @@ fn record_direct_blocker(counters: &mut DirectScanoutCounters, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectScanoutCounters, record_direct_blocker};
+    use super::{
+        DirectCandidatePresentationFlow, DirectPresentationQualification, DirectScanoutCounters,
+        insert_direct_transaction_and_reserve, record_direct_blocker,
+    };
+    use crate::native_output::kms_worker::KmsWorkerAdmissionError;
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionLedger, OutputTransactionState,
+    };
+    use crate::native_output::presentation::transaction::{
+        ContentEpochId, DirectPresentationStateDisposition, DirectScanoutCandidateKey,
+        OutputContentKey, OutputPresentationStateKey, OutputTransaction, OutputTransactionContent,
+        OutputTransactionId,
+    };
+    use crate::native_output::scanout::OutputReleasePlan;
+    use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
+    use oblivion_one::core::OutputId;
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
+    };
+    use oblivion_one::native::scheduler::NativeOutputPacingMode;
+    use std::{num::NonZeroU64, time::Duration};
+
+    fn candidate_key() -> DirectScanoutCandidateKey {
+        DirectScanoutCandidateKey {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            content: OutputContentKey::new(
+                7,
+                NonZeroU64::new(1).expect("buffer id"),
+                ContentEpochId::new(NonZeroU64::new(1).expect("content epoch")),
+                1920,
+                1080,
+                0x3432_5241,
+                0,
+                0,
+                1_000,
+                0,
+            ),
+            output_generation: 1,
+            cursor_content_key: None,
+            color_epoch: 0,
+        }
+    }
+
+    fn target() -> PresentationTarget {
+        let now = MonotonicTimestampNs::new(10);
+        PresentationTarget {
+            sequence: 1,
+            presentation_time: now,
+            submit_not_before: now,
+            render_start_deadline: now,
+            refresh_interval: Duration::from_millis(16),
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: now,
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
+        }
+    }
+
+    fn direct_transaction(
+        id: OutputTransactionId,
+        key: DirectScanoutCandidateKey,
+        framebuffer_id: u32,
+        state: OutputPresentationStateKey,
+    ) -> OutputTransaction {
+        super::build_direct_output_transaction(
+            key.output_id,
+            id,
+            state.output_generation,
+            MonotonicTimestampNs::new(11),
+            target(),
+            NativeOutputPacingMode::ReactiveDouble,
+            id.get(),
+            key,
+            framebuffer_id,
+            None,
+            oblivion_one::compositor::CompositorFrameBatchId::new(
+                NonZeroU64::new(id.get()).expect("frame batch id"),
+            ),
+            key.content.surface_id,
+            OutputReleasePlan::Pageflip,
+            state.mode,
+            state.content_type,
+        )
+        .map(|transaction| transaction.with_client_cursor_presentation_key(None))
+        .expect("direct transaction")
+    }
+
+    fn same_candidate_flow(
+        key: DirectScanoutCandidateKey,
+        confirmed: OutputPresentationMode,
+        requested: OutputPresentationMode,
+    ) -> DirectCandidatePresentationFlow {
+        DirectCandidatePresentationFlow::new(
+            key,
+            Some(key),
+            None,
+            OutputPresentationStateKey {
+                mode: confirmed,
+                content_type: DrmContentType::Graphics,
+                output_generation: key.output_generation,
+            },
+            OutputPresentationStateKey {
+                mode: requested,
+                content_type: DrmContentType::Graphics,
+                output_generation: key.output_generation,
+            },
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn presented_adaptive_direct_candidate_requalifies_falls_back_and_is_admitted_zero_copy() {
+        let key = candidate_key();
+        let flow = same_candidate_flow(
+            key,
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::AdaptiveSync,
+        );
+        assert!(flow.same_visual_assignment());
+        assert_eq!(
+            flow.initial_state_disposition(),
+            Some(DirectPresentationStateDisposition::AlreadyRepresented)
+        );
+
+        let framebuffer_id = 73;
+        let mut imported_framebuffer = None;
+        let mut tested_modes = Vec::new();
+        let qualification = flow
+            .qualify(
+                || {
+                    let reused_framebuffer = framebuffer_id;
+                    imported_framebuffer = Some(reused_framebuffer);
+                    Ok::<_, ()>(reused_framebuffer)
+                },
+                |reused_framebuffer, mode| {
+                    assert_eq!(*reused_framebuffer, framebuffer_id);
+                    tested_modes.push(mode);
+                    mode == OutputPresentationMode::Vsync
+                },
+            )
+            .expect("framebuffer cache reuse");
+        let DirectPresentationQualification::TransactionRequired {
+            framebuffer,
+            state,
+            state_disposition,
+        } = qualification
+        else {
+            panic!("Vsync fallback must require a direct KMS transaction");
+        };
+        assert_eq!(imported_framebuffer, Some(framebuffer_id));
+        assert_eq!(framebuffer, framebuffer_id);
+        assert_eq!(
+            tested_modes,
+            [
+                OutputPresentationMode::AdaptiveSync,
+                OutputPresentationMode::Vsync
+            ]
+        );
+        assert_eq!(state.mode, OutputPresentationMode::Vsync);
+        assert_eq!(
+            state_disposition,
+            DirectPresentationStateDisposition::TransitionRequired
+        );
+
+        let transaction_id = OutputTransactionId::new(NonZeroU64::new(9).unwrap());
+        let transaction = direct_transaction(transaction_id, key, framebuffer, state);
+        let mut ledger = OutputTransactionLedger::new();
+        let mut worker_admissions = 0;
+        let (admission, _obligations) =
+            insert_direct_transaction_and_reserve(&mut ledger, transaction, key, |admitted_key| {
+                assert_eq!(admitted_key, key);
+                worker_admissions += 1;
+                Ok::<_, KmsWorkerAdmissionError>(())
+            })
+            .expect("worker admission");
+
+        assert_eq!(
+            admission.expect("worker accepted the Direct assignment"),
+            ()
+        );
+        assert_eq!(worker_admissions, 1);
+        let record = ledger
+            .transaction(transaction_id)
+            .expect("active Direct transaction");
+        assert_eq!(record.state(), OutputTransactionState::Built);
+        assert_eq!(
+            record.descriptor().presentation_mode(),
+            OutputPresentationMode::Vsync
+        );
+        assert!(matches!(
+            record.descriptor().content(),
+            OutputTransactionContent::Direct {
+                key: transaction_key,
+                ..
+            } if transaction_key == key
+        ));
+    }
+
+    #[test]
+    fn vsync_direct_candidate_qualifies_adaptive_state_only_transition() {
+        let key = candidate_key();
+        let flow = same_candidate_flow(
+            key,
+            OutputPresentationMode::Vsync,
+            OutputPresentationMode::AdaptiveSync,
+        );
+        let mut reused = 0;
+        let qualification = flow
+            .qualify(
+                || {
+                    reused += 1;
+                    Ok::<_, ()>(73_u32)
+                },
+                |framebuffer_id, mode| {
+                    *framebuffer_id == 73 && mode == OutputPresentationMode::AdaptiveSync
+                },
+            )
+            .expect("framebuffer cache reuse");
+        let DirectPresentationQualification::TransactionRequired {
+            framebuffer,
+            state,
+            state_disposition,
+        } = qualification
+        else {
+            panic!("accepted Adaptive Sync must create a direct transaction");
+        };
+        assert_eq!(reused, 1);
+        assert_eq!(framebuffer, 73);
+        assert!(flow.same_visual_assignment());
+        assert_eq!(state.mode, OutputPresentationMode::AdaptiveSync);
+        assert_eq!(
+            state_disposition,
+            DirectPresentationStateDisposition::TransitionRequired
+        );
+
+        let transaction_id = OutputTransactionId::new(NonZeroU64::new(10).unwrap());
+        let transaction = direct_transaction(transaction_id, key, framebuffer, state);
+        let mut ledger = OutputTransactionLedger::new();
+        let mut worker_admissions = 0;
+        let (admission, _obligations) =
+            insert_direct_transaction_and_reserve(&mut ledger, transaction, key, |admitted_key| {
+                assert_eq!(admitted_key, key);
+                worker_admissions += 1;
+                Ok::<_, KmsWorkerAdmissionError>(())
+            })
+            .expect("worker admission");
+
+        admission.expect("worker accepted the state-only Direct transition");
+        assert_eq!(worker_admissions, 1);
+        let record = ledger
+            .transaction(transaction_id)
+            .expect("active Direct state-transition transaction");
+        assert_eq!(record.state(), OutputTransactionState::Built);
+        assert_eq!(
+            record.descriptor().presentation_mode(),
+            OutputPresentationMode::AdaptiveSync
+        );
+        assert!(matches!(
+            record.descriptor().content(),
+            OutputTransactionContent::Direct {
+                key: transaction_key,
+                ..
+            } if transaction_key == key
+        ));
+    }
 
     #[test]
     fn note_direct_blocker_preserves_first_blocker() {

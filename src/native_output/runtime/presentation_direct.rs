@@ -63,6 +63,31 @@ pub(super) const fn interactive_visual_render_admission_allowed(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompositedPrimaryAdmission {
+    NoPrimaryWork,
+    Render,
+}
+
+pub(super) const fn composited_primary_admission(
+    output_damage_empty: bool,
+    effective_redraw_requested: bool,
+    effect_continuous_visible: bool,
+    interactive_visual_applied: bool,
+    physical_state_may_change: bool,
+) -> CompositedPrimaryAdmission {
+    if output_damage_empty
+        && !effective_redraw_requested
+        && !effect_continuous_visible
+        && !interactive_visual_applied
+        && !physical_state_may_change
+    {
+        CompositedPrimaryAdmission::NoPrimaryWork
+    } else {
+        CompositedPrimaryAdmission::Render
+    }
+}
+
 fn direct_candidate_changed(
     direct_candidate_key: Option<DirectScanoutCandidateKey>,
     last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
@@ -278,6 +303,10 @@ pub(super) fn log_prepared_primary_arbitration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_output::presentation::transaction::{
+        DirectPresentationStateDisposition, OutputPresentationStateKey,
+        classify_direct_presentation_state, kms_presentation_state_is_represented,
+    };
     use std::num::NonZeroU64;
 
     fn candidate_key() -> DirectScanoutCandidateKey {
@@ -305,14 +334,8 @@ mod tests {
     fn pending_protocol_work_reenters_an_active_direct_assignment() {
         let key = candidate_key();
 
-        assert!(direct_candidate_changed(
-            Some(key),
-            Some(key),
-            false,
-            false,
-            true,
-            true,
-        ));
+        let reconsidered = direct_candidate_changed(Some(key), Some(key), false, false, true, true);
+        assert!(reconsidered);
         assert!(!direct_candidate_changed(
             Some(key),
             Some(key),
@@ -321,6 +344,75 @@ mod tests {
             false,
             true,
         ));
+
+        let confirmed = OutputPresentationStateKey {
+            mode: oblivion_one::compositor::OutputPresentationMode::Vsync,
+            content_type: oblivion_one::compositor::DrmContentType::Graphics,
+            output_generation: 1,
+        };
+        let requested = OutputPresentationStateKey {
+            mode: oblivion_one::compositor::OutputPresentationMode::AdaptiveSync,
+            ..confirmed
+        };
+        assert_eq!(
+            classify_direct_presentation_state(requested, confirmed, None),
+            DirectPresentationStateDisposition::TransitionRequired
+        );
+
+        let path = super::super::planner::plan_native_presentation_path(
+            super::super::planner::NativePresentationPlanInput {
+                direct_active: true,
+                direct_candidate_changed: reconsidered,
+                direct_candidate_eligible: true,
+                primary_visual_work_pending: true,
+                composition_required: false,
+                cursor_changed: false,
+                cursor_hardware_usable: true,
+                cursor_visible: false,
+                atomic_commit_pending: false,
+                plane_delta_allowed: false,
+                render_ahead_requested: false,
+            },
+        );
+        assert_eq!(path, NativePresentationPath::DirectPrimary);
+    }
+
+    #[test]
+    fn empty_damage_admits_composited_state_transition_and_keeps_confirmed_noop() {
+        let vsync = OutputPresentationStateKey {
+            mode: oblivion_one::compositor::OutputPresentationMode::Vsync,
+            content_type: oblivion_one::compositor::DrmContentType::Graphics,
+            output_generation: 1,
+        };
+        let adaptive = OutputPresentationStateKey {
+            mode: oblivion_one::compositor::OutputPresentationMode::AdaptiveSync,
+            ..vsync
+        };
+        let output_damage = crate::native_output::NativeOutputDamage::empty();
+        let transition_required = !kms_presentation_state_is_represented(adaptive, vsync, None);
+
+        assert_eq!(
+            composited_primary_admission(
+                output_damage.is_empty(),
+                false,
+                false,
+                false,
+                transition_required,
+            ),
+            CompositedPrimaryAdmission::Render
+        );
+
+        let already_confirmed = !kms_presentation_state_is_represented(adaptive, adaptive, None);
+        assert_eq!(
+            composited_primary_admission(
+                output_damage.is_empty(),
+                false,
+                false,
+                false,
+                already_confirmed,
+            ),
+            CompositedPrimaryAdmission::NoPrimaryWork
+        );
     }
 
     #[test]
