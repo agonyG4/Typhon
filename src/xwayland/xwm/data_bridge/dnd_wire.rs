@@ -1,7 +1,8 @@
-//! Typed helpers for the small XDND wire surface used by the Wayland source.
+//! Typed helpers for the XDND wire surface shared by the Wayland source and
+//! incoming XWayland target bridge.
 
 use crate::xwayland::{WaylandDndAction, XwaylandDndAction};
-use x11rb::protocol::xproto::{self, Atom, ClientMessageData};
+use x11rb::protocol::xproto::{self, Atom, ClientMessageData, Window};
 
 use super::super::atoms::{XwmAtomName, XwmAtoms};
 
@@ -9,6 +10,29 @@ pub(crate) const XDND_VERSION_SHIFT: u32 = 24;
 pub(crate) const XDND_MORE_TYPES: u32 = 1;
 pub(crate) const XDND_STATUS_ACCEPTED: u32 = 1;
 pub(crate) const XDND_FINISHED_ACCEPTED: u32 = 1;
+
+/// Decoded fields from an incoming five-word XDND Position message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedXdndPosition {
+    pub(crate) source: Window,
+    pub(crate) state: u32,
+    pub(crate) root_x: i16,
+    pub(crate) root_y: i16,
+    pub(crate) timestamp: u32,
+    pub(crate) action_atom: Atom,
+}
+
+pub(crate) fn decode_xdnd_position(data: [u32; 5]) -> DecodedXdndPosition {
+    let (root_x, root_y) = crate::xwayland::unpack_root_coordinates(data[2]);
+    DecodedXdndPosition {
+        source: data[0],
+        state: data[1],
+        root_x: root_x as i16,
+        root_y: root_y as i16,
+        timestamp: data[3],
+        action_atom: data[4],
+    }
+}
 
 /// Pack root coordinates as signed 16-bit values. XDND's fields carry the
 /// root-space X11 coordinates, so fractional compositor values are rounded
@@ -289,6 +313,110 @@ mod tests {
     }
 
     #[test]
+    fn xdnd_position_decoder_uses_each_protocol_field_exactly() {
+        let atoms = action_atoms();
+        let source = 0x71a5_2400;
+        let state = 0x05a3;
+        let coordinates = pack_root_coordinates(-123.0, 456.0).unwrap();
+        let timestamp = 0x8091_a2b3;
+        let action_atom = atoms.get(XwmAtomName::XdndActionMove);
+        let fields = [source, state, coordinates, timestamp, action_atom];
+        for left in 0..fields.len() {
+            assert!(
+                fields[left + 1..]
+                    .iter()
+                    .all(|right| *right != fields[left])
+            );
+        }
+
+        assert_eq!(
+            decode_xdnd_position(fields),
+            DecodedXdndPosition {
+                source,
+                state,
+                root_x: -123,
+                root_y: 456,
+                timestamp,
+                action_atom,
+            }
+        );
+    }
+
+    #[test]
+    fn xdnd_position_modifier_state_does_not_change_other_fields() {
+        let atoms = action_atoms();
+        let position = [
+            0x71a5_2400,
+            0x05a3,
+            pack_root_coordinates(-123.0, -456.0).unwrap(),
+            0x8091_a2b3,
+            atoms.get(XwmAtomName::XdndActionMove),
+        ];
+        let first = decode_xdnd_position(position);
+        let mut changed_state = position;
+        changed_state[1] = 0x0137;
+        let second = decode_xdnd_position(changed_state);
+
+        assert_eq!(first.state, 0x05a3);
+        assert_eq!(second.state, 0x0137);
+        assert_eq!((first.root_x, first.root_y), (-123, -456));
+        assert_eq!((second.root_x, second.root_y), (-123, -456));
+        assert_eq!(first.timestamp, second.timestamp);
+        assert_eq!(first.action_atom, second.action_atom);
+    }
+
+    #[test]
+    fn xdnd_position_action_is_decoded_only_from_data_four() {
+        let atoms = action_atoms();
+        let known_action = decode_xdnd_position([
+            0x71a5_2400,
+            0x05a3,
+            pack_root_coordinates(-123.0, 456.0).unwrap(),
+            0x8091_a2b3,
+            atoms.get(XwmAtomName::XdndActionMove),
+        ]);
+        assert_eq!(
+            action_from_atom(&atoms, known_action.action_atom),
+            Some(XwaylandDndAction::Move)
+        );
+
+        let unknown_action = decode_xdnd_position([
+            0x71a5_2400,
+            0x05a3,
+            pack_root_coordinates(-123.0, 456.0).unwrap(),
+            atoms.get(XwmAtomName::XdndActionCopy),
+            0xfeed_cafe,
+        ]);
+        assert_eq!(
+            action_from_atom(&atoms, unknown_action.action_atom),
+            None,
+            "a known action atom in timestamp data[3] cannot override unknown data[4]"
+        );
+    }
+
+    #[test]
+    fn xdnd_position_decoder_preserves_signed_coordinate_boundaries() {
+        let atoms = action_atoms();
+        let negative = decode_xdnd_position([
+            1,
+            0,
+            pack_root_coordinates(i16::MIN.into(), (-1_i16).into()).unwrap(),
+            2,
+            atoms.get(XwmAtomName::XdndActionCopy),
+        ]);
+        assert_eq!((negative.root_x, negative.root_y), (i16::MIN, -1));
+
+        let positive = decode_xdnd_position([
+            1,
+            0,
+            pack_root_coordinates(i16::MAX.into(), i16::MAX.into()).unwrap(),
+            2,
+            atoms.get(XwmAtomName::XdndActionCopy),
+        ]);
+        assert_eq!((positive.root_x, positive.root_y), (i16::MAX, i16::MAX));
+    }
+
+    #[test]
     fn requested_action_uses_only_the_deterministic_wayland_domain() {
         assert_eq!(
             requested_action(&[XwaylandDndAction::Move]),
@@ -349,6 +477,30 @@ mod tests {
             });
             assert_eq!(messages[0].data.as_data32()[1] & XDND_MORE_TYPES, more);
         }
+    }
+
+    #[test]
+    fn incoming_position_decoder_matches_the_c2_encoder_wire_layout() {
+        let atoms = action_atoms();
+        let coordinates = pack_root_coordinates(-123.0, 456.0).unwrap();
+        let messages = encode_enter_and_initial_position(EnterPositionFields {
+            actual_target: 0x31,
+            source_proxy: 0x42,
+            version: 5,
+            mime_atoms: &[0x53],
+            coordinates,
+            timestamp: 0x8091_a2b3,
+            action_atom: atoms.get(XwmAtomName::XdndActionMove),
+            enter_atom: 0x64,
+            position_atom: 0x75,
+        });
+
+        let decoded = decode_xdnd_position(messages[1].data.as_data32());
+        assert_eq!(decoded.source, 0x42);
+        assert_eq!(decoded.state, 0);
+        assert_eq!((decoded.root_x, decoded.root_y), (-123, 456));
+        assert_eq!(decoded.timestamp, 0x8091_a2b3);
+        assert_eq!(decoded.action_atom, atoms.get(XwmAtomName::XdndActionMove));
     }
 
     #[test]

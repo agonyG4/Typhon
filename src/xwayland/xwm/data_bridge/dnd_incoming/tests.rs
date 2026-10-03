@@ -10,6 +10,7 @@ use x11rb::{protocol::xproto, x11_utils::Serialize};
 
 mod action_list;
 mod position_authority;
+mod position_wire;
 
 fn offer_id(generation: XwaylandGeneration, serial: u64) -> XwaylandDndOfferId {
     XwaylandDndOfferId::new(generation, NonZeroU64::new(serial).expect("nonzero serial"))
@@ -42,6 +43,29 @@ fn count_requests(bytes: &[u8]) -> u16 {
     }
     assert_eq!(offset, bytes.len(), "complete X11 request stream");
     count
+}
+
+fn selection_conversion_timestamps(bytes: &[u8], selection: Atom) -> Vec<u32> {
+    let mut timestamps = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= bytes.len() {
+        let length_words = usize::from(u16::from_ne_bytes([bytes[offset + 2], bytes[offset + 3]]));
+        let request_len = length_words * 4;
+        assert!(request_len >= 4 && offset + request_len <= bytes.len());
+        if bytes[offset] == xproto::CONVERT_SELECTION_REQUEST {
+            assert_eq!(request_len, 24);
+            assert_eq!(
+                u32::from_ne_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()),
+                selection
+            );
+            timestamps.push(u32::from_ne_bytes(
+                bytes[offset + 20..offset + 24].try_into().unwrap(),
+            ));
+        }
+        offset += request_len;
+    }
+    assert_eq!(offset, bytes.len());
+    timestamps
 }
 
 pub(crate) fn take_requests(peer: &mut UnixStream, sequence: &mut u16) -> Vec<u8> {
@@ -142,7 +166,7 @@ fn inject_position(
         xwm,
         root,
         XwmAtomName::XdndPosition,
-        [source, packed_coordinates, timestamp, action, 0],
+        [source, 0x05a3, packed_coordinates, timestamp, action],
     );
     position.sequence = server_sequence;
     inject_client_message(xwm, peer, position);
@@ -298,10 +322,10 @@ pub(crate) fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Ato
         XwmAtomName::XdndPosition,
         [
             source,
+            0x05a3,
             packed,
             timestamp,
             xwm.atoms.get(XwmAtomName::XdndActionCopy),
-            0,
         ],
     );
     inject_client_message(&mut xwm, &mut peer, position);
@@ -380,7 +404,11 @@ pub(crate) fn position_at_for_test(
         .xid();
     let coordinates = (u32::from(x as u16) << 16) | u32::from(y as u16);
     let action = action_atom_for_test(xwm, action);
-    super::metadata::position(xwm, [source, coordinates, timestamp, action, 0], now_ns)
+    super::metadata::position(
+        xwm,
+        [source, 0x05a3, coordinates, timestamp, action],
+        now_ns,
+    )
 }
 
 pub(crate) fn begin_fake_selection_transfer(
@@ -437,7 +465,12 @@ fn begin_fake_selection_transfer_at(
     .unwrap()
     .expect("exact live offer starts one incoming transfer");
     xwm.connection.flush().unwrap();
-    let _requests = take_requests(peer, server_sequence);
+    let requests = take_requests(peer, server_sequence);
+    assert_eq!(
+        selection_conversion_timestamps(&requests, xwm.atoms.get(XwmAtomName::XdndSelection),),
+        vec![timestamp],
+        "XConvertSelection carries the exact timestamp from Position data[3]"
+    );
     let transfer = &xwm.data_bridge.dnd_incoming.transfers[&transfer_id];
     assert_eq!(transfer.target, mime_atom);
     assert_eq!(transfer.selection_timestamp, timestamp);
@@ -683,10 +716,10 @@ fn inbound_proxy_uses_root_as_logical_target_and_consumes_proxy_window_traffic()
         XwmAtomName::XdndPosition,
         [
             0x441,
+            0x05a3,
             0,
             timestamp + 2,
             xwm.atoms.get(XwmAtomName::XdndActionCopy),
-            0,
         ],
     );
     assert!(!super::is_logical_root_target(
@@ -731,11 +764,12 @@ fn first_unsupported_position_sends_one_root_targeted_rejection_without_begin() 
         .offer_id;
 
     let unsupported_action = 0xfeed_cafe;
+    let misleading_timestamp = xwm.atoms.get(XwmAtomName::XdndActionCopy);
     inject_position(
         &mut xwm,
         &mut peer,
         source,
-        0x1234,
+        misleading_timestamp,
         unsupported_action,
         0,
         0,
@@ -1112,6 +1146,10 @@ fn fake_x_hover_incr_payload_reads_next_chunk_only_after_sink_delivery() {
         &mut server_sequence,
     );
     inject_copy_position(&mut xwm, &mut peer, timestamp + 1, 44, server_sequence);
+    assert_eq!(
+        xwm.data_bridge.dnd_incoming.transfers[&transfer_id].selection_timestamp, timestamp,
+        "a later Position does not replace the INCR transfer's Position timestamp"
+    );
     notify_fake_selection_transfer(
         &mut xwm,
         &mut peer,

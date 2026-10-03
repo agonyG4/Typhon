@@ -101,8 +101,7 @@ fn position_at(
     action: crate::xwayland::XwaylandDndAction,
     now_ns: u64,
 ) {
-    let action_atom = super::action_atom_for_test(xwm, action);
-    super::metadata::position(xwm, [SOURCE, 0, timestamp, action_atom, 0], now_ns).unwrap();
+    super::position_at_for_test(xwm, timestamp, action, 23, -19, now_ns).unwrap();
 }
 
 fn reject_position_at(
@@ -395,8 +394,6 @@ fn later_ask_gets_fresh_action_list_authority_after_timed_out_ask() {
     use crate::xwayland::XwaylandDndAction as Action;
 
     let (mut xwm, mut peer, offer_id, _, _, _, mut server_sequence) = fake_incoming_hover();
-    let ask_atom = xwm.atoms.get(XwmAtomName::XdndActionAsk);
-    let copy_atom = xwm.atoms.get(XwmAtomName::XdndActionCopy);
     let ask1_time = xwm
         .data_bridge
         .dnd
@@ -404,7 +401,7 @@ fn later_ask_gets_fresh_action_list_authority_after_timed_out_ask() {
         .unwrap()
         .metadata_deadline_ns
         + 1;
-    super::metadata::position(&mut xwm, [SOURCE, 0, 0x4001, ask_atom, 0], ask1_time).unwrap();
+    position_at(&mut xwm, 0x4001, Action::Ask, ask1_time);
     let (q1, q1_deadline_ns, p1_id) = action_list_query(&xwm, offer_id);
     let p1_status_deadline_ns = xwm
         .data_bridge
@@ -430,7 +427,7 @@ fn later_ask_gets_fresh_action_list_authority_after_timed_out_ask() {
     );
 
     let p2_time = p1_status_deadline_ns + 1;
-    super::metadata::position(&mut xwm, [SOURCE, 0, 0x4002, copy_atom, 0], p2_time).unwrap();
+    position_at(&mut xwm, 0x4002, Action::Copy, p2_time);
     let p2_id = xwm
         .data_bridge
         .dnd
@@ -447,7 +444,7 @@ fn later_ask_gets_fresh_action_list_authority_after_timed_out_ask() {
     ));
 
     let ask3_time = q1_deadline_ns + 100_000_000;
-    super::metadata::position(&mut xwm, [SOURCE, 0, 0x4003, ask_atom, 0], ask3_time).unwrap();
+    position_at(&mut xwm, 0x4003, Action::Ask, ask3_time);
     let (q2, q2_deadline_ns, p3_id) = action_list_query(&xwm, offer_id);
     assert_ne!(q1, q2);
     assert_ne!(p2_id, p3_id);

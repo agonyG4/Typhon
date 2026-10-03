@@ -13,8 +13,7 @@ fn action_list_queries_follow_the_current_ask_and_receive_a_fresh_deadline() {
         .metadata_deadline_ns;
     let mut server_sequence = 0;
     let ask_time = enter_deadline.saturating_add(1);
-    let ask_atom = xwm.atoms.get(XwmAtomName::XdndActionAsk);
-    super::metadata::position(&mut xwm, [0x441, 0, 0x2001, ask_atom, 0], ask_time).unwrap();
+    position_at_for_test(&mut xwm, 0x2001, Action::Ask, 0, 0, ask_time).unwrap();
     let (q1, q1_deadline, p1) = xwm
         .data_bridge
         .dnd_incoming
@@ -47,9 +46,8 @@ fn action_list_queries_follow_the_current_ask_and_receive_a_fresh_deadline() {
 
     xwm.connection.flush().unwrap();
     let _q1_requests = take_requests(&mut peer, &mut server_sequence);
-    let copy_atom = xwm.atoms.get(XwmAtomName::XdndActionCopy);
     let copy_time = ask_time.saturating_add(100_000_000);
-    super::metadata::position(&mut xwm, [0x441, 0, 0x2002, copy_atom, 0], copy_time).unwrap();
+    position_at_for_test(&mut xwm, 0x2002, Action::Copy, 0, 0, copy_time).unwrap();
     let p2 = xwm
         .data_bridge
         .dnd
@@ -115,7 +113,7 @@ fn action_list_queries_follow_the_current_ask_and_receive_a_fresh_deadline() {
 
     let p3_time =
         enter_deadline.saturating_add(super::TARGET_METADATA_TIMEOUT_NS.saturating_mul(4));
-    super::metadata::position(&mut xwm, [0x441, 0, 0x2003, ask_atom, 0], p3_time).unwrap();
+    position_at_for_test(&mut xwm, 0x2003, Action::Ask, 0, 0, p3_time).unwrap();
     let (q2, q2_deadline, p3) = xwm
         .data_bridge
         .dnd_incoming

@@ -1,3 +1,4 @@
+use super::super::dnd_wire;
 use super::*;
 use std::io;
 
@@ -295,20 +296,24 @@ fn issue_atom_names(
 }
 
 pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(), XwmError> {
+    let position = dnd_wire::decode_xdnd_position(data);
     let Some(session) = xwm.data_bridge.dnd.incoming_session() else {
         return Ok(());
     };
     let proxy = target_proxy(xwm).unwrap_or_default();
-    if !is_exact_source(session, xwm.generation, data[0], xwm.root, proxy) {
+    if !is_exact_source(session, xwm.generation, position.source, xwm.root, proxy) {
         return Ok(());
     }
     let offer_id = session.offer_id;
-    let (x, y) = crate::xwayland::unpack_root_coordinates(data[1]);
+    // The state is preserved by the wire decoder; C3-A currently has no
+    // modifier-driven action policy.
+    let _wire_state = position.state;
     let Some(position_id) = allocate_position_id(xwm, offer_id) else {
         retire_incoming(xwm, offer_id);
         return Ok(());
     };
-    let Some(requested_action) = action_from_atom(xwm, data[3]) else {
+    let Some(requested_action) = dnd_wire::action_from_atom(&xwm.atoms, position.action_atom)
+    else {
         send_rejected_wire_position(xwm, offer_id)?;
         return Ok(());
     };
@@ -320,9 +325,9 @@ pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(),
     {
         session.latest_position = Some(IncomingPosition {
             position_id,
-            root_x: x,
-            root_y: y,
-            timestamp: data[2],
+            root_x: f64::from(position.root_x),
+            root_y: f64::from(position.root_y),
+            timestamp: position.timestamp,
             requested_action,
         });
         session.pending_status_deadline_ns = Some(now_ns.saturating_add(TARGET_STATUS_TIMEOUT_NS));
@@ -427,22 +432,6 @@ fn send_rejected_wire_position(
         session.selected_action = None;
     }
     Ok(())
-}
-
-fn action_from_atom(xwm: &Xwm, atom: Atom) -> Option<crate::xwayland::XwaylandDndAction> {
-    if atom == xwm.atoms.get(XwmAtomName::XdndActionCopy) {
-        Some(crate::xwayland::XwaylandDndAction::Copy)
-    } else if atom == xwm.atoms.get(XwmAtomName::XdndActionMove) {
-        Some(crate::xwayland::XwaylandDndAction::Move)
-    } else if atom == xwm.atoms.get(XwmAtomName::XdndActionLink) {
-        Some(crate::xwayland::XwaylandDndAction::Link)
-    } else if atom == xwm.atoms.get(XwmAtomName::XdndActionAsk) {
-        Some(crate::xwayland::XwaylandDndAction::Ask)
-    } else if atom == xwm.atoms.get(XwmAtomName::XdndActionPrivate) {
-        Some(crate::xwayland::XwaylandDndAction::Private)
-    } else {
-        None
-    }
 }
 
 pub(super) fn representable_source_actions(
@@ -930,7 +919,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                 }
                 let mut available = Vec::new();
                 for atom in atoms {
-                    if let Some(action) = action_from_atom(xwm, atom)
+                    if let Some(action) = dnd_wire::action_from_atom(&xwm.atoms, atom)
                         && matches!(
                             action,
                             crate::xwayland::XwaylandDndAction::Copy
