@@ -105,13 +105,13 @@ impl CompositorState {
                         &constraint.surface,
                     )) == root_surface_id
             })
-            .map(|constraint| constraint.id)
+            .map(|constraint| (constraint.id, constraint.active))
             .collect::<Vec<_>>();
 
-        for constraint_id in constraint_ids {
+        for (constraint_id, was_active) in constraint_ids {
             self.deactivate_pointer_constraint_by_id_with_restore_policy(
                 constraint_id,
-                true,
+                was_active,
                 true,
                 true,
                 PointerConstraintRestorePolicy::PreserveCurrentPosition,

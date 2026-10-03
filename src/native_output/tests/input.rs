@@ -1156,6 +1156,72 @@ fn native_input_first_real_move_after_unlock_starts_from_restored_position() {
 }
 
 #[test]
+fn native_locked_input_resumes_physical_motion_after_preserve_position_deactivation() {
+    let mut backend = NativePointerConstraintBackend::new();
+    let mut input = NativeInputState::new(320, 200);
+    let anchor = CompositorOutputPosition {
+        x: 160.25,
+        y: 100.75,
+    };
+    let id = PointerConstraintBackendId {
+        constraint_id: 21,
+        generation: 4,
+    };
+    input.restore_cursor_position(anchor);
+
+    let activation = backend.handle_request(
+        PointerConstraintBackendRequest::ActivateLocked { id },
+        anchor,
+    );
+    assert_eq!(
+        activation
+            .activated
+            .as_ref()
+            .map(|constraint| constraint.id),
+        Some(id)
+    );
+    assert!(backend.active_locked());
+    // Keep input routing aligned with the backend as the runtime does after settlement.
+    input.pointer_constraint = backend.active_constraint_state();
+    assert_eq!(
+        input.pointer_constraint,
+        NativePointerConstraintState::Locked { anchor }
+    );
+
+    let locked_motion =
+        input.handle_pointer_motion(PointerMotionSample::absolute(31, 250.0, 160.0));
+    assert_eq!(locked_motion.pointer_motion, None);
+    assert_eq!(input.cursor_position_f64(), anchor);
+
+    let deactivation = backend.handle_request(
+        PointerConstraintBackendRequest::Deactivate {
+            id,
+            restore_position: None,
+            restore_origin: None,
+        },
+        input.cursor_position_f64(),
+    );
+    assert_eq!(deactivation.deactivated, Some(id));
+    assert_eq!(deactivation.restore_position, None);
+    assert_eq!(deactivation.restore_origin, None);
+    assert!(!backend.active_locked());
+    input.pointer_constraint = backend.active_constraint_state();
+    assert_eq!(input.pointer_constraint, NativePointerConstraintState::None);
+    assert_eq!(input.cursor_position_f64(), anchor);
+
+    let resumed_motion =
+        input.handle_pointer_motion(PointerMotionSample::absolute(32, 164.25, 105.75));
+    assert_eq!(resumed_motion.pointer_motion, Some((164.25, 105.75)));
+    assert_eq!(
+        input.cursor_position_f64(),
+        CompositorOutputPosition {
+            x: 164.25,
+            y: 105.75
+        }
+    );
+}
+
+#[test]
 fn native_input_confined_relative_motion_clamps_to_region_and_keeps_absolute_motion() {
     let mut input = NativeInputState::new(320, 200);
     input.restore_cursor_position(CompositorOutputPosition { x: 50.0, y: 50.0 });
