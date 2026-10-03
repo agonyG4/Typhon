@@ -2,7 +2,8 @@ use super::*;
 use std::{io, os::fd::RawFd};
 
 /// Start one exact Wayland receive request against this incoming XdndSelection
-/// offer. The X timestamp is the most recent accepted Position timestamp.
+/// offer. Hover conversions use Position time; post-Drop conversions use the
+/// frozen Drop timestamp.
 pub(crate) fn start_data_request(
     xwm: &mut Xwm,
     request: crate::xwayland::XwaylandDndDataRequest,
@@ -26,7 +27,15 @@ pub(crate) fn start_data_request(
                 .atom_to_mime
                 .iter()
                 .find_map(|(atom, mime)| (mime == &request.mime_type).then_some(*atom))?;
-            let timestamp = session.latest_position?.timestamp;
+            let timestamp = match session.wire_phase {
+                IncomingDndWirePhase::Hover => session.latest_position?.timestamp,
+                IncomingDndWirePhase::DropSubmitted { drop_timestamp, .. }
+                | IncomingDndWirePhase::AwaitingWaylandFinish { drop_timestamp, .. } => {
+                    drop_timestamp
+                }
+                IncomingDndWirePhase::DeletePending { .. }
+                | IncomingDndWirePhase::TerminalConsumed => return None,
+            };
             (timestamp != 0).then_some((session.offer_id, session.source.xid(), target, timestamp))
         })
     else {
@@ -662,20 +671,6 @@ pub(crate) fn handle_sink_ready(
     Ok(before != after)
 }
 
-pub(crate) fn source_destroyed(xwm: &mut Xwm, source: Window) -> Result<bool, XwmError> {
-    let Some(offer_id) = xwm
-        .data_bridge
-        .dnd
-        .incoming_session()
-        .filter(|session| session.source.xid() == source)
-        .map(|session| session.offer_id)
-    else {
-        return Ok(false);
-    };
-    let _ = super::metadata::leave_offer(xwm, offer_id);
-    Ok(true)
-}
-
 pub(crate) fn requestor_destroyed(xwm: &mut Xwm, requestor: Window) -> bool {
     let Some(id) = xwm
         .data_bridge
@@ -688,10 +683,4 @@ pub(crate) fn requestor_destroyed(xwm: &mut Xwm, requestor: Window) -> bool {
     };
     finish_transfer(xwm, id);
     true
-}
-
-pub(crate) fn canonical_retired(xwm: &mut Xwm, offer_id: XwaylandDndOfferId) {
-    super::metadata::retire_offer_transfers(xwm, offer_id);
-    let _ = xwm.data_bridge.dnd.retire_incoming_session(offer_id);
-    super::metadata::cancel_metadata_replies(xwm, Some(offer_id));
 }

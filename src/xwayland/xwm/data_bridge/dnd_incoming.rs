@@ -27,6 +27,10 @@ pub(crate) const MAX_ACTIVE_INCOMING_DND_TRANSFERS: usize = 16;
 pub(crate) const MAX_PENDING_INCOMING_DND_TRANSFER_REPLIES: usize = 4;
 pub(crate) const MAX_INCOMING_DND_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const INCOMING_DND_IDLE_TIMEOUT_NS: u64 = 30_000_000_000;
+pub(crate) const INCOMING_DND_DROP_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
+pub(crate) const INCOMING_DND_TERMINAL_TIMEOUT_NS: u64 = 60_000_000_000;
+pub(crate) const INCOMING_DND_DELETE_TIMEOUT_NS: u64 = 2_000_000_000;
+const ROOT_PROXY_VERIFY_TIMEOUT_NS: u64 = 1_000_000_000;
 
 const INCOMING_DND_CHUNK_UNITS: u32 = (MAX_INCOMING_DND_CHUNK_BYTES / 4) as u32;
 const XDND_STATUS_WANT_POSITION_UPDATES: u32 = 1 << 1;
@@ -41,6 +45,62 @@ pub(crate) struct IncomingPosition {
     /// Exact X timestamp used for XdndSelection conversion authority.
     pub(crate) timestamp: u32,
     pub(crate) requested_action: crate::xwayland::XwaylandDndAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncomingDndWirePhase {
+    Hover,
+    DropSubmitted {
+        drop_timestamp: u32,
+        action: crate::xwayland::XwaylandDndAction,
+        acknowledgement_deadline_ns: u64,
+    },
+    AwaitingWaylandFinish {
+        drop_timestamp: u32,
+        action: crate::xwayland::XwaylandDndAction,
+        deadline_ns: u64,
+        cancel_submitted: bool,
+    },
+    DeletePending {
+        drop_timestamp: u32,
+        final_action: crate::xwayland::XwaylandDndAction,
+    },
+    TerminalConsumed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RootProxyAuthority {
+    #[default]
+    Unpublished,
+    Owned {
+        generation: XwaylandGeneration,
+        proxy: Window,
+    },
+    BlockedForeign {
+        generation: XwaylandGeneration,
+        proxy: Window,
+    },
+    Verifying {
+        generation: XwaylandGeneration,
+        proxy: Window,
+        sequence: SequenceNumber,
+        deadline_ns: u64,
+    },
+    Lost {
+        generation: XwaylandGeneration,
+        proxy: Window,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IncomingMoveDelete {
+    pub(crate) offer_id: XwaylandDndOfferId,
+    pub(crate) generation: XwaylandGeneration,
+    pub(crate) source: Window,
+    pub(crate) requestor: Window,
+    pub(crate) property: Atom,
+    pub(crate) drop_timestamp: u32,
+    pub(crate) deadline_ns: u64,
 }
 
 #[derive(Debug)]
@@ -67,6 +127,7 @@ pub(crate) struct IncomingDndSession {
     pub(crate) action_list_cached: bool,
     pub(crate) action_list_complete: bool,
     pub(crate) latest_position: Option<IncomingPosition>,
+    pub(crate) wire_phase: IncomingDndWirePhase,
     pub(crate) next_position_serial: u64,
     pub(crate) canonical_started: bool,
     pub(crate) pending_status_deadline_ns: Option<u64>,
@@ -129,6 +190,8 @@ pub(crate) struct DndIncomingManager {
     pub(crate) target_proxy: Option<Window>,
     pub(crate) next_offer_serial: u64,
     pub(crate) next_transfer_serial: u64,
+    pub(crate) root_proxy_authority: RootProxyAuthority,
+    pub(crate) move_delete: Option<IncomingMoveDelete>,
     pub(crate) events: VecDeque<XwaylandDndIncomingEvent>,
     pub(crate) pending: BTreeMap<SequenceNumber, PendingMetadataReply>,
     transfers: BTreeMap<crate::xwayland::XwaylandDndIncomingTransferId, IncomingTransfer>,
@@ -136,6 +199,8 @@ pub(crate) struct DndIncomingManager {
     transfer_replies: BTreeMap<SequenceNumber, crate::xwayland::XwaylandDndIncomingTransferId>,
     retired_requestors: HashSet<Window>,
 }
+
+mod terminal;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PendingMetadataReply {
@@ -223,6 +288,8 @@ impl DndIncomingManager {
         }
         self.generation = None;
         self.target_proxy = None;
+        self.root_proxy_authority = RootProxyAuthority::Unpublished;
+        self.move_delete = None;
         self.pending.clear();
         self.events.clear();
         self.transfers.clear();
@@ -270,13 +337,17 @@ impl DndIncomingManager {
     }
 
     pub(crate) fn owns_requestor(&self, window: Window) -> bool {
-        self.requestors.contains_key(&window) || self.retired_requestors.contains(&window)
+        self.requestors.contains_key(&window)
+            || self.retired_requestors.contains(&window)
+            || self
+                .move_delete
+                .is_some_and(|delete| delete.requestor == window)
     }
 }
 
 /// Create a private, 1x1 InputOnly protocol window. It is never mapped or
-/// registered in the desktop window registry. C3-A deliberately does not
-/// install the root XdndProxy property.
+/// registered in the desktop window registry. Root discovery is activated
+/// separately, after XWM startup has initialized the complete terminal path.
 pub(crate) fn initialize_target_proxy(xwm: &mut Xwm) -> Result<(), XwmError> {
     if xwm.data_bridge.dnd_incoming.generation == Some(xwm.generation)
         && xwm.data_bridge.dnd_incoming.target_proxy.is_some()
@@ -331,6 +402,7 @@ pub(crate) fn initialize_target_proxy(xwm: &mut Xwm) -> Result<(), XwmError> {
     xwm.data_bridge.dnd.internal_windows.insert(proxy);
     xwm.data_bridge.dnd_incoming.generation = Some(xwm.generation);
     xwm.data_bridge.dnd_incoming.target_proxy = Some(proxy);
+    xwm.data_bridge.dnd_incoming.root_proxy_authority = RootProxyAuthority::Unpublished;
     Ok(())
 }
 
@@ -340,17 +412,14 @@ pub(crate) fn target_proxy(xwm: &Xwm) -> Option<Window> {
         .flatten()
 }
 
-#[allow(dead_code)] // held for the C3-B product activation gate
 fn root_proxy_may_be_replaced(existing: Option<Window>, valid: bool, own_proxy: Window) -> bool {
     existing.is_none() || existing == Some(own_proxy) || !valid
 }
 
-#[allow(dead_code)] // held for the C3-B product activation gate
 fn root_proxy_should_be_released(current: Option<Window>, own_proxy: Window) -> bool {
     current == Some(own_proxy)
 }
 
-#[allow(dead_code)] // used by root-proxy ownership in C3-B
 fn read_single_u32_property(
     xwm: &Xwm,
     window: Window,
@@ -361,6 +430,11 @@ fn read_single_u32_property(
         .connection
         .get_property(false, window, property, AtomEnum::ANY, 0, 2)
         .map_err(XwmError::Connection)?;
+    xwm.connection.flush().map_err(XwmError::Connection)?;
+    // Startup acquisition holds the server grab and must decide from replies
+    // to these exact reads. ReactorStream deliberately never blocks in normal
+    // event handling, so wait for the startup reply before consuming it.
+    wait_for_startup_reply(xwm)?;
     let reply = cookie.reply_unchecked().map_err(XwmError::Connection)?;
     let Some(reply) = reply.filter(|reply| {
         reply.type_ == property_type && reply.format == 32 && reply.bytes_after == 0
@@ -374,7 +448,31 @@ fn read_single_u32_property(
     Ok((values.len() == 1).then_some(values[0]))
 }
 
-#[allow(dead_code)] // used by root-proxy ownership in C3-B
+fn wait_for_startup_reply(xwm: &Xwm) -> Result<(), XwmError> {
+    const TIMEOUT_MS: i32 = 1_000;
+    let mut descriptor = libc::pollfd {
+        fd: xwm.connection.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` points to one valid XWM socket descriptor.
+    let result = unsafe { libc::poll(&mut descriptor, 1, TIMEOUT_MS) };
+    if result > 0 {
+        Ok(())
+    } else if result == 0 {
+        Err(XwmError::Connection(
+            x11rb::errors::ConnectionError::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "X11 server did not answer root-proxy acquisition in time",
+            )),
+        ))
+    } else {
+        Err(XwmError::Connection(
+            x11rb::errors::ConnectionError::IoError(std::io::Error::last_os_error()),
+        ))
+    }
+}
+
 fn foreign_root_proxy_is_valid(xwm: &Xwm, proxy: Window) -> Result<bool, XwmError> {
     let self_proxy = read_single_u32_property(
         xwm,
@@ -394,9 +492,8 @@ fn foreign_root_proxy_is_valid(xwm: &Xwm, proxy: Window) -> Result<bool, XwmErro
     Ok(aware.is_some_and(|version| version >= 4))
 }
 
-/// Future C3-B root-discovery acquisition primitive. It is deliberately not
-/// called from C3-A startup, so production root drop discovery stays off.
-#[allow(dead_code)] // product discovery intentionally remains disabled until C3-B
+/// Acquire root discovery only after the complete reverse terminal path is
+/// ready. The server grab keeps foreign-owner validation and publication atomic.
 pub(crate) fn acquire_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
     let Some(proxy) = target_proxy(xwm) else {
         return Ok(false);
@@ -415,8 +512,25 @@ pub(crate) fn acquire_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
             .map(|current| foreign_root_proxy_is_valid(xwm, current))
             .transpose()?
             .unwrap_or(false);
+        let proxy_self_reference = read_single_u32_property(
+            xwm,
+            proxy,
+            xwm.atoms.get(XwmAtomName::XdndProxy),
+            u32::from(AtomEnum::WINDOW),
+        )?;
+        let proxy_version = read_single_u32_property(
+            xwm,
+            proxy,
+            xwm.atoms.get(XwmAtomName::XdndAware),
+            u32::from(AtomEnum::ATOM),
+        )?;
+        let target_ready = proxy_self_reference == Some(proxy)
+            && proxy_version.is_some_and(|version| version >= 5);
+        if !target_ready {
+            return Ok((false, current, valid, false));
+        }
         if !root_proxy_may_be_replaced(current, valid, proxy) {
-            return Ok(false);
+            return Ok((false, current, valid, true));
         }
         let cookie = xwm
             .connection
@@ -429,7 +543,7 @@ pub(crate) fn acquire_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
             )
             .map_err(XwmError::Connection)?;
         std::mem::forget(cookie);
-        Ok(true)
+        Ok((true, current, valid, true))
     })();
     let ungrab = match xwm.connection.ungrab_server() {
         Ok(cookie) => {
@@ -441,16 +555,148 @@ pub(crate) fn acquire_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
     xwm.connection.flush().map_err(XwmError::Connection)?;
     match result {
         Err(error) => Err(error),
-        Ok(acquired) => {
+        Ok((acquired, current, valid, target_ready)) => {
             ungrab?;
+            xwm.data_bridge.dnd_incoming.root_proxy_authority = if !target_ready {
+                RootProxyAuthority::Lost {
+                    generation: xwm.generation,
+                    proxy,
+                }
+            } else if acquired || current == Some(proxy) {
+                RootProxyAuthority::Owned {
+                    generation: xwm.generation,
+                    proxy,
+                }
+            } else if valid {
+                RootProxyAuthority::BlockedForeign {
+                    generation: xwm.generation,
+                    proxy: current.unwrap_or_default(),
+                }
+            } else {
+                RootProxyAuthority::Lost {
+                    generation: xwm.generation,
+                    proxy,
+                }
+            };
             Ok(acquired)
         }
     }
 }
 
+pub(crate) fn root_proxy_is_owned(xwm: &Xwm) -> bool {
+    let Some(proxy) = target_proxy(xwm) else {
+        return false;
+    };
+    matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Owned { generation, proxy: owned_proxy }
+            if generation == xwm.generation && owned_proxy == proxy
+    )
+}
+
+fn begin_root_proxy_verification(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError> {
+    let RootProxyAuthority::Owned { generation, proxy } =
+        xwm.data_bridge.dnd_incoming.root_proxy_authority
+    else {
+        return Ok(());
+    };
+    if generation != xwm.generation || target_proxy(xwm) != Some(proxy) {
+        return Ok(());
+    }
+    let cookie = xwm
+        .connection
+        .get_property(
+            false,
+            xwm.root,
+            xwm.atoms.get(XwmAtomName::XdndProxy),
+            u32::from(AtomEnum::WINDOW),
+            0,
+            2,
+        )
+        .map_err(XwmError::Connection)?;
+    let sequence = cookie.sequence_number();
+    std::mem::forget(cookie);
+    xwm.data_bridge.dnd_incoming.root_proxy_authority = RootProxyAuthority::Verifying {
+        generation,
+        proxy,
+        sequence,
+        deadline_ns: now_ns.saturating_add(ROOT_PROXY_VERIFY_TIMEOUT_NS),
+    };
+    xwm.connection.flush().map_err(XwmError::Connection)
+}
+
+pub(crate) fn poll_root_proxy_verification(xwm: &mut Xwm, now_ns: u64) -> Result<bool, XwmError> {
+    let RootProxyAuthority::Verifying {
+        generation,
+        proxy,
+        sequence,
+        deadline_ns,
+    } = xwm.data_bridge.dnd_incoming.root_proxy_authority
+    else {
+        return Ok(false);
+    };
+    if generation != xwm.generation || target_proxy(xwm) != Some(proxy) {
+        return Ok(false);
+    }
+    if now_ns >= deadline_ns {
+        xwm.connection.discard_reply(
+            sequence,
+            x11rb::connection::RequestKind::HasResponse,
+            x11rb::connection::DiscardMode::DiscardReply,
+        );
+        mark_root_proxy_lost(xwm, generation, proxy)?;
+        return Ok(true);
+    }
+    let cookie = Cookie::<super::super::connection::X11Connection, xproto::GetPropertyReply>::new(
+        &xwm.connection,
+        sequence,
+    );
+    let reply = match cookie.reply_unchecked() {
+        Ok(reply) => reply,
+        Err(x11rb::errors::ConnectionError::IoError(error))
+            if error.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(XwmError::Connection(error)),
+    };
+    let still_owned = reply.is_some_and(|reply| {
+        if reply.type_ != u32::from(AtomEnum::WINDOW)
+            || reply.format != 32
+            || reply.bytes_after != 0
+        {
+            return false;
+        }
+        let values = reply
+            .value32()
+            .map(|values| values.collect::<Vec<_>>())
+            .unwrap_or_default();
+        values.as_slice() == [proxy]
+    });
+    if still_owned {
+        xwm.data_bridge.dnd_incoming.root_proxy_authority =
+            RootProxyAuthority::Owned { generation, proxy };
+    } else {
+        mark_root_proxy_lost(xwm, generation, proxy)?;
+    }
+    Ok(true)
+}
+
+fn mark_root_proxy_lost(
+    xwm: &mut Xwm,
+    generation: XwaylandGeneration,
+    proxy: Window,
+) -> Result<(), XwmError> {
+    if generation != xwm.generation || target_proxy(xwm) != Some(proxy) {
+        return Ok(());
+    }
+    xwm.data_bridge.dnd_incoming.root_proxy_authority =
+        RootProxyAuthority::Lost { generation, proxy };
+    terminal::root_proxy_lost(xwm)
+}
+
 /// Release root discovery only while the property still names our exact
 /// generation-owned proxy.
-#[allow(dead_code)] // product discovery intentionally remains disabled until C3-B
 pub(crate) fn release_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
     let Some(proxy) = xwm.data_bridge.dnd_incoming.target_proxy else {
         return Ok(false);
@@ -492,7 +738,7 @@ pub(crate) fn release_root_proxy(xwm: &mut Xwm) -> Result<bool, XwmError> {
 }
 
 pub(crate) fn is_logical_root_target(xwm: &Xwm, message: &xproto::ClientMessageEvent) -> bool {
-    target_proxy(xwm).is_some() && message.window == xwm.root
+    message.window == xwm.root
 }
 
 fn is_internal_proxy_target(xwm: &Xwm, message: &xproto::ClientMessageEvent) -> bool {
@@ -526,6 +772,13 @@ pub(crate) fn retire_proxy(xwm: &mut Xwm, generation: XwaylandGeneration) {
         .keys()
         .copied()
         .collect::<Vec<_>>();
+    if let Some(delete) = xwm.data_bridge.dnd_incoming.move_delete.take() {
+        xwm.data_bridge
+            .dnd
+            .internal_windows
+            .remove(&delete.requestor);
+        let _ = xwm.connection.destroy_window(delete.requestor);
+    }
     for requestor in requestors {
         let _ = xwm.connection.destroy_window(requestor);
     }
@@ -536,6 +789,10 @@ pub(crate) fn retire_proxy(xwm: &mut Xwm, generation: XwaylandGeneration) {
         .keys()
         .chain(xwm.data_bridge.dnd_incoming.transfer_replies.keys())
         .copied()
+        .chain(match xwm.data_bridge.dnd_incoming.root_proxy_authority {
+            RootProxyAuthority::Verifying { sequence, .. } => Some(sequence),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     for sequence in sequences {
         xwm.connection.discard_reply(
@@ -578,6 +835,9 @@ pub(crate) fn client_message(
     if !is_logical_root_target(xwm, &event) {
         return Ok(false);
     }
+    if !root_proxy_is_owned(xwm) {
+        return Ok(true);
+    }
     if event.format != 32 {
         return Ok(true);
     }
@@ -589,11 +849,89 @@ pub(crate) fn client_message(
     } else if message_type == xwm.atoms.get(XwmAtomName::XdndLeave) {
         metadata::leave(xwm, data[0])?;
     } else if message_type == xwm.atoms.get(XwmAtomName::XdndDrop) {
-        // C3-A has no terminal authority. Treat a synthetic Drop as a
-        // fail-closed leave and never call the canonical drop contract.
-        metadata::leave(xwm, data[0])?;
+        terminal::drop_received(xwm, data, now_ns)?;
     }
     Ok(true)
+}
+
+pub(crate) fn property_notify(
+    xwm: &mut Xwm,
+    event: xproto::PropertyNotifyEvent,
+    now_ns: u64,
+) -> Result<bool, XwmError> {
+    if event.window == xwm.root && event.atom == xwm.atoms.get(XwmAtomName::XdndProxy) {
+        begin_root_proxy_verification(xwm, now_ns)?;
+        return Ok(true);
+    }
+    if terminal::property_notify(xwm, event) {
+        return Ok(true);
+    }
+    transfer::property_notify(xwm, event, now_ns)
+}
+
+pub(crate) fn resolve_drop(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+    accepted: bool,
+    now_ns: u64,
+) -> Result<(), XwmError> {
+    terminal::resolve_drop(xwm, offer_id, accepted, now_ns)
+}
+
+pub(crate) fn resolve_cancel_after_drop(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+    cancelled: bool,
+) -> Result<(), XwmError> {
+    terminal::resolve_cancel_after_drop(xwm, offer_id, cancelled)
+}
+
+pub(crate) fn apply_transition(
+    xwm: &mut Xwm,
+    transition: crate::xwayland::XwaylandDndTransition,
+    now_ns: u64,
+) -> Result<(), XwmError> {
+    match transition {
+        feedback @ crate::xwayland::XwaylandDndTransition::SourceFeedback { .. } => {
+            apply_source_feedback_transition(xwm, feedback)
+        }
+        crate::xwayland::XwaylandDndTransition::SourceFinished {
+            offer_id,
+            accepted,
+            action,
+        } => source_finished(xwm, offer_id, accepted, action, now_ns),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn source_finished(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+    accepted: bool,
+    action: Option<crate::xwayland::XwaylandDndAction>,
+    now_ns: u64,
+) -> Result<(), XwmError> {
+    terminal::source_finished(xwm, offer_id, accepted, action, now_ns)
+}
+
+pub(crate) fn requestor_destroyed(xwm: &mut Xwm, requestor: Window) -> bool {
+    terminal::requestor_destroyed(xwm, requestor) || transfer::requestor_destroyed(xwm, requestor)
+}
+
+pub(crate) fn selection_notify(
+    xwm: &mut Xwm,
+    event: xproto::SelectionNotifyEvent,
+    now_ns: u64,
+) -> Result<bool, XwmError> {
+    if terminal::selection_notify_delete(xwm, event)? {
+        return Ok(true);
+    }
+    transfer::selection_notify(xwm, event, now_ns)
+}
+
+pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError> {
+    metadata::expire_deadlines(xwm, now_ns)?;
+    terminal::expire_deadlines(xwm, now_ns)
 }
 
 mod metadata;
@@ -605,12 +943,8 @@ mod transfer;
 use metadata::representable_source_actions;
 #[cfg(test)]
 pub(crate) use metadata::source_feedback;
-pub(crate) use metadata::{
-    apply_source_feedback_transition, expire_deadlines, next_deadline_ns, poll_replies,
-};
-pub(crate) use transfer::{
-    canonical_retired, handle_sink_ready, property_notify, requestor_destroyed, selection_notify,
-    source_destroyed, start_data_request,
-};
+pub(crate) use metadata::{apply_source_feedback_transition, next_deadline_ns, poll_replies};
+pub(crate) use terminal::{canonical_retired, source_destroyed};
+pub(crate) use transfer::{handle_sink_ready, start_data_request};
 #[cfg(test)]
 use transfer::{next_after_property_chunk, write_sink_bytes};

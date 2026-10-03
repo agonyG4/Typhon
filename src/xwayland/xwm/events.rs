@@ -1757,5 +1757,9 @@ pub(crate) mod tests {
 mod regression_tests;
 
 #[cfg(test)]
+#[path = "events_root_proxy_regression_tests.rs"]
+mod root_proxy_regression_tests;
+
+#[cfg(test)]
 #[path = "selection_wire_regression_tests.rs"]
 mod selection_wire_regression_tests;

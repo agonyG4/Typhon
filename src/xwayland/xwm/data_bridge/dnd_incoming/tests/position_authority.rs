@@ -3,6 +3,59 @@ use super::*;
 const SOURCE: Window = 0x441;
 const MIME_ATOM: Atom = 0x551;
 
+#[test]
+fn first_unsupported_position_sends_one_root_targeted_rejection_without_begin() {
+    let generation = XwaylandGeneration::new(NonZeroU64::new(82).unwrap());
+    let (mut xwm, mut peer) = super::super::super::super::test_fixture_for_tests(generation);
+    super::initialize_target_proxy(&mut xwm).unwrap();
+    xwm.connection.flush().unwrap();
+    let _proxy_setup = super::read_peer(&mut peer);
+    let proxy = super::target_proxy(&xwm).unwrap();
+    xwm.data_bridge.dnd_incoming.root_proxy_authority =
+        RootProxyAuthority::Owned { generation, proxy };
+
+    let source = 0x442;
+    let enter = super::client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndEnter,
+        [source, 5 << 24, 0x552, 0, 0],
+    );
+    super::inject_client_message(&mut xwm, &mut peer, enter);
+    let offer_id = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .expect("Enter creates the provisional source session")
+        .offer_id;
+
+    let unsupported_action = 0xfeed_cafe;
+    let misleading_timestamp = xwm.atoms.get(XwmAtomName::XdndActionCopy);
+    super::inject_position(
+        &mut xwm,
+        &mut peer,
+        source,
+        misleading_timestamp,
+        unsupported_action,
+        0,
+        0,
+    );
+    xwm.connection.flush().unwrap();
+    let statuses = super::status_messages(&super::read_peer(&mut peer), &xwm);
+    assert_eq!(statuses.len(), 1);
+    let (recipient, data) = statuses[0];
+    assert_eq!(recipient, source);
+    assert_eq!(data[0], xwm.root);
+    assert_eq!(data[1] & 1, 0, "unsupported action must be rejected");
+    assert_eq!(data[4], 0, "rejection has no fabricated action atom");
+    let session = xwm.data_bridge.dnd.incoming_session().unwrap();
+    assert_eq!(session.offer_id, offer_id);
+    assert!(session.latest_position.is_none());
+    assert!(!session.canonical_started);
+    assert!(!session.status_pending);
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+}
+
 fn pending_mime_offer(
     generation_id: u64,
     entered_at_ns: u64,

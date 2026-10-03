@@ -1371,9 +1371,6 @@ impl XwmStartup {
             supporting_wm_check,
             raw_fd,
         };
-        // C3-A creates private target infrastructure but intentionally leaves
-        // root.XdndProxy unpublished until the terminal path is implemented.
-        let _ = super::data_bridge::dnd_incoming::initialize_target_proxy(&mut xwm);
         for adopted in self.adopted_windows.drain(..) {
             let handle = crate::xwayland::X11WindowHandle::new(self.generation, adopted.xid);
             if xwm
@@ -1394,6 +1391,19 @@ impl XwmStartup {
                     DiscardMode::DiscardReply,
                 );
             }
+        }
+        // Root discovery is the final DND startup activation step. A valid
+        // foreign owner blocks only reverse XDND for this generation; C2 and
+        // the rest of XWM remain available.
+        if super::data_bridge::dnd_incoming::initialize_target_proxy(&mut xwm).is_ok()
+            && super::data_bridge::dnd_incoming::acquire_root_proxy(&mut xwm).is_err()
+            && let Some(proxy) = super::data_bridge::dnd_incoming::target_proxy(&xwm)
+        {
+            xwm.data_bridge.dnd_incoming.root_proxy_authority =
+                super::data_bridge::dnd_incoming::RootProxyAuthority::Lost {
+                    generation: self.generation,
+                    proxy,
+                };
         }
         self.state = XwmStartupState::Running;
         Some(xwm)

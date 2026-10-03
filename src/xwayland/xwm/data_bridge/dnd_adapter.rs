@@ -217,16 +217,21 @@ pub(crate) fn apply_transitions(
                 if generation == xwm.generation
                     && let Some(id) = XwaylandDndAdapterId::new(session_id, generation)
                 {
-                    if let CanonicalDndSessionId::Xwayland(offer_id) = session_id {
-                        super::dnd_incoming::canonical_retired(xwm, offer_id);
+                    let incoming_delete_pending = match session_id {
+                        CanonicalDndSessionId::Xwayland(offer_id) => {
+                            super::dnd_incoming::canonical_retired(xwm, offer_id)
+                        }
+                        CanonicalDndSessionId::Wayland(_) => false,
+                    };
+                    if !incoming_delete_pending {
+                        retire_session_for_canonical_retirement(xwm, id)?;
                     }
-                    retire_session_for_canonical_retirement(xwm, id)?;
                 }
             }
-            feedback @ XwaylandDndTransition::SourceFeedback { .. } => {
-                super::dnd_incoming::apply_source_feedback_transition(xwm, feedback)?
+            feedback @ (XwaylandDndTransition::SourceFeedback { .. }
+            | XwaylandDndTransition::SourceFinished { .. }) => {
+                super::dnd_incoming::apply_transition(xwm, feedback, now_ns)?
             }
-            XwaylandDndTransition::SourceFinished { .. } => {}
         }
     }
     Ok(())

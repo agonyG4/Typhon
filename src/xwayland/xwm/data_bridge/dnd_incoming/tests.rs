@@ -11,6 +11,7 @@ use x11rb::{protocol::xproto, x11_utils::Serialize};
 mod action_list;
 mod position_authority;
 mod position_wire;
+mod terminal;
 
 fn offer_id(generation: XwaylandGeneration, serial: u64) -> XwaylandDndOfferId {
     XwaylandDndOfferId::new(generation, NonZeroU64::new(serial).expect("nonzero serial"))
@@ -263,9 +264,17 @@ pub(crate) fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Ato
     super::initialize_target_proxy(&mut xwm).unwrap();
     xwm.connection.flush().unwrap();
     let target_proxy = super::target_proxy(&xwm).unwrap();
+    xwm.data_bridge.dnd_incoming.root_proxy_authority = RootProxyAuthority::Owned {
+        generation: xwm.generation,
+        proxy: target_proxy,
+    };
     let mut server_sequence = 0;
     let proxy_setup = take_requests(&mut peer, &mut server_sequence);
     assert!(xwm.data_bridge.dnd.internal_windows.contains(&target_proxy));
+    assert!(
+        !xwm.windows
+            .contains(X11WindowHandle::new(xwm.generation, target_proxy))
+    );
     assert!(!proxy_setup.is_empty());
     let proxy_properties = proxy_properties(&proxy_setup);
     let self_proxy = proxy_properties
@@ -375,6 +384,59 @@ pub(crate) fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Ato
     )
 }
 
+#[test]
+fn accepted_v5_drop_submits_one_exact_canonical_drop_event() {
+    let (mut xwm, _peer, offer_id, _, _, target_proxy, _) = fake_incoming_hover();
+    xwm.data_bridge.dnd_incoming.root_proxy_authority = RootProxyAuthority::Owned {
+        generation: xwm.generation,
+        proxy: target_proxy,
+    };
+    let position_id = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap()
+        .position_id;
+    super::source_feedback(
+        &mut xwm,
+        offer_id,
+        position_id,
+        Some("text/plain".to_owned()),
+        Some(crate::xwayland::XwaylandDndAction::Copy),
+    )
+    .unwrap();
+    xwm.data_bridge.dnd_incoming.take_events();
+
+    let source = xwm.data_bridge.dnd.incoming_session().unwrap().source.xid();
+    let drop_timestamp = 0x7654_3210;
+    let first_drop = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndDrop,
+        [source, 0xaaaa, drop_timestamp, 0xbbbb, 0xcccc],
+    );
+    assert!(super::client_message(&mut xwm, first_drop, 30_000_000_000).unwrap());
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.take_events().as_slice(),
+        [XwaylandDndIncomingEvent::Drop { offer_id: queued }] if *queued == offer_id
+    ));
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::DropSubmitted { drop_timestamp: timestamp, action, .. }
+            if timestamp == drop_timestamp && action == crate::xwayland::XwaylandDndAction::Copy
+    ));
+    let duplicate_drop = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndDrop,
+        [source, 0, drop_timestamp, 0, 0],
+    );
+    assert!(super::client_message(&mut xwm, duplicate_drop, 30_000_000_001).unwrap());
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+}
+
 pub(crate) fn action_atom_for_test(xwm: &Xwm, action: crate::xwayland::XwaylandDndAction) -> Atom {
     match action {
         crate::xwayland::XwaylandDndAction::Copy => xwm.atoms.get(XwmAtomName::XdndActionCopy),
@@ -469,7 +531,7 @@ fn begin_fake_selection_transfer_at(
     assert_eq!(
         selection_conversion_timestamps(&requests, xwm.atoms.get(XwmAtomName::XdndSelection),),
         vec![timestamp],
-        "XConvertSelection carries the exact timestamp from Position data[3]"
+        "XConvertSelection carries the timestamp authoritative for the wire phase"
     );
     let transfer = &xwm.data_bridge.dnd_incoming.transfers[&transfer_id];
     assert_eq!(transfer.target, mime_atom);
@@ -738,56 +800,6 @@ fn inbound_proxy_uses_root_as_logical_target_and_consumes_proxy_window_traffic()
     assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
     xwm.connection.flush().unwrap();
     assert!(status_messages(&read_peer(&mut peer), &xwm).is_empty());
-}
-
-#[test]
-fn first_unsupported_position_sends_one_root_targeted_rejection_without_begin() {
-    let generation = XwaylandGeneration::new(NonZeroU64::new(82).unwrap());
-    let (mut xwm, mut peer) = super::super::super::test_fixture_for_tests(generation);
-    super::initialize_target_proxy(&mut xwm).unwrap();
-    xwm.connection.flush().unwrap();
-    let _proxy_setup = read_peer(&mut peer);
-
-    let source = 0x442;
-    let enter = client_message(
-        &xwm,
-        xwm.root,
-        XwmAtomName::XdndEnter,
-        [source, 5 << 24, 0x552, 0, 0],
-    );
-    inject_client_message(&mut xwm, &mut peer, enter);
-    let offer_id = xwm
-        .data_bridge
-        .dnd
-        .incoming_session()
-        .expect("Enter creates the provisional source session")
-        .offer_id;
-
-    let unsupported_action = 0xfeed_cafe;
-    let misleading_timestamp = xwm.atoms.get(XwmAtomName::XdndActionCopy);
-    inject_position(
-        &mut xwm,
-        &mut peer,
-        source,
-        misleading_timestamp,
-        unsupported_action,
-        0,
-        0,
-    );
-    xwm.connection.flush().unwrap();
-    let statuses = status_messages(&read_peer(&mut peer), &xwm);
-    assert_eq!(statuses.len(), 1);
-    let (recipient, data) = statuses[0];
-    assert_eq!(recipient, source);
-    assert_eq!(data[0], xwm.root);
-    assert_eq!(data[1] & 1, 0, "unsupported action must be rejected");
-    assert_eq!(data[4], 0, "rejection has no fabricated action atom");
-    let session = xwm.data_bridge.dnd.incoming_session().unwrap();
-    assert_eq!(session.offer_id, offer_id);
-    assert!(session.latest_position.is_none());
-    assert!(!session.canonical_started);
-    assert!(!session.status_pending);
-    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
 }
 
 #[test]

@@ -31,6 +31,8 @@ use crate::compositor::{SurfaceCommitSequence, XwaylandSurfaceCommitObserved};
 
 #[path = "displayfd_service.rs"]
 mod displayfd_service;
+#[path = "service_managed_dnd.rs"]
+mod managed_dnd;
 #[path = "service_runtime.rs"]
 mod service_runtime;
 #[path = "service_state.rs"]

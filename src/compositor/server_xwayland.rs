@@ -114,6 +114,12 @@ impl OwnCompositorServer {
             crate::xwayland::XwaylandDndIncomingEvent::Leave { offer_id } => {
                 self.state.cancel_xwayland_drag(offer_id)
             }
+            crate::xwayland::XwaylandDndIncomingEvent::Drop { offer_id } => {
+                self.drop_xwayland_dnd(offer_id)
+            }
+            crate::xwayland::XwaylandDndIncomingEvent::CancelAfterDrop { offer_id } => {
+                self.finish_xwayland_dnd(offer_id, false) || self.cancel_xwayland_dnd(offer_id)
+            }
         }
     }
 

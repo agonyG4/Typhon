@@ -22,6 +22,21 @@ pub(crate) struct DecodedXdndPosition {
     pub(crate) action_atom: Atom,
 }
 
+/// Exact source identity and timestamp from a v5 target-side XdndDrop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedXdndDrop {
+    pub(crate) source: Window,
+    pub(crate) timestamp: u32,
+}
+
+/// Decode source identity and the exact timestamp used by a target-side Drop.
+/// Timestamp usability is an admission rule so a malformed zero-time Drop can
+/// be rejected against the exact active source without guessing a replacement.
+pub(crate) fn decode_xdnd_drop(data: [u32; 5]) -> Option<DecodedXdndDrop> {
+    let [source, _reserved_1, timestamp, _reserved_3, _reserved_4] = data;
+    (source != 0).then_some(DecodedXdndDrop { source, timestamp })
+}
+
 pub(crate) fn decode_xdnd_position(data: [u32; 5]) -> DecodedXdndPosition {
     let (root_x, root_y) = crate::xwayland::unpack_root_coordinates(data[2]);
     DecodedXdndPosition {
@@ -141,6 +156,41 @@ pub(crate) fn encode_xdnd_drop(fields: XdndDropFields) -> xproto::ClientMessageE
         type_: fields.drop_atom,
         data: ClientMessageData::from([fields.source_proxy, 0, fields.timestamp, 0, 0]),
     }
+}
+
+/// Encode one target-side v5 XdndFinished. The logical root remains in data[0]
+/// even though the internal target proxy owns the source-side routing work.
+pub(crate) fn encode_xdnd_finished(
+    source: Window,
+    logical_target: Window,
+    finished_atom: Atom,
+    accepted: bool,
+    final_action: Option<XwaylandDndAction>,
+    atoms: &XwmAtoms,
+) -> Option<xproto::ClientMessageEvent> {
+    let action_atom = if accepted {
+        match final_action? {
+            XwaylandDndAction::Copy => atoms.get(XwmAtomName::XdndActionCopy),
+            XwaylandDndAction::Move => atoms.get(XwmAtomName::XdndActionMove),
+            XwaylandDndAction::Ask | XwaylandDndAction::Link | XwaylandDndAction::Private => {
+                return None;
+            }
+        }
+    } else {
+        0
+    };
+    Some(xproto::ClientMessageEvent::new(
+        32,
+        source,
+        finished_atom,
+        [
+            logical_target,
+            u32::from(accepted) * XDND_FINISHED_ACCEPTED,
+            action_atom,
+            0,
+            0,
+        ],
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,6 +632,70 @@ mod tests {
         assert_eq!(event.window, 20);
         assert_eq!(event.type_, 51);
         assert_eq!(event.data.as_data32(), [21, 0, 40, 0, 0]);
+    }
+
+    #[test]
+    fn incoming_drop_decoder_uses_only_source_and_exact_data_two_timestamp() {
+        assert_eq!(
+            decode_xdnd_drop([0x441, 0xfeed, 0x1234_5678, 0xbeef, 0xcafe]),
+            Some(DecodedXdndDrop {
+                source: 0x441,
+                timestamp: 0x1234_5678,
+            })
+        );
+        assert_eq!(decode_xdnd_drop([0, 0, 7, 0, 0]), None);
+        assert_eq!(
+            decode_xdnd_drop([0x441, 0, 0, 0, 0]),
+            Some(DecodedXdndDrop {
+                source: 0x441,
+                timestamp: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn incoming_finished_encoder_targets_source_and_names_logical_root() {
+        let atoms = action_atoms();
+        let event = encode_xdnd_finished(
+            0x441,
+            0x202,
+            0x101,
+            true,
+            Some(XwaylandDndAction::Copy),
+            &atoms,
+        )
+        .expect("Copy is representable by the v5 bridge");
+        assert_eq!(event.window, 0x441);
+        assert_eq!(event.type_, 0x101);
+        assert_eq!(
+            event.data.as_data32(),
+            [0x202, XDND_FINISHED_ACCEPTED, 11, 0, 0]
+        );
+        let rejected = encode_xdnd_finished(0x441, 0x202, 0x101, false, None, &atoms)
+            .expect("failure does not require an action atom");
+        assert_eq!(rejected.data.as_data32(), [0x202, 0, 0, 0, 0]);
+        assert!(
+            encode_xdnd_finished(
+                0x441,
+                0x202,
+                0x101,
+                true,
+                Some(XwaylandDndAction::Ask),
+                &atoms,
+            )
+            .is_none()
+        );
+        assert!(
+            encode_xdnd_finished(
+                0x441,
+                0x202,
+                0x101,
+                true,
+                Some(XwaylandDndAction::Link),
+                &atoms,
+            )
+            .is_none()
+        );
     }
 
     #[test]

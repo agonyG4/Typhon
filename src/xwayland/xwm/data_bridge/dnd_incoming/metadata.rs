@@ -15,6 +15,14 @@ pub(super) fn begin_enter(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<
         return Ok(());
     }
     if let Some(previous) = xwm.data_bridge.dnd.incoming_session().map(|s| s.offer_id) {
+        if xwm
+            .data_bridge
+            .dnd
+            .incoming_session()
+            .is_some_and(|session| session.wire_phase != IncomingDndWirePhase::Hover)
+        {
+            return Ok(());
+        }
         if !leave_offer(xwm, previous) {
             let _ = xwm.data_bridge.dnd.retire_incoming_session(previous);
         }
@@ -62,6 +70,7 @@ pub(super) fn begin_enter(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<
         action_list_cached: false,
         action_list_complete: true,
         latest_position: None,
+        wire_phase: IncomingDndWirePhase::Hover,
         next_position_serial: 0,
         canonical_started: false,
         pending_status_deadline_ns: None,
@@ -300,6 +309,9 @@ pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(),
     let Some(session) = xwm.data_bridge.dnd.incoming_session() else {
         return Ok(());
     };
+    if session.wire_phase != IncomingDndWirePhase::Hover {
+        return Ok(());
+    }
     let proxy = target_proxy(xwm).unwrap_or_default();
     if !is_exact_source(session, xwm.generation, position.source, xwm.root, proxy) {
         return Ok(());
@@ -597,7 +609,9 @@ pub(super) fn leave(xwm: &mut Xwm, source: Window) -> Result<(), XwmError> {
         .data_bridge
         .dnd
         .incoming_session()
-        .filter(|session| session.source.xid() == source)
+        .filter(|session| {
+            session.source.xid() == source && session.wire_phase == IncomingDndWirePhase::Hover
+        })
         .map(|session| session.offer_id);
     if let Some(offer_id) = offer_id {
         leave_offer(xwm, offer_id);
@@ -610,7 +624,9 @@ pub(super) fn leave_offer(xwm: &mut Xwm, offer_id: XwaylandDndOfferId) -> bool {
         .data_bridge
         .dnd
         .incoming_session()
-        .is_none_or(|session| session.offer_id != offer_id)
+        .is_none_or(|session| {
+            session.offer_id != offer_id || session.wire_phase != IncomingDndWirePhase::Hover
+        })
     {
         return false;
     }
@@ -704,7 +720,7 @@ pub(super) fn cancel_metadata_replies(xwm: &mut Xwm, offer_id: Option<XwaylandDn
     }
 }
 
-fn send_status(
+pub(super) fn send_status(
     xwm: &mut Xwm,
     offer_id: XwaylandDndOfferId,
     position_id: crate::xwayland::XwaylandDndIncomingPositionId,
@@ -716,6 +732,7 @@ fn send_status(
             && session.generation == xwm.generation
             && position_id.offer_id() == offer_id
             && session.status_pending
+            && session.wire_phase == IncomingDndWirePhase::Hover
             && session.logical_target_root == xwm.root
             && Some(session.target_proxy) == target_proxy(xwm)
     }) else {
@@ -742,7 +759,11 @@ fn send_status(
             _ => false,
         }
     });
-    let accepted = accepted && session.accepted_mime.is_some() && valid_action.is_some();
+    let accepted = accepted
+        && session.version.get() >= 5
+        && session.wire_phase == IncomingDndWirePhase::Hover
+        && session.accepted_mime.is_some()
+        && valid_action.is_some();
     let selected_atom = if accepted {
         match valid_action {
             Some(crate::xwayland::XwaylandDndAction::Copy) => {
@@ -800,15 +821,21 @@ fn send_status(
 }
 
 pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<usize, XwmError> {
+    let mut processed = 0;
+    if budget != 0 && super::poll_root_proxy_verification(xwm, now_ns)? {
+        processed = 1;
+    }
+    if processed >= budget {
+        return Ok(processed);
+    }
     let sequences = xwm
         .data_bridge
         .dnd_incoming
         .pending
         .keys()
         .copied()
-        .take(budget)
+        .take(budget - processed)
         .collect::<Vec<_>>();
-    let mut processed = 0;
     for sequence in sequences {
         let Some(pending) = xwm.data_bridge.dnd_incoming.pending.get(&sequence).copied() else {
             continue;
@@ -1013,6 +1040,12 @@ fn pending_deadline(reply: PendingMetadataReply) -> u64 {
 }
 
 pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError> {
+    if matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Verifying { deadline_ns, .. } if now_ns >= deadline_ns
+    ) {
+        let _ = super::poll_root_proxy_verification(xwm, now_ns)?;
+    }
     let expired_offer = xwm
         .data_bridge
         .dnd
@@ -1082,6 +1115,10 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
 }
 
 pub(crate) fn next_deadline_ns(xwm: &Xwm) -> Option<u64> {
+    let root_verification = match xwm.data_bridge.dnd_incoming.root_proxy_authority {
+        RootProxyAuthority::Verifying { deadline_ns, .. } => Some(deadline_ns),
+        _ => None,
+    };
     let pending = xwm
         .data_bridge
         .dnd_incoming
@@ -1105,7 +1142,32 @@ pub(crate) fn next_deadline_ns(xwm: &Xwm) -> Option<u64> {
         .flatten()
         .min()
     });
-    session.into_iter().chain(pending).chain(transfer).min()
+    let terminal =
+        xwm.data_bridge
+            .dnd
+            .incoming_session()
+            .and_then(|session| match session.wire_phase {
+                IncomingDndWirePhase::DropSubmitted {
+                    acknowledgement_deadline_ns,
+                    ..
+                } => Some(acknowledgement_deadline_ns),
+                IncomingDndWirePhase::AwaitingWaylandFinish { deadline_ns, .. } => {
+                    Some(deadline_ns)
+                }
+                IncomingDndWirePhase::DeletePending { .. } => xwm
+                    .data_bridge
+                    .dnd_incoming
+                    .move_delete
+                    .map(|delete| delete.deadline_ns),
+                IncomingDndWirePhase::Hover | IncomingDndWirePhase::TerminalConsumed => None,
+            });
+    session
+        .into_iter()
+        .chain(terminal)
+        .chain(root_verification)
+        .chain(pending)
+        .chain(transfer)
+        .min()
 }
 
 pub(crate) fn source_feedback(
@@ -1124,6 +1186,7 @@ pub(crate) fn source_feedback(
                 session.offer_id == offer_id
                     && session.generation == xwm.generation
                     && session.canonical_started
+                    && session.wire_phase == IncomingDndWirePhase::Hover
                     && position_id.offer_id() == offer_id
                     && session
                         .latest_position

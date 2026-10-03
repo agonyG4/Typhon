@@ -266,13 +266,48 @@ impl NativeRuntime {
         };
 
         let mut incoming_wayland_events = false;
+        let mut incoming_drop_results = Vec::new();
+        let mut incoming_cancel_results = Vec::new();
         for event in self.xwayland.take_managed_incoming_dnd_events() {
-            incoming_wayland_events |= self.server.apply_xwayland_dnd_incoming_event(event);
+            match event {
+                oblivion_one::xwayland::XwaylandDndIncomingEvent::Drop { offer_id } => {
+                    let accepted = self.server.drop_xwayland_dnd(offer_id);
+                    if !accepted {
+                        incoming_wayland_events |= self.server.cancel_xwayland_dnd(offer_id);
+                    }
+                    incoming_wayland_events |= accepted;
+                    incoming_drop_results.push((offer_id, accepted));
+                }
+                oblivion_one::xwayland::XwaylandDndIncomingEvent::CancelAfterDrop { offer_id } => {
+                    let finished = self.server.finish_xwayland_dnd(offer_id, false);
+                    let cancelled = finished || self.server.cancel_xwayland_dnd(offer_id);
+                    incoming_wayland_events |= cancelled;
+                    incoming_cancel_results.push((offer_id, cancelled));
+                }
+                event => {
+                    incoming_wayland_events |= self.server.apply_xwayland_dnd_incoming_event(event);
+                }
+            }
         }
         if incoming_wayland_events {
             // Deliver data_offer/enter/motion/source_actions before feeding the
             // resulting canonical SourceFeedback back to the XWM.
             self.server.flush_wayland_clients()?;
+        }
+        for (offer_id, accepted) in incoming_drop_results {
+            self.xwayland.resolve_managed_incoming_dnd_drop(
+                offer_id,
+                accepted,
+                &mut self.process_supervisor,
+            )?;
+        }
+        for (offer_id, cancelled) in incoming_cancel_results {
+            self.xwayland
+                .resolve_managed_incoming_dnd_cancel_after_drop(
+                    offer_id,
+                    cancelled,
+                    &mut self.process_supervisor,
+                )?;
         }
 
         let transitions = self.server.take_xwayland_dnd_transitions();

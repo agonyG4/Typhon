@@ -1,5 +1,6 @@
 use super::*;
 use crate::xwayland::trace::{self, TraceFields};
+use x11rb::connection::Connection;
 
 impl Xwm {
     pub(crate) fn submit_proxy_selection_snapshots(
@@ -25,6 +26,25 @@ impl Xwm {
         &mut self,
     ) -> Vec<crate::xwayland::XwaylandDndIncomingEvent> {
         self.data_bridge.dnd_incoming.take_events()
+    }
+
+    pub(crate) fn resolve_incoming_dnd_drop(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        accepted: bool,
+        now_ns: u64,
+    ) -> Result<(), XwmError> {
+        super::data_bridge::dnd_incoming::resolve_drop(self, offer_id, accepted, now_ns)?;
+        self.connection.flush().map_err(XwmError::Connection)
+    }
+
+    pub(crate) fn resolve_incoming_dnd_cancel_after_drop(
+        &mut self,
+        offer_id: crate::xwayland::XwaylandDndOfferId,
+        cancelled: bool,
+    ) -> Result<(), XwmError> {
+        super::data_bridge::dnd_incoming::resolve_cancel_after_drop(self, offer_id, cancelled)?;
+        self.connection.flush().map_err(XwmError::Connection)
     }
 
     pub(crate) fn handle_dnd_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {

@@ -411,6 +411,16 @@ pub enum XwaylandDndIncomingEvent {
     Leave {
         offer_id: XwaylandDndOfferId,
     },
+    /// The incoming wire Drop has been admitted; runtime must apply the exact
+    /// offer-qualified canonical Drop and acknowledge the result to the XWM.
+    Drop {
+        offer_id: XwaylandDndOfferId,
+    },
+    /// Abort a post-Drop session through canonical finish(false), falling back
+    /// to cancel if the Drop has not yet been applied.
+    CancelAfterDrop {
+        offer_id: XwaylandDndOfferId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
