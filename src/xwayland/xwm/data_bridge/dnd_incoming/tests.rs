@@ -9,6 +9,7 @@ use std::{
 use x11rb::{protocol::xproto, x11_utils::Serialize};
 
 mod action_list;
+mod position_authority;
 
 fn offer_id(generation: XwaylandGeneration, serial: u64) -> XwaylandDndOfferId {
     XwaylandDndOfferId::new(generation, NonZeroU64::new(serial).expect("nonzero serial"))

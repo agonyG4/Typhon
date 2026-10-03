@@ -190,6 +190,9 @@ fn action_list_query_is_authoritative(
         .incoming_session()
         .is_some_and(|session| {
             session.offer_id == offer_id
+                && session.generation == xwm.generation
+                && position_id.offer_id() == offer_id
+                && session.status_pending
                 && session.action_list_required
                 && !session.action_list_complete
                 && session.latest_position.is_some_and(|position| {
@@ -197,6 +200,35 @@ fn action_list_query_is_authoritative(
                         && position.requested_action == crate::xwayland::XwaylandDndAction::Ask
                 })
         })
+}
+
+fn cancel_action_list_query(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+    position_id: crate::xwayland::XwaylandDndIncomingPositionId,
+) {
+    let sequences = xwm
+        .data_bridge
+        .dnd_incoming
+        .pending
+        .iter()
+        .filter_map(|(sequence, pending)| match pending {
+            PendingMetadataReply::ActionList {
+                offer_id: pending_offer,
+                position_id: pending_position,
+                ..
+            } if *pending_offer == offer_id && *pending_position == position_id => Some(*sequence),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for sequence in sequences {
+        xwm.data_bridge.dnd_incoming.pending.remove(&sequence);
+        xwm.connection.discard_reply(
+            sequence,
+            x11rb::connection::RequestKind::HasResponse,
+            x11rb::connection::DiscardMode::DiscardReply,
+        );
+    }
 }
 
 fn issue_atom_names(
@@ -445,13 +477,14 @@ fn settle_metadata_and_position(
         .data_bridge
         .dnd
         .incoming_session()
-        .filter(|session| session.offer_id == offer_id)
+        .filter(|session| session.offer_id == offer_id && session.generation == xwm.generation)
         .map(|session| {
             (
                 session.type_list_complete,
                 session.pending_atom_names,
                 session.action_list_required,
                 session.action_list_complete,
+                session.status_pending,
                 session.mime_types.clone(),
                 session.atom_to_mime.clone(),
                 session.available_actions.clone(),
@@ -469,6 +502,7 @@ fn settle_metadata_and_position(
         names_pending,
         needs_actions,
         actions_ready,
+        status_pending,
         mime_types,
         atom_to_mime,
         available_actions,
@@ -491,6 +525,9 @@ fn settle_metadata_and_position(
     let Some(position) = position else {
         return Ok(());
     };
+    if !status_pending {
+        return Ok(());
+    }
     if mime_types.is_empty() {
         send_status(xwm, offer_id, position.position_id, false, None)?;
         return Ok(());
@@ -1013,6 +1050,7 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
         });
     if let Some((offer_id, position_id)) = status_timeout {
         send_status(xwm, offer_id, position_id, false, None)?;
+        cancel_action_list_query(xwm, offer_id, position_id);
     }
     let expired = xwm
         .data_bridge
