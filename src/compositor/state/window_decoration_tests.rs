@@ -1,4 +1,8 @@
+use super::window_open_animation_tests::set_window_open_preset;
 use super::*;
+use crate::animation_control::{
+    AnimationEffect, AnimationPreset, AnimationRuntimeCapabilities, AnimationSlot,
+};
 use crate::compositor::decoration::{
     layout::DecorationLayout,
     render_plan::DecorationRenderPrimitive,
@@ -6,6 +10,7 @@ use crate::compositor::decoration::{
         CapturedXdgDecorationCommitState, DecorationHit, DecorationMode, DecorationPreference,
     },
 };
+use crate::presentation_animation::PresentationOpacity;
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use crate::xwayland::xwm::{X11FrameExtents, X11MotifDecorationHint};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
@@ -164,6 +169,7 @@ fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode:
         DecorationPreference::ServerSide,
         ToplevelMode::Normal,
     );
+    set_window_open_preset(&mut state, AnimationPreset::Astrea);
     state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
@@ -217,13 +223,14 @@ fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode:
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     assert_eq!(
-        state.presentation_animator.track_transaction(scene_node_id),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
     assert_eq!(
         state
             .presentation_animator
@@ -252,6 +259,7 @@ fn unpresented_xdg_mode_change_retargets_active_window_open_geometry() {
         DecorationPreference::ServerSide,
         ToplevelMode::Normal,
     );
+    set_window_open_preset(&mut state, AnimationPreset::Astrea);
     state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
@@ -274,10 +282,10 @@ fn unpresented_xdg_mode_change_retargets_active_window_open_geometry() {
         .track_transaction(scene_node_id)
         .expect("initial WindowOpen geometry transaction");
     assert_eq!(
-        Some(open_transaction),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
     assert!(state.presented_window_geometry(surface_id).is_none());
 
@@ -288,17 +296,17 @@ fn unpresented_xdg_mode_change_retargets_active_window_open_geometry() {
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     let retargeted_transaction = state
         .presentation_animator
         .track_transaction(scene_node_id)
         .expect("retargeted WindowOpen geometry transaction");
     assert_ne!(retargeted_transaction, open_transaction);
     assert_eq!(
-        Some(retargeted_transaction),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
     assert_eq!(
         state
@@ -371,6 +379,7 @@ fn unpresented_xdg_maximized_then_fullscreen_opens_on_fullscreen_geometry() {
         DecorationPreference::ServerSide,
         ToplevelMode::Normal,
     );
+    set_window_open_preset(&mut state, AnimationPreset::Astrea);
     state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
@@ -417,12 +426,12 @@ fn unpresented_xdg_maximized_then_fullscreen_opens_on_fullscreen_geometry() {
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     assert_eq!(
-        state.presentation_animator.track_transaction(scene_node_id),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
     assert_eq!(
         state
@@ -1874,4 +1883,169 @@ fn ssd_controls_and_titles_use_fractional_scale_rasters() {
                 .any(|primitive| matches!(primitive, DecorationRenderPrimitive::Text { .. }))
         );
     }
+}
+
+#[test]
+fn window_scale_above_maximized_xdg_window_starts_at_canonical_opacity() {
+    const MAXIMIZED_ROOT: u32 = 95;
+    const FLOATING_ROOT: u32 = 96;
+
+    let mut state = xdg_state(
+        test_surface(MAXIMIZED_ROOT),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Maximized,
+    );
+    set_window_open_preset(&mut state, AnimationPreset::Astrea);
+    state.presentation_animator.set_enabled(true);
+
+    let maximized_window_id = state
+        .window_id_for_surface(MAXIMIZED_ROOT)
+        .expect("maximized XDG window");
+    let maximized_geometry =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 1_920, 929);
+    state.install_toplevel_visual_geometry(MAXIMIZED_ROOT, maximized_geometry);
+    state
+        .surface_presentation_generations
+        .insert(MAXIMIZED_ROOT, 1);
+
+    let floating_window_id = state.allocate_window_id().expect("floating window ID");
+    let mut floating_window = DesktopWindow::new_xdg(floating_window_id, FLOATING_ROOT);
+    floating_window.state.set_mode(ToplevelMode::Normal);
+    state
+        .insert_desktop_window(floating_window)
+        .expect("floating XDG window");
+    state.append_renderable_surface(test_surface(FLOATING_ROOT));
+    let (_maximized_display, _maximized_client) =
+        install_test_toplevel_role(&mut state, MAXIMIZED_ROOT);
+    let (_floating_display, _floating_client) =
+        install_test_toplevel_role(&mut state, FLOATING_ROOT);
+
+    let floating_geometry =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(320, 180), 944, 501);
+    state.install_toplevel_visual_geometry(FLOATING_ROOT, floating_geometry);
+    state
+        .surface_presentation_generations
+        .insert(FLOATING_ROOT, 1);
+    state.rebuild_active_scene_view();
+    state
+        .ensure_native_output_id()
+        .expect("test output identity");
+
+    assert_eq!(
+        state.animation_control.effective_effect(
+            AnimationSlot::WindowOpen,
+            AnimationRuntimeCapabilities::default(),
+        ),
+        AnimationEffect::WindowScale
+    );
+
+    let maximized_scene_node = state
+        .scene_node_id_for_window_group(maximized_window_id)
+        .expect("maximized scene node");
+    let floating_scene_node = state
+        .scene_node_id_for_window_group(floating_window_id)
+        .expect("floating scene node");
+    let maximized_geometry_before = state
+        .current_visual_root_window_geometry(MAXIMIZED_ROOT)
+        .expect("maximized geometry before WindowOpen");
+    let floating_target = state
+        .presentation_rect_for_geometry(FLOATING_ROOT, floating_geometry)
+        .expect("floating presentation target");
+    let floating_start = PresentationRect::new(
+        floating_target.x() + floating_target.width() * 0.03,
+        floating_target.y() + floating_target.height() * 0.03,
+        floating_target.width() * 0.94,
+        floating_target.height() * 0.94,
+    )
+    .expect("centered WindowScale start rectangle");
+    let assert_rect_near = |actual: PresentationRect, expected: PresentationRect| {
+        const EPSILON: f64 = 1.0e-9;
+        assert!(
+            (actual.x() - expected.x()).abs() <= EPSILON
+                && (actual.y() - expected.y()).abs() <= EPSILON
+                && (actual.width() - expected.width()).abs() <= EPSILON
+                && (actual.height() - expected.height()).abs() <= EPSILON,
+            "presentation rectangle {actual:?} differs from {expected:?}"
+        );
+    };
+
+    assert!(state.maybe_begin_window_open_animation(FLOATING_ROOT));
+
+    let window_open_started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(floating_scene_node)
+        .expect("WindowScale Geometry start time");
+    let first_geometry = state
+        .presentation_animator
+        .sample_at_transition_start_for_scene_node(floating_scene_node)
+        .expect("first WindowScale geometry sample");
+    let first_presentation = state.presentation_scene_sample_at(window_open_started_at);
+    assert_rect_near(first_geometry.rect, floating_start);
+    assert_rect_near(
+        first_presentation
+            .transform_for_scene_node(floating_scene_node)
+            .expect("first WindowScale presentation transform")
+            .presented_rect,
+        floating_start,
+    );
+    assert_eq!(
+        first_presentation.opacity_for_scene_node(floating_scene_node),
+        PresentationOpacity::OPAQUE
+    );
+    assert_eq!(
+        first_presentation.opacity_for_scene_node(maximized_scene_node),
+        PresentationOpacity::OPAQUE
+    );
+    assert!(
+        !state
+            .presentation_animator
+            .has_opacity_track(floating_scene_node),
+        "WindowScale must not install an opacity transition"
+    );
+    assert!(
+        state
+            .presentation_animator
+            .sample_opacity_for_scene_node(floating_scene_node, AnimationTime::from_nanos(0),)
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .current_visual_root_window_geometry(FLOATING_ROOT)
+            .expect("floating canonical geometry"),
+        floating_geometry
+    );
+    assert_eq!(
+        state
+            .window(floating_window_id)
+            .expect("floating window")
+            .state
+            .mode(),
+        ToplevelMode::Normal
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(MAXIMIZED_ROOT),
+        Some(maximized_geometry_before)
+    );
+    assert_eq!(
+        state
+            .window(maximized_window_id)
+            .expect("maximized window")
+            .state
+            .mode(),
+        ToplevelMode::Maximized
+    );
+    assert!(!state.presentation_animator.has_track(maximized_scene_node));
+    let final_presentation =
+        state.presentation_scene_sample_at(AnimationTime::from_nanos(u64::MAX));
+    assert_rect_near(
+        final_presentation
+            .transform_for_scene_node(floating_scene_node)
+            .expect("final WindowScale presentation transform")
+            .presented_rect,
+        floating_target,
+    );
+    assert_eq!(
+        final_presentation.opacity_for_scene_node(floating_scene_node),
+        PresentationOpacity::OPAQUE
+    );
 }

@@ -342,6 +342,10 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
     let root_surface_id = 271;
     let child_surface_id = 272;
     let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
     let window_id = state.allocate_window_id().expect("window id");
     state
         .insert_desktop_window(DesktopWindow::new_xdg(window_id, root_surface_id))
@@ -402,7 +406,7 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
         state
             .presentation_animator
             .opacity_track_transaction(scene_node_id),
-        Some(open_transaction)
+        None
     );
     state
         .toplevel_visual_geometries
@@ -486,7 +490,7 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     let final_open_transaction = state
         .presentation_animator
         .track_transaction(scene_node_id)
@@ -496,7 +500,7 @@ fn unknown_restore_finalizes_only_after_the_surface_tree_publication_boundary() 
         state
             .presentation_animator
             .opacity_track_transaction(scene_node_id),
-        Some(final_open_transaction)
+        None
     );
     assert_eq!(
         state

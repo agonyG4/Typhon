@@ -2571,6 +2571,10 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
 #[test]
 fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
     let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
     let mut snapshot = x11_snapshot(generation, 113, 64);
     snapshot.state.fullscreen = true;
@@ -2645,12 +2649,12 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     assert_eq!(
-        state.presentation_animator.track_transaction(scene_node_id),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
     assert_eq!(
         state
@@ -2692,6 +2696,10 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
 #[test]
 fn unpresented_x11_mode_change_retargets_active_window_open_geometry() {
     let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
     let snapshot = x11_snapshot(generation, 116, 67);
     let id = insert_x11(&mut state, snapshot.clone());
@@ -2721,10 +2729,10 @@ fn unpresented_x11_mode_change_retargets_active_window_open_geometry() {
         .track_transaction(scene_node_id)
         .expect("initial WindowOpen geometry transaction");
     assert_eq!(
-        Some(open_transaction),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
     assert!(
         state
@@ -2743,17 +2751,17 @@ fn unpresented_x11_mode_change_retargets_active_window_open_geometry() {
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     let retargeted_transaction = state
         .presentation_animator
         .track_transaction(scene_node_id)
         .expect("retargeted WindowOpen geometry transaction");
     assert_ne!(retargeted_transaction, open_transaction);
     assert_eq!(
-        Some(retargeted_transaction),
         state
             .presentation_animator
-            .opacity_track_transaction(scene_node_id)
+            .opacity_track_transaction(scene_node_id),
+        None
     );
     assert_eq!(
         state
@@ -2836,6 +2844,10 @@ fn physically_presented_x11_mode_changes_keep_enter_and_exit_animations() {
 #[test]
 fn pre_map_maximized_snapshot_uses_usable_output_geometry() {
     let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
     let mut snapshot = x11_snapshot(generation, 114, 65);
     snapshot.state.maximized = true;
@@ -2930,17 +2942,15 @@ fn pre_map_maximized_snapshot_uses_usable_output_geometry() {
             .has_geometry_track(maximized_scene_node_id)
     );
     assert!(
-        state
+        !state
             .presentation_animator
             .has_opacity_track(maximized_scene_node_id)
     );
     assert_eq!(
         state
             .presentation_animator
-            .track_transaction(maximized_scene_node_id),
-        state
-            .presentation_animator
-            .opacity_track_transaction(maximized_scene_node_id)
+            .opacity_track_transaction(maximized_scene_node_id),
+        None
     );
     assert_eq!(
         state

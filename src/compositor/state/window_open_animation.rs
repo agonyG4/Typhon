@@ -15,10 +15,15 @@ const WINDOW_OPEN_BASE_DURATION: Duration = Duration::from_millis(180);
 pub(super) struct WindowOpenAnimationPlan {
     pub(super) geometry_start: PresentationRect,
     pub(super) geometry_target: PresentationRect,
-    pub(super) opacity_start: PresentationOpacity,
-    pub(super) opacity_target: PresentationOpacity,
     pub(super) geometry_curve: AnimationCurve,
-    pub(super) opacity_curve: AnimationCurve,
+    pub(super) opacity: Option<WindowOpenOpacityAnimationPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct WindowOpenOpacityAnimationPlan {
+    pub(super) start: PresentationOpacity,
+    pub(super) target: PresentationOpacity,
+    pub(super) curve: AnimationCurve,
 }
 
 pub(super) fn window_open_animation_plan(
@@ -53,13 +58,21 @@ pub(super) fn window_open_animation_plan(
         )
     };
 
+    let opacity = match effect {
+        AnimationEffect::WindowScale => None,
+        AnimationEffect::WindowGlide => Some(WindowOpenOpacityAnimationPlan {
+            start: PresentationOpacity::TRANSPARENT,
+            target: canonical_opacity,
+            curve: curve(),
+        }),
+        _ => return None,
+    };
+
     Some(WindowOpenAnimationPlan {
         geometry_start,
         geometry_target: target,
-        opacity_start: PresentationOpacity::TRANSPARENT,
-        opacity_target: canonical_opacity,
         geometry_curve: curve(),
-        opacity_curve: curve(),
+        opacity,
     })
 }
 
@@ -193,20 +206,25 @@ impl CompositorState {
         else {
             return false;
         };
+        let geometry_is_owned = self.presentation_animator.has_geometry_track(scene_node_id);
+        if geometry_is_owned && plan.opacity.is_none() {
+            return false;
+        }
         let Some(now) = AnimationTime::monotonic_now() else {
             return false;
         };
 
-        let opacity = PresentationOpacityMutation::new(
-            scene_node_id,
-            plan.opacity_start,
-            plan.opacity_target,
-            plan.opacity_curve,
-        );
-        let request = if self.presentation_animator.has_geometry_track(scene_node_id) {
-            PresentationTransactionRequest::opacity(now, vec![opacity])
-        } else {
-            PresentationTransactionRequest::mixed(
+        let request = match (geometry_is_owned, plan.opacity) {
+            (true, Some(opacity)) => PresentationTransactionRequest::opacity(
+                now,
+                vec![PresentationOpacityMutation::new(
+                    scene_node_id,
+                    opacity.start,
+                    opacity.target,
+                    opacity.curve,
+                )],
+            ),
+            (false, Some(opacity)) => PresentationTransactionRequest::mixed(
                 now,
                 vec![PresentationGeometryMutation::new(
                     scene_node_id,
@@ -214,8 +232,23 @@ impl CompositorState {
                     plan.geometry_target,
                     plan.geometry_curve,
                 )],
-                vec![opacity],
-            )
+                vec![PresentationOpacityMutation::new(
+                    scene_node_id,
+                    opacity.start,
+                    opacity.target,
+                    opacity.curve,
+                )],
+            ),
+            (false, None) => PresentationTransactionRequest::geometry(
+                now,
+                vec![PresentationGeometryMutation::new(
+                    scene_node_id,
+                    plan.geometry_start,
+                    plan.geometry_target,
+                    plan.geometry_curve,
+                )],
+            ),
+            (true, None) => return false,
         };
 
         self.presentation_animator.commit(request).is_ok()

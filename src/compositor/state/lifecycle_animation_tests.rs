@@ -1577,9 +1577,13 @@ fn failed_minimize_install_rolls_back_identity_without_taking_over_previous_stat
 }
 
 #[test]
-fn successful_minimize_lamp_cancels_both_window_open_property_tracks() {
+fn successful_minimize_lamp_cancels_window_scale_geometry_track() {
     let root_surface_id = 409;
     let (mut state, window_id) = ssd_test_state(root_surface_id);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
     state.presentation_animator.set_enabled(true);
     state.lifecycle_animation_renderer_available = Some(true);
     assert!(state.maybe_begin_window_open_animation(root_surface_id));
@@ -1591,7 +1595,7 @@ fn successful_minimize_lamp_cancels_both_window_open_property_tracks() {
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
 
     state.begin_lifecycle_minimize(
         window_id,
@@ -1623,9 +1627,13 @@ fn successful_minimize_lamp_cancels_both_window_open_property_tracks() {
 }
 
 #[test]
-fn failed_minimize_lamp_install_leaves_window_open_geometry_and_opacity_active() {
+fn failed_minimize_lamp_install_leaves_window_scale_geometry_active() {
     let root_surface_id = 410;
     let (mut state, window_id) = ssd_test_state(root_surface_id);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
     state.presentation_animator.set_enabled(true);
     state.lifecycle_animation_renderer_available = Some(true);
     assert!(state.maybe_begin_window_open_animation(root_surface_id));
@@ -1636,10 +1644,12 @@ fn failed_minimize_lamp_install_leaves_window_open_geometry_and_opacity_active()
         .presentation_animator
         .track_transaction(scene_node_id)
         .expect("Open Geometry transaction");
-    let opacity_transaction = state
-        .presentation_animator
-        .opacity_track_transaction(scene_node_id)
-        .expect("Open Opacity transaction");
+    assert_eq!(
+        state
+            .presentation_animator
+            .opacity_track_transaction(scene_node_id),
+        None
+    );
     state.window_lifecycle_animator.fail_next_start_for_test();
 
     state.begin_lifecycle_minimize(
@@ -1656,18 +1666,12 @@ fn failed_minimize_lamp_install_leaves_window_open_geometry_and_opacity_active()
         state.presentation_animator.track_transaction(scene_node_id),
         Some(geometry_transaction)
     );
-    assert_eq!(
-        state
-            .presentation_animator
-            .opacity_track_transaction(scene_node_id),
-        Some(opacity_transaction)
-    );
     assert!(
         state
             .presentation_animator
             .has_geometry_track(scene_node_id)
     );
-    assert!(state.presentation_animator.has_opacity_track(scene_node_id));
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     assert_eq!(state.presentation_animator.transaction_count(), 1);
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(
