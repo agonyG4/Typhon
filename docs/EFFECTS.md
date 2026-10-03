@@ -63,6 +63,28 @@ output texture is available. This preference applies only to that eligible
 checkpoint Replay case; other capture categories retain their existing planner
 behavior.
 
+Dependency-free Replay `SceneCapture` passes can also own persistent cache
+entries while remaining on the Replay execution path. A new, stale, invalid,
+or identity-changed entry receives a full-domain Replay capture. A consecutive
+entry is reused without capture framebuffer work, clearing, command selection,
+or Replay draws only when the existing causal model proves its source unchanged.
+Changed or unproven sources receive a full-domain Replay refresh; these source
+caches are never partially updated. Their validity serial and causal baseline
+belong to the persistent Effects resource cache and follow the immediately
+previous rendered cache state, including unpresented renders. Existing
+dependency-bearing framebuffer checkpoint candidates retain admission priority
+under the checkpoint soft budget.
+
+When GPU timing is active, `event=effect_gpu_timing` reports
+`replay_capture_cache_hits`, `replay_capture_cache_full_refreshes`,
+`replay_capture_cache_zero_copy_hits`, `replay_capture_cache_update_pixels`,
+`replay_capture_cache_domain_pixels`, and `replay_capture_cache_saved_pixels`
+for dependency-free persistent Replay captures. Hits count consecutive cache
+populations, full refreshes count physical full-domain Replay updates, zero-copy
+hits are a subset of hits, update pixels count physical Replay writes, domain
+pixels count considered cache domains, and saved pixels are domain pixels minus
+update pixels.
+
 `TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH=blit` forces the diagnostic
 framebuffer-blit path. Setting it to `shader-copy` explicitly requests the
 preferred shader-copy path while retaining the no-sampleable-output fallback.

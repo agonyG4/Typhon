@@ -187,7 +187,7 @@ pub(crate) fn checkpoint_capture_cache_key(
     graph: &CompiledFrameGraph,
     pass: &oblivion_one::effects::CompiledRenderPass,
 ) -> Option<CheckpointCaptureCacheKey> {
-    if pass.kind != RenderPassKind::SceneCapture || pass.checkpoint_dependencies.is_empty() {
+    if pass.kind != RenderPassKind::SceneCapture {
         return None;
     }
     let consumer = graph
@@ -1863,6 +1863,41 @@ mod tests {
     }
 
     #[test]
+    fn dependent_checkpoint_key_preserves_ordered_dependency_identity() {
+        let mut graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && pass.instance == EffectInstanceId::new(3).unwrap()
+                    && pass.checkpoint_dependencies.len() > 1
+            })
+            .expect("third stacked capture has ordered dependencies");
+        let baseline = checkpoint_capture_cache_key(&graph, capture).unwrap();
+        let capture_id = capture.id;
+
+        let capture = graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == capture_id)
+            .unwrap();
+        capture.checkpoint_dependencies.reverse();
+        let reordered = checkpoint_capture_cache_key(
+            &graph,
+            graph
+                .passes
+                .iter()
+                .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance.get() == 3)
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_ne!(baseline.dependencies, reordered.dependencies);
+        assert_ne!(baseline, reordered);
+    }
+
+    #[test]
     fn checkpoint_capture_key_changes_with_consumer_anchor_scope() {
         let mut surface_graph = backdrop_stack_graph(1, EffectRegion::empty());
         let consumer = EffectInstanceId::new(3).unwrap();
@@ -2070,6 +2105,78 @@ mod tests {
         );
         assert_ne!(base, changed_scope);
         assert_ne!(changed_scope, changed_group);
+    }
+
+    #[test]
+    fn dependency_free_scene_capture_has_deterministic_exact_cache_key() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let root_capture = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture && pass.checkpoint_dependencies.is_empty()
+            })
+            .expect("root SceneCapture has no checkpoint dependencies");
+        let key = checkpoint_capture_cache_key(&graph, root_capture)
+            .expect("dependency-free SceneCapture is cacheable");
+
+        assert!(key.dependencies.is_empty());
+        let identical_key = checkpoint_capture_cache_key(&graph.clone(), root_capture)
+            .expect("identical root SceneCapture remains cacheable");
+        assert_eq!(key, identical_key);
+
+        let changed_semantics = {
+            let mut changed = graph.clone();
+            changed
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == root_capture.instance)
+                .unwrap()
+                .semantic_signature += 1;
+            checkpoint_capture_cache_key(
+                &changed,
+                changed
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.kind == RenderPassKind::SceneCapture
+                            && pass.checkpoint_dependencies.is_empty()
+                    })
+                    .unwrap(),
+            )
+            .expect("semantic change retains a distinct root key")
+        };
+        assert_ne!(key, changed_semantics);
+
+        let changed_domain = {
+            let mut changed = graph.clone();
+            let output = root_capture.output.unwrap();
+            let texture = changed
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == output)
+                .unwrap();
+            texture.domain = oblivion_one::effects::EffectRect::new(
+                texture.domain.x + 1,
+                texture.domain.y,
+                texture.domain.width,
+                texture.domain.height,
+            )
+            .unwrap();
+            checkpoint_capture_cache_key(
+                &changed,
+                changed
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.kind == RenderPassKind::SceneCapture
+                            && pass.checkpoint_dependencies.is_empty()
+                    })
+                    .unwrap(),
+            )
+            .expect("domain change retains a distinct root key")
+        };
+        assert_ne!(key, changed_domain);
     }
 
     #[test]
@@ -2490,6 +2597,74 @@ mod tests {
         assert_eq!(cache.checkpoint_cache_stats().1, candidate_bytes);
         assert_eq!(cache.pool.metrics().allocation_count, 1);
         assert_eq!(prepared.bindings.len(), 1);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn dependent_candidates_keep_soft_budget_priority_over_replay_roots() {
+        let mut graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let second_capture = graph
+            .passes
+            .iter_mut()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && pass.instance == EffectInstanceId::new(2).unwrap()
+            })
+            .expect("second SceneCapture exists");
+        second_capture.checkpoint_dependencies.clear();
+
+        let config =
+            crate::egl_renderer::effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                crate::egl_renderer::effects::EffectDebugCaptureMode::Replay,
+                crate::egl_renderer::effects::EffectDebugKawaseMode::Partial,
+                crate::egl_renderer::effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+        let candidates =
+            crate::egl_renderer::effects::executor::checkpoint_capture_cache_candidates(
+                &graph, &config, true,
+            );
+        assert_eq!(candidates.len(), 3);
+        assert!(!candidates[0].0.dependencies.is_empty());
+        assert!(candidates[1].0.dependencies.is_empty());
+        assert!(candidates[2].0.dependencies.is_empty());
+
+        let dependent_bytes = texture_key(&candidates[0].1).estimated_bytes().unwrap();
+        let first_root_bytes = texture_key(&candidates[1].1).estimated_bytes().unwrap();
+        let soft_budget = dependent_bytes + first_root_bytes;
+        let all_candidate_bytes = candidates
+            .iter()
+            .map(|(_, plan)| texture_key(plan).estimated_bytes().unwrap())
+            .sum::<u64>();
+        assert!(all_candidate_bytes > soft_budget);
+        let graph_peak = estimate_graph_peak_bytes(&graph).unwrap();
+        let hard_budget = graph_peak + all_candidate_bytes;
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = EffectGlResourceCache::with_budgets(hard_budget, soft_budget).unwrap();
+        cache.pool.next_id = 771;
+        for texture_id in 771..=772 {
+            cache.gl_textures.insert(
+                texture_id,
+                glow::NativeTexture(std::num::NonZeroU32::new(texture_id as u32).unwrap()),
+            );
+        }
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &test_gl_context(),
+            compatibility,
+            Some(graph_peak),
+            &candidates,
+        );
+
+        assert!(prepared.bindings.contains_key(&candidates[0].1.id));
+        assert!(prepared.bindings.contains_key(&candidates[1].1.id));
+        assert!(!prepared.bindings.contains_key(&candidates[2].1.id));
+        assert_eq!(prepared.admission.newly_admitted_candidates, 2);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 1);
+        assert_eq!(prepared.admission.skipped_hard_budget, 0);
         assert_checkpoint_admission_partition(prepared.admission);
     }
 

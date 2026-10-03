@@ -441,6 +441,18 @@ pub(crate) struct EffectExecutionStats {
     pub checkpoint_cache_update_pixels: u64,
     pub checkpoint_cache_domain_pixels: u64,
     pub checkpoint_cache_saved_pixels: u64,
+    /// Dependency-free Replay SceneCapture counters. Hits count consecutive
+    /// cache populations; full refreshes count full-domain physical replays.
+    pub replay_capture_cache_hits: usize,
+    pub replay_capture_cache_full_refreshes: usize,
+    /// Zero-copy hits are a subset of replay_capture_cache_hits.
+    pub replay_capture_cache_zero_copy_hits: usize,
+    /// Physical pixels written by dependency-free Replay cache refreshes.
+    pub replay_capture_cache_update_pixels: u64,
+    /// Capture-domain pixels considered by dependency-free persistent Replay.
+    pub replay_capture_cache_domain_pixels: u64,
+    /// Domain pixels minus physical update pixels for dependency-free Replay.
+    pub replay_capture_cache_saved_pixels: u64,
     pub checkpoint_causal_proven_unchanged: usize,
     pub checkpoint_causal_unproven: usize,
     pub checkpoint_causal_dependency_changed: usize,
@@ -489,6 +501,12 @@ impl EffectExecutionStats {
             checkpoint_cache_update_pixels: self.checkpoint_cache_update_pixels,
             checkpoint_cache_domain_pixels: self.checkpoint_cache_domain_pixels,
             checkpoint_cache_saved_pixels: self.checkpoint_cache_saved_pixels,
+            replay_capture_cache_hits: self.replay_capture_cache_hits,
+            replay_capture_cache_full_refreshes: self.replay_capture_cache_full_refreshes,
+            replay_capture_cache_zero_copy_hits: self.replay_capture_cache_zero_copy_hits,
+            replay_capture_cache_update_pixels: self.replay_capture_cache_update_pixels,
+            replay_capture_cache_domain_pixels: self.replay_capture_cache_domain_pixels,
+            replay_capture_cache_saved_pixels: self.replay_capture_cache_saved_pixels,
             checkpoint_causal_proven_unchanged: self.checkpoint_causal_proven_unchanged,
             checkpoint_causal_unproven: self.checkpoint_causal_unproven,
             checkpoint_causal_dependency_changed: self.checkpoint_causal_dependency_changed,
@@ -618,6 +636,51 @@ impl EffectExecutionStats {
                 .checkpoint_dependency_edges
                 .saturating_add(checkpoint_count);
         }
+    }
+
+    fn record_dependency_free_replay_cache_decision(
+        &mut self,
+        consecutive_cache_hit: bool,
+        full_refresh: bool,
+        zero_copy: bool,
+        domain_pixels: u64,
+        update_pixels: u64,
+    ) {
+        if consecutive_cache_hit {
+            self.checkpoint_cache_hits = self.checkpoint_cache_hits.saturating_add(1);
+            self.replay_capture_cache_hits = self.replay_capture_cache_hits.saturating_add(1);
+        } else {
+            self.checkpoint_cache_full_refreshes =
+                self.checkpoint_cache_full_refreshes.saturating_add(1);
+        }
+        if zero_copy {
+            self.checkpoint_cache_zero_copy_hits =
+                self.checkpoint_cache_zero_copy_hits.saturating_add(1);
+            self.replay_capture_cache_zero_copy_hits =
+                self.replay_capture_cache_zero_copy_hits.saturating_add(1);
+        }
+        if full_refresh {
+            self.replay_capture_cache_full_refreshes =
+                self.replay_capture_cache_full_refreshes.saturating_add(1);
+        }
+        self.checkpoint_cache_domain_pixels = self
+            .checkpoint_cache_domain_pixels
+            .saturating_add(domain_pixels);
+        self.checkpoint_cache_update_pixels = self
+            .checkpoint_cache_update_pixels
+            .saturating_add(update_pixels);
+        self.checkpoint_cache_saved_pixels = self
+            .checkpoint_cache_saved_pixels
+            .saturating_add(domain_pixels.saturating_sub(update_pixels));
+        self.replay_capture_cache_domain_pixels = self
+            .replay_capture_cache_domain_pixels
+            .saturating_add(domain_pixels);
+        self.replay_capture_cache_update_pixels = self
+            .replay_capture_cache_update_pixels
+            .saturating_add(update_pixels);
+        self.replay_capture_cache_saved_pixels = self
+            .replay_capture_cache_saved_pixels
+            .saturating_add(domain_pixels.saturating_sub(update_pixels));
     }
 }
 
@@ -968,34 +1031,11 @@ fn prepare_checkpoint_cache_bindings(
     framebuffer_origin: OutputFramebufferOrigin,
     debug_config: EffectDebugConfig,
 ) -> PreparedCheckpointCaptures {
-    let mut candidates = Vec::new();
-    if debug_config.capture_mode() == EffectDebugCaptureMode::Replay {
-        for pass in &graph.passes {
-            if pass.kind != RenderPassKind::SceneCapture
-                || pass.checkpoint_dependencies.is_empty()
-                || checkpoint_capture_execution_plan_for_pass(
-                    renderer,
-                    pass,
-                    SceneBaselineAuthority::ReplayRequired,
-                    debug_config,
-                )
-                .executed
-                    != CaptureTimingMode::FramebufferShaderCopy
-            {
-                continue;
-            }
-            let Some(key) = checkpoint_capture_cache_key(graph, pass) else {
-                continue;
-            };
-            let Some(output) = pass.output else {
-                continue;
-            };
-            let Some(plan) = graph.textures.iter().find(|texture| texture.id == output) else {
-                continue;
-            };
-            candidates.push((key, plan.clone()));
-        }
-    }
+    let candidates = checkpoint_capture_cache_candidates(
+        graph,
+        &debug_config,
+        renderer.active_output_texture.is_some(),
+    );
     let compatibility = CheckpointCacheCompatibility {
         output_size: renderer.current_size,
         framebuffer_origin_top_left: framebuffer_origin == OutputFramebufferOrigin::TopLeftScanout,
@@ -1008,6 +1048,60 @@ fn prepare_checkpoint_cache_bindings(
         graph_peak_bytes,
         &candidates,
     )
+}
+
+pub(crate) fn checkpoint_capture_cache_candidates(
+    graph: &CompiledFrameGraph,
+    debug_config: &EffectDebugConfig,
+    active_output_texture_available: bool,
+) -> Vec<(
+    super::resources::CheckpointCaptureCacheKey,
+    oblivion_one::effects::GraphTexturePlan,
+)> {
+    let mut dependent_candidates = Vec::new();
+    let mut replay_candidates = Vec::new();
+    if debug_config.capture_mode() != EffectDebugCaptureMode::Replay {
+        return dependent_candidates;
+    }
+    for pass in &graph.passes {
+        if pass.kind != RenderPassKind::SceneCapture {
+            continue;
+        }
+        let dependency_free = pass.checkpoint_dependencies.is_empty();
+        let execution_plan = checkpoint_capture_execution_plan(
+            pass.kind,
+            pass.checkpoint_dependencies.len(),
+            SceneBaselineAuthority::ReplayRequired,
+            debug_config.capture_mode(),
+            debug_config.checkpoint_capture_path(),
+            active_output_texture_available,
+        );
+        let eligible = if dependency_free {
+            execution_plan.executed == CaptureTimingMode::Replay
+        } else {
+            execution_plan.executed == CaptureTimingMode::FramebufferShaderCopy
+        };
+        if !eligible {
+            continue;
+        }
+        let Some(key) = checkpoint_capture_cache_key(graph, pass) else {
+            continue;
+        };
+        let Some(output) = pass.output else {
+            continue;
+        };
+        let Some(plan) = graph.textures.iter().find(|texture| texture.id == output) else {
+            continue;
+        };
+        let candidate = (key, plan.clone());
+        if dependency_free {
+            replay_candidates.push(candidate);
+        } else {
+            dependent_candidates.push(candidate);
+        }
+    }
+    dependent_candidates.extend(replay_candidates);
+    dependent_candidates
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2307,6 +2401,40 @@ struct CheckpointCaptureExecutionPlan {
     requested: Option<CheckpointCapturePath>,
     executed: CaptureTimingMode,
     fallback_reason: Option<CapturePathFallbackReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentSceneCaptureMode {
+    DependentFramebufferCheckpoint,
+    DependencyFreeReplayCapture,
+}
+
+fn persistent_scene_capture_mode(
+    pass: &CompiledRenderPass,
+    target: &GraphTextureBinding,
+    scene_baseline_authority: SceneBaselineAuthority,
+    debug_config: EffectDebugConfig,
+    capture_plan: CheckpointCaptureExecutionPlan,
+) -> Option<PersistentSceneCaptureMode> {
+    if pass.kind != RenderPassKind::SceneCapture
+        || !target.is_checkpoint_cache()
+        || scene_baseline_authority != SceneBaselineAuthority::ReplayRequired
+        || debug_config.capture_mode() != EffectDebugCaptureMode::Replay
+    {
+        return None;
+    }
+    match (
+        pass.checkpoint_dependencies.is_empty(),
+        capture_plan.executed,
+    ) {
+        (false, CaptureTimingMode::FramebufferShaderCopy) => {
+            Some(PersistentSceneCaptureMode::DependentFramebufferCheckpoint)
+        }
+        (true, CaptureTimingMode::Replay) => {
+            Some(PersistentSceneCaptureMode::DependencyFreeReplayCapture)
+        }
+        _ => None,
+    }
 }
 
 fn checkpoint_capture_execution_plan(
@@ -3691,14 +3819,17 @@ fn execute_capture(
     let replay_host_timing_enabled =
         replay_capture_host_timing_enabled(host_timing_enabled, direct_capture);
     let host_start = replay_host_timing_enabled.then(Instant::now);
-    let checkpoint_cache_key = (pass.kind == RenderPassKind::SceneCapture
-        && !pass.checkpoint_dependencies.is_empty()
-        && scene_baseline_authority == SceneBaselineAuthority::ReplayRequired
-        && debug_config.capture_mode() == EffectDebugCaptureMode::Replay
-        && capture_plan.executed == CaptureTimingMode::FramebufferShaderCopy
-        && target.is_checkpoint_cache())
-    .then(|| checkpoint_capture_cache_key(graph, pass))
-    .flatten();
+    let persistent_capture_mode = persistent_scene_capture_mode(
+        pass,
+        target,
+        scene_baseline_authority,
+        debug_config,
+        capture_plan,
+    );
+    let checkpoint_cache_key =
+        persistent_capture_mode.and_then(|_| checkpoint_capture_cache_key(graph, pass));
+    let dependency_free_replay_cache =
+        persistent_capture_mode == Some(PersistentSceneCaptureMode::DependencyFreeReplayCapture);
     let frame_serial = renderer.effect_resources.checkpoint_frame_serial();
     let checkpoint_full_refresh = checkpoint_cache_key.as_ref().is_some_and(|key| {
         renderer
@@ -3753,6 +3884,19 @@ fn execute_capture(
                 )
             }
         })
+    } else if dependency_free_replay_cache {
+        Some(if causal_zero_copy {
+            CaptureMaterializationPlan {
+                region: EffectRegion::empty(),
+                output_rects: Vec::new(),
+            }
+        } else {
+            capture_materialization_plan(
+                &EffectRegion::from_rect(target_plan.domain),
+                Some(target_plan.domain),
+                renderer.current_size,
+            )
+        })
     } else {
         Some(capture_materialization_plan(
             execution_damage,
@@ -3790,6 +3934,26 @@ fn execute_capture(
             materialization.output_rects.len(),
             output_rect_pixels(&capture_rects),
         );
+    }
+    if dependency_free_replay_cache && causal_zero_copy {
+        stats.record_capture_execution_with_mode(pass, CaptureTimingMode::Replay, 0, 0);
+        if let Some(key) = checkpoint_cache_key.as_ref() {
+            renderer
+                .effect_resources
+                .mark_checkpoint_capture_populated(key, frame_serial);
+            if renderer.effect_gpu_profiler.cache_telemetry_enabled() {
+                let domain_pixels =
+                    u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height));
+                stats.record_dependency_free_replay_cache_decision(
+                    true,
+                    false,
+                    true,
+                    domain_pixels,
+                    0,
+                );
+            }
+        }
+        return Ok(None);
     }
     if direct_capture {
         stats.record_capture_execution_with_mode(pass, capture_plan.executed, physical_pixels, 0);
@@ -3854,6 +4018,11 @@ fn execute_capture(
             CaptureTimingMode::Replay => unreachable!("direct capture selected replay timing"),
         }
         return Ok(None);
+    }
+    if dependency_free_replay_cache && let Some(key) = checkpoint_cache_key.as_ref() {
+        // A failed bind, clear, selection, or draw must never leave the
+        // partially rewritten Replay texture authoritative.
+        renderer.effect_resources.invalidate_checkpoint_capture(key);
     }
     renderer
         .effect_resources
@@ -3933,13 +4102,25 @@ fn execute_capture(
     renderer.capture_unattenuated_visual_group = pass.visual_group;
     renderer.capture_unclipped_presentation_owner =
         renderer.presentation_owner_for_visual_group(pass.visual_group);
-    let draw_result = renderer.draw_capture_commands_for_regions(
-        &indices,
-        &scissors,
-        target_plan.domain,
-        (target_plan.width, target_plan.height),
-        replay_host_timing_enabled,
-    );
+    #[cfg(test)]
+    let inject_replay_failure = dependency_free_replay_cache
+        && std::mem::replace(
+            &mut renderer.fail_next_dependency_free_replay_capture,
+            false,
+        );
+    #[cfg(not(test))]
+    let inject_replay_failure = false;
+    let draw_result = if inject_replay_failure {
+        Err(io::Error::other("injected dependency-free Replay capture failure").into())
+    } else {
+        renderer.draw_capture_commands_for_regions(
+            &indices,
+            &scissors,
+            target_plan.domain,
+            (target_plan.width, target_plan.height),
+            replay_host_timing_enabled,
+        )
+    };
     renderer.capture_unattenuated_visual_group = None;
     renderer.capture_unclipped_presentation_owner = None;
     let mut detail = draw_result?;
@@ -3950,6 +4131,22 @@ fn execute_capture(
     detail.execution_pixels = physical_pixels;
     detail.selection_cpu_ns = selection_cpu_ns;
     detail.host_cpu_ns = monotonic_elapsed_ns(host_start);
+    if dependency_free_replay_cache && let Some(key) = checkpoint_cache_key.as_ref() {
+        renderer
+            .effect_resources
+            .mark_checkpoint_capture_populated(key, frame_serial);
+        if renderer.effect_gpu_profiler.cache_telemetry_enabled() {
+            let domain_pixels =
+                u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height));
+            stats.record_dependency_free_replay_cache_decision(
+                !checkpoint_full_refresh,
+                physical_pixels == domain_pixels,
+                false,
+                domain_pixels,
+                physical_pixels,
+            );
+        }
+    }
     Ok(Some(detail))
 }
 
@@ -6235,6 +6432,27 @@ mod coordinate_tests {
 mod tests {
     use super::*;
     use crate::egl_renderer::{EglRect, SurfaceSampling, replay_capture_region_layout};
+
+    #[test]
+    fn dependency_free_replay_cache_telemetry_distinguishes_hits_and_full_updates() {
+        let mut stats = EffectExecutionStats::default();
+        stats.record_dependency_free_replay_cache_decision(false, true, false, 100, 100);
+        stats.record_dependency_free_replay_cache_decision(true, false, true, 100, 0);
+        stats.record_dependency_free_replay_cache_decision(true, true, false, 100, 100);
+
+        assert_eq!(stats.checkpoint_cache_hits, 2);
+        assert_eq!(stats.checkpoint_cache_full_refreshes, 1);
+        assert_eq!(stats.checkpoint_cache_zero_copy_hits, 1);
+        assert_eq!(stats.checkpoint_cache_domain_pixels, 300);
+        assert_eq!(stats.checkpoint_cache_update_pixels, 200);
+        assert_eq!(stats.checkpoint_cache_saved_pixels, 100);
+        assert_eq!(stats.replay_capture_cache_hits, 2);
+        assert_eq!(stats.replay_capture_cache_full_refreshes, 2);
+        assert_eq!(stats.replay_capture_cache_zero_copy_hits, 1);
+        assert_eq!(stats.replay_capture_cache_domain_pixels, 300);
+        assert_eq!(stats.replay_capture_cache_update_pixels, 200);
+        assert_eq!(stats.replay_capture_cache_saved_pixels, 100);
+    }
 
     fn test_texture(
         id: u16,
