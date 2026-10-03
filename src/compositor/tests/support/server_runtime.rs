@@ -260,6 +260,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         surface_id: u32,
         reply: Sender<bool>,
     },
+    SetFullscreenOwnerPreserveReplaceEffect {
+        surface_id: u32,
+        reply: Sender<bool>,
+    },
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
@@ -1631,6 +1635,79 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 region,
                             )
                         });
+                        let _ = reply.send(result);
+                    }
+                    ServerCommand::SetFullscreenOwnerPreserveReplaceEffect {
+                        surface_id,
+                        reply,
+                    } => {
+                        let program_id = crate::effects::EffectProgramId::new(77)
+                            .expect("test effect program ID");
+                        let content_node =
+                            crate::effects::EffectNodeId::new(1).expect("test content node ID");
+                        let masked_node =
+                            crate::effects::EffectNodeId::new(2).expect("test mask node ID");
+                        let effect_name = "test.fullscreen-owner-preserve-mask".to_owned();
+                        let manifest = crate::effects::EffectManifest {
+                            version: crate::effects::EFFECT_MANIFEST_VERSION,
+                            effects: std::collections::BTreeMap::from([(
+                                effect_name.clone(),
+                                crate::effects::EffectDefinition {
+                                    name: effect_name,
+                                    program: crate::effects::EffectProgram {
+                                        id: program_id,
+                                        nodes: vec![
+                                            crate::effects::EffectNode::source(
+                                                content_node,
+                                                crate::effects::EffectSource::TargetContent,
+                                            ),
+                                            crate::effects::EffectNode::mask(
+                                                masked_node,
+                                                content_node,
+                                                crate::effects::MaskSpec {
+                                                    mode: crate::effects::MaskMode::Alpha,
+                                                },
+                                            ),
+                                        ],
+                                        output: masked_node,
+                                        working_space:
+                                            crate::effects::EffectWorkingSpace::LinearSrgb,
+                                        alpha_mode: crate::effects::EffectAlphaMode::Preserve,
+                                        outsets: crate::effects::EffectOutsets::ZERO,
+                                        frame_demand: crate::effects::EffectFrameDemand::OnDamage,
+                                        failure_policy:
+                                            crate::effects::EffectFailurePolicy::Passthrough,
+                                    },
+                                    parameters: std::collections::BTreeMap::new(),
+                                    shader_assets: Vec::new(),
+                                },
+                            )]),
+                        };
+                        let result = if server
+                            .state
+                            .trusted_effect_registry()
+                            .reload(manifest, |_| Ok(()))
+                            .is_ok()
+                        {
+                            server.state.note_trusted_effect_registry_reload();
+                            let region = crate::effects::EffectRect::new(
+                                0,
+                                0,
+                                server.state.output_size.width,
+                                server.state.output_size.height,
+                            )
+                            .map(crate::effects::EffectRegion::from_rect);
+                            region.is_some_and(|region| {
+                                server.state.set_internal_surface_effect(
+                                    surface_id,
+                                    crate::compositor::EffectAnchor::ReplaceSurface(surface_id),
+                                    program_id,
+                                    region,
+                                )
+                            })
+                        } else {
+                            false
+                        };
                         let _ = reply.send(result);
                     }
                     ServerCommand::CaptureClientCursorSnapshot(reply) => {
@@ -3239,6 +3316,19 @@ pub(in crate::compositor::tests) fn set_direct_scanout_test_blur_effect(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report test blur effect update")
+}
+
+pub(in crate::compositor::tests) fn set_fullscreen_owner_preserve_replace_effect(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetFullscreenOwnerPreserveReplaceEffect { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report fullscreen replacement effect update")
 }
 
 pub(in crate::compositor::tests) fn capture_resolved_effect_scene(

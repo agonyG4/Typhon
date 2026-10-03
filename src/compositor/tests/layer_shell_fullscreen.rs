@@ -332,6 +332,118 @@ fn proven_opaque_fullscreen_still_culls_background_and_bottom() {
 }
 
 #[test]
+fn preserve_alpha_fullscreen_replacement_keeps_background_and_bottom_composed_without_input() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _owner = create_fullscreen_identity_viewport_xrgb_dmabuf(&socket_path, &commands).unwrap();
+    let owner_id = capture_fullscreen_render_plan_metrics(&commands)
+        .owner_root_surface_id
+        .expect("fullscreen owner should be registered");
+    commands
+        .send(ServerCommand::SetTestEffectiveXdgWindowGeometry {
+            root_surface_id: owner_id,
+            geometry: XdgWindowGeometry::new(0, 0, 1280, 800),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut client_state = RegistryTestState::default();
+    let (_background_surface, _) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut client_state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Background,
+        "preserve-effect-fullscreen-background",
+        1280,
+        800,
+    );
+    let (_bottom_surface, _) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut client_state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Bottom,
+        "preserve-effect-fullscreen-bottom",
+        1280,
+        32,
+    );
+    assert!(set_fullscreen_owner_preserve_replace_effect(
+        &commands, owner_id
+    ));
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties {
+            root_surface_id: owner_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 1,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let eligibility = capture_fullscreen_presentation_eligibility(&commands);
+    let metrics = capture_fullscreen_render_plan_metrics(&commands);
+    let presented = capture_native_frame_surface_ids(&commands);
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    let direct_scanout_analysis = capture_direct_scanout_scene_analysis(&commands);
+    let background_id = surfaces
+        .iter()
+        .find(|surface| {
+            surface.parent_surface_id.is_none()
+                && surface.width == 1280
+                && surface.height == 800
+                && surface.surface_id != owner_id
+        })
+        .expect("background layer should be renderable")
+        .surface_id;
+    let bottom_id = surfaces
+        .iter()
+        .find(|surface| {
+            surface.parent_surface_id.is_none() && surface.width == 1280 && surface.height == 32
+        })
+        .expect("Bottom layer should be renderable")
+        .surface_id;
+
+    assert!(eligibility.fully_opaque);
+    assert!(metrics.fullscreen_composition_active);
+    assert!(!metrics.solitary_tree_active);
+    assert!(!metrics.wallpaper_culled);
+    assert_eq!(metrics.fullscreen_culled_layer_roots, 0);
+    assert!(presented.contains(&background_id));
+    assert!(presented.contains(&bottom_id));
+    assert!(direct_scanout_analysis.candidate.is_none());
+    assert!(
+        direct_scanout_analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::FullscreenUnderlayVisible)
+    );
+
+    commands
+        .send(ServerCommand::PointerMotion { x: 640.0, y: 400.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_pointer_focus_surface_id(&commands), Some(owner_id));
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
 fn fullscreen_preserved_background_feedback_is_sampled_with_its_frame() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);
