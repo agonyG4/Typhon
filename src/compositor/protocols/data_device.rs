@@ -296,6 +296,15 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
         );
         match request {
             wl_data_offer::Request::Receive { mime_type, fd } => {
+                let requesting_client_id = client.id();
+                state.trace_clipboard_receive_entry(
+                    &requesting_client_id,
+                    &data.target_client_id,
+                    resource,
+                    data.source_generation,
+                    data.kind,
+                    &mime_type,
+                );
                 if state.data_offers.get(&resource.id()).is_some_and(|offer| {
                     matches!(
                         offer.drag_phase,
@@ -310,9 +319,14 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                     );
                     return;
                 }
+                let request_client_id = if data.kind == DataOfferKind::Selection {
+                    &requesting_client_id
+                } else {
+                    &data.target_client_id
+                };
                 state.receive_clipboard_offer(
                     resource,
-                    &data.target_client_id,
+                    request_client_id,
                     data.source_generation,
                     mime_type,
                     fd,

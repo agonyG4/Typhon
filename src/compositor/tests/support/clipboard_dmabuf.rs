@@ -102,6 +102,283 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     Ok((source_state, target_state, received))
 }
 
+const FIREFOX_TEXT_MIME_TYPES: [&str; 4] = [
+    "text/plain;charset=utf-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+];
+
+pub(in crate::compositor::tests) struct ClipboardReceiveRegressionSnapshot {
+    pub(in crate::compositor::tests) advertised_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) original_payloads: Vec<Vec<u8>>,
+    pub(in crate::compositor::tests) current_payloads: Vec<Vec<u8>>,
+    pub(in crate::compositor::tests) stale_payload: Vec<u8>,
+    pub(in crate::compositor::tests) payload_after_source_disconnect: Vec<u8>,
+    pub(in crate::compositor::tests) original_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) replacement_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) replacement_send_count_after_stale_receive: usize,
+    pub(in crate::compositor::tests) selection_active_after_old_source_disconnect: bool,
+    pub(in crate::compositor::tests) selection_active_after_current_source_disconnect: bool,
+    pub(in crate::compositor::tests) final_clipboard_state: ClipboardStateSnapshot,
+}
+
+#[allow(dead_code)]
+struct ClipboardWireClient {
+    connection: Connection,
+    queue: EventQueue<RegistryTestState>,
+    state: RegistryTestState,
+    qh: wayland_client::QueueHandle<RegistryTestState>,
+    _compositor: client_wl_compositor::WlCompositor,
+    _wm_base: client_xdg_wm_base::XdgWmBase,
+    seat: client_wl_seat::WlSeat,
+    _shm: client_wl_shm::WlShm,
+    manager: client_wl_data_device_manager::WlDataDeviceManager,
+    _keyboard: client_wl_keyboard::WlKeyboard,
+    data_device: client_wl_data_device::WlDataDevice,
+    _surface: client_wl_surface::WlSurface,
+    _xdg_surface: client_xdg_surface::XdgSurface,
+    _toplevel: client_xdg_toplevel::XdgToplevel,
+    data_source: Option<client_wl_data_source::WlDataSource>,
+}
+
+impl ClipboardWireClient {
+    fn connect(
+        socket_path: &PathBuf,
+        commands: &Sender<ServerCommand>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stream = UnixStream::connect(socket_path)?;
+        let connection = Connection::from_socket(stream)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let manager: client_wl_data_device_manager::WlDataDeviceManager =
+            globals.bind(&qh, 1..=3, ())?;
+        let keyboard = seat.get_keyboard(&qh, ());
+        let data_device = manager.get_data_device(&seat, &qh, ());
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        surface.commit();
+        connection.flush()?;
+
+        let mut state = RegistryTestState::default();
+        queue.roundtrip(&mut state)?;
+        commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+        connection.flush()?;
+        wait_for_server_commands(commands);
+        queue.roundtrip(&mut state)?;
+
+        Ok(Self {
+            connection,
+            queue,
+            state,
+            qh,
+            _compositor: compositor,
+            _wm_base: wm_base,
+            seat,
+            _shm: shm,
+            manager,
+            _keyboard: keyboard,
+            data_device,
+            _surface: surface,
+            _xdg_surface: xdg_surface,
+            _toplevel: toplevel,
+            data_source: None,
+        })
+    }
+
+    fn publish_clipboard(
+        &mut self,
+        commands: &Sender<ServerCommand>,
+        mime_types: &[&str],
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = self.manager.create_data_source(&self.qh, ());
+        for mime_type in mime_types {
+            source.offer((*mime_type).to_string());
+        }
+        self.state.clipboard_payload = Some(payload.to_vec());
+        self.connection.flush()?;
+
+        commands.send(ServerCommand::KeyboardKey {
+            key: 30,
+            pressed: false,
+        })?;
+        wait_for_server_commands(commands);
+        commands.send(ServerCommand::KeyboardKey {
+            key: 30,
+            pressed: true,
+        })?;
+        wait_for_server_commands(commands);
+        self.queue.roundtrip(&mut self.state)?;
+
+        let serial = self
+            .state
+            .keyboard_key_serial
+            .ok_or_else(|| io::Error::other("clipboard source did not receive a key serial"))?;
+        self.data_device.set_selection(Some(&source), serial);
+        self.connection.flush()?;
+        wait_for_server_commands(commands);
+        self.queue.roundtrip(&mut self.state)?;
+        self.data_source = Some(source);
+        Ok(())
+    }
+}
+
+fn request_clipboard_mime(
+    target: &mut ClipboardWireClient,
+    offer: &client_wl_data_offer::WlDataOffer,
+    source: Option<&mut ClipboardWireClient>,
+    commands: &Sender<ServerCommand>,
+    mime_type: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let (read_fd, write_fd) = owned_pipe()?;
+    offer.receive(mime_type.to_string(), write_fd.as_fd());
+    target.connection.flush()?;
+    drop(write_fd);
+    target.queue.roundtrip(&mut target.state)?;
+    wait_for_server_commands(commands);
+    if let Some(source) = source {
+        source.queue.roundtrip(&mut source.state)?;
+    }
+    let mut payload = Vec::new();
+    File::from(read_fd).read_to_end(&mut payload)?;
+    Ok(payload)
+}
+
+fn destroy_clipboard_offer(
+    target: &mut ClipboardWireClient,
+    offer: &client_wl_data_offer::WlDataOffer,
+    commands: &Sender<ServerCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    offer.destroy();
+    target.connection.flush()?;
+    target.queue.roundtrip(&mut target.state)?;
+    wait_for_server_commands(commands);
+    Ok(())
+}
+
+pub(in crate::compositor::tests) fn exercise_clipboard_receive_replacement_and_disconnect(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    destroy_new_offer_first: bool,
+) -> Result<ClipboardReceiveRegressionSnapshot, Box<dyn std::error::Error>> {
+    let mut original_source = ClipboardWireClient::connect(socket_path, commands)?;
+    original_source.publish_clipboard(
+        commands,
+        &FIREFOX_TEXT_MIME_TYPES,
+        b"original source payload",
+    )?;
+
+    let mut old_target = ClipboardWireClient::connect(socket_path, commands)?;
+    let old_offer = old_target
+        .state
+        .data_device_selection_offer
+        .clone()
+        .ok_or_else(|| io::Error::other("target did not receive the original offer"))?;
+    let advertised_mime_types = old_target.state.data_offer_mime_types.clone();
+
+    let mut original_payloads = Vec::new();
+    for mime_type in ["text/plain;charset=utf-8", "text/plain"] {
+        original_payloads.push(request_clipboard_mime(
+            &mut old_target,
+            &old_offer,
+            Some(&mut original_source),
+            commands,
+            mime_type,
+        )?);
+    }
+    let original_source_send_mime_types = original_source.state.data_source_send_mime_types.clone();
+
+    let mut replacement_source = ClipboardWireClient::connect(socket_path, commands)?;
+    replacement_source.publish_clipboard(
+        commands,
+        &FIREFOX_TEXT_MIME_TYPES,
+        b"replacement source payload",
+    )?;
+    let mut current_target = ClipboardWireClient::connect(socket_path, commands)?;
+    let current_offer = current_target
+        .state
+        .data_device_selection_offer
+        .clone()
+        .ok_or_else(|| io::Error::other("target did not receive the replacement offer"))?;
+    let mut current_payloads = Vec::new();
+    for mime_type in ["text/plain;charset=utf-8", "text/plain"] {
+        current_payloads.push(request_clipboard_mime(
+            &mut current_target,
+            &current_offer,
+            Some(&mut replacement_source),
+            commands,
+            mime_type,
+        )?);
+    }
+    let replacement_source_send_mime_types_before_stale =
+        replacement_source.state.data_source_send_mime_types.len();
+
+    let stale_payload = request_clipboard_mime(
+        &mut old_target,
+        &old_offer,
+        None,
+        commands,
+        "text/plain;charset=utf-8",
+    )?;
+    let replacement_send_count_after_stale_receive =
+        replacement_source.state.data_source_send_mime_types.len();
+    let replacement_source_send_mime_types =
+        replacement_source.state.data_source_send_mime_types.clone();
+    assert_eq!(
+        replacement_send_count_after_stale_receive,
+        replacement_source_send_mime_types_before_stale
+    );
+
+    drop(original_source);
+    wait_for_server_commands(commands);
+    wait_for_server_commands(commands);
+    let selection_active_after_old_source_disconnect =
+        capture_clipboard_state(commands).active_source;
+
+    drop(replacement_source);
+    wait_for_server_commands(commands);
+    wait_for_server_commands(commands);
+    current_target.queue.roundtrip(&mut current_target.state)?;
+    let selection_active_after_current_source_disconnect =
+        capture_clipboard_state(commands).active_source;
+    let payload_after_source_disconnect = request_clipboard_mime(
+        &mut current_target,
+        &current_offer,
+        None,
+        commands,
+        "text/plain",
+    )?;
+
+    if destroy_new_offer_first {
+        destroy_clipboard_offer(&mut current_target, &current_offer, commands)?;
+        destroy_clipboard_offer(&mut old_target, &old_offer, commands)?;
+    } else {
+        destroy_clipboard_offer(&mut old_target, &old_offer, commands)?;
+        destroy_clipboard_offer(&mut current_target, &current_offer, commands)?;
+    }
+    let final_clipboard_state = capture_clipboard_state(commands);
+
+    Ok(ClipboardReceiveRegressionSnapshot {
+        advertised_mime_types,
+        original_payloads,
+        current_payloads,
+        stale_payload,
+        payload_after_source_disconnect,
+        original_source_send_mime_types,
+        replacement_source_send_mime_types,
+        replacement_send_count_after_stale_receive,
+        selection_active_after_old_source_disconnect,
+        selection_active_after_current_source_disconnect,
+        final_clipboard_state,
+    })
+}
+
 pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_offer(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

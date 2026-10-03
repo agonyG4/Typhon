@@ -171,6 +171,79 @@ fn clipboard_ready_wayland_clients_transfer_selection_without_compositor_bufferi
 }
 
 #[test]
+fn clipboard_receive_repeats_exact_firefox_mimes_and_rejects_retired_sources() {
+    for destroy_new_offer_first in [false, true] {
+        let socket_name = unique_socket_name();
+        let server = OwnCompositorServer::bind_with_selection_capabilities(
+            &socket_name,
+            SelectionProtocolCapabilities {
+                clipboard: true,
+                primary_selection: false,
+                data_control: false,
+            },
+        )
+        .unwrap();
+        let socket_path = runtime_socket_path(&socket_name);
+        let (commands, server_thread) = spawn_controllable_test_server(server);
+
+        let result = exercise_clipboard_receive_replacement_and_disconnect(
+            &socket_path,
+            &commands,
+            destroy_new_offer_first,
+        );
+        commands.send(ServerCommand::Stop).unwrap();
+        server_thread.join().unwrap();
+
+        let snapshot = result.unwrap();
+        assert_eq!(
+            snapshot.advertised_mime_types,
+            [
+                "text/plain;charset=utf-8",
+                "UTF8_STRING",
+                "text/plain",
+                "STRING",
+            ],
+            "Wayland MIME strings must be advertised without normalization"
+        );
+        assert_eq!(
+            snapshot.original_payloads,
+            [
+                b"original source payload".to_vec(),
+                b"original source payload".to_vec(),
+            ],
+            "repeated MIME receives on one offer must reach its original source"
+        );
+        assert_eq!(
+            snapshot.current_payloads,
+            [
+                b"replacement source payload".to_vec(),
+                b"replacement source payload".to_vec(),
+            ],
+            "one current offer must transfer multiple advertised MIME types"
+        );
+        assert!(snapshot.stale_payload.is_empty());
+        assert!(snapshot.payload_after_source_disconnect.is_empty());
+        assert_eq!(
+            snapshot.original_source_send_mime_types,
+            ["text/plain;charset=utf-8", "text/plain"]
+        );
+        assert_eq!(
+            snapshot.replacement_source_send_mime_types,
+            ["text/plain;charset=utf-8", "text/plain"]
+        );
+        assert_eq!(snapshot.replacement_send_count_after_stale_receive, 2);
+        assert!(snapshot.selection_active_after_old_source_disconnect);
+        assert!(!snapshot.selection_active_after_current_source_disconnect);
+        assert!(!snapshot.final_clipboard_state.active_source);
+        assert_eq!(
+            snapshot.final_clipboard_state.clipboard_broker_offer_count,
+            0
+        );
+        assert_eq!(snapshot.final_clipboard_state.offer_count, 0);
+    }
+}
+
+#[test]
 fn clipboard_source_disconnect_clears_focused_target_selection() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_with_selection_capabilities(

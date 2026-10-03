@@ -350,6 +350,10 @@ impl SelectionState {
         self.channel(kind).offers.len()
     }
 
+    pub fn has_offer(&self, kind: SelectionKind, offer_id: u64) -> bool {
+        self.channel(kind).offers.contains_key(&offer_id)
+    }
+
     pub fn register_offer(
         &mut self,
         kind: SelectionKind,

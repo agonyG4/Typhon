@@ -247,6 +247,18 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_data_offer(&mut self, offer: &wl_data_offer::WlDataOffer) {
+        let clipboard_offer_snapshot = self
+            .data_offers
+            .get(&offer.id())
+            .filter(|binding| binding.kind == DataOfferKind::Selection)
+            .cloned();
+        if let Some(binding) = clipboard_offer_snapshot.as_ref() {
+            self.trace_clipboard_offer_snapshot(
+                binding,
+                "offer_destruction_begin",
+                "wl_data_offer_destroyed",
+            );
+        }
         let broker_offer_id = if let Some(binding) = self.data_offers.get_mut(&offer.id()) {
             binding.drag_phase = Some(DragOfferPhase::Destroyed);
             binding.broker_offer_id
@@ -265,6 +277,13 @@ impl CompositorState {
         if let Some(broker_offer_id) = broker_offer_id {
             self.selection_state
                 .retire_offer(SelectionKind::Clipboard, broker_offer_id);
+        }
+        if let Some(binding) = clipboard_offer_snapshot.as_ref() {
+            self.trace_clipboard_offer_snapshot(
+                binding,
+                "offer_destroyed",
+                "wl_data_offer_destroyed",
+            );
         }
     }
 

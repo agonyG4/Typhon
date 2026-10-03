@@ -228,6 +228,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) data_offer_source_actions: Vec<u32>,
     pub(in crate::compositor::tests) data_offer_actions: Vec<u32>,
     pub(in crate::compositor::tests) data_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) clipboard_payload: Option<Vec<u8>>,
     pub(in crate::compositor::tests) data_source_target_mime_types: Vec<Option<String>>,
     pub(in crate::compositor::tests) data_source_actions: Vec<u32>,
     pub(in crate::compositor::tests) data_source_dnd_drop_performed_count: usize,
@@ -1023,7 +1024,12 @@ impl Dispatch<client_wl_data_source::WlDataSource, ()> for RegistryTestState {
             client_wl_data_source::Event::Send { mime_type, fd } => {
                 state.data_source_send_mime_types.push(mime_type);
                 let mut file = File::from(fd);
-                let _ = file.write_all(b"clipboard payload");
+                let _ = file.write_all(
+                    state
+                        .clipboard_payload
+                        .as_deref()
+                        .unwrap_or(b"clipboard payload"),
+                );
             }
             client_wl_data_source::Event::Cancelled => {
                 state.data_source_cancelled_count += 1;
