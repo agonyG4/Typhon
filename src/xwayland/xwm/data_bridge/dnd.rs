@@ -1113,7 +1113,7 @@ mod tests {
             source_actions: Vec::new(),
             available_actions: Vec::new(),
             action_list_required: false,
-            action_list_queried: false,
+            action_list_cached: false,
             action_list_complete: true,
             latest_position: None,
             next_position_serial: 0,

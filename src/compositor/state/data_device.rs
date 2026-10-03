@@ -9,6 +9,13 @@ pub(super) const DND_MOVE: u32 = 2;
 pub(super) const DND_ASK: u32 = 4;
 pub(super) const MAX_PENDING_XWAYLAND_DND_DATA_REQUESTS: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum DragTargetLeaveReason {
+    RetargetWithinPosition,
+    NoWaylandTarget,
+    Terminal,
+}
+
 pub(super) fn xdnd_action_from_wayland_mask(
     mask: u32,
 ) -> Option<crate::xwayland::XwaylandDndAction> {
@@ -719,26 +726,38 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn leave_drag_target(&mut self) {
+        self.leave_drag_target_for_reason(DragTargetLeaveReason::Terminal);
+    }
+
+    pub(in crate::compositor) fn leave_drag_target_for_reason(
+        &mut self,
+        reason: DragTargetLeaveReason,
+    ) {
         let transition = {
             let Some(active) = self.active_drag.as_mut() else {
                 return;
             };
-            let Some(target) = active.target.take() else {
-                active.accepted_mime = None;
-                active.target_action = None;
-                active.selected_action = 0;
-                active.destination_actions = None;
-                active.last_offer_action = None;
-                active.last_source_action = None;
-                return;
-            };
-            let transition = match target {
-                ActiveDragTarget::Wayland {
+            let transition = match active.target.take() {
+                None => match (&active.origin, reason) {
+                    (
+                        ActiveDragOrigin::Xwayland { offer },
+                        DragTargetLeaveReason::NoWaylandTarget,
+                    ) => active.xwayland_incoming_position_id.map(|position_id| {
+                        crate::xwayland::XwaylandDndTransition::SourceFeedback {
+                            offer_id: offer.id(),
+                            position_id,
+                            accepted_mime: None,
+                            action: None,
+                        }
+                    }),
+                    _ => None,
+                },
+                Some(ActiveDragTarget::Wayland {
                     client_id,
                     device_id,
                     offer,
                     ..
-                } => {
+                }) => {
                     if let Some(device) = self
                         .data_devices
                         .iter()
@@ -760,7 +779,9 @@ impl CompositorState {
                                 .send_event(wl_data_source::Event::Target { mime_type: None });
                             None
                         }
-                        ActiveDragOrigin::Xwayland { offer } => {
+                        ActiveDragOrigin::Xwayland { offer }
+                            if reason != DragTargetLeaveReason::RetargetWithinPosition =>
+                        {
                             active.xwayland_incoming_position_id.map(|position_id| {
                                 crate::xwayland::XwaylandDndTransition::SourceFeedback {
                                     offer_id: offer.id(),
@@ -770,11 +791,12 @@ impl CompositorState {
                                 }
                             })
                         }
+                        ActiveDragOrigin::Xwayland { .. } => None,
                         ActiveDragOrigin::WaylandSource { .. }
                         | ActiveDragOrigin::WaylandSourceless { .. } => None,
                     }
                 }
-                ActiveDragTarget::Xwayland { window } => {
+                Some(ActiveDragTarget::Xwayland { window }) => {
                     if let ActiveDragOrigin::WaylandSource { source, .. } = &active.origin
                         && source.is_alive()
                     {

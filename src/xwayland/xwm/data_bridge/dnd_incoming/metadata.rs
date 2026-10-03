@@ -58,7 +58,7 @@ pub(super) fn begin_enter(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<
         source_actions: Vec::new(),
         available_actions: Vec::new(),
         action_list_required: false,
-        action_list_queried: false,
+        action_list_cached: false,
         action_list_complete: true,
         latest_position: None,
         next_position_serial: 0,
@@ -78,6 +78,7 @@ pub(super) fn begin_enter(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<
             offer_id,
             XwmAtomName::XdndTypeList,
             PendingPropertyKind::TypeList,
+            now_ns.saturating_add(TARGET_METADATA_TIMEOUT_NS),
         )?;
     } else {
         issue_atom_names(xwm, offer_id, &inline_mime_atoms, now_ns)?;
@@ -88,7 +89,9 @@ pub(super) fn begin_enter(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<
 #[derive(Debug, Clone, Copy)]
 enum PendingPropertyKind {
     TypeList,
-    ActionList,
+    ActionList {
+        position_id: crate::xwayland::XwaylandDndIncomingPositionId,
+    },
 }
 
 fn issue_property_read(
@@ -96,6 +99,7 @@ fn issue_property_read(
     offer_id: XwaylandDndOfferId,
     property: XwmAtomName,
     kind: PendingPropertyKind,
+    deadline_ns: u64,
 ) -> Result<(), XwmError> {
     if xwm.data_bridge.dnd_incoming.pending.len() >= MAX_PENDING_INCOMING_DND_REPLIES {
         return Ok(());
@@ -118,20 +122,20 @@ fn issue_property_read(
             0,
             match kind {
                 PendingPropertyKind::TypeList => 65,
-                PendingPropertyKind::ActionList => 6,
+                PendingPropertyKind::ActionList { .. } => 6,
             },
         )
         .map_err(XwmError::Connection)?;
     let sequence = cookie.sequence_number();
     std::mem::forget(cookie);
-    let deadline_ns = session.metadata_deadline_ns;
     let pending = match kind {
         PendingPropertyKind::TypeList => PendingMetadataReply::TypeList {
             offer_id,
             deadline_ns,
         },
-        PendingPropertyKind::ActionList => PendingMetadataReply::ActionList {
+        PendingPropertyKind::ActionList { position_id } => PendingMetadataReply::ActionList {
             offer_id,
+            position_id,
             deadline_ns,
         },
     };
@@ -140,6 +144,59 @@ fn issue_property_read(
         .pending
         .insert(sequence, pending);
     Ok(())
+}
+
+fn cancel_obsolete_action_list_queries(
+    xwm: &mut Xwm,
+    offer_id: XwaylandDndOfferId,
+    current_position_id: crate::xwayland::XwaylandDndIncomingPositionId,
+    action_list_required: bool,
+) {
+    let sequences = xwm
+        .data_bridge
+        .dnd_incoming
+        .pending
+        .iter()
+        .filter_map(|(sequence, pending)| match pending {
+            PendingMetadataReply::ActionList {
+                offer_id: pending_offer,
+                position_id,
+                ..
+            } if *pending_offer == offer_id
+                && (!action_list_required || *position_id != current_position_id) =>
+            {
+                Some(*sequence)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for sequence in sequences {
+        xwm.data_bridge.dnd_incoming.pending.remove(&sequence);
+        xwm.connection.discard_reply(
+            sequence,
+            x11rb::connection::RequestKind::HasResponse,
+            x11rb::connection::DiscardMode::DiscardReply,
+        );
+    }
+}
+
+fn action_list_query_is_authoritative(
+    xwm: &Xwm,
+    offer_id: XwaylandDndOfferId,
+    position_id: crate::xwayland::XwaylandDndIncomingPositionId,
+) -> bool {
+    xwm.data_bridge
+        .dnd
+        .incoming_session()
+        .is_some_and(|session| {
+            session.offer_id == offer_id
+                && session.action_list_required
+                && !session.action_list_complete
+                && session.latest_position.is_some_and(|position| {
+                    position.position_id == position_id
+                        && position.requested_action == crate::xwayland::XwaylandDndAction::Ask
+                })
+        })
 }
 
 fn issue_atom_names(
@@ -239,26 +296,40 @@ pub(super) fn position(xwm: &mut Xwm, data: [u32; 5], now_ns: u64) -> Result<(),
         session.pending_status_deadline_ns = Some(now_ns.saturating_add(TARGET_STATUS_TIMEOUT_NS));
         session.status_pending = true;
         session.action_list_required = requested_action == crate::xwayland::XwaylandDndAction::Ask;
-        if session.action_list_required {
-            if !session.action_list_queried {
-                session.action_list_queried = true;
-                session.action_list_complete = false;
-            }
-        } else {
-            session.action_list_complete = true;
-        }
+        session.action_list_complete = !session.action_list_required || session.action_list_cached;
     }
+    cancel_obsolete_action_list_queries(
+        xwm,
+        offer_id,
+        position_id,
+        requested_action == crate::xwayland::XwaylandDndAction::Ask,
+    );
     if requested_action == crate::xwayland::XwaylandDndAction::Ask
         && xwm
             .data_bridge
             .dnd
             .incoming_session()
             .is_some_and(|session| session.offer_id == offer_id && !session.action_list_complete)
-        && !xwm.data_bridge.dnd_incoming.pending.values().any(|pending| {
-            matches!(pending, PendingMetadataReply::ActionList { offer_id: current, .. } if *current == offer_id)
-        })
+        && !xwm
+            .data_bridge
+            .dnd_incoming
+            .pending
+            .values()
+            .any(|pending| {
+                matches!(pending, PendingMetadataReply::ActionList {
+                offer_id: current,
+                position_id: current_position,
+                ..
+            } if *current == offer_id && *current_position == position_id)
+            })
     {
-        issue_property_read(xwm, offer_id, XwmAtomName::XdndActionList, PendingPropertyKind::ActionList)?;
+        issue_property_read(
+            xwm,
+            offer_id,
+            XwmAtomName::XdndActionList,
+            PendingPropertyKind::ActionList { position_id },
+            now_ns.saturating_add(TARGET_METADATA_TIMEOUT_NS),
+        )?;
     }
     settle_metadata_and_position(xwm, offer_id, now_ns)
 }
@@ -730,6 +801,17 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
             cancel_metadata_replies(xwm, Some(offer_id));
             continue;
         };
+        if let PendingMetadataReply::ActionList { position_id, .. } = pending
+            && !action_list_query_is_authoritative(xwm, offer_id, position_id)
+        {
+            xwm.data_bridge.dnd_incoming.pending.remove(&sequence);
+            xwm.connection.discard_reply(
+                sequence,
+                x11rb::connection::RequestKind::HasResponse,
+                x11rb::connection::DiscardMode::DiscardReply,
+            );
+            continue;
+        }
         if pending_deadline(pending) <= now_ns || session.generation != xwm.generation {
             retire_incoming(xwm, offer_id);
             continue;
@@ -777,7 +859,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                 }
                 issue_atom_names(xwm, offer_id, &atoms, now_ns)?;
             }
-            PendingMetadataReply::ActionList { .. } => {
+            PendingMetadataReply::ActionList { position_id, .. } => {
                 let cookie = Cookie::<
                     super::super::super::connection::X11Connection,
                     xproto::GetPropertyReply,
@@ -823,13 +905,20 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize, now_ns: u64) -> Result<
                         available.push(action);
                     }
                 }
-                if let Some(session) = xwm
-                    .data_bridge
-                    .dnd
-                    .incoming_session_mut()
-                    .filter(|session| session.offer_id == offer_id)
+                if let Some(session) =
+                    xwm.data_bridge
+                        .dnd
+                        .incoming_session_mut()
+                        .filter(|session| {
+                            session.offer_id == offer_id
+                                && session.action_list_required
+                                && session
+                                    .latest_position
+                                    .is_some_and(|position| position.position_id == position_id)
+                        })
                 {
                     session.available_actions = available;
+                    session.action_list_cached = true;
                     session.action_list_complete = true;
                 }
                 settle_metadata_and_position(xwm, offer_id, now_ns)?;
@@ -930,9 +1019,21 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
         .dnd_incoming
         .pending
         .iter()
-        .filter_map(|(sequence, reply)| (pending_deadline(*reply) <= now_ns).then_some(*sequence))
+        .filter_map(|(sequence, reply)| {
+            (pending_deadline(*reply) <= now_ns).then_some((*sequence, *reply))
+        })
         .collect::<Vec<_>>();
-    for sequence in expired {
+    for (sequence, pending) in expired {
+        if let PendingMetadataReply::ActionList {
+            offer_id,
+            position_id,
+            ..
+        } = pending
+            && action_list_query_is_authoritative(xwm, offer_id, position_id)
+        {
+            retire_incoming(xwm, offer_id);
+            continue;
+        }
         xwm.data_bridge.dnd_incoming.pending.remove(&sequence);
         xwm.connection.discard_reply(
             sequence,

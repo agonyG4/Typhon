@@ -8,11 +8,13 @@ use std::{
 
 use x11rb::{protocol::xproto, x11_utils::Serialize};
 
+mod action_list;
+
 fn offer_id(generation: XwaylandGeneration, serial: u64) -> XwaylandDndOfferId {
     XwaylandDndOfferId::new(generation, NonZeroU64::new(serial).expect("nonzero serial"))
 }
 
-fn read_peer(peer: &mut UnixStream) -> Vec<u8> {
+pub(crate) fn read_peer(peer: &mut UnixStream) -> Vec<u8> {
     peer.set_nonblocking(true).unwrap();
     let mut output = Vec::new();
     let mut buffer = [0; 4096];
@@ -41,7 +43,7 @@ fn count_requests(bytes: &[u8]) -> u16 {
     count
 }
 
-fn take_requests(peer: &mut UnixStream, sequence: &mut u16) -> Vec<u8> {
+pub(crate) fn take_requests(peer: &mut UnixStream, sequence: &mut u16) -> Vec<u8> {
     let requests = read_peer(peer);
     *sequence = sequence.wrapping_add(count_requests(&requests));
     requests
@@ -107,7 +109,7 @@ fn inject_client_message(xwm: &mut Xwm, peer: &mut UnixStream, event: xproto::Cl
     assert_eq!(xwm.drain_events(8).unwrap().events_processed, 1);
 }
 
-fn status_messages(bytes: &[u8], xwm: &Xwm) -> Vec<(Window, [u32; 5])> {
+pub(crate) fn status_messages(bytes: &[u8], xwm: &Xwm) -> Vec<(Window, [u32; 5])> {
     bytes
         .windows(32)
         .filter(|event| {
@@ -165,7 +167,12 @@ fn inject_copy_position(
     );
 }
 
-fn get_property_reply(sequence: u16, type_atom: Atom, format: u8, value: &[u8]) -> Vec<u8> {
+pub(crate) fn get_property_reply(
+    sequence: u16,
+    type_atom: Atom,
+    format: u8,
+    value: &[u8],
+) -> Vec<u8> {
     let value_len = match format {
         8 => value.len(),
         16 => value.len() / 2,
@@ -224,7 +231,8 @@ fn property_new_value(window: Window, property: Atom, sequence: u16) -> Vec<u8> 
     event
 }
 
-fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Window, u16) {
+pub(crate) fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Window, u16)
+{
     let generation = XwaylandGeneration::new(NonZeroU64::new(81).unwrap());
     let (mut xwm, mut peer) = super::super::super::test_fixture_for_tests(generation);
     super::initialize_target_proxy(&mut xwm).unwrap();
@@ -342,7 +350,39 @@ fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Win
     )
 }
 
-fn begin_fake_selection_transfer(
+pub(crate) fn action_atom_for_test(xwm: &Xwm, action: crate::xwayland::XwaylandDndAction) -> Atom {
+    match action {
+        crate::xwayland::XwaylandDndAction::Copy => xwm.atoms.get(XwmAtomName::XdndActionCopy),
+        crate::xwayland::XwaylandDndAction::Move => xwm.atoms.get(XwmAtomName::XdndActionMove),
+        crate::xwayland::XwaylandDndAction::Link => xwm.atoms.get(XwmAtomName::XdndActionLink),
+        crate::xwayland::XwaylandDndAction::Ask => xwm.atoms.get(XwmAtomName::XdndActionAsk),
+        crate::xwayland::XwaylandDndAction::Private => {
+            xwm.atoms.get(XwmAtomName::XdndActionPrivate)
+        }
+    }
+}
+
+pub(crate) fn position_at_for_test(
+    xwm: &mut Xwm,
+    timestamp: u32,
+    action: crate::xwayland::XwaylandDndAction,
+    x: i16,
+    y: i16,
+    now_ns: u64,
+) -> Result<(), XwmError> {
+    let source = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .expect("test Position has an incoming offer")
+        .source
+        .xid();
+    let coordinates = (u32::from(x as u16) << 16) | u32::from(y as u16);
+    let action = action_atom_for_test(xwm, action);
+    super::metadata::position(xwm, [source, coordinates, timestamp, action, 0], now_ns)
+}
+
+pub(crate) fn begin_fake_selection_transfer(
     xwm: &mut Xwm,
     peer: &mut UnixStream,
     offer_id: XwaylandDndOfferId,
@@ -435,7 +475,8 @@ fn start_fake_selection_transfer(
     (reader, transfer_id, requestor, property)
 }
 
-fn notify_fake_selection_transfer(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn notify_fake_selection_transfer(
     xwm: &mut Xwm,
     peer: &mut UnixStream,
     transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
@@ -470,6 +511,39 @@ fn notify_fake_selection_transfer(
         "the fake server observes the pending XGetProperty request: {property_read:?}"
     );
     *server_sequence = server_sequence.wrapping_add(count_requests(&property_read));
+}
+
+pub(crate) fn transfer_selection_timestamp(
+    xwm: &Xwm,
+    transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
+) -> Option<u32> {
+    xwm.data_bridge
+        .dnd_incoming
+        .transfers
+        .get(&transfer_id)
+        .map(|transfer| transfer.selection_timestamp)
+}
+
+pub(crate) fn transfer_pending_sequence(
+    xwm: &Xwm,
+    transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
+) -> Option<u16> {
+    xwm.data_bridge
+        .dnd_incoming
+        .transfers
+        .get(&transfer_id)
+        .and_then(|transfer| transfer.pending_reply)
+        .map(|sequence| sequence as u16)
+}
+
+pub(crate) fn transfer_is_active(
+    xwm: &Xwm,
+    transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
+) -> bool {
+    xwm.data_bridge
+        .dnd_incoming
+        .transfers
+        .contains_key(&transfer_id)
 }
 
 #[test]
@@ -1324,4 +1398,28 @@ fn synthetic_incr_selection_payload_waits_for_each_sink_chunk() {
         next_after_property_chunk(IncomingPropertyMode::Incr, 0, true),
         ContinueAfterWrite::Finish
     );
+}
+
+#[test]
+fn current_position_rejection_sends_one_rejected_status() {
+    let (mut xwm, mut peer, offer_id, _, _, _, _) = fake_incoming_hover();
+    let position_id = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .unwrap()
+        .latest_position
+        .unwrap()
+        .position_id;
+    super::source_feedback(&mut xwm, offer_id, position_id, None, None).unwrap();
+    xwm.connection.flush().unwrap();
+    let rejection = status_messages(&read_peer(&mut peer), &xwm);
+    assert_eq!(rejection.len(), 1);
+    assert_eq!(rejection[0].1[0], xwm.root);
+    assert_eq!(rejection[0].1[1] & 1, 0);
+    assert_eq!(rejection[0].1[4], 0);
+
+    super::source_feedback(&mut xwm, offer_id, position_id, None, None).unwrap();
+    xwm.connection.flush().unwrap();
+    assert!(status_messages(&read_peer(&mut peer), &xwm).is_empty());
 }

@@ -91,14 +91,13 @@ impl OwnCompositorServer {
                 x_timestamp: _,
             } => {
                 let offer_id = offer.id();
+                let source_actions = offer.source_actions().to_vec();
                 if !self.state.begin_xwayland_drag_session(offer) {
                     return false;
                 }
                 self.state
-                    .update_xwayland_drag_position_id(offer_id, position_id)
-                    && self
-                        .state
-                        .update_incoming_xwayland_drag_position(offer_id, x, y)
+                    .apply_incoming_xwayland_position(offer_id, position_id, source_actions, x, y)
+                    .is_some()
             }
             crate::xwayland::XwaylandDndIncomingEvent::Position {
                 offer_id,
@@ -108,16 +107,10 @@ impl OwnCompositorServer {
                 requested_action: _,
                 source_actions,
                 x_timestamp: _,
-            } => {
-                self.state
-                    .update_xwayland_drag_position_id(offer_id, position_id)
-                    && self
-                        .state
-                        .update_xwayland_drag_source_actions(offer_id, source_actions)
-                    && self
-                        .state
-                        .update_incoming_xwayland_drag_position(offer_id, x, y)
-            }
+            } => self
+                .state
+                .apply_incoming_xwayland_position(offer_id, position_id, source_actions, x, y)
+                .is_some(),
             crate::xwayland::XwaylandDndIncomingEvent::Leave { offer_id } => {
                 self.state.cancel_xwayland_drag(offer_id)
             }

@@ -64,7 +64,7 @@ pub(crate) struct IncomingDndSession {
     pub(crate) source_actions: Vec<crate::xwayland::XwaylandDndAction>,
     pub(crate) available_actions: Vec<crate::xwayland::XwaylandDndAction>,
     pub(crate) action_list_required: bool,
-    pub(crate) action_list_queried: bool,
+    pub(crate) action_list_cached: bool,
     pub(crate) action_list_complete: bool,
     pub(crate) latest_position: Option<IncomingPosition>,
     pub(crate) next_position_serial: u64,
@@ -145,6 +145,7 @@ pub(crate) enum PendingMetadataReply {
     },
     ActionList {
         offer_id: XwaylandDndOfferId,
+        position_id: XwaylandDndIncomingPositionId,
         deadline_ns: u64,
     },
     AtomName {
@@ -597,7 +598,7 @@ pub(crate) fn client_message(
 
 mod metadata;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod transfer;
 
 #[cfg(test)]
