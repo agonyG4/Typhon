@@ -3863,20 +3863,9 @@ impl NativeRuntime {
 
     fn control_output_snapshot(&self) -> OutputSnapshot {
         let direct_state = self.direct_scanout_state();
-        let vrr_capable = self.kms_backend.atomic_vrr_capable();
-        let vrr_confirmed = self
-            .confirmed_kms_presentation
-            .vrr_request_confirmed_for(self.drm_file_generation);
-        let vrr_state = if !vrr_capable {
-            FeatureState::Unavailable
-        } else if vrr_confirmed {
-            FeatureState::Active
-        } else {
-            FeatureState::Available
-        };
         OutputSnapshot {
-            id: "oblivion-1".to_string(),
-            name: "Oblivion-1".to_string(),
+            id: format!("output-{}", self.output_id.get()),
+            name: self.output_capabilities.connector_name.clone(),
             make: None,
             model: None,
             serial: None,
@@ -3884,18 +3873,23 @@ impl NativeRuntime {
             current_mode: (!self.scanout_destroyed).then_some(ModeSnapshot {
                 width: self.target.width,
                 height: self.target.height,
-                refresh_millihz: self.refresh_hz.saturating_mul(1000),
+                refresh_millihz: drm_mode_refresh_millihz(&self.target.mode)
+                    .unwrap_or_else(|| self.refresh_hz.saturating_mul(1000)),
             }),
-            physical_size_mm: None,
+            physical_size_mm: self.output_capabilities.physical_size_mm.clone(),
             scale_milli: 1000,
             transform: "normal".to_string(),
             position: PositionSnapshot { x: 0, y: 0 },
             focused: true,
             backend: self.kms_backend.effective_kind().as_str().to_string(),
-            vrr: FeatureStateSnapshot { state: vrr_state },
+            vrr: FeatureStateSnapshot {
+                state: vrr_feature_state(self.output_capabilities.vrr_capable),
+            },
             direct_scanout: FeatureStateSnapshot {
                 state: direct_state,
             },
+            modes: self.output_capabilities.modes.clone(),
+            modes_truncated: self.output_capabilities.modes_truncated,
         }
     }
 }

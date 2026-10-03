@@ -1,4 +1,7 @@
 use super::*;
+use oblivion_one::control_snapshots::{
+    FeatureState, MAX_CONTROL_OUTPUT_MODES, PhysicalSizeSnapshot,
+};
 #[rustfmt::skip]
 use crate::egl_renderer::{BufferAge, EglPartialRepaintCapabilities, PartialRepaintPlanner, RepaintMode};
 use oblivion_one::effects::{EffectRect, EffectRegion};
@@ -165,9 +168,9 @@ fn direct_plane_validation_key_changes_for_modifier_and_generation() {
 }
 #[test]
 fn connected_connector_for_card_prefers_connected_matching_card_output() {
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("target")
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("tests run with an external Cargo target directory")
         .join("native-output-tests")
         .join(std::process::id().to_string());
     let _ = fs::remove_dir_all(&root);
@@ -175,28 +178,243 @@ fn connected_connector_for_card_prefers_connected_matching_card_output() {
     fs::create_dir_all(root.join("card1-HDMI-A-1")).unwrap();
     fs::create_dir_all(root.join("card0-DP-1")).unwrap();
     fs::write(root.join("card1-DP-1/status"), "connected\n").unwrap();
-    fs::write(root.join("card1-DP-1/enabled"), "enabled\n").unwrap();
-    fs::write(root.join("card1-DP-1/modes"), "1920x1080\n1280x720\n").unwrap();
     fs::write(root.join("card1-DP-1/vrr_capable"), "1\n").unwrap();
     fs::write(root.join("card1-HDMI-A-1/status"), "disconnected\n").unwrap();
     fs::write(root.join("card0-DP-1/status"), "connected\n").unwrap();
-    fs::write(root.join("card0-DP-1/modes"), "800x600\n").unwrap();
 
     let connector = connected_connector_for_card(Some(Path::new("/dev/dri/card1")), &root)
         .expect("connected card1 output should be detected");
     let _ = fs::remove_dir_all(&root);
 
-    assert_eq!(connector.name, "card1-DP-1");
-    assert_eq!(connector.enabled.as_deref(), Some("enabled"));
-    assert_eq!(connector.preferred_mode(), Some("1920x1080"));
+    assert_eq!(connector.name, "DP-1");
     assert_eq!(connector.vrr_capable, Some(true));
 }
 
 #[test]
+fn selected_sysfs_output_uses_connector_id_not_directory_sort_order() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("tests run with an external Cargo target directory")
+        .join("native-output-tests")
+        .join(format!("selected-connector-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let display_port = root.join("card0-DP-1");
+    let hdmi = root.join("card0-HDMI-A-1");
+    fs::create_dir_all(&display_port).unwrap();
+    fs::create_dir_all(&hdmi).unwrap();
+    for connector in [&display_port, &hdmi] {
+        fs::write(connector.join("status"), "connected\n").unwrap();
+    }
+    fs::write(display_port.join("connector_id"), "12\n").unwrap();
+    fs::write(display_port.join("vrr_capable"), "1\n").unwrap();
+    fs::write(hdmi.join("connector_id"), "27\n").unwrap();
+    fs::write(hdmi.join("vrr_capable"), "0\n").unwrap();
+
+    let connector =
+        selected_connector_for_kms_target(Some(Path::new("/dev/dri/card0")), &root, 27, "HDMI-A-1")
+            .expect("the selected KMS connector must match its sysfs connector ID");
+    let _ = fs::remove_dir_all(&root);
+
+    let mut capabilities = NativeOutputCapabilities {
+        connector_name: String::from("Display"),
+        physical_size_mm: None,
+        modes: Vec::new(),
+        modes_truncated: false,
+        vrr_capable: None,
+    };
+    capabilities.qualify_sysfs_connector(Some(&connector));
+
+    assert_eq!(connector.connector_id, Some(27));
+    assert_eq!(connector.name, "HDMI-A-1");
+    assert_eq!(connector.vrr_capable, Some(false));
+    assert_eq!(capabilities.connector_name, "HDMI-A-1");
+    assert_eq!(capabilities.vrr_capable, Some(false));
+}
+
+#[test]
+fn selected_sysfs_output_uses_name_only_when_connector_id_metadata_is_absent() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("tests run with an external Cargo target directory")
+        .join("native-output-tests")
+        .join(format!(
+            "selected-connector-fallback-{}",
+            std::process::id()
+        ));
+    let connector_dir = root.join("card0-eDP-1");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&connector_dir).unwrap();
+    fs::write(connector_dir.join("status"), "connected\n").unwrap();
+    fs::write(connector_dir.join("vrr_capable"), "1\n").unwrap();
+
+    let connector =
+        selected_connector_for_kms_target(Some(Path::new("/dev/dri/card0")), &root, 27, "eDP-1")
+            .expect("connector name is the deterministic fallback when connector_id is absent");
+    let _ = fs::remove_dir_all(&root);
+
+    assert_eq!(connector.connector_id, None);
+    assert_eq!(connector.name, "eDP-1");
+    assert_eq!(connector.vrr_capable, Some(true));
+}
+
+fn native_test_drm_mode(
+    width: u16,
+    height: u16,
+    refresh_hz: u32,
+    preferred: bool,
+) -> drm_sys::drm_mode_modeinfo {
+    drm_sys::drm_mode_modeinfo {
+        hdisplay: width,
+        vdisplay: height,
+        vrefresh: refresh_hz,
+        type_: if preferred {
+            drm_sys::DRM_MODE_TYPE_PREFERRED
+        } else {
+            0
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn physical_dimensions_require_both_kernel_values_to_be_nonzero() {
+    assert_eq!(
+        physical_size_snapshot(600, 340),
+        Some(PhysicalSizeSnapshot {
+            width_mm: 600,
+            height_mm: 340
+        })
+    );
+    assert_eq!(physical_size_snapshot(0, 340), None);
+    assert_eq!(physical_size_snapshot(600, 0), None);
+}
+
+#[test]
+fn kms_preferred_flag_projects_native_evidence_without_resolution_inference() {
+    let preferred_low = native_test_drm_mode(1600, 900, 60, true);
+    let high_nonpreferred = native_test_drm_mode(2560, 1440, 165, false);
+    let (modes, truncated) = project_native_output_modes(&[high_nonpreferred, preferred_low]);
+
+    assert!(!truncated);
+    assert_eq!(modes.len(), 2);
+    assert!(
+        modes
+            .iter()
+            .any(|mode| mode.width == 1600 && mode.preferred)
+    );
+    assert!(
+        modes
+            .iter()
+            .any(|mode| mode.width == 2560 && !mode.preferred)
+    );
+}
+
+#[test]
+fn kms_connector_name_dimensions_and_modes_are_projected_from_that_connector() {
+    let connector = drm_sys::drm_mode_get_connector {
+        connector_type: drm_sys::DRM_MODE_CONNECTOR_HDMIA,
+        connector_type_id: 1,
+        mm_width: 600,
+        mm_height: 340,
+        ..Default::default()
+    };
+    let mode = native_test_drm_mode(1920, 1080, 60, true);
+    let capabilities = native_output_capabilities(&connector, &[mode]);
+
+    assert_eq!(capabilities.connector_name, "HDMI-A-1");
+    assert_eq!(
+        capabilities.physical_size_mm,
+        Some(PhysicalSizeSnapshot {
+            width_mm: 600,
+            height_mm: 340
+        })
+    );
+    assert_eq!(capabilities.modes.len(), 1);
+    assert!(capabilities.modes[0].preferred);
+}
+
+#[test]
+fn kms_mode_clock_preserves_fractional_refresh_rate_in_millihertz() {
+    let mode = drm_sys::drm_mode_modeinfo {
+        clock: 148_352,
+        hdisplay: 1920,
+        htotal: 2200,
+        vdisplay: 1080,
+        vtotal: 1125,
+        ..Default::default()
+    };
+
+    assert_eq!(drm_mode_refresh_millihz(&mode), Some(59_940));
+}
+
+#[test]
+fn equivalent_kms_modes_deduplicate_and_preserve_preferred_marker() {
+    let ordinary = native_test_drm_mode(1920, 1080, 60, false);
+    let preferred = native_test_drm_mode(1920, 1080, 60, true);
+    let (modes, truncated) = project_native_output_modes(&[ordinary, preferred]);
+
+    assert!(!truncated);
+    assert_eq!(modes.len(), 1);
+    assert!(modes[0].preferred);
+}
+
+#[test]
+fn available_kms_modes_are_bounded_and_sorted_deterministically() {
+    let input = (0..(MAX_CONTROL_OUTPUT_MODES + 2))
+        .map(|index| native_test_drm_mode(640 + index as u16, 480, 60, false))
+        .collect::<Vec<_>>();
+    let (modes, truncated) = project_native_output_modes(&input);
+
+    assert!(truncated);
+    assert_eq!(modes.len(), MAX_CONTROL_OUTPUT_MODES);
+    assert_eq!(modes.first().map(|mode| mode.width), Some(640));
+    assert_eq!(modes.last().map(|mode| mode.width), Some(767));
+}
+
+#[test]
+fn current_mode_selection_remains_separate_from_preferred_capability() {
+    let modes = [
+        native_test_drm_mode(1920, 1080, 165, false),
+        native_test_drm_mode(1600, 900, 60, true),
+    ];
+    let selected = select_kms_mode(
+        &modes,
+        NativeModePreference::Exact {
+            width: 1920,
+            height: 1080,
+            refresh_hz: Some(165),
+        },
+    )
+    .expect("requested current KMS mode remains selectable");
+    let (available, _) = project_native_output_modes(&modes);
+
+    assert_eq!(
+        (selected.hdisplay, selected.vdisplay, selected.vrefresh),
+        (1920, 1080, 165)
+    );
+    assert!(
+        available
+            .iter()
+            .any(|mode| mode.width == 1600 && mode.preferred)
+    );
+    assert!(
+        available
+            .iter()
+            .any(|mode| mode.width == 1920 && !mode.preferred)
+    );
+}
+
+#[test]
+fn discovered_vrr_capability_is_never_projected_as_runtime_active() {
+    assert_eq!(vrr_feature_state(Some(true)), FeatureState::Available);
+    assert_ne!(vrr_feature_state(Some(true)), FeatureState::Active);
+}
+
+#[test]
 fn matching_render_node_for_card_uses_same_drm_device_directory() {
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("target")
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("tests run with an external Cargo target directory")
         .join("native-render-node-tests")
         .join(std::process::id().to_string());
     let sysfs = root.join("sys");

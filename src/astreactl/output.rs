@@ -369,6 +369,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_human_text_remains_concise_when_capability_modes_are_present() {
+        let value = AstreactlResult::Outputs(crate::control_snapshots::OutputListSnapshot {
+            outputs: vec![crate::control_snapshots::OutputSnapshot {
+                id: String::from("output-1"),
+                name: String::from("DP-1"),
+                make: None,
+                model: None,
+                serial: None,
+                enabled: true,
+                current_mode: Some(crate::control_snapshots::ModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 165_000,
+                }),
+                physical_size_mm: Some(crate::control_snapshots::PhysicalSizeSnapshot {
+                    width_mm: 600,
+                    height_mm: 340,
+                }),
+                scale_milli: 1000,
+                transform: String::from("normal"),
+                position: crate::control_snapshots::PositionSnapshot { x: 0, y: 0 },
+                focused: true,
+                backend: String::from("atomic"),
+                vrr: crate::control_snapshots::FeatureStateSnapshot {
+                    state: crate::control_snapshots::FeatureState::Available,
+                },
+                direct_scanout: crate::control_snapshots::FeatureStateSnapshot {
+                    state: crate::control_snapshots::FeatureState::Unavailable,
+                },
+                modes: vec![crate::control_snapshots::OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 165_000,
+                    preferred: true,
+                    interlaced: false,
+                }],
+                modes_truncated: false,
+            }],
+            total: 1,
+            truncated: false,
+        });
+
+        let output = human(&value);
+        assert_eq!(output, "DP-1\tatomic\t1920x1080 @ 165.000 Hz\tenabled");
+        assert!(!output.contains("preferred"));
+    }
+
     fn window_result(title: &str, app_id: &str) -> AstreactlResult {
         AstreactlResult::Windows(WindowListSnapshot {
             windows: vec![WindowSnapshot {

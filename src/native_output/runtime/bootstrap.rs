@@ -66,26 +66,7 @@ pub(super) fn log_native_runtime_bootstrap(
         "render device: {}",
         display_optional_path(bootstrap.render_device.as_deref())
     );
-    if let Some(connector) = bootstrap.connector.as_ref() {
-        println!("connected output: {}", connector.name);
-        println!(
-            "output enabled: {}",
-            connector.enabled.as_deref().unwrap_or("unknown")
-        );
-        println!(
-            "preferred mode: {}",
-            connector.preferred_mode().unwrap_or("unknown")
-        );
-        println!(
-            "vrr capable: {}",
-            connector
-                .vrr_capable
-                .map(|capable| if capable { "yes" } else { "no" })
-                .unwrap_or("unknown")
-        );
-    } else {
-        println!("connected output: missing");
-    }
+    println!("selected output: pending KMS target selection");
     println!("native VRR policy: {}", vrr_policy.as_str());
     println!("native VRR capability: pending live atomic DRM discovery");
     match bootstrap.kms_resources.as_ref() {
@@ -97,20 +78,6 @@ pub(super) fn log_native_runtime_bootstrap(
             println!(
                 "kms connected connectors: {}",
                 resources.connected_connector_count
-            );
-            println!(
-                "kms first connected connector id: {}",
-                resources
-                    .first_connected_connector_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "missing".to_string())
-            );
-            println!(
-                "kms first connected mode: {}",
-                resources
-                    .first_connected_mode
-                    .as_deref()
-                    .unwrap_or("missing")
             );
         }
         Ok(None) => println!("kms resources: missing"),
@@ -137,15 +104,6 @@ pub(super) fn log_native_runtime_bootstrap(
                 display_optional_path(bootstrap.render_device.as_deref()),
             ),
             NativePerfField::str("vrr_policy", vrr_policy.as_str()),
-            NativePerfField::str(
-                "vrr_sysfs_observation",
-                bootstrap
-                    .connector
-                    .as_ref()
-                    .and_then(|connector| connector.vrr_capable)
-                    .map(|value| if value { "yes" } else { "no" })
-                    .unwrap_or("unknown"),
-            ),
             NativePerfField::str("input_target", session_probe.plan.input_strategy.as_str()),
             NativePerfField::str("output_target", session_probe.plan.output_strategy.as_str()),
         ]
@@ -205,6 +163,7 @@ struct NativeRuntimeBootstrapTail {
     kms: NativeDrmDevice,
     kms_backend: KmsBackendSelection,
     target: KmsTarget,
+    output_capabilities: NativeOutputCapabilities,
     mode_label: String,
     refresh_hz: u32,
     refresh_interval_ns: u64,
@@ -241,6 +200,7 @@ impl NativeRuntime {
             kms,
             kms_backend,
             target,
+            output_capabilities,
             mode_label,
             refresh_hz,
             refresh_interval_ns,
@@ -659,6 +619,7 @@ impl NativeRuntime {
             kms,
             kms_backend,
             target,
+            output_capabilities,
             mode_label,
             refresh_hz,
             drm_file_generation,
@@ -847,7 +808,38 @@ impl NativeRuntime {
         };
         server.set_presentation_clock(presentation_clock);
         let mode_preference = NativeModePreference::from_env();
-        let target = select_kms_target(kms.file(), mode_preference)?;
+        let selection = select_kms_target_with_capabilities(kms.file(), mode_preference)?;
+        let target = selection.target;
+        let mut output_capabilities = selection.capabilities;
+        let selected_sysfs_connector = selected_connector_for_kms_target(
+            bootstrap.kms_device.as_deref(),
+            Path::new("/sys/class/drm"),
+            target.connector_id,
+            &output_capabilities.connector_name,
+        );
+        output_capabilities.qualify_sysfs_connector(selected_sysfs_connector.as_ref());
+        let physical_size = output_capabilities
+            .physical_size_mm
+            .as_ref()
+            .map(|size| format!("{}x{} mm", size.width_mm, size.height_mm))
+            .unwrap_or_else(|| String::from("unknown physical size"));
+        println!(
+            "selected KMS output: {} ({}; {} available mode(s))",
+            output_capabilities.connector_name,
+            physical_size,
+            output_capabilities.modes.len()
+        );
+        println!(
+            "selected output sysfs VRR capability: {}",
+            output_capabilities
+                .vrr_capable
+                .map(|capable| if capable {
+                    "supported"
+                } else {
+                    "not supported"
+                })
+                .unwrap_or("unknown")
+        );
         let mode_label = format!(
             "{}x{}@{}",
             target.width, target.height, target.mode.vrefresh
@@ -867,6 +859,20 @@ impl NativeRuntime {
                 NativePerfField::u64("crtc", u64::from(target.crtc_id)),
                 NativePerfField::str("mode", mode_label.clone()),
                 NativePerfField::str("policy", mode_preference.as_str()),
+                NativePerfField::str("output", output_capabilities.connector_name.clone()),
+                NativePerfField::str(
+                    "output_vrr_sysfs",
+                    output_capabilities
+                        .vrr_capable
+                        .map(|capable| {
+                            if capable {
+                                "supported"
+                            } else {
+                                "not_supported"
+                            }
+                        })
+                        .unwrap_or("unknown"),
+                ),
                 NativePerfField::str("presentation_clock", drm_timestamp_clock.as_str()),
             ]
         });
@@ -1534,6 +1540,10 @@ impl NativeRuntime {
         perf.log("native.vrr_capability", || {
             vec![
                 NativePerfField::str("configured_policy", vrr_policy.as_str()),
+                NativePerfField::str(
+                    "selected_output",
+                    output_capabilities.connector_name.clone(),
+                ),
                 NativePerfField::bool(
                     "drm_connector_capable",
                     kms_backend.atomic_connector_vrr_capable(),
@@ -1568,6 +1578,7 @@ impl NativeRuntime {
             kms,
             kms_backend,
             target,
+            output_capabilities,
             mode_label,
             refresh_hz,
             refresh_interval_ns,

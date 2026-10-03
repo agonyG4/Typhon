@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const MAX_CONTROL_OUTPUTS: usize = 32;
+pub const MAX_CONTROL_OUTPUT_MODES: usize = 128;
 pub const MAX_CONTROL_WINDOWS: usize = 4096;
 pub const MAX_CONTROL_DOCTOR_CHECKS: usize = 128;
 pub const MAX_CONTROL_NAME_BYTES: usize = 256;
@@ -359,6 +360,17 @@ pub struct ModeSnapshot {
     pub refresh_millihz: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct OutputModeSnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+    pub preferred: bool,
+    pub interlaced: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -367,7 +379,7 @@ pub struct PositionSnapshot {
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalSizeSnapshot {
@@ -406,6 +418,8 @@ pub struct OutputSnapshot {
     pub backend: String,
     pub vrr: FeatureStateSnapshot,
     pub direct_scanout: FeatureStateSnapshot,
+    pub modes: Vec<OutputModeSnapshot>,
+    pub modes_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -872,6 +886,71 @@ pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_snapshot_uses_strict_camel_case_mode_and_physical_fields() {
+        let snapshot = OutputListSnapshot {
+            outputs: vec![OutputSnapshot {
+                id: String::from("output-7"),
+                name: String::from("DP-1"),
+                make: None,
+                model: None,
+                serial: None,
+                enabled: true,
+                current_mode: Some(ModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 165_000,
+                }),
+                physical_size_mm: Some(PhysicalSizeSnapshot {
+                    width_mm: 600,
+                    height_mm: 340,
+                }),
+                scale_milli: 1000,
+                transform: String::from("normal"),
+                position: PositionSnapshot { x: 0, y: 0 },
+                focused: true,
+                backend: String::from("atomic"),
+                vrr: FeatureStateSnapshot {
+                    state: FeatureState::Available,
+                },
+                direct_scanout: FeatureStateSnapshot {
+                    state: FeatureState::Unavailable,
+                },
+                modes: vec![OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60_000,
+                    preferred: true,
+                    interlaced: false,
+                }],
+                modes_truncated: false,
+            }],
+            total: 1,
+            truncated: false,
+        };
+
+        let value = serde_json::to_value(&snapshot).expect("output snapshot serializes");
+        assert_eq!(value["outputs"][0]["name"], "DP-1");
+        assert_eq!(
+            value["outputs"][0]["currentMode"]["refreshMillihz"],
+            165_000
+        );
+        assert_eq!(value["outputs"][0]["physicalSizeMm"]["widthMm"], 600);
+        assert_eq!(value["outputs"][0]["modes"][0]["preferred"], true);
+        assert_eq!(value["outputs"][0]["modesTruncated"], false);
+
+        let mut missing_modes = value.clone();
+        missing_modes["outputs"][0]
+            .as_object_mut()
+            .expect("output is an object")
+            .remove("modes");
+        assert!(serde_json::from_value::<OutputListSnapshot>(missing_modes).is_err());
+
+        let mut unknown = value;
+        unknown["outputs"][0]["connectorId"] = serde_json::json!(42);
+        assert!(serde_json::from_value::<OutputListSnapshot>(unknown).is_err());
+    }
 
     #[test]
     fn snapshot_objects_are_deserializable_and_require_all_fields() {

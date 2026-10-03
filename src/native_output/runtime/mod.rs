@@ -615,6 +615,7 @@ pub(crate) struct NativeRuntime {
     cursor_manager: oblivion_one::cursor_manager::CursorThemeManager,
     perf: NativePerfLogger,
     target: KmsTarget,
+    output_capabilities: NativeOutputCapabilities,
     mode_label: String,
     refresh_hz: u32,
     drm_file_generation: u64,

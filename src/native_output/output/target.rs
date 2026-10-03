@@ -1,4 +1,33 @@
 use super::*;
+use oblivion_one::control_snapshots::{
+    FeatureState, MAX_CONTROL_OUTPUT_MODES, OutputModeSnapshot, PhysicalSizeSnapshot,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeOutputCapabilities {
+    pub(crate) connector_name: String,
+    pub(crate) physical_size_mm: Option<PhysicalSizeSnapshot>,
+    pub(crate) modes: Vec<OutputModeSnapshot>,
+    pub(crate) modes_truncated: bool,
+    pub(crate) vrr_capable: Option<bool>,
+}
+
+impl NativeOutputCapabilities {
+    pub(crate) fn qualify_sysfs_connector(&mut self, connector: Option<&NativeConnector>) {
+        if let Some(connector) = connector {
+            self.connector_name.clone_from(&connector.name);
+            self.vrr_capable = connector.vrr_capable;
+        } else {
+            self.vrr_capable = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeKmsTargetSelection {
+    pub(crate) target: KmsTarget,
+    pub(crate) capabilities: NativeOutputCapabilities,
+}
 
 pub(crate) fn first_dri_node(prefix: &str) -> Option<PathBuf> {
     let mut entries = fs::read_dir("/dev/dri")
@@ -40,28 +69,16 @@ pub(crate) fn query_kms_resources(
     .map_err(|error| format!("DRM_IOCTL_MODE_GETRESOURCES failed: {error}"))?;
 
     let mut connected_connector_count = 0usize;
-    let mut first_connected_connector_id = None;
-    let mut first_connected_mode = None;
     for connector_id in &connector_ids {
-        let mut modes = Vec::new();
-        let connector = drm_ffi::mode::get_connector(
-            file.as_fd(),
-            *connector_id,
-            None,
-            None,
-            Some(&mut modes),
-            None,
-            true,
-        )
-        .map_err(|error| {
-            format!("DRM_IOCTL_MODE_GETCONNECTOR failed for connector {connector_id}: {error}")
-        })?;
+        let connector =
+            drm_ffi::mode::get_connector(file.as_fd(), *connector_id, None, None, None, None, true)
+                .map_err(|error| {
+                    format!(
+                        "DRM_IOCTL_MODE_GETCONNECTOR failed for connector {connector_id}: {error}"
+                    )
+                })?;
         if connector.connection == 1 {
             connected_connector_count += 1;
-            first_connected_connector_id.get_or_insert(*connector_id);
-            if first_connected_mode.is_none() {
-                first_connected_mode = modes.first().map(drm_mode_name);
-            }
         }
     }
 
@@ -70,8 +87,6 @@ pub(crate) fn query_kms_resources(
         connector_count: connector_ids.len(),
         encoder_count: encoders.len(),
         connected_connector_count,
-        first_connected_connector_id,
-        first_connected_mode,
     }))
 }
 
@@ -79,6 +94,13 @@ pub(crate) fn select_kms_target(
     file: &fs::File,
     mode_preference: NativeModePreference,
 ) -> io::Result<KmsTarget> {
+    select_kms_target_with_capabilities(file, mode_preference).map(|selection| selection.target)
+}
+
+pub(crate) fn select_kms_target_with_capabilities(
+    file: &fs::File,
+    mode_preference: NativeModePreference,
+) -> io::Result<NativeKmsTargetSelection> {
     let mut crtcs = Vec::new();
     let mut connector_ids = Vec::new();
     drm_ffi::mode::get_resources(
@@ -112,12 +134,15 @@ pub(crate) fn select_kms_target(
         for encoder_id in current_encoder.into_iter().chain(encoder_ids.into_iter()) {
             let encoder = drm_ffi::mode::get_encoder(file.as_fd(), encoder_id)?;
             if let Some(crtc_id) = select_crtc_id(&crtcs, &encoder) {
-                return Ok(KmsTarget {
-                    connector_id,
-                    crtc_id,
-                    mode,
-                    width: u32::from(mode.hdisplay),
-                    height: u32::from(mode.vdisplay),
+                return Ok(NativeKmsTargetSelection {
+                    target: KmsTarget {
+                        connector_id,
+                        crtc_id,
+                        mode,
+                        width: u32::from(mode.hdisplay),
+                        height: u32::from(mode.vdisplay),
+                    },
+                    capabilities: native_output_capabilities(&connector, &modes),
                 });
             }
         }
@@ -127,6 +152,140 @@ pub(crate) fn select_kms_target(
         io::ErrorKind::NotFound,
         "no connected KMS connector with a usable CRTC was found",
     ))
+}
+
+pub(crate) fn native_output_capabilities(
+    connector: &drm_sys::drm_mode_get_connector,
+    modes: &[drm_sys::drm_mode_modeinfo],
+) -> NativeOutputCapabilities {
+    let (modes, modes_truncated) = project_native_output_modes(modes);
+    NativeOutputCapabilities {
+        connector_name: drm_connector_presentation_name(connector),
+        physical_size_mm: physical_size_snapshot(connector.mm_width, connector.mm_height),
+        modes,
+        modes_truncated,
+        vrr_capable: None,
+    }
+}
+
+pub(crate) fn project_native_output_modes(
+    modes: &[drm_sys::drm_mode_modeinfo],
+) -> (Vec<OutputModeSnapshot>, bool) {
+    let mut projected = modes
+        .iter()
+        .filter_map(|mode| {
+            let width = u32::from(mode.hdisplay);
+            let height = u32::from(mode.vdisplay);
+            let refresh_millihz = drm_mode_refresh_millihz(mode)?;
+            (width > 0 && height > 0 && refresh_millihz > 0).then_some(OutputModeSnapshot {
+                width,
+                height,
+                refresh_millihz,
+                preferred: mode.type_ & drm_sys::DRM_MODE_TYPE_PREFERRED != 0,
+                interlaced: mode.flags & drm_sys::DRM_MODE_FLAG_INTERLACE != 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    projected.sort_by_key(|mode| {
+        (
+            mode.width,
+            mode.height,
+            mode.refresh_millihz,
+            mode.interlaced,
+        )
+    });
+
+    let mut unique = Vec::<OutputModeSnapshot>::with_capacity(projected.len());
+    for mode in projected {
+        if let Some(previous) = unique.last_mut().filter(|previous| {
+            previous.width == mode.width
+                && previous.height == mode.height
+                && previous.refresh_millihz == mode.refresh_millihz
+                && previous.interlaced == mode.interlaced
+        }) {
+            previous.preferred |= mode.preferred;
+        } else {
+            unique.push(mode);
+        }
+    }
+
+    let modes_truncated = unique.len() > MAX_CONTROL_OUTPUT_MODES;
+    unique.truncate(MAX_CONTROL_OUTPUT_MODES);
+    (unique, modes_truncated)
+}
+
+pub(crate) fn drm_mode_refresh_millihz(mode: &drm_sys::drm_mode_modeinfo) -> Option<u32> {
+    let calculated = (|| {
+        let width = u64::from(mode.hdisplay);
+        let height = u64::from(mode.vdisplay);
+        let htotal = u64::from(mode.htotal);
+        let vtotal = u64::from(mode.vtotal);
+        if mode.clock == 0 || htotal < width || vtotal < height || htotal == 0 || vtotal == 0 {
+            return None;
+        }
+        let mut numerator = u64::from(mode.clock).checked_mul(1_000_000)?;
+        let mut denominator = htotal.checked_mul(vtotal)?;
+        if mode.flags & drm_sys::DRM_MODE_FLAG_INTERLACE != 0 {
+            numerator = numerator.checked_mul(2)?;
+        }
+        if mode.flags & drm_sys::DRM_MODE_FLAG_DBLSCAN != 0 {
+            denominator = denominator.checked_mul(2)?;
+        }
+        let vscan = u64::from(mode.vscan.max(1));
+        denominator = denominator.checked_mul(vscan)?;
+        let rounded = numerator.checked_add(denominator / 2)? / denominator;
+        u32::try_from(rounded).ok().filter(|refresh| *refresh > 0)
+    })();
+    calculated.or_else(|| {
+        (mode.vrefresh > 0)
+            .then(|| mode.vrefresh.checked_mul(1000))
+            .flatten()
+    })
+}
+
+pub(crate) fn physical_size_snapshot(
+    width_mm: u32,
+    height_mm: u32,
+) -> Option<PhysicalSizeSnapshot> {
+    (width_mm > 0 && height_mm > 0).then_some(PhysicalSizeSnapshot {
+        width_mm,
+        height_mm,
+    })
+}
+
+pub(crate) const fn vrr_feature_state(capable: Option<bool>) -> FeatureState {
+    match capable {
+        Some(true) => FeatureState::Available,
+        Some(false) => FeatureState::Unavailable,
+        None => FeatureState::Degraded,
+    }
+}
+
+fn drm_connector_presentation_name(connector: &drm_sys::drm_mode_get_connector) -> String {
+    let prefix = match connector.connector_type {
+        drm_sys::DRM_MODE_CONNECTOR_VGA => "VGA",
+        drm_sys::DRM_MODE_CONNECTOR_DVII => "DVI-I",
+        drm_sys::DRM_MODE_CONNECTOR_DVID => "DVI-D",
+        drm_sys::DRM_MODE_CONNECTOR_DVIA => "DVI-A",
+        drm_sys::DRM_MODE_CONNECTOR_Composite => "Composite",
+        drm_sys::DRM_MODE_CONNECTOR_SVIDEO => "SVIDEO",
+        drm_sys::DRM_MODE_CONNECTOR_LVDS => "LVDS",
+        drm_sys::DRM_MODE_CONNECTOR_Component => "Component",
+        drm_sys::DRM_MODE_CONNECTOR_9PinDIN => "DIN",
+        drm_sys::DRM_MODE_CONNECTOR_DisplayPort => "DP",
+        drm_sys::DRM_MODE_CONNECTOR_HDMIA => "HDMI-A",
+        drm_sys::DRM_MODE_CONNECTOR_HDMIB => "HDMI-B",
+        drm_sys::DRM_MODE_CONNECTOR_TV => "TV",
+        drm_sys::DRM_MODE_CONNECTOR_eDP => "eDP",
+        drm_sys::DRM_MODE_CONNECTOR_VIRTUAL => "Virtual",
+        drm_sys::DRM_MODE_CONNECTOR_DSI => "DSI",
+        drm_sys::DRM_MODE_CONNECTOR_DPI => "DPI",
+        drm_sys::DRM_MODE_CONNECTOR_WRITEBACK => "Writeback",
+        drm_sys::DRM_MODE_CONNECTOR_SPI => "SPI",
+        drm_sys::DRM_MODE_CONNECTOR_USB => "USB",
+        _ => return String::from("Display"),
+    };
+    format!("{prefix}-{}", connector.connector_type_id)
 }
 
 pub(crate) fn select_kms_mode(

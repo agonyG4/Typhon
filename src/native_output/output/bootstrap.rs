@@ -5,22 +5,14 @@ pub(crate) struct NativeOutputBootstrap {
     pub(crate) runtime_dir: Option<PathBuf>,
     pub(crate) kms_device: Option<PathBuf>,
     pub(crate) render_device: Option<PathBuf>,
-    pub(crate) connector: Option<NativeConnector>,
     pub(crate) kms_resources: Result<Option<KmsResources>, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeConnector {
     pub(crate) name: String,
-    pub(crate) enabled: Option<String>,
-    pub(crate) modes: Vec<String>,
+    pub(crate) connector_id: Option<u32>,
     pub(crate) vrr_capable: Option<bool>,
-}
-
-impl NativeConnector {
-    pub(crate) fn preferred_mode(&self) -> Option<&str> {
-        self.modes.first().map(String::as_str)
-    }
 }
 
 pub(crate) fn native_vrr_policy_from_environment() -> VrrPolicy {
@@ -94,8 +86,6 @@ pub(crate) struct KmsResources {
     pub(crate) connector_count: usize,
     pub(crate) encoder_count: usize,
     pub(crate) connected_connector_count: usize,
-    pub(crate) first_connected_connector_id: Option<u32>,
-    pub(crate) first_connected_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -195,8 +185,6 @@ pub(crate) fn parse_refresh_hz(value: &str) -> Option<u32> {
 impl NativeOutputBootstrap {
     pub(crate) fn discover() -> Self {
         let kms_device = first_dri_node("card");
-        let connector =
-            connected_connector_for_card(kms_device.as_deref(), Path::new("/sys/class/drm"));
         let kms_resources = query_kms_resources(kms_device.as_deref());
         let render_device = kms_device
             .as_deref()
@@ -212,7 +200,6 @@ impl NativeOutputBootstrap {
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
             kms_device,
             render_device,
-            connector,
             kms_resources,
         }
     }
