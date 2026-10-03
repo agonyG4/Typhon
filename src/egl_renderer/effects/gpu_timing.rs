@@ -1827,6 +1827,7 @@ const fn render_pass_kind_name(kind: RenderPassKind) -> &'static str {
 }
 
 fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
+    // Compatibility: checkpoint_cache_budget_bytes remains the historical global pool hard cap.
     let checkpoint_admission = record.checkpoint_cache_admission;
     let capture_ns = record.capture_ns();
     let capture_pixels = record.pixels[TimingCategory::SceneCapture.index()]
@@ -2079,7 +2080,7 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_draw_submit_cpu_ns,
     );
     format!(
-        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={} graph_gap_attribution_available={} max_graph_gap_ns={} max_graph_gap_position={} max_graph_gap_after_pass_id={} max_graph_gap_after_instance_id={} max_graph_gap_after_kind={} max_graph_gap_after_capture_mode={} max_graph_gap_after_checkpoint_count={} max_graph_gap_before_pass_id={} max_graph_gap_before_instance_id={} max_graph_gap_before_kind={} max_graph_gap_before_capture_mode={} max_graph_gap_before_checkpoint_count={} composite_scene_replay_timing_available={} composite_scene_replay_expected_spans={} composite_scene_replay_resolved_spans={} composite_scene_replay_gpu_ns={} composite_scene_replay_host_cpu_ns={} composite_scene_replay_scene_scan_pairs={} composite_scene_replay_commands_executed={} composite_scene_replay_draw_calls={} composite_scene_replay_texture_binds={} max_composite_scene_replay_gpu_ns={} max_composite_scene_replay_pass_id={} max_composite_scene_replay_instance_id={} max_composite_scene_replay_command_start={} max_composite_scene_replay_command_end={} max_composite_scene_replay_command_count={} max_composite_scene_replay_scene_commands={} max_composite_scene_replay_active_work_rects={} max_composite_scene_replay_active_work_pixels={} max_composite_scene_replay_command_region_pairs={} max_composite_scene_replay_scene_scan_pairs={} max_composite_scene_replay_pending_checkpoints={} max_composite_scene_replay_host_cpu_ns={} max_composite_scene_replay_commands_considered={} max_composite_scene_replay_commands_executed={} max_composite_scene_replay_draw_calls={} max_composite_scene_replay_texture_binds={} max_composite_scene_replay_scene_vbo_uploads={} max_composite_scene_replay_scene_vbo_upload_bytes={} checkpoint_cache_candidates={} checkpoint_cache_candidates_considered={} checkpoint_cache_resident_candidates={} checkpoint_cache_new_admissions={} checkpoint_cache_skipped_entry_limit={} checkpoint_cache_skipped_graph_peak_unknown={} checkpoint_cache_skipped_graph_pressure={} checkpoint_cache_skipped_budget={} checkpoint_cache_skipped_size={} checkpoint_cache_skipped_allocation={} checkpoint_cache_skipped_budget_bytes={} checkpoint_cache_graph_peak_known={} checkpoint_cache_graph_peak_bytes={} checkpoint_cache_base_checked_out_bytes={} checkpoint_cache_budget_bytes={} checkpoint_cache_additional_budget_needed_bytes={} checkpoint_cache_additional_budget_needed_known={} checkpoint_cache_cleared_for_graph_pressure={}",
+        "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={} graph_gap_attribution_available={} max_graph_gap_ns={} max_graph_gap_position={} max_graph_gap_after_pass_id={} max_graph_gap_after_instance_id={} max_graph_gap_after_kind={} max_graph_gap_after_capture_mode={} max_graph_gap_after_checkpoint_count={} max_graph_gap_before_pass_id={} max_graph_gap_before_instance_id={} max_graph_gap_before_kind={} max_graph_gap_before_capture_mode={} max_graph_gap_before_checkpoint_count={} composite_scene_replay_timing_available={} composite_scene_replay_expected_spans={} composite_scene_replay_resolved_spans={} composite_scene_replay_gpu_ns={} composite_scene_replay_host_cpu_ns={} composite_scene_replay_scene_scan_pairs={} composite_scene_replay_commands_executed={} composite_scene_replay_draw_calls={} composite_scene_replay_texture_binds={} max_composite_scene_replay_gpu_ns={} max_composite_scene_replay_pass_id={} max_composite_scene_replay_instance_id={} max_composite_scene_replay_command_start={} max_composite_scene_replay_command_end={} max_composite_scene_replay_command_count={} max_composite_scene_replay_scene_commands={} max_composite_scene_replay_active_work_rects={} max_composite_scene_replay_active_work_pixels={} max_composite_scene_replay_command_region_pairs={} max_composite_scene_replay_scene_scan_pairs={} max_composite_scene_replay_pending_checkpoints={} max_composite_scene_replay_host_cpu_ns={} max_composite_scene_replay_commands_considered={} max_composite_scene_replay_commands_executed={} max_composite_scene_replay_draw_calls={} max_composite_scene_replay_texture_binds={} max_composite_scene_replay_scene_vbo_uploads={} max_composite_scene_replay_scene_vbo_upload_bytes={} checkpoint_cache_candidates={} checkpoint_cache_candidates_considered={} checkpoint_cache_resident_candidates={} checkpoint_cache_new_admissions={} checkpoint_cache_skipped_entry_limit={} checkpoint_cache_skipped_graph_peak_unknown={} checkpoint_cache_skipped_graph_pressure={} checkpoint_cache_skipped_budget={} checkpoint_cache_skipped_size={} checkpoint_cache_skipped_allocation={} checkpoint_cache_skipped_budget_bytes={} checkpoint_cache_graph_peak_known={} checkpoint_cache_graph_peak_bytes={} checkpoint_cache_base_checked_out_bytes={} checkpoint_cache_budget_bytes={} checkpoint_cache_additional_budget_needed_bytes={} checkpoint_cache_additional_budget_needed_known={} checkpoint_cache_cleared_for_graph_pressure={} effect_resource_hard_budget_bytes={} checkpoint_cache_soft_budget_bytes={} checkpoint_cache_bytes_at_admission={} checkpoint_cache_skipped_hard_budget={} checkpoint_cache_skipped_hard_budget_bytes={} checkpoint_cache_skipped_soft_budget={} checkpoint_cache_skipped_soft_budget_bytes={} checkpoint_cache_additional_checkpoint_budget_needed_for_all_candidates_bytes={} checkpoint_cache_additional_checkpoint_budget_needed_known={}",
         usize::from(max_capture_replay_detail_available(record)),
         record.pass_timed_ns(),
         record.graph_unattributed_ns(),
@@ -2156,6 +2157,15 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         checkpoint_admission.additional_budget_needed_for_all_candidates_bytes,
         usize::from(checkpoint_admission.additional_budget_needed_known),
         usize::from(checkpoint_admission.cache_cleared_for_graph_pressure),
+        checkpoint_admission.hard_budget_bytes,
+        checkpoint_admission.checkpoint_cache_soft_budget_bytes,
+        checkpoint_admission.checkpoint_cache_bytes_at_admission,
+        checkpoint_admission.skipped_hard_budget,
+        checkpoint_admission.skipped_hard_budget_bytes,
+        checkpoint_admission.skipped_checkpoint_budget,
+        checkpoint_admission.skipped_checkpoint_budget_bytes,
+        checkpoint_admission.additional_checkpoint_budget_needed_for_all_candidates_bytes,
+        usize::from(checkpoint_admission.additional_checkpoint_budget_needed_known),
     )
 }
 
@@ -4475,13 +4485,22 @@ mod tests {
             candidates_considered: 9,
             resident_candidates: 7,
             skipped_budget: 2,
+            skipped_hard_budget: 1,
+            skipped_checkpoint_budget: 1,
             skipped_budget_bytes: 6_291_456,
+            skipped_hard_budget_bytes: 3_145_728,
+            skipped_checkpoint_budget_bytes: 3_145_728,
             graph_peak_known: true,
             graph_peak_bytes: 12_000_000,
             base_checked_out_bytes: 31_285_016,
-            budget_bytes: 64 * 1024 * 1024,
+            hard_budget_bytes: 128 * 1024 * 1024,
+            checkpoint_cache_soft_budget_bytes: 64 * 1024 * 1024,
+            checkpoint_cache_bytes_at_admission: 60_000_000,
+            budget_bytes: 128 * 1024 * 1024,
             additional_budget_needed_for_all_candidates_bytes: 6_291_456,
             additional_budget_needed_known: true,
+            additional_checkpoint_budget_needed_for_all_candidates_bytes: 5_000_000,
+            additional_checkpoint_budget_needed_known: true,
             ..Default::default()
         };
         assert!(state.finish(first.total));
@@ -4542,16 +4561,25 @@ mod tests {
             "checkpoint_cache_skipped_graph_peak_unknown=0",
             "checkpoint_cache_skipped_graph_pressure=0",
             "checkpoint_cache_skipped_budget=2",
+            "checkpoint_cache_skipped_hard_budget=1",
+            "checkpoint_cache_skipped_hard_budget_bytes=3145728",
+            "checkpoint_cache_skipped_soft_budget=1",
+            "checkpoint_cache_skipped_soft_budget_bytes=3145728",
             "checkpoint_cache_skipped_size=0",
             "checkpoint_cache_skipped_allocation=0",
             "checkpoint_cache_skipped_budget_bytes=6291456",
             "checkpoint_cache_graph_peak_known=1",
             "checkpoint_cache_graph_peak_bytes=12000000",
             "checkpoint_cache_base_checked_out_bytes=31285016",
-            "checkpoint_cache_budget_bytes=67108864",
+            "checkpoint_cache_budget_bytes=134217728",
             "checkpoint_cache_additional_budget_needed_bytes=6291456",
             "checkpoint_cache_additional_budget_needed_known=1",
             "checkpoint_cache_cleared_for_graph_pressure=0",
+            "effect_resource_hard_budget_bytes=134217728",
+            "checkpoint_cache_soft_budget_bytes=67108864",
+            "checkpoint_cache_bytes_at_admission=60000000",
+            "checkpoint_cache_additional_checkpoint_budget_needed_for_all_candidates_bytes=5000000",
+            "checkpoint_cache_additional_checkpoint_budget_needed_known=1",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }
@@ -4953,6 +4981,10 @@ mod tests {
             "checkpoint_cache_skipped_graph_peak_unknown",
             "checkpoint_cache_skipped_graph_pressure",
             "checkpoint_cache_skipped_budget",
+            "checkpoint_cache_skipped_hard_budget",
+            "checkpoint_cache_skipped_hard_budget_bytes",
+            "checkpoint_cache_skipped_soft_budget",
+            "checkpoint_cache_skipped_soft_budget_bytes",
             "checkpoint_cache_skipped_size",
             "checkpoint_cache_skipped_allocation",
             "checkpoint_cache_skipped_budget_bytes",
@@ -4963,6 +4995,11 @@ mod tests {
             "checkpoint_cache_additional_budget_needed_bytes",
             "checkpoint_cache_additional_budget_needed_known",
             "checkpoint_cache_cleared_for_graph_pressure",
+            "effect_resource_hard_budget_bytes",
+            "checkpoint_cache_soft_budget_bytes",
+            "checkpoint_cache_bytes_at_admission",
+            "checkpoint_cache_additional_checkpoint_budget_needed_for_all_candidates_bytes",
+            "checkpoint_cache_additional_checkpoint_budget_needed_known",
         ] {
             assert_eq!(
                 line.split_whitespace()

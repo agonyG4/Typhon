@@ -227,9 +227,25 @@ on every frame until a new registry generation is published.
 
 ## Resource limits and diagnostics
 
-The effect resource pool has a 64 MiB default budget, uses graph liveness to
-checkout and return physical textures, reuses compatible allocations, evicts
-idle entries deterministically, and drops idle size history on output resize.
+The Effects resource pool has a 128 MiB default hard budget for all pooled
+Effects textures. The persistent checkpoint cache has a separate 64 MiB default
+soft budget. Graph transient work reserves hard-budget headroom first; the
+optional checkpoint cache can be bypassed when either limit would be exceeded.
+Idle reusable textures can still be evicted deterministically to make room for
+new allocations, and idle size history is dropped on output resize.
+
+Set `TYPHON_EFFECT_RESOURCE_BUDGET_MIB` to override the hard budget and
+`TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB` to override the checkpoint soft
+budget. Values must be positive integer MiB. A missing value uses its default;
+an invalid, non-Unicode, zero, malformed, or overflowing value emits a warning
+and uses that variable's default. If the requested checkpoint budget exceeds
+the effective hard budget, Typhon warns and clamps it to the hard limit.
+Typhon does not automatically size either budget from VRAM yet.
+
+The 128 MiB default does not qualify Effects graphs broadly for 4K. The tested
+fullscreen-blur graph estimate is 82,944,000 bytes, which is below this hard
+cap, but other graph shapes and workloads are not covered by that result.
+
 The shader cache is bounded and prewarms built-ins and trusted custom programs
 at a safe GL boundary. Context teardown clears shader programs, effect
 textures, scratch FBOs, and effect quad objects.

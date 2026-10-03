@@ -47,6 +47,7 @@ pub(crate) use executor::{
 };
 pub(crate) use gpu_timing::{EffectGpuProfiler, ReplayCaptureExecutionDetail};
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
+pub(crate) use resources::EffectResourceBudgetConfig;
 #[cfg(test)]
 pub(crate) use resources::checkpoint_capture_cache_key;
 pub(crate) use resources::{

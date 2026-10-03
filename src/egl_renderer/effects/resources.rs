@@ -14,7 +14,78 @@ use oblivion_one::effects::{
 use super::super::CheckpointCausalState;
 use super::metrics::EffectResourceMetrics;
 
-pub const DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+pub const DEFAULT_EFFECT_CHECKPOINT_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const EFFECT_RESOURCE_BUDGET_ENV: &str = "TYPHON_EFFECT_RESOURCE_BUDGET_MIB";
+const EFFECT_CHECKPOINT_CACHE_BUDGET_ENV: &str = "TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffectResourceBudgetConfig {
+    hard_budget_bytes: u64,
+    checkpoint_cache_budget_bytes: u64,
+}
+
+impl EffectResourceBudgetConfig {
+    pub(crate) fn from_env() -> Self {
+        let hard_budget_bytes = budget_override_or_default(
+            EFFECT_RESOURCE_BUDGET_ENV,
+            DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES,
+        );
+        let requested_checkpoint_budget_bytes = budget_override_or_default(
+            EFFECT_CHECKPOINT_CACHE_BUDGET_ENV,
+            DEFAULT_EFFECT_CHECKPOINT_CACHE_BUDGET_BYTES,
+        );
+        let checkpoint_cache_budget_bytes =
+            requested_checkpoint_budget_bytes.min(hard_budget_bytes);
+        if checkpoint_cache_budget_bytes != requested_checkpoint_budget_bytes {
+            eprintln!(
+                "warning: {EFFECT_CHECKPOINT_CACHE_BUDGET_ENV} exceeds the effective Effects hard budget; clamping checkpoint cache to {} MiB",
+                checkpoint_cache_budget_bytes / BYTES_PER_MIB
+            );
+        }
+        Self {
+            hard_budget_bytes,
+            checkpoint_cache_budget_bytes,
+        }
+    }
+}
+
+impl Default for EffectResourceBudgetConfig {
+    fn default() -> Self {
+        Self {
+            hard_budget_bytes: DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES,
+            checkpoint_cache_budget_bytes: DEFAULT_EFFECT_CHECKPOINT_CACHE_BUDGET_BYTES,
+        }
+    }
+}
+
+fn budget_override_or_default(name: &str, default_bytes: u64) -> u64 {
+    match parse_budget_override(name) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => default_bytes,
+        Err(()) => {
+            eprintln!(
+                "warning: invalid {name}; using default of {} MiB",
+                default_bytes / BYTES_PER_MIB
+            );
+            default_bytes
+        }
+    }
+}
+
+fn parse_budget_override(name: &str) -> Result<Option<u64>, ()> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value.to_str().ok_or(())?;
+    let mib = value.parse::<u64>().map_err(|_| ())?;
+    if mib == 0 {
+        return Err(());
+    }
+    mib.checked_mul(BYTES_PER_MIB).map(Some).ok_or(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EffectTextureFormat {
@@ -288,15 +359,25 @@ pub(crate) struct CheckpointCacheAdmissionStats {
     pub(crate) skipped_graph_peak_unknown: usize,
     pub(crate) skipped_graph_pressure: usize,
     pub(crate) skipped_budget: usize,
+    pub(crate) skipped_hard_budget: usize,
+    pub(crate) skipped_checkpoint_budget: usize,
     pub(crate) skipped_size: usize,
     pub(crate) skipped_allocation: usize,
     pub(crate) skipped_budget_bytes: u64,
+    pub(crate) skipped_hard_budget_bytes: u64,
+    pub(crate) skipped_checkpoint_budget_bytes: u64,
     pub(crate) graph_peak_known: bool,
     pub(crate) graph_peak_bytes: u64,
     pub(crate) base_checked_out_bytes: u64,
+    pub(crate) hard_budget_bytes: u64,
+    pub(crate) checkpoint_cache_soft_budget_bytes: u64,
+    pub(crate) checkpoint_cache_bytes_at_admission: u64,
+    // Historical telemetry meaning: this remains the global pool hard budget.
     pub(crate) budget_bytes: u64,
     pub(crate) additional_budget_needed_for_all_candidates_bytes: u64,
     pub(crate) additional_budget_needed_known: bool,
+    pub(crate) additional_checkpoint_budget_needed_for_all_candidates_bytes: u64,
+    pub(crate) additional_checkpoint_budget_needed_known: bool,
     pub(crate) cache_cleared_for_graph_pressure: bool,
 }
 
@@ -329,7 +410,7 @@ pub struct EffectResourcePool {
 
 impl EffectResourcePool {
     pub fn new() -> Self {
-        Self::with_budget(DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES)
+        Self::with_budget(DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES)
             .expect("stable default effect resource budget is non-zero")
     }
 
@@ -557,6 +638,7 @@ impl Default for EffectResourcePool {
 #[allow(dead_code)]
 pub(crate) struct EffectGlResourceCache {
     pool: EffectResourcePool,
+    checkpoint_cache_budget_bytes: u64,
     gl_textures: HashMap<u64, glow::Texture>,
     scratch_fbo: Option<glow::Framebuffer>,
     lifecycle_composition_fbo: Option<glow::Framebuffer>,
@@ -569,21 +651,17 @@ pub(crate) struct EffectGlResourceCache {
 #[allow(dead_code)]
 impl EffectGlResourceCache {
     pub(crate) fn new() -> Self {
-        Self {
-            pool: EffectResourcePool::new(),
-            gl_textures: HashMap::new(),
-            scratch_fbo: None,
-            lifecycle_composition_fbo: None,
-            checkpoint_captures: HashMap::new(),
-            checkpoint_compatibility: None,
-            checkpoint_frame_serial: 0,
-            checkpoint_causal_baseline: None,
-        }
+        Self::with_budget_config(EffectResourceBudgetConfig::default())
+            .expect("default Effects resource budgets are valid")
     }
 
-    pub(crate) fn with_budget(budget_bytes: u64) -> Result<Self, EffectResourceError> {
+    pub(crate) fn with_budget_config(
+        config: EffectResourceBudgetConfig,
+    ) -> Result<Self, EffectResourceError> {
+        debug_assert!(config.checkpoint_cache_budget_bytes <= config.hard_budget_bytes);
         Ok(Self {
-            pool: EffectResourcePool::with_budget(budget_bytes)?,
+            pool: EffectResourcePool::with_budget(config.hard_budget_bytes)?,
+            checkpoint_cache_budget_bytes: config.checkpoint_cache_budget_bytes,
             gl_textures: HashMap::new(),
             scratch_fbo: None,
             lifecycle_composition_fbo: None,
@@ -591,6 +669,27 @@ impl EffectGlResourceCache {
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
             checkpoint_causal_baseline: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_budget(budget_bytes: u64) -> Result<Self, EffectResourceError> {
+        Self::with_budgets(budget_bytes, budget_bytes)
+    }
+
+    pub(crate) fn with_budgets(
+        hard_budget_bytes: u64,
+        checkpoint_cache_budget_bytes: u64,
+    ) -> Result<Self, EffectResourceError> {
+        if hard_budget_bytes == 0
+            || checkpoint_cache_budget_bytes == 0
+            || checkpoint_cache_budget_bytes > hard_budget_bytes
+        {
+            return Err(EffectResourceError::InvalidBudget);
+        }
+        Self::with_budget_config(EffectResourceBudgetConfig {
+            hard_budget_bytes,
+            checkpoint_cache_budget_bytes,
         })
     }
 
@@ -761,6 +860,9 @@ impl EffectGlResourceCache {
             skipped_entry_limit: candidates.len().saturating_sub(candidates_considered),
             graph_peak_known: graph_peak_bytes.is_some(),
             graph_peak_bytes: graph_peak_bytes.unwrap_or_default(),
+            hard_budget_bytes: self.pool.budget_bytes(),
+            checkpoint_cache_soft_budget_bytes: self.checkpoint_cache_budget_bytes,
+            // Legacy telemetry field: this remains the global pool hard budget.
             budget_bytes: self.pool.budget_bytes(),
             ..Default::default()
         };
@@ -772,46 +874,65 @@ impl EffectGlResourceCache {
                 .map(|(key, _)| key),
         );
 
-        let Some(graph_peak_bytes) = graph_peak_bytes else {
+        if let Some(graph_peak_bytes) = graph_peak_bytes {
+            if self
+                .pool
+                .checked_out_bytes()
+                .saturating_add(graph_peak_bytes)
+                > self.pool.budget_bytes()
+            {
+                admission.cache_cleared_for_graph_pressure = true;
+                self.clear_checkpoint_capture_cache();
+            }
+        } else {
             self.clear_checkpoint_capture_cache();
             admission.skipped_graph_peak_unknown = candidates_considered;
-            admission.base_checked_out_bytes = self.pool.checked_out_bytes();
+        }
+
+        let base_checked_out_bytes = self.pool.checked_out_bytes();
+        admission.base_checked_out_bytes = base_checked_out_bytes;
+        let checkpoint_cache_bytes = self.checkpoint_cache_stats().1;
+        admission.checkpoint_cache_bytes_at_admission = checkpoint_cache_bytes;
+        let mut missing_candidate_bytes = Some(0_u64);
+        for (key, plan) in candidates.iter().take(candidates_considered) {
+            if self.checkpoint_captures.contains_key(key) {
+                continue;
+            }
+            missing_candidate_bytes = missing_candidate_bytes.and_then(|required| {
+                texture_key(plan)
+                    .estimated_bytes()
+                    .ok()
+                    .and_then(|bytes| required.checked_add(bytes))
+            });
+        }
+
+        if let Some(required_bytes) =
+            missing_candidate_bytes.and_then(|bytes| checkpoint_cache_bytes.checked_add(bytes))
+        {
+            admission.additional_checkpoint_budget_needed_for_all_candidates_bytes =
+                required_bytes.saturating_sub(admission.checkpoint_cache_soft_budget_bytes);
+            admission.additional_checkpoint_budget_needed_known = true;
+        }
+
+        if let Some(graph_peak_bytes) = graph_peak_bytes {
+            let required_bytes_for_all_candidates = base_checked_out_bytes
+                .checked_add(graph_peak_bytes)
+                .and_then(|required| {
+                    missing_candidate_bytes.and_then(|bytes| required.checked_add(bytes))
+                });
+            if let Some(required_bytes) = required_bytes_for_all_candidates {
+                admission.additional_budget_needed_for_all_candidates_bytes =
+                    required_bytes.saturating_sub(admission.budget_bytes);
+                admission.additional_budget_needed_known = true;
+            }
+        }
+
+        let Some(graph_peak_bytes) = graph_peak_bytes else {
             return PreparedCheckpointCaptures {
                 bindings: HashMap::new(),
                 admission,
             };
         };
-        if self
-            .pool
-            .checked_out_bytes()
-            .saturating_add(graph_peak_bytes)
-            > self.pool.budget_bytes()
-        {
-            admission.cache_cleared_for_graph_pressure = true;
-            self.clear_checkpoint_capture_cache();
-        }
-
-        let base_checked_out_bytes = self.pool.checked_out_bytes();
-        admission.base_checked_out_bytes = base_checked_out_bytes;
-        let mut required_bytes_for_all_candidates =
-            base_checked_out_bytes.checked_add(graph_peak_bytes);
-        for (key, plan) in candidates.iter().take(candidates_considered) {
-            if self.checkpoint_captures.contains_key(key) {
-                continue;
-            }
-            match texture_key(plan).estimated_bytes() {
-                Ok(bytes) => {
-                    required_bytes_for_all_candidates = required_bytes_for_all_candidates
-                        .and_then(|required| required.checked_add(bytes));
-                }
-                Err(_) => required_bytes_for_all_candidates = None,
-            }
-        }
-        if let Some(required_bytes) = required_bytes_for_all_candidates {
-            admission.additional_budget_needed_for_all_candidates_bytes =
-                required_bytes.saturating_sub(admission.budget_bytes);
-            admission.additional_budget_needed_known = true;
-        }
 
         if base_checked_out_bytes.saturating_add(graph_peak_bytes) > self.pool.budget_bytes() {
             admission.skipped_graph_pressure = candidates_considered;
@@ -821,6 +942,7 @@ impl EffectGlResourceCache {
             };
         }
 
+        let mut checkpoint_cache_bytes = checkpoint_cache_bytes;
         let mut bindings = HashMap::new();
         for (key, plan) in candidates.iter().take(candidates_considered) {
             let was_resident = self.checkpoint_captures.contains_key(key);
@@ -842,6 +964,32 @@ impl EffectGlResourceCache {
                     admission.skipped_budget = admission.skipped_budget.saturating_add(1);
                     admission.skipped_budget_bytes =
                         admission.skipped_budget_bytes.saturating_add(bytes);
+                    admission.skipped_hard_budget = admission.skipped_hard_budget.saturating_add(1);
+                    admission.skipped_hard_budget_bytes =
+                        admission.skipped_hard_budget_bytes.saturating_add(bytes);
+                    continue;
+                }
+                let Some(new_checkpoint_cache_bytes) = checkpoint_cache_bytes.checked_add(bytes)
+                else {
+                    admission.skipped_budget = admission.skipped_budget.saturating_add(1);
+                    admission.skipped_budget_bytes =
+                        admission.skipped_budget_bytes.saturating_add(bytes);
+                    admission.skipped_checkpoint_budget =
+                        admission.skipped_checkpoint_budget.saturating_add(1);
+                    admission.skipped_checkpoint_budget_bytes = admission
+                        .skipped_checkpoint_budget_bytes
+                        .saturating_add(bytes);
+                    continue;
+                };
+                if new_checkpoint_cache_bytes > self.checkpoint_cache_budget_bytes {
+                    admission.skipped_budget = admission.skipped_budget.saturating_add(1);
+                    admission.skipped_budget_bytes =
+                        admission.skipped_budget_bytes.saturating_add(bytes);
+                    admission.skipped_checkpoint_budget =
+                        admission.skipped_checkpoint_budget.saturating_add(1);
+                    admission.skipped_checkpoint_budget_bytes = admission
+                        .skipped_checkpoint_budget_bytes
+                        .saturating_add(bytes);
                     continue;
                 }
                 let texture = match self.acquire_plan(gl, plan) {
@@ -859,6 +1007,7 @@ impl EffectGlResourceCache {
                         last_populated_frame_serial: None,
                     },
                 );
+                checkpoint_cache_bytes = new_checkpoint_cache_bytes;
                 admission.newly_admitted_candidates =
                     admission.newly_admitted_candidates.saturating_add(1);
             } else {
@@ -1304,6 +1453,182 @@ mod tests {
     use oblivion_one::effects::{
         CompiledRenderPass, EffectInstanceId, EffectRegion, EffectWorkingSpace, RenderPassKind,
     };
+    use std::{
+        ffi::{OsStr, OsString},
+        sync::{Mutex, MutexGuard},
+    };
+
+    const HARD_BUDGET_ENV: &str = "TYPHON_EFFECT_RESOURCE_BUDGET_MIB";
+    const CHECKPOINT_BUDGET_ENV: &str = "TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB";
+
+    struct BudgetEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        hard_budget: Option<OsString>,
+        checkpoint_budget: Option<OsString>,
+    }
+
+    impl BudgetEnvGuard {
+        fn new() -> Self {
+            static ENV_LOCK: Mutex<()> = Mutex::new(());
+            let lock = ENV_LOCK.lock().unwrap();
+            Self {
+                _lock: lock,
+                hard_budget: std::env::var_os(HARD_BUDGET_ENV),
+                checkpoint_budget: std::env::var_os(CHECKPOINT_BUDGET_ENV),
+            }
+        }
+
+        fn set(&self, hard_budget: Option<&OsStr>, checkpoint_budget: Option<&OsStr>) {
+            // SAFETY: all budget-configuration tests serialize environment mutation with ENV_LOCK.
+            unsafe {
+                match hard_budget {
+                    Some(value) => std::env::set_var(HARD_BUDGET_ENV, value),
+                    None => std::env::remove_var(HARD_BUDGET_ENV),
+                }
+                match checkpoint_budget {
+                    Some(value) => std::env::set_var(CHECKPOINT_BUDGET_ENV, value),
+                    None => std::env::remove_var(CHECKPOINT_BUDGET_ENV),
+                }
+            }
+        }
+
+        fn set_strs(&self, hard_budget: Option<&str>, checkpoint_budget: Option<&str>) {
+            self.set(
+                hard_budget.map(OsStr::new),
+                checkpoint_budget.map(OsStr::new),
+            );
+        }
+    }
+
+    impl Drop for BudgetEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard still owns ENV_LOCK while restoring the process environment.
+            unsafe {
+                match &self.hard_budget {
+                    Some(value) => std::env::set_var(HARD_BUDGET_ENV, value),
+                    None => std::env::remove_var(HARD_BUDGET_ENV),
+                }
+                match &self.checkpoint_budget {
+                    Some(value) => std::env::set_var(CHECKPOINT_BUDGET_ENV, value),
+                    None => std::env::remove_var(CHECKPOINT_BUDGET_ENV),
+                }
+            }
+        }
+    }
+
+    unsafe extern "system" fn test_gl_get_string(name: u32) -> *const u8 {
+        static VERSION: &[u8] = b"2.1 test\0";
+        static EXTENSIONS: &[u8] = b"\0";
+        match name {
+            glow::VERSION => VERSION.as_ptr(),
+            glow::EXTENSIONS => EXTENSIONS.as_ptr(),
+            _ => std::ptr::null(),
+        }
+    }
+
+    fn test_gl_context() -> glow::Context {
+        unsafe {
+            glow::Context::from_loader_function(|name| {
+                if name == "glGetString" {
+                    test_gl_get_string as *const () as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn effect_resource_budget_config_uses_two_level_defaults() {
+        let env = BudgetEnvGuard::new();
+        env.set_strs(None, None);
+
+        let deterministic_default = EffectResourceBudgetConfig::default();
+        assert_eq!(deterministic_default.hard_budget_bytes, 128 * 1024 * 1024);
+        assert_eq!(
+            deterministic_default.checkpoint_cache_budget_bytes,
+            64 * 1024 * 1024
+        );
+
+        let config = EffectResourceBudgetConfig::from_env();
+
+        assert_eq!(config.hard_budget_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.checkpoint_cache_budget_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn effect_resource_budget_config_parses_valid_overrides_and_clamps_soft_limit() {
+        let env = BudgetEnvGuard::new();
+
+        env.set_strs(Some("96"), None);
+        let config = EffectResourceBudgetConfig::from_env();
+        assert_eq!(config.hard_budget_bytes, 96 * 1024 * 1024);
+        assert_eq!(config.checkpoint_cache_budget_bytes, 64 * 1024 * 1024);
+
+        env.set_strs(None, Some("24"));
+        let config = EffectResourceBudgetConfig::from_env();
+        assert_eq!(config.hard_budget_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.checkpoint_cache_budget_bytes, 24 * 1024 * 1024);
+
+        env.set_strs(Some("128"), Some("80"));
+        let config = EffectResourceBudgetConfig::from_env();
+        assert_eq!(config.hard_budget_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.checkpoint_cache_budget_bytes, 80 * 1024 * 1024);
+
+        env.set_strs(Some("32"), Some("48"));
+        let config = EffectResourceBudgetConfig::from_env();
+        assert_eq!(config.hard_budget_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.checkpoint_cache_budget_bytes, 32 * 1024 * 1024);
+
+        env.set_strs(Some("32"), None);
+        let config = EffectResourceBudgetConfig::from_env();
+        assert_eq!(config.hard_budget_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.checkpoint_cache_budget_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn effect_resource_budget_config_rejects_invalid_overrides_independently() {
+        let env = BudgetEnvGuard::new();
+        let hard_invalid_values = ["0", "not-a-number", "18446744073709551615"];
+        for value in hard_invalid_values {
+            env.set_strs(Some(value), Some("16"));
+            let config = EffectResourceBudgetConfig::from_env();
+            assert_eq!(config.hard_budget_bytes, 128 * 1024 * 1024, "{value}");
+            assert_eq!(config.checkpoint_cache_budget_bytes, 16 * 1024 * 1024);
+        }
+
+        let checkpoint_invalid_values = ["0", "not-a-number", "18446744073709551615"];
+        for value in checkpoint_invalid_values {
+            env.set_strs(Some("96"), Some(value));
+            let config = EffectResourceBudgetConfig::from_env();
+            assert_eq!(config.hard_budget_bytes, 96 * 1024 * 1024);
+            assert_eq!(
+                config.checkpoint_cache_budget_bytes,
+                64 * 1024 * 1024,
+                "{value}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            env.set(
+                Some(OsString::from_vec(vec![0xff]).as_os_str()),
+                Some(OsStr::new("16")),
+            );
+            let config = EffectResourceBudgetConfig::from_env();
+            assert_eq!(config.hard_budget_bytes, 128 * 1024 * 1024);
+            assert_eq!(config.checkpoint_cache_budget_bytes, 16 * 1024 * 1024);
+
+            env.set(
+                Some(OsStr::new("96")),
+                Some(OsString::from_vec(vec![0xff]).as_os_str()),
+            );
+            let config = EffectResourceBudgetConfig::from_env();
+            assert_eq!(config.hard_budget_bytes, 96 * 1024 * 1024);
+            assert_eq!(config.checkpoint_cache_budget_bytes, 64 * 1024 * 1024);
+        }
+    }
 
     fn backdrop_stack_graph(generation: u64, source_damage: EffectRegion) -> CompiledFrameGraph {
         use oblivion_one::{
@@ -1437,6 +1762,16 @@ mod tests {
                 + admission.skipped_size
                 + admission.skipped_allocation,
             admission.candidates_considered
+        );
+        assert_eq!(
+            admission.skipped_budget,
+            admission.skipped_hard_budget + admission.skipped_checkpoint_budget
+        );
+        assert_eq!(
+            admission.skipped_budget_bytes,
+            admission
+                .skipped_hard_budget_bytes
+                .saturating_add(admission.skipped_checkpoint_budget_bytes)
         );
     }
 
@@ -2000,6 +2335,216 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_soft_budget_rejects_before_allocation_when_hard_budget_has_room() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let candidate_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let graph_peak = estimate_graph_peak_bytes(&graph).unwrap();
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache =
+            EffectGlResourceCache::with_budgets(graph_peak + candidate_bytes, candidate_bytes - 1)
+                .unwrap();
+        let allocation_count = cache.pool.metrics().allocation_count;
+        let gl = test_gl_context();
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak),
+            &[(cache_key, plan.clone())],
+        );
+
+        assert!(prepared.bindings.is_empty());
+        assert_eq!(prepared.admission.skipped_budget, 1);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 1);
+        assert_eq!(
+            prepared.admission.skipped_checkpoint_budget_bytes,
+            candidate_bytes
+        );
+        assert_eq!(prepared.admission.skipped_hard_budget, 0);
+        assert_eq!(prepared.admission.skipped_hard_budget_bytes, 0);
+        assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert_eq!(cache.pool.metrics().allocation_count, allocation_count);
+        assert!(cache.checkpoint_captures.is_empty());
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_hard_budget_rejects_before_allocation_when_soft_budget_has_room() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let candidate_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let graph_peak = estimate_graph_peak_bytes(&graph).unwrap();
+        let hard_budget = graph_peak + candidate_bytes - 1;
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = EffectGlResourceCache::with_budgets(hard_budget, hard_budget).unwrap();
+        let allocation_count = cache.pool.metrics().allocation_count;
+        let gl = test_gl_context();
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak),
+            &[(cache_key, plan)],
+        );
+
+        assert!(prepared.bindings.is_empty());
+        assert_eq!(prepared.admission.skipped_budget, 1);
+        assert_eq!(prepared.admission.skipped_hard_budget, 1);
+        assert_eq!(
+            prepared.admission.skipped_hard_budget_bytes,
+            candidate_bytes
+        );
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 0);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget_bytes, 0);
+        assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert_eq!(cache.pool.metrics().allocation_count, allocation_count);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_admission_requires_both_budgets() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (cache_key, plan) = first_checkpoint_candidate(&graph);
+        let candidate_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache =
+            EffectGlResourceCache::with_budgets(candidate_bytes * 2, candidate_bytes).unwrap();
+        let texture_id = 77;
+        cache.pool.next_id = texture_id;
+        cache.gl_textures.insert(
+            texture_id,
+            glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        );
+        let gl = test_gl_context();
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(cache_key, plan.clone())],
+        );
+
+        assert_eq!(prepared.admission.newly_admitted_candidates, 1);
+        assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.admission.skipped_hard_budget, 0);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 0);
+        assert_eq!(prepared.admission.checkpoint_cache_bytes_at_admission, 0);
+        assert_eq!(cache.checkpoint_cache_stats().1, candidate_bytes);
+        assert_eq!(prepared.bindings[&plan.id].texture.id, texture_id);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_admissions_update_soft_occupancy_for_later_candidates() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (first_key, plan) = first_checkpoint_candidate(&graph);
+        let candidate_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let mut second_key = first_key.clone();
+        second_key.consumer_semantic_signature =
+            second_key.consumer_semantic_signature.wrapping_add(1);
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache =
+            EffectGlResourceCache::with_budgets(candidate_bytes * 4, candidate_bytes).unwrap();
+        let texture_id = 91;
+        cache.pool.next_id = texture_id;
+        cache.gl_textures.insert(
+            texture_id,
+            glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        );
+        let gl = test_gl_context();
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(first_key, plan.clone()), (second_key, plan.clone())],
+        );
+
+        assert_eq!(prepared.admission.newly_admitted_candidates, 1);
+        assert_eq!(prepared.admission.skipped_budget, 1);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 1);
+        assert_eq!(
+            prepared.admission.skipped_checkpoint_budget_bytes,
+            candidate_bytes
+        );
+        assert_eq!(prepared.admission.skipped_hard_budget, 0);
+        assert_eq!(prepared.admission.checkpoint_cache_bytes_at_admission, 0);
+        assert_eq!(cache.checkpoint_captures.len(), 1);
+        assert_eq!(cache.checkpoint_cache_stats().1, candidate_bytes);
+        assert_eq!(cache.pool.metrics().allocation_count, 1);
+        assert_eq!(prepared.bindings.len(), 1);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn resident_checkpoint_counts_toward_soft_budget_without_reallocation() {
+        let graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (resident_key, plan) = first_checkpoint_candidate(&graph);
+        let candidate_bytes = texture_key(&plan).estimated_bytes().unwrap();
+        let mut missing_key = resident_key.clone();
+        missing_key.consumer_semantic_signature =
+            missing_key.consumer_semantic_signature.wrapping_add(1);
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache =
+            EffectGlResourceCache::with_budgets(candidate_bytes * 2, candidate_bytes).unwrap();
+        let lease = cache.pool.checkout(texture_key(&plan)).unwrap();
+        let lease_id = lease.id;
+        cache.checkpoint_captures.insert(
+            resident_key.clone(),
+            CachedCheckpointCapture {
+                texture: lease,
+                last_populated_frame_serial: Some(1),
+            },
+        );
+        cache.checkpoint_compatibility = Some(compatibility);
+        let allocations_before = cache.pool.metrics().allocation_count;
+        let gl = test_gl_context();
+
+        let prepared = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(resident_key, plan.clone()), (missing_key, plan.clone())],
+        );
+
+        assert_eq!(prepared.admission.resident_candidates, 1);
+        assert_eq!(prepared.admission.newly_admitted_candidates, 0);
+        assert_eq!(
+            prepared.admission.checkpoint_cache_bytes_at_admission,
+            candidate_bytes
+        );
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 1);
+        assert_eq!(prepared.admission.skipped_budget, 1);
+        assert_eq!(prepared.admission.skipped_hard_budget, 0);
+        assert_eq!(prepared.bindings[&plan.id].texture.id, lease_id);
+        assert_eq!(cache.checkpoint_captures.len(), 1);
+        assert_eq!(cache.checkpoint_cache_stats().1, candidate_bytes);
+        assert_eq!(cache.pool.metrics().allocation_count, allocations_before);
+        assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
     fn checkpoint_compatibility_changes_release_cached_contents() {
         let base = CheckpointCacheCompatibility {
             output_size: (1920, 1080),
@@ -2057,7 +2602,7 @@ mod tests {
         let mut cache = resource_cache_with_checkpoint(cache_key, Some(1));
         assert_eq!(cache.pool.checked_out_bytes(), 8 * 8 * 4);
 
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
         cache.destroy(&gl);
 
         assert!(cache.checkpoint_captures.is_empty());
@@ -2125,7 +2670,7 @@ mod tests {
             effect_registry_generation: 1,
         };
         cache.checkpoint_compatibility = Some(compatibility);
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared = cache.prepare_checkpoint_captures(
             &gl,
@@ -2146,6 +2691,13 @@ mod tests {
         assert_eq!(prepared.admission.skipped_graph_pressure, 0);
         assert_eq!(prepared.admission.skipped_budget, 1);
         assert_eq!(prepared.admission.skipped_budget_bytes, checkpoint_bytes);
+        assert_eq!(prepared.admission.skipped_hard_budget, 1);
+        assert_eq!(
+            prepared.admission.skipped_hard_budget_bytes,
+            checkpoint_bytes
+        );
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 0);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget_bytes, 0);
         assert_eq!(prepared.admission.skipped_size, 0);
         assert_eq!(prepared.admission.skipped_allocation, 0);
         assert!(prepared.admission.graph_peak_known);
@@ -2199,7 +2751,7 @@ mod tests {
         let initial_checked_out = checkpoint_lease.bytes + mandatory_lease.bytes;
         assert!(initial_checked_out.saturating_add(graph_peak) > budget);
         cache.checkpoint_compatibility = Some(compatibility);
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared = cache.prepare_checkpoint_captures(
             &gl,
@@ -2220,6 +2772,8 @@ mod tests {
         assert_eq!(prepared.admission.budget_bytes, budget);
         assert_eq!(prepared.admission.skipped_graph_pressure, 1);
         assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(prepared.admission.skipped_hard_budget, 0);
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 0);
         assert_eq!(prepared.admission.skipped_size, 0);
         assert_eq!(prepared.admission.skipped_allocation, 0);
         assert_checkpoint_admission_partition(prepared.admission);
@@ -2238,7 +2792,7 @@ mod tests {
         };
         let mut cache = resource_cache_with_checkpoint(cache_key.clone(), Some(1));
         cache.checkpoint_compatibility = Some(compatibility);
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared =
             cache.prepare_checkpoint_captures(&gl, compatibility, None, &[(cache_key, plan)]);
@@ -2253,6 +2807,13 @@ mod tests {
         assert_eq!(prepared.admission.graph_peak_bytes, 0);
         assert_eq!(prepared.admission.base_checked_out_bytes, 0);
         assert!(!prepared.admission.additional_budget_needed_known);
+        assert!(prepared.admission.additional_checkpoint_budget_needed_known);
+        assert_eq!(
+            prepared
+                .admission
+                .additional_checkpoint_budget_needed_for_all_candidates_bytes,
+            0
+        );
         assert_checkpoint_admission_partition(prepared.admission);
     }
 
@@ -2268,7 +2829,7 @@ mod tests {
             framebuffer_origin_top_left: false,
             effect_registry_generation: 1,
         };
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared =
             cache.prepare_checkpoint_captures(&gl, compatibility, Some(0), &[(cache_key, plan)]);
@@ -2278,6 +2839,7 @@ mod tests {
         assert_eq!(prepared.admission.skipped_budget, 0);
         assert_eq!(prepared.admission.skipped_allocation, 0);
         assert!(!prepared.admission.additional_budget_needed_known);
+        assert!(!prepared.admission.additional_checkpoint_budget_needed_known);
         assert_checkpoint_admission_partition(prepared.admission);
     }
 
@@ -2301,7 +2863,7 @@ mod tests {
             framebuffer_origin_top_left: false,
             effect_registry_generation: 1,
         };
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared = cache.prepare_checkpoint_captures(&gl, compatibility, Some(0), &candidates);
 
@@ -2323,6 +2885,15 @@ mod tests {
             prepared.admission.skipped_budget_bytes,
             bytes.saturating_mul(MAX_CHECKPOINT_CACHE_ENTRIES as u64)
         );
+        assert_eq!(
+            prepared.admission.skipped_hard_budget,
+            MAX_CHECKPOINT_CACHE_ENTRIES
+        );
+        assert_eq!(
+            prepared.admission.skipped_hard_budget_bytes,
+            bytes.saturating_mul(MAX_CHECKPOINT_CACHE_ENTRIES as u64)
+        );
+        assert_eq!(prepared.admission.skipped_checkpoint_budget, 0);
         assert_checkpoint_admission_partition(prepared.admission);
     }
 
@@ -2349,7 +2920,7 @@ mod tests {
         );
         cache.checkpoint_compatibility = Some(compatibility);
         let allocations_before = cache.pool.metrics().allocation_count;
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared = cache.prepare_checkpoint_captures(
             &gl,
@@ -2361,6 +2932,10 @@ mod tests {
         assert_eq!(prepared.admission.resident_candidates, 1);
         assert_eq!(prepared.admission.newly_admitted_candidates, 0);
         assert_eq!(prepared.admission.skipped_budget, 0);
+        assert_eq!(
+            prepared.admission.checkpoint_cache_bytes_at_admission,
+            checkpoint_bytes
+        );
         assert_eq!(prepared.bindings[&plan.id].texture.id, lease_id);
         assert_eq!(cache.pool.metrics().allocation_count, allocations_before);
         assert_eq!(prepared.admission.base_checked_out_bytes, checkpoint_bytes);
@@ -2384,7 +2959,7 @@ mod tests {
             texture_id,
             glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
         );
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared = cache.prepare_checkpoint_captures(
             &gl,
@@ -2398,6 +2973,8 @@ mod tests {
         assert_eq!(prepared.admission.newly_admitted_candidates, 1);
         assert_eq!(prepared.admission.skipped_budget, 0);
         assert_eq!(prepared.admission.skipped_allocation, 0);
+        assert_eq!(prepared.admission.checkpoint_cache_bytes_at_admission, 0);
+        assert_eq!(cache.checkpoint_cache_stats().1, checkpoint_bytes);
         assert!(prepared.admission.additional_budget_needed_known);
         assert_eq!(
             prepared
@@ -2421,7 +2998,7 @@ mod tests {
             framebuffer_origin_top_left: false,
             effect_registry_generation: 1,
         };
-        let gl = unsafe { glow::Context::from_loader_function(|_| std::ptr::null()) };
+        let gl = test_gl_context();
 
         let prepared =
             cache.prepare_checkpoint_captures(&gl, compatibility, Some(0), &[(cache_key, plan)]);
@@ -2582,7 +3159,7 @@ mod tests {
         pool.return_texture(first.clone()).unwrap();
         let second = pool.checkout(full).unwrap();
         assert_eq!(first.id, second.id);
-        assert!(pool.peak_bytes() <= DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
+        assert!(pool.peak_bytes() <= DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES);
         pool.return_texture(second).unwrap();
     }
 
@@ -2718,10 +3295,11 @@ mod tests {
         assert_eq!(peak_1440p, peak_1080p * 16 / 9);
         assert_eq!(peak_4k, peak_1080p * 4);
         assert_eq!(
-            DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES - peak_1080p,
-            46_372_864
+            DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES - peak_1080p,
+            113_481_728
         );
-        assert!(peak_4k > DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
+        assert!(peak_4k < DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES);
+        assert!(peak_4k > DEFAULT_EFFECT_CHECKPOINT_CACHE_BUDGET_BYTES);
     }
 
     #[test]
@@ -2843,7 +3421,9 @@ mod tests {
             final_damage: EffectRegion::empty(),
             stats: Default::default(),
         };
-        assert!(estimate_graph_peak_bytes(&graph).unwrap() < DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
+        assert!(
+            estimate_graph_peak_bytes(&graph).unwrap() < DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES
+        );
     }
 
     #[test]
@@ -2857,7 +3437,7 @@ mod tests {
         assert_eq!(live_metrics.peak_bytes, live_metrics.current_bytes);
         assert_eq!(
             live_metrics.budget_bytes,
-            DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES
+            DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES
         );
         assert_eq!(live_metrics.cached_key_count, 1);
         assert_eq!(live_metrics.cached_texture_count, 1);

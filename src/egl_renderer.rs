@@ -54,9 +54,10 @@ use damage::{
 };
 use effects::{
     DamageTraceSnapshot, EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache,
-    EffectGpuProfiler, EffectGraphMetrics, EffectRepaintProvenanceSnapshot, FrameTraceSummary,
-    RepaintPlanTraceSnapshot, ReplayCaptureExecutionDetail, ShaderProgramCache,
-    builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
+    EffectGpuProfiler, EffectGraphMetrics, EffectRepaintProvenanceSnapshot,
+    EffectResourceBudgetConfig, FrameTraceSummary, RepaintPlanTraceSnapshot,
+    ReplayCaptureExecutionDetail, ShaderProgramCache, builtin_shader_program_count, graph_metrics,
+    shader_cache_capacity_for_custom_shaders,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
@@ -1467,6 +1468,8 @@ impl GlesSceneRenderer {
 
         let presentation_opacity_location =
             unsafe { gl.get_uniform_location(program, "u_opacity") };
+        let effect_resources =
+            EffectGlResourceCache::with_budget_config(EffectResourceBudgetConfig::from_env())?;
         Ok(Self {
             gl,
             program,
@@ -1532,7 +1535,7 @@ impl GlesSceneRenderer {
                 (width, height),
                 partial_repaint_capabilities,
             ),
-            effect_resources: EffectGlResourceCache::new(),
+            effect_resources,
             effect_registry: EffectRegistry::with_builtin_background_blur(),
             effect_registry_generation: 1,
             failed_effect_generation: None,

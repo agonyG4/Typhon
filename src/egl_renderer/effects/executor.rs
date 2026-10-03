@@ -8391,13 +8391,22 @@ mod tests {
             candidates_considered: 9,
             resident_candidates: 7,
             skipped_budget: 2,
+            skipped_hard_budget: 1,
+            skipped_checkpoint_budget: 1,
             skipped_budget_bytes: 6_291_456,
+            skipped_hard_budget_bytes: 3_145_728,
+            skipped_checkpoint_budget_bytes: 3_145_728,
             graph_peak_known: true,
             graph_peak_bytes: 12_000_000,
             base_checked_out_bytes: 31_285_016,
-            budget_bytes: 64 * 1024 * 1024,
+            hard_budget_bytes: 128 * 1024 * 1024,
+            checkpoint_cache_soft_budget_bytes: 64 * 1024 * 1024,
+            checkpoint_cache_bytes_at_admission: 60_000_000,
+            budget_bytes: 128 * 1024 * 1024,
             additional_budget_needed_for_all_candidates_bytes: 6_291_456,
             additional_budget_needed_known: true,
+            additional_checkpoint_budget_needed_for_all_candidates_bytes: 5_000_000,
+            additional_checkpoint_budget_needed_known: true,
             ..Default::default()
         };
         let stats = EffectExecutionStats {
