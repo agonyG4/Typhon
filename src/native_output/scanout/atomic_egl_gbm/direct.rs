@@ -22,6 +22,9 @@ struct DirectCandidatePresentationFlow {
 enum DirectPresentationQualification<F> {
     DeferUntilPageflip,
     PresentationRejected,
+    AlreadyRepresented {
+        state: OutputPresentationStateKey,
+    },
     TransactionRequired {
         framebuffer: F,
         state: OutputPresentationStateKey,
@@ -92,11 +95,17 @@ impl DirectCandidatePresentationFlow {
             return Ok(DirectPresentationQualification::PresentationRejected);
         };
 
-        Ok(DirectPresentationQualification::TransactionRequired {
-            framebuffer,
-            state,
-            state_disposition,
-        })
+        if self.same_visual_assignment
+            && state_disposition == DirectPresentationStateDisposition::AlreadyRepresented
+        {
+            Ok(DirectPresentationQualification::AlreadyRepresented { state })
+        } else {
+            Ok(DirectPresentationQualification::TransactionRequired {
+                framebuffer,
+                state,
+                state_disposition,
+            })
+        }
     }
 }
 
@@ -471,7 +480,6 @@ impl AtomicEglGbmScanout {
             pending_direct_state,
             has_submitted_direct_assignment,
         );
-        let same_visual_assignment = presentation_flow.same_visual_assignment();
         if presentation_flow.initial_state_disposition()
             == Some(DirectPresentationStateDisposition::DeferUntilPageflip)
         {
@@ -641,6 +649,39 @@ impl AtomicEglGbmScanout {
                     "presentation_test_only_rejected",
                 ));
             }
+            Ok(DirectPresentationQualification::AlreadyRepresented { state }) => {
+                presentation_mode = state.mode;
+                if presentation_mode != requested_presentation_mode {
+                    direct_scanout_debug(format_args!(
+                        "kept direct assignment with weaker presentation mode={}",
+                        presentation_mode.as_str()
+                    ));
+                }
+                self.direct.counters.same_buffer_suppressed = self
+                    .direct
+                    .counters
+                    .same_buffer_suppressed
+                    .saturating_add(1);
+                if !settle_no_visual_change_transaction(
+                    self,
+                    server,
+                    output_transactions,
+                    state.output_generation,
+                    target,
+                    pacing_mode,
+                    candidate_key,
+                    0,
+                    cursor,
+                    cursor_epoch,
+                    candidate.surface_id,
+                    release,
+                    state.mode,
+                    state.content_type,
+                )? {
+                    return Ok(DirectScanoutAttempt::TimingDeferred);
+                }
+                return Ok(DirectScanoutAttempt::Unchanged);
+            }
             Ok(DirectPresentationQualification::TransactionRequired {
                 framebuffer,
                 state,
@@ -659,35 +700,6 @@ impl AtomicEglGbmScanout {
                 "kept direct assignment with weaker presentation mode={}",
                 presentation_mode.as_str()
             ));
-        }
-        if same_visual_assignment {
-            if qualified_state_disposition == DirectPresentationStateDisposition::AlreadyRepresented
-            {
-                self.direct.counters.same_buffer_suppressed = self
-                    .direct
-                    .counters
-                    .same_buffer_suppressed
-                    .saturating_add(1);
-                if !settle_no_visual_change_transaction(
-                    self,
-                    server,
-                    output_transactions,
-                    self.direct.drm_generation,
-                    target,
-                    pacing_mode,
-                    candidate_key,
-                    0,
-                    cursor,
-                    cursor_epoch,
-                    candidate.surface_id,
-                    release,
-                    presentation_mode,
-                    content_type,
-                )? {
-                    return Ok(DirectScanoutAttempt::TimingDeferred);
-                }
-                return Ok(DirectScanoutAttempt::Unchanged);
-            }
         }
         // Every chosen exact direct state was either tested here or has a
         // matching successful mode-specific validation-cache entry.
@@ -1496,6 +1508,38 @@ mod tests {
                 key: transaction_key,
                 ..
             } if transaction_key == key
+        ));
+    }
+
+    #[test]
+    fn same_direct_state_is_no_visual_only_after_exact_qualification() {
+        let flow = same_candidate_flow(
+            candidate_key(),
+            OutputPresentationMode::AdaptiveSync,
+            OutputPresentationMode::AdaptiveSync,
+        );
+        assert_eq!(
+            flow.initial_state_disposition(),
+            Some(DirectPresentationStateDisposition::AlreadyRepresented)
+        );
+
+        let mut tested_modes = Vec::new();
+        let qualification = flow
+            .qualify(
+                || Ok::<_, ()>(73_u32),
+                |framebuffer_id, mode| {
+                    assert_eq!(*framebuffer_id, 73);
+                    tested_modes.push(mode);
+                    true
+                },
+            )
+            .expect("framebuffer cache reuse");
+
+        assert_eq!(tested_modes, [OutputPresentationMode::AdaptiveSync]);
+        assert!(matches!(
+            qualification,
+            DirectPresentationQualification::AlreadyRepresented { state }
+                if state.mode == OutputPresentationMode::AdaptiveSync
         ));
     }
 
