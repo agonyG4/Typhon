@@ -201,6 +201,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         width: u32,
         height: u32,
     },
+    SetTestEffectiveXdgWindowGeometry {
+        root_surface_id: u32,
+        geometry: XdgWindowGeometry,
+    },
     SetFocusedRootRenderableSize {
         width: u32,
         height: u32,
@@ -907,6 +911,36 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .state
                                 .update_toplevel_visual_render_assignment(surface_id);
                         }
+                    }
+                    ServerCommand::SetTestEffectiveXdgWindowGeometry {
+                        root_surface_id,
+                        geometry,
+                    } => {
+                        let placement = SurfacePlacement::absolute_root_at(0, 0);
+                        let width = u32::try_from(geometry.width)
+                            .expect("test XDG window width is positive");
+                        let height = u32::try_from(geometry.height)
+                            .expect("test XDG window height is positive");
+                        server
+                            .state
+                            .set_surface_placement(root_surface_id, placement);
+                        server
+                            .state
+                            .set_test_effective_xdg_window_geometry(root_surface_id, geometry);
+                        server.state.toplevel_visual_geometries.insert(
+                            root_surface_id,
+                            ToplevelVisualGeometry {
+                                placement,
+                                width,
+                                height,
+                                active_resize: None,
+                                mode_transition: false,
+                                xdg_mode_transition_fence: None,
+                            },
+                        );
+                        server
+                            .state
+                            .update_toplevel_visual_render_assignment(root_surface_id);
                     }
                     ServerCommand::SetFocusedRootRenderableSize { width, height } => {
                         if let Some(surface_id) = server.state.focused_root_surface_id()

@@ -665,7 +665,7 @@ fn fullscreen_origin_is_independent_of_raise_and_focus_order() {
 }
 
 #[test]
-fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
+fn special_workspace_visibility_controls_fullscreen_composition() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -695,13 +695,13 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
     wait_for_server_commands(&commands);
 
     let hidden_metrics = capture_fullscreen_render_plan_metrics(&commands);
+    let hidden_native_ids = capture_native_frame_surface_ids(&commands);
     assert_eq!(hidden_metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(hidden_metrics.fullscreen_composition_active);
-    assert!(hidden_metrics.solitary_tree_active);
-    assert_eq!(
-        capture_native_frame_surface_ids(&commands),
-        vec![surface_ids[2]]
-    );
+    assert!(!hidden_metrics.solitary_tree_active);
+    assert!(hidden_native_ids.contains(&surface_ids[0]));
+    assert!(hidden_native_ids.contains(&surface_ids[2]));
+    assert!(!hidden_native_ids.contains(&surface_ids[1]));
 
     commands
         .send(ServerCommand::SetPointerHitInstrumentationEnabled(true))
@@ -719,11 +719,11 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
     assert_eq!(opened_metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(opened_metrics.fullscreen_composition_active);
     assert!(!opened_metrics.solitary_tree_active);
+    assert!(opened_native_ids.contains(&surface_ids[0]));
     assert!(opened_native_ids.contains(&surface_ids[1]));
     assert!(opened_native_ids.contains(&surface_ids[2]));
-    assert!(!opened_native_ids.contains(&surface_ids[0]));
     assert_eq!(opened_metrics.fullscreen_allowed_application_roots, 1);
-    assert_eq!(opened_metrics.fullscreen_culled_application_roots, 1);
+    assert_eq!(opened_metrics.fullscreen_culled_application_roots, 0);
     assert_eq!(opened_metrics.fullscreen_culled_layer_roots, 1);
     assert_eq!(
         capture_configure_serial(&commands),
@@ -735,7 +735,7 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
     );
     assert_eq!(
         capture_direct_scanout_candidate(&commands),
-        Err(DirectScanoutSceneRejection::OverlayVisible)
+        Err(DirectScanoutSceneRejection::FullscreenUnderlayVisible)
     );
 
     let pointer_hits_before_close =
@@ -746,11 +746,10 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
     wait_for_server_commands(&commands);
     let closed_metrics = capture_fullscreen_render_plan_metrics(&commands);
     assert!(closed_metrics.fullscreen_composition_active);
-    assert!(closed_metrics.solitary_tree_active);
-    assert_eq!(
-        capture_native_frame_surface_ids(&commands),
-        vec![surface_ids[2]]
-    );
+    assert!(!closed_metrics.solitary_tree_active);
+    let closed_native_ids = capture_native_frame_surface_ids(&commands);
+    assert!(closed_native_ids.contains(&surface_ids[0]));
+    assert!(closed_native_ids.contains(&surface_ids[2]));
     assert_eq!(capture_focused_surface_id(&commands), Some(surface_ids[2]));
     assert_eq!(
         capture_pointer_input_metrics(&commands).pointer_scene_hit_calls,
@@ -801,9 +800,11 @@ fn fullscreen_presentation_ignores_restacked_application_and_top_shell() {
     );
     assert_eq!(metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(metrics.fullscreen_composition_active);
-    assert!(metrics.solitary_tree_active);
-    assert_eq!(presented, vec![surface_ids[2]]);
+    assert!(!metrics.solitary_tree_active);
+    assert!(presented.contains(&surface_ids[0]));
+    assert!(presented.contains(&surface_ids[2]));
     assert!(!presented.contains(&surface_ids[1]));
+    assert!(!presented.contains(&panel_surface_id));
     commands
         .send(ServerCommand::PointerMotion { x: 100.0, y: 16.0 })
         .unwrap();

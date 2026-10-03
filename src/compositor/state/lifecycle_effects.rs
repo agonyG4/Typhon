@@ -46,7 +46,7 @@ impl CompositorState {
         };
         root_surface_id.is_none_or(|root| {
             !lifecycle.restore_suppresses_root(root)
-                && fullscreen_plan.allows_presentation_root(root)
+                && fullscreen_plan.allows_composition_root(root)
         })
     }
 

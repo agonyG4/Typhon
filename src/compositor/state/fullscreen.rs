@@ -365,9 +365,12 @@ impl CompositorState {
         } else {
             FullscreenCompositionMode::Transitioning
         };
+        let owner_occludes_underlays = mode.is_dominant()
+            && self.fullscreen_owner_proves_full_occlusion(owner_root_surface_id, eligibility);
         let mut plan = FullscreenCompositionPlan {
             owner_root_surface_id: Some(owner_root_surface_id),
             mode,
+            owner_occludes_underlays,
             ..FullscreenCompositionPlan::default()
         };
         if !mode.is_dominant() {
@@ -393,13 +396,49 @@ impl CompositorState {
                     plan.above_fullscreen_reason.get_or_insert(reason);
                 }
                 FullscreenRootClassification::CulledByFullscreen(_) => {
-                    if self.layer_surfaces.contains_key(&root_surface_id) {
-                        plan.culled_layer_roots = plan.culled_layer_roots.saturating_add(1);
-                    } else if self.window_id_for_surface(root_surface_id).is_some() {
-                        plan.culled_application_roots =
-                            plan.culled_application_roots.saturating_add(1);
-                    }
+                    // Root counts are filled after composition underlays have
+                    // been derived, so they report actual scene culling.
                 }
+            }
+        }
+
+        if !plan.owner_occludes_underlays {
+            let owner_surface_index = self
+                .active_scene_surfaces()
+                .iter()
+                .position(|surface| surface.surface_id == owner_root_surface_id)
+                .expect("dominant fullscreen owner is present in the active scene");
+            let mut seen_underlay_roots = HashSet::new();
+            for surface in self
+                .active_scene_surfaces()
+                .iter()
+                .take(owner_surface_index)
+            {
+                let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
+                if !seen_underlay_roots.insert(root_surface_id) {
+                    continue;
+                }
+                if matches!(
+                    self.fullscreen_root_classification(owner_root_surface_id, root_surface_id),
+                    FullscreenRootClassification::CulledByFullscreen(_)
+                ) {
+                    plan.composition_underlay_roots.push(root_surface_id);
+                }
+            }
+        }
+
+        let mut counted_roots = HashSet::new();
+        for surface in self.active_scene_surfaces() {
+            let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
+            if !counted_roots.insert(root_surface_id)
+                || plan.allows_composition_root(root_surface_id)
+            {
+                continue;
+            }
+            if self.layer_surfaces.contains_key(&root_surface_id) {
+                plan.culled_layer_roots = plan.culled_layer_roots.saturating_add(1);
+            } else if self.window_id_for_surface(root_surface_id).is_some() {
+                plan.culled_application_roots = plan.culled_application_roots.saturating_add(1);
             }
         }
 
@@ -407,7 +446,7 @@ impl CompositorState {
             .active_scene_surfaces()
             .iter()
             .filter(|surface| {
-                !plan.allows_presentation_root(
+                !plan.allows_composition_root(
                     self.presentation_owner_root_for_surface(surface.surface_id),
                 )
             })
@@ -421,8 +460,91 @@ impl CompositorState {
         plan.solitary_owner_only = !has_additional_owner_family
             && !popup_visible
             && plan.allowed_application_roots.is_empty()
-            && plan.allowed_layer_roots.is_empty();
+            && plan.allowed_layer_roots.is_empty()
+            && plan.composition_underlay_roots.is_empty();
         plan
+    }
+
+    fn fullscreen_owner_proves_full_occlusion(
+        &self,
+        owner_root_surface_id: u32,
+        eligibility: FullscreenPresentationEligibility,
+    ) -> bool {
+        if !eligibility.fully_opaque
+            || !eligibility.exactly_covers_output
+            || self.presentation_animation_pending_for_root(owner_root_surface_id)
+        {
+            return false;
+        }
+
+        let Some(geometry) = self.current_visual_root_window_geometry(owner_root_surface_id) else {
+            return false;
+        };
+        if geometry.width != self.output_size.width
+            || geometry.height != self.output_size.height
+            || geometry.placement.root_mode != RootPlacementMode::Absolute
+            || geometry.placement.local_x != 0
+            || geometry.placement.local_y != 0
+        {
+            return false;
+        }
+        let Some(presented_geometry) =
+            self.presented_visual_root_window_geometry(owner_root_surface_id)
+        else {
+            return false;
+        };
+        if presented_geometry.width != geometry.width
+            || presented_geometry.height != geometry.height
+            || presented_geometry.placement != geometry.placement
+        {
+            return false;
+        }
+
+        let Some(owner_surface) = self
+            .active_scene_surfaces()
+            .iter()
+            .find(|surface| surface.surface_id == owner_root_surface_id)
+        else {
+            return false;
+        };
+        if owner_surface.visual_clip.is_some()
+            || owner_surface.width != self.output_size.width
+            || owner_surface.height != self.output_size.height
+            || owner_surface
+                .render_placement
+                .is_some_and(|placement| placement != owner_surface.placement)
+            || owner_surface.placement != SurfacePlacement::absolute_root_at(0, 0)
+        {
+            return false;
+        }
+
+        let Some(window_id) = self.window_id_for_surface(owner_root_surface_id) else {
+            return false;
+        };
+        let Some(window) = self.window(window_id) else {
+            return false;
+        };
+        if !window.canonical_opacity().is_opaque() || !window.canonical_clip().is_unbounded() {
+            return false;
+        }
+
+        let Some(scene_node_id) = self.presentation_scene_node_id_for_root(owner_root_surface_id)
+        else {
+            return false;
+        };
+        // Sparse presentation properties in a published snapshot mean identity;
+        // no snapshot means the currently presented state is unknown.
+        if self.presented_presentation.is_none() {
+            return false;
+        }
+        let geometry_identity =
+            !self.presented_presentation_geometry_is_non_identity_for_scene_node(scene_node_id);
+        let opacity_identity =
+            !self.presented_presentation_opacity_is_non_identity_for_scene_node(scene_node_id);
+        let clip_unbounded = self
+            .presented_presentation_clip_for_scene_node(scene_node_id)
+            .is_unbounded();
+        geometry_identity && opacity_identity && clip_unbounded
     }
 
     fn fullscreen_root_classification(
@@ -520,6 +642,16 @@ impl CompositorState {
         plan: &FullscreenCompositionPlan,
         eligibility: FullscreenPresentationEligibility,
     ) -> FullscreenRenderPlanMetrics {
+        let wallpaper_culled = plan.mode.is_dominant()
+            && self
+                .active_scene_presentation_owner_roots_in_order()
+                .iter()
+                .any(|root_surface_id| {
+                    self.layer_surfaces
+                        .get(root_surface_id)
+                        .is_some_and(|role| role.committed.layer == Layer::Background)
+                        && !plan.allows_composition_root(*root_surface_id)
+                });
         FullscreenRenderPlanMetrics {
             fullscreen_active: plan.owner_root_surface_id.is_some(),
             owner_root_surface_id: plan.owner_root_surface_id,
@@ -529,7 +661,7 @@ impl CompositorState {
                 .is_some_and(|owner| self.presentation_animation_pending_for_root(owner)),
             solitary_tree_active: plan.solitary_owner_only,
             culled_surface_count: plan.culled_surface_count,
-            wallpaper_culled: plan.mode.is_dominant(),
+            wallpaper_culled,
             visible_overlay_count: self.visible_fullscreen_overlay_count(),
             fullscreen_allowed_application_roots: plan.allowed_application_roots.len(),
             fullscreen_allowed_layer_roots: plan.allowed_layer_roots.len(),
@@ -611,7 +743,7 @@ impl CompositorState {
 
         let has_culled_surfaces = owner_roots
             .iter()
-            .any(|owner_root| !plan.allows_presentation_root(*owner_root));
+            .any(|owner_root| !plan.allows_composition_root(*owner_root));
         if !has_culled_surfaces {
             return CanonicalPresentationScene {
                 surfaces,
@@ -628,7 +760,7 @@ impl CompositorState {
         let mut filtered_scene_nodes = Vec::with_capacity(scene_nodes.len());
         let mut filtered_owner_roots = Vec::with_capacity(owner_roots.len());
         for index in 0..surfaces.len() {
-            if plan.allows_presentation_root(owner_roots[index]) {
+            if plan.allows_composition_root(owner_roots[index]) {
                 filtered_surfaces.push(surfaces[index].clone());
                 filtered_scene_nodes.push(scene_nodes[index]);
                 filtered_owner_roots.push(owner_roots[index]);

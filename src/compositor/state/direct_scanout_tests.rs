@@ -104,6 +104,17 @@ fn fullscreen_canonical_scene_keeps_subsurface_scanout_identity_aligned_after_fi
     for surface_id in [360, 361, 362] {
         state.surface_presentation_generations.insert(surface_id, 1);
     }
+    let presentation_targets =
+        state.native_frame_presentation_targets(state.active_scene_surfaces());
+    let presentation_sample = state.presentation_scene_sample_for_targets_at(
+        AnimationTime::from_nanos(0),
+        &presentation_targets,
+    );
+    let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+        &presentation_sample,
+        state.presented_window_geometries_for_targets(&presentation_sample, &presentation_targets),
+    );
+    state.publish_presented_presentation(1, &presentation_snapshot);
     let blur_program = crate::effects::builtin_background_blur_program_id();
     let blur_region = EffectRegion::from_rect(EffectRect::new(0, 0, 32, 32).unwrap());
     assert!(state.set_internal_surface_effect(

@@ -584,7 +584,16 @@ impl CompositorState {
             .and_then(|window_id| self.scene_node_id_for_window_group(window_id));
         #[cfg(test)]
         {
-            group.or_else(|| SceneNodeId::from_raw(u64::from(root_surface_id)))
+            group.or_else(|| {
+                // Layer roots have no window group in tests. Keep their
+                // synthetic scene nodes separate from window-group IDs.
+                let id = if self.layer_surfaces.contains_key(&root_surface_id) {
+                    (1_u64 << 63) | u64::from(root_surface_id)
+                } else {
+                    u64::from(root_surface_id)
+                };
+                SceneNodeId::from_raw(id)
+            })
         }
         #[cfg(not(test))]
         {

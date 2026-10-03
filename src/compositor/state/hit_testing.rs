@@ -92,7 +92,7 @@ impl CompositorState {
                 continue;
             };
             let root_surface_id = self.visual_stack_root_for_surface(renderable.surface_id);
-            if !self.fullscreen_plan_allows_root(&fullscreen_plan, root_surface_id) {
+            if !self.fullscreen_plan_allows_interaction_root(&fullscreen_plan, root_surface_id) {
                 continue;
             }
             if self.window_id_for_surface(root_surface_id).is_none() {
@@ -289,13 +289,15 @@ impl CompositorState {
             && cache.x == x
             && cache.y == y
             && match &cache.hit {
-                PointerSceneHit::Client { target } => self.fullscreen_plan_allows_root(
+                PointerSceneHit::Client { target } => self.fullscreen_plan_allows_interaction_root(
                     &fullscreen_plan,
                     compositor_surface_id(&target.surface),
                 ),
                 PointerSceneHit::Decoration {
                     root_surface_id, ..
-                } => self.fullscreen_plan_allows_root(&fullscreen_plan, *root_surface_id),
+                } => {
+                    self.fullscreen_plan_allows_interaction_root(&fullscreen_plan, *root_surface_id)
+                }
                 PointerSceneHit::None => true,
             }
         {
@@ -437,7 +439,9 @@ impl CompositorState {
             if root_surface.surface_id != group.root_surface_id() {
                 continue;
             }
-            if !self.fullscreen_plan_allows_root(fullscreen_plan, group.root_surface_id()) {
+            let interaction_allowed = self
+                .fullscreen_plan_allows_interaction_root(fullscreen_plan, group.root_surface_id());
+            if !interaction_allowed {
                 continue;
             }
             if self.lifecycle_root_restore_suppressed(group.root_surface_id()) {
@@ -498,7 +502,8 @@ impl CompositorState {
                 else {
                     continue;
                 };
-                if !self.surface_accepts_input_at(renderable, surface_x, surface_y) {
+                let accepts_input = self.surface_accepts_input_at(renderable, surface_x, surface_y);
+                if !accepts_input {
                     continue;
                 }
                 let Some(surface) = self.surface_resource_by_id(renderable.surface_id) else {
@@ -535,7 +540,7 @@ impl CompositorState {
             PointerSceneHit::Client { target } => {
                 let surface_id = compositor_surface_id(&target.surface);
                 let root_surface_id = self.visual_stack_root_for_surface(surface_id);
-                if !self.fullscreen_plan_allows_root(fullscreen_plan, root_surface_id) {
+                if !self.fullscreen_plan_allows_interaction_root(fullscreen_plan, root_surface_id) {
                     return None;
                 }
                 if self.lifecycle_root_restore_suppressed(root_surface_id) {
@@ -579,7 +584,8 @@ impl CompositorState {
                 root_surface_id,
                 hit,
             } => {
-                if !self.fullscreen_plan_allows_root(fullscreen_plan, *root_surface_id) {
+                if !self.fullscreen_plan_allows_interaction_root(fullscreen_plan, *root_surface_id)
+                {
                     return None;
                 }
                 if self.lifecycle_root_restore_suppressed(*root_surface_id) {
@@ -625,7 +631,9 @@ impl CompositorState {
         fullscreen_plan: &FullscreenCompositionPlan,
     ) -> bool {
         for group in self.visual_stack_groups_cache.iter().rev() {
-            if !self.fullscreen_plan_allows_root(fullscreen_plan, group.root_surface_id()) {
+            if !self
+                .fullscreen_plan_allows_interaction_root(fullscreen_plan, group.root_surface_id())
+            {
                 continue;
             }
             let Some(root_index) = self.active_scene_surface_index(group.root_surface_id()) else {
@@ -735,7 +743,7 @@ impl CompositorState {
         y: f64,
     ) -> Option<PointerTarget> {
         let fullscreen_plan = self.fullscreen_composition_plan();
-        if !self.fullscreen_plan_allows_root(&fullscreen_plan, root_surface_id) {
+        if !self.fullscreen_plan_allows_interaction_root(&fullscreen_plan, root_surface_id) {
             return None;
         }
         self.refresh_surface_origin_cache();
@@ -765,13 +773,13 @@ impl CompositorState {
         })
     }
 
-    fn fullscreen_plan_allows_root(
+    fn fullscreen_plan_allows_interaction_root(
         &self,
         fullscreen_plan: &FullscreenCompositionPlan,
         root_surface_id: u32,
     ) -> bool {
         fullscreen_plan
-            .allows_presentation_root(self.presentation_owner_root_for_surface(root_surface_id))
+            .allows_interaction_root(self.presentation_owner_root_for_surface(root_surface_id))
     }
 
     pub(in crate::compositor) fn pointer_target_for_surface_at_output(

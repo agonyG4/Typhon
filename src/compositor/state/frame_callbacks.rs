@@ -365,7 +365,7 @@ impl CompositorState {
         }
         let visible = self.surface_is_visible_in_active_scene(feedback.surface_id);
         let root = self.presentation_owner_root_for_surface(feedback.surface_id);
-        let allowed = fullscreen_plan.allows_presentation_root(root);
+        let allowed = fullscreen_plan.allows_composition_root(root);
         visible && allowed
     }
 

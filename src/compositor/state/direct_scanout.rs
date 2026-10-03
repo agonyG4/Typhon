@@ -252,6 +252,9 @@ impl CompositorState {
         );
 
         let mut blockers = DirectScanoutSceneBlockers::default();
+        if !fullscreen_plan.composition_underlay_roots.is_empty() {
+            blockers.push(DirectScanoutSceneRejection::FullscreenUnderlayVisible);
+        }
         let output_rect = SurfaceTargetRect::new(0, 0, output_size.width, output_size.height);
         let render_targets = crate::compositor::render::surface_render_space_targets(
             scene.surfaces.as_ref(),

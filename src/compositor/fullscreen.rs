@@ -56,6 +56,8 @@ pub enum FullscreenRootClassification {
 pub struct FullscreenCompositionPlan {
     pub owner_root_surface_id: Option<u32>,
     pub mode: FullscreenCompositionMode,
+    pub owner_occludes_underlays: bool,
+    pub composition_underlay_roots: Vec<u32>,
     pub owner_family_roots: Vec<u32>,
     pub allowed_application_roots: Vec<u32>,
     pub allowed_layer_roots: Vec<u32>,
@@ -67,11 +69,20 @@ pub struct FullscreenCompositionPlan {
 }
 
 impl FullscreenCompositionPlan {
-    pub fn allows_presentation_root(&self, root_surface_id: u32) -> bool {
+    pub fn allows_semantic_fullscreen_root(&self, root_surface_id: u32) -> bool {
         !self.mode.is_dominant()
             || self.owner_family_roots.contains(&root_surface_id)
             || self.allowed_application_roots.contains(&root_surface_id)
             || self.allowed_layer_roots.contains(&root_surface_id)
+    }
+
+    pub fn allows_composition_root(&self, root_surface_id: u32) -> bool {
+        self.allows_semantic_fullscreen_root(root_surface_id)
+            || self.composition_underlay_roots.contains(&root_surface_id)
+    }
+
+    pub fn allows_interaction_root(&self, root_surface_id: u32) -> bool {
+        self.allows_semantic_fullscreen_root(root_surface_id)
     }
 }
 
