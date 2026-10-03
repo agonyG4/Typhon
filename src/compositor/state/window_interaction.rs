@@ -876,10 +876,6 @@ impl CompositorState {
             log_begin_rejection(self, begin, "interaction_already_active");
             return false;
         }
-        if self.window_interaction_blocked_by_pointer_lock() {
-            log_begin_rejection(self, begin, "pointer_lock_active_or_pending");
-            return false;
-        }
         let BeginWindowInteraction {
             window_id: begin_window_id,
             root_surface_id,
@@ -1193,6 +1189,7 @@ impl CompositorState {
             self.tiled_resize_cursor_kind(preparation.handle, kind)
         });
         self.set_interaction_cursor_override(cursor_kind);
+        self.suspend_pointer_constraints_for_window_interaction(root_surface_id);
         let snapshot = self
             .window_interaction
             .expect("window interaction was just installed")
@@ -1417,8 +1414,8 @@ impl CompositorState {
                 self.advance_render_generation(RenderGenerationCause::CursorState);
             }
             self.sync_cursor_visibility_request();
-            self.resume_pending_pointer_constraint_activation();
         }
+        self.resume_pending_pointer_constraint_activation();
         had_interaction || had_cursor_override
     }
 

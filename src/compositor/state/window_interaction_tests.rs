@@ -3111,24 +3111,6 @@ fn failed_interaction_begin_does_not_activate_cursor_override() {
 }
 
 #[test]
-fn locked_client_rejects_window_interaction_begin_without_cursor_override() {
-    let mut state = CompositorState::default();
-    state
-        .pointer_constraint
-        .activate(PointerConstraintMode::Locked, 42);
-
-    assert!(!state.begin_window_interaction_at(
-        100.0,
-        100.0,
-        WindowInteractionKind::Move,
-        WindowInteractionSource::NativeBinding,
-        Some(0x110),
-        None,
-    ));
-    assert!(state.interaction_cursor_override.is_none());
-}
-
-#[test]
 fn ending_window_interaction_clears_cursor_override_and_only_advances_cursor_generation() {
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction_with_target(

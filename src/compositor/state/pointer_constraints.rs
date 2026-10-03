@@ -8,6 +8,12 @@ use crate::compositor::subsurface::{
 
 const WL_POINTER_WARP_SINCE: u32 = 11;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerConstraintRestorePolicy {
+    HonorCursorPositionHint,
+    PreserveCurrentPosition,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) enum PointerConstraintDeactivationReason {
     WorkspaceDeparture,
@@ -65,17 +71,6 @@ impl CompositorState {
         );
     }
 
-    pub(in crate::compositor) fn window_interaction_blocked_by_pointer_lock(&self) -> bool {
-        if self.pointer_constraint.mode() == PointerConstraintMode::Locked
-            || self.active_locked_pointer_binding().is_some()
-        {
-            return true;
-        }
-        self.pending_backend_constraint
-            .and_then(|id| self.pointer_constraints.get(&id.constraint_id))
-            .is_some_and(|constraint| constraint.mode == PointerConstraintMode::Locked)
-    }
-
     pub(in crate::compositor) fn resume_pending_pointer_constraint_activation(&mut self) {
         if self.window_interaction.is_some() {
             return;
@@ -94,6 +89,33 @@ impl CompositorState {
             .collect::<Vec<_>>();
         for id in ids {
             self.maybe_request_pointer_constraint_activation(id);
+        }
+    }
+
+    pub(in crate::compositor) fn suspend_pointer_constraints_for_window_interaction(
+        &mut self,
+        root_surface_id: u32,
+    ) {
+        let constraint_ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| {
+                (constraint.active || constraint.backend_pending)
+                    && self.presentation_owner_root_for_surface(compositor_surface_id(
+                        &constraint.surface,
+                    )) == root_surface_id
+            })
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+
+        for constraint_id in constraint_ids {
+            self.deactivate_pointer_constraint_by_id_with_restore_policy(
+                constraint_id,
+                true,
+                true,
+                true,
+                PointerConstraintRestorePolicy::PreserveCurrentPosition,
+            );
         }
     }
 
@@ -701,11 +723,7 @@ impl CompositorState {
         &mut self,
         constraint_id: u64,
     ) {
-        let locked = self
-            .pointer_constraints
-            .get(&constraint_id)
-            .is_some_and(|constraint| constraint.mode == PointerConstraintMode::Locked);
-        if self.window_interaction.is_some() && locked {
+        if self.window_interaction.is_some() {
             pointer_debug_log(format!(
                 "constraint activation deferred id={} reason=window_interaction",
                 constraint_id
@@ -1339,6 +1357,23 @@ impl CompositorState {
         emit_event: bool,
         queue_backend_deactivate: bool,
     ) {
+        self.deactivate_pointer_constraint_by_id_with_restore_policy(
+            constraint_id,
+            compositor_driven,
+            emit_event,
+            queue_backend_deactivate,
+            PointerConstraintRestorePolicy::HonorCursorPositionHint,
+        );
+    }
+
+    fn deactivate_pointer_constraint_by_id_with_restore_policy(
+        &mut self,
+        constraint_id: u64,
+        compositor_driven: bool,
+        emit_event: bool,
+        queue_backend_deactivate: bool,
+        restore_policy: PointerConstraintRestorePolicy,
+    ) {
         self.invalidate_locked_relative_recipient_cache();
         let Some((
             was_active,
@@ -1403,7 +1438,9 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|active| active.constraint_id == constraint_id)
         {
-            let restore_position = if mode == PointerConstraintMode::Locked {
+            let restore_position = if mode == PointerConstraintMode::Locked
+                && restore_policy == PointerConstraintRestorePolicy::HonorCursorPositionHint
+            {
                 self.locked_pointer_release_restore_decision(
                     backend_id,
                     &surface,
@@ -1485,7 +1522,8 @@ impl CompositorState {
                 "constraint pending activation canceled id={} generation={}",
                 backend_id.constraint_id, backend_id.generation
             ));
-            if mode == PointerConstraintMode::Locked
+            if restore_policy == PointerConstraintRestorePolicy::HonorCursorPositionHint
+                && mode == PointerConstraintMode::Locked
                 && lifetime == PointerConstraintLifetime::Oneshot
                 && let Some(position) =
                     self.valid_cursor_hint_output_position(&surface, cursor_position_hint)

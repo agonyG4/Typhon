@@ -44,10 +44,30 @@ fn activate_confined_backend(
     id
 }
 
+fn start_workspace_pointer_constraint_test() -> (
+    Sender<ServerCommand>,
+    JoinHandle<OwnCompositorServer>,
+    WorkspacePointerConstraintFixture,
+) {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let fixture = workspace_pointer_constraint_fixture(&socket_path, &commands);
+    (commands, server_thread, fixture)
+}
+
 struct WorkspacePointerConstraintFixture {
     connection: Connection,
     queue: EventQueue<RegistryTestState>,
     state: RegistryTestState,
+    compositor: client_wl_compositor::WlCompositor,
+    subcompositor: client_wl_subcompositor::WlSubcompositor,
     constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
     pointer: client_wl_pointer::WlPointer,
     surface: client_wl_surface::WlSurface,
@@ -63,6 +83,8 @@ fn workspace_pointer_constraint_fixture(
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
@@ -109,11 +131,699 @@ fn workspace_pointer_constraint_fixture(
         connection,
         queue,
         state,
+        compositor,
+        subcompositor,
         constraints,
         pointer,
         surface,
         _other_surface: other_surface,
     }
+}
+
+#[test]
+fn compositor_move_suspends_active_persistent_locked_pointer_without_hint_warp() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    lock.set_cursor_position_hint(70.0, 50.0);
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("persistent lock should be registered");
+    let backend_id = activate_locked_backend(&commands, &mut fixture.state, &mut fixture.queue);
+    assert_eq!(fixture.state.locked_count, 1);
+
+    let ids_before_unrelated = capture_pointer_constraint_ids(&commands);
+    let unrelated = fixture.constraints.lock_pointer(
+        &fixture._other_surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Oneshot,
+        &qh,
+        (),
+    );
+    fixture._other_surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let unrelated_constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .find(|id| !ids_before_unrelated.contains(id))
+        .expect("other root's one-shot constraint should be registered");
+    let unrelated_before = capture_pointer_constraint_snapshot(&commands, unrelated_constraint_id)
+        .expect("other root's constraint should remain registered");
+    assert!(unrelated_before.committed);
+    assert!(!unrelated_before.defunct);
+
+    let root_surface_id =
+        capture_xdg_role_snapshot(&commands, fixture.surface.id().protocol_id()).surface_id;
+    let (start_x, start_y) = capture_last_pointer_position(&commands);
+    let pointer_before = (start_x, start_y);
+    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
+    assert!(
+        !capture_interaction_cursor_state(&commands).visible,
+        "the active lock should hide the client cursor before takeover"
+    );
+    let root_x_before = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("root should be renderable")
+        .origin_x;
+
+    commands
+        .send(ServerCommand::BeginMove {
+            x: start_x,
+            y: start_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let interaction = capture_window_interaction_debug_snapshot(&commands)
+        .expect("interaction should begin while the persistent lock is active");
+    assert_eq!(interaction.root_surface_id, root_surface_id);
+    assert_eq!(interaction.kind, WindowInteractionKind::Move);
+
+    let cursor = capture_interaction_cursor_state(&commands);
+    assert!(cursor.override_active);
+    assert!(
+        cursor.visible,
+        "interaction cursor must override the lock-hidden cursor"
+    );
+    assert_eq!(
+        (cursor.pointer_x, cursor.pointer_y),
+        pointer_before,
+        "takeover must preserve the current logical position instead of applying the hint"
+    );
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate {
+            id,
+            restore_position: None,
+            restore_origin: None,
+        } if *id == backend_id
+    )));
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+    )));
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    assert_eq!(fixture.state.unlocked_count, 1);
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let during_interaction_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(during_interaction_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ActivateLocked { .. }
+    )));
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: start_x + 35.0,
+            y: start_y + 25.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let root_x_after = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("moved root should remain renderable")
+        .origin_x;
+    assert_ne!(
+        root_x_after, root_x_before,
+        "physical pointer motion must move the window"
+    );
+
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    let resumed_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(resumed_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ActivateLocked { id } if *id == backend_id
+    )));
+    let unrelated_after = capture_pointer_constraint_snapshot(&commands, unrelated_constraint_id)
+        .expect("other root's constraint should remain registered");
+    assert!(unrelated_after.committed);
+    assert!(
+        !unrelated_after.defunct,
+        "interaction suspension must be root-scoped"
+    );
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    assert_eq!(fixture.state.locked_count, 2);
+    assert!(
+        capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("persistent lock remains registered")
+            .active
+    );
+    let cursor_after_reactivation = capture_interaction_cursor_state(&commands);
+    assert!(!cursor_after_reactivation.override_active);
+    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
+    assert!(
+        !cursor_after_reactivation.visible,
+        "the reactivated client lock should restore its normal hidden-cursor policy"
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+    let _ = unrelated;
+}
+
+#[test]
+fn compositor_move_defers_persistent_confined_pointer_reactivation_until_interaction_ends() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+    let confine = fixture.constraints.confine_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("persistent confinement should be registered");
+    let backend_id = activate_confined_backend(&commands, &mut fixture.state, &mut fixture.queue);
+    assert_eq!(fixture.state.confined_count, 1);
+
+    let root_surface_id =
+        capture_xdg_role_snapshot(&commands, fixture.surface.id().protocol_id()).surface_id;
+    let (start_x, start_y) = capture_last_pointer_position(&commands);
+    let root_x_before = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("root should be renderable")
+        .origin_x;
+    commands
+        .send(ServerCommand::BeginMove {
+            x: start_x,
+            y: start_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_window_interaction_debug_snapshot(&commands).is_some());
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate { id, .. } if *id == backend_id
+    )));
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    assert_eq!(fixture.state.unconfined_count, 1);
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let updated_region = fixture.compositor.create_region(&qh, ());
+    updated_region.add(0, 0, 160, 120);
+    confine.set_region(Some(&updated_region));
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let during_interaction_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(
+        during_interaction_requests.iter().all(|request| !matches!(
+            request,
+            PointerConstraintBackendRequest::ActivateConfined { .. }
+        )),
+        "confinement must not reacquire pointer authority during interaction"
+    );
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)
+        .expect("persistent confinement remains registered");
+    assert!(!snapshot.active);
+    assert!(!snapshot.backend_pending);
+    assert!(!snapshot.defunct);
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: start_x + 35.0,
+            y: start_y + 25.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let root_x_after = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .expect("moved root should remain renderable")
+        .origin_x;
+    assert_ne!(
+        root_x_after, root_x_before,
+        "pointer motion must move the window"
+    );
+
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    let resumed_requests = capture_pointer_constraint_backend_requests(&commands);
+    let resumed_id = resumed_requests.iter().find_map(|request| match request {
+        PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+        _ => None,
+    });
+    assert_eq!(resumed_id, Some(backend_id));
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    assert_eq!(fixture.state.confined_count, 2);
+    assert!(
+        capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("persistent confinement remains registered")
+            .active
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn compositor_move_terminates_active_oneshot_pointer_constraint() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Oneshot,
+        &qh,
+        (),
+    );
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("one-shot lock should be registered");
+    let backend_id = activate_locked_backend(&commands, &mut fixture.state, &mut fixture.queue);
+
+    let (x, y) = capture_last_pointer_position(&commands);
+    commands.send(ServerCommand::BeginMove { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_window_interaction_debug_snapshot(&commands).is_some());
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)
+        .expect("one-shot constraint should remain until backend settlement");
+    assert!(!snapshot.active);
+    assert!(snapshot.defunct);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .any(|request| matches!(
+                request,
+                PointerConstraintBackendRequest::Deactivate { id, .. } if *id == backend_id
+            ))
+    );
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    assert_eq!(fixture.state.unlocked_count, 1);
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .all(|request| !matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateLocked { .. }
+            ))
+    );
+    assert!(
+        capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("one-shot constraint should remain terminal")
+            .defunct
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+    let _ = lock;
+}
+
+#[test]
+fn compositor_move_cancels_pending_persistent_lock_activation_and_allows_later_resume() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    lock.set_cursor_position_hint(70.0, 50.0);
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("persistent lock should be registered");
+    let activation_id = capture_pointer_constraint_backend_requests(&commands)
+        .into_iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked { id } => Some(id),
+            _ => None,
+        })
+        .expect("locked activation should be pending");
+    assert!(
+        capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("pending lock remains registered")
+            .backend_pending
+    );
+
+    let pointer_before = capture_last_pointer_position(&commands);
+    commands
+        .send(ServerCommand::BeginMove {
+            x: pointer_before.0,
+            y: pointer_before.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_window_interaction_debug_snapshot(&commands).is_some());
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)
+        .expect("persistent constraint remains registered after takeover");
+    assert!(snapshot.committed);
+    assert!(!snapshot.active);
+    assert!(!snapshot.backend_pending);
+    assert!(!snapshot.defunct);
+    assert_eq!(capture_last_pointer_position(&commands), pointer_before);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .all(|request| !matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateLocked { .. }
+            ))
+    );
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(
+            activation_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let stale_snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)
+        .expect("persistent constraint remains eligible");
+    assert!(!stale_snapshot.active);
+    assert!(!stale_snapshot.backend_pending);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .all(|request| !matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateLocked { .. }
+            ))
+    );
+
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .any(|request| matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateLocked { id } if *id == activation_id
+            ))
+    );
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(
+            activation_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("persistent lock remains registered")
+            .active
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn compositor_move_terminates_active_oneshot_confined_pointer() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+    let confine = fixture.constraints.confine_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Oneshot,
+        &qh,
+        (),
+    );
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("one-shot confinement should be registered");
+    let backend_id = activate_confined_backend(&commands, &mut fixture.state, &mut fixture.queue);
+
+    let (x, y) = capture_last_pointer_position(&commands);
+    commands.send(ServerCommand::BeginMove { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_window_interaction_debug_snapshot(&commands).is_some());
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)
+        .expect("one-shot confinement should remain until backend settlement");
+    assert!(!snapshot.active);
+    assert!(snapshot.defunct);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .any(|request| matches!(
+                request,
+                PointerConstraintBackendRequest::Deactivate { id, .. } if *id == backend_id
+            ))
+    );
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    assert_eq!(fixture.state.unconfined_count, 1);
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .all(|request| !matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateConfined { .. }
+            ))
+    );
+    assert!(
+        capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("one-shot confinement should remain terminal")
+            .defunct
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+    let _ = confine;
+}
+
+#[test]
+fn compositor_move_cancels_pending_oneshot_lock_without_hint_warp() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Oneshot,
+        &qh,
+        (),
+    );
+    lock.set_cursor_position_hint(70.0, 50.0);
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("one-shot lock should be registered");
+    let activation_id = capture_pointer_constraint_backend_requests(&commands)
+        .into_iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked { id } => Some(id),
+            _ => None,
+        })
+        .expect("one-shot activation should be pending");
+    let pointer_before = capture_last_pointer_position(&commands);
+
+    commands
+        .send(ServerCommand::BeginMove {
+            x: pointer_before.0,
+            y: pointer_before.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_window_interaction_debug_snapshot(&commands).is_some());
+    assert_eq!(
+        capture_last_pointer_position(&commands),
+        pointer_before,
+        "canceling a pending one-shot lock must not apply its compatibility hint"
+    );
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)
+        .expect("one-shot constraint should remain terminal");
+    assert!(snapshot.committed);
+    assert!(!snapshot.active);
+    assert!(!snapshot.backend_pending);
+    assert!(snapshot.defunct);
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(
+            activation_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        !capture_pointer_constraint_snapshot(&commands, constraint_id)
+            .expect("one-shot constraint should remain registered")
+            .active
+    );
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_pointer_constraint_backend_requests(&commands)
+            .iter()
+            .all(|request| !matches!(
+                request,
+                PointerConstraintBackendRequest::ActivateLocked { .. }
+            ))
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+    let _ = lock;
+}
+
+#[test]
+fn compositor_move_leaves_inactive_oneshot_constraint_on_the_same_root_eligible() {
+    let (commands, server_thread, mut fixture) = start_workspace_pointer_constraint_test();
+    let qh = fixture.queue.handle();
+    let _active_lock = fixture.constraints.lock_pointer(
+        &fixture.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let active_lock_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .next()
+        .expect("persistent lock should be registered");
+    let active_backend_id =
+        activate_locked_backend(&commands, &mut fixture.state, &mut fixture.queue);
+
+    let child = fixture.compositor.create_surface(&qh, ());
+    let _subsurface = fixture
+        .subcompositor
+        .get_subsurface(&child, &fixture.surface, &qh, ());
+    let inactive_lock = fixture.constraints.lock_pointer(
+        &child,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Oneshot,
+        &qh,
+        (),
+    );
+    child.commit();
+    fixture.surface.commit();
+    fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    fixture.queue.roundtrip(&mut fixture.state).unwrap();
+    let inactive_constraint_id = capture_pointer_constraint_ids(&commands)
+        .into_iter()
+        .find(|id| *id != active_lock_id)
+        .expect("child one-shot constraint should be registered");
+    let inactive_before = capture_pointer_constraint_snapshot(&commands, inactive_constraint_id)
+        .expect("child constraint should remain registered");
+    assert!(inactive_before.committed);
+    assert!(!inactive_before.active);
+    assert!(!inactive_before.backend_pending);
+    assert!(!inactive_before.defunct);
+
+    let (x, y) = capture_last_pointer_position(&commands);
+    commands.send(ServerCommand::BeginMove { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_window_interaction_debug_snapshot(&commands).is_some());
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate { id, .. }
+            if *id == active_backend_id
+    )));
+    assert!(requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate { id, .. }
+            if id.constraint_id == inactive_constraint_id
+    )));
+    let inactive_after = capture_pointer_constraint_snapshot(&commands, inactive_constraint_id)
+        .expect("inactive child constraint should remain registered");
+    assert!(inactive_after.committed);
+    assert!(!inactive_after.active);
+    assert!(!inactive_after.backend_pending);
+    assert!(
+        !inactive_after.defunct,
+        "interaction takeover must not terminate an inactive one-shot constraint"
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+    let _ = inactive_lock;
 }
 
 struct SynchronizedConstraintFixture {
