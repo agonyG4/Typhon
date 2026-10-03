@@ -576,6 +576,7 @@ fn prepare_plane_delta_with_presentation(
     )
     .map_err(io::Error::other)?
     .with_presentation_state(presentation_mode, content_type)
+    .map_err(io::Error::other)?
     .with_client_cursor_presentation_key(client_cursor_presentation_key);
     let presentation_feedback_batch_id = server.as_deref_mut().and_then(|server| {
         take_client_cursor_presentation_feedback_batch(

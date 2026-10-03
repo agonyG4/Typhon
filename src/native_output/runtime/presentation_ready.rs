@@ -208,6 +208,7 @@ pub(super) fn submit_ready_frame(
     frame_index: &mut u64,
     frame_submitted: &mut bool,
     perf: NativePerfLogger,
+    vrr_policy: VrrPolicy,
     #[cfg(test)] native_io_recorder: &mut NativeIoRecorder,
 ) -> NativeResult<ReadySubmissionResult> {
     let repaint_present_start = Instant::now();
@@ -300,6 +301,7 @@ pub(super) fn submit_ready_frame(
                     ),
                     true,
                     cursor_reveal_trace,
+                    vrr_policy,
                 )?
             else {
                 if let Some(batch_id) = callback_batch_id {
@@ -400,6 +402,7 @@ pub(super) fn submit_ready_frame(
                 crate::native_output::kms_worker::KmsCommitTestPolicy::from_cursor(test_only),
                 cursor_epoch,
                 validation_base,
+                vrr_policy,
             ) {
                 Ok(result) => result,
                 Err(error) => {
@@ -449,6 +452,7 @@ pub(super) fn submit_ready_frame(
                 |scanout, presentation_mode, content_type| {
                     scanout.present(kms_backend, cursor, presentation_mode, content_type)
                 },
+                vrr_policy,
             );
             match result {
                 Ok(result) => result,

@@ -322,9 +322,9 @@ impl NativeSessionIo for NativeRuntime {
 
     fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
         self.abandon_direct_fallback();
-        if self.atomic_cursor.is_some() {
+        if self.kms_backend.effective_kind() == KmsBackendKind::Atomic {
             self.kms_backend
-                .rediscover_atomic_cursor_for_recovery(self.kms.file().as_fd())?;
+                .rediscover_atomic_pipeline_for_recovery(self.kms.file().as_fd())?;
         }
         let generation = allocate_native_drm_file_generation();
         let recovery = self.scanout.prepare_session_recovery()?;
@@ -423,7 +423,7 @@ impl NativeSessionIo for NativeRuntime {
         if recovery_progress != NativeSessionRecoveryProgress::Complete {
             return Ok(recovery_progress);
         }
-        self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
+        self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
         self.submitted_worker_ownership.clear();
         self.worker_quarantine.jobs.clear();
         self.worker_quarantine.cursor_sidecars.clear();
@@ -554,7 +554,11 @@ impl NativeSessionIo for NativeRuntime {
             generation,
         );
         self.abandon_direct_fallback();
-        self.scanout.rebind_session_generation(generation);
+        self.scanout.rebind_session_generation(
+            generation,
+            self.kms_backend.atomic_connector_vrr_capable(),
+            self.kms_backend.atomic_crtc_vrr_property_available(),
+        );
         if !apply_native_scanout_feedback(
             &mut self.server,
             &self.scanout,

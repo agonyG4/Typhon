@@ -68,7 +68,7 @@ fn settle_no_visual_change_transaction(
         direct_surface_id,
         release,
     )
-    .map(|transaction| transaction.with_presentation_state(presentation_mode, content_type))
+    .and_then(|transaction| transaction.with_presentation_state(presentation_mode, content_type))
     {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -132,6 +132,7 @@ impl AtomicEglGbmScanout {
         pacing_mode: NativeOutputPacingMode,
         confirmed_content_type: DrmContentType,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+        vrr_policy: VrrPolicy,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
         let sync_readiness = DirectSyncReadiness::from_capabilities(
@@ -189,7 +190,7 @@ impl AtomicEglGbmScanout {
         };
         let effective_presentation = EffectivePresentation::decide(
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
-            VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref()),
+            vrr_policy,
             candidate.presentation,
             AsyncEligibility {
                 solitary_fullscreen: server
@@ -237,7 +238,7 @@ impl AtomicEglGbmScanout {
                 transition_supported: true,
             },
         );
-        let presentation_mode = effective_presentation.mode;
+        let mut presentation_mode = effective_presentation.mode;
         let content_type =
             kms.resolved_content_type(effective_presentation.content_type.drm_value());
         self.direct.counters.candidates_accepted += 1;
@@ -364,18 +365,6 @@ impl AtomicEglGbmScanout {
             presentation_mode,
             content_type,
         };
-        let test_only = if self.direct.validation_cache.contains(validation_key) {
-            self.direct.counters.validation_cache_hits =
-                self.direct.counters.validation_cache_hits.saturating_add(1);
-            KmsTestOnlyPolicy::Skip
-        } else {
-            self.direct.counters.validation_cache_misses = self
-                .direct
-                .counters
-                .validation_cache_misses
-                .saturating_add(1);
-            KmsTestOnlyPolicy::Required
-        };
         if candidate.viewport_identity_metadata_present
             && !self.direct.identity_viewport_metadata_logged
         {
@@ -410,6 +399,73 @@ impl AtomicEglGbmScanout {
         } else {
             "imported dma-buf framebuffer".to_string()
         });
+
+        let requested_presentation_mode = presentation_mode;
+        let test_token = PageFlipToken::new(allocate_native_page_flip_token())
+            .expect("allocated native TEST_ONLY pageflip token is nonzero");
+        let mut qualified_validation_key = None;
+        let Some(qualified_mode) =
+            first_qualified_direct_presentation_mode(requested_presentation_mode, |mode| {
+                let key = validation_key.with_presentation_state(mode, content_type);
+                let qualified = if self.direct.validation_cache.contains(key) {
+                    self.direct.counters.validation_cache_hits =
+                        self.direct.counters.validation_cache_hits.saturating_add(1);
+                    true
+                } else {
+                    self.direct.counters.validation_cache_misses = self
+                        .direct
+                        .counters
+                        .validation_cache_misses
+                        .saturating_add(1);
+                    let result = if let Some(cursor) = cursor {
+                        kms.test_flip_with_presentation(
+                            framebuffer.framebuffer,
+                            test_token,
+                            Some(cursor),
+                            mode,
+                            content_type,
+                        )
+                    } else {
+                        kms.test_flip_without_cursor_with_presentation(
+                            framebuffer.framebuffer,
+                            test_token,
+                            mode,
+                            content_type,
+                        )
+                    };
+                    if result.is_ok() {
+                        self.direct.validation_cache.record_success(key);
+                    } else {
+                        direct_scanout_debug(format_args!(
+                            "exact presentation TEST_ONLY rejected mode={}",
+                            mode.as_str()
+                        ));
+                    }
+                    result.is_ok()
+                };
+                if qualified {
+                    qualified_validation_key = Some(key);
+                }
+                qualified
+            })
+        else {
+            self.note_direct_rejection(true, cursor.is_some());
+            return Ok(DirectScanoutAttempt::Fallback(
+                "presentation_test_only_rejected",
+            ));
+        };
+        presentation_mode = qualified_mode;
+        let validation_key = qualified_validation_key
+            .expect("qualified direct presentation mode retains its exact validation key");
+        if presentation_mode != requested_presentation_mode {
+            direct_scanout_debug(format_args!(
+                "kept direct assignment with weaker presentation mode={}",
+                presentation_mode.as_str()
+            ));
+        }
+        // Every chosen exact direct state was either tested here or has a
+        // matching successful mode-specific validation-cache entry.
+        let test_only = KmsTestOnlyPolicy::Skip;
 
         let frame_id = self.swapchain()?.next_frame_id();
         let presentation_samples = server
@@ -481,10 +537,15 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             candidate.surface_id,
             release,
-        ) {
-            Ok(transaction) => transaction
+        )
+        .and_then(|transaction| {
+            transaction
                 .with_presentation_state(presentation_mode, content_type)
-                .with_client_cursor_presentation_key(client_cursor_presentation_key),
+                .map(|transaction| {
+                    transaction.with_client_cursor_presentation_key(client_cursor_presentation_key)
+                })
+        }) {
+            Ok(transaction) => transaction,
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 drop(surface_damage);

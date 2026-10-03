@@ -20,6 +20,108 @@ use oblivion_one::native::presentation_deadline::TargetSelectionEvidence;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+fn plane_delta_transaction(
+    transaction_id: u64,
+    output_generation: u64,
+    cursor_epoch: u64,
+    mode: OutputPresentationMode,
+    content_type: DrmContentType,
+) -> OutputTransaction {
+    OutputTransaction::cursor_plane_delta(
+        OutputId::from_raw(1).unwrap(),
+        OutputTransactionId::new(NonZeroU64::new(transaction_id).unwrap()),
+        output_generation,
+        MonotonicTimestampNs::new(transaction_id),
+        worker_test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        cursor_epoch,
+        None,
+        OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_presentation_state(mode, content_type)
+    .unwrap()
+}
+
+#[test]
+fn successful_plane_delta_pageflips_confirm_mode_and_content_type_without_primary_completion() {
+    let mut confirmed = ConfirmedKmsPresentationState::default();
+    let adaptive = plane_delta_transaction(
+        1,
+        7,
+        1,
+        OutputPresentationMode::AdaptiveSync,
+        DrmContentType::Photo,
+    );
+    assert!(confirm_kms_presentation_state(
+        &mut confirmed,
+        &adaptive,
+        7,
+        true
+    ));
+    assert_eq!(confirmed.mode, OutputPresentationMode::AdaptiveSync);
+    assert_eq!(confirmed.content_type, DrmContentType::Photo);
+    assert_eq!(confirmed.output_generation, 7);
+
+    let vsync =
+        plane_delta_transaction(2, 7, 2, OutputPresentationMode::Vsync, DrmContentType::Game);
+    assert!(confirm_kms_presentation_state(
+        &mut confirmed,
+        &vsync,
+        7,
+        true
+    ));
+    assert_eq!(confirmed.mode, OutputPresentationMode::Vsync);
+    assert_eq!(confirmed.content_type, DrmContentType::Game);
+
+    let delta_completion = AtomicCommitCompletion::Completed {
+        kind: AtomicCommitKind::PlaneDelta {
+            transaction_id: OutputTransactionId::new(NonZeroU64::new(2).unwrap()),
+            cursor_epoch: 2,
+            framebuffer_id: None,
+        },
+        submitted_at_ns: 10,
+    };
+    assert!(is_non_primary_atomic_completion(delta_completion));
+    assert!(
+        !AtomicCommitKind::PlaneDelta {
+            transaction_id: OutputTransactionId::new(NonZeroU64::new(2).unwrap()),
+            cursor_epoch: 2,
+            framebuffer_id: None,
+        }
+        .is_primary()
+    );
+}
+
+#[test]
+fn stale_generation_and_rejected_plane_delta_do_not_confirm_presentation_state() {
+    let mut confirmed = ConfirmedKmsPresentationState {
+        mode: OutputPresentationMode::AdaptiveSync,
+        content_type: DrmContentType::Photo,
+        output_generation: 7,
+    };
+    let before = confirmed;
+    let stale =
+        plane_delta_transaction(3, 6, 3, OutputPresentationMode::Vsync, DrmContentType::Game);
+    assert!(!confirm_kms_presentation_state(
+        &mut confirmed,
+        &stale,
+        7,
+        true
+    ));
+    assert_eq!(confirmed, before);
+
+    let rejected =
+        plane_delta_transaction(4, 7, 4, OutputPresentationMode::Vsync, DrmContentType::Game);
+    assert!(!confirm_kms_presentation_state(
+        &mut confirmed,
+        &rejected,
+        7,
+        false
+    ));
+    assert_eq!(confirmed, before);
+}
+
 #[test]
 fn seat_disable_wins_over_a_same_batch_recovery_fence_wake() {
     assert!(!should_continue_resuming_recovery(true, true, true));

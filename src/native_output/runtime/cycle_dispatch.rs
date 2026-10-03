@@ -1364,13 +1364,10 @@ impl NativeRuntime {
                     ),
                     doctor_check(
                         "vrr.state",
-                        vrr_doctor_severity(
-                            self.vrr_preference,
-                            self.kms_backend.atomic_vrr_capable(),
-                        ),
+                        vrr_doctor_severity(self.vrr_policy, self.kms_backend.atomic_vrr_capable()),
                         format!(
                             "policy={} atomic_capable={}",
-                            self.vrr_preference.as_str(),
+                            self.vrr_policy.as_str(),
                             self.kms_backend.atomic_vrr_capable()
                         ),
                     ),
@@ -3868,7 +3865,7 @@ impl NativeRuntime {
         let direct_state = self.direct_scanout_state();
         let vrr_capable = self.kms_backend.atomic_vrr_capable();
         let vrr_confirmed = self
-            .confirmed_output_presentation
+            .confirmed_kms_presentation
             .vrr_request_confirmed_for(self.drm_file_generation);
         let vrr_state = if !vrr_capable {
             FeatureState::Unavailable

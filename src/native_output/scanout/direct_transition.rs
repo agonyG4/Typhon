@@ -172,6 +172,7 @@ impl NativeScanoutBackend {
         pacing_mode: NativeOutputPacingMode,
         confirmed_content_type: oblivion_one::compositor::DrmContentType,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+        vrr_policy: oblivion_one::compositor::VrrPolicy,
     ) -> io::Result<DirectScanoutAttempt> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(
@@ -186,6 +187,7 @@ impl NativeScanoutBackend {
                 pacing_mode,
                 confirmed_content_type,
                 worker,
+                vrr_policy,
             ),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct scanout is unsupported by this backend",

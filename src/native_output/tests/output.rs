@@ -215,32 +215,23 @@ fn matching_render_node_for_card_uses_same_drm_device_directory() {
 }
 
 #[test]
-fn native_vrr_preference_parses_policy_values() {
+fn native_vrr_policy_parses_compatibility_aliases() {
+    assert_eq!(VrrPolicy::from_environment(Some("auto")), VrrPolicy::Auto);
+    assert_eq!(VrrPolicy::from_environment(Some("1")), VrrPolicy::On);
+    assert_eq!(VrrPolicy::from_environment(Some("true")), VrrPolicy::On);
+    assert_eq!(VrrPolicy::from_environment(Some("0")), VrrPolicy::Off);
+    assert_eq!(VrrPolicy::from_environment(Some("false")), VrrPolicy::Off);
     assert_eq!(
-        NativeVrrPreference::parse("auto"),
-        NativeVrrPreference::Auto
-    );
-    assert_eq!(NativeVrrPreference::parse("1"), NativeVrrPreference::On);
-    assert_eq!(NativeVrrPreference::parse("true"), NativeVrrPreference::On);
-    assert_eq!(NativeVrrPreference::parse("0"), NativeVrrPreference::Off);
-    assert_eq!(
-        NativeVrrPreference::parse("false"),
-        NativeVrrPreference::Off
-    );
-    assert_eq!(
-        NativeVrrPreference::parse("unknown"),
-        NativeVrrPreference::Auto
+        VrrPolicy::from_environment(Some("unknown")),
+        VrrPolicy::Auto
     );
 }
 
 #[test]
-fn native_vrr_preference_is_configuration_only() {
-    assert_eq!(
-        NativeVrrPreference::parse("auto"),
-        NativeVrrPreference::Auto
-    );
-    assert_eq!(NativeVrrPreference::parse("on"), NativeVrrPreference::On);
-    assert_eq!(NativeVrrPreference::parse("off"), NativeVrrPreference::Off);
+fn native_vrr_policy_preserves_named_values() {
+    assert_eq!(VrrPolicy::from_environment(Some("auto")), VrrPolicy::Auto);
+    assert_eq!(VrrPolicy::from_environment(Some("on")), VrrPolicy::On);
+    assert_eq!(VrrPolicy::from_environment(Some("off")), VrrPolicy::Off);
 }
 
 #[test]

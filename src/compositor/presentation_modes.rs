@@ -182,8 +182,8 @@ pub enum VrrPolicy {
 impl VrrPolicy {
     pub fn from_environment(value: Option<&str>) -> Self {
         match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("off") => Self::Off,
-            Some("on") => Self::On,
+            Some("0" | "false" | "no" | "off" | "disable" | "disabled") => Self::Off,
+            Some("1" | "true" | "yes" | "on" | "enable" | "enabled") => Self::On,
             _ => Self::Auto,
         }
     }
@@ -193,6 +193,16 @@ impl VrrPolicy {
             Self::Off => "off",
             Self::Auto => "auto",
             Self::On => "on",
+        }
+    }
+
+    /// Phase 1's shared policy predicate for scheduler and transaction
+    /// eligibility. Auto is limited to its caller's solitary-fullscreen hint.
+    pub const fn allows_adaptive_sync(self, auto_candidate: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Auto => auto_candidate,
+            Self::On => true,
         }
     }
 }
@@ -823,6 +833,88 @@ mod vrr_phase1_regression_tests {
         assert_eq!(VrrPolicy::from_environment(Some("on")), VrrPolicy::On);
         assert_eq!(VrrPolicy::from_environment(Some("off")), VrrPolicy::Off);
         assert_eq!(VrrPolicy::from_environment(None), VrrPolicy::Auto);
+    }
+
+    #[test]
+    fn all_vrr_aliases_have_identical_scheduler_composited_and_direct_semantics() {
+        let parse = |value| VrrPolicy::from_environment(Some(value));
+        for alias in ["0", "false", "no", "off", "disable", "disabled"] {
+            assert_eq!(parse(alias), VrrPolicy::Off, "alias {alias}");
+        }
+        for alias in ["1", "true", "yes", "on", "enable", "enabled"] {
+            assert_eq!(parse(alias), VrrPolicy::On, "alias {alias}");
+        }
+        for alias in ["auto", "unknown", ""] {
+            assert_eq!(parse(alias), VrrPolicy::Auto, "alias {alias}");
+        }
+
+        let mut eligibility = vrr_eligible();
+        eligibility.auto_candidate = false;
+        for alias in ["0", "false", "no", "off", "disable", "disabled"] {
+            assert_eq!(
+                EffectivePresentation::decide(
+                    TearingPolicy::Off,
+                    parse(alias),
+                    SurfacePresentationMetadata::default(),
+                    AsyncEligibility {
+                        solitary_fullscreen: true,
+                        ..AsyncEligibility::default()
+                    },
+                    vrr_eligible(),
+                )
+                .mode,
+                OutputPresentationMode::Vsync,
+                "Off alias {alias} must not produce an Adaptive transaction",
+            );
+        }
+        for alias in ["1", "true", "yes", "on", "enable", "enabled"] {
+            assert_eq!(
+                EffectivePresentation::decide(
+                    TearingPolicy::Off,
+                    parse(alias),
+                    SurfacePresentationMetadata::default(),
+                    AsyncEligibility::default(),
+                    eligibility,
+                )
+                .mode,
+                OutputPresentationMode::AdaptiveSync,
+                "On alias {alias} must not fall back to Auto eligibility",
+            );
+        }
+
+        // Scheduler, composited output, and Direct Scanout all consume this
+        // same immutable enum. Check the policy-to-mode result for each
+        // accepted alias so no caller can silently narrow the vocabulary.
+        for alias in [
+            "0", "false", "no", "off", "disable", "disabled", "1", "true", "yes", "on", "enable",
+            "enabled", "auto",
+        ] {
+            let policy = parse(alias);
+            let expected = match policy {
+                VrrPolicy::Off => OutputPresentationMode::Vsync,
+                VrrPolicy::On => OutputPresentationMode::AdaptiveSync,
+                VrrPolicy::Auto => OutputPresentationMode::AdaptiveSync,
+            };
+            let actual = EffectivePresentation::decide(
+                TearingPolicy::Off,
+                policy,
+                SurfacePresentationMetadata::default(),
+                AsyncEligibility::default(),
+                vrr_eligible(),
+            )
+            .mode;
+            assert_eq!(
+                policy.allows_adaptive_sync(true),
+                expected.uses_vrr(),
+                "scheduler predicate for alias {alias}"
+            );
+            assert_eq!(
+                policy.allows_adaptive_sync(false),
+                policy == VrrPolicy::On,
+                "non-fullscreen scheduler predicate for alias {alias}"
+            );
+            assert_eq!(actual, expected, "policy alias {alias}");
+        }
     }
 
     #[test]

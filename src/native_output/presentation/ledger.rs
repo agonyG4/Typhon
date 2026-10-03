@@ -177,6 +177,7 @@ pub(crate) enum OutputTransactionError {
     },
     PresentationTargetMismatch,
     PresentationStateAlreadyOwned,
+    VrrCannotUseDeferredO1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1180,9 +1181,13 @@ impl OutputTransactionLedger {
         ) {
             return Err(OutputTransactionError::PresentationStateAlreadyOwned);
         }
+        if mode.uses_vrr() && record.descriptor.reservation().is_deferred_o1() {
+            return Err(OutputTransactionError::VrrCannotUseDeferredO1);
+        }
         let descriptor = record.descriptor.clone();
         record.descriptor = descriptor
             .with_presentation_state(mode, content_type)
+            .map_err(|_| OutputTransactionError::VrrCannotUseDeferredO1)?
             .with_presentation_validation_key(validation_key);
         Ok(())
     }

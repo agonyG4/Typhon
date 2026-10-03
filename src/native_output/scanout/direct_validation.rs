@@ -7,6 +7,36 @@ use std::{
 
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
+const DIRECT_ADAPTIVE_ASYNC_CANDIDATES: &[OutputPresentationMode] = &[
+    OutputPresentationMode::AdaptiveAsync,
+    OutputPresentationMode::AdaptiveSync,
+    OutputPresentationMode::Async,
+    OutputPresentationMode::Vsync,
+];
+const DIRECT_ADAPTIVE_SYNC_CANDIDATES: &[OutputPresentationMode] = &[
+    OutputPresentationMode::AdaptiveSync,
+    OutputPresentationMode::Vsync,
+];
+const DIRECT_ASYNC_CANDIDATES: &[OutputPresentationMode] =
+    &[OutputPresentationMode::Async, OutputPresentationMode::Vsync];
+const DIRECT_VSYNC_CANDIDATES: &[OutputPresentationMode] = &[OutputPresentationMode::Vsync];
+
+pub(crate) fn first_qualified_direct_presentation_mode(
+    requested: OutputPresentationMode,
+    mut qualifies: impl FnMut(OutputPresentationMode) -> bool,
+) -> Option<OutputPresentationMode> {
+    let candidates = match requested {
+        OutputPresentationMode::AdaptiveAsync => DIRECT_ADAPTIVE_ASYNC_CANDIDATES,
+        OutputPresentationMode::AdaptiveSync => DIRECT_ADAPTIVE_SYNC_CANDIDATES,
+        OutputPresentationMode::Async => DIRECT_ASYNC_CANDIDATES,
+        OutputPresentationMode::Vsync => DIRECT_VSYNC_CANDIDATES,
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| qualifies(*candidate))
+}
+
 pub(crate) fn direct_cursor_content_key(
     cursor: Option<&AtomicCursorVisualState>,
     compatible: bool,
@@ -344,6 +374,104 @@ mod tests {
     }
 
     #[test]
+    fn direct_adaptive_async_rejection_keeps_the_strongest_qualified_mode() {
+        let mut tested = Vec::new();
+        let selected = first_qualified_direct_presentation_mode(
+            OutputPresentationMode::AdaptiveAsync,
+            |mode| {
+                tested.push(mode);
+                mode == OutputPresentationMode::AdaptiveSync
+            },
+        );
+        assert_eq!(selected, Some(OutputPresentationMode::AdaptiveSync));
+        assert_eq!(
+            tested,
+            [
+                OutputPresentationMode::AdaptiveAsync,
+                OutputPresentationMode::AdaptiveSync
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_adaptive_async_can_fall_back_to_async() {
+        let mut tested = Vec::new();
+        let selected = first_qualified_direct_presentation_mode(
+            OutputPresentationMode::AdaptiveAsync,
+            |mode| {
+                tested.push(mode);
+                mode == OutputPresentationMode::Async
+            },
+        );
+        assert_eq!(selected, Some(OutputPresentationMode::Async));
+        assert_eq!(
+            tested,
+            [
+                OutputPresentationMode::AdaptiveAsync,
+                OutputPresentationMode::AdaptiveSync,
+                OutputPresentationMode::Async
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_adaptive_sync_rejection_can_fall_back_to_vsync() {
+        let mut tested = Vec::new();
+        let selected = first_qualified_direct_presentation_mode(
+            OutputPresentationMode::AdaptiveSync,
+            |mode| {
+                tested.push(mode);
+                mode == OutputPresentationMode::Vsync
+            },
+        );
+        assert_eq!(selected, Some(OutputPresentationMode::Vsync));
+        assert_eq!(
+            tested,
+            [
+                OutputPresentationMode::AdaptiveSync,
+                OutputPresentationMode::Vsync
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_async_rejection_can_fall_back_to_vsync() {
+        let mut tested = Vec::new();
+        let selected =
+            first_qualified_direct_presentation_mode(OutputPresentationMode::Async, |mode| {
+                tested.push(mode);
+                mode == OutputPresentationMode::Vsync
+            });
+        assert_eq!(selected, Some(OutputPresentationMode::Vsync));
+        assert_eq!(
+            tested,
+            [OutputPresentationMode::Async, OutputPresentationMode::Vsync]
+        );
+    }
+
+    #[test]
+    fn direct_scanout_falls_back_only_after_every_exact_mode_rejects() {
+        let mut tested = Vec::new();
+        let selected = first_qualified_direct_presentation_mode(
+            OutputPresentationMode::AdaptiveAsync,
+            |mode| {
+                tested.push(mode);
+                false
+            },
+        );
+        assert_eq!(selected, None);
+        assert_eq!(
+            tested,
+            [
+                OutputPresentationMode::AdaptiveAsync,
+                OutputPresentationMode::AdaptiveSync,
+                OutputPresentationMode::Async,
+                OutputPresentationMode::Vsync
+            ]
+        );
+    }
+
+    #[test]
     fn validation_key_changes_with_plane_identity() {
         let mut crtc_changed = key(1);
         crtc_changed.crtc_id = 8;
@@ -366,6 +494,21 @@ mod tests {
         let first = buffer_with_fd();
         let second = buffer_with_fd();
         assert_eq!(plane_layout_hash(&first), plane_layout_hash(&second));
+    }
+
+    #[test]
+    fn adaptive_validation_evidence_does_not_qualify_vsync() {
+        let adaptive = key(1).with_presentation_state(
+            OutputPresentationMode::AdaptiveSync,
+            DrmContentType::Graphics,
+        );
+        let vsync = adaptive
+            .with_presentation_state(OutputPresentationMode::Vsync, DrmContentType::Graphics);
+        let mut cache = DirectPlaneValidationCache::default();
+        cache.record_success(adaptive);
+
+        assert!(cache.contains(adaptive));
+        assert!(!cache.contains(vsync));
     }
 
     #[test]

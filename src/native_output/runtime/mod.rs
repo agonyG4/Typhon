@@ -480,19 +480,21 @@ pub(crate) enum NativeClientCursorPath {
 pub(super) type PresentedPrimaryAssignment = PresentedPrimaryState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConfirmedOutputPresentationState {
+/// Last presentation state confirmed by a matching successful KMS pageflip.
+/// This is separate from primary compositor-frame scheduler completion.
+pub(crate) struct ConfirmedKmsPresentationState {
     pub(crate) mode: OutputPresentationMode,
     pub(crate) content_type: DrmContentType,
     pub(crate) output_generation: u64,
 }
 
-impl ConfirmedOutputPresentationState {
+impl ConfirmedKmsPresentationState {
     pub(crate) const fn vrr_request_confirmed_for(self, output_generation: u64) -> bool {
         self.output_generation == output_generation && self.mode.uses_vrr()
     }
 }
 
-impl Default for ConfirmedOutputPresentationState {
+impl Default for ConfirmedKmsPresentationState {
     fn default() -> Self {
         Self {
             mode: OutputPresentationMode::Vsync,
@@ -503,7 +505,7 @@ impl Default for ConfirmedOutputPresentationState {
 }
 
 #[cfg(test)]
-mod confirmed_output_presentation_tests {
+mod confirmed_kms_presentation_tests {
     use super::*;
 
     #[test]
@@ -512,7 +514,7 @@ mod confirmed_output_presentation_tests {
             OutputPresentationMode::AdaptiveSync,
             OutputPresentationMode::AdaptiveAsync,
         ] {
-            let confirmed = ConfirmedOutputPresentationState {
+            let confirmed = ConfirmedKmsPresentationState {
                 mode,
                 content_type: DrmContentType::Graphics,
                 output_generation: 7,
@@ -521,13 +523,13 @@ mod confirmed_output_presentation_tests {
             assert!(!confirmed.vrr_request_confirmed_for(8));
         }
 
-        let confirmed_vsync = ConfirmedOutputPresentationState {
+        let confirmed_vsync = ConfirmedKmsPresentationState {
             mode: OutputPresentationMode::Vsync,
             content_type: DrmContentType::Graphics,
             output_generation: 7,
         };
         assert!(!confirmed_vsync.vrr_request_confirmed_for(7));
-        assert!(!ConfirmedOutputPresentationState::default().vrr_request_confirmed_for(0));
+        assert!(!ConfirmedKmsPresentationState::default().vrr_request_confirmed_for(0));
     }
 }
 
@@ -629,7 +631,7 @@ pub(crate) struct NativeRuntime {
     dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry,
     control_server: NativeControlServer,
     started_at: Instant,
-    vrr_preference: NativeVrrPreference,
+    vrr_policy: VrrPolicy,
     xwayland: XwaylandService,
     xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
     xwayland_reactor_generation: u64,
@@ -670,7 +672,7 @@ pub(crate) struct NativeRuntime {
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
-    confirmed_output_presentation: ConfirmedOutputPresentationState,
+    confirmed_kms_presentation: ConfirmedKmsPresentationState,
     presentation_timing: KmsPresentationTimingModel,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
@@ -974,7 +976,7 @@ impl Drop for NativeRuntime {
             return;
         }
         self.presented_planes.primary = None;
-        self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
+        self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
         if !self.scanout_destroyed
             && let Err(error) = self.scanout.release_direct_for_target_destroyed()
         {

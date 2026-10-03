@@ -1332,6 +1332,7 @@ impl CompatibilityPresentationHarness {
                     .take()
                     .expect("compatibility presentation is attempted once")
             },
+            VrrPolicy::Off,
         )
     }
 

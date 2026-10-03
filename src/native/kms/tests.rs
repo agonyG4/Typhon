@@ -169,6 +169,54 @@ fn atomic_vrr_requires_connector_true_and_crtc_property() {
 }
 
 #[test]
+fn recovery_refreshes_live_vrr_capability_across_generation_rebinds_only() {
+    fn with_live_vrr(
+        discovered: &mut AtomicDiscovery,
+        connector_value: Option<u64>,
+        crtc_property_available: bool,
+    ) {
+        let mut connector_properties = complete_connector_properties();
+        if let Some(value) = connector_value {
+            connector_properties.push(property(20, "vrr_capable", value));
+        }
+        discovered.pipeline.connector_props =
+            AtomicConnectorProperties::discover(&connector_properties).unwrap();
+
+        let mut crtc_properties = vec![property(2, "ACTIVE", 1), property(3, "MODE_ID", 99)];
+        if crtc_property_available {
+            crtc_properties.push(property(4, "VRR_ENABLED", 0));
+        }
+        discovered.pipeline.crtc_props = AtomicCrtcProperties::discover(&crtc_properties).unwrap();
+        discovered.optional.vrr_enabled = crtc_property_available;
+    }
+
+    let mut current = discovery();
+    with_live_vrr(&mut current, Some(1), true);
+    let original_restore_snapshot = current.snapshot;
+    assert!(current.vrr_capable());
+
+    for (connector_value, crtc_available, expected) in [
+        (Some(1), true, true),
+        (Some(0), false, false),
+        (Some(1), true, true),
+    ] {
+        let mut refreshed = discovery();
+        with_live_vrr(&mut refreshed, connector_value, crtc_available);
+        current.refresh_live_pipeline_state(&refreshed);
+
+        assert_eq!(current.vrr_capable(), expected);
+        assert_eq!(current.optional.vrr_enabled, crtc_available);
+        assert_eq!(current.snapshot, original_restore_snapshot);
+    }
+
+    let mut connector_property_disappeared = discovery();
+    with_live_vrr(&mut connector_property_disappeared, None, true);
+    current.refresh_live_pipeline_state(&connector_property_disappeared);
+    assert!(!current.vrr_capable());
+    assert_eq!(current.snapshot, original_restore_snapshot);
+}
+
+#[test]
 fn optional_properties_are_recorded_without_becoming_required() {
     let crtc = AtomicCrtcProperties::discover(&complete_crtc_properties()).unwrap();
     let plane = AtomicPlaneProperties::discover(&complete_plane_properties()).unwrap();

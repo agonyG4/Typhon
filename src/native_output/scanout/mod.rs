@@ -674,9 +674,18 @@ impl NativeScanoutBackend {
         Ok(())
     }
 
-    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+    pub(crate) fn rebind_session_generation(
+        &mut self,
+        generation: u64,
+        vrr_connector_capable: bool,
+        vrr_crtc_property_available: bool,
+    ) {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.rebind_session_generation(generation),
+            Self::AtomicEglGbm(scanout) => scanout.rebind_session_generation(
+                generation,
+                vrr_connector_capable,
+                vrr_crtc_property_available,
+            ),
             Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Dumb(_) => {}

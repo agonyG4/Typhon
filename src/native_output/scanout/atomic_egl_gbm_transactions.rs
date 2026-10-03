@@ -36,7 +36,7 @@ fn strongest_qualified_fallback(
         .unwrap_or(OutputPresentationMode::Vsync)
 }
 
-fn adaptive_async_blockers(
+pub(super) fn adaptive_async_blockers(
     adaptive_sync_qualified: bool,
     async_qualified: bool,
 ) -> (Option<VrrBlocker>, Option<AsyncBlocker>) {
@@ -46,8 +46,51 @@ fn adaptive_async_blockers(
     )
 }
 
+pub(super) fn adaptive_async_combination_blocker(
+    requested_mode: OutputPresentationMode,
+    vrr_blocker: Option<VrrBlocker>,
+    async_blocker: Option<AsyncBlocker>,
+) -> Option<&'static str> {
+    (requested_mode == OutputPresentationMode::AdaptiveAsync
+        && vrr_blocker.is_none()
+        && async_blocker.is_none())
+    .then_some("adaptive_async_exact_kms_rejected_as_combination")
+}
+
+pub(super) fn adaptive_async_fallback_diagnostics(
+    adaptive_sync_qualified: bool,
+    async_qualified: bool,
+) -> (
+    OutputPresentationMode,
+    Option<VrrBlocker>,
+    Option<AsyncBlocker>,
+    Option<&'static str>,
+) {
+    let (vrr_blocker, async_blocker) =
+        adaptive_async_blockers(adaptive_sync_qualified, async_qualified);
+    let effective_mode = if adaptive_sync_qualified {
+        OutputPresentationMode::AdaptiveSync
+    } else if async_qualified {
+        OutputPresentationMode::Async
+    } else {
+        OutputPresentationMode::Vsync
+    };
+    let combination_blocker = adaptive_async_combination_blocker(
+        OutputPresentationMode::AdaptiveAsync,
+        vrr_blocker,
+        async_blocker,
+    );
+    (
+        effective_mode,
+        vrr_blocker,
+        async_blocker,
+        combination_blocker,
+    )
+}
+
 fn log_composited_presentation_rejection(
     kms: &KmsBackendSelection,
+    vrr_policy: VrrPolicy,
     requested_mode: OutputPresentationMode,
     effective_mode: OutputPresentationMode,
     vrr_blocker: Option<VrrBlocker>,
@@ -57,11 +100,7 @@ fn log_composited_presentation_rejection(
 ) {
     NativePerfLogger::from_env().log("native.output_presentation_qualification", || {
         vec![
-            NativePerfField::str(
-                "configured_policy",
-                VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
-                    .as_str(),
-            ),
+            NativePerfField::str("configured_policy", vrr_policy.as_str()),
             NativePerfField::bool("drm_connector_capable", kms.atomic_connector_vrr_capable()),
             NativePerfField::bool(
                 "crtc_vrr_property_available",
@@ -76,6 +115,11 @@ fn log_composited_presentation_rejection(
             NativePerfField::str(
                 "async_blocker",
                 async_blocker.map_or("none", AsyncBlocker::as_str),
+            ),
+            NativePerfField::str(
+                "combination_blocker",
+                adaptive_async_combination_blocker(requested_mode, vrr_blocker, async_blocker)
+                    .unwrap_or("none"),
             ),
             NativePerfField::str("failure_stage", failure_stage),
             NativePerfField::u64("output_generation", output_generation),
@@ -129,6 +173,7 @@ impl AtomicEglGbmScanout {
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
         output_transactions: &mut OutputTransactionLedger,
+        vrr_policy: VrrPolicy,
     ) -> io::Result<(u64, u32, OutputTransactionId)> {
         let ready_transaction_id = self
             .swapchain()?
@@ -242,6 +287,7 @@ impl AtomicEglGbmScanout {
                 .map_or(0, |record| record.descriptor().output_generation());
             log_composited_presentation_rejection(
                 kms,
+                vrr_policy,
                 original_mode,
                 presentation_mode,
                 vrr_blocker,
@@ -409,6 +455,7 @@ impl AtomicEglGbmScanout {
                 .map_or(0, |record| record.descriptor().output_generation());
             log_composited_presentation_rejection(
                 kms,
+                vrr_policy,
                 failed_mode,
                 planned_fallback_mode,
                 vrr_blocker,
@@ -480,6 +527,7 @@ impl AtomicEglGbmScanout {
                             .map_or(0, |record| record.descriptor().output_generation());
                         log_composited_presentation_rejection(
                             kms,
+                            vrr_policy,
                             fallback_mode,
                             OutputPresentationMode::Vsync,
                             vrr_blocker,
@@ -615,6 +663,27 @@ mod adaptive_async_blocker_tests {
             )
         );
         assert_eq!(adaptive_async_blockers(true, true), (None, None));
+        assert_eq!(
+            adaptive_async_fallback_diagnostics(true, true),
+            (
+                OutputPresentationMode::AdaptiveSync,
+                None,
+                None,
+                Some("adaptive_async_exact_kms_rejected_as_combination")
+            )
+        );
+        assert_eq!(
+            adaptive_async_combination_blocker(OutputPresentationMode::AdaptiveAsync, None, None),
+            Some("adaptive_async_exact_kms_rejected_as_combination")
+        );
+        assert_eq!(
+            adaptive_async_combination_blocker(
+                OutputPresentationMode::AdaptiveAsync,
+                Some(VrrBlocker::ExactKmsQualificationRejected),
+                None
+            ),
+            None
+        );
     }
 
     #[test]

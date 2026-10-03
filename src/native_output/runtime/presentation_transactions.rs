@@ -25,6 +25,7 @@ pub(crate) struct DirectCallbackLeakMetrics {
 }
 
 pub(crate) fn effective_output_presentation(
+    vrr_policy: VrrPolicy,
     server: &OwnCompositorServer,
     cursor_visible: bool,
     kms_backend: Option<&KmsBackendSelection>,
@@ -38,7 +39,7 @@ pub(crate) fn effective_output_presentation(
     let metrics = server.fullscreen_render_plan_metrics();
     let effective = EffectivePresentation::decide(
         TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
-        VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref()),
+        vrr_policy,
         metadata,
         AsyncEligibility {
             solitary_fullscreen: metrics.solitary_tree_active,
@@ -77,11 +78,7 @@ pub(crate) fn effective_output_presentation(
     );
     NativePerfLogger::from_env().log("native.output_presentation_policy", || {
         vec![
-            NativePerfField::str(
-                "configured_policy",
-                VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
-                    .as_str(),
-            ),
+            NativePerfField::str("configured_policy", vrr_policy.as_str()),
             NativePerfField::bool(
                 "drm_connector_capable",
                 kms_backend.is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
@@ -740,8 +737,10 @@ pub(super) fn build_compatibility_transaction(
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
     kms_backend: Option<&KmsBackendSelection>,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<Option<OutputTransactionId>> {
     let (presentation_mode, content_type) = effective_output_presentation(
+        vrr_policy,
         server,
         cursor.is_some_and(|state| state.visible),
         kms_backend,
@@ -790,7 +789,8 @@ pub(super) fn build_compatibility_transaction(
         None => return Ok(None),
     }
     .map_err(io::Error::other)?
-    .with_presentation_state(presentation_mode, content_type);
+    .with_presentation_state(presentation_mode, content_type)
+    .map_err(io::Error::other)?;
     output_transactions
         .insert(transaction)
         .map_err(io::Error::other)?;
@@ -816,6 +816,7 @@ pub(super) fn present_compatibility_frame(
         OutputPresentationMode,
         DrmContentType,
     ) -> io::Result<NativePresentResult>,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
     let transaction_id = build_compatibility_transaction(
         output_transactions,
@@ -828,6 +829,7 @@ pub(super) fn present_compatibility_frame(
         cursor,
         cursor_epoch,
         kms_backend,
+        vrr_policy,
     )?;
     let (mut presentation_mode, content_type) = transaction_id
         .and_then(|transaction_id| output_transactions.transaction(transaction_id))
@@ -885,13 +887,7 @@ pub(super) fn present_compatibility_frame(
             }
             NativePerfLogger::from_env().log("native.output_presentation_qualification", || {
                 vec![
-                    NativePerfField::str(
-                        "configured_policy",
-                        VrrPolicy::from_environment(
-                            std::env::var("OBLIVION_ONE_VRR").ok().as_deref(),
-                        )
-                        .as_str(),
-                    ),
+                    NativePerfField::str("configured_policy", vrr_policy.as_str()),
                     NativePerfField::bool(
                         "drm_connector_capable",
                         kms_backend.is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
@@ -931,11 +927,7 @@ pub(super) fn present_compatibility_frame(
         }
         NativePerfLogger::from_env().log("native.output_presentation_qualification", || {
             vec![
-                NativePerfField::str(
-                    "configured_policy",
-                    VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
-                        .as_str(),
-                ),
+                NativePerfField::str("configured_policy", vrr_policy.as_str()),
                 NativePerfField::bool(
                     "drm_connector_capable",
                     kms_backend.is_some_and(KmsBackendSelection::atomic_connector_vrr_capable),
@@ -1144,6 +1136,7 @@ pub(super) fn build_cursor_transaction(
     )
     .map_err(io::Error::other)?
     .with_presentation_state(presentation_mode, content_type)
+    .map_err(io::Error::other)?
     .with_client_cursor_presentation_key(client_cursor_presentation_key);
     let transaction = match presentation_feedback_batch_id {
         Some(batch_id) => transaction
@@ -1194,8 +1187,10 @@ pub(super) fn submit_plane_delta(
     cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
     server: &mut OwnCompositorServer,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<SchedulerDecision> {
     let (presentation_mode, content_type) = effective_output_presentation(
+        vrr_policy,
         server,
         desired.as_ref().is_some_and(|state| state.visible),
         Some(kms_backend),

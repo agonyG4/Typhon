@@ -256,14 +256,14 @@ impl NativeRuntime {
             emergency_quarantined_worker_jobs,
             output_transactions,
             presented_planes,
-            confirmed_output_presentation,
+            confirmed_kms_presentation,
             presentation_timing,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
             adaptive_buffering,
             triple_buffer_policy,
-            vrr_preference,
+            vrr_policy,
             pending_proven_deadline_miss: _,
             effective_app_gpu_policy: _,
             last_rendered_scene_generation,
@@ -493,7 +493,7 @@ impl NativeRuntime {
         frame_pacing.note_prediction(prediction);
         let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
-        let vrr_policy: VrrPolicy = (*vrr_preference).into();
+        let vrr_policy = *vrr_policy;
         let tearing_policy = oblivion_one::compositor::TearingPolicy::from_environment(
             std::env::var("OBLIVION_ONE_TEARING").ok().as_deref(),
         );
@@ -502,11 +502,7 @@ impl NativeRuntime {
             .fullscreen_tree_presentation_metadata()
             .is_some_and(|metadata| metadata.hint.is_async());
         let adaptive_sync_candidate = kms_backend.atomic_vrr_capable()
-            && match vrr_policy {
-                VrrPolicy::Off => false,
-                VrrPolicy::Auto => solitary_fullscreen,
-                VrrPolicy::On => true,
-            };
+            && vrr_policy.allows_adaptive_sync(solitary_fullscreen);
         let async_candidate =
             tearing_policy.allows_async_request() && solitary_fullscreen && surface_async_hint;
         let reactive_presentation_candidate =
@@ -763,11 +759,11 @@ impl NativeRuntime {
                 candidate,
                 *output_id,
                 *drm_file_generation,
-                confirmed_output_presentation.output_generation,
+                confirmed_kms_presentation.output_generation,
                 atomic_pipeline,
                 target.width,
                 target.height,
-                confirmed_output_presentation.content_type,
+                confirmed_kms_presentation.content_type,
                 atomic_cursor
                     .as_ref()
                     .filter(|cursor| cursor.current().visible)
@@ -917,6 +913,7 @@ impl NativeRuntime {
                 current_software_cursor_damage,
                 runtime_plane_plan.as_ref(),
                 cursor_reveal_trace,
+                vrr_policy,
             )?
             else {
                 *queued_redraw_requested = true;
@@ -1038,6 +1035,7 @@ impl NativeRuntime {
                 frame_index,
                 &mut frame_submitted,
                 perf,
+                vrr_policy,
                 #[cfg(test)]
                 native_io_recorder,
             )?;
@@ -1193,8 +1191,9 @@ impl NativeRuntime {
                         frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
                         cursor_epoch,
                         pacing_mode,
-                        confirmed_output_presentation.content_type,
+                        confirmed_kms_presentation.content_type,
                         kms_commit_worker.as_ref(),
+                        vrr_policy,
                     )? {
                         DirectScanoutAttempt::Unchanged => {
                             direct_suppressed = note_same_buffer_suppressed(perf);
@@ -1571,9 +1570,10 @@ impl NativeRuntime {
                             ),
                             frozen_cursor_plane_owner,
                             frozen_cursor_trace_reveal,
-                            AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
+                            AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_kms_presentation.content_type),
                             release_safety,
                             dmabuf_gpu_release_lease_id,
+                            vrr_policy,
                         ).inspect_err(|_| {
                             frame_pacing.note_predictive_o1_failed();
                             frame_pacing.cancel_unsubmitted_render();
@@ -1913,6 +1913,7 @@ impl NativeRuntime {
                                         ),
                                         false,
                                         cursor_reveal_trace,
+                                        vrr_policy,
                                     )?
                                     else {
                                         server.note_frame_callback_admission_failure(protocol_batch_id);
@@ -2215,7 +2216,7 @@ impl NativeRuntime {
                                 .map(|(before, after)| after.delta_us_since(before))
                                 .unwrap_or((0, 0));
                             let repaint_present_start = Instant::now();
-                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead { (NativePresentResult::Noop, None) } else { present_composited_compatibility_frame(scanout, server, output_transactions, *drm_file_generation, target.crtc_id, presentation_deadline, *scheduled_presentation_target, scheduler_now, predicted_total_cost, pacing_mode, render_generation, effective_cursor.as_ref(), cursor_epoch, *frame_index, kms_backend, scene_history)? };
+                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead { (NativePresentResult::Noop, None) } else { present_composited_compatibility_frame(scanout, server, output_transactions, *drm_file_generation, target.crtc_id, presentation_deadline, *scheduled_presentation_target, scheduler_now, predicted_total_cost, pacing_mode, render_generation, effective_cursor.as_ref(), cursor_epoch, *frame_index, kms_backend, scene_history, vrr_policy)? };
                             #[cfg(test)]
                             if !render_ahead {
                                 native_io_recorder.record(NativeIoOperation::ScanoutPresent);

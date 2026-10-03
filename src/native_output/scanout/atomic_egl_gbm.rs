@@ -327,7 +327,14 @@ impl AtomicEglGbmScanout {
             .request_direct_release(DirectReleaseProof::Unproven, false);
     }
 
-    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+    pub(crate) fn rebind_session_generation(
+        &mut self,
+        generation: u64,
+        vrr_connector_capable: bool,
+        vrr_crtc_property_available: bool,
+    ) {
+        self.vrr_connector_capable = vrr_connector_capable;
+        self.vrr_crtc_property_available = vrr_crtc_property_available;
         let Some(pool) = self.pool.as_mut() else {
             return;
         };
@@ -903,6 +910,7 @@ impl AtomicEglGbmScanout {
         async_policy_inputs: AtomicAsyncPolicyInputs,
         dmabuf_gpu_release_safety: DmabufGpuReleaseSafety,
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
+        vrr_policy: VrrPolicy,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let metadata = server
             .fullscreen_tree_presentation_metadata()
@@ -910,10 +918,6 @@ impl AtomicEglGbmScanout {
         let metrics = server.fullscreen_render_plan_metrics();
         let resolved_content_type =
             self.resolve_connector_content_type(metadata.content_type.drm_value());
-        let acquire_strategy = match pacing_mode {
-            NativeOutputPacingMode::ReactiveDouble => 0,
-            NativeOutputPacingMode::PredictiveTriple => 1,
-        };
         let cursor_visible = matches!(
             cursor.as_ref(),
             Some(CursorPlaneAssignment::Atomic {
@@ -927,7 +931,7 @@ impl AtomicEglGbmScanout {
         };
         let effective_presentation = EffectivePresentation::decide(
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
-            VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref()),
+            vrr_policy,
             metadata,
             AsyncEligibility {
                 solitary_fullscreen: metrics.solitary_tree_active,
@@ -956,9 +960,23 @@ impl AtomicEglGbmScanout {
             },
         );
         let mut presentation_mode = effective_presentation.mode;
+        let mut pacing_mode = pacing_mode;
+        let mut render_ahead = render_ahead;
+        if presentation_mode.uses_vrr() {
+            // Phase 1 has no VRR-aware O1 preparation. Defensively drop a
+            // stale upstream RenderAhead decision before reserving or
+            // preparing the output transaction.
+            render_ahead = false;
+            pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+        }
+        let acquire_strategy = match pacing_mode {
+            NativeOutputPacingMode::ReactiveDouble => 0,
+            NativeOutputPacingMode::PredictiveTriple => 1,
+        };
         let content_type = resolved_content_type;
         let mut vrr_blocker = effective_presentation.vrr_blocker;
         let mut async_blocker = effective_presentation.async_blocker;
+        let mut combination_blocker = None;
         if presentation_mode != OutputPresentationMode::Vsync
             && let Some(mut rejected_key) = self.composited_presentation_validation_key(
                 output_generation,
@@ -979,17 +997,15 @@ impl AtomicEglGbmScanout {
                     let adaptive_sync_key = rejected_key;
                     rejected_key.presentation_mode = OutputPresentationMode::Async;
                     let async_key = rejected_key;
-                    if self.presentation_validation_is_accepted(adaptive_sync_key) {
-                        presentation_mode = OutputPresentationMode::AdaptiveSync;
-                        async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
-                    } else if self.presentation_validation_is_accepted(async_key) {
-                        presentation_mode = OutputPresentationMode::Async;
-                        vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
-                    } else {
-                        presentation_mode = OutputPresentationMode::Vsync;
-                        vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
-                        async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
-                    }
+                    (
+                        presentation_mode,
+                        vrr_blocker,
+                        async_blocker,
+                        combination_blocker,
+                    ) = atomic_egl_gbm_transactions::adaptive_async_fallback_diagnostics(
+                        self.presentation_validation_is_accepted(adaptive_sync_key),
+                        self.presentation_validation_is_accepted(async_key),
+                    );
                 }
                 OutputPresentationMode::AdaptiveSync => {
                     presentation_mode = OutputPresentationMode::Vsync;
@@ -1004,11 +1020,7 @@ impl AtomicEglGbmScanout {
         }
         NativePerfLogger::from_env().log("native.output_presentation_policy", || {
             vec![
-                NativePerfField::str(
-                    "configured_policy",
-                    VrrPolicy::from_environment(std::env::var("OBLIVION_ONE_VRR").ok().as_deref())
-                        .as_str(),
-                ),
+                NativePerfField::str("configured_policy", vrr_policy.as_str()),
                 NativePerfField::bool("drm_connector_capable", self.vrr_connector_capable),
                 NativePerfField::bool(
                     "crtc_vrr_property_available",
@@ -1023,6 +1035,7 @@ impl AtomicEglGbmScanout {
                     "async_blocker",
                     async_blocker.map_or("none", AsyncBlocker::as_str),
                 ),
+                NativePerfField::str("combination_blocker", combination_blocker.unwrap_or("none")),
                 NativePerfField::u64("output_generation", output_generation),
             ]
         });
@@ -1156,12 +1169,12 @@ impl AtomicEglGbmScanout {
                 equivalent_direct_key,
             )
         };
-        let transaction = match transaction_result {
+        let transaction = match transaction_result.and_then(|transaction| {
+            transaction.with_presentation_state(presentation_mode, content_type)
+        }) {
             Ok(transaction) => transaction
-                .with_presentation_state(presentation_mode, content_type)
                 .with_presentation_validation_key(presentation_validation_key)
                 .with_client_cursor_presentation_key(hardware_cursor_presentation_key),
-
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 self.swapchain_mut()?.cancel_render_before_gpu(slot)?;

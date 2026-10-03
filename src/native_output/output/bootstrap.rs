@@ -23,62 +23,25 @@ impl NativeConnector {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeVrrPreference {
-    Auto,
-    On,
-    Off,
-}
-
-impl NativeVrrPreference {
-    pub(crate) fn from_env() -> Self {
-        let Some(value) = std::env::var_os("OBLIVION_ONE_VRR") else {
-            return Self::Auto;
-        };
-        let value = value.to_string_lossy();
-        let preference = Self::parse(&value);
-        if preference == Self::Auto && !value.eq_ignore_ascii_case("auto") {
-            eprintln!("native KMS: unknown OBLIVION_ONE_VRR={value:?}; using auto");
-        }
-        preference
+pub(crate) fn native_vrr_policy_from_environment() -> VrrPolicy {
+    let Some(value) = std::env::var_os("OBLIVION_ONE_VRR") else {
+        return VrrPolicy::Auto;
+    };
+    let value = value.to_string_lossy();
+    let policy = VrrPolicy::from_environment(Some(&value));
+    if policy == VrrPolicy::Auto && !value.eq_ignore_ascii_case("auto") {
+        eprintln!("native KMS: unknown OBLIVION_ONE_VRR={value:?}; using auto");
     }
-
-    pub(crate) fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" | "enable" | "enabled" => Self::On,
-            "0" | "false" | "no" | "off" | "disable" | "disabled" => Self::Off,
-            _ => Self::Auto,
-        }
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl From<NativeVrrPreference> for oblivion_one::compositor::VrrPolicy {
-    fn from(value: NativeVrrPreference) -> Self {
-        match value {
-            NativeVrrPreference::Auto => Self::Auto,
-            NativeVrrPreference::On => Self::On,
-            NativeVrrPreference::Off => Self::Off,
-        }
-    }
+    policy
 }
 
 pub(crate) const fn vrr_doctor_severity(
-    requested: NativeVrrPreference,
+    requested: VrrPolicy,
     supported: bool,
 ) -> oblivion_one::control_snapshots::DoctorSeverity {
     match requested {
-        NativeVrrPreference::On if !supported => {
-            oblivion_one::control_snapshots::DoctorSeverity::Warning
-        }
-        NativeVrrPreference::Auto | NativeVrrPreference::Off | NativeVrrPreference::On => {
+        VrrPolicy::On if !supported => oblivion_one::control_snapshots::DoctorSeverity::Warning,
+        VrrPolicy::Auto | VrrPolicy::Off | VrrPolicy::On => {
             oblivion_one::control_snapshots::DoctorSeverity::Ok
         }
     }
@@ -93,20 +56,17 @@ mod doctor_tests {
     fn doctor_severity_reports_only_hard_capability_unavailability_for_on() {
         for supported in [false, true] {
             assert_eq!(
-                vrr_doctor_severity(NativeVrrPreference::Off, supported),
+                vrr_doctor_severity(VrrPolicy::Off, supported),
                 DoctorSeverity::Ok
             );
             assert_eq!(
-                vrr_doctor_severity(NativeVrrPreference::Auto, supported),
+                vrr_doctor_severity(VrrPolicy::Auto, supported),
                 DoctorSeverity::Ok
             );
         }
+        assert_eq!(vrr_doctor_severity(VrrPolicy::On, true), DoctorSeverity::Ok);
         assert_eq!(
-            vrr_doctor_severity(NativeVrrPreference::On, true),
-            DoctorSeverity::Ok
-        );
-        assert_eq!(
-            vrr_doctor_severity(NativeVrrPreference::On, false),
+            vrr_doctor_severity(VrrPolicy::On, false),
             DoctorSeverity::Warning
         );
     }

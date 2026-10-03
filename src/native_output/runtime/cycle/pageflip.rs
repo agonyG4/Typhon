@@ -22,6 +22,44 @@ use oblivion_one::native::adaptive_buffering::{
 };
 use oblivion_one::native::presentation_deadline::PresentationTarget;
 
+fn is_non_primary_atomic_completion(completion: AtomicCommitCompletion) -> bool {
+    matches!(
+        completion,
+        AtomicCommitCompletion::Completed { kind, .. } if !kind.is_primary()
+    )
+}
+
+fn confirmed_presentation_for_pageflip(
+    transaction: &OutputTransaction,
+    output_generation: u64,
+    successful_matching_pageflip: bool,
+) -> Option<ConfirmedKmsPresentationState> {
+    (successful_matching_pageflip && transaction.output_generation() == output_generation).then(
+        || ConfirmedKmsPresentationState {
+            mode: transaction.presentation_mode(),
+            content_type: transaction.content_type(),
+            output_generation,
+        },
+    )
+}
+
+fn confirm_kms_presentation_state(
+    confirmed: &mut ConfirmedKmsPresentationState,
+    transaction: &OutputTransaction,
+    output_generation: u64,
+    successful_matching_pageflip: bool,
+) -> bool {
+    let Some(next) = confirmed_presentation_for_pageflip(
+        transaction,
+        output_generation,
+        successful_matching_pageflip,
+    ) else {
+        return false;
+    };
+    *confirmed = next;
+    true
+}
+
 fn pageflip_identity(
     output_id: OutputId,
     token: PageFlipToken,
@@ -655,13 +693,13 @@ impl NativeRuntime {
             atomic_commit_arbiter,
             output_transactions,
             presented_planes,
-            confirmed_output_presentation,
+            confirmed_kms_presentation,
             presentation_deadline,
             presentation_timing,
             scheduled_presentation_target,
             render_journal,
             adaptive_buffering,
-            vrr_preference,
+            vrr_policy,
             pending_proven_deadline_miss,
             effective_app_gpu_policy: _,
             last_primary_presented_at_ns,
@@ -1097,7 +1135,7 @@ impl NativeRuntime {
                     ..
                 })
             );
-            let completion = if cursor_commit {
+            let completion = if atomic_completion.is_some_and(is_non_primary_atomic_completion) {
                 // Cursor-only Atomic commits are validated and completed by
                 // the Atomic arbiter, not by the primary frame scheduler.
                 PageFlipCompletionResult::Stale
@@ -1109,6 +1147,55 @@ impl NativeRuntime {
             } else {
                 frame_scheduler.complete_kernel_pageflip(pageflip.user_data, compositor_receive_ns)
             };
+            let pageflip_token = PageFlipToken::new(pageflip.user_data)
+                .ok_or_else(|| io::Error::other("pageflip token is zero"))?;
+            let atomic_transaction_id = match atomic_completion {
+                Some(AtomicCommitCompletion::Completed { kind, .. }) => Some(kind.transaction_id()),
+                _ => None,
+            };
+            let compatibility_transaction_id =
+                matches!(completion, PageFlipCompletionResult::Completed { .. })
+                    .then(|| {
+                        output_transactions
+                            .submitted_transaction(pageflip_token, *drm_file_generation)
+                    })
+                    .flatten();
+            let presentation_transaction_id =
+                atomic_transaction_id.or(compatibility_transaction_id);
+            if let Some(transaction_id) = presentation_transaction_id
+                && let Some(record) =
+                    output_transactions.transaction_including_terminal(transaction_id)
+            {
+                let descriptor = record.descriptor();
+                if confirm_kms_presentation_state(
+                    confirmed_kms_presentation,
+                    descriptor,
+                    *drm_file_generation,
+                    true,
+                ) {
+                    let presentation_mode = descriptor.presentation_mode();
+                    perf.log("native.output_presentation_confirmed", || {
+                        vec![
+                            NativePerfField::str("configured_policy", vrr_policy.as_str()),
+                            NativePerfField::bool(
+                                "drm_connector_capable",
+                                kms_backend.atomic_connector_vrr_capable(),
+                            ),
+                            NativePerfField::bool(
+                                "crtc_vrr_property_available",
+                                kms_backend.atomic_crtc_vrr_property_available(),
+                            ),
+                            NativePerfField::str("effective_mode", presentation_mode.as_str()),
+                            NativePerfField::str("submitted_mode", presentation_mode.as_str()),
+                            NativePerfField::str(
+                                "pageflip_confirmed_mode",
+                                presentation_mode.as_str(),
+                            ),
+                            NativePerfField::u64("output_generation", *drm_file_generation),
+                        ]
+                    });
+                }
+            }
             if matches!(completion, PageFlipCompletionResult::Completed { .. }) {
                 if let Some(token) = pageflip_drain.deferred_promotion_token {
                     scanout
@@ -1129,59 +1216,13 @@ impl NativeRuntime {
             }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
                 let completed_frame_id = frame_pacing.pending;
-                let compatibility_transaction_id = output_transactions.submitted_transaction(
-                    PageFlipToken::new(pageflip.user_data)
-                        .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                    *drm_file_generation,
-                );
-                let presentation_mode = match atomic_completion {
-                    Some(AtomicCommitCompletion::Completed { kind, .. }) => output_transactions
-                        .transaction(kind.transaction_id())
-                        .map(|record| record.descriptor().presentation_mode())
-                        .unwrap_or(OutputPresentationMode::Vsync),
-                    _ => compatibility_transaction_id
-                        .and_then(|transaction_id| {
-                            output_transactions
-                                .transaction(transaction_id)
-                                .map(|record| record.descriptor().presentation_mode())
-                        })
-                        .unwrap_or(OutputPresentationMode::Vsync),
-                };
-                let presentation_content_type = match atomic_completion {
-                    Some(AtomicCommitCompletion::Completed { kind, .. }) => output_transactions
-                        .transaction(kind.transaction_id())
-                        .map(|record| record.descriptor().content_type())
-                        .unwrap_or(oblivion_one::compositor::DrmContentType::Graphics),
-                    _ => compatibility_transaction_id
-                        .and_then(|transaction_id| {
-                            output_transactions
-                                .transaction(transaction_id)
-                                .map(|record| record.descriptor().content_type())
-                        })
-                        .unwrap_or(oblivion_one::compositor::DrmContentType::Graphics),
-                };
-                *confirmed_output_presentation = ConfirmedOutputPresentationState {
-                    mode: presentation_mode,
-                    content_type: presentation_content_type,
-                    output_generation: *drm_file_generation,
-                };
-                perf.log("native.output_presentation_confirmed", || {
-                    vec![
-                        NativePerfField::str("configured_policy", vrr_preference.as_str()),
-                        NativePerfField::bool(
-                            "drm_connector_capable",
-                            kms_backend.atomic_connector_vrr_capable(),
-                        ),
-                        NativePerfField::bool(
-                            "crtc_vrr_property_available",
-                            kms_backend.atomic_crtc_vrr_property_available(),
-                        ),
-                        NativePerfField::str("effective_mode", presentation_mode.as_str()),
-                        NativePerfField::str("submitted_mode", presentation_mode.as_str()),
-                        NativePerfField::str("pageflip_confirmed_mode", presentation_mode.as_str()),
-                        NativePerfField::u64("output_generation", *drm_file_generation),
-                    ]
-                });
+                let presentation_mode = presentation_transaction_id
+                    .and_then(|transaction_id| {
+                        output_transactions
+                            .transaction_including_terminal(transaction_id)
+                            .map(|record| record.descriptor().presentation_mode())
+                    })
+                    .unwrap_or(OutputPresentationMode::Vsync);
                 let presentation = (if presentation_mode.is_async() && direct_pending {
                     FramePresentation::tearing_zero_copy(
                         *presentation_clock,

@@ -48,7 +48,7 @@ pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
     bootstrap: &NativeOutputBootstrap,
     session_probe: &NativeSessionProbe,
-    vrr_preference: NativeVrrPreference,
+    vrr_policy: VrrPolicy,
     startup_app: Option<&Vec<String>>,
     perf: NativePerfLogger,
 ) {
@@ -86,7 +86,7 @@ pub(super) fn log_native_runtime_bootstrap(
     } else {
         println!("connected output: missing");
     }
-    println!("native VRR policy: {}", vrr_preference.as_str());
+    println!("native VRR policy: {}", vrr_policy.as_str());
     println!("native VRR capability: pending live atomic DRM discovery");
     match bootstrap.kms_resources.as_ref() {
         Ok(Some(resources)) => {
@@ -136,7 +136,7 @@ pub(super) fn log_native_runtime_bootstrap(
                 "render_device",
                 display_optional_path(bootstrap.render_device.as_deref()),
             ),
-            NativePerfField::str("vrr_policy", vrr_preference.as_str()),
+            NativePerfField::str("vrr_policy", vrr_policy.as_str()),
             NativePerfField::str(
                 "vrr_sysfs_observation",
                 bootstrap
@@ -226,7 +226,7 @@ struct NativeRuntimeBootstrapTail {
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
-    vrr_preference: NativeVrrPreference,
+    vrr_policy: VrrPolicy,
     initial_presented_scene: NativeFrameSceneSnapshot,
 }
 impl NativeRuntime {
@@ -262,7 +262,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
-            vrr_preference,
+            vrr_policy,
             initial_presented_scene,
         } = parts;
         let mut legacy_cursor = pre_kms_legacy_cursor;
@@ -692,7 +692,7 @@ impl NativeRuntime {
             dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
             started_at: Instant::now(),
-            vrr_preference,
+            vrr_policy,
             xwayland,
             xwayland_reactor_tokens,
             xwayland_reactor_generation: 0,
@@ -728,7 +728,7 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new_for_output(output_id),
-            confirmed_output_presentation: ConfirmedOutputPresentationState::default(),
+            confirmed_kms_presentation: ConfirmedKmsPresentationState::default(),
             presentation_timing,
             presentation_deadline,
             scheduled_presentation_target,
@@ -812,12 +812,12 @@ impl NativeRuntime {
         let startup_app = (!app.is_empty()).then_some(app);
         let bootstrap = NativeOutputBootstrap::discover();
         let session_probe = NativeSessionProbe::detect();
-        let vrr_preference = NativeVrrPreference::from_env();
+        let vrr_policy = native_vrr_policy_from_environment();
         log_native_runtime_bootstrap(
             &server,
             &bootstrap,
             &session_probe,
-            vrr_preference,
+            vrr_policy,
             startup_app.as_ref(),
             perf,
         );
@@ -1533,7 +1533,7 @@ impl NativeRuntime {
         });
         perf.log("native.vrr_capability", || {
             vec![
-                NativePerfField::str("configured_policy", vrr_preference.as_str()),
+                NativePerfField::str("configured_policy", vrr_policy.as_str()),
                 NativePerfField::bool(
                     "drm_connector_capable",
                     kms_backend.atomic_connector_vrr_capable(),
@@ -1589,7 +1589,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
-            vrr_preference,
+            vrr_policy,
             initial_presented_scene,
         })
     }

@@ -447,6 +447,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     cursor_reveal_trace: Option<
         crate::native_output::presentation::cursor_trace::CursorRevealTraceSnapshot,
     >,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<WorkerQueueOutcome> {
     if scanout.compatibility_framebuffer_id().is_none() {
         return Ok(WorkerQueueOutcome::Unavailable(
@@ -468,6 +469,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         cursor,
         cursor_epoch,
         Some(kms_backend),
+        vrr_policy,
     )?
     else {
         return Ok(WorkerQueueOutcome::Unavailable(

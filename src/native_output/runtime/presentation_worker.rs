@@ -269,6 +269,7 @@ pub(super) fn present_composited_compatibility_frame(
     frame_id: u64,
     kms_backend: &KmsBackendSelection,
     scene_history: &mut NativeSceneHistory,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
     let compatibility_target = scheduled_presentation_target
         .or_else(|| presentation_deadline.reactive_target(scheduler_now, predicted_total_cost))
@@ -296,6 +297,7 @@ pub(super) fn present_composited_compatibility_frame(
                 content_type,
             )
         },
+        vrr_policy,
     );
     if result.is_err() {
         scene_history.discard_ready();
@@ -795,6 +797,7 @@ pub(super) fn present_cursor_for_presentation(
     current_software_cursor_damage: Option<NativeDamageRect>,
     plane_plan: Option<&RuntimePlanePlan>,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<Option<SchedulerDecision>> {
     let cursor_surface_damage = desired
         .as_ref()
@@ -815,6 +818,7 @@ pub(super) fn present_cursor_for_presentation(
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let cursor_delivery = presented_delivery_for_plan(plane_plan, &desired);
         let (presentation_mode, content_type) = effective_output_presentation(
+            vrr_policy,
             server,
             desired.as_ref().is_some_and(|state| state.visible),
             Some(kms_backend),
@@ -901,6 +905,7 @@ pub(super) fn present_cursor_for_presentation(
         cursor_surface_damage,
         server,
         cursor_reveal_trace,
+        vrr_policy,
     )?;
     if decision == SchedulerDecision::WaitForPageFlip {
         *last_submitted_cursor_epoch = cursor_epoch;
@@ -975,6 +980,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
     context: WorkerPrimarySubmissionContext<'_>,
     ready_submit: bool,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
@@ -1063,7 +1069,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
     }
     let trace_snapshot = explicit.swapchain()?.ready_cursor_trace_reveal();
     let (token, framebuffer_id, transaction_id) =
-        explicit.submit_ready_frame(kms_backend, server, output_transactions)?;
+        explicit.submit_ready_frame(kms_backend, server, output_transactions, vrr_policy)?;
     if let Some(snapshot) = trace_snapshot
         && let Some(ledger) = cursor_reveal_trace.as_mut()
         && let Some(token) = PageFlipToken::new(token)
@@ -1120,6 +1126,7 @@ pub(super) fn queue_compatibility_for_presentation(
     test_policy: KmsCommitTestPolicy,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
+    vrr_policy: VrrPolicy,
 ) -> NativeResult<Option<(NativePresentResult, Option<OutputTransactionId>)>> {
     let trace_snapshot =
         if let KmsPrimaryCursorPresentation::Promote(state) = primary_cursor_presentation {
@@ -1161,6 +1168,7 @@ pub(super) fn queue_compatibility_for_presentation(
         cursor_epoch,
         validation_base,
         trace_snapshot,
+        vrr_policy,
     )? {
         WorkerQueueOutcome::Queued {
             transaction_id,

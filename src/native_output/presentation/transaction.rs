@@ -111,6 +111,7 @@ pub(crate) enum OutputTransactionBuildError {
     FrameBatchForPlaneDelta,
     DirectSurfaceForCompositedContent,
     DirectSurfaceForPlaneDelta,
+    VrrCannotUseDeferredO1,
     PresentationFeedbackBatchForCompatibilityImmediate,
     OverlayAssignmentsUnsupported,
 }
@@ -869,7 +870,15 @@ impl OutputTransaction {
         mut self,
         presentation_mode: OutputPresentationMode,
         content_type: DrmContentType,
-    ) -> Self {
+    ) -> Result<Self, OutputTransactionBuildError> {
+        if presentation_mode.uses_vrr()
+            && matches!(
+                self.reservation,
+                FramePresentationReservation::DeferredO1(_)
+            )
+        {
+            return Err(OutputTransactionBuildError::VrrCannotUseDeferredO1);
+        }
         self.presentation_mode = presentation_mode;
         self.content_type = content_type;
         self.pacing_mode = if presentation_mode.is_async() || presentation_mode.uses_vrr() {
@@ -877,7 +886,7 @@ impl OutputTransaction {
         } else {
             self.selected_pacing_mode
         };
-        self
+        Ok(self)
     }
 
     pub(crate) fn with_presentation_validation_key(
@@ -1135,6 +1144,9 @@ pub(crate) fn classify_direct_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionError, OutputTransactionLedger,
+    };
     use std::time::Duration;
 
     fn target() -> PresentationTarget {
@@ -1192,6 +1204,38 @@ mod tests {
         )
         .expect("deferred transaction");
         assert!(transaction.bound_target().is_none());
+        assert_eq!(
+            transaction
+                .clone()
+                .with_presentation_state(
+                    OutputPresentationMode::AdaptiveSync,
+                    DrmContentType::Graphics,
+                )
+                .unwrap_err(),
+            OutputTransactionBuildError::VrrCannotUseDeferredO1
+        );
+        let mut ledger = OutputTransactionLedger::new_for_output(transaction.output_id());
+        ledger
+            .insert(transaction.clone())
+            .expect("deferred transaction enters the ledger");
+        assert_eq!(
+            ledger.replace_presentation_state_before_submit(
+                id,
+                OutputPresentationMode::AdaptiveSync,
+                DrmContentType::Graphics,
+                None,
+            ),
+            Err(OutputTransactionError::VrrCannotUseDeferredO1)
+        );
+        assert_eq!(
+            ledger
+                .transaction(id)
+                .expect("deferred transaction remains active")
+                .descriptor()
+                .presentation_mode(),
+            OutputPresentationMode::Vsync,
+            "rejected replacement leaves the deferred transaction unchanged"
+        );
 
         let claim = PrimaryRefreshClaim {
             sequence: 3,
@@ -1237,6 +1281,7 @@ mod tests {
             assert_eq!(
                 base.clone()
                     .with_presentation_state(mode, DrmContentType::Graphics)
+                    .expect("VRR compatibility transaction is not deferred O1")
                     .pacing_mode(),
                 NativeOutputPacingMode::ReactiveDouble
             );
@@ -1247,12 +1292,15 @@ mod tests {
                     OutputPresentationMode::AdaptiveSync,
                     DrmContentType::Graphics,
                 )
+                .expect("VRR compatibility transaction is not deferred O1")
                 .with_presentation_state(OutputPresentationMode::Vsync, DrmContentType::Graphics)
+                .expect("Vsync compatibility state is valid")
                 .pacing_mode(),
             NativeOutputPacingMode::PredictiveTriple
         );
         assert_eq!(
             base.with_presentation_state(OutputPresentationMode::Vsync, DrmContentType::Graphics)
+                .expect("Vsync compatibility state is valid")
                 .pacing_mode(),
             NativeOutputPacingMode::PredictiveTriple
         );

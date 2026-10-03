@@ -55,6 +55,18 @@ impl AtomicDiscovery {
                 .is_some_and(|value| value != 0)
             && self.pipeline.crtc_props.vrr_enabled.is_some()
     }
+
+    pub(crate) fn refresh_live_pipeline_state(&mut self, refreshed: &AtomicDiscovery) {
+        // Keep the original snapshot for final restoration. Only the live
+        // properties used by current-generation runtime decisions are replaced.
+        self.pipeline.connector_props = refreshed.pipeline.connector_props.clone();
+        self.pipeline.crtc_props = refreshed.pipeline.crtc_props.clone();
+        self.pipeline.cursor_plane = refreshed.pipeline.cursor_plane.clone();
+        self.optional.vrr_enabled = refreshed.optional.vrr_enabled;
+        self.cursor_plane = refreshed.cursor_plane.clone();
+        self.cursor_width = refreshed.cursor_width;
+        self.cursor_height = refreshed.cursor_height;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,7 +827,7 @@ impl DrmAtomicBackend {
         )
     }
 
-    pub fn rediscover_cursor_for_recovery(
+    pub fn rediscover_pipeline_for_recovery(
         &mut self,
         fd: BorrowedFd<'_>,
     ) -> Result<(), AtomicKmsError> {
@@ -834,10 +846,7 @@ impl DrmAtomicBackend {
                 "Atomic recovery rediscovered a different output pipeline",
             ));
         }
-        self.discovery.pipeline.cursor_plane = refreshed.pipeline.cursor_plane.clone();
-        self.discovery.cursor_plane = refreshed.cursor_plane;
-        self.discovery.cursor_width = refreshed.cursor_width;
-        self.discovery.cursor_height = refreshed.cursor_height;
+        self.discovery.refresh_live_pipeline_state(&refreshed);
         Ok(())
     }
 
@@ -934,6 +943,29 @@ impl KmsBackendSelection {
                     content_type,
                 )
             }
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot TEST_ONLY an Adaptive Sync presentation",
+            )),
+        }
+    }
+
+    pub fn test_flip_without_cursor_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend
+                .commit_submitter()
+                .test_primary_without_cursor_with_presentation(
+                    framebuffer,
+                    token,
+                    presentation_mode,
+                    content_type,
+                ),
             KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
                 AtomicKmsErrorKind::Unsupported,
                 "legacy KMS cannot TEST_ONLY an Adaptive Sync presentation",
@@ -1517,15 +1549,15 @@ impl KmsBackendSelection {
         }
     }
 
-    pub fn rediscover_atomic_cursor_for_recovery(
+    pub fn rediscover_atomic_pipeline_for_recovery(
         &mut self,
         fd: BorrowedFd<'_>,
     ) -> Result<(), AtomicKmsError> {
         match &mut self.backend {
-            KmsDisplayBackend::Atomic(backend) => backend.rediscover_cursor_for_recovery(fd),
+            KmsDisplayBackend::Atomic(backend) => backend.rediscover_pipeline_for_recovery(fd),
             KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
                 AtomicKmsErrorKind::Unsupported,
-                "legacy KMS cannot rediscover an Atomic cursor plane",
+                "legacy KMS cannot rediscover an Atomic output pipeline",
             )),
         }
     }
