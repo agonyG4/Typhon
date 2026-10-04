@@ -61,6 +61,93 @@ void main() {
 }
 "#;
 
+pub(crate) const DUAL_KAWASE_DOWNSAMPLE_FUSED_CAPTURE_SHADER: &str = r#"#version 300 es
+precision highp float;
+precision highp int;
+uniform lowp sampler2D u_effect_input;
+uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
+uniform int u_effect_input_flip_y;
+uniform vec2 u_effect_output_size;
+uniform vec4 u_effect_capture_domain;
+uniform vec2 u_effect_capture_size;
+uniform int u_effect_capture_origin_bottom_left;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
+ivec2 typhon_capture_local_to_output_texel(ivec2 local_texel) {
+    ivec2 capture_size = ivec2(u_effect_capture_size);
+    int logical_y = capture_size.y - 1 - local_texel.y;
+    int output_y = u_effect_capture_origin_bottom_left != 0
+        ? int(u_effect_output_size.y) - 1 - int(u_effect_capture_domain.y) - logical_y
+        : int(u_effect_capture_domain.y) + logical_y;
+    return ivec2(int(u_effect_capture_domain.x) + local_texel.x, output_y);
+}
+
+lowp vec4 typhon_virtual_capture_fetch(ivec2 local_texel) {
+    ivec2 capture_size = ivec2(u_effect_capture_size);
+    ivec2 clamped_local = clamp(local_texel, ivec2(0), capture_size - ivec2(1));
+    return texelFetch(u_effect_input, typhon_capture_local_to_output_texel(clamped_local), 0);
+}
+
+// Match texture()'s lowp sampler result before the existing sRGB decode.
+lowp vec4 typhon_virtual_capture_sample(vec2 logical_uv) {
+    vec2 local_texel = logical_uv * u_effect_capture_size - vec2(0.5);
+    ivec2 lower = ivec2(floor(local_texel));
+    vec2 fraction = fract(local_texel);
+    vec4 bottom = mix(
+        typhon_virtual_capture_fetch(lower),
+        typhon_virtual_capture_fetch(lower + ivec2(1, 0)),
+        fraction.x
+    );
+    vec4 top = mix(
+        typhon_virtual_capture_fetch(lower + ivec2(0, 1)),
+        typhon_virtual_capture_fetch(lower + ivec2(1, 1)),
+        fraction.x
+    );
+    return mix(bottom, top, fraction.y);
+}
+
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    value.a = clamp(value.a, 0.0, 1.0);
+    value.rgb = clamp(value.rgb, vec3(0.0), vec3(value.a));
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(
+        straight.r <= 0.04045 ? straight.r / 12.92 : pow((straight.r + 0.055) / 1.055, 2.4),
+        straight.g <= 0.04045 ? straight.g / 12.92 : pow((straight.g + 0.055) / 1.055, 2.4),
+        straight.b <= 0.04045 ? straight.b / 12.92 : pow((straight.b + 0.055) / 1.055, 2.4)
+    );
+    return vec4(clamp(linear * value.a, vec3(0.0), vec3(value.a)), value.a);
+}
+
+void main() {
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 sample_a = typhon_virtual_capture_sample(sample_uv + offset);
+    vec4 sample_b = typhon_virtual_capture_sample(sample_uv - offset);
+    vec4 sample_c = typhon_virtual_capture_sample(sample_uv + vec2(offset.x, -offset.y));
+    vec4 sample_d = typhon_virtual_capture_sample(sample_uv + vec2(-offset.x, offset.y));
+    vec4 result = (
+        typhon_decode_premultiplied_srgb(sample_a) +
+        typhon_decode_premultiplied_srgb(sample_b) +
+        typhon_decode_premultiplied_srgb(sample_c) +
+        typhon_decode_premultiplied_srgb(sample_d)
+    ) * 0.25;
+    if (any(isnan(result)) || any(isinf(result))) result = vec4(0.0);
+    result.a = clamp(result.a, 0.0, 1.0);
+    result.rgb = clamp(result.rgb, vec3(0.0), vec3(result.a));
+    out_color = result;
+}
+"#;
+
 pub(crate) const DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;

@@ -118,7 +118,7 @@ pub struct ShaderProgramCache {
     evicted: Vec<ShaderProgramKey>,
 }
 
-fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 9] {
+fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 10] {
     [
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE)
@@ -131,6 +131,12 @@ fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'
                 .expect("builtin shader ids are non-zero"),
             1,
             blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE)
+                .expect("builtin shader ids are non-zero"),
+            2,
+            blur::DUAL_KAWASE_DOWNSAMPLE_FUSED_CAPTURE_SHADER,
         ),
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE)
@@ -328,6 +334,20 @@ impl ShaderProgramCache {
         self.uniform_location_with(key, name, || unsafe {
             gl.get_uniform_location(program, name)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_uniform_missing_for_test(
+        &mut self,
+        key: ShaderProgramKey,
+        name: &str,
+    ) -> Result<(), ShaderCacheError> {
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or(ShaderCacheError::MissingProgram)?;
+        entry.uniform_locations.insert(name.to_owned(), None);
+        Ok(())
     }
 
     fn uniform_location_with<F>(
@@ -662,10 +682,10 @@ mod tests {
             builtin_shader_program_count(),
             builtin_shader_programs().len()
         );
-        assert_eq!(builtin_shader_program_count(), 9);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 9);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 10);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 129);
+        assert_eq!(builtin_shader_program_count(), 10);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 10);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 11);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 130);
         assert_eq!(
             shader_cache_capacity_for_custom_shaders(usize::MAX),
             Err(ShaderCacheError::CapacityOverflow)

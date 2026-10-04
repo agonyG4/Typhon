@@ -85,6 +85,24 @@ hits are a subset of hits, update pixels count physical Replay writes, domain
 pixels count considered cache domains, and saved pixels are domain pixels minus
 update pixels.
 
+Newly admitted dependency-bearing checkpoints can elide their framebuffer
+shader-copy when a changed capture layout replaces a resident checkpoint from
+the same logical family and the capture is immediately followed by its unique
+first Dual Kawase downsample. The logical `SceneCapture` remains in the graph.
+Fusion is limited to that downsample and never reuses pixels from the replaced
+checkpoint. Its allocated checkpoint stays unpopulated for that frame, so a
+stable identity is materialized on the next frame before normal causal
+zero-copy reuse can begin.
+
+GPU timing reports `capture_downsample_fusion_candidates`,
+`capture_downsample_fusion_executed`,
+`capture_downsample_fusion_elided_capture_pixels`,
+`capture_downsample_fusion_output_pixels`, and
+`capture_downsample_fusion_ineligible`. A fused `SceneCapture` records zero
+physical capture pixels. Its first downsample keeps the ordinary
+`DualKawaseDownsample` timing, including the additional direct-output sampling
+work.
+
 `TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH=blit` forces the diagnostic
 framebuffer-blit path. Setting it to `shader-copy` explicitly requests the
 preferred shader-copy path while retaining the no-sampleable-output fallback.

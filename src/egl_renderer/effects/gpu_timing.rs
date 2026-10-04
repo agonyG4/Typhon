@@ -204,6 +204,11 @@ pub(crate) struct CaptureExecutionTimingSummary {
     pub(crate) checkpoint_cache_entries: usize,
     pub(crate) checkpoint_cache_bytes: u64,
     pub(crate) checkpoint_cache_admission: CheckpointCacheAdmissionStats,
+    pub(crate) capture_downsample_fusion_candidates: usize,
+    pub(crate) capture_downsample_fusion_executed: usize,
+    pub(crate) capture_downsample_fusion_elided_capture_pixels: u64,
+    pub(crate) capture_downsample_fusion_output_pixels: u64,
+    pub(crate) capture_downsample_fusion_ineligible: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -499,6 +504,11 @@ struct GpuTimingRecord {
     checkpoint_cache_entries: usize,
     checkpoint_cache_bytes: u64,
     checkpoint_cache_admission: CheckpointCacheAdmissionStats,
+    capture_downsample_fusion_candidates: usize,
+    capture_downsample_fusion_executed: usize,
+    capture_downsample_fusion_elided_capture_pixels: u64,
+    capture_downsample_fusion_output_pixels: u64,
+    capture_downsample_fusion_ineligible: usize,
     max_capture_pass: Option<MaxCapturePassTiming>,
     max_effect_pass: Option<MaxEffectPassTiming>,
     max_composite_scene_replay: Option<MaxCompositeSceneReplayTiming>,
@@ -1526,6 +1536,23 @@ impl TimingState {
                 .map_or(CheckpointCacheAdmissionStats::default(), |summary| {
                     summary.checkpoint_cache_admission
                 }),
+            capture_downsample_fusion_candidates: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.capture_downsample_fusion_candidates),
+            capture_downsample_fusion_executed: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.capture_downsample_fusion_executed),
+            capture_downsample_fusion_elided_capture_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| {
+                    summary.capture_downsample_fusion_elided_capture_pixels
+                }),
+            capture_downsample_fusion_output_pixels: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.capture_downsample_fusion_output_pixels),
+            capture_downsample_fusion_ineligible: aggregate
+                .capture_execution
+                .map_or(0, |summary| summary.capture_downsample_fusion_ineligible),
             composite_scene_replay_timing_available: composite_scene_replay_summary_is_complete(
                 aggregate.composite_scene_replay_timing_available,
                 aggregate.composite_scene_replay_expected_spans,
@@ -1996,7 +2023,7 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         .max_composite_scene_replay
         .map_or(0, |replay| replay.scene_vbo_upload_bytes);
     let line = format!(
-        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} checkpoint_cache_hits={} checkpoint_cache_full_refreshes={} checkpoint_cache_zero_copy_hits={} checkpoint_cache_update_pixels={} checkpoint_cache_domain_pixels={} checkpoint_cache_saved_pixels={} replay_capture_cache_hits={} replay_capture_cache_full_refreshes={} replay_capture_cache_zero_copy_hits={} replay_capture_cache_update_pixels={} replay_capture_cache_domain_pixels={} replay_capture_cache_saved_pixels={} checkpoint_causal_proven_unchanged={} checkpoint_causal_unproven={} checkpoint_causal_dependency_changed={} checkpoint_causal_scene_prefix_changed={} checkpoint_cache_entries={} checkpoint_cache_bytes={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
+        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} checkpoint_cache_hits={} checkpoint_cache_full_refreshes={} checkpoint_cache_zero_copy_hits={} checkpoint_cache_update_pixels={} checkpoint_cache_domain_pixels={} checkpoint_cache_saved_pixels={} replay_capture_cache_hits={} replay_capture_cache_full_refreshes={} replay_capture_cache_zero_copy_hits={} replay_capture_cache_update_pixels={} replay_capture_cache_domain_pixels={} replay_capture_cache_saved_pixels={} checkpoint_causal_proven_unchanged={} checkpoint_causal_unproven={} checkpoint_causal_dependency_changed={} checkpoint_causal_scene_prefix_changed={} checkpoint_cache_entries={} checkpoint_cache_bytes={} capture_downsample_fusion_candidates={} capture_downsample_fusion_executed={} capture_downsample_fusion_elided_capture_pixels={} capture_downsample_fusion_output_pixels={} capture_downsample_fusion_ineligible={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
             .frame_id
             .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
@@ -2091,6 +2118,11 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         record.checkpoint_causal_scene_prefix_changed,
         record.checkpoint_cache_entries,
         record.checkpoint_cache_bytes,
+        record.capture_downsample_fusion_candidates,
+        record.capture_downsample_fusion_executed,
+        record.capture_downsample_fusion_elided_capture_pixels,
+        record.capture_downsample_fusion_output_pixels,
+        record.capture_downsample_fusion_ineligible,
         max_capture_pass_ns,
         max_capture_pass_id,
         max_capture_instance_id,
@@ -2246,6 +2278,11 @@ impl EffectGpuProfiler {
     }
 
     pub(crate) fn cache_telemetry_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            return true;
+        }
+        #[cfg(not(test))]
         matches!(&self.state, ProfilerState::Active(_))
     }
 
@@ -4967,6 +5004,11 @@ mod tests {
             checkpoint_cache_entries: 0,
             checkpoint_cache_bytes: 0,
             checkpoint_cache_admission: CheckpointCacheAdmissionStats::default(),
+            capture_downsample_fusion_candidates: 3,
+            capture_downsample_fusion_executed: 2,
+            capture_downsample_fusion_elided_capture_pixels: 345,
+            capture_downsample_fusion_output_pixels: 78,
+            capture_downsample_fusion_ineligible: 1,
             max_capture_pass: None,
             max_effect_pass: None,
             max_composite_scene_replay: None,
@@ -5060,6 +5102,11 @@ mod tests {
             "checkpoint_cache_bytes_at_admission",
             "checkpoint_cache_additional_checkpoint_budget_needed_for_all_candidates_bytes",
             "checkpoint_cache_additional_checkpoint_budget_needed_known",
+            "capture_downsample_fusion_candidates",
+            "capture_downsample_fusion_executed",
+            "capture_downsample_fusion_elided_capture_pixels",
+            "capture_downsample_fusion_output_pixels",
+            "capture_downsample_fusion_ineligible",
         ] {
             assert_eq!(
                 line.split_whitespace()
@@ -5106,13 +5153,23 @@ mod tests {
         assert!(saturated_line.contains("graph_unattributed_ns=0"));
         assert!(line.contains("checkpoint_capture_passes=3"));
         assert!(line.contains("checkpoint_capture_execution_passes=2"));
+        assert!(line.contains("capture_downsample_fusion_candidates=3"));
+        assert!(line.contains("capture_downsample_fusion_executed=2"));
+        assert!(line.contains("capture_downsample_fusion_elided_capture_pixels=345"));
+        assert!(line.contains("capture_downsample_fusion_output_pixels=78"));
+        assert!(line.contains("capture_downsample_fusion_ineligible=1"));
+        let legacy_line = line.replace(
+            " capture_downsample_fusion_candidates=3 capture_downsample_fusion_executed=2 capture_downsample_fusion_elided_capture_pixels=345 capture_downsample_fusion_output_pixels=78 capture_downsample_fusion_ineligible=1",
+            "",
+        );
         assert_eq!(
-            line
+            legacy_line
                 .split(" checkpoint_cache_candidates=")
                 .next()
                 .expect("admission fields follow legacy timing fields")
                 .strip_suffix(" max_capture_replay_detail_available=0 pass_timed_ns=281400 graph_unattributed_ns=0 max_effect_pass_ns=0 max_effect_pass_id=0 max_effect_instance_id=0 max_effect_kind=none max_effect_capture_mode=none max_effect_pixels=0 max_effect_damage_rects=0 max_effect_damage_bbox_pixels=0 max_effect_target_width=0 max_effect_target_height=0 graph_gap_attribution_available=0 max_graph_gap_ns=0 max_graph_gap_position=none max_graph_gap_after_pass_id=0 max_graph_gap_after_instance_id=0 max_graph_gap_after_kind=none max_graph_gap_after_capture_mode=none max_graph_gap_after_checkpoint_count=0 max_graph_gap_before_pass_id=0 max_graph_gap_before_instance_id=0 max_graph_gap_before_kind=none max_graph_gap_before_capture_mode=none max_graph_gap_before_checkpoint_count=0 composite_scene_replay_timing_available=1 composite_scene_replay_expected_spans=0 composite_scene_replay_resolved_spans=0 composite_scene_replay_gpu_ns=0 composite_scene_replay_host_cpu_ns=0 composite_scene_replay_scene_scan_pairs=0 composite_scene_replay_commands_executed=0 composite_scene_replay_draw_calls=0 composite_scene_replay_texture_binds=0 max_composite_scene_replay_gpu_ns=0 max_composite_scene_replay_pass_id=0 max_composite_scene_replay_instance_id=0 max_composite_scene_replay_command_start=0 max_composite_scene_replay_command_end=0 max_composite_scene_replay_command_count=0 max_composite_scene_replay_scene_commands=0 max_composite_scene_replay_active_work_rects=0 max_composite_scene_replay_active_work_pixels=0 max_composite_scene_replay_command_region_pairs=0 max_composite_scene_replay_scene_scan_pairs=0 max_composite_scene_replay_pending_checkpoints=0 max_composite_scene_replay_host_cpu_ns=0 max_composite_scene_replay_commands_considered=0 max_composite_scene_replay_commands_executed=0 max_composite_scene_replay_draw_calls=0 max_composite_scene_replay_texture_binds=0 max_composite_scene_replay_scene_vbo_uploads=0 max_composite_scene_replay_scene_vbo_upload_bytes=0")
-                .expect("appended timing coverage and max-effect fields"),
+                .expect("appended timing coverage and max-effect fields")
+                ,
             "event=effect_gpu_timing frame_id=120 scope=31 total_ns=281400 capture_ns=41200 normalize_ns=0 blur_downsample_ns=78300 blur_upsample_ns=109700 fragment_ns=0 blend_ns=0 mask_ns=0 composite_ns=52200 postprocess_ns=0 timed_passes=6 dropped_passes=0 capture_pixels=640 normalize_pixels=0 blur_downsample_pixels=320 blur_upsample_pixels=160 fragment_pixels=0 blend_pixels=0 mask_pixels=0 composite_pixels=640 postprocess_pixels=0 query_pool_capacity=4096 query_pool_high_water=14 dropped_spans=0 disjoint_invalidated_spans=0 scene_capture_ns=0 surface_capture_ns=0 replay_capture_ns=0 framebuffer_capture_ns=0 framebuffer_blit_capture_ns=0 framebuffer_shader_copy_capture_ns=0 checkpoint_capture_ns=0 scene_capture_passes=0 surface_capture_passes=0 replay_capture_passes=0 framebuffer_capture_passes=0 framebuffer_blit_capture_passes=0 framebuffer_shader_copy_capture_passes=0 checkpoint_capture_passes=3 scene_capture_pixels=0 surface_capture_pixels=0 replay_capture_pixels=0 framebuffer_capture_pixels=0 framebuffer_blit_capture_pixels=0 framebuffer_shader_copy_capture_pixels=0 checkpoint_capture_pixels=0 capture_execution_summary_available=0 capture_execution_pixels=0 scene_capture_execution_pixels=0 surface_capture_execution_pixels=0 replay_capture_execution_pixels=0 framebuffer_capture_execution_pixels=0 framebuffer_shader_copy_capture_execution_pixels=0 checkpoint_capture_execution_pixels=0 replay_capture_execution_passes=0 framebuffer_capture_execution_passes=0 checkpoint_capture_execution_passes=2 replay_capture_commands=0 checkpoint_dependency_edges=0 replay_capture_materialization_rects=0 replay_capture_execution_regions=0 replay_capture_disjoint_overflows=0 replay_capture_command_region_pairs=0 replay_capture_scene_scan_pairs=0 replay_capture_planner_commands_visited=0 replay_capture_planner_commands_drawable=0 replay_capture_commands_executed=0 replay_capture_draw_calls=0 replay_capture_host_cpu_ns=0 replay_capture_selection_cpu_ns=0 replay_capture_visibility_cpu_ns=0 replay_capture_draw_submit_cpu_ns=0 checkpoint_cache_hits=0 checkpoint_cache_full_refreshes=0 checkpoint_cache_zero_copy_hits=0 checkpoint_cache_update_pixels=0 checkpoint_cache_domain_pixels=0 checkpoint_cache_saved_pixels=0 replay_capture_cache_hits=0 replay_capture_cache_full_refreshes=0 replay_capture_cache_zero_copy_hits=0 replay_capture_cache_update_pixels=0 replay_capture_cache_domain_pixels=0 replay_capture_cache_saved_pixels=0 checkpoint_causal_proven_unchanged=0 checkpoint_causal_unproven=0 checkpoint_causal_dependency_changed=0 checkpoint_causal_scene_prefix_changed=0 checkpoint_cache_entries=0 checkpoint_cache_bytes=0 max_capture_pass_ns=0 max_capture_pass_id=0 max_capture_instance_id=0 max_capture_kind=none max_capture_mode=none max_capture_pixels=0 max_capture_checkpoint_count=0 max_capture_execution_pixels=0 max_capture_materialization_rects=0 max_capture_execution_regions=0 max_capture_disjoint_overflow=0 max_capture_replay_commands=0 max_capture_command_region_pairs=0 max_capture_scene_commands=0 max_capture_scene_scan_pairs=0 max_capture_planner_commands_visited=0 max_capture_planner_commands_drawable=0 max_capture_commands_executed=0 max_capture_draw_calls=0 max_capture_host_cpu_ns=0 max_capture_selection_cpu_ns=0 max_capture_visibility_cpu_ns=0 max_capture_draw_submit_cpu_ns=0",
         );
     }

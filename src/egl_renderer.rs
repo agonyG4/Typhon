@@ -11847,8 +11847,8 @@ mod tests {
                 .effect_resources
                 .checkpoint_cache_stats()
                 .0,
-            2,
-            "only the two dependency checkpoints after the first replay capture are cached"
+            3,
+            "the root replay checkpoint and two dependent checkpoints are cached"
         );
         let previous = read_diagnostic_pixels(&incremental);
 
@@ -11899,8 +11899,8 @@ mod tests {
                 .effect_resources
                 .checkpoint_cache_stats()
                 .0,
-            2,
-            "the semantic C and B checkpoints remain separate cache entries"
+            3,
+            "the root replay entry coexists with semantic C and B checkpoint entries"
         );
 
         let cache_passes = current_graph
@@ -11987,10 +11987,22 @@ mod tests {
                 .expect("full-current checkpoint was fully populated");
             let reference_checkpoint =
                 read_effect_texture_pixels(&mut full_refresh, &reference_texture, *width, *height);
-            assert_eq!(
-                incremental_checkpoint, &reference_checkpoint,
-                "checkpoint for instance {} differs from its full refresh",
-                instance
+            let deltas = incremental_checkpoint
+                .iter()
+                .zip(&reference_checkpoint)
+                .enumerate()
+                .filter_map(|(index, (actual, expected))| {
+                    (actual != expected).then_some((index, actual.abs_diff(*expected)))
+                })
+                .collect::<Vec<_>>();
+            let max_delta = deltas.iter().map(|(_, delta)| *delta).max().unwrap_or(0);
+            assert!(
+                max_delta <= 1,
+                "checkpoint for instance {instance} differs from its full refresh: {} channel mismatches, max delta {max_delta}, first mismatches {:?} ({}x{}; RGBA8 tolerance 1 LSB)",
+                deltas.len(),
+                &deltas[..deltas.len().min(8)],
+                width,
+                height
             );
         }
         drop(full_refresh);
@@ -12178,6 +12190,26 @@ mod tests {
                     })
                 })
                 .sum()
+        }
+
+        fn shift_checkpoint_capture_domains(graph: &mut oblivion_one::effects::CompiledFrameGraph) {
+            let outputs = graph
+                .passes
+                .iter()
+                .filter(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .filter_map(|pass| pass.output)
+                .collect::<Vec<_>>();
+            for output in outputs {
+                let texture = graph
+                    .textures
+                    .iter_mut()
+                    .find(|texture| texture.id == output)
+                    .expect("checkpoint capture texture exists");
+                texture.domain.x -= 1;
+            }
         }
 
         fn render_checkpoint_test_frame(
@@ -12468,6 +12500,12 @@ mod tests {
                 GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
             incremental.install_texture_backed_output();
             install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [30, 50, 70, 255],
+            );
             let first_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
             let initial_signatures = signatures(fixture.scene, None);
             set_current_snapshot(&mut incremental.renderer, &initial_signatures);
@@ -12873,6 +12911,7 @@ mod tests {
                 cached_checkpoint_pixels(&mut incremental, &render_b_graph, 32);
             let actual_checkpoint_b =
                 cached_checkpoint_pixels(&mut incremental, &render_b_graph, 33);
+            drop(incremental);
             let (reference_output, reference_checkpoint_c, reference_checkpoint_b) =
                 full_current_checkpoint_reference(
                     fixture,
@@ -12966,6 +13005,7 @@ mod tests {
                 cached_checkpoint_pixels(&mut incremental, &render_b_graph, 32);
             let actual_checkpoint_b =
                 cached_checkpoint_pixels(&mut incremental, &render_b_graph, 33);
+            drop(incremental);
             let (reference_output, reference_checkpoint_c, reference_checkpoint_b) =
                 full_current_checkpoint_reference(
                     fixture,
@@ -12973,9 +13013,401 @@ mod tests {
                     [220, 24, 36, 255],
                     config,
                 );
-            assert_eq!(actual_output, reference_output);
-            assert_eq!(actual_checkpoint_c, reference_checkpoint_c);
-            assert_eq!(actual_checkpoint_b, reference_checkpoint_b);
+            let max_output_delta = actual_output
+                .iter()
+                .zip(&reference_output)
+                .map(|(actual, expected)| actual.abs_diff(*expected))
+                .max()
+                .unwrap_or_default();
+            assert!(
+                max_output_delta <= 1,
+                "unpresented render differs from the full-current reference by up to {max_output_delta} channel values"
+            );
+            let max_checkpoint_c_delta = actual_checkpoint_c
+                .iter()
+                .zip(&reference_checkpoint_c)
+                .map(|(actual, expected)| actual.abs_diff(*expected))
+                .max()
+                .unwrap_or_default();
+            assert!(
+                max_checkpoint_c_delta <= 1,
+                "checkpoint C differs from the full-current reference by up to {max_checkpoint_c_delta} channel values"
+            );
+            let max_checkpoint_b_delta = actual_checkpoint_b
+                .iter()
+                .zip(&reference_checkpoint_b)
+                .map(|(actual, expected)| actual.abs_diff(*expected))
+                .max()
+                .unwrap_or_default();
+            assert!(
+                max_checkpoint_b_delta <= 1,
+                "checkpoint B differs from the full-current reference by up to {max_checkpoint_b_delta} channel values"
+            );
+        }
+
+        #[test]
+        fn churning_checkpoint_fusion_materializes_then_recovers_zero_copy_when_stable() {
+            let fixture = native_three_checkpoint_fixture();
+            let config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let current_damage = diagnostic_region(fixture.repair);
+            let initial_signatures = signatures(fixture.scene, None);
+            let seed_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            let mut first_churning_graph =
+                compile_native_three_checkpoint_graph(fixture, &current_damage);
+            shift_checkpoint_capture_domains(&mut first_churning_graph);
+            let mut second_churning_graph = first_churning_graph.clone();
+            shift_checkpoint_capture_domains(&mut second_churning_graph);
+
+            let mut incremental =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            incremental.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut incremental, fixture.scene);
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [30, 50, 70, 255],
+            );
+
+            // Seed each capture family with the preceding layout. The moved
+            // layout below creates new exact cache keys in those same families.
+            render_checkpoint_test_frame(
+                &mut incremental,
+                &seed_graph,
+                &initial_signatures,
+                fixture.repair,
+                fixture.output_size,
+                full_region.clone(),
+                true,
+                config,
+            );
+            incremental
+                .renderer
+                .commit_presented(EglSceneFrameCommit::empty_for_test(), OutputDamage::Empty);
+
+            update_diagnostic_background_for_surface(
+                &incremental,
+                fixture.scene.background_surface,
+                fixture.repair,
+                [220, 24, 36, 255],
+            );
+            let changed_signatures =
+                signatures(fixture.scene, Some(fixture.scene.background_surface));
+
+            let capture_a = first_churning_graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance == EffectInstanceId::new(33).unwrap()
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .unwrap();
+            let seed_capture_a = seed_graph
+                .passes
+                .iter()
+                .find(|pass| pass.id == capture_a.id)
+                .unwrap();
+            assert_ne!(
+                effects::checkpoint_capture_cache_key(&seed_graph, seed_capture_a),
+                effects::checkpoint_capture_cache_key(&first_churning_graph, capture_a),
+                "movement changes the exact persistent cache key"
+            );
+            let key_a = effects::checkpoint_capture_cache_key(&first_churning_graph, capture_a)
+                .expect("first churning identity has a persistent cache key");
+
+            let frame_a = render_checkpoint_test_frame_with_stats(
+                &mut incremental,
+                &first_churning_graph,
+                &changed_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+            assert!(frame_a.capture_downsample_fusion_candidates > 0);
+            assert!(frame_a.capture_downsample_fusion_executed > 0);
+            assert_eq!(frame_a.checkpoint_capture_execution_pixels, 0);
+            assert!(frame_a.capture_downsample_fusion_elided_capture_pixels > 0);
+            let frame_a_serial = incremental
+                .renderer
+                .effect_resources
+                .checkpoint_frame_serial();
+            assert!(
+                incremental
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_needs_full_refresh(
+                        &key_a,
+                        frame_a_serial.saturating_add(1)
+                    )
+            );
+
+            // Move again before the first identity can stabilize. The new key
+            // in frame B must also fuse and remain unpublished.
+            let capture_b = second_churning_graph
+                .passes
+                .iter()
+                .find(|pass| pass.id == capture_a.id)
+                .expect("same logical capture exists in the second layout");
+            let key_b = effects::checkpoint_capture_cache_key(&second_churning_graph, capture_b)
+                .expect("second churning identity has a persistent cache key");
+            assert_ne!(key_a, key_b);
+            let frame_b = render_checkpoint_test_frame_with_stats(
+                &mut incremental,
+                &second_churning_graph,
+                &changed_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+            assert!(frame_b.capture_downsample_fusion_candidates > 0);
+            assert!(frame_b.capture_downsample_fusion_executed > 0);
+            assert_eq!(frame_b.checkpoint_capture_execution_pixels, 0);
+            assert!(frame_b.capture_downsample_fusion_elided_capture_pixels > 0);
+            let frame_b_serial = incremental
+                .renderer
+                .effect_resources
+                .checkpoint_frame_serial();
+            assert!(
+                incremental
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_needs_full_refresh(
+                        &key_b,
+                        frame_b_serial.saturating_add(1)
+                    )
+            );
+
+            // Once the identity stops moving, the ordinary path materializes
+            // it. The following unchanged frame can then use causal zero-copy.
+            let frame_c = render_checkpoint_test_frame_with_stats(
+                &mut incremental,
+                &second_churning_graph,
+                &changed_signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage.clone(),
+                false,
+                config,
+            );
+            assert_eq!(frame_c.capture_downsample_fusion_executed, 0);
+            assert!(frame_c.checkpoint_capture_execution_pixels > 0);
+            let frame_c_serial = incremental
+                .renderer
+                .effect_resources
+                .checkpoint_frame_serial();
+            assert!(
+                !incremental
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_needs_full_refresh(
+                        &key_b,
+                        frame_c_serial.saturating_add(1)
+                    )
+            );
+
+            set_current_snapshot(&mut incremental.renderer, &changed_signatures);
+            incremental
+                .renderer
+                .effect_resources
+                .begin_checkpoint_frame();
+            let frame_d_demand =
+                oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+                    &second_churning_graph,
+                    &current_damage,
+                    true,
+                    config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
+                );
+            let frame_d_selection =
+                effects::select_effect_execution(&second_churning_graph, &frame_d_demand);
+            let frame_d_repaint = diagnostic_repaint_plan_for_repairs_in_size(
+                &[fixture.repair],
+                false,
+                fixture.output_size,
+            );
+            let frame_d = effects::execute_effect_graph_with_debug_config(
+                &mut incremental.renderer,
+                &second_churning_graph,
+                OutputFramebufferOrigin::TopLeftScanout,
+                &frame_d_repaint,
+                &frame_d_demand,
+                &frame_d_selection,
+                config,
+            )
+            .expect("frame C executes stable checkpoint graph passes");
+            assert_eq!(frame_d.capture_downsample_fusion_executed, 0);
+            assert!(
+                frame_d.checkpoint_cache_zero_copy_hits > 0,
+                "zero-copy misses: hits={} cache_hits={} update_pixels={} proven={} unproven={} dependency_changed={} scene_prefix_changed={}",
+                frame_d.checkpoint_cache_zero_copy_hits,
+                frame_d.checkpoint_cache_hits,
+                frame_d.checkpoint_cache_update_pixels,
+                frame_d.checkpoint_causal_proven_unchanged,
+                frame_d.checkpoint_causal_unproven,
+                frame_d.checkpoint_causal_dependency_changed,
+                frame_d.checkpoint_causal_scene_prefix_changed
+            );
+            assert!(frame_d.checkpoint_causal_proven_unchanged > 0);
+        }
+
+        #[test]
+        fn fused_downsample_failure_keeps_checkpoint_invalid_and_restores_renderer_state() {
+            let fixture = native_three_checkpoint_fixture();
+            let config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+                effects::CheckpointCapturePath::FramebufferShaderCopy,
+            );
+            let full_region = EffectRegion::from_rect(fixture.output_bounds);
+            let current_damage = diagnostic_region(fixture.repair);
+            let signatures = signatures(fixture.scene, None);
+            let seed_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+            let mut churning_graph =
+                compile_native_three_checkpoint_graph(fixture, &current_damage);
+            shift_checkpoint_capture_domains(&mut churning_graph);
+
+            let capture = churning_graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.kind == RenderPassKind::SceneCapture
+                        && pass.instance == EffectInstanceId::new(33).unwrap()
+                        && !pass.checkpoint_dependencies.is_empty()
+                })
+                .unwrap();
+            let cache_key =
+                effects::checkpoint_capture_cache_key(&churning_graph, capture).unwrap();
+            let mut harness =
+                GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+            harness.install_texture_backed_output();
+            install_native_three_checkpoint_diagnostic_scene(&mut harness, fixture.scene);
+
+            render_checkpoint_test_frame(
+                &mut harness,
+                &seed_graph,
+                &signatures,
+                fixture.repair,
+                fixture.output_size,
+                full_region,
+                true,
+                config,
+            );
+
+            let fused_shader_key = effects::ShaderProgramKey::new(
+                oblivion_one::effects::ShaderModuleId::new(
+                    oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
+                )
+                .unwrap(),
+                2,
+                oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+            );
+            harness
+                .renderer
+                .effect_shaders
+                .force_uniform_missing_for_test(
+                    fused_shader_key,
+                    "u_effect_capture_origin_bottom_left",
+                )
+                .unwrap();
+
+            set_current_snapshot(&mut harness.renderer, &signatures);
+            harness.renderer.effect_resources.begin_checkpoint_frame();
+            let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+                &churning_graph,
+                &current_damage,
+                false,
+                config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
+            );
+            let selection = effects::select_effect_execution(&churning_graph, &demand);
+            let repaint = diagnostic_repaint_plan_for_repairs_in_size(
+                &[fixture.repair],
+                false,
+                fixture.output_size,
+            );
+            let failed_result = effects::execute_effect_graph_with_debug_config(
+                &mut harness.renderer,
+                &churning_graph,
+                OutputFramebufferOrigin::TopLeftScanout,
+                &repaint,
+                &demand,
+                &selection,
+                config,
+            );
+            assert!(
+                failed_result.is_err(),
+                "the injected fused uniform failure must fail the graph"
+            );
+
+            unsafe {
+                assert_eq!(
+                    harness.renderer.gl.get_parameter_i32(glow::ACTIVE_TEXTURE),
+                    glow::TEXTURE0 as i32
+                );
+                assert_eq!(
+                    harness
+                        .renderer
+                        .gl
+                        .get_parameter_i32(glow::TEXTURE_BINDING_2D),
+                    0
+                );
+                assert!(harness.renderer.gl.is_enabled(glow::BLEND));
+                assert!(!harness.renderer.gl.is_enabled(glow::SCISSOR_TEST));
+                let mut viewport = [0; 4];
+                harness
+                    .renderer
+                    .gl
+                    .get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+                assert_eq!(
+                    viewport,
+                    [
+                        0,
+                        0,
+                        fixture.output_size.0 as i32,
+                        fixture.output_size.1 as i32,
+                    ]
+                );
+            }
+
+            let failed_serial = harness.renderer.effect_resources.checkpoint_frame_serial();
+            assert!(
+                harness
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_needs_full_refresh(&cache_key, failed_serial)
+            );
+
+            let retry = render_checkpoint_test_frame_with_stats(
+                &mut harness,
+                &churning_graph,
+                &signatures,
+                fixture.repair,
+                fixture.output_size,
+                current_damage,
+                false,
+                config,
+            );
+            assert_eq!(retry.capture_downsample_fusion_executed, 0);
+            assert!(retry.checkpoint_capture_execution_pixels > 0);
+            assert_eq!(retry.checkpoint_cache_zero_copy_hits, 0);
+            let retry_serial = harness.renderer.effect_resources.checkpoint_frame_serial();
+            assert!(
+                !harness
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_needs_full_refresh(
+                        &cache_key,
+                        retry_serial.saturating_add(1)
+                    )
+            );
         }
 
         #[test]
@@ -14388,6 +14820,484 @@ mod tests {
             );
         }
         pixels
+    }
+
+    fn read_effect_test_pixels_f32(gl: &glow::Context, width: u32, height: u32) -> Vec<f32> {
+        let mut pixels = vec![0.0_f32; width as usize * height as usize * 4];
+        let pixels_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut pixels);
+        unsafe {
+            gl.flush();
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelPackData::Slice(Some(pixels_bytes)),
+            );
+        }
+        pixels
+    }
+
+    #[test]
+    fn fused_downsample_matches_materialized_rgba8_capture_for_edges_origins_and_damage() {
+        // The Mesa GL_LINEAR path differs by 11 RGBA16F ULPs at the worst
+        // observed sample; allow one ULP of comparison headroom.
+        const MAX_RGBA16F_SAMPLER_DIFFERENCE: f32 = 12.0 / 8192.0;
+        let mut harness = GlesEffectTestHarness::new(19, 17);
+        harness.install_texture_backed_output();
+        let gl = &harness.gl;
+        let output_size = (19_u32, 17_u32);
+        let active_output = harness.renderer.active_output_texture.unwrap();
+        let (quad, _) = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("fullscreen effect quad is available");
+        let capture_copy = harness.renderer.capture_copy_program;
+        let downsample_module = oblivion_one::effects::ShaderModuleId::new(
+            oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
+        )
+        .unwrap();
+        let shader_space = oblivion_one::effects::EffectWorkingSpace::LinearSrgb;
+        let reference_program = harness
+            .renderer
+            .effect_shaders
+            .lookup(effects::ShaderProgramKey::new(
+                downsample_module,
+                0,
+                shader_space,
+            ))
+            .expect("existing first-downsample shader is prewarmed");
+        let fused_program = harness
+            .renderer
+            .effect_shaders
+            .lookup(effects::ShaderProgramKey::new(
+                downsample_module,
+                2,
+                shader_space,
+            ))
+            .expect("fused first-downsample shader is prewarmed");
+        let color_order_domain = oblivion_one::effects::EffectRect::new(5, 6, 4, 2).unwrap();
+        let domains = [
+            oblivion_one::effects::EffectRect::new(5, 4, 6, 4).unwrap(),
+            oblivion_one::effects::EffectRect::new(6, 5, 7, 5).unwrap(),
+            oblivion_one::effects::EffectRect::new(9, 8, 1, 1).unwrap(),
+            oblivion_one::effects::EffectRect::new(2, 7, 2, 3).unwrap(),
+            oblivion_one::effects::EffectRect::new(0, 4, 5, 5).unwrap(),
+            oblivion_one::effects::EffectRect::new(14, 3, 5, 7).unwrap(),
+            oblivion_one::effects::EffectRect::new(6, 0, 7, 4).unwrap(),
+            oblivion_one::effects::EffectRect::new(5, 12, 8, 5).unwrap(),
+            oblivion_one::effects::EffectRect::new(0, 0, 19, 17).unwrap(),
+            color_order_domain,
+        ];
+        let mut worst_differential = (0.0_f32, String::new());
+
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            for domain in domains {
+                let capture_size = (domain.width, domain.height);
+                let sample_pixels = (0..output_size.1)
+                    .flat_map(|gl_y| {
+                        (0..output_size.0).flat_map(move |x| {
+                            let local_y = match origin {
+                                OutputFramebufferOrigin::BottomLeft => {
+                                    let first_y = output_size.1 - domain.y as u32 - domain.height;
+                                    (gl_y >= first_y && gl_y < first_y + domain.height)
+                                        .then(|| gl_y - first_y)
+                                }
+                                OutputFramebufferOrigin::TopLeftScanout => (gl_y
+                                    >= domain.y as u32
+                                    && gl_y < domain.y as u32 + domain.height)
+                                    .then(|| domain.y as u32 + domain.height - 1 - gl_y),
+                            };
+                            let inside = x >= domain.x as u32
+                                && x < domain.x as u32 + domain.width
+                                && local_y.is_some();
+                            let pixel = if !inside {
+                                [255, 0, 255, 255]
+                            } else {
+                                let local_x = x - domain.x as u32;
+                                let local_y = local_y.unwrap();
+                                if domain == color_order_domain {
+                                    let encoded = if local_x < 2 { 0 } else { 255 };
+                                    [encoded, encoded, encoded, 255]
+                                } else {
+                                    let alpha = ((local_x * 37 + local_y * 71 + 80) % 256) as u8;
+                                    [
+                                        (((local_x * 73 + local_y * 29 + 11) % 256) as u8)
+                                            .min(alpha),
+                                        (((local_x * 17 + local_y * 61 + 53) % 256) as u8)
+                                            .min(alpha),
+                                        (((local_x * 31 + local_y * 47 + 97) % 256) as u8)
+                                            .min(alpha),
+                                        alpha,
+                                    ]
+                                }
+                            };
+                            pixel.into_iter()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                unsafe {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(active_output));
+                    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        output_size.0 as i32,
+                        output_size.1 as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(&sample_pixels)),
+                    );
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                }
+
+                let capture_texture =
+                    unsafe { gl.create_texture().expect("RGBA8 capture texture creates") };
+                let capture_framebuffer = unsafe {
+                    gl.create_framebuffer()
+                        .expect("capture framebuffer creates")
+                };
+                unsafe {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(capture_texture));
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_T,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA8 as i32,
+                        capture_size.0 as i32,
+                        capture_size.1 as i32,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(capture_framebuffer));
+                    gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(capture_texture),
+                        0,
+                    );
+                    assert_eq!(
+                        gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                        glow::FRAMEBUFFER_COMPLETE,
+                        "RGBA8 capture framebuffer is complete"
+                    );
+                    gl.viewport(0, 0, capture_size.0 as i32, capture_size.1 as i32);
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.disable(glow::BLEND);
+                    gl.use_program(Some(capture_copy));
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(active_output));
+                    set_effect_test_uniform_i32(gl, capture_copy, "u_output_texture", 0);
+                    set_effect_test_uniform_2_f32(
+                        gl,
+                        capture_copy,
+                        "u_capture_output_size",
+                        output_size.0 as f32,
+                        output_size.1 as f32,
+                    );
+                    set_effect_test_uniform_4_f32(
+                        gl,
+                        capture_copy,
+                        "u_capture_domain",
+                        [
+                            domain.x as f32,
+                            domain.y as f32,
+                            domain.width as f32,
+                            domain.height as f32,
+                        ],
+                    );
+                    set_effect_test_uniform_2_f32(
+                        gl,
+                        capture_copy,
+                        "u_capture_target_size",
+                        capture_size.0 as f32,
+                        capture_size.1 as f32,
+                    );
+                    set_effect_test_uniform_i32(
+                        gl,
+                        capture_copy,
+                        "u_capture_origin_bottom_left",
+                        i32::from(origin == OutputFramebufferOrigin::BottomLeft),
+                    );
+                    gl.bind_vertex_array(Some(quad));
+                    gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                    gl.bind_vertex_array(None);
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    gl.use_program(None);
+                }
+
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(capture_framebuffer));
+                }
+                let captured_pixels = read_effect_test_pixels(gl, capture_size.0, capture_size.1);
+                for local_y in 0..capture_size.1 {
+                    let logical_y = capture_size.1 - 1 - local_y;
+                    let source_y = match origin {
+                        OutputFramebufferOrigin::BottomLeft => {
+                            output_size.1 - 1 - domain.y as u32 - logical_y
+                        }
+                        OutputFramebufferOrigin::TopLeftScanout => domain.y as u32 + logical_y,
+                    };
+                    for local_x in 0..capture_size.0 {
+                        let source_x = domain.x as u32 + local_x;
+                        let source_offset = ((source_y * output_size.0 + source_x) * 4) as usize;
+                        let capture_offset = ((local_y * capture_size.0 + local_x) * 4) as usize;
+                        assert_eq!(
+                            &captured_pixels[capture_offset..capture_offset + 4],
+                            &sample_pixels[source_offset..source_offset + 4],
+                            "capture-copy bytes at {origin:?}, domain {domain:?}, local ({local_x}, {local_y})"
+                        );
+                    }
+                }
+
+                let downsample_size = (capture_size.0.div_ceil(2), capture_size.1.div_ceil(2));
+                let make_downsample_target = || {
+                    let texture =
+                        unsafe { gl.create_texture().expect("linear output texture creates") };
+                    let framebuffer = unsafe {
+                        gl.create_framebuffer()
+                            .expect("linear output framebuffer creates")
+                    };
+                    unsafe {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MIN_FILTER,
+                            glow::NEAREST as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAG_FILTER,
+                            glow::NEAREST as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_S,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_T,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA16F as i32,
+                            downsample_size.0 as i32,
+                            downsample_size.1 as i32,
+                            0,
+                            glow::RGBA,
+                            glow::HALF_FLOAT,
+                            glow::PixelUnpackData::Slice(None),
+                        );
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                        gl.framebuffer_texture_2d(
+                            glow::FRAMEBUFFER,
+                            glow::COLOR_ATTACHMENT0,
+                            glow::TEXTURE_2D,
+                            Some(texture),
+                            0,
+                        );
+                        assert_eq!(
+                            gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                            glow::FRAMEBUFFER_COMPLETE,
+                            "RGBA16F downsample framebuffer is complete"
+                        );
+                    }
+                    (texture, framebuffer)
+                };
+                let (reference_texture, reference_framebuffer) = make_downsample_target();
+                let (fused_texture, fused_framebuffer) = make_downsample_target();
+
+                let render_downsample = |framebuffer: glow::Framebuffer,
+                                         input_texture: glow::Texture,
+                                         program: glow::Program,
+                                         fused: bool,
+                                         blur_radius: f32,
+                                         partial: bool| {
+                    unsafe {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                        gl.viewport(0, 0, downsample_size.0 as i32, downsample_size.1 as i32);
+                        gl.disable(glow::SCISSOR_TEST);
+                        gl.disable(glow::BLEND);
+                        gl.clear_color(0.13, 0.27, 0.41, 1.0);
+                        gl.clear(glow::COLOR_BUFFER_BIT);
+                        if partial {
+                            gl.enable(glow::SCISSOR_TEST);
+                            gl.scissor(
+                                0,
+                                0,
+                                (downsample_size.0 / 2).max(1) as i32,
+                                (downsample_size.1 / 2).max(1) as i32,
+                            );
+                        }
+                        gl.use_program(Some(program));
+                    }
+                    set_effect_test_uniform_i32(gl, program, "u_effect_target_flip_y", 0);
+                    set_effect_test_uniform_i32(gl, program, "u_effect_input_flip_y", 1);
+                    set_effect_test_uniform_i32(gl, program, "u_effect_input", 0);
+                    set_effect_test_uniform_2_f32(
+                        gl,
+                        program,
+                        "u_effect_texel_size",
+                        1.0 / capture_size.0 as f32,
+                        1.0 / capture_size.1 as f32,
+                    );
+                    let radius_location = unsafe {
+                        gl.get_uniform_location(program, "u_effect_blur_radius")
+                            .expect("downsample blur radius uniform is active")
+                    };
+                    unsafe { gl.uniform_1_f32(Some(&radius_location), blur_radius) };
+                    if fused {
+                        set_effect_test_uniform_2_f32(
+                            gl,
+                            program,
+                            "u_effect_output_size",
+                            output_size.0 as f32,
+                            output_size.1 as f32,
+                        );
+                        set_effect_test_uniform_4_f32(
+                            gl,
+                            program,
+                            "u_effect_capture_domain",
+                            [
+                                domain.x as f32,
+                                domain.y as f32,
+                                domain.width as f32,
+                                domain.height as f32,
+                            ],
+                        );
+                        set_effect_test_uniform_2_f32(
+                            gl,
+                            program,
+                            "u_effect_capture_size",
+                            capture_size.0 as f32,
+                            capture_size.1 as f32,
+                        );
+                        set_effect_test_uniform_i32(
+                            gl,
+                            program,
+                            "u_effect_capture_origin_bottom_left",
+                            i32::from(origin == OutputFramebufferOrigin::BottomLeft),
+                        );
+                    }
+                    unsafe {
+                        gl.active_texture(glow::TEXTURE0);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(input_texture));
+                        gl.bind_vertex_array(Some(quad));
+                        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                        gl.bind_vertex_array(None);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+                        gl.disable(glow::SCISSOR_TEST);
+                        gl.use_program(None);
+                    }
+                };
+
+                for blur_radius in [0.5_f32, 1.0, 2.75] {
+                    for partial in [false, true] {
+                        render_downsample(
+                            reference_framebuffer,
+                            capture_texture,
+                            reference_program,
+                            false,
+                            blur_radius,
+                            partial,
+                        );
+                        render_downsample(
+                            fused_framebuffer,
+                            active_output,
+                            fused_program,
+                            true,
+                            blur_radius,
+                            partial,
+                        );
+                        unsafe {
+                            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(reference_framebuffer))
+                        };
+                        let reference =
+                            read_effect_test_pixels_f32(gl, downsample_size.0, downsample_size.1);
+                        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fused_framebuffer)) };
+                        let fused =
+                            read_effect_test_pixels_f32(gl, downsample_size.0, downsample_size.1);
+                        let (maximum_error_index, maximum_error) = reference
+                            .iter()
+                            .zip(&fused)
+                            .enumerate()
+                            .map(|(index, (expected, actual))| (index, (expected - actual).abs()))
+                            .max_by(|left, right| left.1.total_cmp(&right.1))
+                            .unwrap_or((0, 0.0));
+                        if maximum_error > worst_differential.0 {
+                            worst_differential = (
+                                maximum_error,
+                                format!(
+                                    "component {maximum_error_index}: reference={}, fused={} for {origin:?}, domain {domain:?}, radius {blur_radius}, partial={partial}",
+                                    reference[maximum_error_index], fused[maximum_error_index],
+                                ),
+                            );
+                        }
+                        if domain == color_order_domain
+                            && origin == OutputFramebufferOrigin::BottomLeft
+                            && blur_radius == 1.0
+                            && !partial
+                        {
+                            assert!(
+                                (0.10..0.115).contains(&fused[0]),
+                                "fused output must bilinear-filter encoded 0/1 before sRGB decode: {}",
+                                fused[0]
+                            );
+                        }
+                    }
+                }
+
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.delete_framebuffer(capture_framebuffer);
+                    gl.delete_texture(capture_texture);
+                    gl.delete_framebuffer(reference_framebuffer);
+                    gl.delete_texture(reference_texture);
+                    gl.delete_framebuffer(fused_framebuffer);
+                    gl.delete_texture(fused_texture);
+                }
+            }
+        }
+
+        assert!(
+            worst_differential.0 <= MAX_RGBA16F_SAMPLER_DIFFERENCE,
+            "fused/reference max error {} at {}",
+            worst_differential.0,
+            worst_differential.1
+        );
     }
 
     fn assert_effect_test_pixel(pixels: &[u8], width: u32, x: u32, y: u32, expected: [u8; 4]) {

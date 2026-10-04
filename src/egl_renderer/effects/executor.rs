@@ -1,4 +1,4 @@
-use std::{io, time::Instant};
+use std::{collections::HashMap, io, time::Instant};
 
 use glow::HasContext;
 use oblivion_one::effects::{
@@ -28,10 +28,10 @@ use super::{
     CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
     EffectDebugKawaseMode, FrameTraceSummary, PassTraceSummary, blur, capture, effect_debug_config,
     resources::{
-        CheckpointCacheAdmissionStats, CheckpointCacheCompatibility, EffectTextureFilter,
-        EffectTextureFormat, EffectTextureKey, GraphTextureBinding, PooledEffectTexture,
-        PreparedCheckpointCaptures, checkpoint_capture_cache_key, estimate_graph_peak_bytes,
-        release_dead_graph_textures,
+        CheckpointCacheAdmissionStats, CheckpointCacheCompatibility, CheckpointCapturePreparation,
+        EffectTextureFilter, EffectTextureFormat, EffectTextureKey, GraphTextureBinding,
+        PooledEffectTexture, PreparedCheckpointCaptures, checkpoint_capture_cache_key,
+        estimate_graph_peak_bytes, release_dead_graph_textures,
     },
     shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
@@ -460,6 +460,11 @@ pub(crate) struct EffectExecutionStats {
     pub checkpoint_cache_entries: usize,
     pub checkpoint_cache_bytes: u64,
     pub checkpoint_cache_admission: CheckpointCacheAdmissionStats,
+    pub capture_downsample_fusion_candidates: usize,
+    pub capture_downsample_fusion_executed: usize,
+    pub capture_downsample_fusion_elided_capture_pixels: u64,
+    pub capture_downsample_fusion_output_pixels: u64,
+    pub capture_downsample_fusion_ineligible: usize,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
@@ -514,6 +519,12 @@ impl EffectExecutionStats {
             checkpoint_cache_entries: self.checkpoint_cache_entries,
             checkpoint_cache_bytes: self.checkpoint_cache_bytes,
             checkpoint_cache_admission: self.checkpoint_cache_admission,
+            capture_downsample_fusion_candidates: self.capture_downsample_fusion_candidates,
+            capture_downsample_fusion_executed: self.capture_downsample_fusion_executed,
+            capture_downsample_fusion_elided_capture_pixels: self
+                .capture_downsample_fusion_elided_capture_pixels,
+            capture_downsample_fusion_output_pixels: self.capture_downsample_fusion_output_pixels,
+            capture_downsample_fusion_ineligible: self.capture_downsample_fusion_ineligible,
         }
     }
 
@@ -1134,6 +1145,7 @@ fn execute_effect_graph_with_debug_config_internal(
         graph,
         &mut textures,
         checkpoint_cache_admission,
+        &prepared.preparations,
         targets,
         framebuffer_origin,
         Some(repaint_plan),
@@ -1208,6 +1220,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         graph,
         &mut textures,
         CheckpointCacheAdmissionStats::default(),
+        &HashMap::new(),
         targets,
         framebuffer_origin,
         None,
@@ -1249,6 +1262,7 @@ fn execute_graph_passes(
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
     checkpoint_cache_admission: CheckpointCacheAdmissionStats,
+    checkpoint_preparations: &HashMap<GraphTextureId, CheckpointCapturePreparation>,
     targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: Option<&super::super::damage::RepaintPlan>,
@@ -1260,6 +1274,16 @@ fn execute_graph_passes(
     draw_overlays: bool,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
 ) -> RendererResult<EffectExecutionStats> {
+    let fusion_plan = plan_capture_downsample_fusions(
+        graph,
+        selection,
+        checkpoint_preparations,
+        renderer.active_output_texture.is_some(),
+        renderer.current_size,
+        framebuffer_origin,
+        scene_baseline_authority,
+        debug_config,
+    );
     let graph_scope = (!renderer.capture_in_progress)
         .then(|| {
             renderer
@@ -1282,6 +1306,7 @@ fn execute_graph_passes(
         draw_overlays,
         scene_replay_work_mode_override,
         graph_scope,
+        &fusion_plan,
     );
     if let Ok(stats) = &mut result {
         stats.checkpoint_cache_admission = checkpoint_cache_admission;
@@ -1349,8 +1374,11 @@ fn execute_graph_passes_inner(
     draw_overlays: bool,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
     graph_scope: Option<super::gpu_timing::GraphTimingScope>,
+    fusion_plan: &CaptureDownsampleFusionPlan,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
+    stats.capture_downsample_fusion_candidates = fusion_plan.candidates;
+    stats.capture_downsample_fusion_ineligible = fusion_plan.ineligible;
     let checkpoint_causal_stability = checkpoint_causal_stability_plan(renderer, graph);
     #[cfg(any(debug_assertions, test))]
     // Validity belongs to this graph execution and logical texture ID. A
@@ -1868,6 +1896,11 @@ fn execute_graph_passes_inner(
                 capture_plan,
                 &checkpoint_causal_stability,
                 graph_scope.is_some(),
+                fusion_plan
+                    .by_capture
+                    .get(&pass.id)
+                    .or_else(|| fusion_plan.by_consumer.get(&pass.id))
+                    .copied(),
                 &mut stats,
             );
             let replay_execution = execute_result.as_ref().ok().copied().flatten();
@@ -1907,6 +1940,14 @@ fn execute_graph_passes_inner(
                     renderer.effect_trace.invariant_failure(invariant);
                 }
                 return Err(error);
+            }
+            if let Some(fusion) = fusion_plan.by_consumer.get(&pass.id) {
+                debug_assert_eq!(fusion.consumer_pass, pass.id);
+                stats.capture_downsample_fusion_executed =
+                    stats.capture_downsample_fusion_executed.saturating_add(1);
+                stats.capture_downsample_fusion_output_pixels = stats
+                    .capture_downsample_fusion_output_pixels
+                    .saturating_add(effect_region_pixels(&execution_damage.region));
             }
             if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
                 let capture_satisfied = scene_work_state.mark_capture_satisfied(pass.id);
@@ -2404,6 +2445,22 @@ struct CheckpointCaptureExecutionPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureDownsampleFusion {
+    capture_pass: GraphPassId,
+    consumer_pass: GraphPassId,
+    capture_texture: GraphTextureId,
+    capture_domain: oblivion_one::effects::EffectRect,
+}
+
+#[derive(Debug, Default)]
+struct CaptureDownsampleFusionPlan {
+    by_capture: HashMap<GraphPassId, CaptureDownsampleFusion>,
+    by_consumer: HashMap<GraphPassId, CaptureDownsampleFusion>,
+    candidates: usize,
+    ineligible: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PersistentSceneCaptureMode {
     DependentFramebufferCheckpoint,
     DependencyFreeReplayCapture,
@@ -2506,6 +2563,119 @@ fn checkpoint_capture_execution_plan_for_pass(
         debug_config.checkpoint_capture_path(),
         renderer.active_output_texture.is_some(),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_capture_downsample_fusions(
+    graph: &CompiledFrameGraph,
+    selection: &EffectExecutionSelection,
+    preparations: &HashMap<GraphTextureId, CheckpointCapturePreparation>,
+    active_output_texture_available: bool,
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+    scene_baseline_authority: SceneBaselineAuthority,
+    debug_config: EffectDebugConfig,
+) -> CaptureDownsampleFusionPlan {
+    let mut plan = CaptureDownsampleFusionPlan::default();
+    for (capture_index, capture) in graph.passes.iter().enumerate() {
+        if capture.kind != RenderPassKind::SceneCapture {
+            continue;
+        }
+        let Some(capture_texture) = capture.output else {
+            continue;
+        };
+        let Some(preparation) = preparations.get(&capture_texture) else {
+            continue;
+        };
+        if !preparation.newly_admitted || !preparation.identity_churn {
+            continue;
+        }
+        plan.candidates = plan.candidates.saturating_add(1);
+        let fusion = (|| {
+            if capture.checkpoint_dependencies.is_empty()
+                || !selection.executed_passes.contains(&capture.id)
+                || !active_output_texture_available
+            {
+                return None;
+            }
+            let capture_execution = checkpoint_capture_execution_plan(
+                capture.kind,
+                capture.checkpoint_dependencies.len(),
+                scene_baseline_authority,
+                debug_config.capture_mode(),
+                debug_config.checkpoint_capture_path(),
+                active_output_texture_available,
+            );
+            if capture_execution.executed != CaptureTimingMode::FramebufferShaderCopy {
+                return None;
+            }
+            let capture_plan = graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == capture_texture)?;
+            if capture_plan.source != GraphTextureSource::CapturedScene
+                || capture_plan.working_space
+                    != oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb
+                || capture_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft
+                || capture_plan.width != capture_plan.domain.width
+                || capture_plan.height != capture_plan.domain.height
+                || plan_graph_texture_capture(
+                    output_size,
+                    capture_plan.domain,
+                    (capture_plan.width, capture_plan.height),
+                    framebuffer_origin,
+                )
+                .is_none()
+            {
+                return None;
+            }
+            let consumer_index = capture_index.checked_add(1)?;
+            let consumer = graph.passes.get(consumer_index)?;
+            if !selection.executed_passes.contains(&consumer.id)
+                || consumer.instance != capture.instance
+                || consumer.kind != RenderPassKind::DualKawaseDownsample
+                || consumer.inputs.as_slice() != [capture_texture]
+                || graph
+                    .passes
+                    .iter()
+                    .filter(|candidate| candidate.inputs.contains(&capture_texture))
+                    .count()
+                    != 1
+                || graph
+                    .passes
+                    .iter()
+                    .find(|candidate| {
+                        candidate.kind == RenderPassKind::DualKawaseDownsample
+                            && candidate.instance == capture.instance
+                    })
+                    .is_none_or(|first| first.id != consumer.id)
+            {
+                return None;
+            }
+            let output = consumer.output?;
+            if graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == output)
+                .is_none_or(|texture| texture.source != GraphTextureSource::Intermediate)
+            {
+                return None;
+            }
+            Some(CaptureDownsampleFusion {
+                capture_pass: capture.id,
+                consumer_pass: consumer.id,
+                capture_texture,
+                capture_domain: capture_plan.domain,
+            })
+        })();
+        if let Some(fusion) = fusion {
+            plan.by_capture.insert(fusion.capture_pass, fusion);
+            plan.by_consumer.insert(fusion.consumer_pass, fusion);
+        } else {
+            plan.ineligible = plan.ineligible.saturating_add(1);
+        }
+    }
+    plan
 }
 
 fn capture_timing_metadata(
@@ -3094,6 +3264,7 @@ fn execute_pass(
     capture_plan: CheckpointCaptureExecutionPlan,
     causal_stability: &CheckpointCausalStabilityPlan,
     host_timing_enabled: bool,
+    capture_downsample_fusion: Option<CaptureDownsampleFusion>,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
     match pass.kind {
@@ -3111,12 +3282,25 @@ fn execute_pass(
                 capture_plan,
                 causal_stability,
                 host_timing_enabled,
+                capture_downsample_fusion.filter(|fusion| fusion.capture_pass == pass.id),
                 stats,
             )?;
             stats.scene_captures = stats.scene_captures.saturating_add(1);
             return Ok(replay_execution);
         }
         RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample => {
+            if capture_downsample_fusion.is_some_and(|fusion| {
+                fusion.consumer_pass == pass.id
+                    && pass.inputs.as_slice() != [fusion.capture_texture]
+            }) {
+                return Err(
+                    io::Error::other("fused downsample input changed after planning").into(),
+                );
+            }
+            let fused_downsample = capture_downsample_fusion.filter(|fusion| {
+                fusion.consumer_pass == pass.id
+                    && pass.inputs.as_slice() == [fusion.capture_texture]
+            });
             let first_downsample = pass.kind == RenderPassKind::DualKawaseDownsample
                 && graph
                     .passes
@@ -3134,6 +3318,9 @@ fn execute_pass(
                     texture.working_space == oblivion_one::effects::EffectWorkingSpace::LinearSrgb
                 });
             let fragment = match pass.kind {
+                RenderPassKind::DualKawaseDownsample if fused_downsample.is_some() => {
+                    blur::DUAL_KAWASE_DOWNSAMPLE_FUSED_CAPTURE_SHADER
+                }
                 RenderPassKind::DualKawaseDownsample if first_downsample && !input_is_linear => {
                     blur::DUAL_KAWASE_DOWNSAMPLE_SHADER
                 }
@@ -3151,6 +3338,7 @@ fn execute_pass(
                 framebuffer_origin,
                 true,
                 execution_damage,
+                fused_downsample,
             )?;
             match pass.kind {
                 RenderPassKind::DualKawaseDownsample => {
@@ -3173,6 +3361,7 @@ fn execute_pass(
                 framebuffer_origin,
                 false,
                 execution_damage,
+                None,
             )?;
         }
         RenderPassKind::Fragment | RenderPassKind::Blend | RenderPassKind::Mask => {
@@ -3223,6 +3412,7 @@ fn execute_pass(
                 framebuffer_origin,
                 false,
                 execution_damage,
+                None,
             )?;
             stats.composites = stats.composites.saturating_add(1);
         }
@@ -3805,6 +3995,7 @@ fn execute_capture(
     capture_plan: CheckpointCaptureExecutionPlan,
     causal_stability: &CheckpointCausalStabilityPlan,
     host_timing_enabled: bool,
+    fusion: Option<CaptureDownsampleFusion>,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
     let output = pass
@@ -3836,6 +4027,36 @@ fn execute_capture(
             .effect_resources
             .checkpoint_capture_needs_full_refresh(key, frame_serial)
     });
+    if let Some(fusion) = fusion {
+        let Some(key) = checkpoint_cache_key.as_ref() else {
+            return Err(io::Error::other(
+                "fused checkpoint capture has no persistent cache identity",
+            )
+            .into());
+        };
+        if fusion.capture_pass != pass.id
+            || fusion.capture_texture != output
+            || !direct_capture
+            || !target.is_checkpoint_cache()
+            || pass.checkpoint_dependencies.is_empty()
+            || capture_plan.executed != CaptureTimingMode::FramebufferShaderCopy
+            || !checkpoint_full_refresh
+        {
+            return Err(io::Error::other("fused checkpoint capture failed validation").into());
+        }
+        stats.record_capture_execution_with_mode(pass, capture_plan.executed, 0, 0);
+        stats.capture_downsample_fusion_elided_capture_pixels = stats
+            .capture_downsample_fusion_elided_capture_pixels
+            .saturating_add(
+                u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height)),
+            );
+        debug_assert!(
+            renderer
+                .effect_resources
+                .checkpoint_capture_needs_full_refresh(key, frame_serial)
+        );
+        return Ok(None);
+    }
     let causal_capture = causal_stability.captures.get(&pass.id);
     let causal_zero_copy = checkpoint_cache_key.is_some()
         && !checkpoint_full_refresh
@@ -4753,22 +4974,93 @@ fn execute_fullscreen_pass(
     framebuffer_origin: OutputFramebufferOrigin,
     blur_shader: bool,
     execution_damage: &EffectRegion,
+    capture_fusion: Option<CaptureDownsampleFusion>,
 ) -> RendererResult<()> {
     let input = pass
         .inputs
         .first()
         .copied()
         .ok_or_else(|| io::Error::other("effect pass has no input texture"))?;
-    let input_texture = textures
-        .get(&input)
-        .and_then(|texture| renderer.effect_resources.texture(texture))
-        .ok_or_else(|| io::Error::other("effect input texture is not realized"))?;
+    let input_texture = if let Some(fusion) = capture_fusion {
+        if fusion.capture_texture != input {
+            return Err(
+                io::Error::other("fused downsample input does not match its capture").into(),
+            );
+        }
+        renderer
+            .active_output_texture
+            .ok_or_else(|| io::Error::other("fused downsample has no active output texture"))?
+    } else {
+        textures
+            .get(&input)
+            .and_then(|texture| renderer.effect_resources.texture(texture))
+            .ok_or_else(|| io::Error::other("effect input texture is not realized"))?
+    };
     let output = pass
         .output
         .ok_or_else(|| io::Error::other("effect pass has no output target"))?;
     let input_plan = graph_texture(graph, input)?;
     let output_plan = graph_texture(graph, output)?;
     let output_is_framebuffer = output_plan.source == GraphTextureSource::Output;
+    let module = if blur_shader {
+        match pass.kind {
+            RenderPassKind::DualKawaseDownsample => {
+                oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE
+            }
+            RenderPassKind::DualKawaseUpsample => {
+                oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE
+            }
+            _ => 1000,
+        }
+    } else if output_is_framebuffer {
+        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE
+    } else {
+        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COPY
+    };
+    let shader_key = ShaderProgramKey::new(
+        ShaderModuleId::new(module).expect("static effect shader ids are non-zero"),
+        if capture_fusion.is_some() {
+            2
+        } else if pass.kind == RenderPassKind::NormalizeInput
+            || (pass.kind == RenderPassKind::DualKawaseDownsample
+                && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER)
+        {
+            1
+        } else {
+            0
+        },
+        oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+    );
+    let program = renderer.effect_shaders.lookup(shader_key)?;
+    let (vertex_array, _) = renderer.ensure_effect_quad()?;
+    if capture_fusion.is_some() {
+        for name in [
+            "u_effect_input",
+            "u_effect_target_flip_y",
+            "u_effect_input_flip_y",
+            "u_effect_texel_size",
+            "u_effect_blur_radius",
+            "u_effect_output_size",
+            "u_effect_capture_domain",
+            "u_effect_capture_size",
+            "u_effect_capture_origin_bottom_left",
+        ] {
+            if uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                name,
+            )
+            .is_none()
+            {
+                return Err(io::Error::other(format!(
+                    "fused downsample shader is missing uniform {name}"
+                ))
+                .into());
+            }
+        }
+    }
     let output_texture = if output_is_framebuffer {
         None
     } else {
@@ -4812,35 +5104,6 @@ fn execute_fullscreen_pass(
             .gl
             .viewport(0, 0, output_plan.width as i32, output_plan.height as i32);
     }
-    let module = if blur_shader {
-        match pass.kind {
-            RenderPassKind::DualKawaseDownsample => {
-                oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE
-            }
-            RenderPassKind::DualKawaseUpsample => {
-                oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE
-            }
-            _ => 1000,
-        }
-    } else if output_is_framebuffer {
-        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE
-    } else {
-        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COPY
-    };
-    let shader_key = ShaderProgramKey::new(
-        ShaderModuleId::new(module).expect("static effect shader ids are non-zero"),
-        if pass.kind == RenderPassKind::NormalizeInput
-            || (pass.kind == RenderPassKind::DualKawaseDownsample
-                && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER)
-        {
-            1
-        } else {
-            0
-        },
-        oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
-    );
-    let program = renderer.effect_shaders.lookup(shader_key)?;
-    let (vertex_array, _) = renderer.ensure_effect_quad()?;
     let target_flip_y =
         effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
     let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
@@ -4922,6 +5185,64 @@ fn execute_fullscreen_pass(
             renderer
                 .gl
                 .uniform_1_f32(Some(&location), pass.blur_radius.unwrap_or(1.0));
+        }
+        if let Some(fusion) = capture_fusion {
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            ) {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    renderer.current_size.0 as f32,
+                    renderer.current_size.1 as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_capture_domain",
+            ) {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    fusion.capture_domain.x as f32,
+                    fusion.capture_domain.y as f32,
+                    fusion.capture_domain.width as f32,
+                    fusion.capture_domain.height as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_capture_size",
+            ) {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    input_plan.width as f32,
+                    input_plan.height as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_capture_origin_bottom_left",
+            ) {
+                renderer.gl.uniform_1_i32(
+                    Some(&location),
+                    i32::from(matches!(
+                        framebuffer_origin,
+                        OutputFramebufferOrigin::BottomLeft
+                    )),
+                );
+            }
         }
         if !blur_shader
             && let Some(location) = uniform_location(
@@ -6563,6 +6884,368 @@ mod tests {
             )
             .collect();
         demand
+    }
+
+    fn fusion_test_graph() -> CompiledFrameGraph {
+        let region = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(260, 180, 37, 29).unwrap(),
+        );
+        let mut graph = compile_builtin_background_blur(
+            region.clone(),
+            &region,
+            oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+        );
+        let capture_id = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .unwrap()
+            .id;
+        graph
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == capture_id)
+            .unwrap()
+            .checkpoint_dependencies
+            .push(GraphPassId::new(u16::MAX).unwrap());
+        graph
+    }
+
+    fn fusion_test_plan(
+        graph: &CompiledFrameGraph,
+        selected_passes: Vec<GraphPassId>,
+        preparation: CheckpointCapturePreparation,
+        active_output_texture_available: bool,
+        debug_config: EffectDebugConfig,
+    ) -> CaptureDownsampleFusionPlan {
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                matches!(
+                    pass.kind,
+                    RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+                )
+            })
+            .unwrap();
+        let capture_texture = capture.output.unwrap();
+        let selection = EffectExecutionSelection {
+            executed_passes: selected_passes,
+            ..EffectExecutionSelection::default()
+        };
+        let preparations = HashMap::from([(capture_texture, preparation)]);
+        plan_capture_downsample_fusions(
+            graph,
+            &selection,
+            &preparations,
+            active_output_texture_available,
+            (1920, 1080),
+            OutputFramebufferOrigin::BottomLeft,
+            SceneBaselineAuthority::ReplayRequired,
+            debug_config,
+        )
+    }
+
+    fn all_graph_passes_selected(graph: &CompiledFrameGraph) -> Vec<GraphPassId> {
+        graph.passes.iter().map(|pass| pass.id).collect()
+    }
+
+    fn assert_fusion_ineligible(graph: &CompiledFrameGraph) {
+        let config =
+            EffectDebugConfig::from_env_values_with_checkpoint_capture_path(None, None, None);
+        let plan = fusion_test_plan(
+            graph,
+            all_graph_passes_selected(graph),
+            CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: true,
+            },
+            true,
+            config,
+        );
+        assert!(
+            plan.by_capture.is_empty(),
+            "unexpected fusion plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn eligible_churning_checkpoint_immediately_followed_by_first_kawase_plans_fusion() {
+        let graph = fusion_test_graph();
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        let consumer = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::DualKawaseDownsample
+                    && pass.instance == capture.instance
+            })
+            .unwrap();
+        assert_eq!(graph.passes[1].id, consumer.id);
+        let capture_texture = capture.output.unwrap();
+        let mut selection = EffectExecutionSelection::default();
+        selection.executed_passes = vec![capture.id, consumer.id];
+        let mut preparations = std::collections::HashMap::new();
+        preparations.insert(
+            capture_texture,
+            super::super::resources::CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: true,
+            },
+        );
+        let debug_config =
+            EffectDebugConfig::from_env_values_with_checkpoint_capture_path(None, None, None);
+
+        let plan = plan_capture_downsample_fusions(
+            &graph,
+            &selection,
+            &preparations,
+            true,
+            (1920, 1080),
+            OutputFramebufferOrigin::BottomLeft,
+            SceneBaselineAuthority::ReplayRequired,
+            debug_config,
+        );
+
+        assert_eq!(plan.candidates, 1);
+        assert_eq!(plan.ineligible, 0);
+        let fusion = plan.by_capture.get(&capture.id).unwrap();
+        assert_eq!(fusion.consumer_pass, consumer.id);
+        assert_eq!(fusion.capture_texture, capture_texture);
+        assert_eq!(
+            fusion.capture_domain,
+            graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == capture_texture)
+                .unwrap()
+                .domain
+        );
+    }
+
+    #[test]
+    fn capture_downsample_fusion_fails_closed_for_ineligible_cache_and_graph_cases() {
+        let base = fusion_test_graph();
+        let capture = base
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        let consumer = base
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::DualKawaseDownsample
+                    && pass.instance == capture.instance
+            })
+            .unwrap();
+        let default_config =
+            EffectDebugConfig::from_env_values_with_checkpoint_capture_path(None, None, None);
+
+        for preparation in [
+            CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: false,
+            },
+            CheckpointCapturePreparation {
+                newly_admitted: false,
+                identity_churn: false,
+            },
+        ] {
+            let plan = fusion_test_plan(
+                &base,
+                all_graph_passes_selected(&base),
+                preparation,
+                true,
+                default_config,
+            );
+            assert!(plan.by_capture.is_empty());
+        }
+
+        let mut root_replay = base.clone();
+        root_replay
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == capture.id)
+            .unwrap()
+            .checkpoint_dependencies
+            .clear();
+        assert_fusion_ineligible(&root_replay);
+
+        let blit_config = EffectDebugConfig::from_env_values_with_checkpoint_capture_path(
+            None,
+            None,
+            Some(std::ffi::OsStr::new("blit")),
+        );
+        let blit = fusion_test_plan(
+            &base,
+            all_graph_passes_selected(&base),
+            CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: true,
+            },
+            true,
+            blit_config,
+        );
+        assert!(blit.by_capture.is_empty());
+
+        let no_output = fusion_test_plan(
+            &base,
+            all_graph_passes_selected(&base),
+            CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: true,
+            },
+            false,
+            default_config,
+        );
+        assert!(no_output.by_capture.is_empty());
+
+        let mut surface_capture = base.clone();
+        surface_capture
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == capture.id)
+            .unwrap()
+            .kind = RenderPassKind::SurfaceCapture;
+        assert_fusion_ineligible(&surface_capture);
+
+        let mut multiple_consumers = base.clone();
+        let mut extra_consumer = consumer.clone();
+        extra_consumer.id = GraphPassId::new(u16::MAX - 1).unwrap();
+        multiple_consumers.passes.push(extra_consumer);
+        assert_fusion_ineligible(&multiple_consumers);
+
+        let mut different_instance = base.clone();
+        different_instance
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == consumer.id)
+            .unwrap()
+            .instance = oblivion_one::effects::EffectInstanceId::new(2).unwrap();
+        assert_fusion_ineligible(&different_instance);
+
+        let mut multiple_inputs = base.clone();
+        multiple_inputs
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == consumer.id)
+            .unwrap()
+            .inputs
+            .push(GraphTextureId::new(u16::MAX - 4).unwrap());
+        assert_fusion_ineligible(&multiple_inputs);
+
+        let mut non_kawase = base.clone();
+        non_kawase
+            .passes
+            .iter_mut()
+            .find(|pass| pass.id == consumer.id)
+            .unwrap()
+            .kind = RenderPassKind::NormalizeInput;
+        assert_fusion_ineligible(&non_kawase);
+
+        let mut framebuffer_output = base.clone();
+        let output = consumer.output.unwrap();
+        framebuffer_output
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == output)
+            .unwrap()
+            .source = GraphTextureSource::Output;
+        assert_fusion_ineligible(&framebuffer_output);
+
+        let mut non_first_kawase = base.clone();
+        let first_downsample = test_pass(
+            u16::MAX - 2,
+            RenderPassKind::DualKawaseDownsample,
+            capture.instance,
+            Vec::new(),
+            GraphTextureId::new(u16::MAX - 2).unwrap(),
+            Vec::new(),
+        );
+        non_first_kawase.passes.insert(0, first_downsample);
+        assert_fusion_ineligible(&non_first_kawase);
+
+        let mut intervening_pass = base.clone();
+        let capture_index = intervening_pass
+            .passes
+            .iter()
+            .position(|pass| pass.id == capture.id)
+            .unwrap();
+        let unrelated_texture = intervening_pass
+            .textures
+            .iter()
+            .find(|texture| texture.id != capture.output.unwrap())
+            .unwrap()
+            .id;
+        let intervening = test_pass(
+            u16::MAX - 3,
+            RenderPassKind::NormalizeInput,
+            capture.instance,
+            vec![unrelated_texture],
+            GraphTextureId::new(u16::MAX - 3).unwrap(),
+            Vec::new(),
+        );
+        intervening_pass
+            .passes
+            .insert(capture_index + 1, intervening);
+        assert_fusion_ineligible(&intervening_pass);
+
+        let unselected_consumer = fusion_test_plan(
+            &base,
+            vec![capture.id],
+            CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: true,
+            },
+            true,
+            default_config,
+        );
+        assert!(unselected_consumer.by_capture.is_empty());
+
+        let unselected_capture = fusion_test_plan(
+            &base,
+            vec![consumer.id],
+            CheckpointCapturePreparation {
+                newly_admitted: true,
+                identity_churn: true,
+            },
+            true,
+            default_config,
+        );
+        assert!(unselected_capture.by_capture.is_empty());
+
+        let mut scaled_capture = base.clone();
+        let capture_texture = capture.output.unwrap();
+        scaled_capture
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == capture_texture)
+            .unwrap()
+            .width += 1;
+        assert_fusion_ineligible(&scaled_capture);
+
+        let mut wrong_source = base.clone();
+        wrong_source
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == capture.output.unwrap())
+            .unwrap()
+            .source = GraphTextureSource::CapturedTarget;
+        assert_fusion_ineligible(&wrong_source);
+
+        let mut wrong_working_space = base.clone();
+        wrong_working_space
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == capture.output.unwrap())
+            .unwrap()
+            .working_space = oblivion_one::effects::EffectWorkingSpace::LinearSrgb;
+        assert_fusion_ineligible(&wrong_working_space);
     }
 
     #[test]
@@ -8651,6 +9334,44 @@ mod tests {
         assert_eq!(summary.checkpoint_cache_entries, 5);
         assert_eq!(summary.checkpoint_cache_bytes, 80_000);
         assert_eq!(summary.checkpoint_cache_admission, admission);
+    }
+
+    #[test]
+    fn fused_checkpoint_reports_zero_physical_capture_pixels_in_timing_summary() {
+        let mut capture = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            oblivion_one::effects::EffectInstanceId::new(1).unwrap(),
+            Vec::new(),
+            GraphTextureId::new(2).unwrap(),
+            Vec::new(),
+        );
+        capture
+            .checkpoint_dependencies
+            .push(GraphPassId::new(3).unwrap());
+        let mut stats = EffectExecutionStats::default();
+        stats.record_capture_execution_with_mode(
+            &capture,
+            CaptureTimingMode::FramebufferShaderCopy,
+            0,
+            0,
+        );
+        stats.capture_downsample_fusion_candidates = 1;
+        stats.capture_downsample_fusion_executed = 1;
+        stats.capture_downsample_fusion_elided_capture_pixels = 1_073_600;
+        stats.capture_downsample_fusion_output_pixels = 240_000;
+
+        let summary = stats.capture_timing_summary();
+
+        assert_eq!(summary.framebuffer_shader_copy_capture_execution_pixels, 0);
+        assert_eq!(summary.checkpoint_capture_execution_pixels, 0);
+        assert_eq!(summary.capture_downsample_fusion_candidates, 1);
+        assert_eq!(summary.capture_downsample_fusion_executed, 1);
+        assert_eq!(
+            summary.capture_downsample_fusion_elided_capture_pixels,
+            1_073_600
+        );
+        assert_eq!(summary.capture_downsample_fusion_output_pixels, 240_000);
     }
 
     #[test]

@@ -152,6 +152,27 @@ pub(crate) struct CheckpointCaptureCacheKey {
     dependencies: Vec<CheckpointDependencySemanticIdentity>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CheckpointCaptureFamilyKey {
+    consumer: EffectInstanceId,
+    consumer_composition: CheckpointCompositionIdentity,
+    format: EffectTextureFormat,
+    working_space: EffectWorkingSpace,
+    dependencies: Vec<CheckpointDependencySemanticIdentity>,
+}
+
+impl CheckpointCaptureCacheKey {
+    fn family(&self) -> CheckpointCaptureFamilyKey {
+        CheckpointCaptureFamilyKey {
+            consumer: self.consumer,
+            consumer_composition: self.consumer_composition,
+            format: self.format,
+            working_space: self.working_space,
+            dependencies: self.dependencies.clone(),
+        }
+    }
+}
+
 fn checkpoint_composition_identity(
     pass: &oblivion_one::effects::CompiledRenderPass,
 ) -> CheckpointCompositionIdentity {
@@ -383,7 +404,14 @@ pub(crate) struct CheckpointCacheAdmissionStats {
 
 pub(crate) struct PreparedCheckpointCaptures {
     pub(crate) bindings: HashMap<GraphTextureId, GraphTextureBinding>,
+    pub(crate) preparations: HashMap<GraphTextureId, CheckpointCapturePreparation>,
     pub(crate) admission: CheckpointCacheAdmissionStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CheckpointCapturePreparation {
+    pub(crate) newly_admitted: bool,
+    pub(crate) identity_churn: bool,
 }
 
 #[derive(Debug)]
@@ -867,6 +895,20 @@ impl EffectGlResourceCache {
             ..Default::default()
         };
         self.update_checkpoint_compatibility(compatibility);
+        let resident_families = self
+            .checkpoint_captures
+            .keys()
+            .map(CheckpointCaptureCacheKey::family)
+            .collect::<std::collections::HashSet<_>>();
+        let identity_churn_keys = candidates
+            .iter()
+            .take(candidates_considered)
+            .filter_map(|(key, _)| {
+                (!self.checkpoint_captures.contains_key(key)
+                    && resident_families.contains(&key.family()))
+                .then_some(key.clone())
+            })
+            .collect::<std::collections::HashSet<_>>();
         self.retain_checkpoint_captures(
             candidates
                 .iter()
@@ -930,6 +972,7 @@ impl EffectGlResourceCache {
         let Some(graph_peak_bytes) = graph_peak_bytes else {
             return PreparedCheckpointCaptures {
                 bindings: HashMap::new(),
+                preparations: HashMap::new(),
                 admission,
             };
         };
@@ -938,14 +981,17 @@ impl EffectGlResourceCache {
             admission.skipped_graph_pressure = candidates_considered;
             return PreparedCheckpointCaptures {
                 bindings: HashMap::new(),
+                preparations: HashMap::new(),
                 admission,
             };
         }
 
         let mut checkpoint_cache_bytes = checkpoint_cache_bytes;
         let mut bindings = HashMap::new();
+        let mut preparations = HashMap::new();
         for (key, plan) in candidates.iter().take(candidates_considered) {
             let was_resident = self.checkpoint_captures.contains_key(key);
+            let mut newly_admitted = false;
             if !was_resident {
                 let bytes = match texture_key(plan).estimated_bytes() {
                     Ok(bytes) => bytes,
@@ -1010,6 +1056,7 @@ impl EffectGlResourceCache {
                 checkpoint_cache_bytes = new_checkpoint_cache_bytes;
                 admission.newly_admitted_candidates =
                     admission.newly_admitted_candidates.saturating_add(1);
+                newly_admitted = true;
             } else {
                 admission.resident_candidates = admission.resident_candidates.saturating_add(1);
             }
@@ -1018,10 +1065,18 @@ impl EffectGlResourceCache {
                     plan.id,
                     GraphTextureBinding::checkpoint_cache(cached.texture.clone()),
                 );
+                preparations.insert(
+                    plan.id,
+                    CheckpointCapturePreparation {
+                        newly_admitted,
+                        identity_churn: newly_admitted && identity_churn_keys.contains(key),
+                    },
+                );
             }
         }
         PreparedCheckpointCaptures {
             bindings,
+            preparations,
             admission,
         }
     }
@@ -3159,6 +3214,323 @@ mod tests {
         );
         assert_eq!(prepared.bindings[&plan.id].texture.id, texture_id);
         assert_checkpoint_admission_partition(prepared.admission);
+    }
+
+    #[test]
+    fn checkpoint_preparation_marks_only_replaced_family_identity_as_churn() {
+        let first_graph = backdrop_stack_graph(1, EffectRegion::empty());
+        let (first_key, first_plan) = first_checkpoint_candidate(&first_graph);
+        let mut moved_graph = first_graph.clone();
+        let capture = moved_graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .unwrap();
+        let output = capture.output.unwrap();
+        let texture = moved_graph
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == output)
+            .unwrap();
+        texture.domain.x += 7;
+        texture.domain.y += 5;
+        let moved_key = checkpoint_capture_cache_key(&moved_graph, capture).unwrap();
+        let moved_plan = moved_graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == output)
+            .unwrap()
+            .clone();
+        assert_ne!(first_key, moved_key);
+
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
+        cache.pool.next_id = 77;
+        cache.gl_textures.insert(
+            77,
+            glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        );
+        let gl = test_gl_context();
+
+        let first = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(first_key.clone(), first_plan.clone())],
+        );
+        let first_output = first.preparations.get(&first_plan.id).unwrap();
+        assert!(first_output.newly_admitted);
+        assert!(
+            !first_output.identity_churn,
+            "first admission has no predecessor"
+        );
+
+        let moved = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(moved_key.clone(), moved_plan.clone())],
+        );
+        let moved_output = moved.preparations.get(&moved_plan.id).unwrap();
+        assert!(moved_output.newly_admitted);
+        assert!(moved_output.identity_churn);
+
+        let stable = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(0),
+            &[(moved_key, moved_plan.clone())],
+        );
+        let stable_output = stable.preparations.get(&moved_plan.id).unwrap();
+        assert!(!stable_output.newly_admitted);
+        assert!(!stable_output.identity_churn);
+    }
+
+    #[test]
+    fn checkpoint_capture_family_ignores_layout_and_consumer_signature_only() {
+        let graph_a = backdrop_stack_graph(1, EffectRegion::empty());
+        let (key_a, _) = first_checkpoint_candidate(&graph_a);
+        let mut graph_b = graph_a.clone();
+        let pass_index = graph_b
+            .passes
+            .iter()
+            .position(|pass| {
+                pass.kind == RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .unwrap();
+        let consumer_instance_id = graph_b.passes[pass_index].instance;
+        let texture_id = graph_b.passes[pass_index].output.unwrap();
+        let texture = graph_b
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == texture_id)
+            .unwrap();
+        texture.domain.x += 3;
+        texture.domain.y += 2;
+        texture.domain.width += 1;
+        texture.domain.height += 1;
+        texture.width += 1;
+        texture.height += 1;
+        let consumer = graph_b
+            .instances
+            .iter_mut()
+            .find(|instance| instance.id == consumer_instance_id)
+            .unwrap();
+        consumer.semantic_signature = consumer.semantic_signature.wrapping_add(1);
+        let key_b = checkpoint_capture_cache_key(&graph_b, &graph_b.passes[pass_index]).unwrap();
+
+        assert_ne!(
+            key_a, key_b,
+            "persistent cache identity retains layout and signature"
+        );
+        assert_eq!(key_a.family(), key_b.family());
+
+        let mut changed_dependency = graph_b.clone();
+        let dependency = changed_dependency.passes[pass_index].checkpoint_dependencies[0];
+        let dependency_instance = changed_dependency
+            .passes
+            .iter()
+            .find(|pass| pass.id == dependency)
+            .unwrap()
+            .instance;
+        let dependency_instance = changed_dependency
+            .instances
+            .iter_mut()
+            .find(|instance| instance.id == dependency_instance)
+            .unwrap();
+        dependency_instance.semantic_signature =
+            dependency_instance.semantic_signature.wrapping_add(1);
+        let changed_key = checkpoint_capture_cache_key(
+            &changed_dependency,
+            &changed_dependency.passes[pass_index],
+        )
+        .unwrap();
+        assert_ne!(key_b.family(), changed_key.family());
+
+        let mut changed_format = graph_b.clone();
+        changed_format
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == texture_id)
+            .unwrap()
+            .source = GraphTextureSource::Intermediate;
+        let changed_format_key =
+            checkpoint_capture_cache_key(&changed_format, &changed_format.passes[pass_index])
+                .unwrap();
+        assert_ne!(key_b.family(), changed_format_key.family());
+
+        let mut changed_working_space = graph_b.clone();
+        changed_working_space
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == texture_id)
+            .unwrap()
+            .working_space = EffectWorkingSpace::LinearSrgb;
+        let changed_working_space_key = checkpoint_capture_cache_key(
+            &changed_working_space,
+            &changed_working_space.passes[pass_index],
+        )
+        .unwrap();
+        assert_ne!(key_b.family(), changed_working_space_key.family());
+
+        let mut changed_composition = graph_b.clone();
+        changed_composition.passes[pass_index].anchor =
+            oblivion_one::compositor::EffectAnchor::OutputPostProcess;
+        let changed_composition_key = checkpoint_capture_cache_key(
+            &changed_composition,
+            &changed_composition.passes[pass_index],
+        )
+        .unwrap();
+        assert_ne!(key_b.family(), changed_composition_key.family());
+    }
+
+    #[test]
+    fn fused_unpopulated_checkpoint_uses_materialization_on_next_stable_frame() {
+        let graph_a = backdrop_stack_graph(1, EffectRegion::empty());
+        let (key_a, plan_a) = first_checkpoint_candidate(&graph_a);
+        let output = plan_a.id;
+        let mut graph_b = graph_a.clone();
+        let texture_b = graph_b
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == output)
+            .unwrap();
+        texture_b.domain.x += 7;
+        texture_b.domain.y += 5;
+        let pass_b = graph_b
+            .passes
+            .iter()
+            .find(|pass| pass.output == Some(output))
+            .unwrap();
+        let key_b = checkpoint_capture_cache_key(&graph_b, pass_b).unwrap();
+        let plan_b = graph_b
+            .textures
+            .iter()
+            .find(|texture| texture.id == output)
+            .unwrap()
+            .clone();
+        let mut graph_c = graph_b.clone();
+        let texture_c = graph_c
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == output)
+            .unwrap();
+        texture_c.domain.x += 11;
+        texture_c.domain.y += 3;
+        let pass_c = graph_c
+            .passes
+            .iter()
+            .find(|pass| pass.output == Some(output))
+            .unwrap();
+        let key_c = checkpoint_capture_cache_key(&graph_c, pass_c).unwrap();
+        let plan_c = graph_c
+            .textures
+            .iter()
+            .find(|texture| texture.id == output)
+            .unwrap()
+            .clone();
+        let graph_peak_bytes = estimate_graph_peak_bytes(&graph_a).unwrap();
+        assert_eq!(estimate_graph_peak_bytes(&graph_b), Ok(graph_peak_bytes));
+        assert_eq!(estimate_graph_peak_bytes(&graph_c), Ok(graph_peak_bytes));
+        let compatibility = CheckpointCacheCompatibility {
+            output_size: (1920, 1080),
+            framebuffer_origin_top_left: false,
+            effect_registry_generation: 1,
+        };
+        let checkpoint_bytes = texture_key(&plan_a).estimated_bytes().unwrap();
+        let mut cache =
+            EffectGlResourceCache::with_budget(graph_peak_bytes.saturating_add(checkpoint_bytes))
+                .unwrap();
+        cache.pool.next_id = 91;
+        cache.gl_textures.insert(
+            91,
+            glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        );
+        let gl = test_gl_context();
+
+        let admitted_a = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak_bytes),
+            &[(key_a.clone(), plan_a.clone())],
+        );
+        assert!(admitted_a.preparations[&output].newly_admitted);
+        assert!(!admitted_a.preparations[&output].identity_churn);
+        assert_eq!(admitted_a.admission.newly_admitted_candidates, 1);
+        assert_eq!(admitted_a.admission.skipped_hard_budget, 0);
+        assert_eq!(admitted_a.admission.skipped_checkpoint_budget, 0);
+        let hard_budget_bytes = admitted_a.admission.hard_budget_bytes;
+        let soft_budget_bytes = admitted_a.admission.checkpoint_cache_soft_budget_bytes;
+        assert_eq!(cache.pool.metrics().allocation_count, 1);
+        cache.mark_checkpoint_capture_populated(&key_a, 1);
+        assert!(!cache.checkpoint_capture_needs_full_refresh(&key_a, 2));
+
+        let churn_frame_b = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak_bytes),
+            &[(key_b.clone(), plan_b.clone())],
+        );
+        assert!(churn_frame_b.preparations[&output].newly_admitted);
+        assert!(churn_frame_b.preparations[&output].identity_churn);
+        assert_eq!(churn_frame_b.admission.newly_admitted_candidates, 1);
+        assert_eq!(churn_frame_b.admission.skipped_hard_budget, 0);
+        assert_eq!(churn_frame_b.admission.skipped_checkpoint_budget, 0);
+        assert_eq!(churn_frame_b.admission.hard_budget_bytes, hard_budget_bytes);
+        assert_eq!(
+            churn_frame_b.admission.checkpoint_cache_soft_budget_bytes,
+            soft_budget_bytes
+        );
+        assert_eq!(cache.pool.metrics().allocation_count, 1);
+        assert_eq!(cache.checkpoint_cache_stats().0, 1);
+        assert_eq!(
+            cache.checkpoint_captures[&key_b].last_populated_frame_serial, None,
+            "a fused frame leaves the newly admitted checkpoint unpublished"
+        );
+        assert!(cache.checkpoint_capture_needs_full_refresh(&key_b, 2));
+
+        let churn_frame_c = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak_bytes),
+            &[(key_c.clone(), plan_c.clone())],
+        );
+        assert!(churn_frame_c.preparations[&output].newly_admitted);
+        assert!(churn_frame_c.preparations[&output].identity_churn);
+        assert_eq!(churn_frame_c.admission.newly_admitted_candidates, 1);
+        assert_eq!(churn_frame_c.admission.skipped_hard_budget, 0);
+        assert_eq!(churn_frame_c.admission.skipped_checkpoint_budget, 0);
+        assert_eq!(churn_frame_c.admission.hard_budget_bytes, hard_budget_bytes);
+        assert_eq!(
+            churn_frame_c.admission.checkpoint_cache_soft_budget_bytes,
+            soft_budget_bytes
+        );
+        assert_eq!(cache.pool.metrics().allocation_count, 1);
+        assert_eq!(cache.checkpoint_cache_stats().0, 1);
+        assert_eq!(
+            cache.checkpoint_captures[&key_c].last_populated_frame_serial, None,
+            "continued churn also leaves each new checkpoint unpublished"
+        );
+
+        let stable_frame = cache.prepare_checkpoint_captures(
+            &gl,
+            compatibility,
+            Some(graph_peak_bytes),
+            &[(key_c.clone(), plan_c.clone())],
+        );
+        assert!(!stable_frame.preparations[&output].newly_admitted);
+        assert!(!stable_frame.preparations[&output].identity_churn);
+        assert!(cache.checkpoint_capture_needs_full_refresh(&key_c, 4));
+        cache.mark_checkpoint_capture_populated(&key_c, 4);
+        assert!(!cache.checkpoint_capture_needs_full_refresh(&key_c, 5));
     }
 
     #[test]
