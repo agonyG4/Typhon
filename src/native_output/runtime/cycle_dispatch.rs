@@ -133,6 +133,10 @@ fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
 #[serde(deny_unknown_fields)]
 struct EmptyKeyboardLayoutArgs {}
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AnimationConfigurationSetArgs {
