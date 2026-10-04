@@ -2355,10 +2355,10 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnimationConfigurationSetArgs, DirectScanoutCounters, DirectScanoutDoctorFormat, DirectScanoutDoctorRuntime,
-        DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs,
-        KeyboardLayoutSetArgs, MaterialSetError, NativePreReadInputDecision,
-        decide_native_pre_read_input, dispatch_keyboard_layout_command,
+        AnimationConfigurationSetArgs, DirectScanoutCounters, DirectScanoutDoctorFormat,
+        DirectScanoutDoctorRuntime, DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs,
+        KeyboardConfigurationSetArgs, KeyboardLayoutSetArgs, MaterialSetError,
+        NativePreReadInputDecision, decide_native_pre_read_input, dispatch_keyboard_layout_command,
         format_direct_scanout_doctor_detail, format_dmabuf_feedback_source_format,
         input_requires_full_server_progression, keyboard_layout_failure,
         material_program_get_args_are_empty, material_program_parameter_set_failure_response,
@@ -2402,8 +2402,7 @@ mod tests {
             "overrides": {"window.open": "window.scale"},
             "animateMaximizedWindowOpen": false
         });
-        let args: AnimationConfigurationSetArgs =
-            serde_json::from_value(explicit_off).unwrap();
+        let args: AnimationConfigurationSetArgs = serde_json::from_value(explicit_off).unwrap();
         assert!(!args.animate_maximized_window_open);
         assert_eq!(args.overrides["window.open"], "window.scale");
 
@@ -2415,10 +2414,9 @@ mod tests {
             speed: args.speed,
             overrides: args.overrides,
         };
-        let configuration = oblivion_one::animation_control::AnimationConfiguration::from_document(
-            document,
-        )
-        .unwrap();
+        let configuration =
+            oblivion_one::animation_control::AnimationConfiguration::from_document(document)
+                .unwrap();
         assert!(!configuration.animate_maximized_window_open);
         assert!(configuration.enabled);
         assert_eq!(configuration.preset.id(), "astrea");

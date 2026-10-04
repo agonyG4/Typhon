@@ -134,6 +134,39 @@ fn selection_notify_event(
     }
 }
 
+fn start_root_proxy_verification(xwm: &mut Xwm, now_ns: u64) -> u16 {
+    let event = xproto::PropertyNotifyEvent {
+        response_type: xproto::PROPERTY_NOTIFY_EVENT,
+        sequence: 0,
+        window: xwm.root,
+        atom: xwm.atoms.get(XwmAtomName::XdndProxy),
+        time: 1,
+        state: xproto::Property::NEW_VALUE,
+    };
+    assert!(super::super::property_notify(xwm, event, now_ns).unwrap());
+    match xwm.data_bridge.dnd_incoming.root_proxy_authority {
+        RootProxyAuthority::Verifying { sequence, .. } => sequence as u16,
+        authority => panic!("expected root proxy verification, got {authority:?}"),
+    }
+}
+
+fn send_root_proxy_reply(peer: &mut UnixStream, sequence: u16, proxy: Window) {
+    peer.write_all(&get_property_reply(
+        sequence,
+        u32::from(AtomEnum::WINDOW),
+        32,
+        &proxy.to_ne_bytes(),
+    ))
+    .unwrap();
+}
+
+fn lose_root_proxy(xwm: &mut Xwm, peer: &mut UnixStream, now_ns: u64, foreign_proxy: Window) {
+    let sequence = start_root_proxy_verification(xwm, now_ns);
+    let _verification_request = read_peer(peer);
+    send_root_proxy_reply(peer, sequence, foreign_proxy);
+    super::poll_replies(xwm, 8, now_ns.saturating_add(1)).unwrap();
+}
+
 fn deliver_post_drop_direct_payload(
     xwm: &mut Xwm,
     peer: &mut UnixStream,
@@ -1105,7 +1138,7 @@ fn source_destruction_cancels_before_and_after_drop_without_finished() {
 }
 
 #[test]
-fn dropped_terminal_timeout_submits_canonical_cancel_then_fails_wire_once() {
+fn dropped_terminal_timeout_preserves_queued_success_after_false_cancel_result() {
     let (mut xwm, mut peer, offer_id, _, _, _) = accepted_drop(Action::Copy);
     let deadline = match xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase {
         IncomingDndWirePhase::AwaitingWaylandFinish { deadline_ns, .. } => deadline_ns,
@@ -1123,11 +1156,102 @@ fn dropped_terminal_timeout_submits_canonical_cancel_then_fails_wire_once() {
         xwm.data_bridge.dnd_incoming.take_events().as_slice(),
         [XwaylandDndIncomingEvent::CancelAfterDrop { offer_id: cancelled }] if *cancelled == offer_id
     ));
+
+    let queued_transition = crate::xwayland::XwaylandDndTransition::SourceFinished {
+        offer_id,
+        accepted: true,
+        action: Some(Action::Copy),
+    };
     super::super::resolve_cancel_after_drop(&mut xwm, offer_id, false).unwrap();
+
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::AwaitingWaylandFinish {
+            cancel_submitted: true,
+            ..
+        }
+    ));
+    assert!(finished_messages(&read_peer(&mut peer), &xwm).is_empty());
+
+    super::super::apply_transition(&mut xwm, queued_transition, deadline + 1).unwrap();
+    let success = finished_messages(&read_peer(&mut peer), &xwm);
+    assert_eq!(success.len(), 1);
+    assert_eq!(
+        success[0].1,
+        [
+            xwm.root,
+            1,
+            xwm.atoms.get(XwmAtomName::XdndActionCopy),
+            0,
+            0
+        ]
+    );
     assert!(xwm.data_bridge.dnd.incoming_session().is_none());
+}
+
+#[test]
+fn dropped_terminal_timeout_fallback_fails_once_without_canonical_completion() {
+    let (mut xwm, mut peer, offer_id, _, _, _) = accepted_drop(Action::Copy);
+    let first_deadline = match xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase {
+        IncomingDndWirePhase::AwaitingWaylandFinish { deadline_ns, .. } => deadline_ns,
+        phase => panic!("expected dropped phase, got {phase:?}"),
+    };
+    super::super::expire_deadlines(&mut xwm, first_deadline).unwrap();
+    super::super::resolve_cancel_after_drop(&mut xwm, offer_id, false).unwrap();
+    let fallback_deadline = match xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase {
+        IncomingDndWirePhase::AwaitingWaylandFinish {
+            deadline_ns,
+            cancel_submitted: true,
+            ..
+        } => deadline_ns,
+        phase => panic!("expected cancellation fallback, got {phase:?}"),
+    };
+
+    super::super::expire_deadlines(&mut xwm, fallback_deadline).unwrap();
     let failure = finished_messages(&read_peer(&mut peer), &xwm);
     assert_eq!(failure.len(), 1);
     assert_eq!(failure[0].1, [xwm.root, 0, 0, 0, 0]);
+    assert!(xwm.data_bridge.dnd.incoming_session().is_none());
+    super::super::expire_deadlines(&mut xwm, fallback_deadline + 1).unwrap();
+    assert!(finished_messages(&read_peer(&mut peer), &xwm).is_empty());
+}
+
+#[test]
+fn accepted_cancel_waits_for_canonical_failure_without_duplicate_finished() {
+    let (mut xwm, mut peer, offer_id, _, _, _) = accepted_drop(Action::Copy);
+    let deadline = match xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase {
+        IncomingDndWirePhase::AwaitingWaylandFinish { deadline_ns, .. } => deadline_ns,
+        phase => panic!("expected dropped phase, got {phase:?}"),
+    };
+    super::super::expire_deadlines(&mut xwm, deadline).unwrap();
+    super::super::resolve_cancel_after_drop(&mut xwm, offer_id, true).unwrap();
+    assert!(xwm.data_bridge.dnd.incoming_session().is_some());
+    assert!(finished_messages(&read_peer(&mut peer), &xwm).is_empty());
+
+    let retired = crate::xwayland::XwaylandDndTransition::SourceFinished {
+        offer_id,
+        accepted: false,
+        action: None,
+    };
+    super::super::apply_transition(&mut xwm, retired, deadline + 1).unwrap();
+    assert_eq!(
+        finished_messages(&read_peer(&mut peer), &xwm)
+            .iter()
+            .map(|(_, data)| *data)
+            .collect::<Vec<_>>(),
+        [[xwm.root, 0, 0, 0, 0]]
+    );
+    super::super::apply_transition(
+        &mut xwm,
+        crate::xwayland::XwaylandDndTransition::SourceFinished {
+            offer_id,
+            accepted: false,
+            action: None,
+        },
+        deadline + 2,
+    )
+    .unwrap();
+    assert!(finished_messages(&read_peer(&mut peer), &xwm).is_empty());
 }
 
 #[test]
@@ -1273,46 +1397,276 @@ fn root_proxy_verification_deadline_fails_closed_without_reclaim() {
 }
 
 #[test]
-fn root_proxy_loss_after_drop_cancels_canonical_drag_and_sends_one_failure() {
-    let (mut xwm, mut peer, offer_id, _, _, _) = accepted_drop(Action::Copy);
-    let target_proxy = xwm.data_bridge.dnd_incoming.target_proxy.unwrap();
-    let root_change = xproto::PropertyNotifyEvent {
-        response_type: xproto::PROPERTY_NOTIFY_EVENT,
-        sequence: 0,
-        window: xwm.root,
-        atom: xwm.atoms.get(XwmAtomName::XdndProxy),
-        time: 1,
-        state: xproto::Property::NEW_VALUE,
-    };
-    super::super::property_notify(&mut xwm, root_change, 1).unwrap();
-    let sequence = match xwm.data_bridge.dnd_incoming.root_proxy_authority {
-        RootProxyAuthority::Verifying { sequence, .. } => sequence as u16,
-        authority => panic!("expected async verification, got {authority:?}"),
-    };
-    let _verification_request = read_peer(&mut peer);
+fn newer_root_property_event_discards_stale_owned_verification() {
+    let (mut xwm, mut peer, _, _, _, target_proxy, _) = fake_incoming_hover();
+    let first_sequence = start_root_proxy_verification(&mut xwm, 1);
+    let _first_request = read_peer(&mut peer);
+    send_root_proxy_reply(&mut peer, first_sequence, target_proxy);
+
+    let second_sequence = start_root_proxy_verification(&mut xwm, 2);
+    assert_ne!(first_sequence, second_sequence);
+    let _second_request = read_peer(&mut peer);
     let foreign_proxy: Window = 0x779;
-    peer.write_all(&get_property_reply(
-        sequence,
-        u32::from(AtomEnum::WINDOW),
-        32,
-        &foreign_proxy.to_ne_bytes(),
-    ))
-    .unwrap();
-    super::poll_replies(&mut xwm, 8, 2).unwrap();
+    send_root_proxy_reply(&mut peer, second_sequence, foreign_proxy);
+    super::poll_replies(&mut xwm, 8, 3).unwrap();
+
     assert!(matches!(
         xwm.data_bridge.dnd_incoming.root_proxy_authority,
-        RootProxyAuthority::Lost { generation, proxy }
-            if generation == offer_id.generation() && proxy == target_proxy
+        RootProxyAuthority::Lost { proxy, .. } if proxy == target_proxy
     ));
-    assert!(xwm.data_bridge.dnd.incoming_session().is_none());
+}
+
+#[test]
+fn newest_root_property_verification_can_restore_owned_authority() {
+    let (mut xwm, mut peer, _, _, _, target_proxy, _) = fake_incoming_hover();
+    let first_sequence = start_root_proxy_verification(&mut xwm, 1);
+    let _first_request = read_peer(&mut peer);
+    send_root_proxy_reply(&mut peer, first_sequence, 0x778);
+
+    let second_sequence = start_root_proxy_verification(&mut xwm, 2);
+    assert_ne!(first_sequence, second_sequence);
+    let _second_request = read_peer(&mut peer);
+    send_root_proxy_reply(&mut peer, second_sequence, target_proxy);
+    super::poll_replies(&mut xwm, 8, 3).unwrap();
+
+    assert!(root_proxy_is_owned(&xwm));
+}
+
+#[test]
+fn repeated_root_property_events_keep_only_the_newest_verification_live() {
+    let (mut xwm, mut peer, _, _, _, target_proxy, _) = fake_incoming_hover();
+    let mut sequence = start_root_proxy_verification(&mut xwm, 1);
+    let _ = read_peer(&mut peer);
+    for time in 2..=8 {
+        send_root_proxy_reply(&mut peer, sequence, 0x777);
+        let next_sequence = start_root_proxy_verification(&mut xwm, time);
+        assert_ne!(sequence, next_sequence);
+        assert!(matches!(
+            xwm.data_bridge.dnd_incoming.root_proxy_authority,
+            RootProxyAuthority::Verifying { sequence: current, .. }
+                if current == u64::from(next_sequence)
+        ));
+        let request = read_peer(&mut peer);
+        assert_eq!(request.first(), Some(&xproto::GET_PROPERTY_REQUEST));
+        sequence = next_sequence;
+    }
+
+    send_root_proxy_reply(&mut peer, sequence, target_proxy);
+    super::poll_replies(&mut xwm, 16, 9).unwrap();
+    assert!(root_proxy_is_owned(&xwm));
+}
+
+#[test]
+fn root_proxy_loss_after_drop_preserves_drop_submission_and_blocks_new_enters() {
+    let (mut xwm, mut peer, offer_id, _, _, target_proxy, _) = fake_incoming_hover();
+    assert!(accept_position(&mut xwm, &mut peer, offer_id, Action::Copy));
+    let source = xwm.data_bridge.dnd.incoming_session().unwrap().source.xid();
+    let drop = drop_message(&xwm, source, DROP_TIME);
+    assert!(super::super::client_message(&mut xwm, drop, 40).unwrap());
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.take_events().as_slice(),
+        [XwaylandDndIncomingEvent::Drop { offer_id: submitted }] if *submitted == offer_id
+    ));
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::DropSubmitted { .. }
+    ));
+
+    lose_root_proxy(&mut xwm, &mut peer, 41, 0x779);
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Lost { proxy, .. } if proxy == target_proxy
+    ));
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::DropSubmitted { .. }
+    ));
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+
+    let new_enter = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndEnter,
+        [0x992, 5 << 24, 0x552, 0, 0],
+    );
+    assert!(super::super::client_message(&mut xwm, new_enter, 42).unwrap());
+    assert_eq!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().offer_id,
+        offer_id
+    );
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+
+    super::super::resolve_drop(&mut xwm, offer_id, true, 43).unwrap();
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::AwaitingWaylandFinish { .. }
+    ));
+    let finished = crate::xwayland::XwaylandDndTransition::SourceFinished {
+        offer_id,
+        accepted: true,
+        action: Some(Action::Copy),
+    };
+    super::super::apply_transition(&mut xwm, finished, 44).unwrap();
+    assert_eq!(
+        finished_messages(&read_peer(&mut peer), &xwm)
+            .iter()
+            .map(|(_, data)| *data)
+            .collect::<Vec<_>>(),
+        [[
+            xwm.root,
+            1,
+            xwm.atoms.get(XwmAtomName::XdndActionCopy),
+            0,
+            0
+        ]]
+    );
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Lost { .. }
+    ));
+}
+
+#[test]
+fn queued_source_finished_beats_cancel_and_root_loss_for_committed_copy() {
+    let (mut xwm, mut peer, offer_id, _, _, _) = accepted_drop(Action::Copy);
+    let target_proxy = xwm.data_bridge.dnd_incoming.target_proxy.unwrap();
+    // The canonical finish is already in the compositor outbox when timeout
+    // and the root-property event are processed by the runtime.
+    let queued_success = crate::xwayland::XwaylandDndTransition::SourceFinished {
+        offer_id,
+        accepted: true,
+        action: Some(Action::Copy),
+    };
+    let terminal_deadline = match xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase {
+        IncomingDndWirePhase::AwaitingWaylandFinish { deadline_ns, .. } => deadline_ns,
+        phase => panic!("expected dropped phase, got {phase:?}"),
+    };
+    super::super::expire_deadlines(&mut xwm, terminal_deadline).unwrap();
     assert!(matches!(
         xwm.data_bridge.dnd_incoming.take_events().as_slice(),
         [XwaylandDndIncomingEvent::CancelAfterDrop { offer_id: cancelled }]
             if *cancelled == offer_id
     ));
-    let failure = finished_messages(&read_peer(&mut peer), &xwm);
-    assert_eq!(failure.len(), 1);
-    assert_eq!(failure[0].1, [xwm.root, 0, 0, 0, 0]);
+
+    lose_root_proxy(&mut xwm, &mut peer, 1, 0x779);
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Lost { proxy, .. } if proxy == target_proxy
+    ));
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::AwaitingWaylandFinish {
+            cancel_submitted: true,
+            ..
+        }
+    ));
+
+    super::super::resolve_cancel_after_drop(&mut xwm, offer_id, false).unwrap();
+    super::super::apply_transition(&mut xwm, queued_success, terminal_deadline + 1).unwrap();
+
+    let finished = finished_messages(&read_peer(&mut peer), &xwm);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        finished[0].1,
+        [
+            xwm.root,
+            1,
+            xwm.atoms.get(XwmAtomName::XdndActionCopy),
+            0,
+            0
+        ]
+    );
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Lost { .. }
+    ));
+    assert!(xwm.data_bridge.dnd.incoming_session().is_none());
+
+    let event = xproto::PropertyNotifyEvent {
+        response_type: xproto::PROPERTY_NOTIFY_EVENT,
+        sequence: 0,
+        window: xwm.root,
+        atom: xwm.atoms.get(XwmAtomName::XdndProxy),
+        time: 3,
+        state: xproto::Property::NEW_VALUE,
+    };
+    assert!(super::super::property_notify(&mut xwm, event, 3).unwrap());
+    assert!(read_peer(&mut peer).is_empty());
+}
+
+#[test]
+fn move_delete_completes_after_root_proxy_loss_and_lost_rejects_new_enter() {
+    let (mut xwm, mut peer, offer_id, _, drop_timestamp, mut server_sequence) =
+        accepted_drop(Action::Move);
+    super::super::source_finished(&mut xwm, offer_id, true, Some(Action::Move), 50).unwrap();
+    let delete = xwm.data_bridge.dnd_incoming.move_delete.unwrap();
+    assert!(matches!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase,
+        IncomingDndWirePhase::DeletePending {
+            drop_timestamp: timestamp,
+            final_action: Action::Move,
+        } if timestamp == drop_timestamp
+    ));
+    let _delete_requests = take_requests(&mut peer, &mut server_sequence);
+
+    lose_root_proxy(&mut xwm, &mut peer, 51, 0x779);
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Lost { .. }
+    ));
+    assert!(xwm.data_bridge.dnd_incoming.move_delete.is_some());
+    assert!(xwm.data_bridge.dnd.incoming_session().is_some());
+
+    let enter = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndEnter,
+        [0x993, 5 << 24, 0x553, 0, 0],
+    );
+    assert!(super::super::client_message(&mut xwm, enter, 52).unwrap());
+    assert_eq!(
+        xwm.data_bridge.dnd.incoming_session().unwrap().offer_id,
+        offer_id
+    );
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+
+    let success = selection_notify_event(
+        delete.requestor,
+        xwm.atoms.get(XwmAtomName::XdndSelection),
+        xwm.atoms.get(XwmAtomName::Delete),
+        delete.property,
+        drop_timestamp,
+    );
+    assert!(super::super::selection_notify(&mut xwm, success, 53).unwrap());
+    let finished = finished_messages(&read_peer(&mut peer), &xwm);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        finished[0].1,
+        [
+            xwm.root,
+            1,
+            xwm.atoms.get(XwmAtomName::XdndActionMove),
+            0,
+            0
+        ]
+    );
+    assert!(xwm.data_bridge.dnd.incoming_session().is_none());
+    assert!(xwm.data_bridge.dnd_incoming.move_delete.is_none());
+    assert!(matches!(
+        xwm.data_bridge.dnd_incoming.root_proxy_authority,
+        RootProxyAuthority::Lost { .. }
+    ));
+
+    let enter = client_message(
+        &xwm,
+        xwm.root,
+        XwmAtomName::XdndEnter,
+        [0x994, 5 << 24, 0x554, 0, 0],
+    );
+    assert!(super::super::client_message(&mut xwm, enter, 54).unwrap());
+    assert!(xwm.data_bridge.dnd.incoming_session().is_none());
+    assert!(xwm.data_bridge.dnd_incoming.take_events().is_empty());
+    assert!(read_peer(&mut peer).is_empty());
 }
 
 #[test]

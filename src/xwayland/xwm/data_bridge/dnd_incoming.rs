@@ -595,13 +595,26 @@ pub(crate) fn root_proxy_is_owned(xwm: &Xwm) -> bool {
 }
 
 fn begin_root_proxy_verification(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmError> {
-    let RootProxyAuthority::Owned { generation, proxy } =
-        xwm.data_bridge.dnd_incoming.root_proxy_authority
-    else {
-        return Ok(());
-    };
+    let (generation, proxy, superseded_sequence) =
+        match xwm.data_bridge.dnd_incoming.root_proxy_authority {
+            RootProxyAuthority::Owned { generation, proxy } => (generation, proxy, None),
+            RootProxyAuthority::Verifying {
+                generation,
+                proxy,
+                sequence,
+                ..
+            } => (generation, proxy, Some(sequence)),
+            _ => return Ok(()),
+        };
     if generation != xwm.generation || target_proxy(xwm) != Some(proxy) {
         return Ok(());
+    }
+    if let Some(sequence) = superseded_sequence {
+        xwm.connection.discard_reply(
+            sequence,
+            x11rb::connection::RequestKind::HasResponse,
+            x11rb::connection::DiscardMode::DiscardReply,
+        );
     }
     let cookie = xwm
         .connection

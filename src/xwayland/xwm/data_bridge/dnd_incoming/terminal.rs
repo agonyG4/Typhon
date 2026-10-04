@@ -264,7 +264,7 @@ pub(crate) fn resolve_cancel_after_drop(
     offer_id: XwaylandDndOfferId,
     cancelled: bool,
 ) -> Result<(), XwmError> {
-    let Some((source, logical_target_root, target_proxy, version, phase)) = xwm
+    let Some((source, logical_target_root, target_proxy, version, phase, cancel_submitted)) = xwm
         .data_bridge
         .dnd
         .incoming_session()
@@ -283,12 +283,22 @@ pub(crate) fn resolve_cancel_after_drop(
                 session.target_proxy,
                 session.version,
                 session.wire_phase,
+                matches!(
+                    session.wire_phase,
+                    IncomingDndWirePhase::AwaitingWaylandFinish {
+                        cancel_submitted: true,
+                        ..
+                    }
+                ),
             )
         })
     else {
         return Ok(());
     };
-    if !cancelled {
+    // `cancelled == false` can mean the drag already completed and its
+    // SourceFinished transition is waiting in the compositor outbox. Keep the
+    // exact terminal session for that transition or the existing fallback.
+    if !cancelled && !cancel_submitted {
         send_finished(
             xwm,
             DropSnapshot {
@@ -687,14 +697,10 @@ pub(crate) fn root_proxy_lost(xwm: &mut Xwm) -> Result<(), XwmError> {
             let _ = metadata::leave_offer(xwm, offer_id);
         }
         IncomingDndWirePhase::DropSubmitted { .. }
-        | IncomingDndWirePhase::AwaitingWaylandFinish { .. } => {
-            let _ = enqueue_cancel_after_drop(xwm, offer_id);
-            send_finished_for_offer(xwm, offer_id, false, None, true)?;
-            cleanup_terminal(xwm, offer_id);
-        }
-        IncomingDndWirePhase::DeletePending { .. } => {
-            send_finished_for_offer(xwm, offer_id, false, None, true)?;
-            cleanup_terminal(xwm, offer_id);
+        | IncomingDndWirePhase::AwaitingWaylandFinish { .. }
+        | IncomingDndWirePhase::DeletePending { .. } => {
+            // Root ownership gates new admission. These phases already carry
+            // the immutable identity needed to finish their committed work.
         }
         IncomingDndWirePhase::TerminalConsumed => cleanup_terminal(xwm, offer_id),
     }
