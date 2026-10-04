@@ -1,5 +1,15 @@
 use std::collections::HashMap;
 
+#[cfg(test)]
+thread_local! {
+    static RESOLVED_EFFECT_SCENE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::compositor) fn resolved_effect_scene_call_count_for_test() -> usize {
+    RESOLVED_EFFECT_SCENE_CALLS.with(std::cell::Cell::get)
+}
+
 use crate::presentation_animation::PresentationRect;
 
 use crate::effects::{
@@ -284,7 +294,23 @@ impl super::CompositorState {
         self.effect_scene_summary = summary;
     }
 
+    pub(in crate::compositor) fn replacement_effect_instances(
+        &self,
+    ) -> impl Iterator<Item = &ResolvedEffectInstance> {
+        self.internal_surface_effects
+            .values()
+            .chain(
+                self.protocol_surface_effects
+                    .values()
+                    .filter_map(|binding| binding.instance.as_ref()),
+            )
+            .filter(|instance| matches!(instance.anchor, EffectAnchor::ReplaceSurface(_)))
+    }
+
     pub(in crate::compositor) fn resolved_effect_scene(&self) -> ResolvedEffectScene {
+        #[cfg(test)]
+        RESOLVED_EFFECT_SCENE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
         let registry_generation = self.trusted_effect_registry.current();
         let material_selection = self.material_program_control.snapshot(
             &registry_generation,
@@ -621,6 +647,14 @@ impl super::CompositorState {
     ) -> Option<VisualGroupId> {
         let surfaces = self.active_scene_surfaces();
         let groups = visual_stack_groups(surfaces, self.active_scene_popup_surface_ids());
+        Self::visual_group_for_surface_in_groups(surfaces, &groups, surface_id)
+    }
+
+    pub(in crate::compositor) fn visual_group_for_surface_in_groups(
+        surfaces: &[super::RenderableSurface],
+        groups: &[VisualStackGroup],
+        surface_id: u32,
+    ) -> Option<VisualGroupId> {
         groups
             .iter()
             .position(|group| {

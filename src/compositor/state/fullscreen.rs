@@ -551,15 +551,20 @@ impl CompositorState {
     }
 
     fn fullscreen_owner_effects_preserve_full_occlusion(&self, owner_root_surface_id: u32) -> bool {
-        let scene = self.resolved_effect_scene();
-        let registry = self.trusted_effect_registry.current();
+        let mut replacements = self.replacement_effect_instances().peekable();
+        if replacements.peek().is_none() {
+            return true;
+        }
+
         let active_surfaces = self.active_scene_surfaces();
-        let owner_visual_group = self.visual_group_for_surface(owner_root_surface_id);
         let output_bounds =
             crate::effects::EffectRect::new(0, 0, self.output_size.width, self.output_size.height)
                 .expect("configured output size is nonzero");
+        let mut visual_groups = None;
+        let mut owner_visual_group = None;
+        let mut registry = None;
 
-        for instance in &scene.instances {
+        for instance in replacements {
             let crate::compositor::EffectAnchor::ReplaceSurface(surface_id) = instance.anchor
             else {
                 continue;
@@ -579,12 +584,25 @@ impl CompositorState {
                 if effect_root == owner_root_surface_id {
                     true
                 } else {
-                    let current_effect_group = self.visual_group_for_surface(surface_id);
-                    match (
-                        instance.visual_group,
-                        current_effect_group,
-                        owner_visual_group,
-                    ) {
+                    let groups = visual_groups.get_or_insert_with(|| {
+                        crate::compositor::visual_stack_groups(
+                            active_surfaces,
+                            self.active_scene_popup_surface_ids(),
+                        )
+                    });
+                    let current_effect_group = Self::visual_group_for_surface_in_groups(
+                        active_surfaces,
+                        groups,
+                        surface_id,
+                    );
+                    let owner_group = *owner_visual_group.get_or_insert_with(|| {
+                        Self::visual_group_for_surface_in_groups(
+                            active_surfaces,
+                            groups,
+                            owner_root_surface_id,
+                        )
+                    });
+                    match (instance.visual_group, current_effect_group, owner_group) {
                         (Some(resolved), Some(current), Some(owner)) if resolved == current => {
                             current == owner
                         }
@@ -607,12 +625,21 @@ impl CompositorState {
                 continue;
             }
 
+            let registry = registry.get_or_insert_with(|| self.trusted_effect_registry.current());
             let Some(program) = registry.effect_for_program(instance.program) else {
                 // A replacement with missing trusted program metadata has no
                 // formal opacity guarantee.
                 return false;
             };
             if program.program.program.alpha_mode != crate::effects::EffectAlphaMode::Opaque {
+                return false;
+            }
+            let uncovered_output = crate::effects::EffectRegion::from_rect(output_bounds)
+                .subtract(&instance.region.intersect_rect(output_bounds));
+            if !uncovered_output.is_empty() {
+                // ReplaceSurface skips its target composition range. An opaque
+                // graph only proves full output opacity when its region covers
+                // every pixel of the fullscreen output.
                 return false;
             }
             // The effect graph copies this trusted alpha mode to its final
@@ -1006,6 +1033,7 @@ mod occlusion_proof_tests {
 
     const UNDERLAY_ROOT: u32 = 941;
     const OWNER_ROOT: u32 = 942;
+    const OWNER_CHILD: u32 = 943;
 
     fn fullscreen_owner_fixture() -> (CompositorState, WindowId, SceneNodeId, PresentationRect) {
         let mut state = CompositorState::default();
@@ -1120,6 +1148,44 @@ mod occlusion_proof_tests {
     fn owner_proves_full_occlusion(state: &CompositorState) -> bool {
         let eligibility = state.fullscreen_presentation_eligibility();
         state.fullscreen_owner_proves_full_occlusion(OWNER_ROOT, eligibility)
+    }
+
+    #[test]
+    fn fullscreen_occlusion_effect_proof_without_replacements_skips_scene_resolution() {
+        let (state, _, _, _) = fullscreen_owner_fixture();
+        let calls_before = crate::compositor::effects::resolved_effect_scene_call_count_for_test();
+
+        assert!(state.fullscreen_owner_effects_preserve_full_occlusion(OWNER_ROOT));
+        assert_eq!(
+            crate::compositor::effects::resolved_effect_scene_call_count_for_test(),
+            calls_before,
+            "a no-replacement proof must not resolve the effect scene"
+        );
+    }
+
+    #[test]
+    fn fullscreen_occlusion_effect_proof_ignores_before_surface_effect_without_scene_resolution() {
+        let (mut state, _, _, _) = fullscreen_owner_fixture();
+        let program = register_preserving_mask_program(&state);
+        assert!(
+            state.set_internal_surface_effect(
+                UNDERLAY_ROOT,
+                EffectAnchor::BeforeSurface(UNDERLAY_ROOT),
+                program,
+                EffectRegion::from_rect(
+                    EffectRect::new(0, 0, state.output_size.width, state.output_size.height)
+                        .expect("background effect region"),
+                ),
+            )
+        );
+        let calls_before = crate::compositor::effects::resolved_effect_scene_call_count_for_test();
+
+        assert!(state.fullscreen_owner_effects_preserve_full_occlusion(OWNER_ROOT));
+        assert_eq!(
+            crate::compositor::effects::resolved_effect_scene_call_count_for_test(),
+            calls_before,
+            "an unrelated BeforeSurface effect must not resolve the effect scene"
+        );
     }
 
     #[test]
@@ -1261,6 +1327,77 @@ mod occlusion_proof_tests {
     }
 
     #[test]
+    fn fullscreen_occlusion_proof_ignores_replacement_on_inactive_surface() {
+        let (mut state, _, _, _) = fullscreen_owner_fixture();
+        let inactive_surface = OWNER_ROOT + 100;
+        assert!(
+            state.set_internal_surface_effect(
+                inactive_surface,
+                EffectAnchor::ReplaceSurface(inactive_surface),
+                EffectProgramId::new(98).expect("unknown program ID"),
+                EffectRegion::from_rect(
+                    EffectRect::new(0, 0, state.output_size.width, state.output_size.height)
+                        .expect("replacement region"),
+                ),
+            )
+        );
+
+        assert!(owner_proves_full_occlusion(&state));
+    }
+
+    #[test]
+    fn fullscreen_occlusion_proof_ignores_replacement_region_outside_output() {
+        let (mut state, _, _, _) = fullscreen_owner_fixture();
+        let output_right = i32::try_from(state.output_size.width).expect("output width") + 1;
+        assert!(state.set_internal_surface_effect(
+            OWNER_ROOT,
+            EffectAnchor::ReplaceSurface(OWNER_ROOT),
+            EffectProgramId::new(98).expect("unknown program ID"),
+            EffectRegion::from_rect(
+                EffectRect::new(output_right, 0, 10, 10).expect("off-output region"),
+            ),
+        ));
+
+        assert!(owner_proves_full_occlusion(&state));
+    }
+
+    #[test]
+    fn fullscreen_occlusion_proof_includes_active_protocol_replacement_bindings() {
+        let (mut state, _, _, _) = fullscreen_owner_fixture();
+        let program = register_preserving_mask_program(&state);
+        assert!(
+            state.set_internal_surface_effect(
+                OWNER_ROOT,
+                EffectAnchor::ReplaceSurface(OWNER_ROOT),
+                program,
+                EffectRegion::from_rect(
+                    EffectRect::new(0, 0, state.output_size.width, state.output_size.height)
+                        .expect("replacement region"),
+                ),
+            )
+        );
+        let instance = state
+            .internal_surface_effects
+            .remove(&OWNER_ROOT)
+            .expect("created replacement instance");
+        state.protocol_surface_effects.insert(
+            crate::compositor::effects::SurfaceEffectBindingKey {
+                surface_id: OWNER_ROOT,
+                slot: crate::compositor::effects::SurfaceEffectSlot::Content,
+            },
+            crate::compositor::effects::ProtocolSurfaceEffectBinding {
+                owner_id: 1,
+                instance: Some(instance),
+                program_name: None,
+                program_generation: None,
+                schema_signature: None,
+            },
+        );
+
+        assert!(!owner_proves_full_occlusion(&state));
+    }
+
+    #[test]
     fn fullscreen_occlusion_proof_accepts_trusted_opaque_replacement_effect() {
         let (mut state, _, _, _) = fullscreen_owner_fixture();
         let program = register_mask_program(&state, EffectAlphaMode::Opaque);
@@ -1288,6 +1425,90 @@ mod occlusion_proof_tests {
     }
 
     #[test]
+    fn fullscreen_occlusion_proof_rejects_visual_group_replacement_in_owner_group() {
+        let (mut state, owner_window, _, _) = fullscreen_owner_fixture();
+        let output_size = state.output_size;
+        let child = super::super::desktop_window_tests::x11_scanout_surface(
+            OWNER_CHILD,
+            output_size.width,
+            output_size.height,
+            SurfacePlacement {
+                parent_surface_id: Some(OWNER_ROOT),
+                local_x: 0,
+                local_y: 0,
+                root_mode: RootPlacementMode::CascadedWindow,
+            },
+            DrmFormat::Xrgb8888,
+        );
+        let mut surfaces = state.active_scene_surfaces().to_vec();
+        surfaces.push(child);
+        state.install_native_frame_test_scene(
+            surfaces,
+            &[
+                (
+                    UNDERLAY_ROOT,
+                    WindowId::from_raw(41).expect("underlay window id"),
+                ),
+                (OWNER_ROOT, owner_window),
+            ],
+            Some(OWNER_ROOT),
+        );
+
+        assert!(
+            state
+                .active_scene_surfaces()
+                .iter()
+                .any(|surface| surface.surface_id == OWNER_CHILD)
+        );
+        assert_eq!(
+            state.root_surface_id_for_surface(OWNER_CHILD),
+            OWNER_ROOT,
+            "the replacement target belongs to the fullscreen owner root"
+        );
+        assert_eq!(
+            state.visual_group_for_surface(OWNER_CHILD),
+            state.visual_group_for_surface(OWNER_ROOT)
+        );
+
+        let program = register_preserving_mask_program(&state);
+        assert!(
+            state.set_internal_surface_effect(
+                OWNER_CHILD,
+                EffectAnchor::ReplaceSurface(OWNER_CHILD),
+                program,
+                EffectRegion::from_rect(
+                    EffectRect::new(0, 0, output_size.width, output_size.height)
+                        .expect("replacement region"),
+                ),
+            )
+        );
+
+        assert!(!state.fullscreen_owner_effects_preserve_full_occlusion(OWNER_ROOT));
+    }
+
+    #[test]
+    fn fullscreen_occlusion_proof_rejects_partial_output_opaque_replacement() {
+        let (mut state, _, _, _) = fullscreen_owner_fixture();
+        let program = register_mask_program(&state, EffectAlphaMode::Opaque);
+        assert!(
+            state.set_internal_surface_effect(
+                OWNER_ROOT,
+                EffectAnchor::ReplaceSurface(OWNER_ROOT),
+                program,
+                EffectRegion::from_rect(
+                    EffectRect::new(0, 0, state.output_size.width / 2, state.output_size.height,)
+                        .expect("partial replacement region"),
+                ),
+            )
+        );
+
+        assert!(
+            !owner_proves_full_occlusion(&state),
+            "a replacement that skips composition must cover the fullscreen output"
+        );
+    }
+
+    #[test]
     fn fullscreen_occlusion_proof_ignores_replacement_effect_in_other_visual_group() {
         let (mut state, _, _, _) = fullscreen_owner_fixture();
         let program = register_preserving_mask_program(&state);
@@ -1307,6 +1528,36 @@ mod occlusion_proof_tests {
         let plan = state.fullscreen_composition_plan();
         assert!(plan.owner_occludes_underlays);
         assert!(!plan.allows_composition_root(UNDERLAY_ROOT));
+    }
+
+    #[test]
+    fn fullscreen_occlusion_proof_rejects_ambiguous_visual_group_identity() {
+        let (mut state, _, _, _) = fullscreen_owner_fixture();
+        let program = register_preserving_mask_program(&state);
+        assert!(
+            state.set_internal_surface_effect(
+                UNDERLAY_ROOT,
+                EffectAnchor::ReplaceSurface(UNDERLAY_ROOT),
+                program,
+                EffectRegion::from_rect(
+                    EffectRect::new(0, 0, state.output_size.width, state.output_size.height)
+                        .expect("underlay replacement region"),
+                ),
+            )
+        );
+        state
+            .internal_surface_effects
+            .get_mut(&UNDERLAY_ROOT)
+            .expect("underlay replacement")
+            .visual_group = Some(
+            crate::compositor::render::VisualGroupId::new(u32::MAX)
+                .expect("nonzero group identity"),
+        );
+
+        assert!(
+            !owner_proves_full_occlusion(&state),
+            "a replacement with stale group identity cannot prove occlusion"
+        );
     }
 
     #[test]
