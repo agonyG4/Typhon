@@ -82,7 +82,7 @@ impl Default for BlurApplicationPolicy {
         Self {
             wayland: BlurApplicationMode::Auto,
             xwayland: BlurXwaylandMode::RulesOnly,
-            auto_fullscreen: false,
+            auto_fullscreen: true,
         }
     }
 }
@@ -210,7 +210,7 @@ impl Default for BlurPolicySnapshot {
             generation: 1,
             wayland_mode: BlurApplicationMode::Auto,
             xwayland_mode: BlurXwaylandMode::RulesOnly,
-            auto_fullscreen: false,
+            auto_fullscreen: true,
             layer_default: BlurLayerMode::ClientOnly,
             window_rule_count: 0,
             layer_rule_count: 0,
@@ -232,10 +232,11 @@ mod tests {
         assert!(policy.enabled);
         assert_eq!(policy.applications.wayland, BlurApplicationMode::Auto);
         assert_eq!(policy.applications.xwayland, BlurXwaylandMode::RulesOnly);
-        assert!(!policy.applications.auto_fullscreen);
+        assert!(policy.applications.auto_fullscreen);
         assert_eq!(policy.layers.default, BlurLayerMode::ClientOnly);
         assert!(policy.window_rules.is_empty());
         assert!(policy.layer_rules.is_empty());
+        assert!(BlurPolicySnapshot::default().auto_fullscreen);
     }
 
     #[test]
@@ -244,6 +245,8 @@ mod tests {
             r#"{"version":1,"enabled":true,"applications":{"wayland":"auto","xwayland":"rules_only","auto_fullscreen":false},"layers":{"default":"client_only"},"window_rules":[{"name":"force-terminal-blur","match":{"app_id":"^kitty$","backend":"wayland"},"blur":"enable"}],"layer_rules":[{"name":"third-party-bar","match":{"namespace":"^waybar$"},"blur":"enable"}]}"#,
         )
         .expect("approved schema");
+        assert_eq!(config.version, 1);
+        assert!(!config.applications.auto_fullscreen);
         assert_eq!(config.window_rules[0].name, "force-terminal-blur");
         assert_eq!(
             config.window_rules[0].matcher.app_id.as_deref(),
@@ -257,6 +260,16 @@ mod tests {
             config.layer_rules[0].matcher.namespace.as_deref(),
             Some("^waybar$")
         );
+    }
+
+    #[test]
+    fn version_one_config_accepts_explicit_fullscreen_auto_blur() {
+        let config: BlurPolicyConfig = serde_json::from_str(
+            r#"{"version":1,"enabled":true,"applications":{"wayland":"auto","xwayland":"rules_only","auto_fullscreen":true},"layers":{"default":"client_only"},"window_rules":[],"layer_rules":[]}"#,
+        )
+        .expect("explicit fullscreen auto blur is valid in version 1");
+        assert_eq!(config.version, 1);
+        assert!(config.applications.auto_fullscreen);
     }
 
     #[test]

@@ -117,6 +117,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         assert_eq!(snapshot.version, 1);
         assert!(snapshot.enabled);
+        assert!(!snapshot.applications.auto_fullscreen);
         assert_eq!(
             snapshot.applications.wayland,
             super::super::model::BlurApplicationMode::Auto

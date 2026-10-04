@@ -968,6 +968,20 @@ pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dma
     )
 }
 
+pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_argb_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_viewport_dmabuf(
+        socket_path,
+        commands,
+        Some((0.0, 0.0, 1280.0, 800.0)),
+        Some((1280, 800)),
+        true,
+        DrmFormat::ARGB8888_FOURCC,
+    )
+}
+
 pub(in crate::compositor::tests) fn create_fullscreen_dmabuf_subsurface_scanout_source(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

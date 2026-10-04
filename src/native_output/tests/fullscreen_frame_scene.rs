@@ -407,7 +407,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
 }
 
 #[test]
-fn fullscreen_enter_repairs_removed_nonuniform_blur_pixels() {
+fn removed_nonuniform_blur_pixels_are_repaired() {
     const WIDTH: u32 = 64;
     const HEIGHT: u32 = 40;
     let owner = test_renderable_surface(401, 0, 0, WIDTH, HEIGHT, RenderableSurfaceDamage::Empty);
@@ -448,6 +448,6 @@ fn fullscreen_enter_repairs_removed_nonuniform_blur_pixels() {
                 && rect.x.saturating_add(rect.width as i32) >= 25
                 && rect.y.saturating_add(rect.height as i32) >= 21
         }),
-        "fullscreen effect removal must repair the old blur region"
+        "effect removal must repair the old blur region"
     );
 }

@@ -114,6 +114,37 @@ fn fullscreen_identity_viewport_xrgb_dmabuf_is_direct_scanout_candidate() {
 }
 
 #[test]
+fn fullscreen_argb_dmabuf_with_wayland_auto_blur_requires_composition() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_with_capabilities(
+        &socket_name,
+        true,
+        InputProtocolCapabilities::desktop_baseline(),
+        SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::qualified_native(),
+    )
+    .unwrap();
+    server
+        .state
+        .blur_assignment
+        .replace_config(crate::blur_policy::BlurPolicyConfig::default())
+        .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _state = create_fullscreen_identity_viewport_argb_dmabuf(&socket_path, &commands).unwrap();
+    settle_fullscreen_presentation(&commands);
+    let scene = capture_resolved_effect_scene(&commands);
+    assert_eq!(background_effect_count(&scene), 1);
+    assert!(
+        capture_direct_scanout_candidate(&commands).is_err(),
+        "a fullscreen alpha-capable Wayland window with auto blur must stay composited"
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn fullscreen_identity_viewport_xbgr_dmabuf_is_direct_scanout_candidate() {
     let socket_name = unique_socket_name();
     let mut probe =

@@ -236,6 +236,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         reply: Sender<(String, bool)>,
     },
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
+    CaptureFocusedPresentationEffectSceneAfter {
+        elapsed_nanos: u64,
+        reply: Sender<ResolvedEffectScene>,
+    },
     SetMaterialProgramConfiguration {
         configuration: crate::material_program::MaterialProgramConfiguration,
         reply: Sender<Result<(), String>>,
@@ -1528,6 +1532,42 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         })
                                 });
                         let _ = reply.send(sample);
+                    }
+                    ServerCommand::CaptureFocusedPresentationEffectSceneAfter {
+                        elapsed_nanos,
+                        reply,
+                    } => {
+                        let scene = server
+                            .state
+                            .focused_root_surface_id()
+                            .and_then(|root_surface_id| {
+                                let scene_node_id = server
+                                    .state
+                                    .presentation_scene_node_id_for_root(root_surface_id)?;
+                                let started_at = server
+                                    .state
+                                    .presentation_animator
+                                    .transition_started_at_for_scene_node(scene_node_id)?;
+                                let at = AnimationTime::from_nanos(
+                                    started_at.as_nanos().saturating_add(elapsed_nanos),
+                                );
+                                let (canonical_surfaces, fullscreen_plan, _) =
+                                    server.native_frame_renderable_surfaces_with_composition_plan();
+                                let targets = server
+                                    .native_frame_presentation_targets(canonical_surfaces.as_ref());
+                                let presentation =
+                                    server.presentation_scene_sample_for_targets_at(at, &targets);
+                                let lifecycle = server.lifecycle_scene_sample_at(at);
+                                Some(
+                                    server.resolved_effect_scene_for_presentation_with_lifecycle(
+                                        &presentation,
+                                        &fullscreen_plan,
+                                        &lifecycle,
+                                    ),
+                                )
+                            })
+                            .expect("focused root should have an active presentation transition");
+                        let _ = reply.send(scene);
                     }
                     ServerCommand::CapturePresentedPresentation {
                         root_surface_id,
@@ -3232,6 +3272,22 @@ pub(in crate::compositor::tests) fn capture_focused_presentation_after(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report presentation sample")
+}
+
+pub(in crate::compositor::tests) fn capture_focused_presentation_effect_scene_after(
+    commands: &Sender<ServerCommand>,
+    elapsed_nanos: u64,
+) -> ResolvedEffectScene {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedPresentationEffectSceneAfter {
+            elapsed_nanos,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report presentation-resolved effect scene")
 }
 
 pub(in crate::compositor::tests) fn drop_focused_toplevel_visual_geometry(

@@ -743,8 +743,69 @@ mod tests {
                 true,
                 false
             ),
-            BlurAssignment::None
+            BlurAssignment::CompositorSynthesized
         );
+    }
+
+    #[test]
+    fn fullscreen_auto_blur_uses_default_and_honors_explicit_opt_out() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let empty = EffectRegion::empty();
+        let default = resolver();
+        let default_fullscreen = default
+            .resolve_window_assignment(
+                6,
+                empty.clone(),
+                candidate.clone(),
+                &empty,
+                false,
+                Some("org.example.app"),
+                None,
+                BlurBackend::Wayland,
+                SurfaceAlphaCapability::AlphaCapable,
+                true,
+                false,
+            )
+            .expect("default Wayland auto blur remains enabled in fullscreen");
+        assert_eq!(default_fullscreen.source, BlurAssignmentSource::WaylandAuto);
+
+        let mut config = BlurPolicyConfig::default();
+        config.applications.auto_fullscreen = false;
+        let explicit_opt_out = BlurAssignmentResolver::from_config(config, true).unwrap();
+        assert!(
+            explicit_opt_out
+                .resolve_window_assignment(
+                    7,
+                    empty.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Wayland,
+                    SurfaceAlphaCapability::AlphaCapable,
+                    true,
+                    false,
+                )
+                .is_none(),
+            "explicit auto_fullscreen=false suppresses automatic blur in fullscreen"
+        );
+        let outside_fullscreen = explicit_opt_out
+            .resolve_window_assignment(
+                8,
+                empty.clone(),
+                candidate,
+                &empty,
+                false,
+                Some("org.example.app"),
+                None,
+                BlurBackend::Wayland,
+                SurfaceAlphaCapability::AlphaCapable,
+                false,
+                false,
+            )
+            .expect("explicit opt-out still permits normal-window auto blur");
+        assert_eq!(outside_fullscreen.source, BlurAssignmentSource::WaylandAuto);
     }
 
     #[test]
@@ -926,6 +987,7 @@ mod tests {
         let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
         let empty = EffectRegion::empty();
         let automatic = resolver();
+        assert!(automatic.config().applications.auto_fullscreen);
         assert!(
             automatic
                 .resolve_window_assignment(
@@ -938,7 +1000,7 @@ mod tests {
                     None,
                     BlurBackend::Wayland,
                     SurfaceAlphaCapability::AlphaCapable,
-                    false,
+                    true,
                     false,
                 )
                 .is_none(),
@@ -969,7 +1031,7 @@ mod tests {
                     None,
                     BlurBackend::Wayland,
                     SurfaceAlphaCapability::Opaque,
-                    false,
+                    true,
                     false,
                 )
                 .unwrap()

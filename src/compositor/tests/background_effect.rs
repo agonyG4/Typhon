@@ -57,6 +57,20 @@ fn capture_effect_scene(commands: &Sender<ServerCommand>) -> ResolvedEffectScene
         .expect("effect scene capture should complete")
 }
 
+fn sole_background_blur(
+    scene: &ResolvedEffectScene,
+) -> &crate::compositor::effects::ResolvedEffectInstance {
+    let mut blurs = scene.instances.iter().filter(|instance| {
+        instance.program == crate::effects::builtin_background_blur_program_id()
+    });
+    let blur = blurs.next().expect("background blur should remain active");
+    assert!(
+        blurs.next().is_none(),
+        "the window should have exactly one effective background blur"
+    );
+    blur
+}
+
 fn set_material_program(
     commands: &Sender<ServerCommand>,
     requested_program: &str,
@@ -664,6 +678,202 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         assert_ne!(
             negative_offset_scene.instances[0].signature, auto_scene.instances[0].signature,
             "a committed XDG geometry change must alter the resolved effect signature"
+        );
+        Ok(())
+    })();
+
+    stop_controllable_test_server(commands, server_thread);
+    result.unwrap();
+}
+
+#[test]
+fn production_wayland_auto_blur_follows_fullscreen_and_restore_presentation() {
+    const MIDPOINT_NANOS: u64 = 125_000_000;
+    const SETTLED_NANOS: u64 = 500_000_000;
+
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.state.set_background_effect_enabled(true);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    replace_blur_policy_config(&commands, crate::blur_policy::BlurPolicyConfig::default());
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let (surface, xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 100)?;
+        xdg_surface.set_window_geometry(10, 12, 100, 70);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let setup_scene = capture_effect_scene(&commands);
+        let setup_blur = sole_background_blur(&setup_scene);
+        let root_surface_id = match setup_blur.anchor {
+            EffectAnchor::BeforeSurface(surface_id) => surface_id,
+            other => panic!("automatic background blur should anchor before its root: {other:?}"),
+        };
+        let settle_root_presentation = |frame_id| {
+            commands
+                .send(ServerCommand::PublishFocusedPresentationAfter {
+                    frame_id,
+                    elapsed_nanos: SETTLED_NANOS,
+                })
+                .unwrap();
+            wait_for_server_commands(&commands);
+            commands
+                .send(ServerCommand::CancelRootPresentationProperties { root_surface_id })
+                .unwrap();
+            commands
+                .send(ServerCommand::PublishTestPresentationAt {
+                    frame_id,
+                    at: AnimationTime::from_nanos(u64::MAX),
+                })
+                .unwrap();
+            wait_for_server_commands(&commands);
+        };
+        settle_root_presentation(90);
+
+        let normal_scene = capture_effect_scene(&commands);
+        let normal_blur = sole_background_blur(&normal_scene);
+        assert_eq!(normal_blur.id, setup_blur.id);
+        assert_eq!(normal_blur.anchor_scope, EffectAnchorScope::VisualGroup);
+        let stable_id = normal_blur.id;
+        let stable_program = normal_blur.program;
+        let stable_anchor = normal_blur.anchor;
+        let normal_region = normal_blur.region.clone();
+
+        commands
+            .send(ServerCommand::ToggleFullscreenFocused)
+            .unwrap();
+        wait_for_server_commands(&commands);
+        assert_eq!(
+            capture_fullscreen_render_plan_metrics(&commands).owner_root_surface_id,
+            Some(root_surface_id),
+            "fullscreen ownership should update before geometry animation sampling"
+        );
+
+        let assert_stable_blur = |scene: &ResolvedEffectScene| {
+            let blur = sole_background_blur(scene);
+            assert_eq!(
+                blur.id, stable_id,
+                "blur instance identity should be stable"
+            );
+            assert_eq!(
+                blur.program, stable_program,
+                "blur program should be stable"
+            );
+            assert_eq!(blur.anchor, stable_anchor, "blur anchor should be stable");
+            assert_eq!(blur.anchor_scope, EffectAnchorScope::VisualGroup);
+        };
+
+        let fullscreen_immediate_scene = capture_effect_scene(&commands);
+        assert_stable_blur(&fullscreen_immediate_scene);
+        let fullscreen_region = sole_background_blur(&fullscreen_immediate_scene)
+            .region
+            .clone();
+        assert_ne!(fullscreen_region, normal_region);
+
+        let fullscreen_start = capture_focused_presentation_effect_scene_after(&commands, 0);
+        assert_stable_blur(&fullscreen_start);
+        let fullscreen_start_region = sole_background_blur(&fullscreen_start).region.clone();
+
+        let fullscreen_midpoint =
+            capture_focused_presentation_effect_scene_after(&commands, MIDPOINT_NANOS);
+        assert_stable_blur(&fullscreen_midpoint);
+        let fullscreen_midpoint_region = &sole_background_blur(&fullscreen_midpoint).region;
+        assert_ne!(
+            fullscreen_midpoint_region, &fullscreen_start_region,
+            "fullscreen midpoint blur should move from the transition start geometry"
+        );
+        assert_ne!(
+            fullscreen_midpoint_region, &normal_region,
+            "fullscreen midpoint blur should move away from the old window rectangle"
+        );
+        assert_ne!(
+            fullscreen_midpoint_region, &fullscreen_region,
+            "fullscreen midpoint blur should not jump to the final fullscreen rectangle"
+        );
+
+        let fullscreen_settled_presentation =
+            capture_focused_presentation_effect_scene_after(&commands, SETTLED_NANOS);
+        assert_stable_blur(&fullscreen_settled_presentation);
+        assert_eq!(
+            sole_background_blur(&fullscreen_settled_presentation).region,
+            fullscreen_region,
+            "presentation-mapped blur should reach the final fullscreen geometry"
+        );
+        settle_root_presentation(100);
+        let fullscreen_settled = capture_effect_scene(&commands);
+        assert_stable_blur(&fullscreen_settled);
+        assert_eq!(
+            sole_background_blur(&fullscreen_settled).region,
+            fullscreen_region,
+            "settled fullscreen blur should cover the final fullscreen geometry"
+        );
+        assert!(
+            capture_direct_scanout_candidate(&commands).is_err(),
+            "an alpha-capable fullscreen window with active blur requires composition"
+        );
+
+        commands
+            .send(ServerCommand::ToggleFullscreenFocused)
+            .unwrap();
+        wait_for_server_commands(&commands);
+        assert_eq!(
+            capture_fullscreen_render_plan_metrics(&commands).owner_root_surface_id,
+            None,
+            "restoring should clear fullscreen ownership before its geometry animation"
+        );
+
+        let restore_immediate_scene = capture_effect_scene(&commands);
+        assert_stable_blur(&restore_immediate_scene);
+        let restore_region = sole_background_blur(&restore_immediate_scene)
+            .region
+            .clone();
+        assert_eq!(restore_region, normal_region);
+
+        let restore_start = capture_focused_presentation_effect_scene_after(&commands, 0);
+        assert_stable_blur(&restore_start);
+        let restore_start_region = sole_background_blur(&restore_start).region.clone();
+
+        let restore_midpoint =
+            capture_focused_presentation_effect_scene_after(&commands, MIDPOINT_NANOS);
+        assert_stable_blur(&restore_midpoint);
+        let restore_midpoint_region = &sole_background_blur(&restore_midpoint).region;
+        assert_ne!(
+            restore_midpoint_region, &restore_start_region,
+            "restore midpoint blur should move from the transition start geometry"
+        );
+        assert_ne!(
+            restore_midpoint_region, &fullscreen_region,
+            "restore midpoint blur should move away from the fullscreen rectangle"
+        );
+        assert_ne!(
+            restore_midpoint_region, &normal_region,
+            "restore midpoint blur should not jump to the final normal rectangle"
+        );
+
+        let restore_settled_presentation =
+            capture_focused_presentation_effect_scene_after(&commands, SETTLED_NANOS);
+        assert_stable_blur(&restore_settled_presentation);
+        assert_eq!(
+            sole_background_blur(&restore_settled_presentation).region,
+            normal_region,
+            "presentation-mapped blur should return to the normal window geometry"
+        );
+        settle_root_presentation(101);
+        let normal_settled = capture_effect_scene(&commands);
+        assert_stable_blur(&normal_settled);
+        assert_eq!(
+            sole_background_blur(&normal_settled).region,
+            normal_region,
+            "settled restore should return the automatic blur to its normal geometry"
         );
         Ok(())
     })();
