@@ -220,14 +220,14 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                     );
                     return;
                 }
-                if resource.version() < 2 && surface_has_content {
-                    state.post_protocol_error(
-                        _client,
-                        resource,
-                        zxdg_toplevel_decoration_v1::Error::UnconfiguredBuffer,
-                        "version 1 decoration object created after surface content".to_string(),
+                if resource.version() < 2
+                    && surface_has_content
+                    && compositor_debug_surface_logging_enabled()
+                {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_decoration_compat_accept surface={surface_id} version={} reason=late_creation_after_content",
+                        resource.version(),
                     );
-                    return;
                 }
                 let generation = if let Some(decoration_state) =
                     state.xdg_decoration_states.get_mut(&surface_id)

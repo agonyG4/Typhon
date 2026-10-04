@@ -566,25 +566,63 @@ fn fullscreen_decoration_visibility_follows_the_applied_mode() {
 }
 
 #[test]
-fn v1_decoration_creation_after_mapped_content_is_rejected() {
+fn v1_decoration_creation_after_mapped_content_uses_configure_transaction() {
     let (socket_path, commands, server_thread) = start_server();
-    let client = MappedDecorationClient::connect(&socket_path, &commands, 1)
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 1)
         .expect("connect v1 decoration client");
     assert_eq!(client.advertised_manager_version, 2);
     assert_eq!(client.manager.version(), 1);
+    let decoration_configures_before = client.state.decoration_configure_count;
+    let surface_configures_before = client.state.surface_configure_count;
+    let decoration =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert!(decoration.is_alive());
+    assert_eq!(
+        client.state.decoration_configure_count,
+        decoration_configures_before + 1
+    );
+    assert_eq!(
+        client.state.surface_configure_count,
+        surface_configures_before + 1
+    );
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn v1_late_decoration_respects_explicit_client_side_preference() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 1)
+        .expect("connect v1 decoration client");
     let decoration =
         client
             .manager
             .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
     decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
     client.connection.flush().unwrap();
-    wait_for_server_commands(&commands);
-    let observed = expect_protocol_error(
-        &client.connection,
-        "zxdg_decoration_manager_v1",
-        client_zxdg_toplevel_decoration_v1::Error::UnconfiguredBuffer as u32,
+    client.pump(&commands).unwrap();
+    assert!(decoration.is_alive());
+    assert_eq!(
+        client.state.decoration_configure_modes.last(),
+        Some(&(client_zxdg_toplevel_decoration_v1::Mode::ClientSide as u32))
     );
-    assert!(observed.message.contains("version 1"));
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, serial).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
     drop(client);
     stop_server(commands, server_thread);
 }
@@ -1048,4 +1086,59 @@ fn delayed_surface_commit_uses_decoration_state_captured_at_commit() {
 
     drop(client);
     stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn v1_destroy_recreate_keeps_baseline_until_new_configure_commit() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 1)
+        .expect("connect v1 decoration client");
+    let first =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert!(first.is_alive());
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    let first_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, first_serial).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    first.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    let stale_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.xdg_surface.ack_configure(stale_serial);
+    first.destroy();
+    let second =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert!(second.is_alive());
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+
+    // The acknowledged ClientSide configure belongs to the old generation.
+    // A commit without acknowledging the recreated object's configure must
+    // retain the previous ServerSide publication.
+    client.commit_surface(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    second.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(
+        client.state.decoration_configure_modes.last(),
+        Some(&(client_zxdg_toplevel_decoration_v1::Mode::ClientSide as u32))
+    );
+    let second_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.commit_configure(&commands, second_serial).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    drop(client);
+    stop_server(commands, server_thread);
 }
