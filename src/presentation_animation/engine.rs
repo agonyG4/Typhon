@@ -691,6 +691,42 @@ impl PresentationEngine {
         self.transactions.get(&transaction_id)
     }
 
+    pub(crate) fn active_transaction_member(
+        &self,
+        scene_node_id: SceneNodeId,
+        property: PresentationPropertyKind,
+    ) -> Option<PresentationTransactionMember> {
+        let (transaction_id, revision_id) = match property {
+            PresentationPropertyKind::Geometry => {
+                let track = self.geometry_tracks.get(&scene_node_id)?;
+                (
+                    track.transition.transaction_id,
+                    track.transition.revision_id,
+                )
+            }
+            PresentationPropertyKind::Opacity => {
+                let track = self.opacity_tracks.get(&scene_node_id)?;
+                (track.transaction_id, track.revision_id)
+            }
+            PresentationPropertyKind::Clip => {
+                let track = self.clip_tracks.get(&scene_node_id)?;
+                (track.transaction_id, track.revision_id)
+            }
+        };
+
+        self.transactions
+            .get(&transaction_id)?
+            .members()
+            .iter()
+            .copied()
+            .find(|member| {
+                member.scene_node_id() == scene_node_id
+                    && member.property() == Some(property)
+                    && member.transaction_id() == transaction_id
+                    && member.revision_id() == revision_id
+            })
+    }
+
     pub(crate) fn cancel_geometry(&mut self, scene_node_id: SceneNodeId) {
         let Some(track) = self.geometry_tracks.remove(&scene_node_id) else {
             return;

@@ -4,10 +4,16 @@ use super::{catalog::*, config::AnimationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnimationConfigurationSnapshot {
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub animate_maximized_window_open: bool,
     pub preset: String,
     pub speed: f64,
     pub overrides: BTreeMap<String, String>,
@@ -17,6 +23,7 @@ impl From<&AnimationConfiguration> for AnimationConfigurationSnapshot {
     fn from(configuration: &AnimationConfiguration) -> Self {
         Self {
             enabled: configuration.enabled,
+            animate_maximized_window_open: configuration.animate_maximized_window_open,
             preset: configuration.preset.id().to_string(),
             speed: configuration.speed,
             overrides: configuration
@@ -162,5 +169,35 @@ mod tests {
         assert_eq!(snapshot.requested["window.restore"], "minimize.lamp");
         assert_eq!(snapshot.effective["window.restore"], "minimize.lamp");
         assert!(serde_json::to_vec(&snapshot).unwrap().len() < 16 * 1024);
+    }
+
+    #[test]
+    fn disabled_maximized_open_policy_does_not_rewrite_window_open_effect() {
+        let configuration = AnimationConfiguration {
+            animate_maximized_window_open: false,
+            ..AnimationConfiguration::default()
+        };
+        let mut snapshot = AnimationControlSnapshot {
+            generation: 0,
+            source: "default".into(),
+            startup_override: false,
+            config: (&configuration).into(),
+            effective: BTreeMap::new(),
+            requested: BTreeMap::new(),
+            catalog: AnimationCatalogSnapshot::default(),
+        };
+        let window_open_effect = configuration.requested_effect(AnimationSlot::WindowOpen).0;
+        snapshot.effective.insert(
+            AnimationSlot::WindowOpen.id().into(),
+            window_open_effect.id().into(),
+        );
+
+        assert!(!snapshot.config.animate_maximized_window_open);
+        assert_eq!(window_open_effect, AnimationEffect::WindowScale);
+        assert_eq!(snapshot.effective["window.open"], "window.scale");
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["config"]["animateMaximizedWindowOpen"],
+            false
+        );
     }
 }

@@ -161,6 +161,10 @@ fn format_animation(snapshot: &crate::animation_control::AnimationControlSnapsho
     let config = &snapshot.config;
     let mut lines = vec![
         format!("Enabled: {}", config.enabled),
+        format!(
+            "Animate maximized window open: {}",
+            config.animate_maximized_window_open
+        ),
         format!("Preset: {}", sanitize_terminal_text(&config.preset)),
         format!("Speed: {:.2}x", config.speed),
         format!("Generation: {}", snapshot.generation),
@@ -302,6 +306,10 @@ pub fn sanitize_terminal_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::human;
+    use crate::animation_control::{
+        AnimationCatalogSnapshot, AnimationConfiguration, AnimationConfigurationSnapshot,
+        AnimationControlSnapshot, AnimationEffect, AnimationPreset, AnimationSlot,
+    };
     use crate::control_snapshots::{
         AstreactlResult, ControlWindowId, DoctorCheck, DoctorSeverity, DoctorSnapshot,
         KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot, VersionSnapshot, WindowKindSnapshot,
@@ -504,5 +512,29 @@ mod tests {
             human(&value),
             "Effective: 1\nLocked: 1\n\n  0  Portuguese  (Brazil)\n* 1  English (US)\n  2  Unnamed"
         );
+    }
+
+    #[test]
+    fn human_animation_output_reports_maximized_window_open_policy() {
+        let configuration = AnimationConfiguration {
+            animate_maximized_window_open: false,
+            ..AnimationConfiguration::default()
+        };
+        let effect = configuration.requested_effect(AnimationSlot::WindowOpen).0;
+        let value = AstreactlResult::Animation(AnimationControlSnapshot {
+            generation: 3,
+            source: "persisted".into(),
+            startup_override: false,
+            config: AnimationConfigurationSnapshot::from(&configuration),
+            effective: [("window.open".to_owned(), effect.id().to_owned())]
+                .into_iter()
+                .collect(),
+            requested: Default::default(),
+            catalog: AnimationCatalogSnapshot::default(),
+        });
+
+        assert!(human(&value).contains("Animate maximized window open: false"));
+        assert_eq!(configuration.preset, AnimationPreset::Astrea);
+        assert_eq!(effect, AnimationEffect::WindowScale);
     }
 }

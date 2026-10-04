@@ -162,6 +162,46 @@ mod tests {
     }
 
     #[test]
+    fn disabled_maximized_open_policy_round_trips() {
+        let directory = temp_directory();
+        let store = AnimationConfigurationStore::new(directory.clone()).unwrap();
+        let configuration = AnimationConfiguration {
+            animate_maximized_window_open: false,
+            ..AnimationConfiguration::default()
+        };
+
+        store.write(&configuration).unwrap();
+
+        assert_eq!(store.read().unwrap(), configuration);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn legacy_version_one_json_loads_with_maximized_open_policy_enabled() {
+        let directory = temp_directory();
+        let store = AnimationConfigurationStore::new(directory.clone()).unwrap();
+        fs::write(
+            store.configuration_file(),
+            br#"{"version":1,"enabled":false,"preset":"macos","speed":1.25,"overrides":{"window.move":"geometry.macos"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(
+            store.configuration_file(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let configuration = store.read().unwrap();
+
+        assert!(!configuration.enabled);
+        assert_eq!(configuration.preset.id(), "macos");
+        assert_eq!(configuration.speed, 1.25);
+        assert!(configuration.animate_maximized_window_open);
+        assert_eq!(configuration.overrides.len(), 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn malformed_and_unsupported_documents_fall_back_safely() {
         let directory = temp_directory();
         let store = AnimationConfigurationStore::new(directory.clone()).unwrap();

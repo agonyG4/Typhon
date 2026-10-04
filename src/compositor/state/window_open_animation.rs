@@ -164,6 +164,14 @@ impl CompositorState {
         {
             return false;
         }
+        if window.state.mode() == ToplevelMode::Maximized
+            && !self
+                .animation_control
+                .configuration()
+                .animate_maximized_window_open
+        {
+            return false;
+        }
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
             return false;
         };

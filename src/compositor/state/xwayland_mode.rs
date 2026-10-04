@@ -3,13 +3,14 @@ use super::*;
 use crate::wm::LayoutMembership;
 
 impl CompositorState {
-    pub(in crate::compositor) fn transition_x11_window_mode(
+    pub(in crate::compositor) fn transition_x11_window_mode_from_source(
         &mut self,
         window_id: WindowId,
         mode: ToplevelMode,
         minimized: bool,
+        source: WindowModeRequestSource,
     ) -> bool {
-        self.transition_x11_window_mode_with_target(window_id, mode, minimized, None)
+        self.transition_x11_window_mode_with_target(window_id, mode, minimized, None, source)
     }
 
     pub(in crate::compositor) fn transition_x11_window_mode_for_interaction(
@@ -22,6 +23,7 @@ impl CompositorState {
             ToplevelMode::Normal,
             false,
             Some((target_geometry, VisualGeometryTransition::Immediate)),
+            WindowModeRequestSource::OtherInternal,
         )
     }
 
@@ -31,6 +33,7 @@ impl CompositorState {
         mode: ToplevelMode,
         minimized: bool,
         interaction_target: Option<(WindowGeometry, VisualGeometryTransition)>,
+        source: WindowModeRequestSource,
     ) -> bool {
         let Some((root_surface_id, current_mode, current_minimized, current_geometry)) = self
             .window(window_id)
@@ -113,6 +116,9 @@ impl CompositorState {
         } else {
             self.window_geometry_for_surface_mode(root_surface_id, mode)
         };
+        if mode_changed {
+            self.trace_window_mode_request(root_surface_id, mode, source, Some(target_geometry));
+        }
         if let Some(window) = self.window_mut(window_id) {
             window.state.set_mode(mode);
         }

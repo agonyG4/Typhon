@@ -966,13 +966,24 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                 }
             }
             xdg_toplevel::Request::SetMaximized => {
-                state.set_root_window_mode(
-                    compositor_surface_id(&data.surface),
+                let surface_id = compositor_surface_id(&data.surface);
+                if super::super::runtime_files::compositor_debug_surface_logging_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: event=xdg_toplevel_request request=set_maximized source=xdg_client root_surface_id={surface_id} client_id={:?}",
+                        client.id(),
+                    );
+                }
+                state.set_root_window_mode_from(
+                    surface_id,
                     ToplevelMode::Maximized,
+                    super::super::state::WindowModeRequestSource::XdgClient,
                 );
             }
             xdg_toplevel::Request::UnsetMaximized => {
-                state.restore_normal_root_window(compositor_surface_id(&data.surface));
+                state.restore_normal_root_window_from(
+                    compositor_surface_id(&data.surface),
+                    super::super::state::WindowModeRequestSource::XdgClient,
+                );
             }
             xdg_toplevel::Request::SetFullscreen { output } => {
                 let surface_id = compositor_surface_id(&data.surface);
@@ -993,7 +1004,11 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                         output.is_some(),
                     );
                 }
-                let configured = state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen);
+                let configured = state.set_root_window_mode_from(
+                    surface_id,
+                    ToplevelMode::Fullscreen,
+                    super::super::state::WindowModeRequestSource::XdgClient,
+                );
                 if crate::compositor::fullscreen::fullscreen_trace_enabled() {
                     eprintln!(
                         "oblivion-one fullscreen: event=fullscreen_mode_requested root_surface_id={surface_id} old_mode={old_mode:?} new_mode=Fullscreen configure_sent={configured}"
@@ -1008,7 +1023,10 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                         client.id(),
                     );
                 }
-                state.restore_normal_root_window(surface_id);
+                state.restore_normal_root_window_from(
+                    surface_id,
+                    super::super::state::WindowModeRequestSource::XdgClient,
+                );
             }
             xdg_toplevel::Request::SetMinimized => {
                 state.minimize_root_window(compositor_surface_id(&data.surface));

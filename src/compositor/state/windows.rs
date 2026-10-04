@@ -11,7 +11,80 @@ use crate::window_lifecycle_animation::{
 };
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum WindowModeRequestSource {
+    XdgClient,
+    CompositorShortcut,
+    Decoration,
+    ControlPlane,
+    X11Ewmh,
+    OtherInternal,
+}
+
+impl WindowModeRequestSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::XdgClient => "xdg_client",
+            Self::CompositorShortcut => "compositor_shortcut",
+            Self::Decoration => "decoration",
+            Self::ControlPlane => "control_plane",
+            Self::X11Ewmh => "x11_ewmh",
+            Self::OtherInternal => "other_internal",
+        }
+    }
+}
+
 impl CompositorState {
+    pub(in crate::compositor) fn trace_window_mode_request(
+        &self,
+        root_surface_id: u32,
+        requested_mode: ToplevelMode,
+        source: WindowModeRequestSource,
+        target_geometry: Option<WindowGeometry>,
+    ) {
+        if !super::runtime_files::compositor_debug_surface_logging_enabled() {
+            return;
+        }
+
+        let window_id = self.window_id_for_surface(root_surface_id);
+        let window = window_id.and_then(|window_id| self.window(window_id));
+        let scene_node_id =
+            window_id.and_then(|window_id| self.scene_node_id_for_window_group(window_id));
+        let presented = self.presented_window_geometry(root_surface_id).is_some();
+        let geometry_member = scene_node_id.and_then(|node| {
+            self.presentation_animator.active_transaction_member(
+                node,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            )
+        });
+        let opacity_member = scene_node_id.and_then(|node| {
+            self.presentation_animator.active_transaction_member(
+                node,
+                crate::presentation_animation::PresentationPropertyKind::Opacity,
+            )
+        });
+        let geometry_transaction = geometry_member.map(|member| member.transaction_id());
+        let geometry_revision = geometry_member.map(|member| member.revision_id());
+        let opacity_transaction = opacity_member.map(|member| member.transaction_id());
+        let opacity_revision = opacity_member.map(|member| member.revision_id());
+        let window_open_geometry_track_candidate =
+            self.window_open_geometry_track_active(root_surface_id);
+        let previous_mode = window.map(|window| window.state.mode());
+        let app_id = window
+            .and_then(|window| window.metadata.app_id.as_deref())
+            .unwrap_or("<unknown>");
+        let title = window
+            .and_then(|window| window.metadata.title.as_deref())
+            .unwrap_or("<unknown>");
+
+        eprintln!(
+            "oblivion-one compositor: event=window_mode_request root_surface_id={root_surface_id} window_id={window_id:?} app_id={app_id:?} title={title:?} source={} previous_mode={previous_mode:?} requested_mode={requested_mode:?} presented={presented} window_open_active=untracked window_open_geometry_track_candidate={window_open_geometry_track_candidate} geometry_transaction={geometry_transaction:?} geometry_revision={geometry_revision:?} opacity_transaction={opacity_transaction:?} opacity_revision={opacity_revision:?} canonical_geometry={:?} visual_geometry={:?} target_geometry={target_geometry:?}",
+            source.label(),
+            self.current_root_window_geometry(root_surface_id),
+            self.current_visual_root_window_geometry(root_surface_id),
+        );
+    }
+
     pub(in crate::compositor) fn x11_window_wants_initial_focus(
         &self,
         window_id: WindowId,
@@ -1275,7 +1348,11 @@ impl CompositorState {
         let Some(surface_id) = self.focused_root_surface_id() else {
             return false;
         };
-        self.toggle_root_window_mode(surface_id, ToplevelMode::Maximized)
+        self.toggle_root_window_mode(
+            surface_id,
+            ToplevelMode::Maximized,
+            WindowModeRequestSource::ControlPlane,
+        )
     }
 
     pub(in crate::compositor) fn toggle_maximize_desktop_window(
@@ -1285,14 +1362,22 @@ impl CompositorState {
         let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id) else {
             return false;
         };
-        self.toggle_root_window_mode(surface_id, ToplevelMode::Maximized)
+        self.toggle_root_window_mode(
+            surface_id,
+            ToplevelMode::Maximized,
+            WindowModeRequestSource::Decoration,
+        )
     }
 
     pub(in crate::compositor) fn toggle_fullscreen_focused_window(&mut self) -> bool {
         let Some(surface_id) = self.focused_root_surface_id() else {
             return false;
         };
-        self.toggle_root_window_mode(surface_id, ToplevelMode::Fullscreen)
+        self.toggle_root_window_mode(
+            surface_id,
+            ToplevelMode::Fullscreen,
+            WindowModeRequestSource::CompositorShortcut,
+        )
     }
 
     pub(in crate::compositor) fn minimize_root_window(&mut self, surface_id: u32) -> bool {
@@ -1668,10 +1753,11 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn toggle_root_window_mode(
+    fn toggle_root_window_mode(
         &mut self,
         surface_id: u32,
         mode: ToplevelMode,
+        source: WindowModeRequestSource,
     ) -> bool {
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
@@ -1691,16 +1777,16 @@ impl CompositorState {
             Some(WindowBackend::X11(_))
         ) {
             return if current_mode == mode {
-                self.restore_normal_root_window(surface_id)
+                self.restore_normal_root_window_from(surface_id, source)
             } else {
-                self.set_root_window_mode(surface_id, mode)
+                self.set_root_window_mode_from(surface_id, mode, source)
             };
         }
 
         if current_mode == mode {
-            self.restore_normal_root_window(surface_id)
+            self.restore_normal_root_window_from(surface_id, source)
         } else {
-            self.set_root_window_mode(surface_id, mode)
+            self.set_root_window_mode_from(surface_id, mode, source)
         }
     }
 
@@ -1715,10 +1801,20 @@ impl CompositorState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn set_root_window_mode(
         &mut self,
         surface_id: u32,
         mode: ToplevelMode,
+    ) -> bool {
+        self.set_root_window_mode_from(surface_id, mode, WindowModeRequestSource::OtherInternal)
+    }
+
+    pub(in crate::compositor) fn set_root_window_mode_from(
+        &mut self,
+        surface_id: u32,
+        mode: ToplevelMode,
+        source: WindowModeRequestSource,
     ) -> bool {
         if self
             .window_id_for_surface(surface_id)
@@ -1728,8 +1824,9 @@ impl CompositorState {
             return false;
         }
         if mode == ToplevelMode::Normal {
-            return self.restore_normal_root_window(surface_id);
+            return self.restore_normal_root_window_from(surface_id, source);
         }
+        let target_geometry = self.window_geometry_for_surface_mode(surface_id, mode);
         self.cancel_pending_normal_restore(surface_id, "conflicting_mode_transition");
         if let Some(window_id) = self.window_id_for_surface(surface_id)
             && mode != ToplevelMode::Normal
@@ -1750,11 +1847,12 @@ impl CompositorState {
                 Some(WindowBackend::X11(_))
             )
         {
-            return self.transition_x11_window_mode(window_id, mode, false);
+            return self.transition_x11_window_mode_from_source(window_id, mode, false, source);
         }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
+        self.trace_window_mode_request(surface_id, mode, source, Some(target_geometry));
         let previous_mode = self
             .window_id_for_surface(surface_id)
             .and_then(|window_id| self.window(window_id))
@@ -1791,7 +1889,7 @@ impl CompositorState {
             self.mark_astrea_toplevel_dirty(window_id);
         }
 
-        let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
+        let geometry = target_geometry;
         let states = mode.xdg_states();
         let configure_serial = self.send_configure_root_window_to(
             surface_id,
@@ -1827,15 +1925,30 @@ impl CompositorState {
         configured
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn restore_normal_root_window(&mut self, surface_id: u32) -> bool {
+        self.restore_normal_root_window_from(surface_id, WindowModeRequestSource::OtherInternal)
+    }
+
+    pub(in crate::compositor) fn restore_normal_root_window_from(
+        &mut self,
+        surface_id: u32,
+        source: WindowModeRequestSource,
+    ) -> bool {
         if let Some(window_id) = self.window_id_for_surface(surface_id)
             && matches!(
                 self.window(window_id).map(|window| window.backend),
                 Some(WindowBackend::X11(_))
             )
         {
-            return self.transition_x11_window_mode(window_id, ToplevelMode::Normal, false);
+            return self.transition_x11_window_mode_from_source(
+                window_id,
+                ToplevelMode::Normal,
+                false,
+                source,
+            );
         }
+        self.trace_window_mode_request(surface_id, ToplevelMode::Normal, source, None);
         self.restore_normal_root_window_with_transition(surface_id, None)
     }
 

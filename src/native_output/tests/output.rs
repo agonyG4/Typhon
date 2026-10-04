@@ -1,4 +1,6 @@
 use super::*;
+use crate::native_output::runtime::ConfirmedKmsPresentationState;
+use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
 use oblivion_one::control_snapshots::{
     FeatureState, MAX_CONTROL_OUTPUT_MODES, PhysicalSizeSnapshot,
 };
@@ -220,7 +222,7 @@ fn selected_sysfs_output_uses_connector_id_not_directory_sort_order() {
         physical_size_mm: None,
         modes: Vec::new(),
         modes_truncated: false,
-        vrr_capable: None,
+        sysfs_vrr_capable: None,
     };
     capabilities.qualify_sysfs_connector(Some(&connector));
 
@@ -228,7 +230,7 @@ fn selected_sysfs_output_uses_connector_id_not_directory_sort_order() {
     assert_eq!(connector.name, "HDMI-A-1");
     assert_eq!(connector.vrr_capable, Some(false));
     assert_eq!(capabilities.connector_name, "HDMI-A-1");
-    assert_eq!(capabilities.vrr_capable, Some(false));
+    assert_eq!(capabilities.sysfs_vrr_capable, Some(false));
 }
 
 #[test]
@@ -405,9 +407,106 @@ fn current_mode_selection_remains_separate_from_preferred_capability() {
 }
 
 #[test]
-fn discovered_vrr_capability_is_never_projected_as_runtime_active() {
-    assert_eq!(vrr_feature_state(Some(true)), FeatureState::Available);
-    assert_ne!(vrr_feature_state(Some(true)), FeatureState::Active);
+fn control_snapshot_vrr_state_uses_atomic_capability_and_confirmed_pageflip_state() {
+    let current_generation = 7;
+    let cases = [
+        // Sysfs true cannot make an atomically incapable output available.
+        (
+            Some(true),
+            false,
+            OutputPresentationMode::Vsync,
+            7,
+            None,
+            FeatureState::Unavailable,
+        ),
+        // Sysfs false cannot hide atomic capability when VRR is not confirmed.
+        (
+            Some(false),
+            true,
+            OutputPresentationMode::Vsync,
+            7,
+            None,
+            FeatureState::Available,
+        ),
+        // Missing sysfs metadata does not degrade a confirmed atomic output.
+        (
+            None,
+            true,
+            OutputPresentationMode::AdaptiveSync,
+            7,
+            None,
+            FeatureState::Active,
+        ),
+        // Confirmation from an older output generation is stale.
+        (
+            None,
+            true,
+            OutputPresentationMode::AdaptiveSync,
+            6,
+            None,
+            FeatureState::Available,
+        ),
+        // Both adaptive modes become active only after current-generation confirmation.
+        (
+            Some(false),
+            true,
+            OutputPresentationMode::AdaptiveAsync,
+            7,
+            None,
+            FeatureState::Active,
+        ),
+        // A submitted Adaptive Sync transaction is not pageflip confirmation.
+        (
+            None,
+            true,
+            OutputPresentationMode::Vsync,
+            7,
+            Some(OutputPresentationMode::AdaptiveSync),
+            FeatureState::Available,
+        ),
+    ];
+
+    for (
+        sysfs_vrr_capable,
+        atomic_capable,
+        confirmed_mode,
+        confirmed_generation,
+        submitted_mode,
+        expected,
+    ) in cases
+    {
+        let capabilities = NativeOutputCapabilities {
+            connector_name: String::from("DP-1"),
+            physical_size_mm: None,
+            modes: Vec::new(),
+            modes_truncated: false,
+            sysfs_vrr_capable,
+        };
+        assert_eq!(capabilities.sysfs_vrr_capable, sysfs_vrr_capable);
+
+        let confirmed = ConfirmedKmsPresentationState {
+            mode: confirmed_mode,
+            content_type: DrmContentType::Graphics,
+            output_generation: confirmed_generation,
+        };
+        if let Some(submitted_mode) = submitted_mode {
+            let submitted_state =
+                crate::native_output::presentation::transaction::OutputPresentationStateKey {
+                    mode: submitted_mode,
+                    content_type: DrmContentType::Graphics,
+                    output_generation: current_generation,
+                };
+            assert_eq!(submitted_state.mode, OutputPresentationMode::AdaptiveSync);
+        }
+        assert_eq!(
+            runtime_vrr_feature_state(
+                atomic_capable,
+                confirmed.vrr_request_confirmed_for(current_generation)
+            ),
+            expected,
+            "sysfs={sysfs_vrr_capable:?}, atomic={atomic_capable}, confirmed={confirmed_mode:?}@{confirmed_generation}"
+        );
+    }
 }
 
 #[test]

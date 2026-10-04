@@ -11840,6 +11840,7 @@ mod tests {
             incremental_config,
             OutputFramebufferOrigin::TopLeftScanout,
         );
+        drop(first_graph);
         assert_eq!(
             incremental
                 .renderer
@@ -11911,11 +11912,42 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(cache_passes.len(), 2);
-        let cache_keys = cache_passes
+        let incremental_checkpoint_snapshots = cache_passes
             .iter()
-            .map(|pass| effects::checkpoint_capture_cache_key(&current_graph, pass).unwrap())
+            .map(|pass| {
+                let key = effects::checkpoint_capture_cache_key(&current_graph, pass).unwrap();
+                let texture_plan = current_graph
+                    .textures
+                    .iter()
+                    .find(|texture| Some(texture.id) == pass.output)
+                    .unwrap();
+                let texture = incremental
+                    .renderer
+                    .effect_resources
+                    .checkpoint_capture_texture(&key)
+                    .expect("incremental checkpoint texture remains cache-owned");
+                let pixels = read_effect_texture_pixels(
+                    &mut incremental,
+                    &texture,
+                    texture_plan.width,
+                    texture_plan.height,
+                );
+                (
+                    key,
+                    pass.instance.get(),
+                    texture_plan.width,
+                    texture_plan.height,
+                    pixels,
+                )
+            })
             .collect::<Vec<_>>();
-        assert_ne!(cache_keys[0], cache_keys[1]);
+        assert_ne!(
+            &incremental_checkpoint_snapshots[0].0,
+            &incremental_checkpoint_snapshots[1].0
+        );
+        drop(cache_passes);
+        drop(current_graph);
+        drop(incremental);
 
         let mut full_refresh =
             GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
@@ -11945,42 +11977,23 @@ mod tests {
             incremental_config,
             OutputFramebufferOrigin::TopLeftScanout,
         );
-        for pass in &cache_passes {
-            let key = effects::checkpoint_capture_cache_key(&current_graph, pass).unwrap();
-            let actual_texture = incremental
-                .renderer
-                .effect_resources
-                .checkpoint_capture_texture(&key)
-                .expect("incremental checkpoint texture remains cache-owned");
+        for (key, instance, width, height, incremental_checkpoint) in
+            &incremental_checkpoint_snapshots
+        {
             let reference_texture = full_refresh
                 .renderer
                 .effect_resources
-                .checkpoint_capture_texture(&key)
+                .checkpoint_capture_texture(key)
                 .expect("full-current checkpoint was fully populated");
-            let texture_plan = current_graph
-                .textures
-                .iter()
-                .find(|texture| Some(texture.id) == pass.output)
-                .unwrap();
-            let actual_checkpoint = read_effect_texture_pixels(
-                &mut incremental,
-                &actual_texture,
-                texture_plan.width,
-                texture_plan.height,
-            );
-            let reference_checkpoint = read_effect_texture_pixels(
-                &mut full_refresh,
-                &reference_texture,
-                texture_plan.width,
-                texture_plan.height,
-            );
+            let reference_checkpoint =
+                read_effect_texture_pixels(&mut full_refresh, &reference_texture, *width, *height);
             assert_eq!(
-                actual_checkpoint,
-                reference_checkpoint,
+                incremental_checkpoint, &reference_checkpoint,
                 "checkpoint for instance {} differs from its full refresh",
-                pass.instance.get()
+                instance
             );
         }
+        drop(full_refresh);
 
         let mut uncached_reference =
             GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
@@ -12011,6 +12024,7 @@ mod tests {
             OutputFramebufferOrigin::TopLeftScanout,
         );
         let full_current_reference = read_diagnostic_pixels(&uncached_reference);
+        drop(uncached_reference);
         let (outside, inside) = diagnostic_matrix_mismatch_counts_for_origin(
             &actual,
             &previous,
@@ -12031,20 +12045,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_faithful_full_kawase_dock_control() {
-        let fixture = native_dock_fixture();
-        let config = effects::EffectDebugConfig::new(
-            effects::EffectDebugCaptureMode::Replay,
-            effects::EffectDebugKawaseMode::Full,
-        );
-        let (_, previous, candidate, events) =
-            render_native_stacked_candidate(fixture, config, None);
-        assert!(events.iter().any(|line| {
-            line.contains("event=effect_pass_execute_end")
-                && line.contains("kind=SceneCapture")
-                && line.contains("checkpoints=1")
-                && line.contains("capture_mode=framebuffer_blit")
     mod checkpoint_causal_gles_tests {
         use super::*;
         use oblivion_one::effects::{EffectFrameDemand, EffectInstanceId, GraphPassId};
@@ -13138,6 +13138,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_faithful_full_kawase_dock_control() {
+        let fixture = native_dock_fixture();
+        let config = effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Full,
+        );
+        let (_, previous, candidate, events) =
+            render_native_stacked_candidate(fixture, config, None);
+        assert!(events.iter().any(|line| {
+            line.contains("event=effect_pass_execute_end")
+                && line.contains("kind=SceneCapture")
+                && line.contains("checkpoints=1")
+                && line.contains("capture_mode=framebuffer_blit")
                 && line.contains("backdrop_capture_policy=replay")
                 && line.contains("kawase_execution_policy=full")
         }));

@@ -3255,3 +3255,127 @@ fn already_topmost_transient_family_does_not_queue_duplicate_restack() {
     assert!(state.raise_window_id(parent_id));
     assert!(state.take_backend_commands().is_empty());
 }
+
+#[test]
+fn output_sized_normal_x11_window_still_receives_window_open_when_policy_is_off() {
+    let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset_with_maximized_policy(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+        false,
+    );
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 401, 401);
+    let window_id = insert_x11(&mut state, snapshot.clone());
+    let maximized_geometry =
+        state.window_geometry_for_surface_mode(snapshot.surface_id, ToplevelMode::Maximized);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_geometry
+        .as_mut()
+        .expect("X11 frame geometry")
+        .frame = maximized_geometry;
+    assert!(state.set_surface_placement(snapshot.surface_id, maximized_geometry.placement));
+    state.append_renderable_surface(x11_shm_surface(
+        snapshot.surface_id,
+        maximized_geometry.width,
+        maximized_geometry.height,
+        maximized_geometry.placement,
+    ));
+    state
+        .surface_presentation_generations
+        .insert(snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+
+    assert_eq!(
+        state.window(window_id).expect("X11 window").state.mode(),
+        ToplevelMode::Normal
+    );
+    assert_eq!(
+        state.current_root_window_geometry(snapshot.surface_id),
+        Some(maximized_geometry)
+    );
+    assert!(state.maybe_begin_window_open_animation(snapshot.surface_id));
+    assert!(
+        state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
+}
+
+#[test]
+fn maximized_x11_window_skips_window_open_when_policy_is_off() {
+    let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset_with_maximized_policy(
+        &mut state,
+        crate::animation_control::AnimationPreset::Macos,
+        false,
+    );
+    assert_eq!(
+        state.animation_control.effective_effect(
+            crate::animation_control::AnimationSlot::WindowOpen,
+            crate::animation_control::AnimationRuntimeCapabilities::default(),
+        ),
+        crate::animation_control::AnimationEffect::WindowGlide
+    );
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut snapshot = x11_snapshot(generation, 402, 402);
+    snapshot.state.maximized = true;
+    let window_id = insert_x11(&mut state, snapshot.clone());
+    let placement = state.surface_placement(snapshot.surface_id);
+    state.append_renderable_surface(x11_shm_surface(
+        snapshot.surface_id,
+        snapshot.geometry.width,
+        snapshot.geometry.height,
+        placement,
+    ));
+    state
+        .surface_presentation_generations
+        .insert(snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let maximized_geometry =
+        state.window_geometry_for_surface_mode(snapshot.surface_id, ToplevelMode::Maximized);
+    assert!(state.apply_initial_x11_state(snapshot.handle, snapshot.state, snapshot.geometry));
+    let canonical_opacity = state
+        .window(window_id)
+        .expect("X11 window")
+        .canonical_opacity();
+    let transaction_count = state.presentation_animator.transaction_count();
+
+    assert_eq!(
+        state.window(window_id).expect("X11 window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state.current_root_window_geometry(snapshot.surface_id),
+        Some(maximized_geometry)
+    );
+    assert!(!state.maybe_begin_window_open_animation(snapshot.surface_id));
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state.presentation_animator.transaction_count(),
+        transaction_count
+    );
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("X11 window")
+            .canonical_opacity(),
+        canonical_opacity
+    );
+}

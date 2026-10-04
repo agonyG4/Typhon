@@ -138,6 +138,8 @@ struct EmptyKeyboardLayoutArgs {}
 struct AnimationConfigurationSetArgs {
     version: u32,
     enabled: bool,
+    #[serde(default = "default_true")]
+    animate_maximized_window_open: bool,
     preset: String,
     speed: f64,
     #[serde(default)]
@@ -742,6 +744,7 @@ impl NativeRuntime {
             let document = oblivion_one::animation_control::AnimationConfigurationDocument {
                 version: args.version,
                 enabled: args.enabled,
+                animate_maximized_window_open: args.animate_maximized_window_open,
                 preset: args.preset,
                 speed: args.speed,
                 overrides: args.overrides,
@@ -2348,7 +2351,7 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectScanoutCounters, DirectScanoutDoctorFormat, DirectScanoutDoctorRuntime,
+        AnimationConfigurationSetArgs, DirectScanoutCounters, DirectScanoutDoctorFormat, DirectScanoutDoctorRuntime,
         DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs,
         KeyboardLayoutSetArgs, MaterialSetError, NativePreReadInputDecision,
         decide_native_pre_read_input, dispatch_keyboard_layout_command,
@@ -2368,6 +2371,56 @@ mod tests {
     use std::sync::Mutex;
 
     static KEYBOARD_LAYOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn legacy_animation_config_set_payload_defaults_policy_on_and_keeps_other_fields() {
+        let legacy = serde_json::json!({
+            "version": 1,
+            "enabled": false,
+            "preset": "macos",
+            "speed": 1.25,
+            "overrides": {"window.open": "window.glide"}
+        });
+        let args: AnimationConfigurationSetArgs = serde_json::from_value(legacy).unwrap();
+
+        assert!(args.animate_maximized_window_open);
+        assert_eq!(args.version, 1);
+        assert!(!args.enabled);
+        assert_eq!(args.preset, "macos");
+        assert_eq!(args.speed, 1.25);
+        assert_eq!(args.overrides["window.open"], "window.glide");
+
+        let explicit_off = serde_json::json!({
+            "version": 1,
+            "enabled": true,
+            "preset": "astrea",
+            "speed": 1.0,
+            "overrides": {"window.open": "window.scale"},
+            "animateMaximizedWindowOpen": false
+        });
+        let args: AnimationConfigurationSetArgs =
+            serde_json::from_value(explicit_off).unwrap();
+        assert!(!args.animate_maximized_window_open);
+        assert_eq!(args.overrides["window.open"], "window.scale");
+
+        let document = oblivion_one::animation_control::AnimationConfigurationDocument {
+            version: args.version,
+            enabled: args.enabled,
+            animate_maximized_window_open: args.animate_maximized_window_open,
+            preset: args.preset,
+            speed: args.speed,
+            overrides: args.overrides,
+        };
+        let configuration = oblivion_one::animation_control::AnimationConfiguration::from_document(
+            document,
+        )
+        .unwrap();
+        assert!(!configuration.animate_maximized_window_open);
+        assert!(configuration.enabled);
+        assert_eq!(configuration.preset.id(), "astrea");
+        assert_eq!(configuration.speed, 1.0);
+        assert_eq!(configuration.overrides.len(), 1);
+    }
 
     #[test]
     fn unsupported_material_set_maps_to_invalid_argument_with_matching_id() {
@@ -3883,7 +3936,11 @@ impl NativeRuntime {
             focused: true,
             backend: self.kms_backend.effective_kind().as_str().to_string(),
             vrr: FeatureStateSnapshot {
-                state: vrr_feature_state(self.output_capabilities.vrr_capable),
+                state: runtime_vrr_feature_state(
+                    self.kms_backend.atomic_vrr_capable(),
+                    self.confirmed_kms_presentation
+                        .vrr_request_confirmed_for(self.drm_file_generation),
+                ),
             },
             direct_scanout: FeatureStateSnapshot {
                 state: direct_state,

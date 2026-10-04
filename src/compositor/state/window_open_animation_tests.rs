@@ -41,6 +41,14 @@ fn mapped_test_window() -> (CompositorState, WindowId, u32) {
 }
 
 pub(super) fn set_window_open_preset(state: &mut CompositorState, preset: AnimationPreset) {
+    set_window_open_preset_with_maximized_policy(state, preset, true);
+}
+
+pub(super) fn set_window_open_preset_with_maximized_policy(
+    state: &mut CompositorState,
+    preset: AnimationPreset,
+    animate_maximized_window_open: bool,
+) {
     let test_temp_dir = std::env::current_exe()
         .expect("Cargo test executable")
         .parent()
@@ -60,6 +68,7 @@ pub(super) fn set_window_open_preset(state: &mut CompositorState, preset: Animat
     );
     let configuration = AnimationConfiguration {
         preset,
+        animate_maximized_window_open,
         ..AnimationConfiguration::default()
     };
     state
@@ -137,7 +146,7 @@ fn open_plan_uses_ease_out_cubic_and_existing_speed_scaling() {
 #[test]
 fn window_scale_commits_geometry_only_and_preserves_canonical_translucency() {
     let (mut state, window_id, root_surface_id) = mapped_test_window();
-    set_window_open_preset(&mut state, AnimationPreset::Astrea);
+    set_window_open_preset_with_maximized_policy(&mut state, AnimationPreset::Astrea, false);
     let target_opacity = PresentationOpacity::new(0.42).expect("canonical opacity");
     state
         .window_mut(window_id)
@@ -154,6 +163,10 @@ fn window_scale_commits_geometry_only_and_preserves_canonical_translucency() {
         .expect("test output identity");
 
     assert!(state.maybe_begin_window_open_animation(root_surface_id));
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        ToplevelMode::Normal
+    );
 
     assert!(
         state
@@ -260,7 +273,7 @@ fn window_scale_preserves_existing_geometry_owner_without_adding_a_transaction()
 #[test]
 fn window_glide_still_commits_geometry_and_opacity_together() {
     let (mut state, window_id, root_surface_id) = mapped_test_window();
-    set_window_open_preset(&mut state, AnimationPreset::Macos);
+    set_window_open_preset_with_maximized_policy(&mut state, AnimationPreset::Macos, false);
     let canonical_opacity = PresentationOpacity::new(0.42).expect("canonical opacity");
     state
         .window_mut(window_id)

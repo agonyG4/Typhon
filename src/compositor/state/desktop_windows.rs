@@ -491,7 +491,12 @@ impl CompositorState {
             self.clear_fullscreen_presentation_owner(root_surface_id);
             self.queue_backend_state(window_id);
         } else {
-            self.transition_x11_window_mode(window_id, mode, state.hidden);
+            self.transition_x11_window_mode_from_source(
+                window_id,
+                mode,
+                state.hidden,
+                WindowModeRequestSource::X11Ewmh,
+            );
         }
         true
     }
@@ -1112,7 +1117,12 @@ impl CompositorState {
         } else {
             ToplevelMode::Normal
         };
-        self.transition_x11_window_mode(window_id, mode, state.hidden);
+        self.transition_x11_window_mode_from_source(
+            window_id,
+            mode,
+            state.hidden,
+            WindowModeRequestSource::X11Ewmh,
+        );
         true
     }
 

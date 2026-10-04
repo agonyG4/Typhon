@@ -12,9 +12,14 @@ pub const MIN_ANIMATION_SPEED: f64 = 0.5;
 pub const MAX_ANIMATION_SPEED: f64 = 2.0;
 pub const MAX_ANIMATION_OVERRIDES: usize = AnimationSlot::ALL.len();
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnimationConfiguration {
     pub enabled: bool,
+    pub animate_maximized_window_open: bool,
     pub preset: AnimationPreset,
     pub speed: f64,
     pub overrides: BTreeMap<AnimationSlot, AnimationEffect>,
@@ -24,6 +29,7 @@ impl Default for AnimationConfiguration {
     fn default() -> Self {
         Self {
             enabled: true,
+            animate_maximized_window_open: true,
             preset: AnimationPreset::Astrea,
             speed: 1.0,
             overrides: BTreeMap::new(),
@@ -86,6 +92,7 @@ impl AnimationConfiguration {
         AnimationConfigurationDocument {
             version: ANIMATION_CONFIGURATION_VERSION,
             enabled: self.enabled,
+            animate_maximized_window_open: self.animate_maximized_window_open,
             preset: self.preset.id().to_string(),
             speed: self.speed,
             overrides: self
@@ -121,6 +128,7 @@ impl AnimationConfiguration {
         }
         let configuration = Self {
             enabled: document.enabled,
+            animate_maximized_window_open: document.animate_maximized_window_open,
             preset,
             speed: document.speed,
             overrides,
@@ -135,6 +143,8 @@ impl AnimationConfiguration {
 pub struct AnimationConfigurationDocument {
     pub version: u32,
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub animate_maximized_window_open: bool,
     pub preset: String,
     pub speed: f64,
     #[serde(default)]
@@ -209,6 +219,7 @@ mod tests {
         assert_eq!(config.preset, AnimationPreset::Astrea);
         assert_eq!(config.speed, 1.0);
         assert!(config.overrides.is_empty());
+        assert!(config.animate_maximized_window_open);
     }
 
     #[test]
@@ -287,6 +298,7 @@ mod tests {
     #[test]
     fn document_round_trips() {
         let mut config = AnimationConfiguration::default();
+        config.animate_maximized_window_open = false;
         config
             .overrides
             .insert(AnimationSlot::WindowMove, AnimationEffect::GeometryMacos);
@@ -294,6 +306,24 @@ mod tests {
             AnimationConfiguration::from_document(config.to_document()).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn legacy_version_one_document_defaults_maximized_window_open_to_true() {
+        let document: AnimationConfigurationDocument = serde_json::from_str(
+            r#"{"version":1,"enabled":false,"preset":"macos","speed":1.25,"overrides":{"window.move":"geometry.macos"}}"#,
+        )
+        .unwrap();
+        let configuration = AnimationConfiguration::from_document(document).unwrap();
+
+        assert!(!configuration.enabled);
+        assert_eq!(configuration.preset, AnimationPreset::Macos);
+        assert_eq!(configuration.speed, 1.25);
+        assert_eq!(
+            configuration.overrides.get(&AnimationSlot::WindowMove),
+            Some(&AnimationEffect::GeometryMacos)
+        );
+        assert!(configuration.animate_maximized_window_open);
     }
 
     #[test]

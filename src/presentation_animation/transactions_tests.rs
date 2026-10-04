@@ -118,6 +118,82 @@ fn opacity_transaction_uses_exact_revision_and_sample_evidence() {
 }
 
 #[test]
+fn active_transaction_member_reports_only_the_current_exact_property_revision() {
+    let mut engine = PresentationEngine::enabled();
+    let scene_node_id = node(102);
+    let transaction = engine
+        .commit(PresentationTransactionRequest::mixed(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(20.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::EaseOut),
+            )],
+            vec![PresentationOpacityMutation::new(
+                scene_node_id,
+                PresentationOpacity::TRANSPARENT,
+                PresentationOpacity::OPAQUE,
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::EaseOut),
+            )],
+        ))
+        .expect("mixed transaction");
+    let geometry_member = transaction
+        .members()
+        .iter()
+        .find(|member| member.property() == Some(PresentationPropertyKind::Geometry))
+        .copied()
+        .expect("geometry member");
+    let opacity_member = transaction
+        .members()
+        .iter()
+        .find(|member| member.property() == Some(PresentationPropertyKind::Opacity))
+        .copied()
+        .expect("opacity member");
+
+    assert_eq!(
+        engine.active_transaction_member(scene_node_id, PresentationPropertyKind::Geometry),
+        Some(geometry_member)
+    );
+    assert_eq!(
+        engine.active_transaction_member(scene_node_id, PresentationPropertyKind::Opacity),
+        Some(opacity_member)
+    );
+    assert_eq!(
+        engine.active_transaction_member(scene_node_id, PresentationPropertyKind::Clip),
+        None
+    );
+
+    let replacement = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(1),
+            vec![PresentationGeometryMutation::new(
+                scene_node_id,
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(40.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::Linear),
+            )],
+        ))
+        .expect("replacement geometry transaction");
+    let replacement_member = replacement.members()[0];
+    assert_ne!(replacement_member, geometry_member);
+    assert_eq!(
+        engine.active_transaction_member(scene_node_id, PresentationPropertyKind::Geometry),
+        Some(replacement_member)
+    );
+
+    engine.cancel_geometry(scene_node_id);
+    assert_eq!(
+        engine.active_transaction_member(scene_node_id, PresentationPropertyKind::Geometry),
+        None
+    );
+    assert_eq!(
+        engine.active_transaction_member(scene_node_id, PresentationPropertyKind::Opacity),
+        Some(opacity_member)
+    );
+}
+
+#[test]
 fn clip_transaction_projects_with_geometry_sample_from_same_timestamp() {
     let mut engine = PresentationEngine::enabled();
     let scene_node_id = node(119);

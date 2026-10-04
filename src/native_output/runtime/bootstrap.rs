@@ -832,7 +832,7 @@ impl NativeRuntime {
         println!(
             "selected output sysfs VRR capability: {}",
             output_capabilities
-                .vrr_capable
+                .sysfs_vrr_capable
                 .map(|capable| if capable {
                     "supported"
                 } else {
@@ -863,7 +863,7 @@ impl NativeRuntime {
                 NativePerfField::str(
                     "output_vrr_sysfs",
                     output_capabilities
-                        .vrr_capable
+                        .sysfs_vrr_capable
                         .map(|capable| {
                             if capable {
                                 "supported"

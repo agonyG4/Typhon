@@ -133,10 +133,7 @@ fn direct_pageflip_info_preserves_the_accepted_window_projection() {
         None,
         accepted_rect,
     );
-    assert_eq!(
-        lease.buffer_id().get(),
-        lease.key().content.buffer_id.get(),
-    );
+    assert_eq!(lease.buffer_id().get(), lease.key().content.buffer_id.get(),);
     let mut ownership = DirectPrimaryOwnership::default();
     let submitted = test_submitted(91, lease);
     ownership

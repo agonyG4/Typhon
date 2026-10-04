@@ -9,16 +9,16 @@ pub(crate) struct NativeOutputCapabilities {
     pub(crate) physical_size_mm: Option<PhysicalSizeSnapshot>,
     pub(crate) modes: Vec<OutputModeSnapshot>,
     pub(crate) modes_truncated: bool,
-    pub(crate) vrr_capable: Option<bool>,
+    pub(crate) sysfs_vrr_capable: Option<bool>,
 }
 
 impl NativeOutputCapabilities {
     pub(crate) fn qualify_sysfs_connector(&mut self, connector: Option<&NativeConnector>) {
         if let Some(connector) = connector {
             self.connector_name.clone_from(&connector.name);
-            self.vrr_capable = connector.vrr_capable;
+            self.sysfs_vrr_capable = connector.vrr_capable;
         } else {
-            self.vrr_capable = None;
+            self.sysfs_vrr_capable = None;
         }
     }
 }
@@ -164,7 +164,7 @@ pub(crate) fn native_output_capabilities(
         physical_size_mm: physical_size_snapshot(connector.mm_width, connector.mm_height),
         modes,
         modes_truncated,
-        vrr_capable: None,
+        sysfs_vrr_capable: None,
     }
 }
 
@@ -253,11 +253,16 @@ pub(crate) fn physical_size_snapshot(
     })
 }
 
-pub(crate) const fn vrr_feature_state(capable: Option<bool>) -> FeatureState {
-    match capable {
-        Some(true) => FeatureState::Available,
-        Some(false) => FeatureState::Unavailable,
-        None => FeatureState::Degraded,
+pub(crate) const fn runtime_vrr_feature_state(
+    atomic_capable: bool,
+    pageflip_confirmed_active: bool,
+) -> FeatureState {
+    if !atomic_capable {
+        FeatureState::Unavailable
+    } else if pageflip_confirmed_active {
+        FeatureState::Active
+    } else {
+        FeatureState::Available
     }
 }
 

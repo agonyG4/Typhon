@@ -1,4 +1,6 @@
-use super::window_open_animation_tests::set_window_open_preset;
+use super::window_open_animation_tests::{
+    set_window_open_preset, set_window_open_preset_with_maximized_policy,
+};
 use super::*;
 use crate::animation_control::{
     AnimationEffect, AnimationPreset, AnimationRuntimeCapabilities, AnimationSlot,
@@ -163,13 +165,21 @@ fn acknowledge_test_xdg_configure(state: &mut CompositorState, surface_id: u32, 
     state.ack_xdg_surface_configure(surface_id, acknowledgement);
 }
 
-fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode: ToplevelMode) {
+fn assert_unpresented_xdg_mode_admission_uses_window_open(
+    surface_id: u32,
+    mode: ToplevelMode,
+    animate_maximized_window_open: bool,
+) {
     let mut state = xdg_state(
         test_surface(surface_id),
         DecorationPreference::ServerSide,
         ToplevelMode::Normal,
     );
-    set_window_open_preset(&mut state, AnimationPreset::Astrea);
+    set_window_open_preset_with_maximized_policy(
+        &mut state,
+        AnimationPreset::Astrea,
+        animate_maximized_window_open,
+    );
     state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
@@ -184,6 +194,10 @@ fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode:
         .scene_node_id_for_window_group(window_id)
         .expect("window group node");
     let target_geometry = state.window_geometry_for_surface_mode(surface_id, mode);
+    let canonical_opacity = state
+        .window(window_id)
+        .expect("test window")
+        .canonical_opacity();
 
     assert!(state.presented_window_geometry(surface_id).is_none());
     assert!(state.set_root_window_mode(surface_id, mode));
@@ -217,11 +231,17 @@ fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode:
     let target_rect = state
         .presentation_rect_for_geometry(surface_id, target_geometry)
         .expect("final XDG mode target rect");
-    assert!(state.maybe_begin_window_open_animation(surface_id));
-    assert!(
+    let transaction_count_before_open = state.presentation_animator.transaction_count();
+    let should_animate = mode != ToplevelMode::Maximized || animate_maximized_window_open;
+    assert_eq!(
+        state.maybe_begin_window_open_animation(surface_id),
+        should_animate
+    );
+    assert_eq!(
         state
             .presentation_animator
-            .has_geometry_track(scene_node_id)
+            .has_geometry_track(scene_node_id),
+        should_animate
     );
     assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
     assert_eq!(
@@ -230,25 +250,64 @@ fn assert_unpresented_xdg_mode_admission_uses_window_open(surface_id: u32, mode:
             .opacity_track_transaction(scene_node_id),
         None
     );
-    assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_eq!(
+        state.presentation_animator.transaction_count(),
+        transaction_count_before_open + if should_animate { 1 } else { 0 }
+    );
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        mode
+    );
     assert_eq!(
         state
-            .presentation_animator
-            .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
-            .expect("WindowOpen sample")
-            .rect,
-        target_rect
+            .window(window_id)
+            .expect("test window")
+            .canonical_opacity(),
+        canonical_opacity
     );
+    if should_animate {
+        assert_eq!(
+            state
+                .presentation_animator
+                .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+                .expect("WindowOpen sample")
+                .rect,
+            target_rect
+        );
+    } else {
+        assert_eq!(
+            state.current_visual_root_window_geometry(surface_id),
+            Some(target_geometry)
+        );
+        assert_eq!(
+            state
+                .presentation_animator
+                .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
+                .expect("canonical scene sample")
+                .rect,
+            target_rect
+        );
+    }
 }
 
 #[test]
 fn unpresented_xdg_fullscreen_admission_uses_window_open_geometry() {
-    assert_unpresented_xdg_mode_admission_uses_window_open(90, ToplevelMode::Fullscreen);
+    assert_unpresented_xdg_mode_admission_uses_window_open(90, ToplevelMode::Fullscreen, true);
 }
 
 #[test]
 fn unpresented_xdg_maximized_admission_uses_window_open_geometry() {
-    assert_unpresented_xdg_mode_admission_uses_window_open(91, ToplevelMode::Maximized);
+    assert_unpresented_xdg_mode_admission_uses_window_open(91, ToplevelMode::Maximized, true);
+}
+
+#[test]
+fn disabled_maximized_window_open_policy_installs_no_presentation_transaction() {
+    assert_unpresented_xdg_mode_admission_uses_window_open(94, ToplevelMode::Maximized, false);
+}
+
+#[test]
+fn disabled_maximized_window_open_policy_keeps_fullscreen_admission() {
+    assert_unpresented_xdg_mode_admission_uses_window_open(95, ToplevelMode::Fullscreen, false);
 }
 
 #[test]
@@ -259,7 +318,7 @@ fn unpresented_xdg_mode_change_retargets_active_window_open_geometry() {
         DecorationPreference::ServerSide,
         ToplevelMode::Normal,
     );
-    set_window_open_preset(&mut state, AnimationPreset::Astrea);
+    set_window_open_preset_with_maximized_policy(&mut state, AnimationPreset::Astrea, false);
     state.set_test_effective_xdg_window_geometry(
         surface_id,
         XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
@@ -317,6 +376,87 @@ fn unpresented_xdg_mode_change_retargets_active_window_open_geometry() {
         state
             .presentation_rect_for_geometry(surface_id, target_geometry)
             .expect("fullscreen target rect")
+    );
+}
+
+#[test]
+fn unpresented_xdg_normal_to_maximized_cancels_window_open_without_restarting_it() {
+    let surface_id = 96;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    set_window_open_preset_with_maximized_policy(&mut state, AnimationPreset::Astrea, false);
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let canonical_opacity = state
+        .window(window_id)
+        .expect("test window")
+        .canonical_opacity();
+
+    assert!(state.maybe_begin_window_open_animation(surface_id));
+    let _first_open_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("initial WindowOpen geometry transaction");
+    assert!(state.window_open_geometry_track_active(surface_id));
+    let transaction_count = state.presentation_animator.transaction_count();
+    assert!(state.presented_window_geometry(surface_id).is_none());
+
+    let maximized_geometry =
+        state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Maximized);
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Maximized));
+
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert!(!state.window_open_geometry_track_active(surface_id));
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id)
+    );
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        None
+    );
+    assert_eq!(
+        state.presentation_animator.transaction_count(),
+        transaction_count
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(maximized_geometry)
+    );
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("test window")
+            .canonical_opacity(),
+        canonical_opacity
+    );
+    assert!(!state.maybe_begin_window_open_animation(surface_id));
+    assert_eq!(
+        state.presentation_animator.transaction_count(),
+        transaction_count
+    );
+    assert_eq!(
+        state.presentation_animator.track_transaction(scene_node_id),
+        None
     );
 }
 

@@ -47,9 +47,9 @@ impl DirectCandidatePresentationFlow {
             classify_direct_content(candidate_key, presented_key, pending_key);
         let same_visual_assignment = content_disposition != DirectContentDisposition::NewContent;
         let initial_state_disposition = same_visual_assignment.then(|| {
-            if (content_disposition == DirectContentDisposition::MatchesQueuedOrSubmitted
-                || has_submitted_direct_assignment)
-                && pending_state.is_none()
+            if has_submitted_direct_assignment
+                || (content_disposition == DirectContentDisposition::MatchesQueuedOrSubmitted
+                    && pending_state.is_none())
             {
                 DirectPresentationStateDisposition::DeferUntilPageflip
             } else {
@@ -1541,6 +1541,133 @@ mod tests {
             DirectPresentationQualification::AlreadyRepresented { state }
                 if state.mode == OutputPresentationMode::AdaptiveSync
         ));
+    }
+
+    #[test]
+    fn submitted_adaptive_state_matching_request_defers_before_direct_side_effects() {
+        let key = candidate_key();
+        let confirmed_state = OutputPresentationStateKey {
+            mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
+            output_generation: key.output_generation,
+        };
+        let submitted_state = OutputPresentationStateKey {
+            mode: OutputPresentationMode::AdaptiveSync,
+            content_type: DrmContentType::Graphics,
+            output_generation: key.output_generation,
+        };
+        let flow = DirectCandidatePresentationFlow::new(
+            key,
+            Some(key),
+            Some(key),
+            confirmed_state,
+            submitted_state,
+            Some(submitted_state),
+            true,
+        );
+        assert!(flow.same_visual_assignment());
+        assert_eq!(
+            flow.initial_state_disposition(),
+            Some(DirectPresentationStateDisposition::DeferUntilPageflip)
+        );
+
+        let mut import_count = 0;
+        let mut exact_qualification_count = 0;
+        let mut validation_cache_lookup_count = 0;
+        let mut test_only_count = 0;
+        let qualification = flow
+            .qualify(
+                || {
+                    import_count += 1;
+                    Ok::<_, ()>(73_u32)
+                },
+                |_, _| {
+                    exact_qualification_count += 1;
+                    validation_cache_lookup_count += 1;
+                    test_only_count += 1;
+                    true
+                },
+            )
+            .expect("defer does not import or qualify");
+
+        let mut transaction_build_count = 0;
+        let mut obligation_transfer_count = 0;
+        let mut worker_admission_count = 0;
+        match qualification {
+            DirectPresentationQualification::DeferUntilPageflip => {}
+            DirectPresentationQualification::TransactionRequired { .. } => {
+                transaction_build_count += 1;
+                obligation_transfer_count += 1;
+                worker_admission_count += 1;
+            }
+            DirectPresentationQualification::AlreadyRepresented { .. } => {
+                transaction_build_count += 1;
+                obligation_transfer_count += 1;
+            }
+            DirectPresentationQualification::PresentationRejected => {}
+        }
+
+        assert_eq!(import_count, 0);
+        assert_eq!(exact_qualification_count, 0);
+        assert_eq!(validation_cache_lookup_count, 0);
+        assert_eq!(test_only_count, 0);
+        assert_eq!(transaction_build_count, 0);
+        assert_eq!(obligation_transfer_count, 0);
+        assert_eq!(worker_admission_count, 0);
+    }
+
+    #[test]
+    fn matching_pageflip_recomputes_direct_transition_from_confirmed_state() {
+        let key = candidate_key();
+        let confirmed_state = OutputPresentationStateKey {
+            mode: OutputPresentationMode::AdaptiveSync,
+            content_type: DrmContentType::Graphics,
+            output_generation: key.output_generation,
+        };
+        let requested_state = OutputPresentationStateKey {
+            mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
+            output_generation: key.output_generation,
+        };
+        let flow = DirectCandidatePresentationFlow::new(
+            key,
+            Some(key),
+            None,
+            confirmed_state,
+            requested_state,
+            None,
+            false,
+        );
+        assert_eq!(
+            flow.initial_state_disposition(),
+            Some(DirectPresentationStateDisposition::TransitionRequired)
+        );
+
+        let mut qualified_modes = Vec::new();
+        let qualification = flow
+            .qualify(
+                || Ok::<_, ()>(73_u32),
+                |_, mode| {
+                    qualified_modes.push(mode);
+                    true
+                },
+            )
+            .expect("confirmed assignment can be requalified");
+        let DirectPresentationQualification::TransactionRequired {
+            state,
+            state_disposition,
+            ..
+        } = qualification
+        else {
+            panic!("Vsync after Adaptive Sync pageflip must require a transition");
+        };
+
+        assert_eq!(qualified_modes, [OutputPresentationMode::Vsync]);
+        assert_eq!(state, requested_state);
+        assert_eq!(
+            state_disposition,
+            DirectPresentationStateDisposition::TransitionRequired
+        );
     }
 
     #[test]
