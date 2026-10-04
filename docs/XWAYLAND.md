@@ -65,17 +65,40 @@ discovery for that generation without an automatic reclaim attempt.
 
 The production reverse terminal bridge accepts v5 Copy and Move, and Ask when
 the Wayland destination resolves it to Copy or Move. Move performs the XDND
-`DELETE` selection conversion before successful `XdndFinished`. Pre-v5 root
-metadata remains parseable, but pre-v5 terminal interoperability is
-intentionally unqualified because `XdndFinished` cannot report failure before
-v5. This compatibility boundary should be reviewed in F11-C4. Real GTK/Qt and
-application qualification remains F11-D. The current root-coordinate mapping
-is 1:1 pending a future output-layout mapping for multi-output support.
+`DELETE` selection conversion before successful `XdndFinished`. F11-C4 reviewed
+and intentionally retained v5 as the minimum version for productive terminal
+interoperability. v2-v4 metadata and messages remain parseable for safe
+inspection and rejection, but those sources cannot receive accepted terminal
+Status or enter canonical productive Drop/Finished handling. Before v5,
+`XdndFinished` cannot truthfully encode late failure and action semantics.
+Real GTK/Qt/Electron/Wine/Proton and application qualification remains F11-D;
+deterministic tests do not claim that qualification. The current
+root-coordinate mapping is 1:1 pending a future output-layout mapping for
+multi-output support.
 
-The `XdndFinished` deadline is currently a fixed 60 seconds, including while a
-large INCR transfer continues making progress. F11-C4 real-application
-qualification should determine whether active transfer progress should affect
-that terminal deadline.
+After the canonical Drop acknowledgement starts `AwaitingWaylandFinish`, its
+terminal progress lease is 60 seconds and renews only for concrete, validated
+activity on an exact live transfer for that offer: successful post-Drop data
+request admission, a valid non-None `SelectionNotify`, a validated direct or
+INCR property reply (including each chunk, read continuation, and empty INCR
+terminator), or a positive-byte write into the Wayland sink. Merely issuing
+`ConvertSelection`/`GetProperty`, raw `PropertyNotify`, the INCR
+`DeleteProperty` handshake, sink readiness, zero writes, `WouldBlock`,
+`EINTR`, malformed or stale replies, and X-side draining after sink loss do not
+renew it.
+
+Renewal cannot move the lease past the immutable 10-minute absolute lifetime
+cap, which begins at the successful canonical Drop acknowledgement. At either
+deadline Typhon submits the existing canonical `CancelAfterDrop` request; the
+one-second cancellation fallback remains available for a queued canonical
+`SourceFinished` transition to win before failure `XdndFinished` is sent. The
+independent per-transfer idle timeout remains 30 seconds and only retires that
+data transaction. Root proxy authority becoming `Lost` rejects new reverse
+XDND admission but does not abort or freeze already committed Drop, terminal,
+or Move DELETE work. Move DELETE retains its separate bounded timeout.
+
+F11-C4 is the progress-aware bounded terminal lifetime and reviewed v5
+compatibility boundary. F11-D is real-application qualification.
 
 INCR teardown distinguishes source/session cancellation from an idle transfer
 deadline. Cancellation retires the exact transfer and may send the empty

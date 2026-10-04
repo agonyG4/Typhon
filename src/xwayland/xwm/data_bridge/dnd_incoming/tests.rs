@@ -199,6 +199,16 @@ pub(crate) fn get_property_reply(
     format: u8,
     value: &[u8],
 ) -> Vec<u8> {
+    get_property_reply_with_bytes_after(sequence, type_atom, format, value, 0)
+}
+
+pub(crate) fn get_property_reply_with_bytes_after(
+    sequence: u16,
+    type_atom: Atom,
+    format: u8,
+    value: &[u8],
+    bytes_after: u32,
+) -> Vec<u8> {
     let value_len = match format {
         8 => value.len(),
         16 => value.len() / 2,
@@ -210,7 +220,7 @@ pub(crate) fn get_property_reply(
         sequence,
         length: value.len().div_ceil(4) as u32,
         type_: type_atom,
-        bytes_after: 0,
+        bytes_after,
         value_len,
         value: value.to_vec(),
     }
@@ -259,6 +269,12 @@ fn property_new_value(window: Window, property: Atom, sequence: u16) -> Vec<u8> 
 
 pub(crate) fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Window, u16)
 {
+    fake_incoming_hover_with_version(5)
+}
+
+pub(crate) fn fake_incoming_hover_with_version(
+    source_version: u32,
+) -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, u32, Window, u16) {
     let generation = XwaylandGeneration::new(NonZeroU64::new(81).unwrap());
     let (mut xwm, mut peer) = super::super::super::test_fixture_for_tests(generation);
     super::initialize_target_proxy(&mut xwm).unwrap();
@@ -305,7 +321,7 @@ pub(crate) fn fake_incoming_hover() -> (Xwm, UnixStream, XwaylandDndOfferId, Ato
         &xwm,
         xwm.root,
         XwmAtomName::XdndEnter,
-        [source, 5 << 24, mime_atom, 0, 0],
+        [source, source_version << 24, mime_atom, 0, 0],
     );
     inject_client_message(&mut xwm, &mut peer, enter);
     xwm.connection.flush().unwrap();

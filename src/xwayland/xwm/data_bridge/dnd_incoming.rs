@@ -29,6 +29,7 @@ pub(crate) const MAX_INCOMING_DND_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const INCOMING_DND_IDLE_TIMEOUT_NS: u64 = 30_000_000_000;
 pub(crate) const INCOMING_DND_DROP_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 pub(crate) const INCOMING_DND_TERMINAL_TIMEOUT_NS: u64 = 60_000_000_000;
+pub(crate) const INCOMING_DND_TERMINAL_MAX_LIFETIME_NS: u64 = 600_000_000_000;
 pub(crate) const INCOMING_DND_DELETE_TIMEOUT_NS: u64 = 2_000_000_000;
 const ROOT_PROXY_VERIFY_TIMEOUT_NS: u64 = 1_000_000_000;
 
@@ -59,6 +60,7 @@ pub(crate) enum IncomingDndWirePhase {
         drop_timestamp: u32,
         action: crate::xwayland::XwaylandDndAction,
         deadline_ns: u64,
+        hard_deadline_ns: u64,
         cancel_submitted: bool,
     },
     DeletePending {

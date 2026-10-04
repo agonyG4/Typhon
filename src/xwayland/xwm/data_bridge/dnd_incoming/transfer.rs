@@ -129,6 +129,7 @@ pub(crate) fn start_data_request(
         .map_err(XwmError::Connection)?;
     std::mem::forget(cookie);
     xwm.connection.flush().map_err(XwmError::Connection)?;
+    super::terminal::note_terminal_transfer_progress(xwm, id, now_ns);
     Ok(Some(id))
 }
 
@@ -181,6 +182,7 @@ pub(crate) fn selection_notify(
         finish_transfer(xwm, id);
         return Ok(true);
     }
+    super::terminal::note_terminal_transfer_progress(xwm, id, now_ns);
     if let Some(transfer) = xwm.data_bridge.dnd_incoming.transfers.get_mut(&id) {
         transfer.phase = IncomingTransferPhase::ReadingProperty;
         transfer.mode = IncomingPropertyMode::Initial;
@@ -305,6 +307,8 @@ pub(super) fn poll_transfer_replies(
             && transfer.pending_reply == Some(sequence)
         {
             transfer.pending_reply = None;
+        } else {
+            continue;
         }
         processed += 1;
         let Some(reply) = reply else {
@@ -362,6 +366,7 @@ fn consume_transfer_property_reply(
             finish_transfer(xwm, id);
             return Ok(());
         }
+        super::terminal::note_terminal_transfer_progress(xwm, id, now_ns);
         let Some(transfer) = xwm.data_bridge.dnd_incoming.transfers.get_mut(&id) else {
             return Ok(());
         };
@@ -377,21 +382,43 @@ fn consume_transfer_property_reply(
         return Ok(());
     }
     let type_format = (reply.type_, reply.format);
+    let Some(expected_type_format) = xwm
+        .data_bridge
+        .dnd_incoming
+        .transfers
+        .get(&id)
+        .map(|transfer| transfer.expected_type_format)
+    else {
+        return Ok(());
+    };
+    if expected_type_format.is_some_and(|expected| expected != type_format) {
+        finish_transfer(xwm, id);
+        return Ok(());
+    }
     if reply.bytes_after > 0 && (reply.value.is_empty() || !reply.value.len().is_multiple_of(4)) {
         finish_transfer(xwm, id);
         return Ok(());
     }
     let units = u32::try_from(reply.value.len().div_ceil(4)).unwrap_or(u32::MAX);
+    let next_offset = if reply.bytes_after > 0 {
+        let Some(next_offset) = xwm
+            .data_bridge
+            .dnd_incoming
+            .transfers
+            .get(&id)
+            .and_then(|transfer| transfer.offset_units.checked_add(units))
+        else {
+            finish_transfer(xwm, id);
+            return Ok(());
+        };
+        Some(next_offset)
+    } else {
+        None
+    };
+    super::terminal::note_terminal_transfer_progress(xwm, id, now_ns);
     let Some(transfer) = xwm.data_bridge.dnd_incoming.transfers.get_mut(&id) else {
         return Ok(());
     };
-    if transfer
-        .expected_type_format
-        .is_some_and(|expected| expected != type_format)
-    {
-        finish_transfer(xwm, id);
-        return Ok(());
-    }
     transfer.expected_type_format = Some(type_format);
     if mode == IncomingPropertyMode::Initial {
         transfer.mode = IncomingPropertyMode::Direct;
@@ -401,11 +428,7 @@ fn consume_transfer_property_reply(
         transfer.written = 0;
     }
     transfer.bytes_after = reply.bytes_after;
-    if reply.bytes_after > 0 {
-        let Some(next_offset) = transfer.offset_units.checked_add(units) else {
-            finish_transfer(xwm, id);
-            return Ok(());
-        };
+    if let Some(next_offset) = next_offset {
         transfer.offset_units = next_offset;
     }
     transfer.continue_after_write =
@@ -469,7 +492,12 @@ fn write_transfer_buffer(
         let start = transfer.written;
         let bytes = &transfer.buffer[start..];
         // SAFETY: sink ownership and the source slice are held for this call.
-        let result = write_sink_bytes(fd, bytes);
+        let result = super::terminal::note_terminal_transfer_write_result(
+            xwm,
+            id,
+            now_ns,
+            write_sink_bytes(fd, bytes),
+        );
         calls += 1;
         if let Ok(written) = result {
             if written == 0 {

@@ -1151,9 +1151,16 @@ pub(crate) fn next_deadline_ns(xwm: &Xwm) -> Option<u64> {
                     acknowledgement_deadline_ns,
                     ..
                 } => Some(acknowledgement_deadline_ns),
-                IncomingDndWirePhase::AwaitingWaylandFinish { deadline_ns, .. } => {
-                    Some(deadline_ns)
-                }
+                IncomingDndWirePhase::AwaitingWaylandFinish {
+                    deadline_ns,
+                    hard_deadline_ns,
+                    cancel_submitted,
+                    ..
+                } => Some(if cancel_submitted {
+                    deadline_ns
+                } else {
+                    deadline_ns.min(hard_deadline_ns)
+                }),
                 IncomingDndWirePhase::DeletePending { .. } => xwm
                     .data_bridge
                     .dnd_incoming

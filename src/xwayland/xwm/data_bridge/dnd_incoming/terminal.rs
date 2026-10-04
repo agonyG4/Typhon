@@ -240,6 +240,7 @@ pub(crate) fn resolve_drop(
                 drop_timestamp,
                 action,
                 deadline_ns: now_ns.saturating_add(INCOMING_DND_TERMINAL_TIMEOUT_NS),
+                hard_deadline_ns: now_ns.saturating_add(INCOMING_DND_TERMINAL_MAX_LIFETIME_NS),
                 cancel_submitted: false,
             };
         }
@@ -257,6 +258,90 @@ pub(crate) fn resolve_drop(
         cleanup_terminal(xwm, offer_id);
     }
     Ok(())
+}
+
+pub(super) fn note_terminal_transfer_progress(
+    xwm: &mut Xwm,
+    transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
+    now_ns: u64,
+) -> bool {
+    let Some(transfer) = xwm.data_bridge.dnd_incoming.transfers.get(&transfer_id) else {
+        return false;
+    };
+    if transfer.id != transfer_id
+        || transfer.offer_id != transfer_id.offer_id()
+        || transfer.generation != xwm.generation
+        || transfer.offer_id.generation() != xwm.generation
+        || transfer.sink.is_none()
+        || xwm
+            .data_bridge
+            .dnd_incoming
+            .requestors
+            .get(&transfer.requestor)
+            != Some(&transfer_id)
+    {
+        return false;
+    }
+    let Some((deadline_ns, hard_deadline_ns, drop_timestamp, action)) = xwm
+        .data_bridge
+        .dnd
+        .incoming_session()
+        .filter(|session| {
+            session.offer_id == transfer.offer_id
+                && session.generation == transfer.generation
+                && session.source.xid() == transfer.source
+                && session.canonical_started
+        })
+        .and_then(|session| match session.wire_phase {
+            IncomingDndWirePhase::AwaitingWaylandFinish {
+                drop_timestamp,
+                action,
+                deadline_ns,
+                hard_deadline_ns,
+                cancel_submitted: false,
+            } => Some((deadline_ns, hard_deadline_ns, drop_timestamp, action)),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    if now_ns >= hard_deadline_ns {
+        return false;
+    }
+    let candidate = now_ns
+        .saturating_add(INCOMING_DND_TERMINAL_TIMEOUT_NS)
+        .min(hard_deadline_ns);
+    if candidate <= deadline_ns {
+        return false;
+    }
+    let Some(session) = xwm
+        .data_bridge
+        .dnd
+        .incoming_session_mut()
+        .filter(|session| session.offer_id == transfer.offer_id)
+    else {
+        return false;
+    };
+    session.wire_phase = IncomingDndWirePhase::AwaitingWaylandFinish {
+        drop_timestamp,
+        action,
+        deadline_ns: candidate,
+        hard_deadline_ns,
+        cancel_submitted: false,
+    };
+    true
+}
+
+pub(super) fn note_terminal_transfer_write_result(
+    xwm: &mut Xwm,
+    transfer_id: crate::xwayland::XwaylandDndIncomingTransferId,
+    now_ns: u64,
+    result: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    if matches!(&result, Ok(written) if *written > 0) {
+        note_terminal_transfer_progress(xwm, transfer_id, now_ns);
+    }
+    result
 }
 
 pub(crate) fn resolve_cancel_after_drop(
@@ -587,8 +672,9 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
             drop_timestamp,
             action,
             deadline_ns,
+            hard_deadline_ns,
             cancel_submitted: false,
-        } if now_ns >= deadline_ns => {
+        } if now_ns >= deadline_ns || now_ns >= hard_deadline_ns => {
             if enqueue_cancel_after_drop(xwm, offer_id) {
                 if let Some(session) = xwm
                     .data_bridge
@@ -600,6 +686,7 @@ pub(crate) fn expire_deadlines(xwm: &mut Xwm, now_ns: u64) -> Result<(), XwmErro
                         drop_timestamp,
                         action,
                         deadline_ns: now_ns.saturating_add(INCOMING_DND_DROP_ACK_TIMEOUT_NS),
+                        hard_deadline_ns,
                         cancel_submitted: true,
                     };
                 }

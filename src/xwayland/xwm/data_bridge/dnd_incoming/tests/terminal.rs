@@ -3,12 +3,16 @@ use crate::xwayland::XwaylandDndAction as Action;
 use std::{
     collections::HashMap,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::net::UnixStream,
     thread,
 };
 use x11rb::protocol::xproto;
 
 const DROP_TIME: u32 = 0x7654_3210;
+
+#[path = "terminal_progress_tests.rs"]
+mod progress;
 
 fn finished_messages(bytes: &[u8], xwm: &Xwm) -> Vec<(Window, [u32; 5])> {
     bytes
@@ -116,6 +120,18 @@ fn accepted_drop(action: Action) -> (Xwm, UnixStream, XwaylandDndOfferId, Atom, 
     (xwm, peer, offer_id, mime_atom, DROP_TIME, server_sequence)
 }
 
+fn terminal_deadlines(xwm: &Xwm) -> (u64, u64, bool) {
+    match xwm.data_bridge.dnd.incoming_session().unwrap().wire_phase {
+        IncomingDndWirePhase::AwaitingWaylandFinish {
+            deadline_ns,
+            hard_deadline_ns,
+            cancel_submitted,
+            ..
+        } => (deadline_ns, hard_deadline_ns, cancel_submitted),
+        phase => panic!("expected dropped phase, got {phase:?}"),
+    }
+}
+
 fn selection_notify_event(
     requestor: Window,
     selection: Atom,
@@ -132,6 +148,23 @@ fn selection_notify_event(
         target,
         property,
     }
+}
+
+fn deliver_selection_notify(
+    xwm: &mut Xwm,
+    requestor: Window,
+    target: Atom,
+    property: Atom,
+    timestamp: u32,
+    now_ns: u64,
+) -> bool {
+    let selection = xwm.atoms.get(XwmAtomName::XdndSelection);
+    super::super::selection_notify(
+        xwm,
+        selection_notify_event(requestor, selection, target, property, timestamp),
+        now_ns,
+    )
+    .unwrap()
 }
 
 fn start_root_proxy_verification(xwm: &mut Xwm, now_ns: u64) -> u16 {
@@ -628,17 +661,24 @@ fn zero_drop_timestamp_fails_closed_without_guessing_position_time() {
 
 #[test]
 fn pre_v5_root_position_is_rejected_and_cannot_reach_canonical_drop() {
-    let (mut xwm, mut peer, offer_id, _, _, _, _) = fake_incoming_hover();
-    xwm.data_bridge.dnd.incoming_session_mut().unwrap().version =
-        crate::xwayland::XwaylandDndVersion::new(4).unwrap();
-    assert!(!accept_position(
+    let (mut xwm, mut peer, offer_id, _, _, _, _) = fake_incoming_hover_with_version(4);
+    let session = xwm.data_bridge.dnd.incoming_session().unwrap();
+    assert_eq!(session.version.get(), 4);
+    assert!(session.metadata_complete);
+    assert_eq!(session.mime_types, ["text/plain"]);
+    let position_id = session.latest_position.unwrap().position_id;
+    super::source_feedback(
         &mut xwm,
-        &mut peer,
         offer_id,
-        Action::Copy
-    ));
+        position_id,
+        Some("text/plain".to_owned()),
+        Some(Action::Copy),
+    )
+    .unwrap();
+    xwm.connection.flush().unwrap();
     let rejected = status_messages(&read_peer(&mut peer), &xwm);
-    assert!(rejected.is_empty());
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].1[1] & 1, 0, "v4 receives rejected Status only");
     let source = xwm.data_bridge.dnd.incoming_session().unwrap().source.xid();
     let event = drop_message(&xwm, source, DROP_TIME);
     super::super::client_message(&mut xwm, event, 53).unwrap();
