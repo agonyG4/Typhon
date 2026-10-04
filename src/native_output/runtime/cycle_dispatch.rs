@@ -12,8 +12,10 @@ use oblivion_one::control::{
 use oblivion_one::control_snapshots::{
     ActiveWindowSnapshot, ControlStatusSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot, FeatureState,
-    FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot, PositionSnapshot,
-    StatusSnapshot, TrustedEffectsReloadSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
+    FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputMutationCapabilitiesSnapshot,
+    OutputSnapshot, OutputTransformSnapshot, PositionSnapshot, ScaleMutationCapabilitySnapshot,
+    StatusSnapshot, TransformMutationCapabilitySnapshot, TrustedEffectsReloadSnapshot,
+    VersionSnapshot, XwaylandStatusSnapshot,
 };
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
@@ -124,6 +126,34 @@ fn settle_native_pointer_constraint_backend_requests(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyCursorArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutputConfigureArgs {
+    version: u8,
+    output_id: String,
+    base_configuration_generation: u64,
+    mode_id: u32,
+    scale_milli: u32,
+    transform: OutputTransformSnapshot,
+}
+
+impl OutputConfigureArgs {
+    fn valid(&self) -> bool {
+        self.version == 1
+            && !self.output_id.is_empty()
+            && self.base_configuration_generation > 0
+            && self.mode_id > 0
+            && self.scale_milli > 0
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutputTransactionArgs {
+    version: u8,
+    transaction_id: u64,
+}
 
 fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
     serde_json::from_value::<EmptyCursorArgs>(args).is_ok()
@@ -686,6 +716,18 @@ impl NativeRuntime {
                 ControlError::new(ControlErrorCode::InvalidCommand, "unknown control command"),
             ));
         };
+        if command == ControlCommand::OutputsConfigure {
+            return Some(self.dispatch_output_configure(request.id, request.args));
+        }
+        if matches!(
+            command,
+            ControlCommand::OutputsConfigureConfirm | ControlCommand::OutputsConfigureRevert
+        ) {
+            return Some(dispatch_output_transaction_command(
+                request.id,
+                request.args,
+            ));
+        }
         if matches!(
             command,
             ControlCommand::KeyboardLayoutGet
@@ -1386,15 +1428,7 @@ impl NativeRuntime {
                     checks,
                 })
             }
-            ControlCommand::Outputs => serde_json::to_value(OutputListSnapshot {
-                outputs: if self.scanout_destroyed {
-                    Vec::new()
-                } else {
-                    vec![self.control_output_snapshot()]
-                },
-                total: if self.scanout_destroyed { 0 } else { 1 },
-                truncated: false,
-            }),
+            ControlCommand::Outputs => serde_json::to_value(self.control_output_list_snapshot()),
             ControlCommand::Windows => self
                 .server
                 .control_window_list_snapshot()
@@ -3900,6 +3934,98 @@ fn format_direct_scanout_counters(counters: Option<&DirectScanoutCounters>) -> S
 }
 
 impl NativeRuntime {
+    fn control_output_list_snapshot(&self) -> OutputListSnapshot {
+        OutputListSnapshot {
+            outputs: if self.scanout_destroyed {
+                Vec::new()
+            } else {
+                vec![self.control_output_snapshot()]
+            },
+            total: if self.scanout_destroyed { 0 } else { 1 },
+            truncated: false,
+            transaction: None,
+        }
+    }
+
+    fn dispatch_output_configure(
+        &self,
+        request_id: u64,
+        value: serde_json::Value,
+    ) -> ControlResponse {
+        let args = match serde_json::from_value::<OutputConfigureArgs>(value) {
+            Ok(args) if args.valid() => args,
+            _ => {
+                return output_mutation_rejection(
+                    request_id,
+                    oblivion_one::control::ControlErrorCode::InvalidArgument,
+                    "invalid output configuration request",
+                );
+            }
+        };
+        let output_id = format!("output-{}", self.output_id.get());
+        if self.scanout_destroyed || args.output_id != output_id {
+            return output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::UnknownOutput,
+                "the requested output is not available",
+            );
+        }
+        if args.base_configuration_generation != self.output_configuration_generation.get() {
+            return output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::StaleOutputGeneration,
+                "the output configuration generation has changed",
+            );
+        }
+        let mode_is_known = args.mode_id == self.target.mode_id
+            || self
+                .output_capabilities
+                .modes
+                .iter()
+                .any(|mode| mode.id == args.mode_id);
+        if !mode_is_known {
+            return output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::UnknownOutputMode,
+                "the mode ID is not part of this output configuration generation",
+            );
+        }
+
+        let no_change = args.mode_id == self.target.mode_id
+            && args.scale_milli == 1000
+            && args.transform == OutputTransformSnapshot::Normal;
+        if no_change {
+            return match serde_json::to_value(self.control_output_list_snapshot()) {
+                Ok(snapshot) => ControlResponse::success(request_id, snapshot),
+                Err(_) => output_mutation_rejection(
+                    request_id,
+                    oblivion_one::control::ControlErrorCode::Internal,
+                    "output snapshot serialization failed",
+                ),
+            };
+        }
+
+        if args.scale_milli != 1000 {
+            return output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::UnsupportedOutputScale,
+                "canonical output scale mutation is unavailable",
+            );
+        }
+        if args.transform != OutputTransformSnapshot::Normal {
+            return output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::UnsupportedOutputTransform,
+                "canonical output transform mutation is unavailable",
+            );
+        }
+        output_mutation_rejection(
+            request_id,
+            oblivion_one::control::ControlErrorCode::UnsupportedOutputMode,
+            "runtime output mode reconfiguration is unavailable",
+        )
+    }
+
     fn direct_scanout_state(&self) -> FeatureState {
         if !self.direct_scanout_preference.enabled() || self.scanout_destroyed {
             FeatureState::Unavailable
@@ -3926,14 +4052,35 @@ impl NativeRuntime {
             serial: None,
             enabled: !self.scanout_destroyed,
             current_mode: (!self.scanout_destroyed).then_some(ModeSnapshot {
+                id: self.target.mode_id,
                 width: self.target.width,
                 height: self.target.height,
                 refresh_millihz: drm_mode_refresh_millihz(&self.target.mode)
                     .unwrap_or_else(|| self.refresh_hz.saturating_mul(1000)),
             }),
             physical_size_mm: self.output_capabilities.physical_size_mm.clone(),
+            configuration_generation: self.output_configuration_generation.get(),
             scale_milli: 1000,
-            transform: "normal".to_string(),
+            transform: OutputTransformSnapshot::Normal,
+            mutation_capabilities: OutputMutationCapabilitiesSnapshot {
+                // The current NativeRuntime has no runtime output reconfiguration
+                // owner yet. Do not advertise mode mutation until worker drain,
+                // scanout invalidation, and canonical KMS apply/rollback are wired.
+                mode_selection_supported: false,
+                scale: ScaleMutationCapabilitySnapshot {
+                    supported: false,
+                    min_milli: None,
+                    max_milli: None,
+                    values_milli: Vec::new(),
+                },
+                transform: TransformMutationCapabilitySnapshot {
+                    supported: false,
+                    transforms: Vec::new(),
+                },
+                enable_disable_supported: false,
+                topology_supported: false,
+                vrr_mutation_supported: false,
+            },
             position: PositionSnapshot { x: 0, y: 0 },
             focused: true,
             backend: self.kms_backend.effective_kind().as_str().to_string(),
@@ -3951,6 +4098,36 @@ impl NativeRuntime {
             modes_truncated: self.output_capabilities.modes_truncated,
         }
     }
+}
+
+fn dispatch_output_transaction_command(
+    request_id: u64,
+    value: serde_json::Value,
+) -> ControlResponse {
+    let args = match serde_json::from_value::<OutputTransactionArgs>(value) {
+        Ok(args) if args.version == 1 && args.transaction_id > 0 => args,
+        _ => {
+            return output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::InvalidArgument,
+                "invalid output transaction request",
+            );
+        }
+    };
+    let _requested_id = args.transaction_id;
+    output_mutation_rejection(
+        request_id,
+        oblivion_one::control::ControlErrorCode::OutputTransactionNotFound,
+        "there is no active output configuration transaction",
+    )
+}
+
+fn output_mutation_rejection(
+    request_id: u64,
+    code: oblivion_one::control::ControlErrorCode,
+    message: &'static str,
+) -> ControlResponse {
+    ControlResponse::failure(request_id, ControlError::new(code, message))
 }
 
 #[derive(Debug, Clone, Copy)]

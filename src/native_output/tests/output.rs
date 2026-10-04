@@ -350,14 +350,16 @@ fn kms_mode_clock_preserves_fractional_refresh_rate_in_millihertz() {
 }
 
 #[test]
-fn equivalent_kms_modes_deduplicate_and_preserve_preferred_marker() {
+fn equivalent_presentation_modes_keep_distinct_native_mode_ids() {
     let ordinary = native_test_drm_mode(1920, 1080, 60, false);
     let preferred = native_test_drm_mode(1920, 1080, 60, true);
     let (modes, truncated) = project_native_output_modes(&[ordinary, preferred]);
 
     assert!(!truncated);
-    assert_eq!(modes.len(), 1);
-    assert!(modes[0].preferred);
+    assert_eq!(modes.len(), 2);
+    assert_ne!(modes[0].id, modes[1].id);
+    assert!(modes.iter().any(|mode| mode.id == 2 && mode.preferred));
+    assert!(modes.iter().any(|mode| mode.id == 1 && !mode.preferred));
 }
 
 #[test]

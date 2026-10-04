@@ -134,10 +134,20 @@ pub(crate) fn select_kms_target_with_capabilities(
         for encoder_id in current_encoder.into_iter().chain(encoder_ids.into_iter()) {
             let encoder = drm_ffi::mode::get_encoder(file.as_fd(), encoder_id)?;
             if let Some(crtc_id) = select_crtc_id(&crtcs, &encoder) {
+                let mode_id = modes
+                    .iter()
+                    .position(|candidate| native_mode_identity_eq(candidate, &mode))
+                    .and_then(|index| u32::try_from(index + 1).ok())
+                    .ok_or_else(|| {
+                        io::Error::other(
+                            "selected native mode is absent from its connector inventory",
+                        )
+                    })?;
                 return Ok(NativeKmsTargetSelection {
                     target: KmsTarget {
                         connector_id,
                         crtc_id,
+                        mode_id,
                         mode,
                         width: u32::from(mode.hdisplay),
                         height: u32::from(mode.vdisplay),
@@ -173,20 +183,26 @@ pub(crate) fn project_native_output_modes(
 ) -> (Vec<OutputModeSnapshot>, bool) {
     let mut projected = modes
         .iter()
-        .filter_map(|mode| {
+        .enumerate()
+        .filter_map(|(index, mode)| {
             let width = u32::from(mode.hdisplay);
             let height = u32::from(mode.vdisplay);
             let refresh_millihz = drm_mode_refresh_millihz(mode)?;
-            (width > 0 && height > 0 && refresh_millihz > 0).then_some(OutputModeSnapshot {
-                width,
-                height,
-                refresh_millihz,
-                preferred: mode.type_ & drm_sys::DRM_MODE_TYPE_PREFERRED != 0,
-                interlaced: mode.flags & drm_sys::DRM_MODE_FLAG_INTERLACE != 0,
-            })
+            let id = u32::try_from(index + 1).ok()?;
+            (width > 0 && height > 0 && refresh_millihz > 0).then_some((
+                id,
+                OutputModeSnapshot {
+                    id,
+                    width,
+                    height,
+                    refresh_millihz,
+                    preferred: mode.type_ & drm_sys::DRM_MODE_TYPE_PREFERRED != 0,
+                    interlaced: mode.flags & drm_sys::DRM_MODE_FLAG_INTERLACE != 0,
+                },
+            ))
         })
         .collect::<Vec<_>>();
-    projected.sort_by_key(|mode| {
+    projected.sort_by_key(|(_, mode)| {
         (
             mode.width,
             mode.height,
@@ -195,23 +211,32 @@ pub(crate) fn project_native_output_modes(
         )
     });
 
-    let mut unique = Vec::<OutputModeSnapshot>::with_capacity(projected.len());
-    for mode in projected {
-        if let Some(previous) = unique.last_mut().filter(|previous| {
-            previous.width == mode.width
-                && previous.height == mode.height
-                && previous.refresh_millihz == mode.refresh_millihz
-                && previous.interlaced == mode.interlaced
-        }) {
-            previous.preferred |= mode.preferred;
-        } else {
-            unique.push(mode);
-        }
-    }
+    let modes_truncated = projected.len() > MAX_CONTROL_OUTPUT_MODES;
+    projected.truncate(MAX_CONTROL_OUTPUT_MODES);
+    (
+        projected.into_iter().map(|(_, mode)| mode).collect(),
+        modes_truncated,
+    )
+}
 
-    let modes_truncated = unique.len() > MAX_CONTROL_OUTPUT_MODES;
-    unique.truncate(MAX_CONTROL_OUTPUT_MODES);
-    (unique, modes_truncated)
+fn native_mode_identity_eq(
+    left: &drm_sys::drm_mode_modeinfo,
+    right: &drm_sys::drm_mode_modeinfo,
+) -> bool {
+    left.clock == right.clock
+        && left.hdisplay == right.hdisplay
+        && left.hsync_start == right.hsync_start
+        && left.hsync_end == right.hsync_end
+        && left.htotal == right.htotal
+        && left.hskew == right.hskew
+        && left.vdisplay == right.vdisplay
+        && left.vsync_start == right.vsync_start
+        && left.vsync_end == right.vsync_end
+        && left.vtotal == right.vtotal
+        && left.vscan == right.vscan
+        && left.flags == right.flags
+        && left.type_ == right.type_
+        && left.name == right.name
 }
 
 pub(crate) fn drm_mode_refresh_millihz(mode: &drm_sys::drm_mode_modeinfo) -> Option<u32> {

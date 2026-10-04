@@ -620,6 +620,7 @@ impl NativeRuntime {
             kms_backend,
             target,
             output_capabilities,
+            output_configuration_generation: OutputConfigurationGeneration::initial(),
             mode_label,
             refresh_hz,
             drm_file_generation,

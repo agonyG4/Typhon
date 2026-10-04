@@ -355,6 +355,7 @@ pub struct DoctorSnapshot {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ModeSnapshot {
+    pub id: u32,
     pub width: u32,
     pub height: u32,
     pub refresh_millihz: u32,
@@ -364,11 +365,58 @@ pub struct ModeSnapshot {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct OutputModeSnapshot {
+    pub id: u32,
     pub width: u32,
     pub height: u32,
     pub refresh_millihz: u32,
     pub preferred: bool,
     pub interlaced: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum OutputTransformSnapshot {
+    Normal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    Flipped,
+    Flipped90,
+    Flipped180,
+    Flipped270,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ScaleMutationCapabilitySnapshot {
+    pub supported: bool,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub min_milli: Option<u32>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub max_milli: Option<u32>,
+    pub values_milli: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TransformMutationCapabilitySnapshot {
+    pub supported: bool,
+    pub transforms: Vec<OutputTransformSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct OutputMutationCapabilitiesSnapshot {
+    pub mode_selection_supported: bool,
+    pub scale: ScaleMutationCapabilitySnapshot,
+    pub transform: TransformMutationCapabilitySnapshot,
+    pub enable_disable_supported: bool,
+    pub topology_supported: bool,
+    pub vrr_mutation_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,8 +459,10 @@ pub struct OutputSnapshot {
     pub current_mode: Option<ModeSnapshot>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub physical_size_mm: Option<PhysicalSizeSnapshot>,
+    pub configuration_generation: u64,
     pub scale_milli: u32,
-    pub transform: String,
+    pub transform: OutputTransformSnapshot,
+    pub mutation_capabilities: OutputMutationCapabilitiesSnapshot,
     pub position: PositionSnapshot,
     pub focused: bool,
     pub backend: String,
@@ -422,6 +472,27 @@ pub struct OutputSnapshot {
     pub modes_truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum OutputTransactionStateSnapshot {
+    PendingConfirmation,
+    RollbackFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct OutputTransactionSnapshot {
+    pub id: u64,
+    pub output_id: String,
+    pub state: OutputTransactionStateSnapshot,
+    pub applied_configuration_generation: u64,
+    pub remaining_ms: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub error_code: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -429,6 +500,8 @@ pub struct OutputListSnapshot {
     pub outputs: Vec<OutputSnapshot>,
     pub total: u32,
     pub truncated: bool,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub transaction: Option<OutputTransactionSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -898,6 +971,7 @@ mod tests {
                 serial: None,
                 enabled: true,
                 current_mode: Some(ModeSnapshot {
+                    id: 9,
                     width: 1920,
                     height: 1080,
                     refresh_millihz: 165_000,
@@ -906,8 +980,25 @@ mod tests {
                     width_mm: 600,
                     height_mm: 340,
                 }),
+                configuration_generation: 1,
                 scale_milli: 1000,
-                transform: String::from("normal"),
+                transform: OutputTransformSnapshot::Normal,
+                mutation_capabilities: OutputMutationCapabilitiesSnapshot {
+                    mode_selection_supported: false,
+                    scale: ScaleMutationCapabilitySnapshot {
+                        supported: false,
+                        min_milli: None,
+                        max_milli: None,
+                        values_milli: Vec::new(),
+                    },
+                    transform: TransformMutationCapabilitySnapshot {
+                        supported: false,
+                        transforms: Vec::new(),
+                    },
+                    enable_disable_supported: false,
+                    topology_supported: false,
+                    vrr_mutation_supported: false,
+                },
                 position: PositionSnapshot { x: 0, y: 0 },
                 focused: true,
                 backend: String::from("atomic"),
@@ -918,9 +1009,10 @@ mod tests {
                     state: FeatureState::Unavailable,
                 },
                 modes: vec![OutputModeSnapshot {
+                    id: 9,
                     width: 1920,
                     height: 1080,
-                    refresh_millihz: 60_000,
+                    refresh_millihz: 165_000,
                     preferred: true,
                     interlaced: false,
                 }],
@@ -928,6 +1020,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            transaction: None,
         };
 
         let value = serde_json::to_value(&snapshot).expect("output snapshot serializes");

@@ -55,7 +55,13 @@ rejections, malformed and oversized requests, timeouts, stale tokens, and
 client I/O failures rather than logging every connection or client string.
 
 M3 adds bounded read-only `version`, `status`, `doctor`, `outputs`, `windows`,
-and `active-window` snapshots. M4 adds typed `cursor.get`, `cursor.set-theme`,
+and `active-window` snapshots. The output snapshot carries a semantic
+`configurationGeneration`, current and available opaque mode IDs, explicit
+mutation capabilities, and a nullable transaction projection. The generation
+is distinct from frame, render, swapchain, and KMS presentation IDs. Mode IDs
+refer to exact entries in the selected connector's native mode inventory and
+are valid only with that output configuration generation. M4 adds typed
+`cursor.get`, `cursor.set-theme`,
 `cursor.set-size`, `cursor.set`, and `cursor.reload` commands. Snapshot data is
 copied into owned values before encoding, and the client decodes each success
 into the exact command-specific result type. Missing, null, incompatible, or
@@ -77,6 +83,28 @@ job may finish independently while the process tears down. Failed validation, lo
 persistence leaves the active generation unchanged. Old cursor generations
 remain retained while KMS transactions, worker jobs, cursor-plane owners, or
 software frames still reference them.
+
+The v1 Display request shapes are `outputs.configure`,
+`outputs.configure.confirm`, and `outputs.configure.revert`. Configure carries
+the output ID, base configuration generation, opaque native mode ID, scale,
+and transform. Confirm and revert carry only the server-issued transaction ID.
+The server owns transaction deadlines; clients cannot select the timeout. A
+successful future transaction must return a complete output snapshot, Keep
+must persist before clearing the deadline, and Revert or expiry must restore
+the captured exact configuration. Structured rejection codes distinguish
+unknown outputs, stale generations, unknown modes, unsupported dimensions,
+and transaction or persistence failures.
+
+The current native output runtime does not yet own a safe runtime KMS mode
+reconfiguration and rollback path. It advertises mode, scale, and transform
+mutation as unsupported; changed configurations receive structured rejection,
+and no active output transaction is created. The exact-current no-op configure
+request is accepted without a transaction. Scale, transform, enable/disable,
+topology, and VRR mutation are unavailable. There is no Display configuration
+persistence or startup restore path yet. Settings remains read-only until the
+KMS worker/pageflip drain, scanout lifecycle, atomic candidate, server
+deadline, persistence, and rollback path are owned by the native output
+runtime.
 
 Cursor configuration is persisted at
 `$XDG_CONFIG_HOME/AstreaOS/input/cursor.json`, or

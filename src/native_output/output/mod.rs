@@ -1,6 +1,7 @@
 use super::*;
 
 mod bootstrap;
+mod configuration;
 mod cursor;
 mod cursor_buffer;
 mod cursor_state;
@@ -12,6 +13,7 @@ mod sysfs;
 mod target;
 
 pub(crate) use bootstrap::*;
+pub(crate) use configuration::*;
 pub(crate) use cursor::*;
 pub(crate) use cursor_buffer::CursorFramebufferPin;
 pub(crate) use cursor_state::*;

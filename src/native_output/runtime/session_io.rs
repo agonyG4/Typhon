@@ -569,6 +569,7 @@ impl NativeSessionIo for NativeRuntime {
         self.acquire_watches.set_drm_file_generation(generation);
         self.restart_kms_commit_worker_after_recovery()?;
         self.rearm_parked_acquire_watches()?;
+        self.output_configuration_generation.advance();
         self.drm_file_generation = generation;
         self.pending_session_recovery = None;
         Ok(())

@@ -45,6 +45,9 @@ pub enum ControlCommand {
     Version,
     Doctor,
     Outputs,
+    OutputsConfigure,
+    OutputsConfigureConfirm,
+    OutputsConfigureRevert,
     Windows,
     ActiveWindow,
     Performance,
@@ -89,6 +92,9 @@ impl ControlCommand {
             Self::Version => "version",
             Self::Doctor => "doctor",
             Self::Outputs => "outputs",
+            Self::OutputsConfigure => "outputs.configure",
+            Self::OutputsConfigureConfirm => "outputs.configure.confirm",
+            Self::OutputsConfigureRevert => "outputs.configure.revert",
             Self::Windows => "windows",
             Self::ActiveWindow => "active-window",
             Self::Performance => "performance",
@@ -133,6 +139,9 @@ impl ControlCommand {
             "version" => Self::Version,
             "doctor" => Self::Doctor,
             "outputs" => Self::Outputs,
+            "outputs.configure" => Self::OutputsConfigure,
+            "outputs.configure.confirm" => Self::OutputsConfigureConfirm,
+            "outputs.configure.revert" => Self::OutputsConfigureRevert,
             "windows" => Self::Windows,
             "active-window" => Self::ActiveWindow,
             "performance" => Self::Performance,
@@ -177,6 +186,18 @@ impl ControlCommand {
 #[serde(rename_all = "snake_case")]
 pub enum ControlErrorCode {
     InvalidArgument,
+    UnknownOutput,
+    StaleOutputGeneration,
+    UnknownOutputMode,
+    UnsupportedOutputMode,
+    UnsupportedOutputScale,
+    UnsupportedOutputTransform,
+    OutputTransactionActive,
+    OutputTransactionNotFound,
+    OutputTestFailed,
+    OutputApplyFailed,
+    OutputPersistFailed,
+    OutputRollbackFailed,
     InvalidCommand,
     InvalidRequest,
     MalformedJson,
@@ -191,6 +212,18 @@ impl ControlErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidArgument => "invalid_argument",
+            Self::UnknownOutput => "unknown_output",
+            Self::StaleOutputGeneration => "stale_output_generation",
+            Self::UnknownOutputMode => "unknown_output_mode",
+            Self::UnsupportedOutputMode => "unsupported_output_mode",
+            Self::UnsupportedOutputScale => "unsupported_output_scale",
+            Self::UnsupportedOutputTransform => "unsupported_output_transform",
+            Self::OutputTransactionActive => "output_transaction_active",
+            Self::OutputTransactionNotFound => "output_transaction_not_found",
+            Self::OutputTestFailed => "output_test_failed",
+            Self::OutputApplyFailed => "output_apply_failed",
+            Self::OutputPersistFailed => "output_persist_failed",
+            Self::OutputRollbackFailed => "output_rollback_failed",
             Self::InvalidCommand => "invalid_command",
             Self::InvalidRequest => "invalid_request",
             Self::MalformedJson => "malformed_json",
@@ -383,7 +416,7 @@ fn validate_response(response: &ControlResponse) -> Result<(), ControlCodecError
 
 #[cfg(test)]
 mod tests {
-    use super::ControlCommand;
+    use super::{ControlCommand, ControlErrorCode};
 
     #[test]
     fn performance_command_is_part_of_the_bounded_control_codec() {
@@ -392,6 +425,75 @@ mod tests {
             Some(ControlCommand::Performance)
         );
         assert_eq!(ControlCommand::Performance.as_str(), "performance");
+    }
+
+    #[test]
+    fn output_configuration_transaction_commands_are_canonical_and_strict() {
+        let cases = [
+            ("outputs", ControlCommand::Outputs),
+            ("outputs.configure", ControlCommand::OutputsConfigure),
+            (
+                "outputs.configure.confirm",
+                ControlCommand::OutputsConfigureConfirm,
+            ),
+            (
+                "outputs.configure.revert",
+                ControlCommand::OutputsConfigureRevert,
+            ),
+        ];
+        for (name, command) in cases {
+            assert_eq!(ControlCommand::parse(name), Some(command));
+            assert_eq!(command.as_str(), name);
+        }
+        for near_miss in [
+            "outputs.config",
+            "outputs.configure.keep",
+            "outputs.configure.rollback",
+        ] {
+            assert_eq!(ControlCommand::parse(near_miss), None);
+        }
+    }
+
+    #[test]
+    fn display_mutation_rejections_have_stable_machine_codes() {
+        let cases = [
+            (ControlErrorCode::UnknownOutput, "unknown_output"),
+            (
+                ControlErrorCode::StaleOutputGeneration,
+                "stale_output_generation",
+            ),
+            (ControlErrorCode::UnknownOutputMode, "unknown_output_mode"),
+            (
+                ControlErrorCode::UnsupportedOutputScale,
+                "unsupported_output_scale",
+            ),
+            (
+                ControlErrorCode::UnsupportedOutputTransform,
+                "unsupported_output_transform",
+            ),
+            (
+                ControlErrorCode::OutputTransactionActive,
+                "output_transaction_active",
+            ),
+            (
+                ControlErrorCode::OutputTransactionNotFound,
+                "output_transaction_not_found",
+            ),
+            (ControlErrorCode::OutputTestFailed, "output_test_failed"),
+            (ControlErrorCode::OutputApplyFailed, "output_apply_failed"),
+            (
+                ControlErrorCode::OutputPersistFailed,
+                "output_persist_failed",
+            ),
+            (
+                ControlErrorCode::OutputRollbackFailed,
+                "output_rollback_failed",
+            ),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(code.as_str(), expected);
+            assert_eq!(serde_json::to_value(code).unwrap(), expected);
+        }
     }
 
     #[test]

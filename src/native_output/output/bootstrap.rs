@@ -92,6 +92,7 @@ pub(crate) struct KmsResources {
 pub(crate) struct KmsTarget {
     pub(crate) connector_id: u32,
     pub(crate) crtc_id: u32,
+    pub(crate) mode_id: u32,
     pub(crate) mode: drm_sys::drm_mode_modeinfo,
     pub(crate) width: u32,
     pub(crate) height: u32,

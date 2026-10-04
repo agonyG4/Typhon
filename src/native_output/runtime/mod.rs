@@ -616,6 +616,7 @@ pub(crate) struct NativeRuntime {
     perf: NativePerfLogger,
     target: KmsTarget,
     output_capabilities: NativeOutputCapabilities,
+    output_configuration_generation: OutputConfigurationGeneration,
     mode_label: String,
     refresh_hz: u32,
     drm_file_generation: u64,

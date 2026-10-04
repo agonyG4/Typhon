@@ -388,6 +388,7 @@ mod tests {
                 serial: None,
                 enabled: true,
                 current_mode: Some(crate::control_snapshots::ModeSnapshot {
+                    id: 1,
                     width: 1920,
                     height: 1080,
                     refresh_millihz: 165_000,
@@ -396,8 +397,26 @@ mod tests {
                     width_mm: 600,
                     height_mm: 340,
                 }),
+                configuration_generation: 1,
                 scale_milli: 1000,
-                transform: String::from("normal"),
+                transform: crate::control_snapshots::OutputTransformSnapshot::Normal,
+                mutation_capabilities:
+                    crate::control_snapshots::OutputMutationCapabilitiesSnapshot {
+                        mode_selection_supported: false,
+                        scale: crate::control_snapshots::ScaleMutationCapabilitySnapshot {
+                            supported: false,
+                            min_milli: None,
+                            max_milli: None,
+                            values_milli: Vec::new(),
+                        },
+                        transform: crate::control_snapshots::TransformMutationCapabilitySnapshot {
+                            supported: false,
+                            transforms: Vec::new(),
+                        },
+                        enable_disable_supported: false,
+                        topology_supported: false,
+                        vrr_mutation_supported: false,
+                    },
                 position: crate::control_snapshots::PositionSnapshot { x: 0, y: 0 },
                 focused: true,
                 backend: String::from("atomic"),
@@ -408,6 +427,7 @@ mod tests {
                     state: crate::control_snapshots::FeatureState::Unavailable,
                 },
                 modes: vec![crate::control_snapshots::OutputModeSnapshot {
+                    id: 1,
                     width: 1920,
                     height: 1080,
                     refresh_millihz: 165_000,
@@ -418,6 +438,7 @@ mod tests {
             }],
             total: 1,
             truncated: false,
+            transaction: None,
         });
 
         let output = human(&value);
