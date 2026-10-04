@@ -702,6 +702,7 @@ pub struct CompositorState {
     active_scene_view: ActiveSceneView,
     scene_registry: CanonicalSceneRegistry,
     presentation_animator: PresentationAnimator,
+    window_open_presentation_ownership: HashMap<u32, state::WindowOpenPresentationOwnership>,
     #[allow(dead_code)]
     presentation_animation_policy: PresentationAnimationPolicy,
     pub(in crate::compositor) animation_control: crate::animation_control::AnimationControlState,

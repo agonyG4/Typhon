@@ -727,6 +727,26 @@ impl PresentationEngine {
             })
     }
 
+    pub(crate) fn cancel_presentation_member_exact(
+        &mut self,
+        expected: PresentationTransactionMember,
+    ) -> bool {
+        let Some(property) = expected.property() else {
+            return false;
+        };
+        let scene_node_id = expected.scene_node_id();
+        if self.active_transaction_member(scene_node_id, property) != Some(expected) {
+            return false;
+        }
+
+        match property {
+            PresentationPropertyKind::Geometry => self.cancel_geometry(scene_node_id),
+            PresentationPropertyKind::Opacity => self.cancel_opacity(scene_node_id),
+            PresentationPropertyKind::Clip => self.cancel_clip(scene_node_id),
+        }
+        true
+    }
+
     pub(crate) fn cancel_geometry(&mut self, scene_node_id: SceneNodeId) {
         let Some(track) = self.geometry_tracks.remove(&scene_node_id) else {
             return;

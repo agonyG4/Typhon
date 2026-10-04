@@ -234,6 +234,9 @@ impl CompositorState {
         self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window_group_scene_node_id = self.scene_node_id_for_window_group(id);
+        if let Some(root_surface_id) = self.window(id).map(|window| window.root_surface_id) {
+            self.cancel_window_open_presentation_ownership(root_surface_id);
+        }
         if let Some(WindowBackend::X11(handle)) =
             self.desktop_windows.get(&id).map(|window| window.backend)
         {
@@ -276,6 +279,7 @@ impl CompositorState {
         if !should_detach {
             return false;
         }
+        self.cancel_window_open_presentation_ownership(surface_id);
         self.detach_surface_from_window_scene(surface_id);
         self.window_by_root_surface.remove(&surface_id);
         if let Some(window) = self.window_mut(window_id) {

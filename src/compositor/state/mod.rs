@@ -1,5 +1,24 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::compositor) struct WindowOpenPresentationOwnership {
+    scene_node_id: crate::core::SceneNodeId,
+    geometry: Option<crate::presentation_animation::PresentationTransactionMember>,
+    opacity: Option<crate::presentation_animation::PresentationTransactionMember>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::compositor) struct WindowOpenPresentationActivity {
+    pub geometry_exact: bool,
+    pub opacity_exact: bool,
+}
+
+impl WindowOpenPresentationActivity {
+    pub const fn is_active(self) -> bool {
+        self.geometry_exact || self.opacity_exact
+    }
+}
+
 mod active_scene;
 mod client_lifecycle;
 mod commit_timing_runtime;

@@ -194,6 +194,61 @@ fn active_transaction_member_reports_only_the_current_exact_property_revision() 
 }
 
 #[test]
+fn exact_member_cancellation_rejects_stale_revisions_and_wrong_transactions() {
+    let mut engine = PresentationEngine::enabled();
+    let first = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(0),
+            vec![PresentationGeometryMutation::new(
+                node(143),
+                rect(0.0, 0.0, 10.0, 10.0),
+                rect(20.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::Linear),
+            )],
+        ))
+        .expect("first geometry transaction");
+    let first_member = first.members()[0];
+    let current = engine
+        .commit(PresentationTransactionRequest::geometry(
+            AnimationTime::from_nanos(1),
+            vec![PresentationGeometryMutation::new(
+                node(143),
+                rect(20.0, 0.0, 10.0, 10.0),
+                rect(40.0, 0.0, 10.0, 10.0),
+                AnimationCurve::easing(Duration::from_millis(100), EasingCurve::Linear),
+            )],
+        ))
+        .expect("replacement geometry transaction");
+    let current_member = current.members()[0];
+
+    assert!(!engine.cancel_presentation_member_exact(first_member));
+    let stale_revision = PresentationTransactionMember::new(
+        node(143),
+        PresentationPropertyKind::Geometry,
+        current_member.transaction_id(),
+        PresentationRevisionId::from_raw(1).expect("stale revision identity"),
+    );
+    assert!(!engine.cancel_presentation_member_exact(stale_revision));
+    let wrong_transaction = PresentationTransactionMember::new(
+        node(143),
+        PresentationPropertyKind::Geometry,
+        PresentationTransactionId::new(NonZeroU64::new(999).expect("wrong transaction identity")),
+        current_member.revision_id(),
+    );
+    assert!(!engine.cancel_presentation_member_exact(wrong_transaction));
+    assert_eq!(
+        engine.active_transaction_member(node(143), PresentationPropertyKind::Geometry),
+        Some(current_member),
+        "stale or wrong identities must leave the newer track untouched"
+    );
+    assert_eq!(engine.transaction_count(), 1);
+
+    assert!(engine.cancel_presentation_member_exact(current_member));
+    assert_eq!(engine.active_count(), 0);
+    assert_eq!(engine.transaction_count(), 0);
+}
+
+#[test]
 fn clip_transaction_projects_with_geometry_sample_from_same_timestamp() {
     let mut engine = PresentationEngine::enabled();
     let scene_node_id = node(119);

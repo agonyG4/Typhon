@@ -2842,6 +2842,136 @@ fn physically_presented_x11_mode_changes_keep_enter_and_exit_animations() {
 }
 
 #[test]
+fn xwayland_presented_window_open_is_cancelled_by_late_maximize_when_policy_is_off() {
+    let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset_with_maximized_policy(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+        false,
+    );
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 3_511, 3_511);
+    let window_id = insert_x11(&mut state, snapshot.clone());
+    let placement = state.surface_placement(snapshot.surface_id);
+    state.append_renderable_surface(x11_shm_surface(
+        snapshot.surface_id,
+        snapshot.geometry.width,
+        snapshot.geometry.height,
+        placement,
+    ));
+    state
+        .surface_presentation_generations
+        .insert(snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+
+    assert!(state.maybe_begin_window_open_animation(snapshot.surface_id));
+    let open_geometry = state
+        .presentation_animator
+        .active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        )
+        .expect("WindowOpen Geometry member");
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("WindowOpen start time");
+    let intermediate = state
+        .presentation_animator
+        .sample_for_scene_node(
+            scene_node_id,
+            AnimationTime::from_nanos(started_at.as_nanos() + 80_000_000),
+        )
+        .expect("intermediate WindowOpen sample");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(snapshot.surface_id, intermediate.rect),
+    );
+    assert!(
+        state
+            .presented_window_geometry(snapshot.surface_id)
+            .is_some()
+    );
+    assert_eq!(
+        state.presentation_animator.active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        ),
+        Some(open_geometry)
+    );
+    let maximized_geometry =
+        state.window_geometry_for_surface_mode(snapshot.surface_id, ToplevelMode::Maximized);
+    let mut maximized_state = snapshot.state;
+    maximized_state.maximized = true;
+
+    assert!(state.apply_x11_published_state(snapshot.handle, maximized_state));
+
+    assert_eq!(
+        state.window(window_id).expect("X11 window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state.presentation_animator.track_curve(scene_node_id),
+        None,
+        "policy Off must use Immediate and must not install MaximizeEnter"
+    );
+    assert_eq!(
+        state.presentation_animator.active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        ),
+        None,
+        "the exact WindowOpen Geometry member must be retired"
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(snapshot.surface_id),
+        Some(maximized_geometry)
+    );
+}
+
+#[test]
+fn xwayland_detach_retires_window_open_presentation_members() {
+    let mut state = CompositorState::new(None);
+    super::window_open_animation_tests::set_window_open_preset(
+        &mut state,
+        crate::animation_control::AnimationPreset::Astrea,
+    );
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 3_513, 3_513);
+    let window_id = insert_x11(&mut state, snapshot.clone());
+    let placement = state.surface_placement(snapshot.surface_id);
+    state.append_renderable_surface(x11_shm_surface(
+        snapshot.surface_id,
+        snapshot.geometry.width,
+        snapshot.geometry.height,
+        placement,
+    ));
+    state
+        .surface_presentation_generations
+        .insert(snapshot.surface_id, 1);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    assert!(state.maybe_begin_window_open_animation(snapshot.surface_id));
+
+    assert!(state.detach_x11_surface(snapshot.surface_id));
+
+    assert!(
+        !state
+            .window_open_presentation_ownership
+            .contains_key(&snapshot.surface_id)
+    );
+    assert!(!state.presentation_animator.has_track(scene_node_id));
+    assert_eq!(state.presentation_animator.transaction_count(), 0);
+}
+
+#[test]
 fn pre_map_maximized_snapshot_uses_usable_output_geometry() {
     let mut state = CompositorState::new(None);
     super::window_open_animation_tests::set_window_open_preset(

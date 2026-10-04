@@ -65,8 +65,9 @@ impl CompositorState {
             .or_else(|| self.current_root_window_geometry(root_surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(root_surface_id), 1, 1));
         let presentation = self.mode_transition_presentation(root_surface_id);
-        let window_open_geometry_was_active =
-            self.window_open_geometry_track_active(root_surface_id);
+        let window_open_was_active = self.window_open_presentation_active(root_surface_id);
+        let instant_maximize_during_window_open =
+            self.suppress_maximize_animation_for_active_window_open(root_surface_id, mode);
         let restore_geometry = if mode_changed && mode != ToplevelMode::Normal {
             Some(source_geometry)
         } else {
@@ -124,10 +125,14 @@ impl CompositorState {
         }
 
         let geometry_changed = current_geometry != Some(target_geometry);
-        let transition = interaction_target.map_or_else(
-            || mode_visual_transition(presentation, current_mode, mode, source_geometry),
-            |(_, transition)| transition,
-        );
+        let transition = if instant_maximize_during_window_open {
+            VisualGeometryTransition::Immediate
+        } else {
+            interaction_target.map_or_else(
+                || mode_visual_transition(presentation, current_mode, mode, source_geometry),
+                |(_, transition)| transition,
+            )
+        };
         if geometry_changed || mode_changed || minimized_changed {
             let _ = self.set_x11_frame_geometry(window_id, target_geometry);
             self.set_surface_placement_with_cause(
@@ -135,16 +140,19 @@ impl CompositorState {
                 target_geometry.placement,
                 RenderGenerationCause::WindowMode,
             );
+            if instant_maximize_during_window_open {
+                self.cancel_window_open_presentation_ownership(root_surface_id);
+            }
             self.install_x11_visual_geometry_with_transition(
                 root_surface_id,
                 target_geometry,
                 transition,
             );
-            if interaction_target.is_none() {
+            if interaction_target.is_none() && !instant_maximize_during_window_open {
                 self.retarget_window_open_after_mode_transition(
                     root_surface_id,
                     presentation,
-                    window_open_geometry_was_active,
+                    window_open_was_active,
                 );
             }
         }

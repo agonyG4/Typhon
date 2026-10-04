@@ -163,6 +163,7 @@ fn window_scale_commits_geometry_only_and_preserves_canonical_translucency() {
         .expect("test output identity");
 
     assert!(state.maybe_begin_window_open_animation(root_surface_id));
+    assert!(state.window_open_presentation_active(root_surface_id));
     assert_eq!(
         state.window(window_id).expect("test window").state.mode(),
         ToplevelMode::Normal
@@ -368,6 +369,7 @@ fn window_glide_with_existing_geometry_owner_adds_only_its_opacity_track() {
         .expect("existing Geometry transaction");
 
     assert!(state.maybe_begin_window_open_animation(root_surface_id));
+    assert!(state.window_open_presentation_active(root_surface_id));
 
     assert_eq!(
         state.presentation_animator.track_transaction(scene_node_id),
@@ -442,6 +444,11 @@ fn removing_a_window_during_window_scale_cancels_geometry_ownership() {
         .remove_desktop_window(window_id)
         .expect("remove window");
 
+    assert!(
+        !state
+            .window_open_presentation_ownership
+            .contains_key(&root_surface_id)
+    );
     assert!(!state.presentation_animator.has_track(scene_node_id));
     assert_eq!(state.presentation_animator.transaction_count(), 0);
 }

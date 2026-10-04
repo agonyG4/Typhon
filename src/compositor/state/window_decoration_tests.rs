@@ -165,6 +165,112 @@ fn acknowledge_test_xdg_configure(state: &mut CompositorState, surface_id: u32, 
     state.ack_xdg_surface_configure(surface_id, acknowledgement);
 }
 
+struct XdgWindowOpenFixture {
+    state: CompositorState,
+    _display: wayland_server::Display<CompositorState>,
+    _client: wayland_server::Client,
+    surface_id: u32,
+    scene_node_id: crate::core::SceneNodeId,
+}
+
+impl XdgWindowOpenFixture {
+    fn new(
+        surface_id: u32,
+        preset: AnimationPreset,
+        animate_maximized_window_open: bool,
+        canonical_opacity: Option<PresentationOpacity>,
+    ) -> Self {
+        let mut state = xdg_state(
+            test_surface(surface_id),
+            DecorationPreference::ServerSide,
+            ToplevelMode::Normal,
+        );
+        set_window_open_preset_with_maximized_policy(
+            &mut state,
+            preset,
+            animate_maximized_window_open,
+        );
+        state.set_test_effective_xdg_window_geometry(
+            surface_id,
+            XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+        );
+        state.xdg_surface_lifecycles.entry(surface_id).or_default();
+        let (display, client) = install_test_toplevel_role(&mut state, surface_id);
+        state.presentation_animator.set_enabled(true);
+        let window_id = state
+            .window_id_for_surface(surface_id)
+            .expect("test window");
+        if let Some(opacity) = canonical_opacity {
+            state
+                .window_mut(window_id)
+                .expect("test window")
+                .set_canonical_opacity(opacity);
+        }
+        let scene_node_id = state
+            .scene_node_id_for_window_group(window_id)
+            .expect("window group node");
+
+        Self {
+            state,
+            _display: display,
+            _client: client,
+            surface_id,
+            scene_node_id,
+        }
+    }
+
+    fn start_and_physically_present_intermediate_geometry(
+        &mut self,
+    ) -> (
+        crate::presentation_animation::PresentationTransactionMember,
+        crate::presentation_animation::PresentationRect,
+    ) {
+        assert!(
+            self.state
+                .maybe_begin_window_open_animation(self.surface_id)
+        );
+        let member = self
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                self.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            )
+            .expect("WindowOpen Geometry member");
+        let started_at = self
+            .state
+            .presentation_animator
+            .track_started_at_for_scene_node(self.scene_node_id)
+            .expect("WindowOpen start time");
+        let sample = self
+            .state
+            .presentation_animator
+            .sample_for_scene_node(
+                self.scene_node_id,
+                AnimationTime::from_nanos(started_at.as_nanos() + 80_000_000),
+            )
+            .expect("intermediate WindowOpen sample");
+        self.state.publish_presented_window_geometry(
+            1,
+            PresentedWindowGeometry::new(self.surface_id, sample.rect),
+        );
+        assert!(
+            self.state
+                .presented_window_geometry(self.surface_id)
+                .is_some()
+        );
+        assert_eq!(
+            self.state.presentation_animator.active_transaction_member(
+                self.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+            Some(member),
+            "intermediate physical presentation must not ACK the unsettled revision"
+        );
+        (member, sample.rect)
+    }
+}
+
 fn assert_unpresented_xdg_mode_admission_uses_window_open(
     surface_id: u32,
     mode: ToplevelMode,
@@ -278,14 +384,6 @@ fn assert_unpresented_xdg_mode_admission_uses_window_open(
         assert_eq!(
             state.current_visual_root_window_geometry(surface_id),
             Some(target_geometry)
-        );
-        assert_eq!(
-            state
-                .presentation_animator
-                .sample_for_scene_node(scene_node_id, AnimationTime::from_nanos(u64::MAX))
-                .expect("canonical scene sample")
-                .rect,
-            target_rect
         );
     }
 }
@@ -411,8 +509,7 @@ fn unpresented_xdg_normal_to_maximized_cancels_window_open_without_restarting_it
         .presentation_animator
         .track_transaction(scene_node_id)
         .expect("initial WindowOpen geometry transaction");
-    assert!(state.window_open_geometry_track_active(surface_id));
-    let transaction_count = state.presentation_animator.transaction_count();
+    assert!(state.window_open_presentation_active(surface_id));
     assert!(state.presented_window_geometry(surface_id).is_none());
 
     let maximized_geometry =
@@ -423,7 +520,7 @@ fn unpresented_xdg_normal_to_maximized_cancels_window_open_without_restarting_it
         state.window(window_id).expect("test window").state.mode(),
         ToplevelMode::Maximized
     );
-    assert!(!state.window_open_geometry_track_active(surface_id));
+    assert!(!state.window_open_presentation_active(surface_id));
     assert!(
         !state
             .presentation_animator
@@ -434,10 +531,7 @@ fn unpresented_xdg_normal_to_maximized_cancels_window_open_without_restarting_it
         state.presentation_animator.track_transaction(scene_node_id),
         None
     );
-    assert_eq!(
-        state.presentation_animator.transaction_count(),
-        transaction_count
-    );
+    assert_eq!(state.presentation_animator.transaction_count(), 0);
     assert_eq!(
         state.current_visual_root_window_geometry(surface_id),
         Some(maximized_geometry)
@@ -450,10 +544,7 @@ fn unpresented_xdg_normal_to_maximized_cancels_window_open_without_restarting_it
         canonical_opacity
     );
     assert!(!state.maybe_begin_window_open_animation(surface_id));
-    assert_eq!(
-        state.presentation_animator.transaction_count(),
-        transaction_count
-    );
+    assert_eq!(state.presentation_animator.transaction_count(), 0);
     assert_eq!(
         state.presentation_animator.track_transaction(scene_node_id),
         None
@@ -509,6 +600,852 @@ fn unpresented_xdg_fullscreen_then_normal_is_an_admission_correction() {
         state.current_visual_root_window_geometry(surface_id),
         Some(normal_geometry)
     );
+}
+
+#[test]
+fn presented_xdg_window_scale_is_settled_by_late_maximize_when_policy_is_off() {
+    let surface_id = 3_501;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    set_window_open_preset_with_maximized_policy(&mut state, AnimationPreset::Astrea, false);
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+
+    assert!(state.maybe_begin_window_open_animation(surface_id));
+    let open_member = state
+        .presentation_animator
+        .active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        )
+        .expect("WindowOpen Geometry member");
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("WindowOpen start time");
+    let intermediate = state
+        .presentation_animator
+        .sample_for_scene_node(
+            scene_node_id,
+            AnimationTime::from_nanos(started_at.as_nanos() + 90_000_000),
+        )
+        .expect("intermediate WindowOpen sample");
+    let maximized_geometry =
+        state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Maximized);
+    let maximized_rect = state
+        .presentation_rect_for_geometry(surface_id, maximized_geometry)
+        .expect("maximized target rect");
+    assert_ne!(intermediate.rect, maximized_rect);
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(surface_id, intermediate.rect),
+    );
+    assert!(state.presented_window_geometry(surface_id).is_some());
+    assert_eq!(
+        state.presentation_animator.active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        ),
+        Some(open_member),
+        "intermediate physical presentation must not ACK the unsettled WindowOpen revision"
+    );
+    assert!(state.window_open_presentation_active(surface_id));
+
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Maximized));
+
+    assert_eq!(
+        state.window(window_id).expect("test window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state.presentation_animator.active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        ),
+        None,
+        "late maximize should cancel WindowOpen Geometry without installing MaximizeEnter"
+    );
+    assert!(!state.presentation_animator.has_opacity_track(scene_node_id));
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(maximized_geometry)
+    );
+}
+
+#[test]
+fn presented_xdg_window_glide_is_cancelled_on_late_maximize_and_restores_canonical_opacity() {
+    let canonical_opacity = PresentationOpacity::new(0.42).expect("canonical opacity");
+    let mut fixture = XdgWindowOpenFixture::new(
+        3_502,
+        AnimationPreset::Macos,
+        false,
+        Some(canonical_opacity),
+    );
+    let (open_geometry, _) = fixture.start_and_physically_present_intermediate_geometry();
+    assert!(
+        fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    let open_opacity = fixture
+        .state
+        .presentation_animator
+        .active_transaction_member(
+            fixture.scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Opacity,
+        )
+        .expect("WindowOpen Opacity member");
+    assert_eq!(
+        open_geometry.transaction_id(),
+        open_opacity.transaction_id()
+    );
+    let start_time = fixture
+        .state
+        .presentation_animator
+        .track_started_at_for_scene_node(fixture.scene_node_id)
+        .expect("WindowGlide start time");
+    let intermediate_time = AnimationTime::from_nanos(start_time.as_nanos() + 80_000_000);
+    let maximized_geometry = fixture
+        .state
+        .window_geometry_for_surface_mode(fixture.surface_id, ToplevelMode::Maximized);
+
+    assert!(
+        fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        None
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Opacity,
+            ),
+        None,
+        "both exact WindowOpen members must be retired"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        None,
+        "late maximize with policy Off must not install MaximizeEnter"
+    );
+    assert!(
+        !fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    assert_eq!(
+        fixture
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(maximized_geometry)
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_scene_sample_at(intermediate_time)
+            .opacity_for_scene_node(fixture.scene_node_id),
+        canonical_opacity,
+        "cancelling Glide Opacity must immediately expose canonical opacity"
+    );
+}
+
+#[test]
+fn opacity_only_window_glide_ownership_suppresses_late_maximize_without_claiming_geometry() {
+    let canonical_opacity = PresentationOpacity::new(0.42).expect("canonical opacity");
+    let mut fixture = XdgWindowOpenFixture::new(
+        3_503,
+        AnimationPreset::Macos,
+        false,
+        Some(canonical_opacity),
+    );
+    let target = fixture
+        .state
+        .current_presentation_rect_for_root(fixture.surface_id)
+        .expect("canonical presentation rect");
+    let unrelated_start = crate::presentation_animation::PresentationRect::new(
+        target.x() - 40.0,
+        target.y(),
+        target.width(),
+        target.height(),
+    )
+    .expect("unrelated geometry start");
+    let unrelated_transaction = fixture
+        .state
+        .presentation_animator
+        .commit(
+            crate::presentation_animation::PresentationTransactionRequest::geometry(
+                AnimationTime::monotonic_now().expect("monotonic time"),
+                vec![
+                    crate::presentation_animation::PresentationGeometryMutation::new(
+                        fixture.scene_node_id,
+                        unrelated_start,
+                        target,
+                        crate::presentation_animation::AnimationCurve::easing(
+                            std::time::Duration::from_millis(400),
+                            crate::presentation_animation::EasingCurve::Linear,
+                        ),
+                    ),
+                ],
+            ),
+        )
+        .expect("unrelated Geometry transaction");
+    let unrelated_member = unrelated_transaction.members()[0];
+
+    assert!(
+        fixture
+            .state
+            .maybe_begin_window_open_animation(fixture.surface_id)
+    );
+
+    let open_opacity = fixture
+        .state
+        .presentation_animator
+        .active_transaction_member(
+            fixture.scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Opacity,
+        )
+        .expect("opacity-only WindowOpen member");
+    assert_ne!(
+        open_opacity.transaction_id(),
+        unrelated_member.transaction_id()
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        Some(unrelated_member),
+        "WindowGlide fallback must preserve the unrelated Geometry owner"
+    );
+    assert!(
+        fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    let started_at = fixture
+        .state
+        .presentation_animator
+        .track_started_at_for_scene_node(fixture.scene_node_id)
+        .expect("unrelated Geometry start time");
+    let intermediate_time = AnimationTime::from_nanos(started_at.as_nanos() + 80_000_000);
+    let intermediate = fixture
+        .state
+        .presentation_animator
+        .sample_for_scene_node(fixture.scene_node_id, intermediate_time)
+        .expect("intermediate Geometry sample");
+    fixture.state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(fixture.surface_id, intermediate.rect),
+    );
+
+    let maximized_geometry = fixture
+        .state
+        .window_geometry_for_surface_mode(fixture.surface_id, ToplevelMode::Maximized);
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Opacity,
+            ),
+        None,
+        "exact WindowOpen Opacity ownership must be cancelled"
+    );
+    assert!(
+        !fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        None,
+        "policy Off must use the canonical immediate maximized visual"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(maximized_geometry)
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_scene_sample_at(intermediate_time)
+            .opacity_for_scene_node(fixture.scene_node_id),
+        canonical_opacity
+    );
+}
+
+#[test]
+fn maximized_window_open_policy_on_keeps_presented_late_maximize_animation() {
+    let mut fixture = XdgWindowOpenFixture::new(3_504, AnimationPreset::Astrea, true, None);
+    let (open_geometry, _) = fixture.start_and_physically_present_intermediate_geometry();
+    let maximize_curve = fixture
+        .state
+        .presentation_animation_policy
+        .curve_for(crate::compositor::PresentationAnimationKind::MaximizeEnter);
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_ne!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        Some(open_geometry)
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        Some(maximize_curve),
+        "policy On retains the existing MaximizeEnter behavior"
+    );
+}
+
+#[test]
+fn physically_acked_window_scale_is_settled_before_later_maximize() {
+    let mut fixture = XdgWindowOpenFixture::new(3_505, AnimationPreset::Astrea, false, None);
+    assert!(
+        fixture
+            .state
+            .maybe_begin_window_open_animation(fixture.surface_id)
+    );
+    let open_geometry = fixture
+        .state
+        .presentation_animator
+        .active_transaction_member(
+            fixture.scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        )
+        .expect("WindowOpen Geometry member");
+    let started_at = fixture
+        .state
+        .presentation_animator
+        .track_started_at_for_scene_node(fixture.scene_node_id)
+        .expect("WindowOpen start time");
+    let intermediate_rect = fixture
+        .state
+        .presentation_animator
+        .sample_for_scene_node(
+            fixture.scene_node_id,
+            AnimationTime::from_nanos(started_at.as_nanos() + 80_000_000),
+        )
+        .expect("intermediate WindowOpen sample")
+        .rect;
+    fixture.state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(fixture.surface_id, intermediate_rect),
+    );
+    let settled_rect = fixture
+        .state
+        .presentation_animator
+        .sample_for_scene_node(fixture.scene_node_id, AnimationTime::from_nanos(u64::MAX))
+        .expect("mathematically settled WindowOpen sample")
+        .rect;
+    fixture.state.publish_presented_window_geometry(
+        2,
+        PresentedWindowGeometry::new(fixture.surface_id, settled_rect),
+    );
+    assert!(
+        fixture
+            .state
+            .presented_window_geometry(fixture.surface_id)
+            .is_some()
+    );
+    let output_id = fixture
+        .state
+        .ensure_native_output_id()
+        .expect("test output identity");
+    assert!(
+        fixture
+            .state
+            .presentation_animator
+            .acknowledge_presented_geometry(
+                output_id,
+                crate::presentation_animation::PresentedGeometryAck {
+                    output_id,
+                    scene_node_id: fixture.scene_node_id,
+                    property: crate::presentation_animation::PresentationPropertyKind::Geometry,
+                    transaction_id: open_geometry.transaction_id(),
+                    revision_id: open_geometry.revision_id(),
+                    presented_rect: settled_rect,
+                },
+            )
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        None
+    );
+    assert!(
+        !fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    let maximize_curve = fixture
+        .state
+        .presentation_animation_policy
+        .curve_for(crate::compositor::PresentationAnimationKind::MaximizeEnter);
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        Some(maximize_curve),
+        "fully ACKed WindowOpen must not suppress a later MaximizeEnter"
+    );
+}
+
+#[test]
+fn mathematically_settled_but_unacked_window_scale_still_suppresses_late_maximize() {
+    let mut fixture = XdgWindowOpenFixture::new(3_506, AnimationPreset::Astrea, false, None);
+    assert!(
+        fixture
+            .state
+            .maybe_begin_window_open_animation(fixture.surface_id)
+    );
+    let open_geometry = fixture
+        .state
+        .presentation_animator
+        .active_transaction_member(
+            fixture.scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        )
+        .expect("WindowOpen Geometry member");
+    let started_at = fixture
+        .state
+        .presentation_animator
+        .track_started_at_for_scene_node(fixture.scene_node_id)
+        .expect("WindowOpen start time");
+    let intermediate_rect = fixture
+        .state
+        .presentation_animator
+        .sample_for_scene_node(
+            fixture.scene_node_id,
+            AnimationTime::from_nanos(started_at.as_nanos() + 80_000_000),
+        )
+        .expect("intermediate WindowOpen sample")
+        .rect;
+    fixture.state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(fixture.surface_id, intermediate_rect),
+    );
+    let settled_sample = fixture
+        .state
+        .presentation_animator
+        .sample_for_scene_node(fixture.scene_node_id, AnimationTime::from_nanos(u64::MAX))
+        .expect("mathematically settled sample");
+    assert!(settled_sample.mathematically_settled);
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        Some(open_geometry),
+        "mathematical settlement without the exact ACK remains active"
+    );
+    assert!(
+        fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    let maximized_geometry = fixture
+        .state
+        .window_geometry_for_surface_mode(fixture.surface_id, ToplevelMode::Maximized);
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        None,
+        "only the physical exact-revision ACK settles WindowOpen"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(maximized_geometry)
+    );
+}
+
+#[test]
+fn unrelated_geometry_track_is_not_window_open_ownership() {
+    let mut fixture = XdgWindowOpenFixture::new(3_507, AnimationPreset::Astrea, false, None);
+    let target = fixture
+        .state
+        .current_presentation_rect_for_root(fixture.surface_id)
+        .expect("canonical presentation rect");
+    let start = crate::presentation_animation::PresentationRect::new(
+        target.x() - 40.0,
+        target.y(),
+        target.width(),
+        target.height(),
+    )
+    .expect("unrelated Geometry start");
+    fixture
+        .state
+        .presentation_animator
+        .commit(
+            crate::presentation_animation::PresentationTransactionRequest::geometry(
+                AnimationTime::monotonic_now().expect("monotonic time"),
+                vec![
+                    crate::presentation_animation::PresentationGeometryMutation::new(
+                        fixture.scene_node_id,
+                        start,
+                        target,
+                        crate::presentation_animation::AnimationCurve::easing(
+                            std::time::Duration::from_millis(400),
+                            crate::presentation_animation::EasingCurve::Linear,
+                        ),
+                    ),
+                ],
+            ),
+        )
+        .expect("unrelated Geometry transaction");
+
+    assert!(
+        fixture
+            .state
+            .presentation_animator
+            .has_geometry_track(fixture.scene_node_id)
+    );
+    assert!(
+        !fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id),
+        "a generic Geometry track must not be called WindowOpen"
+    );
+    let maximize_curve = fixture
+        .state
+        .presentation_animation_policy
+        .curve_for(crate::compositor::PresentationAnimationKind::MaximizeEnter);
+    fixture.state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(fixture.surface_id, start),
+    );
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        Some(maximize_curve)
+    );
+}
+
+#[test]
+fn stale_superseded_window_scale_member_does_not_suppress_late_maximize() {
+    let mut fixture = XdgWindowOpenFixture::new(3_508, AnimationPreset::Astrea, false, None);
+    let (open_geometry, _) = fixture.start_and_physically_present_intermediate_geometry();
+    let target = fixture
+        .state
+        .current_presentation_rect_for_root(fixture.surface_id)
+        .expect("canonical presentation rect");
+    let replacement_start = crate::presentation_animation::PresentationRect::new(
+        target.x() - 60.0,
+        target.y(),
+        target.width(),
+        target.height(),
+    )
+    .expect("replacement Geometry start");
+    let replacement = fixture
+        .state
+        .presentation_animator
+        .commit(
+            crate::presentation_animation::PresentationTransactionRequest::geometry(
+                AnimationTime::monotonic_now().expect("monotonic time"),
+                vec![
+                    crate::presentation_animation::PresentationGeometryMutation::new(
+                        fixture.scene_node_id,
+                        replacement_start,
+                        target,
+                        crate::presentation_animation::AnimationCurve::easing(
+                            std::time::Duration::from_millis(400),
+                            crate::presentation_animation::EasingCurve::Linear,
+                        ),
+                    ),
+                ],
+            ),
+        )
+        .expect("replacement Geometry transaction");
+    let replacement_member = replacement.members()[0];
+    assert_ne!(Some(replacement_member), Some(open_geometry));
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        Some(replacement_member)
+    );
+    assert!(
+        !fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id),
+        "the stored WindowOpen revision is stale even though Geometry remains active"
+    );
+    let maximize_curve = fixture
+        .state
+        .presentation_animation_policy
+        .curve_for(crate::compositor::PresentationAnimationKind::MaximizeEnter);
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        Some(maximize_curve),
+        "a stale WindowOpen identity must not cancel or replace a newer owner"
+    );
+}
+
+#[test]
+fn superseded_glide_geometry_keeps_window_open_active_through_exact_opacity() {
+    let mut fixture = XdgWindowOpenFixture::new(3_509, AnimationPreset::Macos, false, None);
+    let (open_geometry, _) = fixture.start_and_physically_present_intermediate_geometry();
+    let open_opacity = fixture
+        .state
+        .presentation_animator
+        .active_transaction_member(
+            fixture.scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Opacity,
+        )
+        .expect("WindowOpen Opacity member");
+    let target = fixture
+        .state
+        .current_presentation_rect_for_root(fixture.surface_id)
+        .expect("canonical presentation rect");
+    let replacement = fixture
+        .state
+        .presentation_animator
+        .commit(
+            crate::presentation_animation::PresentationTransactionRequest::geometry(
+                AnimationTime::monotonic_now().expect("monotonic time"),
+                vec![
+                    crate::presentation_animation::PresentationGeometryMutation::new(
+                        fixture.scene_node_id,
+                        crate::presentation_animation::PresentationRect::new(
+                            target.x() - 60.0,
+                            target.y(),
+                            target.width(),
+                            target.height(),
+                        )
+                        .expect("replacement Geometry start"),
+                        target,
+                        crate::presentation_animation::AnimationCurve::easing(
+                            std::time::Duration::from_millis(400),
+                            crate::presentation_animation::EasingCurve::Linear,
+                        ),
+                    ),
+                ],
+            ),
+        )
+        .expect("replacement Geometry transaction");
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Opacity,
+            ),
+        Some(open_opacity)
+    );
+    assert_ne!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        Some(open_geometry)
+    );
+    assert!(
+        fixture
+            .state
+            .window_open_presentation_active(fixture.surface_id)
+    );
+    let maximized_geometry = fixture
+        .state
+        .window_geometry_for_surface_mode(fixture.surface_id, ToplevelMode::Maximized);
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Maximized)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Opacity,
+            ),
+        None,
+        "the still-exact WindowOpen Opacity member must be cancelled"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        None
+    );
+    assert_eq!(
+        fixture
+            .state
+            .current_visual_root_window_geometry(fixture.surface_id),
+        Some(maximized_geometry)
+    );
+    assert_ne!(replacement.members()[0], open_geometry);
+}
+
+#[test]
+fn presented_window_open_does_not_suppress_xdg_fullscreen_enter() {
+    let mut fixture = XdgWindowOpenFixture::new(3_510, AnimationPreset::Astrea, false, None);
+    let _ = fixture.start_and_physically_present_intermediate_geometry();
+    let fullscreen_curve = fixture
+        .state
+        .presentation_animation_policy
+        .curve_for(crate::compositor::PresentationAnimationKind::FullscreenEnter);
+
+    assert!(
+        fixture
+            .state
+            .set_root_window_mode(fixture.surface_id, ToplevelMode::Fullscreen)
+    );
+
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .track_curve(fixture.scene_node_id),
+        Some(fullscreen_curve),
+        "the maximized-open policy does not apply to FullscreenEnter"
+    );
+}
+
+#[test]
+fn xdg_unmap_retires_window_open_presentation_members() {
+    let mut fixture = XdgWindowOpenFixture::new(3_512, AnimationPreset::Astrea, false, None);
+    let _ = fixture.start_and_physically_present_intermediate_geometry();
+
+    assert!(fixture.state.unmap_xdg_role_surfaces(fixture.surface_id));
+
+    assert!(
+        !fixture
+            .state
+            .window_open_presentation_ownership
+            .contains_key(&fixture.surface_id)
+    );
+    assert_eq!(
+        fixture
+            .state
+            .presentation_animator
+            .active_transaction_member(
+                fixture.scene_node_id,
+                crate::presentation_animation::PresentationPropertyKind::Geometry,
+            ),
+        None,
+        "unmapped XDG WindowOpen identity must not survive for a later map"
+    );
+    assert_eq!(fixture.state.presentation_animator.transaction_count(), 0);
 }
 
 #[test]

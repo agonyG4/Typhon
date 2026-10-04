@@ -1371,6 +1371,7 @@ impl CompositorState {
     pub(in crate::compositor) fn unmap_xdg_role_surfaces(&mut self, surface_id: u32) -> bool {
         if self.root_surface_id_for_surface(surface_id) == surface_id {
             self.cancel_pending_normal_restore(surface_id, "root_unmapped");
+            self.cancel_window_open_presentation_ownership(surface_id);
         }
         let renderable_ids = self
             .renderable_surfaces

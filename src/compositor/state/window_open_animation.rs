@@ -2,8 +2,8 @@ use super::*;
 use crate::animation_control::{AnimationEffect, AnimationSlot, scale_curve};
 use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationGeometryMutation, PresentationOpacity,
-    PresentationOpacityMutation, PresentationRect, PresentationRetainedVisualKind,
-    PresentationTransactionRequest,
+    PresentationOpacityMutation, PresentationPropertyKind, PresentationRect,
+    PresentationRetainedVisualKind, PresentationTransactionMember, PresentationTransactionRequest,
 };
 use std::time::Duration;
 
@@ -94,26 +94,105 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn window_open_geometry_track_active(
+    pub(in crate::compositor) fn window_open_presentation_activity(
+        &self,
+        root_surface_id: u32,
+    ) -> WindowOpenPresentationActivity {
+        let Some(ownership) = self
+            .window_open_presentation_ownership
+            .get(&root_surface_id)
+        else {
+            return WindowOpenPresentationActivity::default();
+        };
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return WindowOpenPresentationActivity::default();
+        };
+        if self
+            .window(window_id)
+            .is_none_or(|window| window.root_surface_id != root_surface_id)
+            || self.scene_node_id_for_window_group(window_id) != Some(ownership.scene_node_id)
+        {
+            return WindowOpenPresentationActivity::default();
+        }
+
+        let member_is_exact = |member: Option<PresentationTransactionMember>, property| {
+            member.is_some_and(|expected| {
+                expected.scene_node_id() == ownership.scene_node_id
+                    && expected.property() == Some(property)
+                    && self
+                        .presentation_animator
+                        .active_transaction_member(ownership.scene_node_id, property)
+                        == Some(expected)
+            })
+        };
+
+        WindowOpenPresentationActivity {
+            geometry_exact: member_is_exact(ownership.geometry, PresentationPropertyKind::Geometry),
+            opacity_exact: member_is_exact(ownership.opacity, PresentationPropertyKind::Opacity),
+        }
+    }
+
+    pub(in crate::compositor) fn window_open_presentation_active(
         &self,
         root_surface_id: u32,
     ) -> bool {
-        self.window_id_for_surface(root_surface_id)
-            .and_then(|window_id| self.scene_node_id_for_window_group(window_id))
-            .is_some_and(|scene_node_id| {
-                self.presentation_animator.has_geometry_track(scene_node_id)
-            })
+        self.window_open_presentation_activity(root_surface_id)
+            .is_active()
+    }
+
+    pub(in crate::compositor) fn suppress_maximize_animation_for_active_window_open(
+        &self,
+        root_surface_id: u32,
+        target_mode: ToplevelMode,
+    ) -> bool {
+        target_mode == ToplevelMode::Maximized
+            && !self
+                .animation_control
+                .configuration()
+                .animate_maximized_window_open
+            && self.window_open_presentation_active(root_surface_id)
+    }
+
+    pub(in crate::compositor) fn cancel_window_open_presentation_ownership(
+        &mut self,
+        root_surface_id: u32,
+    ) {
+        let Some(ownership) = self
+            .window_open_presentation_ownership
+            .remove(&root_surface_id)
+        else {
+            return;
+        };
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return;
+        };
+        if self
+            .window(window_id)
+            .is_none_or(|window| window.root_surface_id != root_surface_id)
+            || self.scene_node_id_for_window_group(window_id) != Some(ownership.scene_node_id)
+        {
+            return;
+        }
+
+        if let Some(member) = ownership.geometry {
+            self.presentation_animator
+                .cancel_presentation_member_exact(member);
+        }
+        if let Some(member) = ownership.opacity {
+            self.presentation_animator
+                .cancel_presentation_member_exact(member);
+        }
     }
 
     pub(in crate::compositor) fn retarget_window_open_after_mode_transition(
         &mut self,
         root_surface_id: u32,
         presentation: ModeTransitionPresentation,
-        geometry_track_was_active: bool,
+        window_open_was_active: bool,
     ) {
         if presentation != ModeTransitionPresentation::Unpresented
-            || !geometry_track_was_active
-            || self.window_open_geometry_track_active(root_surface_id)
+            || !window_open_was_active
+            || self.window_open_presentation_active(root_surface_id)
         {
             return;
         }
@@ -132,17 +211,19 @@ impl CompositorState {
         {
             return;
         }
-        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
-            return;
-        };
-        let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
-            return;
-        };
-        if !self.presentation_animator.has_geometry_track(scene_node_id) {
+        let activity = self.window_open_presentation_activity(root_surface_id);
+        if !activity.geometry_exact {
             return;
         }
 
-        self.presentation_animator.cancel_geometry(scene_node_id);
+        if let Some(member) = self
+            .window_open_presentation_ownership
+            .get(&root_surface_id)
+            .and_then(|ownership| ownership.geometry)
+        {
+            self.presentation_animator
+                .cancel_presentation_member_exact(member);
+        }
         self.begin_window_open_animation_after_surface_tree_publication(root_surface_id);
     }
 
@@ -259,6 +340,29 @@ impl CompositorState {
             (true, None) => return false,
         };
 
-        self.presentation_animator.commit(request).is_ok()
+        let Ok(transaction) = self.presentation_animator.commit(request) else {
+            return false;
+        };
+        let mut ownership = WindowOpenPresentationOwnership {
+            scene_node_id,
+            geometry: None,
+            opacity: None,
+        };
+        for member in transaction.members().iter().copied() {
+            if member.scene_node_id() != scene_node_id {
+                continue;
+            }
+            match member.property() {
+                Some(PresentationPropertyKind::Geometry) => ownership.geometry = Some(member),
+                Some(PresentationPropertyKind::Opacity) => ownership.opacity = Some(member),
+                Some(PresentationPropertyKind::Clip) | None => {}
+            }
+        }
+        if ownership.geometry.is_none() && ownership.opacity.is_none() {
+            return false;
+        }
+        self.window_open_presentation_ownership
+            .insert(root_surface_id, ownership);
+        true
     }
 }

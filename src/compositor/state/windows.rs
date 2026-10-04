@@ -67,8 +67,19 @@ impl CompositorState {
         let geometry_revision = geometry_member.map(|member| member.revision_id());
         let opacity_transaction = opacity_member.map(|member| member.transaction_id());
         let opacity_revision = opacity_member.map(|member| member.revision_id());
-        let window_open_geometry_track_candidate =
-            self.window_open_geometry_track_active(root_surface_id);
+        let window_open_activity = self.window_open_presentation_activity(root_surface_id);
+        let maximized_open_policy = self
+            .animation_control
+            .configuration()
+            .animate_maximized_window_open;
+        let mode_transition_policy = if requested_mode == ToplevelMode::Maximized
+            && !maximized_open_policy
+            && window_open_activity.is_active()
+        {
+            "window_open_instant_maximize"
+        } else {
+            "ordinary"
+        };
         let previous_mode = window.map(|window| window.state.mode());
         let app_id = window
             .and_then(|window| window.metadata.app_id.as_deref())
@@ -78,8 +89,11 @@ impl CompositorState {
             .unwrap_or("<unknown>");
 
         eprintln!(
-            "oblivion-one compositor: event=window_mode_request root_surface_id={root_surface_id} window_id={window_id:?} app_id={app_id:?} title={title:?} source={} previous_mode={previous_mode:?} requested_mode={requested_mode:?} presented={presented} window_open_active=untracked window_open_geometry_track_candidate={window_open_geometry_track_candidate} geometry_transaction={geometry_transaction:?} geometry_revision={geometry_revision:?} opacity_transaction={opacity_transaction:?} opacity_revision={opacity_revision:?} canonical_geometry={:?} visual_geometry={:?} target_geometry={target_geometry:?}",
+            "oblivion-one compositor: event=window_mode_request root_surface_id={root_surface_id} window_id={window_id:?} app_id={app_id:?} title={title:?} source={} previous_mode={previous_mode:?} requested_mode={requested_mode:?} presented={presented} window_open_active={} window_open_geometry_exact={} window_open_opacity_exact={} maximized_open_policy={maximized_open_policy} mode_transition_policy={mode_transition_policy} geometry_transaction={geometry_transaction:?} geometry_revision={geometry_revision:?} opacity_transaction={opacity_transaction:?} opacity_revision={opacity_revision:?} canonical_geometry={:?} visual_geometry={:?} target_geometry={target_geometry:?}",
             source.label(),
+            window_open_activity.is_active(),
+            window_open_activity.geometry_exact,
+            window_open_activity.opacity_exact,
             self.current_root_window_geometry(root_surface_id),
             self.current_visual_root_window_geometry(root_surface_id),
         );
@@ -1863,7 +1877,9 @@ impl CompositorState {
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
         let presentation = self.mode_transition_presentation(surface_id);
-        let window_open_geometry_was_active = self.window_open_geometry_track_active(surface_id);
+        let window_open_was_active = self.window_open_presentation_active(surface_id);
+        let instant_maximize_during_window_open =
+            self.suppress_maximize_animation_for_active_window_open(surface_id, mode);
         let observed_normal_geometry =
             self.observed_normal_restore_geometry(surface_id, source_geometry.placement);
         self.clear_resize_state_for_surfaces_with_reason(
@@ -1910,18 +1926,27 @@ impl CompositorState {
             geometry.placement,
             RenderGenerationCause::WindowMode,
         );
-        let transition = mode_visual_transition(presentation, previous_mode, mode, source_geometry);
+        let transition = if instant_maximize_during_window_open {
+            VisualGeometryTransition::Immediate
+        } else {
+            mode_visual_transition(presentation, previous_mode, mode, source_geometry)
+        };
+        if instant_maximize_during_window_open {
+            self.cancel_window_open_presentation_ownership(surface_id);
+        }
         self.install_xdg_mode_transition_visual_geometry(
             surface_id,
             geometry,
             transition,
             configure_serial,
         );
-        self.retarget_window_open_after_mode_transition(
-            surface_id,
-            presentation,
-            window_open_geometry_was_active,
-        );
+        if !instant_maximize_during_window_open {
+            self.retarget_window_open_after_mode_transition(
+                surface_id,
+                presentation,
+                window_open_was_active,
+            );
+        }
         configured
     }
 
@@ -1987,7 +2012,7 @@ impl CompositorState {
             .map(|window| window.state.mode())
             .unwrap_or(ToplevelMode::Normal);
         let presentation = self.mode_transition_presentation(surface_id);
-        let window_open_geometry_was_active = self.window_open_geometry_track_active(surface_id);
+        let window_open_was_active = self.window_open_presentation_active(surface_id);
         let source_geometry = self
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))
@@ -2082,7 +2107,7 @@ impl CompositorState {
                     self.retarget_window_open_after_mode_transition(
                         surface_id,
                         presentation,
-                        window_open_geometry_was_active,
+                        window_open_was_active,
                     );
                 }
                 if configured && let Some(window) = self.toplevel_window_state_mut(surface_id) {
