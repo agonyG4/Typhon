@@ -145,6 +145,7 @@ mod tests {
                     configuration.enabled,
                     AnimationRuntimeCapabilities {
                         lamp_renderer: true,
+                        squash_renderer: true,
                     },
                 )
                 .id()
@@ -161,6 +162,7 @@ mod tests {
             catalog: AnimationCatalogSnapshot::for_runtime_capabilities(
                 AnimationRuntimeCapabilities {
                     lamp_renderer: true,
+                    squash_renderer: true,
                 },
             ),
         };

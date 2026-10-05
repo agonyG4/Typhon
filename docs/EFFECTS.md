@@ -109,6 +109,34 @@ preferred shader-copy path while retaining the no-sampleable-output fallback.
 When unset, the production default is the same shader-copy preference. Invalid
 values emit the existing bounded warning and use that production default.
 
+## Retained window lifecycle effects
+
+`window.minimize` and `window.restore` use the retained lifecycle owner for
+Lamp and Squash. The owner freezes the presented client geometry, retained
+surface presentation snapshot, server-side decoration snapshot, and any
+resolved owned-effect visual source. A reversal transfers that same payload to
+a new exact presentation identity, keeps the active effect family, and starts
+from the current semantic progress. Ownership retires only after the matching
+retained identity is represented in a rendered frame and acknowledged by
+physical presentation. Restore samples suppress the canonical live root until
+that acknowledgement.
+
+Squash maps semantic progress `p` from normal (`0`) to minimized (`1`) and uses
+`q = clamp(p, 0, 1)^3`. The presented client rectangle is the component-wise
+linear interpolation from the retained presented client rectangle to the
+taskbar or dock icon rectangle by `q`; opacity is canonical opacity multiplied
+by `1 - q`. Restore reverses the same progress and mapping, which yields an
+OutCubic visual recovery. The complete retained visual, including subsurfaces,
+frozen SSD, and a frozen resolved-effect source, receives that same affine
+transform. Squash draws retained primitives as textured quads and does not use
+Lamp's nonlinear mesh. Its base duration is 250 ms before global speed scaling.
+
+The animation catalog advertises `minimize.squash` only when the active GLES
+renderer has qualified its textured lifecycle path. The KDE preset selects
+Squash for minimize and restore; Astrea continues to select Lamp. If no valid
+taskbar or dock anchor is available, Squash admission fails and the window
+follows the existing immediate lifecycle fallback.
+
 ## Color and alpha
 
 Captured output is decoded from output-encoded sRGB once at the first effect

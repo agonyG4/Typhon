@@ -23,6 +23,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnimationRuntimeCapabilities {
     pub lamp_renderer: bool,
+    pub squash_renderer: bool,
 }
 
 use crate::presentation_animation::{AnimationCurve, SpringSpec};
@@ -303,6 +304,7 @@ mod tests {
         );
         let available = state.snapshot(AnimationRuntimeCapabilities {
             lamp_renderer: true,
+            squash_renderer: false,
         });
         assert_eq!(available.requested["window.minimize"], "minimize.lamp");
         assert_eq!(available.effective["window.minimize"], "minimize.lamp");
@@ -347,6 +349,7 @@ mod tests {
                 lamp.clone(),
                 AnimationRuntimeCapabilities {
                     lamp_renderer: true,
+                    squash_renderer: false,
                 },
             )
             .unwrap();

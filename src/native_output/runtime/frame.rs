@@ -268,7 +268,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let lifecycle_decorations =
             server.lifecycle_decoration_render_instances(&lifecycle, &lifecycle_surfaces);
         let restore_suppressed_roots = lifecycle
-            .lamps
+            .samples
             .iter()
             .filter(|lamp| {
                 lamp.direction

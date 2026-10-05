@@ -123,6 +123,7 @@ impl AnimationEffect {
                 | Self::WindowScale
                 | Self::WindowGlide
                 | Self::MinimizeLamp
+                | Self::MinimizeSquash
         )
     }
 
@@ -136,6 +137,10 @@ impl AnimationEffect {
             Self::WindowScale | Self::WindowGlide => {
                 matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
             }
+            Self::MinimizeLamp | Self::MinimizeSquash => matches!(
+                slot,
+                AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore
+            ),
             _ => self.is_available(),
         }
     }
@@ -152,11 +157,15 @@ impl AnimationEffect {
         self,
         runtime_capabilities: super::AnimationRuntimeCapabilities,
     ) -> &'static str {
+        match self {
+            Self::MinimizeLamp if !runtime_capabilities.lamp_renderer => return "unavailable",
+            Self::MinimizeSquash if !runtime_capabilities.squash_renderer => {
+                return "unavailable";
+            }
+            _ => {}
+        }
         if !self.is_available() {
             return "planned";
-        }
-        if matches!(self, Self::MinimizeLamp) && !runtime_capabilities.lamp_renderer {
-            return "unavailable";
         }
         "available"
     }
@@ -166,7 +175,11 @@ impl AnimationEffect {
         runtime_capabilities: super::AnimationRuntimeCapabilities,
     ) -> bool {
         self.is_available()
-            && (!matches!(self, Self::MinimizeLamp) || runtime_capabilities.lamp_renderer)
+            && match self {
+                Self::MinimizeLamp => runtime_capabilities.lamp_renderer,
+                Self::MinimizeSquash => runtime_capabilities.squash_renderer,
+                _ => true,
+            }
     }
 
     pub const fn is_executable_for(
@@ -175,7 +188,11 @@ impl AnimationEffect {
         runtime_capabilities: super::AnimationRuntimeCapabilities,
     ) -> bool {
         self.is_available_for_slot(slot)
-            && (!matches!(self, Self::MinimizeLamp) || runtime_capabilities.lamp_renderer)
+            && match self {
+                Self::MinimizeLamp => runtime_capabilities.lamp_renderer,
+                Self::MinimizeSquash => runtime_capabilities.squash_renderer,
+                _ => true,
+            }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -244,6 +261,9 @@ impl AnimationPreset {
             (Self::Astrea, AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore) => {
                 AnimationEffect::MinimizeLamp
             }
+            (Self::Kde, AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore) => {
+                AnimationEffect::MinimizeSquash
+            }
             (
                 Self::Macos,
                 AnimationSlot::WindowMove
@@ -292,6 +312,7 @@ mod tests {
     fn astrea_resolves_lamp_for_minimize_and_restore() {
         let capabilities = super::super::AnimationRuntimeCapabilities {
             lamp_renderer: true,
+            squash_renderer: false,
         };
         for slot in [AnimationSlot::WindowMinimize, AnimationSlot::WindowRestore] {
             let requested = AnimationPreset::Astrea.requested_effect(slot);
@@ -301,6 +322,66 @@ mod tests {
                 AnimationEffect::MinimizeLamp
             );
         }
+    }
+
+    #[test]
+    fn kde_resolves_squash_for_minimize_and_restore() {
+        for slot in [AnimationSlot::WindowMinimize, AnimationSlot::WindowRestore] {
+            assert_eq!(
+                AnimationPreset::Kde.requested_effect(slot),
+                AnimationEffect::MinimizeSquash
+            );
+        }
+    }
+
+    #[test]
+    fn squash_is_unavailable_without_its_qualified_renderer() {
+        let capabilities = super::super::AnimationRuntimeCapabilities {
+            lamp_renderer: true,
+            squash_renderer: false,
+        };
+
+        assert_eq!(
+            AnimationEffect::MinimizeSquash.availability_for_runtime(capabilities),
+            "unavailable"
+        );
+        assert!(
+            !AnimationEffect::MinimizeSquash
+                .is_executable_for(AnimationSlot::WindowMinimize, capabilities,)
+        );
+        assert!(
+            AnimationEffect::MinimizeLamp
+                .is_executable_for(AnimationSlot::WindowMinimize, capabilities,)
+        );
+    }
+
+    #[test]
+    fn squash_is_available_only_for_its_lifecycle_slots() {
+        let capabilities = super::super::AnimationRuntimeCapabilities {
+            lamp_renderer: false,
+            squash_renderer: true,
+        };
+
+        assert_eq!(
+            AnimationEffect::MinimizeSquash.availability_for_runtime(capabilities),
+            "available"
+        );
+        assert!(
+            AnimationEffect::MinimizeSquash
+                .is_executable_for(AnimationSlot::WindowMinimize, capabilities,)
+        );
+        assert!(
+            AnimationEffect::MinimizeSquash
+                .is_executable_for(AnimationSlot::WindowRestore, capabilities,)
+        );
+        assert!(
+            !AnimationEffect::MinimizeSquash
+                .is_executable_for(AnimationSlot::WindowOpen, capabilities,)
+        );
+        assert!(
+            !AnimationEffect::MinimizeLamp
+                .is_executable_for(AnimationSlot::WindowMinimize, capabilities,)
+        );
     }
 
     #[test]
@@ -318,6 +399,7 @@ mod tests {
         assert_eq!(
             requested.availability_for_runtime(super::super::AnimationRuntimeCapabilities {
                 lamp_renderer: true,
+                squash_renderer: false,
             }),
             "available"
         );

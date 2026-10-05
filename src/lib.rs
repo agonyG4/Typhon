@@ -36,6 +36,7 @@ pub mod shell;
 pub mod syncobj;
 pub mod wayland_drm;
 pub mod window_lifecycle_animation;
+mod window_lifecycle_squash;
 pub mod wm;
 pub mod xwayland;
 

@@ -5,7 +5,8 @@ use crate::presentation_animation::{
     PresentationTransactionId,
 };
 use crate::window_lifecycle_animation::{
-    LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleVisualGroup,
+    LifecycleDirection, LifecycleEffectKind, LifecycleSceneSample, LifecycleVisualGroup,
+    LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
 };
 
 fn identity_for_test(window_id: WindowId) -> PresentationRetainedVisualIdentity {
@@ -135,23 +136,33 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
         800,
     )
     .unwrap();
+    let window_id = WindowId::from_raw(1).unwrap();
+    let presentation_identity = identity_for_test(window_id);
+    let payload_id = crate::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+        presentation_identity,
+    );
     LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(1),
-        lamps: vec![LampWindowSample {
-            window_id: WindowId::from_raw(1).unwrap(),
+        samples: vec![LifecycleWindowSample {
+            window_id,
             root_surface_id: 901,
-            presentation_identity: identity_for_test(WindowId::from_raw(1).unwrap()),
-            payload_id:
-                crate::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
-                    identity_for_test(WindowId::from_raw(1).unwrap()),
-                ),
+            presentation_identity,
+            payload_id,
             visual_group,
+            visual_source: LifecycleVisualSource {
+                window_id,
+                root_surface_id: 901,
+                presentation_identity,
+                payload_id,
+                kind: LifecycleVisualSourceKind::NoOwnedEffects,
+                effect_scene: std::sync::Arc::new(crate::compositor::ResolvedEffectScene::default()),
+            },
+            effect: LifecycleEffectKind::Lamp,
             progress: 0.4,
-            opacity: 1.0,
+            effect_opacity: 1.0,
             direction: LifecycleDirection::Minimize,
             mathematically_settled: false,
         }],
-        visual_sources: Vec::new(),
     }
 }
 
@@ -339,8 +350,7 @@ fn dock_promotion_is_lifecycle_scoped_and_keeps_true_overlays_ordered_after_it()
     let active_lamp = active_lamp(dock_anchor);
     let ordinary = server.external_overlay_surface_ids(&LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(1),
-        lamps: Vec::new(),
-        visual_sources: Vec::new(),
+        samples: Vec::new(),
     });
     let promoted = server.external_overlay_surface_ids(&active_lamp);
     let ordinary_root = server
@@ -405,8 +415,7 @@ fn dock_promotion_is_lifecycle_scoped_and_keeps_true_overlays_ordered_after_it()
 
     let settled = server.external_overlay_surface_ids(&LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(2),
-        lamps: Vec::new(),
-        visual_sources: Vec::new(),
+        samples: Vec::new(),
     });
     assert_eq!(settled, ordinary);
     assert!(!settled.contains(&matching_dock_root));

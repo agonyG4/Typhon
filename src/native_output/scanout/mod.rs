@@ -346,6 +346,14 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn squash_animation_available(&self) -> bool {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.squash_animation_available(),
+            Self::NativeEglGbm(scanout) => scanout.squash_animation_available(),
+            Self::Gbm(_) | Self::Dumb(_) => false,
+        }
+    }
+
     pub(crate) fn explicit_output_counters(&self) -> Option<ExplicitOutputCounters> {
         match self {
             Self::AtomicEglGbm(scanout) => Some(scanout.counters()),

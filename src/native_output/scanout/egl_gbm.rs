@@ -338,6 +338,10 @@ impl NativeEglGbmScanout {
         self.scene.lifecycle_animation_available()
     }
 
+    pub(crate) fn squash_animation_available(&self) -> bool {
+        self.scene.squash_animation_available()
+    }
+
     pub(crate) fn reload_trusted_effect_registry(
         &mut self,
         registry: &oblivion_one::effects::TrustedEffectRegistry,

@@ -23,8 +23,8 @@ use oblivion_one::effects::{
 use oblivion_one::presentation_animation::{PresentationEngine, PresentationRetainedVisualKind};
 use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use oblivion_one::window_lifecycle_animation::{
-    LampWindowSample, LifecycleDirection, LifecycleFrameSnapshot, LifecycleSceneSample,
-    LifecycleVisualGroup,
+    LifecycleDirection, LifecycleEffectKind, LifecycleFrameSnapshot, LifecycleSceneSample,
+    LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
 };
 use std::borrow::Cow;
 use std::process;
@@ -140,18 +140,26 @@ fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
         .expect("test retained lifecycle identity");
     let lifecycle = LifecycleSceneSample {
         sampled_at: at,
-        lamps: vec![LampWindowSample {
+        samples: vec![LifecycleWindowSample {
             window_id,
             root_surface_id,
             presentation_identity: identity,
             payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
             visual_group,
+            visual_source: LifecycleVisualSource {
+                window_id,
+                root_surface_id,
+                presentation_identity: identity,
+                payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
+                kind: LifecycleVisualSourceKind::NoOwnedEffects,
+                effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
+            },
+            effect: LifecycleEffectKind::Lamp,
             progress: 0.5,
-            opacity: 1.0,
+            effect_opacity: 1.0,
             direction: LifecycleDirection::Restore,
             mathematically_settled: true,
         }],
-        visual_sources: Vec::new(),
     };
     let resolved = ResolvedNativeFrameScene::from_server_at_with_lifecycle(
         &server,
@@ -160,13 +168,16 @@ fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
         lifecycle,
     );
 
-    assert_eq!(resolved.lifecycle.lamps.len(), 1);
+    assert_eq!(resolved.lifecycle.samples.len(), 1);
     assert_eq!(
-        resolved.lifecycle.lamps[0].direction,
+        resolved.lifecycle.samples[0].direction,
         LifecycleDirection::Restore
     );
     assert_eq!(resolved.lifecycle.sampled_at, at);
-    assert_eq!(resolved.lifecycle.lamps[0].root_surface_id, root_surface_id);
+    assert_eq!(
+        resolved.lifecycle.samples[0].root_surface_id,
+        root_surface_id
+    );
     assert!(
         !resolved
             .surface_ids()
@@ -337,8 +348,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
             lifecycle: LifecycleSceneSample {
                 sampled_at: AnimationTime::from_nanos(0),
-                lamps: Vec::new(),
-                visual_sources: Vec::new(),
+                samples: Vec::new(),
             },
             lifecycle_surfaces: Vec::new(),
             lifecycle_decorations: Vec::new(),

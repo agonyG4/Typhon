@@ -1312,7 +1312,7 @@ impl CompositorState {
     }
 
     fn lifecycle_dock_root_ids(&self, lifecycle: &LifecycleSceneSample) -> HashSet<u32> {
-        if lifecycle.lamps.is_empty() {
+        if lifecycle.samples.is_empty() {
             return HashSet::new();
         }
 
@@ -1355,7 +1355,7 @@ impl CompositorState {
                         .expect("union of valid renderable surface bounds must be valid")
                     })?;
                 lifecycle
-                    .lamps
+                    .samples
                     .iter()
                     .any(|lamp| presentation_rects_intersect(bounds, lamp.visual_group.anchor_rect))
                     .then_some(*root_id)

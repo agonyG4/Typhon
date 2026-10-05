@@ -1,7 +1,7 @@
 use crate::compositor::PresentedLifecycleScene;
 use crate::core::{SceneNodeId, WindowId};
 use crate::window_lifecycle_animation::{
-    LifecycleFrameLamp, LifecycleFrameSnapshot, lamp_footprint_intersects_output,
+    LifecycleFrameSample, LifecycleFrameSnapshot, lifecycle_visual_bounds_intersect_output,
 };
 
 /// Evidence of lifecycle Lamps that may still occupy a physically presented
@@ -38,11 +38,11 @@ impl PresentedLifecyclePhysicalState {
             } => (canonical_root_surface_ids, true),
         };
         let mut qualified = snapshot.clone();
-        for old in &self.snapshot.lamps {
+        for old in &self.snapshot.samples {
             let replaced = snapshot
-                .lamps
+                .samples
                 .iter()
-                .any(|lamp| lamp.root_surface_id == old.root_surface_id);
+                .any(|sample| sample.root_surface_id == old.root_surface_id);
             let canonical_replaced = canonical_root_surface_ids.contains(&old.root_surface_id);
             let rendered_replaced = rendered_scene_replacement && !replaced;
             if !replaced
@@ -50,7 +50,7 @@ impl PresentedLifecyclePhysicalState {
                 && !rendered_replaced
                 && pending_visible(old, output_width, output_height)
             {
-                qualified.lamps.push(*old);
+                qualified.samples.push(*old);
             }
         }
         qualified.refresh_signature();
@@ -59,9 +59,9 @@ impl PresentedLifecyclePhysicalState {
 
     pub(crate) fn has_pending_visible(&self, output_width: u32, output_height: u32) -> bool {
         self.snapshot
-            .lamps
+            .samples
             .iter()
-            .any(|lamp| pending_visible(lamp, output_width, output_height))
+            .any(|sample| pending_visible(sample, output_width, output_height))
     }
 
     pub(crate) fn has_pending_visible_scene_node(
@@ -70,16 +70,16 @@ impl PresentedLifecyclePhysicalState {
         output_width: u32,
         output_height: u32,
     ) -> bool {
-        self.snapshot.lamps.iter().any(|lamp| {
-            lamp.presentation_identity.scene_node_id() == scene_node_id
-                && pending_visible(lamp, output_width, output_height)
+        self.snapshot.samples.iter().any(|sample| {
+            sample.presentation_identity.scene_node_id() == scene_node_id
+                && pending_visible(sample, output_width, output_height)
         })
     }
 
     pub(crate) fn remove_window(&mut self, window_id: WindowId) {
         self.snapshot
-            .lamps
-            .retain(|lamp| lamp.window_id != window_id);
+            .samples
+            .retain(|sample| sample.window_id != window_id);
         self.snapshot.refresh_signature();
     }
 
@@ -95,8 +95,14 @@ impl PresentedLifecyclePhysicalState {
     }
 }
 
-fn pending_visible(lamp: &LifecycleFrameLamp, output_width: u32, output_height: u32) -> bool {
-    !lamp.mathematically_settled
-        && lamp.opacity > f64::EPSILON
-        && lamp_footprint_intersects_output(lamp.visual_group, output_width, output_height)
+fn pending_visible(sample: &LifecycleFrameSample, output_width: u32, output_height: u32) -> bool {
+    !sample.mathematically_settled
+        && sample.effect_opacity > f64::EPSILON
+        && lifecycle_visual_bounds_intersect_output(
+            sample.effect,
+            sample.visual_group,
+            sample.progress,
+            output_width,
+            output_height,
+        )
 }

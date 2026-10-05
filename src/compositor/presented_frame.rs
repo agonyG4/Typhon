@@ -228,7 +228,7 @@ mod tests {
         PresentationWindowTarget,
     };
     use crate::window_lifecycle_animation::{
-        LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleMotionRequest,
+        LifecycleDirection, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleMotionRequest,
         LifecycleVisualGroup,
     };
     use std::time::Duration;
@@ -280,7 +280,7 @@ mod tests {
     ) -> LifecycleFrameSnapshot {
         let mut snapshot = LifecycleFrameSnapshot {
             sampled_at: Some(AnimationTime::from_nanos(280_000_000)),
-            lamps: vec![LifecycleFrameLamp {
+            samples: vec![LifecycleFrameSample {
                 window_id,
                 root_surface_id,
                 presentation_identity,
@@ -288,12 +288,13 @@ mod tests {
                     presentation_identity,
                 ),
                 visual_group: lifecycle_visual_group(),
+                effect: crate::window_lifecycle_animation::LifecycleEffectKind::Lamp,
                 progress: if direction == LifecycleDirection::Restore {
                     0.0
                 } else {
                     1.0
                 },
-                opacity: 1.0,
+                effect_opacity: 1.0,
                 mathematically_settled,
                 direction,
             }],
@@ -356,6 +357,8 @@ mod tests {
         LifecycleMotionRequest {
             presentation_identity,
             direction,
+            effect: crate::window_lifecycle_animation::LifecycleEffectKind::Lamp,
+            canonical_opacity: 1.0,
         }
     }
 
@@ -581,8 +584,11 @@ mod tests {
         assert_eq!(state.presented_lifecycle_frame_id(), 9);
         assert_eq!(state.presented_presentation.as_ref(), Some(&presentation));
         assert_eq!(
-            state.presented_lifecycle_physical.snapshot_for_test().lamps,
-            old_physical_lifecycle.lamps
+            state
+                .presented_lifecycle_physical
+                .snapshot_for_test()
+                .samples,
+            old_physical_lifecycle.samples
         );
         assert_eq!(
             state
@@ -644,8 +650,8 @@ mod tests {
         });
 
         let physical = state.presented_lifecycle_physical.snapshot_for_test();
-        assert_eq!(physical.lamps.len(), 1);
-        assert_eq!(physical.lamps[0].presentation_identity, identity);
+        assert_eq!(physical.samples.len(), 1);
+        assert_eq!(physical.samples[0].presentation_identity, identity);
         assert_eq!(state.presented_lifecycle_frame_id(), 2);
         assert_eq!(state.window_lifecycle_animator.active_count(), 1);
         assert_eq!(
@@ -780,13 +786,13 @@ mod tests {
         assert!(endpoint.mathematically_settled);
         let lifecycle_sample = state.lifecycle_scene_sample_at(endpoint_time);
         assert!(lifecycle_sample.restore_suppresses_root(root_surface_id));
-        assert_eq!(lifecycle_sample.lamps.len(), 1);
+        assert_eq!(lifecycle_sample.samples.len(), 1);
         assert_eq!(
-            lifecycle_sample.lamps[0].payload_id,
+            lifecycle_sample.samples[0].payload_id,
             PresentationRetainedVisualPayloadId::from_origin_identity(transition_id)
         );
         let lifecycle = LifecycleFrameSnapshot::from_sample(&lifecycle_sample);
-        assert!(lifecycle.lamps[0].mathematically_settled);
+        assert!(lifecycle.samples[0].mathematically_settled);
         let presentation = PresentationFrameSnapshot::empty_for_output(output_id);
         state.publish_presented_frame(PresentedFramePublication {
             frame_id: 12,
@@ -809,7 +815,11 @@ mod tests {
         assert_eq!(state.presented_presentation_frame_id(), 12);
         assert_eq!(state.presented_lifecycle_frame_id(), 12);
         assert_eq!(
-            state.presented_lifecycle_physical.snapshot_for_test().lamps[0].presentation_identity,
+            state
+                .presented_lifecycle_physical
+                .snapshot_for_test()
+                .samples[0]
+                .presentation_identity,
             transition_id
         );
     }
@@ -907,7 +917,7 @@ mod tests {
             active,
             LifecycleDirection::Restore,
         );
-        exact.lamps[0].payload_id = state
+        exact.samples[0].payload_id = state
             .retained_lifecycle_payloads
             .get_exact(active)
             .expect("reversal retains first payload")

@@ -103,9 +103,9 @@ fn active_lamp_geometry_stays_frozen_when_live_subsurface_moves() {
         Vec::new(),
     );
     let initial = state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample"));
-    assert_eq!(initial.lamps.len(), 1);
+    assert_eq!(initial.samples.len(), 1);
     assert_eq!(
-        initial.visual_sources[0].kind,
+        initial.samples[0].visual_source.kind,
         crate::window_lifecycle_animation::LifecycleVisualSourceKind::NoOwnedEffects
     );
     let captured_surfaces = state.lifecycle_renderable_surfaces(&initial);
@@ -211,9 +211,9 @@ fn resolved_effect_lifecycle_source_uses_the_captured_surface_topology() {
         .expect("live child surface")
         .placement = live_placement;
     let sample = state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample"));
-    assert_eq!(sample.lamps.len(), 1);
+    assert_eq!(sample.samples.len(), 1);
     assert_eq!(
-        sample.visual_sources[0].kind,
+        sample.samples[0].visual_source.kind,
         crate::window_lifecycle_animation::LifecycleVisualSourceKind::ResolvedOwnedEffects
     );
     let projected = state.lifecycle_renderable_surfaces(&sample);
@@ -283,7 +283,7 @@ fn minimized_commit_keeps_live_buffer_with_captured_lifecycle_topology() {
     let before_payload = std::sync::Arc::clone(
         state
             .retained_lifecycle_payloads
-            .get_exact(before.lamps[0].presentation_identity)
+            .get_exact(before.samples[0].presentation_identity)
             .expect("retained topology payload"),
     );
 
@@ -430,7 +430,7 @@ fn minimized_commit_keeps_live_buffer_with_captured_lifecycle_topology() {
     assert!(std::sync::Arc::ptr_eq(
         state
             .retained_lifecycle_payloads
-            .get_exact(current.lamps[0].presentation_identity)
+            .get_exact(current.samples[0].presentation_identity)
             .expect("same retained payload remains active"),
         &before_payload
     ));

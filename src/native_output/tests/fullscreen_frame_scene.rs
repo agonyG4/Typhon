@@ -84,8 +84,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(0),
-            lamps: Vec::new(),
-            visual_sources: Vec::new(),
+            samples: Vec::new(),
         },
         lifecycle_surfaces: Vec::new(),
         lifecycle_decorations: Vec::new(),
@@ -156,8 +155,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
         lifecycle: LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(7),
-            lamps: Vec::new(),
-            visual_sources: Vec::new(),
+            samples: Vec::new(),
         },
         lifecycle_surfaces: Vec::new(),
         lifecycle_decorations: Vec::new(),

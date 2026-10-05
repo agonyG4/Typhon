@@ -1,7 +1,6 @@
 use super::hit_testing::PointerSceneHit;
 use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
-use crate::animation_control::AnimationEffect;
 use crate::compositor::decoration::types::ConfiguredXdgDecorationState;
 use crate::compositor::window_state::{
     NormalRestoreGeometryObservation, NormalRestoreGeometrySource,
@@ -1493,18 +1492,16 @@ impl CompositorState {
         // Capture only the compositor-owned SSD plan while the minimized
         // window still has its pre-focus-change visual state. Client and
         // subsurface content remains live in the retained surface list.
-        let lifecycle_decorations = if !has_active_lifecycle
-            && self.lifecycle_effect(LifecycleDirection::Minimize) == AnimationEffect::MinimizeLamp
-        {
+        let minimize_effect =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
+        let lifecycle_decorations = if !has_active_lifecycle && minimize_effect.is_some() {
             self.native_decoration_render_instances_for_scale(&minimized_surfaces, 1.0)
         } else {
             Vec::new()
         };
         let lifecycle_visual_group = if has_active_lifecycle {
             None
-        } else if self.lifecycle_effect(LifecycleDirection::Minimize)
-            == AnimationEffect::MinimizeLamp
-        {
+        } else if minimize_effect.is_some() {
             presented_source_client_rect
                 .zip(canonical_client_rect)
                 .zip(self.lifecycle_anchor_rect(window_id))
@@ -1531,7 +1528,8 @@ impl CompositorState {
                         });
                     let visual =
                         canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                    LifecycleVisualGroup::from_bounds(
+                    LifecycleVisualGroup::from_effect_bounds(
+                        minimize_effect?,
                         canonical_client,
                         visual,
                         presented_source,
@@ -1677,8 +1675,10 @@ impl CompositorState {
         } else {
             self.resolved_effect_scene_for_lifecycle_root(root_surface_id)
         };
+        let restore_effect =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore);
         let lifecycle_decorations = if !has_active_lifecycle
-            && self.lifecycle_effect(LifecycleDirection::Restore) == AnimationEffect::MinimizeLamp
+            && restore_effect.is_some()
             && lifecycle_scene_node_id
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
                 .is_none()
@@ -1726,7 +1726,8 @@ impl CompositorState {
                         });
                     let visual =
                         canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                    LifecycleVisualGroup::from_bounds(
+                    LifecycleVisualGroup::from_effect_bounds(
+                        restore_effect?,
                         canonical_client,
                         visual,
                         canonical_client,

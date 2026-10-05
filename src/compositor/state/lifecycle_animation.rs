@@ -6,9 +6,9 @@ use crate::presentation_animation::PresentationRetainedVisualKind;
 #[cfg(test)]
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
-    LampWindowSample, LifecycleDirection, LifecycleFrameSnapshot, LifecycleMotionRequest,
+    LifecycleDirection, LifecycleEffectKind, LifecycleFrameSnapshot, LifecycleMotionRequest,
     LifecycleRenderFallbackEntry, LifecycleSceneSample, LifecycleVisualGroup,
-    LifecycleVisualSource, LifecycleVisualSourceKind,
+    LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
 };
 use std::num::NonZeroU64;
 
@@ -97,7 +97,32 @@ impl CompositorState {
     ) -> AnimationRuntimeCapabilities {
         AnimationRuntimeCapabilities {
             lamp_renderer: self.lifecycle_animation_renderer_available == Some(true),
+            squash_renderer: self.lifecycle_squash_renderer_available == Some(true),
         }
+    }
+
+    pub(in crate::compositor) fn lifecycle_effect_kind_for_window(
+        &self,
+        window_id: WindowId,
+        direction: LifecycleDirection,
+    ) -> Option<LifecycleEffectKind> {
+        let active_effect = self
+            .scene_node_id_for_window_group(window_id)
+            .and_then(|scene_node_id| {
+                self.presentation_animator.active_retained_visual(
+                    scene_node_id,
+                    PresentationRetainedVisualKind::WindowLifecycle,
+                )
+            })
+            .and_then(|identity| {
+                let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+                self.window_lifecycle_animator
+                    .sample(identity, now)
+                    .map(|sample| sample.effect)
+            });
+        active_effect.or_else(|| {
+            LifecycleEffectKind::from_animation_effect(self.lifecycle_effect(direction))
+        })
     }
 
     pub(in crate::compositor) fn lifecycle_minimize_source_rect(
@@ -143,10 +168,11 @@ impl CompositorState {
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
-        if self.lifecycle_effect(LifecycleDirection::Minimize) != AnimationEffect::MinimizeLamp {
-            self.lifecycle_cancel_window(window_id);
+        let Some(effect) =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize)
+        else {
             return;
-        }
+        };
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
             return;
         };
@@ -165,6 +191,7 @@ impl CompositorState {
             canonical_client_rect,
             visual_group,
             LifecycleDirection::Minimize,
+            effect,
             resolved_effect_scene,
             frozen_decoration,
             now,
@@ -187,6 +214,7 @@ impl CompositorState {
         canonical_client_rect: Option<PresentationRect>,
         visual_group: Option<LifecycleVisualGroup>,
         direction: LifecycleDirection,
+        effect: LifecycleEffectKind,
         resolved_effect_scene: ResolvedEffectScene,
         frozen_decoration: Option<DecorationRenderInstance>,
         now: AnimationTime,
@@ -219,7 +247,8 @@ impl CompositorState {
                 LifecycleDirection::Restore => canonical_client_rect,
             };
             let anchor_rect = self.lifecycle_anchor_rect(window_id)?;
-            LifecycleVisualGroup::from_bounds(
+            LifecycleVisualGroup::from_effect_bounds(
+                effect,
                 canonical_client_rect,
                 canonical_client_rect,
                 presented_source_client_rect,
@@ -228,11 +257,15 @@ impl CompositorState {
                 self.output_size.height,
             )?
         };
-        if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-            visual_group,
-            self.output_size.width,
-            self.output_size.height,
-        ) {
+        let visual_intersects_output =
+            crate::window_lifecycle_animation::lifecycle_visual_bounds_intersect_output(
+                effect,
+                visual_group,
+                0.0,
+                self.output_size.width,
+                self.output_size.height,
+            );
+        if !visual_intersects_output {
             return None;
         }
         let fresh_surface_presentation = if previous_payload.is_none() {
@@ -309,6 +342,11 @@ impl CompositorState {
             LifecycleMotionRequest {
                 presentation_identity: identity,
                 direction,
+                effect,
+                canonical_opacity: self
+                    .window(window_id)
+                    .map(|window| window.canonical_opacity().get())
+                    .unwrap_or(1.0),
             },
             previous_identity,
             now,
@@ -366,10 +404,11 @@ impl CompositorState {
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
-        if self.lifecycle_effect(LifecycleDirection::Restore) != AnimationEffect::MinimizeLamp {
-            self.lifecycle_cancel_window(window_id);
+        let Some(effect) =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore)
+        else {
             return;
-        }
+        };
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
             return;
         };
@@ -388,6 +427,7 @@ impl CompositorState {
             None,
             visual_group,
             LifecycleDirection::Restore,
+            effect,
             resolved_effect_scene,
             frozen_decoration,
             now,
@@ -404,8 +444,7 @@ impl CompositorState {
         let active_identities = self
             .presentation_animator
             .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle);
-        let mut lamps = Vec::with_capacity(active_identities.len());
-        let mut visual_sources = Vec::with_capacity(active_identities.len());
+        let mut samples = Vec::with_capacity(active_identities.len());
         for identity in active_identities {
             let Some(motion) = self.window_lifecycle_animator.sample(identity, at) else {
                 continue;
@@ -421,30 +460,31 @@ impl CompositorState {
             } else {
                 LifecycleVisualSourceKind::ResolvedOwnedEffects
             };
-            lamps.push(LampWindowSample {
-                window_id: payload.window_id,
-                root_surface_id: payload.root_surface_id,
-                presentation_identity: identity,
-                payload_id: payload.payload_id,
-                visual_group: payload.visual_group,
-                progress: motion.progress,
-                opacity: motion.opacity,
-                direction: motion.direction,
-                mathematically_settled: motion.mathematically_settled,
-            });
-            visual_sources.push(LifecycleVisualSource {
+            let visual_source = LifecycleVisualSource {
                 window_id: payload.window_id,
                 root_surface_id: payload.root_surface_id,
                 presentation_identity: identity,
                 payload_id: payload.payload_id,
                 kind,
                 effect_scene: std::sync::Arc::clone(&payload.effect_scene),
+            };
+            samples.push(LifecycleWindowSample {
+                window_id: payload.window_id,
+                root_surface_id: payload.root_surface_id,
+                presentation_identity: identity,
+                payload_id: payload.payload_id,
+                visual_group: payload.visual_group,
+                visual_source,
+                effect: motion.effect,
+                progress: motion.progress,
+                effect_opacity: motion.effect_opacity,
+                direction: motion.direction,
+                mathematically_settled: motion.mathematically_settled,
             });
         }
         LifecycleSceneSample {
             sampled_at: at,
-            lamps,
-            visual_sources,
+            samples,
         }
     }
 
@@ -467,19 +507,19 @@ impl CompositorState {
     ) -> Vec<RenderableSurface> {
         let mut surfaces = Vec::new();
         let mut seen = HashSet::new();
-        for lamp in &sample.lamps {
+        for lifecycle_sample in &sample.samples {
             let Some(payload) = self
                 .retained_lifecycle_payloads
-                .get_exact(lamp.presentation_identity)
+                .get_exact(lifecycle_sample.presentation_identity)
                 .filter(|payload| {
-                    payload.payload_id == lamp.payload_id
-                        && payload.window_id == lamp.window_id
-                        && payload.root_surface_id == lamp.root_surface_id
+                    payload.payload_id == lifecycle_sample.payload_id
+                        && payload.window_id == lifecycle_sample.window_id
+                        && payload.root_surface_id == lifecycle_sample.root_surface_id
                 })
             else {
                 continue;
             };
-            let candidates = self.lifecycle_surface_candidates(lamp.window_id);
+            let candidates = self.lifecycle_surface_candidates(lifecycle_sample.window_id);
             for surface in payload
                 .surface_presentation
                 .project(&candidates, &self.surface_presentation_generations)
@@ -534,37 +574,35 @@ impl CompositorState {
         surfaces: &[RenderableSurface],
     ) -> Vec<DecorationRenderInstance> {
         let roots = sample
-            .lamps
+            .samples
             .iter()
             .map(|lamp| lamp.root_surface_id)
             .collect::<HashSet<_>>();
         let mut frozen = Vec::new();
         let mut frozen_roots = HashSet::new();
-        for lamp in &sample.lamps {
+        for lifecycle_sample in &sample.samples {
             if self.presentation_animator.active_retained_visual(
-                lamp.presentation_identity.scene_node_id(),
+                lifecycle_sample.presentation_identity.scene_node_id(),
                 PresentationRetainedVisualKind::WindowLifecycle,
-            ) != Some(lamp.presentation_identity)
+            ) != Some(lifecycle_sample.presentation_identity)
             {
                 continue;
             }
             let Some(payload) = self
                 .retained_lifecycle_payloads
-                .get_exact(lamp.presentation_identity)
+                .get_exact(lifecycle_sample.presentation_identity)
             else {
                 continue;
             };
-            if payload.payload_id != lamp.payload_id
-                || payload.root_surface_id != lamp.root_surface_id
-                || payload.window_id != lamp.window_id
+            if payload.payload_id != lifecycle_sample.payload_id
+                || payload.root_surface_id != lifecycle_sample.root_surface_id
+                || payload.window_id != lifecycle_sample.window_id
             {
                 continue;
             }
-            if let Some(decoration) = payload
-                .frozen_decoration
-                .as_ref()
-                .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
-                && frozen_roots.insert(lamp.root_surface_id)
+            if let Some(decoration) = payload.frozen_decoration.as_ref().filter(|decoration| {
+                decoration.root_surface_id() == lifecycle_sample.root_surface_id
+            }) && frozen_roots.insert(lifecycle_sample.root_surface_id)
             {
                 frozen.push(decoration.clone());
             }
@@ -589,41 +627,35 @@ impl CompositorState {
             .restore_suppresses_root(root_surface_id)
     }
 
-    fn lifecycle_lamp_intersects_output(
-        &self,
-        lamp: &crate::window_lifecycle_animation::LampWindowSample,
-    ) -> bool {
-        crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-            lamp.visual_group,
+    fn lifecycle_sample_has_visible_pixels(&self, sample: &LifecycleWindowSample) -> bool {
+        crate::window_lifecycle_animation::lifecycle_sample_requires_physical_ack(
+            sample.effect,
+            sample.visual_group,
+            sample.progress,
+            sample.effect_opacity,
+            sample.mathematically_settled,
             self.output_size.width,
             self.output_size.height,
         )
-    }
-
-    fn lifecycle_lamp_has_visible_pixels(
-        &self,
-        lamp: &crate::window_lifecycle_animation::LampWindowSample,
-    ) -> bool {
-        lamp.opacity > f64::EPSILON && self.lifecycle_lamp_intersects_output(lamp)
     }
 
     pub(in crate::compositor) fn settle_lifecycle_no_visual_change(&mut self) -> bool {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
         let candidates = self
             .lifecycle_scene_sample_at(now)
-            .lamps
+            .samples
             .into_iter()
-            .filter(|lamp| !self.lifecycle_lamp_has_visible_pixels(lamp))
-            .filter(|lamp| {
+            .filter(|sample| !self.lifecycle_sample_has_visible_pixels(sample))
+            .filter(|sample| {
                 !self
                     .presented_lifecycle_physical
                     .has_pending_visible_scene_node(
-                        lamp.presentation_identity.scene_node_id(),
+                        sample.presentation_identity.scene_node_id(),
                         self.output_size.width,
                         self.output_size.height,
                     )
             })
-            .map(|lamp| (lamp.presentation_identity, lamp.payload_id))
+            .map(|sample| (sample.presentation_identity, sample.payload_id))
             .collect::<Vec<_>>();
         let mut settled = false;
         for (identity, payload_id) in candidates {
@@ -662,9 +694,9 @@ impl CompositorState {
             .lifecycle_scene_sample_at(
                 AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)),
             )
-            .lamps
+            .samples
             .iter()
-            .any(|lamp| self.lifecycle_lamp_has_visible_pixels(lamp));
+            .any(|sample| self.lifecycle_sample_has_visible_pixels(sample));
         active_intersects
             || self
                 .presented_lifecycle_physical
@@ -715,35 +747,36 @@ impl CompositorState {
             self.output_size.width,
             self.output_size.height,
         );
-        for lamp in &snapshot.lamps {
+        for lifecycle_sample in &snapshot.samples {
             if self.presentation_animator.active_retained_visual(
-                lamp.presentation_identity.scene_node_id(),
-                lamp.presentation_identity.kind(),
-            ) != Some(lamp.presentation_identity)
+                lifecycle_sample.presentation_identity.scene_node_id(),
+                lifecycle_sample.presentation_identity.kind(),
+            ) != Some(lifecycle_sample.presentation_identity)
             {
                 continue;
             }
             if !self
                 .retained_lifecycle_payloads
-                .get_exact(lamp.presentation_identity)
+                .get_exact(lifecycle_sample.presentation_identity)
                 .is_some_and(|payload| {
-                    payload.payload_id == lamp.payload_id
-                        && payload.root_surface_id == lamp.root_surface_id
-                        && payload.window_id == lamp.window_id
+                    payload.payload_id == lifecycle_sample.payload_id
+                        && payload.root_surface_id == lifecycle_sample.root_surface_id
+                        && payload.window_id == lifecycle_sample.window_id
                 })
             {
                 continue;
             }
-            let acknowledged = self
-                .window_lifecycle_animator
-                .acknowledge(lamp.presentation_identity, lamp.mathematically_settled);
+            let acknowledged = self.window_lifecycle_animator.acknowledge(
+                lifecycle_sample.presentation_identity,
+                lifecycle_sample.mathematically_settled,
+            );
             let retired = acknowledged.is_some_and(|identity| {
                 self.presentation_animator
                     .retire_active_retained_visual_exact(identity)
             });
             if retired {
                 self.retained_lifecycle_payloads
-                    .retire_exact(lamp.presentation_identity);
+                    .retire_exact(lifecycle_sample.presentation_identity);
             }
         }
         self.advance_pointer_hit_generation();
@@ -760,11 +793,11 @@ impl CompositorState {
 
     pub(in crate::compositor) fn reconcile_lifecycle_animation_policy(&mut self) {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-        let active = self.lifecycle_scene_sample_at(now).lamps;
-        for lamp in active {
-            if self.lifecycle_effect(lamp.direction) != AnimationEffect::MinimizeLamp {
+        if !self.animation_control.configuration().enabled {
+            let active = self.lifecycle_scene_sample_at(now).samples;
+            for sample in active {
                 self.window_lifecycle_animator
-                    .snap_to_endpoint(lamp.presentation_identity, now);
+                    .snap_to_endpoint(sample.presentation_identity, now);
             }
         }
     }
@@ -797,6 +830,7 @@ impl CompositorState {
             || payload.window_id != fallback.window_id
             || payload.payload_id != fallback.payload_id
             || current.presentation_identity != fallback.presentation_identity
+            || current.effect != fallback.effect
         {
             return false;
         }
@@ -821,27 +855,37 @@ impl CompositorState {
         &mut self,
         available: bool,
     ) {
-        self.lifecycle_animation_renderer_available = Some(available);
-        if !available {
-            let active = self
-                .presentation_animator
-                .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle);
-            for identity in active {
-                self.window_lifecycle_animator.cancel(identity);
-                self.presentation_animator
-                    .retire_active_retained_visual_exact(identity);
-                self.retained_lifecycle_payloads.retire_exact(identity);
-            }
-            for identity in self.window_lifecycle_animator.cancel_all() {
-                self.presentation_animator
-                    .retire_retained_visual_exact(identity);
-                self.retained_lifecycle_payloads.retire_exact(identity);
-            }
-            for (identity, _) in self.retained_lifecycle_payloads.drain_all() {
-                self.presentation_animator
-                    .retire_retained_visual_exact(identity);
-                self.window_lifecycle_animator.cancel(identity);
-            }
+        self.set_lifecycle_animation_renderer_capabilities(
+            available,
+            self.lifecycle_squash_renderer_available.unwrap_or(false),
+        );
+    }
+
+    pub(in crate::compositor) fn set_lifecycle_animation_renderer_capabilities(
+        &mut self,
+        lamp_available: bool,
+        squash_available: bool,
+    ) {
+        self.lifecycle_animation_renderer_available = Some(lamp_available);
+        self.lifecycle_squash_renderer_available = Some(squash_available);
+        let unavailable = self
+            .presentation_animator
+            .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle)
+            .into_iter()
+            .filter(|identity| {
+                self.window_lifecycle_animator
+                    .sample(*identity, AnimationTime::from_nanos(0))
+                    .is_some_and(|sample| match sample.effect {
+                        LifecycleEffectKind::Lamp => !lamp_available,
+                        LifecycleEffectKind::Squash => !squash_available,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for identity in unavailable {
+            self.window_lifecycle_animator.cancel(identity);
+            self.presentation_animator
+                .retire_active_retained_visual_exact(identity);
+            self.retained_lifecycle_payloads.retire_exact(identity);
         }
     }
 

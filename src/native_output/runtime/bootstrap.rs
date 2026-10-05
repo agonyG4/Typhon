@@ -26,7 +26,10 @@ fn publish_scanout_runtime_capabilities(
     server: &mut OwnCompositorServer,
     scanout: &NativeScanoutBackend,
 ) {
-    server.set_lifecycle_animation_renderer_available(scanout.lifecycle_animation_available());
+    server.set_lifecycle_animation_renderer_capabilities(
+        scanout.lifecycle_animation_available(),
+        scanout.squash_animation_available(),
+    );
     server.set_material_runtime_capabilities(scanout.material_runtime_capabilities());
     server.set_material_program_rendering_available(scanout.material_program_rendering_available());
 }

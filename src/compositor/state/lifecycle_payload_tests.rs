@@ -258,19 +258,19 @@ fn frozen_ssd_resolution_requires_the_exact_payload_identity() {
         AnimationTime::monotonic_now().expect("sample both lifecycle owners"),
     );
     let index_a = sample
-        .lamps
+        .samples
         .iter()
         .position(|lamp| lamp.root_surface_id == root_a)
         .expect("first lifecycle sample");
     let identity_b = sample
-        .lamps
+        .samples
         .iter()
         .find(|lamp| lamp.root_surface_id == root_b)
         .expect("second lifecycle sample")
         .presentation_identity;
     // Preserve A's matching root, WindowId, and payload ID while selecting B's
     // active retained identity. Root/WindowId lookup must not return SSD A.
-    sample.lamps[index_a].presentation_identity = identity_b;
+    sample.samples[index_a].presentation_identity = identity_b;
 
     let resolved = state.lifecycle_decoration_render_instances(&sample, &[]);
 

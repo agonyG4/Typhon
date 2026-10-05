@@ -1355,6 +1355,15 @@ impl OwnCompositorServer {
             .set_lifecycle_animation_renderer_available(available);
     }
 
+    pub fn set_lifecycle_animation_renderer_capabilities(
+        &mut self,
+        lamp_available: bool,
+        squash_available: bool,
+    ) {
+        self.state
+            .set_lifecycle_animation_renderer_capabilities(lamp_available, squash_available);
+    }
+
     pub fn apply_lifecycle_render_fallback(
         &mut self,
         fallback: crate::window_lifecycle_animation::LifecycleRenderFallbackEntry,
@@ -1423,7 +1432,7 @@ impl OwnCompositorServer {
         );
         let lifecycle_sample = self.lifecycle_scene_sample_at(at);
         let evidence = crate::window_lifecycle_animation::LifecycleRenderEvidence::from_consumed(
-            lifecycle_sample.lamps.iter().map(|lamp| {
+            lifecycle_sample.samples.iter().map(|lamp| {
                 crate::window_lifecycle_animation::LifecycleRenderEvidenceEntry {
                     window_id: lamp.window_id,
                     root_surface_id: lamp.root_surface_id,

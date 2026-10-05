@@ -28,10 +28,11 @@ use oblivion_one::{
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
     window_lifecycle_animation::{
-        LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
-        LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleRenderFallbacks,
-        LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind, lamp_footprint,
-        lamp_motion_channels,
+        LifecycleEffectKind, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleRenderEvidence,
+        LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
+        LifecycleRenderFallbacks, LifecycleSceneSample, LifecycleVisualGroup,
+        LifecycleVisualSource, LifecycleVisualSourceKind, lamp_motion_channels,
+        lifecycle_visual_transition_bounds, visible_lifecycle_samples,
     },
 };
 
@@ -683,6 +684,12 @@ pub(crate) struct GlesSceneRenderer {
     lamp_geometry_key: Option<u64>,
     lamp_vertices: Vec<EglLampVertex>,
     lamp_commands: Vec<EglLampDrawCommand>,
+    squash_vertices: Vec<EglTexturedVertex>,
+    squash_commands: Vec<EglSquashDrawCommand>,
+    squash_vertex_array: GlVertexArray,
+    squash_vertex_buffer: GlBuffer,
+    squash_vertex_buffer_capacity: usize,
+    squash_geometry_dirty: bool,
     lifecycle_source_vertices:
         HashMap<compositor::PresentationRetainedVisualPayloadId, Vec<EglTexturedVertex>>,
     lifecycle_source_commands:
@@ -693,7 +700,7 @@ pub(crate) struct GlesSceneRenderer {
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,
     >,
-    lamp_samples: Vec<LampWindowSample>,
+    lifecycle_samples: Vec<LifecycleFrameSample>,
     lifecycle_render_evidence: LifecycleRenderEvidence,
     lifecycle_render_fallbacks: LifecycleRenderFallbacks,
     current_framebuffer_origin: OutputFramebufferOrigin,
@@ -762,7 +769,7 @@ struct CaptureRendererState {
     effect_output_scale: f32,
     lifecycle_render_evidence: LifecycleRenderEvidence,
     lifecycle_render_fallbacks: LifecycleRenderFallbacks,
-    lamp_samples: Vec<LampWindowSample>,
+    lifecycle_samples: Vec<LifecycleFrameSample>,
     lifecycle_visual_sources: HashMap<
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,
@@ -794,7 +801,7 @@ impl CaptureRendererState {
             effect_output_scale: renderer.effect_output_scale,
             lifecycle_render_evidence: renderer.lifecycle_render_evidence.clone(),
             lifecycle_render_fallbacks: renderer.lifecycle_render_fallbacks.clone(),
-            lamp_samples: renderer.lamp_samples.clone(),
+            lifecycle_samples: renderer.lifecycle_samples.clone(),
             lifecycle_visual_sources: renderer.lifecycle_visual_sources.clone(),
             failed_surface_generations: renderer.failed_surface_generations.clone(),
             active_output_framebuffer: renderer.active_output_framebuffer,
@@ -821,7 +828,7 @@ impl CaptureRendererState {
         renderer.effect_output_scale = self.effect_output_scale;
         renderer.lifecycle_render_evidence = self.lifecycle_render_evidence;
         renderer.lifecycle_render_fallbacks = self.lifecycle_render_fallbacks;
-        renderer.lamp_samples = self.lamp_samples;
+        renderer.lifecycle_samples = self.lifecycle_samples;
         renderer.lifecycle_visual_sources = self.lifecycle_visual_sources;
         renderer.failed_surface_generations = self.failed_surface_generations;
         renderer.active_output_framebuffer = self.active_output_framebuffer;
@@ -865,7 +872,7 @@ fn surface_root_for_lamp(
     let mut current = surface.surface_id;
     for _ in 0..=surfaces.len() {
         if lifecycle
-            .lamps
+            .samples
             .iter()
             .any(|lamp| lamp.root_surface_id == current)
         {
@@ -888,6 +895,12 @@ struct LampGridSpec {
     presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
     bounds: EglRect,
     uv: EglUvRect,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EglSquashDrawCommand {
+    command: EglDrawCommand,
+    presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
 }
 
 fn lamp_grid_subdivisions(
@@ -921,6 +934,7 @@ enum LegacySceneScissoredPhase {
     PrepareLifecycleSources,
     RestoreRepairScissor(usize),
     Lamp(usize),
+    Squash(usize),
     ExternalOverlays(usize),
 }
 
@@ -940,13 +954,14 @@ impl Iterator for LegacySceneScissoredPhasePlan {
             LegacySceneScissoredPhase::PrepareLifecycleSources
         } else {
             let offset = self.index - self.repair_count - 1;
-            let repair = offset / 3;
+            let repair = offset / 4;
             if repair >= self.repair_count {
                 return None;
             }
-            match offset % 3 {
+            match offset % 4 {
                 0 => LegacySceneScissoredPhase::RestoreRepairScissor(repair),
                 1 => LegacySceneScissoredPhase::Lamp(repair),
+                2 => LegacySceneScissoredPhase::Squash(repair),
                 _ => LegacySceneScissoredPhase::ExternalOverlays(repair),
             }
         };
@@ -1044,7 +1059,11 @@ fn lamp_geometry_key(
         OutputFramebufferOrigin::BottomLeft => 1,
         OutputFramebufferOrigin::TopLeftScanout => 2,
     });
-    for lamp in &lifecycle.lamps {
+    for lamp in lifecycle
+        .samples
+        .iter()
+        .filter(|sample| sample.effect == LifecycleEffectKind::Lamp)
+    {
         for value in [
             lamp.window_id.get(),
             u64::from(lamp.root_surface_id),
@@ -1107,13 +1126,12 @@ fn lamp_geometry_key(
         ] {
             mix(value);
         }
-        if let Some(source) = lifecycle_visual_source_for_lamp(lifecycle, *lamp) {
-            mix(match source.kind {
-                LifecycleVisualSourceKind::NoOwnedEffects => 1,
-                LifecycleVisualSourceKind::ResolvedOwnedEffects => 2,
-            });
-            mix(source.effect_scene.signature);
-        }
+        let source = &lamp.visual_source;
+        mix(match source.kind {
+            LifecycleVisualSourceKind::NoOwnedEffects => 1,
+            LifecycleVisualSourceKind::ResolvedOwnedEffects => 2,
+        });
+        mix(source.effect_scene.signature);
     }
     for surface in surfaces {
         mix(u64::from(surface.surface_id));
@@ -1226,8 +1244,10 @@ fn lifecycle_damage_for_samples(
     output_scale: f64,
 ) -> OutputDamage {
     let mut rects = Vec::new();
-    for lamp in &lifecycle.lamps {
-        if let Some(footprint) = lamp_footprint(lamp.visual_group) {
+    for sample in &lifecycle.samples {
+        if let Some(footprint) =
+            lifecycle_visual_transition_bounds(sample.effect, sample.visual_group, sample.progress)
+        {
             let left = footprint.x();
             let top = footprint.y();
             let right = footprint.x() + footprint.width();
@@ -1245,7 +1265,7 @@ fn lifecycle_damage_for_samples(
 
 fn lifecycle_visual_source_for_lamp(
     lifecycle: &LifecycleSceneSample,
-    lamp: LampWindowSample,
+    lamp: LifecycleFrameSample,
 ) -> Option<&LifecycleVisualSource> {
     lifecycle
         .visual_source_for_identity(lamp.presentation_identity)
@@ -1341,6 +1361,12 @@ impl GlesSceneRenderer {
         self.lamp_program.is_some()
     }
 
+    /// Squash reuses the mandatory textured scene program. Renderer creation
+    /// fails if that program cannot be compiled and linked.
+    pub(crate) const fn squash_animation_available(&self) -> bool {
+        true
+    }
+
     pub(crate) fn invalidate_presented_damage_history(&mut self) {
         self.repaint_planner.invalidate();
         self.presented_scene_key = None;
@@ -1371,12 +1397,15 @@ impl GlesSceneRenderer {
         let scene_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         let overlay_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let overlay_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
+        let squash_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
+        let squash_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         let lamp_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let lamp_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         unsafe {
             for (vertex_array, vertex_buffer) in [
                 (scene_vertex_array, scene_vertex_buffer),
                 (overlay_vertex_array, overlay_vertex_buffer),
+                (squash_vertex_array, squash_vertex_buffer),
             ] {
                 gl.bind_vertex_array(Some(vertex_array));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
@@ -1497,11 +1526,17 @@ impl GlesSceneRenderer {
             lamp_geometry_key: None,
             lamp_vertices: Vec::new(),
             lamp_commands: Vec::new(),
+            squash_vertices: Vec::new(),
+            squash_commands: Vec::new(),
+            squash_vertex_array,
+            squash_vertex_buffer,
+            squash_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+            squash_geometry_dirty: true,
             lifecycle_source_vertices: HashMap::new(),
             lifecycle_source_commands: HashMap::new(),
             lifecycle_visual_resources: HashMap::new(),
             lifecycle_visual_sources: HashMap::new(),
-            lamp_samples: Vec::new(),
+            lifecycle_samples: Vec::new(),
             lifecycle_render_evidence: LifecycleRenderEvidence::default(),
             lifecycle_render_fallbacks: LifecycleRenderFallbacks::default(),
             current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
@@ -2079,16 +2114,17 @@ impl GlesSceneRenderer {
             None
         };
         self.current_framebuffer_origin = framebuffer_origin;
-        self.lamp_samples.clear();
-        self.lamp_samples.extend_from_slice(&lifecycle.lamps);
+        self.lifecycle_samples.clear();
+        self.lifecycle_samples
+            .extend(LifecycleFrameSnapshot::from_sample(lifecycle).samples);
         self.lifecycle_render_evidence.consumed.clear();
         self.lifecycle_render_fallbacks.failed.clear();
         self.lifecycle_visual_sources.clear();
         self.lifecycle_visual_sources.extend(
             lifecycle
-                .visual_sources
+                .samples
                 .iter()
-                .cloned()
+                .map(|sample| sample.visual_source.clone())
                 .map(|source| (source.presentation_identity, source)),
         );
         let output_scale_key = compositor::output_scale_key(output_scale);
@@ -2291,6 +2327,12 @@ impl GlesSceneRenderer {
                 &self.presentation_visual_group_owners,
             ));
         self.rebuild_lamp_commands_if_needed(
+            lifecycle,
+            lifecycle_surfaces,
+            lifecycle_decorations,
+            output_scale,
+        );
+        self.rebuild_squash_commands(
             lifecycle,
             lifecycle_surfaces,
             lifecycle_decorations,
@@ -3657,6 +3699,7 @@ impl GlesSceneRenderer {
                 self.draw_command_batch(true, None)?;
                 self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
                 self.draw_lamp_overlay(None)?;
+                self.draw_squash_overlay(None)?;
                 self.draw_command_batch(false, None)?;
             }
             RenderExecution::Scissored {
@@ -3704,6 +3747,15 @@ impl GlesSceneRenderer {
                                 framebuffer_origin,
                             );
                             draw_result = self.draw_lamp_overlay(output_rect);
+                        }
+                        LegacySceneScissoredPhase::Squash(index) => {
+                            let [x, y, width, height] = scissors[index];
+                            let output_rect = gl_scissor_to_output_rect(
+                                [x, y, width, height],
+                                self.current_size.1,
+                                framebuffer_origin,
+                            );
+                            draw_result = self.draw_squash_overlay(output_rect);
                         }
                         LegacySceneScissoredPhase::ExternalOverlays(index) => {
                             let [x, y, width, height] = scissors[index];
@@ -3754,14 +3806,22 @@ impl GlesSceneRenderer {
         self.lamp_geometry_dirty = true;
         self.lamp_vertices.clear();
         self.lamp_commands.clear();
-        if lifecycle.lamps.is_empty() {
+        if !lifecycle
+            .samples
+            .iter()
+            .any(|sample| sample.effect == LifecycleEffectKind::Lamp)
+        {
             return;
         }
         let mut transition_starts = HashMap::new();
         let mut rejected_transitions = HashSet::new();
         let assignments =
             compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
-        for lamp in lifecycle.lamps.iter().copied() {
+        for lamp in LifecycleFrameSnapshot::from_sample(lifecycle)
+            .samples
+            .into_iter()
+            .filter(|sample| sample.effect == LifecycleEffectKind::Lamp)
+        {
             let Some(source) = lifecycle_visual_source_for_lamp(lifecycle, lamp) else {
                 self.record_lifecycle_render_fallback(
                     lamp,
@@ -3942,21 +4002,197 @@ impl GlesSceneRenderer {
                 }
             }
         }
-        for lamp in &lifecycle.lamps {
+        for lamp in LifecycleFrameSnapshot::from_sample(lifecycle)
+            .samples
+            .into_iter()
+            .filter(|sample| sample.effect == LifecycleEffectKind::Lamp)
+        {
             if !transition_starts.contains_key(&lamp.presentation_identity)
                 && !rejected_transitions.contains(&lamp.presentation_identity)
             {
                 self.record_lifecycle_render_fallback(
-                    *lamp,
+                    lamp,
                     LifecycleRenderFallbackReason::MeshBudget,
                 );
             }
         }
     }
 
+    fn rebuild_squash_commands(
+        &mut self,
+        lifecycle: &LifecycleSceneSample,
+        lifecycle_surfaces: &[RenderableSurface],
+        lifecycle_decorations: &[DecorationRenderInstance],
+        output_scale: f64,
+    ) {
+        self.squash_vertices.clear();
+        self.squash_commands.clear();
+        self.squash_geometry_dirty = true;
+        let assignments =
+            compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
+        for sample in lifecycle
+            .samples
+            .iter()
+            .filter(|sample| sample.effect == LifecycleEffectKind::Squash)
+        {
+            let initial_command_count = self.squash_commands.len();
+            if sample.visual_source.root_surface_id != sample.root_surface_id
+                || sample.visual_source.payload_id != sample.payload_id
+                || sample.visual_source.presentation_identity != sample.presentation_identity
+            {
+                self.record_lifecycle_render_fallback(
+                    LifecycleFrameSample {
+                        window_id: sample.window_id,
+                        root_surface_id: sample.root_surface_id,
+                        presentation_identity: sample.presentation_identity,
+                        payload_id: sample.payload_id,
+                        visual_group: sample.visual_group,
+                        effect: sample.effect,
+                        progress: sample.progress,
+                        effect_opacity: sample.effect_opacity,
+                        mathematically_settled: sample.mathematically_settled,
+                        direction: sample.direction,
+                    },
+                    LifecycleRenderFallbackReason::NoConsumedRepresentation,
+                );
+                continue;
+            }
+            let frame_sample = LifecycleFrameSample {
+                window_id: sample.window_id,
+                root_surface_id: sample.root_surface_id,
+                presentation_identity: sample.presentation_identity,
+                payload_id: sample.payload_id,
+                visual_group: sample.visual_group,
+                effect: sample.effect,
+                progress: sample.progress,
+                effect_opacity: sample.effect_opacity,
+                mathematically_settled: sample.mathematically_settled,
+                direction: sample.direction,
+            };
+
+            if sample.visual_source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects {
+                let Some(target_rect) =
+                    oblivion_one::window_lifecycle_animation::squash_visual_rect_at_progress(
+                        sample.visual_group.presented_source_client_rect,
+                        sample.visual_group.anchor_rect,
+                        sample.visual_group.presented_source_visual_rect,
+                        sample.progress,
+                    )
+                else {
+                    self.record_lifecycle_render_fallback(
+                        frame_sample,
+                        LifecycleRenderFallbackReason::NoConsumedRepresentation,
+                    );
+                    continue;
+                };
+                let target = scaled_presentation_rect(target_rect, output_scale);
+                let mut vertices = Vec::new();
+                let mut commands = Vec::new();
+                push_draw_command(
+                    &mut vertices,
+                    &mut commands,
+                    EglDrawLayer::LifecycleResolvedVisual(sample.payload_id),
+                    EglRect::new(
+                        target.x() as f32,
+                        target.y() as f32,
+                        target.width() as f32,
+                        target.height() as f32,
+                    ),
+                    self.current_size.0,
+                    self.current_size.1,
+                    self.current_framebuffer_origin,
+                );
+                self.append_squash_batch(sample.presentation_identity, vertices, commands);
+            } else {
+                for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
+                    if surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
+                        != sample.root_surface_id
+                    {
+                        continue;
+                    }
+                    let mut vertices = Vec::new();
+                    let mut commands = Vec::new();
+                    push_egl_surface_commands(
+                        &mut vertices,
+                        &mut commands,
+                        self.current_size.0,
+                        self.current_size.1,
+                        surface,
+                        assignment.clone(),
+                        self.current_framebuffer_origin,
+                        None,
+                    );
+                    if transform_squash_geometry(
+                        &mut vertices,
+                        &mut commands,
+                        sample.visual_group,
+                        sample.progress,
+                        output_scale,
+                        self.current_size,
+                        self.current_framebuffer_origin,
+                    ) {
+                        self.append_squash_batch(sample.presentation_identity, vertices, commands);
+                    }
+                }
+                for decoration in lifecycle_decorations
+                    .iter()
+                    .filter(|decoration| decoration.root_surface_id() == sample.root_surface_id)
+                {
+                    let mut vertices = Vec::new();
+                    let mut commands = Vec::new();
+                    push_egl_decoration_instance(
+                        &mut vertices,
+                        &mut commands,
+                        self.current_size.0,
+                        self.current_size.1,
+                        decoration,
+                        output_scale,
+                        self.current_framebuffer_origin,
+                        None,
+                    );
+                    if transform_squash_geometry(
+                        &mut vertices,
+                        &mut commands,
+                        sample.visual_group,
+                        sample.progress,
+                        output_scale,
+                        self.current_size,
+                        self.current_framebuffer_origin,
+                    ) {
+                        self.append_squash_batch(sample.presentation_identity, vertices, commands);
+                    }
+                }
+            }
+            if self.squash_commands.len() == initial_command_count {
+                self.record_lifecycle_render_fallback(
+                    frame_sample,
+                    LifecycleRenderFallbackReason::NoConsumedRepresentation,
+                );
+            }
+        }
+    }
+
+    fn append_squash_batch(
+        &mut self,
+        presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        vertices: Vec<EglTexturedVertex>,
+        commands: Vec<EglDrawCommand>,
+    ) {
+        let vertex_offset = u32::try_from(self.squash_vertices.len()).unwrap_or(u32::MAX);
+        self.squash_vertices.extend(vertices);
+        self.squash_commands
+            .extend(commands.into_iter().map(|mut command| {
+                command.vertex_start = command.vertex_start.saturating_add(vertex_offset);
+                EglSquashDrawCommand {
+                    command,
+                    presentation_identity,
+                }
+            }));
+    }
+
     fn append_lamp_grid_for_transition(
         &mut self,
-        lamp: LampWindowSample,
+        lamp: LifecycleFrameSample,
         spec: LampGridSpec,
         transition_starts: &mut HashMap<
             oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
@@ -4002,7 +4238,7 @@ impl GlesSceneRenderer {
 
         for source in sources {
             let Some(lamp) = self
-                .lamp_samples
+                .lifecycle_samples
                 .iter()
                 .find(|sample| {
                     sample.presentation_identity == source.presentation_identity
@@ -4099,7 +4335,7 @@ impl GlesSceneRenderer {
 
     fn record_lifecycle_render_fallback(
         &mut self,
-        lamp: LampWindowSample,
+        lamp: LifecycleFrameSample,
         reason: LifecycleRenderFallbackReason,
     ) {
         self.lifecycle_render_fallbacks
@@ -4108,6 +4344,7 @@ impl GlesSceneRenderer {
                 root_surface_id: lamp.root_surface_id,
                 presentation_identity: lamp.presentation_identity,
                 payload_id: lamp.payload_id,
+                effect: lamp.effect,
                 reason,
             });
     }
@@ -4125,7 +4362,7 @@ impl GlesSceneRenderer {
     fn capture_lifecycle_visual_source(
         &mut self,
         source: &LifecycleVisualSource,
-        lamp: LampWindowSample,
+        lamp: LifecycleFrameSample,
         target: PooledEffectTexture,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> Result<(), LifecycleSourceCaptureFailure> {
@@ -4493,7 +4730,8 @@ impl GlesSceneRenderer {
                         .uniform_1_f32(Some(location), channels.temporal_progress as f32);
                 }
                 if let Some(location) = &uniforms.opacity {
-                    self.gl.uniform_1_f32(Some(location), sample.opacity as f32);
+                    self.gl
+                        .uniform_1_f32(Some(location), sample.effect_opacity as f32);
                 }
                 self.gl.draw_arrays(
                     glow::TRIANGLES,
@@ -4520,52 +4758,177 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
-    fn record_visible_lifecycle_fallbacks(&mut self, reason: LifecycleRenderFallbackReason) {
-        let visible = self
-            .lamp_samples
+    fn draw_squash_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
+        if self.squash_vertices.is_empty() || self.squash_commands.is_empty() {
+            return Ok(());
+        }
+        let required_size = self.squash_vertices.len() * std::mem::size_of::<EglTexturedVertex>();
+        ensure_vertex_buffer_capacity(
+            &self.gl,
+            self.squash_vertex_buffer,
+            &mut self.squash_vertex_buffer_capacity,
+            required_size,
+        );
+        if self.squash_geometry_dirty {
+            unsafe {
+                self.gl
+                    .bind_buffer(glow::ARRAY_BUFFER, Some(self.squash_vertex_buffer));
+                self.gl.buffer_sub_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    0,
+                    bytemuck::cast_slice(self.squash_vertices.as_slice()),
+                );
+            }
+            self.squash_geometry_dirty = false;
+        }
+        let active = self
+            .lifecycle_samples
             .iter()
+            .filter(|sample| sample.effect == LifecycleEffectKind::Squash)
             .copied()
-            .filter(|lamp| self.lamp_intersects_current_output(lamp))
             .collect::<Vec<_>>();
-        for lamp in visible {
-            self.record_lifecycle_render_fallback(lamp, reason);
+        let mut draw_calls = 0_usize;
+        let mut texture_binds = 0_usize;
+        let mut missing_required_decoration_resources = 0_usize;
+        unsafe {
+            self.gl.use_program(Some(self.program));
+            self.gl.bind_vertex_array(Some(self.squash_vertex_array));
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+        }
+        let mut current_sampling = None;
+        for sample in active {
+            let commands = self
+                .squash_commands
+                .iter()
+                .filter(|entry| entry.presentation_identity == sample.presentation_identity)
+                .filter(|entry| {
+                    scissor.is_none_or(|rect| entry.command.bounds.intersects_output_rect(rect))
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                continue;
+            }
+            if commands
+                .iter()
+                .any(|entry| self.texture_for_layer(entry.command.layer).is_none())
+            {
+                if commands
+                    .iter()
+                    .any(|entry| Self::is_required_decoration_layer(entry.command.layer))
+                {
+                    missing_required_decoration_resources =
+                        missing_required_decoration_resources.saturating_add(1);
+                }
+                self.record_lifecycle_render_fallback(
+                    sample,
+                    LifecycleRenderFallbackReason::LifecycleResourceUnavailable,
+                );
+                continue;
+            }
+            for entry in commands {
+                let command = &entry.command;
+                let Some(texture) = self.texture_for_layer(command.layer) else {
+                    continue;
+                };
+                unsafe {
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    texture_binds = texture_binds.saturating_add(1);
+                    if current_sampling != Some(command.sampling) {
+                        let filter = match command.sampling {
+                            SurfaceSampling::ExactNearest => glow::NEAREST,
+                            SurfaceSampling::ScaledLinear => glow::LINEAR,
+                        } as i32;
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MIN_FILTER,
+                            filter,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAG_FILTER,
+                            filter,
+                        );
+                        current_sampling = Some(command.sampling);
+                    }
+                    if let Some(location) = &self.presentation_opacity_location {
+                        self.gl
+                            .uniform_1_f32(Some(location), sample.effect_opacity as f32);
+                    }
+                    self.gl.draw_arrays(
+                        glow::TRIANGLES,
+                        command.vertex_start as i32,
+                        command.vertex_count as i32,
+                    );
+                }
+                draw_calls = draw_calls.saturating_add(1);
+                self.lifecycle_render_evidence
+                    .record(LifecycleRenderEvidenceEntry {
+                        window_id: sample.window_id,
+                        root_surface_id: sample.root_surface_id,
+                        presentation_identity: sample.presentation_identity,
+                        payload_id: sample.payload_id,
+                    });
+            }
+        }
+        self.frame_stats.draw_calls = self.frame_stats.draw_calls.saturating_add(draw_calls);
+        self.frame_stats.commands_executed = self
+            .frame_stats
+            .commands_executed
+            .saturating_add(draw_calls);
+        self.frame_stats.texture_binds =
+            self.frame_stats.texture_binds.saturating_add(texture_binds);
+        self.frame_stats.missing_required_decoration_resources = self
+            .frame_stats
+            .missing_required_decoration_resources
+            .saturating_add(missing_required_decoration_resources);
+        unsafe {
+            self.gl.use_program(Some(self.program));
+            self.gl.bind_vertex_array(Some(self.scene_vertex_array));
+        }
+        Ok(())
+    }
+
+    fn record_visible_lifecycle_fallbacks(&mut self, reason: LifecycleRenderFallbackReason) {
+        let visible = visible_lifecycle_samples(
+            &self.lifecycle_samples,
+            f64::from(self.effect_output_scale),
+            self.current_size.0,
+            self.current_size.1,
+        )
+        .collect::<Vec<_>>();
+        for sample in visible {
+            self.record_lifecycle_render_fallback(sample, reason);
         }
     }
 
     fn record_lifecycle_fallbacks_without_evidence(&mut self) {
-        let missing = self
-            .lamp_samples
-            .iter()
-            .copied()
-            .filter(|lamp| {
-                !self.lifecycle_render_evidence.contains(
-                    lamp.presentation_identity,
-                    lamp.payload_id,
-                    lamp.root_surface_id,
-                )
-            })
-            .filter(|lamp| self.lamp_intersects_current_output(lamp))
-            .collect::<Vec<_>>();
-        for lamp in missing {
+        let missing = visible_lifecycle_samples(
+            &self.lifecycle_samples,
+            f64::from(self.effect_output_scale),
+            self.current_size.0,
+            self.current_size.1,
+        )
+        .filter(|sample| {
+            !self.lifecycle_render_evidence.contains(
+                sample.presentation_identity,
+                sample.payload_id,
+                sample.root_surface_id,
+            )
+        })
+        .collect::<Vec<_>>();
+        for sample in missing {
             self.record_lifecycle_render_fallback(
-                lamp,
+                sample,
                 LifecycleRenderFallbackReason::NoConsumedRepresentation,
             );
         }
-    }
-
-    fn lamp_intersects_current_output(&self, lamp: &LampWindowSample) -> bool {
-        let scale = self.effect_output_scale.max(1.0) as f64;
-        lamp_footprint(lamp.visual_group).is_some_and(|footprint| {
-            let x = footprint.x() * scale;
-            let y = footprint.y() * scale;
-            let width = footprint.width() * scale;
-            let height = footprint.height() * scale;
-            x < f64::from(self.current_size.0)
-                && y < f64::from(self.current_size.1)
-                && x + width > 0.0
-                && y + height > 0.0
-        })
     }
 
     pub(crate) fn draw_lifecycle_overlays(
@@ -4590,6 +4953,7 @@ impl GlesSceneRenderer {
                     .scissor(rect.x, y, rect.width as i32, rect.height as i32);
             }
             self.draw_lamp_overlay(Some(*rect))?;
+            self.draw_squash_overlay(Some(*rect))?;
         }
         unsafe {
             self.gl.disable(glow::SCISSOR_TEST);
@@ -4600,8 +4964,8 @@ impl GlesSceneRenderer {
     fn lamp_geometry_sample(
         &self,
         presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
-    ) -> Option<LampWindowSample> {
-        self.lamp_samples
+    ) -> Option<LifecycleFrameSample> {
+        self.lifecycle_samples
             .iter()
             .find(|sample| sample.presentation_identity == presentation_identity)
             .copied()
@@ -5314,6 +5678,8 @@ impl GlesSceneRenderer {
             self.gl.delete_vertex_array(self.scene_vertex_array);
             self.gl.delete_buffer(self.overlay_vertex_buffer);
             self.gl.delete_vertex_array(self.overlay_vertex_array);
+            self.gl.delete_buffer(self.squash_vertex_buffer);
+            self.gl.delete_vertex_array(self.squash_vertex_array);
             self.gl.delete_program(self.program);
             self.gl.delete_program(self.capture_program);
             self.gl.delete_program(self.capture_copy_program);
@@ -6412,9 +6778,91 @@ fn output_point_to_ndc(
     [x as f32, y as f32]
 }
 
+fn transform_squash_geometry(
+    vertices: &mut [EglTexturedVertex],
+    commands: &mut [EglDrawCommand],
+    visual_group: LifecycleVisualGroup,
+    progress: f64,
+    output_scale: f64,
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> bool {
+    let source_client =
+        scaled_presentation_rect(visual_group.presented_source_client_rect, output_scale);
+    let Some(current_client) =
+        oblivion_one::window_lifecycle_animation::squash_client_rect_at_progress(
+            visual_group.presented_source_client_rect,
+            visual_group.anchor_rect,
+            progress,
+        )
+    else {
+        return false;
+    };
+    let current_client = scaled_presentation_rect(current_client, output_scale);
+    if !source_client.x().is_finite()
+        || !source_client.y().is_finite()
+        || !source_client.width().is_finite()
+        || !source_client.height().is_finite()
+        || source_client.width() <= 0.0
+        || source_client.height() <= 0.0
+    {
+        return false;
+    }
+    let map_point = |point: [f64; 2]| {
+        [
+            current_client.x()
+                + (point[0] - source_client.x()) * current_client.width() / source_client.width(),
+            current_client.y()
+                + (point[1] - source_client.y()) * current_client.height() / source_client.height(),
+        ]
+    };
+    for vertex in vertices {
+        let point = ndc_to_output_point(vertex.position, output_size, framebuffer_origin);
+        vertex.position = output_point_to_ndc(map_point(point), output_size, framebuffer_origin);
+    }
+    let map_rect = |rect: EglRect| {
+        let source_rect = compositor::PresentationRect::new(
+            f64::from(rect.x()),
+            f64::from(rect.y()),
+            f64::from(rect.width()),
+            f64::from(rect.height()),
+        )?;
+        let transformed = oblivion_one::window_lifecycle_animation::squash_transform_rect(
+            source_client,
+            current_client,
+            source_rect,
+        )?;
+        Some(EglRect::new(
+            transformed.x() as f32,
+            transformed.y() as f32,
+            transformed.width() as f32,
+            transformed.height() as f32,
+        ))
+    };
+    for command in commands {
+        let Some(bounds) = map_rect(command.bounds) else {
+            return false;
+        };
+        command.bounds = bounds;
+        command.presentation_clip = match command.presentation_clip {
+            Some(clip) => match map_rect(clip) {
+                Some(clip) => Some(clip),
+                None => return false,
+            },
+            None => None,
+        };
+        command.opaque_regions = command
+            .opaque_regions
+            .iter()
+            .filter_map(|rect| map_rect(*rect))
+            .collect();
+    }
+    true
+}
+
 fn lifecycle_visual_source_signature(
     source: &LifecycleVisualSource,
-    lamp: LampWindowSample,
+    lamp: LifecycleFrameSample,
     output_scale: f64,
 ) -> u64 {
     let mut signature = source.effect_scene.signature ^ source.payload_id.get();
@@ -7664,8 +8112,9 @@ mod tests {
         DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
     use oblivion_one::window_lifecycle_animation::{
-        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleVisualGroup,
-        LifecycleVisualSource, LifecycleVisualSourceKind,
+        LifecycleDirection, LifecycleEffectKind, LifecycleFrameSample, LifecycleSceneSample,
+        LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind,
+        LifecycleWindowSample,
     };
 
     fn test_lifecycle_identity(
@@ -16085,24 +16534,25 @@ mod tests {
             .expect("valid visual group");
         LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(1),
-            lamps: vec![LampWindowSample {
+            samples: vec![LifecycleWindowSample {
                 window_id,
                 root_surface_id: 1,
                 presentation_identity,
                 payload_id,
                 visual_group,
+                visual_source: LifecycleVisualSource {
+                    window_id,
+                    root_surface_id: 1,
+                    presentation_identity,
+                    payload_id,
+                    kind: LifecycleVisualSourceKind::NoOwnedEffects,
+                    effect_scene: Arc::new(compositor::ResolvedEffectScene::default()),
+                },
+                effect: LifecycleEffectKind::Lamp,
                 progress,
-                opacity: 1.0,
+                effect_opacity: 1.0,
                 direction: LifecycleDirection::Minimize,
                 mathematically_settled: false,
-            }],
-            visual_sources: vec![LifecycleVisualSource {
-                window_id,
-                root_surface_id: 1,
-                presentation_identity,
-                payload_id,
-                kind: LifecycleVisualSourceKind::NoOwnedEffects,
-                effect_scene: Arc::new(compositor::ResolvedEffectScene::default()),
             }],
         }
     }
@@ -16163,24 +16613,25 @@ mod tests {
                 .expect("valid lifecycle visual group");
         LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(started_at),
-            lamps: vec![LampWindowSample {
+            samples: vec![LifecycleWindowSample {
                 window_id,
                 root_surface_id,
                 presentation_identity,
                 payload_id,
                 visual_group,
+                visual_source: LifecycleVisualSource {
+                    window_id,
+                    root_surface_id,
+                    presentation_identity,
+                    payload_id,
+                    kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
+                    effect_scene: Arc::new(effect_scene),
+                },
+                effect: LifecycleEffectKind::Lamp,
                 progress,
-                opacity: 1.0,
+                effect_opacity: 1.0,
                 direction,
                 mathematically_settled: false,
-            }],
-            visual_sources: vec![LifecycleVisualSource {
-                window_id,
-                root_surface_id,
-                presentation_identity,
-                payload_id,
-                kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
-                effect_scene: Arc::new(effect_scene),
             }],
         }
     }
@@ -16485,7 +16936,7 @@ mod tests {
         assert_eq!(renderer.repaint_planner.history_depth(), 0);
 
         let mut resolved_effect_lifecycle = lamp_test_sample(0.5);
-        resolved_effect_lifecycle.visual_sources = vec![LifecycleVisualSource {
+        resolved_effect_lifecycle.samples[0].visual_source = LifecycleVisualSource {
             window_id: oblivion_one::compositor::WindowId::from_raw(1)
                 .expect("valid lifecycle window ID"),
             root_surface_id: 1,
@@ -16505,7 +16956,7 @@ mod tests {
             effect_scene: std::sync::Arc::new(
                 oblivion_one::compositor::ResolvedEffectScene::default(),
             ),
-        }];
+        };
         renderer.lamp_geometry_key = None;
         renderer.rebuild_lamp_commands_if_needed(&resolved_effect_lifecycle, &[], &[], 1.0);
         assert_eq!(renderer.lamp_commands.len(), 1);
@@ -16615,9 +17066,9 @@ mod tests {
         );
         resolved.lifecycle =
             lifecycle_effect_sample(0.45, LifecycleDirection::Minimize, 604, 1, blur_scene);
-        let identity = resolved.lifecycle.lamps[0].presentation_identity;
-        let payload_id = resolved.lifecycle.lamps[0].payload_id;
-        let source_scene = Arc::clone(&resolved.lifecycle.visual_sources[0].effect_scene);
+        let identity = resolved.lifecycle.samples[0].presentation_identity;
+        let payload_id = resolved.lifecycle.samples[0].payload_id;
+        let source_scene = Arc::clone(&resolved.lifecycle.samples[0].visual_source.effect_scene);
 
         let input_state = crate::native_output::NativeInputState::new(320, 200);
         let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
@@ -16684,11 +17135,11 @@ mod tests {
         // and its resolved visual stay frozen through minimize-to-restore.
         resolved.effects = ResolvedEffectScene::new(999, Vec::new());
         resolved.lifecycle.sampled_at = AnimationTime::from_nanos(2);
-        resolved.lifecycle.lamps[0].direction = LifecycleDirection::Restore;
-        resolved.lifecycle.lamps[0].progress = 0.55;
+        resolved.lifecycle.samples[0].direction = LifecycleDirection::Restore;
+        resolved.lifecycle.samples[0].progress = 0.55;
         assert!(Arc::ptr_eq(
             &source_scene,
-            &resolved.lifecycle.visual_sources[0].effect_scene
+            &resolved.lifecycle.samples[0].visual_source.effect_scene
         ));
         effects::clear_effect_trace_test_events();
         let request = frame_renderer.egl_scene_draw_request(
@@ -16743,8 +17194,8 @@ mod tests {
         );
         resolved.lifecycle =
             lifecycle_effect_sample(0.4, LifecycleDirection::Minimize, 604, 2, failed_scene);
-        let failed_identity = resolved.lifecycle.lamps[0].presentation_identity;
-        let failed_payload = resolved.lifecycle.lamps[0].payload_id;
+        let failed_identity = resolved.lifecycle.samples[0].presentation_identity;
+        let failed_payload = resolved.lifecycle.samples[0].payload_id;
         effects::clear_effect_trace_test_events();
         let request = frame_renderer.egl_scene_draw_request(
             320,
@@ -16838,9 +17289,9 @@ mod tests {
                 EffectRect::new(60, 60, 180, 100).expect("blur owner rect"),
             ),
         );
-        resolved.lifecycle.lamps[0].window_id = window_id;
-        resolved.lifecycle.visual_sources[0].window_id = window_id;
-        resolved.lifecycle.lamps[0].visual_group = LifecycleVisualGroup::from_bounds(
+        resolved.lifecycle.samples[0].window_id = window_id;
+        resolved.lifecycle.samples[0].visual_source.window_id = window_id;
+        resolved.lifecycle.samples[0].visual_group = LifecycleVisualGroup::from_bounds(
             PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("canonical client rect"),
             PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
             PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("presented client rect"),
@@ -16850,7 +17301,7 @@ mod tests {
         )
         .expect("expanded lifecycle visual group");
         assert_eq!(
-            resolved.lifecycle.lamps[0]
+            resolved.lifecycle.samples[0]
                 .visual_group
                 .presented_source_visual_rect,
             PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("expanded bounds"),
@@ -16869,7 +17320,7 @@ mod tests {
             "fixture SSD extends above the retained client: {decoration_y}"
         );
 
-        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let payload_id = resolved.lifecycle.samples[0].payload_id;
         let input_state = crate::native_output::NativeInputState::new(320, 200);
         let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
         let request = frame_renderer.egl_scene_draw_request(
@@ -16927,7 +17378,7 @@ mod tests {
             .next()
             .expect("frozen lifecycle effect source is retained")
             .clone();
-        let lamp = harness.renderer.lamp_samples[0];
+        let lamp = harness.renderer.lifecycle_samples[0];
         harness
             .renderer
             .capture_lifecycle_visual_source(&source, lamp, texture.clone(), framebuffer_origin)
@@ -17059,7 +17510,7 @@ mod tests {
         );
         resolved.lifecycle =
             lifecycle_effect_sample(0.45, LifecycleDirection::Minimize, 616, 1, alpha_scene);
-        resolved.lifecycle.lamps[0].visual_group = LifecycleVisualGroup::from_bounds(
+        resolved.lifecycle.samples[0].visual_group = LifecycleVisualGroup::from_bounds(
             PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("canonical client rect"),
             PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
             PresentationRect::new(60.0, 60.0, 180.0, 100.0).expect("presented client rect"),
@@ -17068,7 +17519,7 @@ mod tests {
             200,
         )
         .expect("expanded alpha visual group");
-        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let payload_id = resolved.lifecycle.samples[0].payload_id;
         let input_state = crate::native_output::NativeInputState::new(320, 200);
         let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
         let request = frame_renderer.egl_scene_draw_request(
@@ -17176,8 +17627,8 @@ mod tests {
                 oblivion_one::effects::builtin_background_blur_program_id(),
             ),
         );
-        let identity = resolved.lifecycle.lamps[0].presentation_identity;
-        let payload_id = resolved.lifecycle.lamps[0].payload_id;
+        let identity = resolved.lifecycle.samples[0].presentation_identity;
+        let payload_id = resolved.lifecycle.samples[0].payload_id;
         let input_state = crate::native_output::NativeInputState::new(320, 200);
         let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
         let request = frame_renderer.egl_scene_draw_request(
@@ -17462,11 +17913,11 @@ mod tests {
     fn lamp_mesh_identity_includes_sink_geometry() {
         let baseline = lamp_test_sample(0.5);
         let mut changed = baseline.clone();
-        changed.lamps[0].visual_group.sink_rect = PresentationRect::new(
-            changed.lamps[0].visual_group.sink_rect.x(),
-            changed.lamps[0].visual_group.sink_rect.y() + 1.0,
-            changed.lamps[0].visual_group.sink_rect.width(),
-            changed.lamps[0].visual_group.sink_rect.height(),
+        changed.samples[0].visual_group.sink_rect = PresentationRect::new(
+            changed.samples[0].visual_group.sink_rect.x(),
+            changed.samples[0].visual_group.sink_rect.y() + 1.0,
+            changed.samples[0].visual_group.sink_rect.width(),
+            changed.samples[0].visual_group.sink_rect.height(),
         )
         .expect("valid changed sink rectangle");
         assert_ne!(
@@ -17484,13 +17935,14 @@ mod tests {
     #[test]
     fn lifecycle_source_requires_exact_owner_payload_and_root() {
         let sample = lamp_test_sample(0.5);
-        let first = sample.lamps[0];
+        let first = LifecycleFrameSnapshot::from_sample(&sample).samples[0];
         let next_identity = test_lifecycle_identity(first.window_id, 2);
         let mut reversed = sample.clone();
-        reversed.lamps[0].presentation_identity = next_identity;
-        reversed.visual_sources[0].presentation_identity = next_identity;
+        reversed.samples[0].presentation_identity = next_identity;
+        reversed.samples[0].visual_source.presentation_identity = next_identity;
+        let reversed_frame = LifecycleFrameSnapshot::from_sample(&reversed).samples[0];
 
-        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed.lamps[0]).is_some());
+        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed_frame).is_some());
 
         let wrong_payload =
             compositor::PresentationRetainedVisualPayloadId::from_origin_identity(next_identity);
@@ -17505,19 +17957,21 @@ mod tests {
             first.payload_id,
             LifecycleVisualSourceKind::ResolvedOwnedEffects,
         ));
-        reversed.lamps[0].payload_id = wrong_payload;
-        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed.lamps[0]).is_none());
+        reversed.samples[0].payload_id = wrong_payload;
+        let reversed_frame = LifecycleFrameSnapshot::from_sample(&reversed).samples[0];
+        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed_frame).is_none());
 
-        reversed.lamps[0].payload_id = first.payload_id;
-        reversed.lamps[0].root_surface_id = 2;
-        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed.lamps[0]).is_none());
+        reversed.samples[0].payload_id = first.payload_id;
+        reversed.samples[0].root_surface_id = 2;
+        let reversed_frame = LifecycleFrameSnapshot::from_sample(&reversed).samples[0];
+        assert!(lifecycle_visual_source_for_lamp(&reversed, reversed_frame).is_none());
     }
 
     #[test]
     fn frozen_visual_signature_survives_reversal_but_changes_for_fresh_payload() {
         let first_sample = lamp_test_sample(0.5);
-        let first_lamp = first_sample.lamps[0];
-        let first_source = &first_sample.visual_sources[0];
+        let first_lamp = LifecycleFrameSnapshot::from_sample(&first_sample).samples[0];
+        let first_source = &first_sample.samples[0].visual_source;
         let next_identity = test_lifecycle_identity(first_lamp.window_id, 2);
         let mut reversed_lamp = first_lamp;
         reversed_lamp.presentation_identity = next_identity;
@@ -17533,7 +17987,7 @@ mod tests {
 
         let fresh_payload =
             compositor::PresentationRetainedVisualPayloadId::from_origin_identity(next_identity);
-        let fresh_lamp = LampWindowSample {
+        let fresh_lamp = LifecycleFrameSample {
             presentation_identity: next_identity,
             payload_id: fresh_payload,
             ..first_lamp
@@ -17573,6 +18027,160 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].presentation_identity, first);
         assert_eq!(commands[1].presentation_identity, second);
+    }
+
+    #[test]
+    fn squash_resolved_source_is_one_quad_and_does_not_use_lamp_mesh() {
+        let mut harness = GlesEffectTestHarness::new(320, 200);
+        let mut lifecycle = lamp_test_sample(0.5);
+        let sample = &mut lifecycle.samples[0];
+        let source =
+            PresentationRect::new(100.0, 80.0, 160.0, 100.0).expect("source client rectangle");
+        let anchor =
+            PresentationRect::new(240.0, 140.0, 48.0, 32.0).expect("taskbar anchor rectangle");
+        sample.effect = LifecycleEffectKind::Squash;
+        sample.visual_group = LifecycleVisualGroup::from_effect_bounds(
+            LifecycleEffectKind::Squash,
+            source,
+            source,
+            source,
+            anchor,
+            320,
+            200,
+        )
+        .expect("valid Squash visual group");
+        sample.visual_source.kind = LifecycleVisualSourceKind::ResolvedOwnedEffects;
+        harness
+            .renderer
+            .rebuild_squash_commands(&lifecycle, &[], &[], 1.0);
+
+        assert_eq!(harness.renderer.squash_vertices.len(), 6);
+        assert_eq!(harness.renderer.squash_commands.len(), 1);
+        assert!(matches!(
+            harness.renderer.squash_commands[0].command.layer,
+            EglDrawLayer::LifecycleResolvedVisual(_)
+        ));
+        assert!(harness.renderer.lamp_vertices.is_empty());
+        assert!(harness.renderer.lamp_commands.is_empty());
+    }
+
+    #[test]
+    fn squash_missing_retained_texture_falls_back_without_render_evidence() {
+        let mut harness = GlesEffectTestHarness::new(320, 200);
+        let mut lifecycle = lamp_test_sample(0.5);
+        let sample = &mut lifecycle.samples[0];
+        let source =
+            PresentationRect::new(100.0, 80.0, 160.0, 100.0).expect("source client rectangle");
+        let anchor =
+            PresentationRect::new(240.0, 140.0, 48.0, 32.0).expect("taskbar anchor rectangle");
+        sample.effect = LifecycleEffectKind::Squash;
+        sample.visual_group = LifecycleVisualGroup::from_effect_bounds(
+            LifecycleEffectKind::Squash,
+            source,
+            source,
+            source,
+            anchor,
+            320,
+            200,
+        )
+        .expect("valid Squash visual group");
+        let retained_surface = lifecycle_test_surface(
+            1,
+            100,
+            80,
+            160,
+            100,
+            0xffee_8844,
+            &mut BufferIdAllocator::default(),
+        );
+        harness.renderer.lifecycle_samples =
+            LifecycleFrameSnapshot::from_sample(&lifecycle).samples;
+        harness.renderer.rebuild_squash_commands(
+            &lifecycle,
+            std::slice::from_ref(&retained_surface),
+            &[],
+            1.0,
+        );
+
+        harness
+            .renderer
+            .draw_squash_overlay(None)
+            .expect("missing retained texture is a recoverable lifecycle fallback");
+        assert_eq!(harness.renderer.lifecycle_render_fallbacks.failed.len(), 1);
+        assert_eq!(
+            harness.renderer.lifecycle_render_fallbacks.failed[0].effect,
+            LifecycleEffectKind::Squash
+        );
+        assert!(
+            harness
+                .renderer
+                .lifecycle_render_evidence
+                .consumed
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn squash_affine_quad_preserves_uvs_for_both_framebuffer_origins() {
+        let source =
+            PresentationRect::new(100.0, 80.0, 160.0, 100.0).expect("source client rectangle");
+        let anchor =
+            PresentationRect::new(240.0, 140.0, 48.0, 32.0).expect("taskbar anchor rectangle");
+        let group = LifecycleVisualGroup::from_effect_bounds(
+            LifecycleEffectKind::Squash,
+            source,
+            source,
+            source,
+            anchor,
+            320,
+            200,
+        )
+        .expect("valid Squash visual group");
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let mut vertices = Vec::new();
+            let mut commands = Vec::new();
+            push_draw_command(
+                &mut vertices,
+                &mut commands,
+                EglDrawLayer::Surface(7),
+                EglRect::new(110.0, 90.0, 40.0, 30.0),
+                320,
+                200,
+                origin,
+            );
+            let original_uvs = vertices.iter().map(|vertex| vertex.uv).collect::<Vec<_>>();
+            let original_first = ndc_to_output_point(vertices[0].position, (320, 200), origin);
+
+            assert!(transform_squash_geometry(
+                &mut vertices,
+                &mut commands,
+                group,
+                0.5,
+                1.0,
+                (320, 200),
+                origin,
+            ));
+            assert_eq!(
+                vertices.iter().map(|vertex| vertex.uv).collect::<Vec<_>>(),
+                original_uvs
+            );
+            let transformed_first = ndc_to_output_point(vertices[0].position, (320, 200), origin);
+            let current = oblivion_one::window_lifecycle_animation::squash_client_rect_at_progress(
+                source, anchor, 0.5,
+            )
+            .expect("finite midpoint client rectangle");
+            let expected = [
+                current.x() + (original_first[0] - source.x()) * current.width() / source.width(),
+                current.y() + (original_first[1] - source.y()) * current.height() / source.height(),
+            ];
+            assert!((transformed_first[0] - expected[0]).abs() < 1e-4);
+            assert!((transformed_first[1] - expected[1]).abs() < 1e-4);
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].vertex_count, 6);
+        }
     }
 
     #[test]
@@ -17686,9 +18294,11 @@ mod tests {
                 LegacySceneScissoredPhase::PrepareLifecycleSources,
                 LegacySceneScissoredPhase::RestoreRepairScissor(0),
                 LegacySceneScissoredPhase::Lamp(0),
+                LegacySceneScissoredPhase::Squash(0),
                 LegacySceneScissoredPhase::ExternalOverlays(0),
                 LegacySceneScissoredPhase::RestoreRepairScissor(1),
                 LegacySceneScissoredPhase::Lamp(1),
+                LegacySceneScissoredPhase::Squash(1),
                 LegacySceneScissoredPhase::ExternalOverlays(1),
             ]
         );

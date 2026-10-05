@@ -3,7 +3,9 @@ use oblivion_one::compositor::{
     PresentationFrameSnapshot, PresentedCanonicalSceneSnapshot, WindowExitFrameEvidence,
 };
 use oblivion_one::effects::EffectRect;
-use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, lamp_footprint};
+use oblivion_one::window_lifecycle_animation::{
+    LifecycleFrameSnapshot, lifecycle_visual_transition_bounds,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeFrameSceneSnapshot {
@@ -397,10 +399,14 @@ fn lifecycle_damage_rects(
     output_height: u32,
 ) -> Vec<NativeDamageRect> {
     snapshot
-        .lamps
+        .samples
         .iter()
-        .filter_map(|lamp| {
-            let footprint = lamp_footprint(lamp.visual_group)?;
+        .filter_map(|sample| {
+            let footprint = lifecycle_visual_transition_bounds(
+                sample.effect,
+                sample.visual_group,
+                sample.progress,
+            )?;
             let left = footprint.x();
             let top = footprint.y();
             let right = footprint.x() + footprint.width();
@@ -419,13 +425,15 @@ fn lifecycle_damage_rects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oblivion_one::compositor::ResolvedEffectScene;
     use oblivion_one::core::SceneNodeId;
     use oblivion_one::presentation_animation::{
         AnimationTime, PresentationEngine, PresentationRetainedVisualIdentity,
         PresentationRetainedVisualKind,
     };
     use oblivion_one::window_lifecycle_animation::{
-        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleVisualGroup,
+        LifecycleDirection, LifecycleEffectKind, LifecycleSceneSample, LifecycleVisualGroup,
+        LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
     };
 
     fn retained_identity(
@@ -559,7 +567,7 @@ mod tests {
         let presentation_identity = retained_identity(window_id, 1);
         LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
             sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
-            lamps: vec![LampWindowSample {
+            samples: vec![LifecycleWindowSample {
                 window_id,
                 root_surface_id: 7,
                 presentation_identity,
@@ -570,12 +578,22 @@ mod tests {
                     source, source, source, anchor, 1920, 1080,
                 )
                 .expect("valid visual group"),
+                visual_source: LifecycleVisualSource {
+                    window_id,
+                    root_surface_id: 7,
+                    presentation_identity,
+                    payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                        presentation_identity,
+                    ),
+                    kind: LifecycleVisualSourceKind::NoOwnedEffects,
+                    effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
+                },
+                effect: LifecycleEffectKind::Lamp,
                 progress,
-                opacity: if progress >= 1.0 { 0.0 } else { 1.0 },
+                effect_opacity: if progress >= 1.0 { 0.0 } else { 1.0 },
                 mathematically_settled: progress >= 1.0,
                 direction: LifecycleDirection::Minimize,
             }],
-            visual_sources: Vec::new(),
         })
     }
 
@@ -598,7 +616,7 @@ mod tests {
                 .presented_snapshot()
                 .expect("initial scene is presented")
                 .lifecycle
-                .lamps[0]
+                .samples[0]
                 .progress,
             0.5
         );
@@ -608,7 +626,7 @@ mod tests {
                 .presented_snapshot()
                 .expect("promoted scene is presented")
                 .lifecycle
-                .lamps[0]
+                .samples[0]
                 .mathematically_settled
         );
     }
@@ -628,7 +646,7 @@ mod tests {
         let presentation_identity = retained_identity(window_id, 8);
         let snapshot = LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
             sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
-            lamps: vec![LampWindowSample {
+            samples: vec![LifecycleWindowSample {
                 window_id,
                 root_surface_id: 8,
                 presentation_identity,
@@ -636,12 +654,22 @@ mod tests {
                     presentation_identity,
                 ),
                 visual_group: group,
+                visual_source: LifecycleVisualSource {
+                    window_id,
+                    root_surface_id: 8,
+                    presentation_identity,
+                    payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                        presentation_identity,
+                    ),
+                    kind: LifecycleVisualSourceKind::NoOwnedEffects,
+                    effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
+                },
+                effect: LifecycleEffectKind::Lamp,
                 progress: 0.5,
-                opacity: 1.0,
+                effect_opacity: 1.0,
                 mathematically_settled: false,
                 direction: LifecycleDirection::Minimize,
             }],
-            visual_sources: Vec::new(),
         });
 
         let damage = lifecycle_damage_rects(&snapshot, 1920, 1080);

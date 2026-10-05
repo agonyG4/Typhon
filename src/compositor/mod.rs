@@ -717,6 +717,7 @@ pub struct CompositorState {
     retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,
     window_exit_payloads: state::WindowExitPayloadStore,
     lifecycle_animation_renderer_available: Option<bool>,
+    lifecycle_squash_renderer_available: Option<bool>,
     presented_lifecycle_physical: state::PresentedLifecyclePhysicalState,
     presented_presentation: Option<PresentationFrameSnapshot>,
     presented_canonical_scene: Option<PresentedCanonicalSceneSnapshot>,

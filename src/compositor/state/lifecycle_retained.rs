@@ -289,6 +289,8 @@ mod tests {
                 LifecycleMotionRequest {
                     presentation_identity: motion_only_identity,
                     direction: LifecycleDirection::Minimize,
+                    effect: crate::window_lifecycle_animation::LifecycleEffectKind::Lamp,
+                    canonical_opacity: 1.0,
                 },
                 None,
                 AnimationTime::from_nanos(0),
@@ -297,8 +299,7 @@ mod tests {
             .expect("motion-only executor entry");
 
         let sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(1));
-        assert!(sample.lamps.is_empty());
-        assert!(sample.visual_sources.is_empty());
+        assert!(sample.samples.is_empty());
         assert!(!state.lifecycle_animation_has_pending_visible());
         assert!(!state.has_unowned_frame_work());
         assert!(

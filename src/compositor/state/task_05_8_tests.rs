@@ -44,6 +44,7 @@ mod task_05_8_tests {
                 configuration,
                 crate::animation_control::AnimationRuntimeCapabilities {
                     lamp_renderer: true,
+                    squash_renderer: false,
                 },
             )
             .expect("animation test configuration");

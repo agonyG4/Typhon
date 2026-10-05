@@ -1090,7 +1090,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .map(|surface| surface.surface_id)
                             .collect::<Vec<_>>();
                         let (canonical_surface_count, retained_surface_count) = lifecycle
-                            .lamps
+                            .samples
                             .first()
                             .and_then(|lamp| server.state.window(lamp.window_id))
                             .map(|window| {
@@ -1117,7 +1117,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .instances
                                 .len(),
                             lifecycle_resolved_effect_instance_count: lifecycle
-                                .lamps
+                                .samples
                                 .first()
                                 .and_then(|lamp| lifecycle.visual_source_for_window(lamp.window_id))
                                 .map_or(0, |source| source.effect_scene.instances.len()),

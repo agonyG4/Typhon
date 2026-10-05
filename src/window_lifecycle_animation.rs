@@ -1,3 +1,4 @@
+use crate::animation_control::AnimationEffect;
 use crate::compositor::{PresentationRetainedVisualPayloadId, ResolvedEffectScene};
 use crate::core::WindowId;
 use crate::presentation_animation::{
@@ -45,6 +46,29 @@ pub enum LifecycleDirection {
     Restore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleEffectKind {
+    Lamp,
+    Squash,
+}
+
+impl LifecycleEffectKind {
+    pub(crate) const fn from_animation_effect(effect: AnimationEffect) -> Option<Self> {
+        match effect {
+            AnimationEffect::MinimizeLamp => Some(Self::Lamp),
+            AnimationEffect::MinimizeSquash => Some(Self::Squash),
+            _ => None,
+        }
+    }
+
+    const fn base_duration_ms(self) -> u64 {
+        match self {
+            Self::Lamp => ASTREA_LAMP_BASE_DURATION_MS,
+            Self::Squash => crate::window_lifecycle_squash::MINIMIZE_SQUASH_BASE_DURATION_MS,
+        }
+    }
+}
+
 impl LifecycleDirection {
     const fn target_progress(self) -> f64 {
         match self {
@@ -83,6 +107,77 @@ pub struct LifecycleVisualGroup {
 }
 
 impl LifecycleVisualGroup {
+    pub fn from_effect_bounds(
+        effect: LifecycleEffectKind,
+        canonical_client_rect: PresentationRect,
+        canonical_visual_rect: PresentationRect,
+        presented_source_client_rect: PresentationRect,
+        anchor_rect: PresentationRect,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<Self> {
+        match effect {
+            LifecycleEffectKind::Lamp => Self::from_bounds(
+                canonical_client_rect,
+                canonical_visual_rect,
+                presented_source_client_rect,
+                anchor_rect,
+                output_width,
+                output_height,
+            ),
+            LifecycleEffectKind::Squash => Self::from_squash_bounds(
+                canonical_client_rect,
+                canonical_visual_rect,
+                presented_source_client_rect,
+                anchor_rect,
+                output_width,
+                output_height,
+            ),
+        }
+    }
+
+    fn from_squash_bounds(
+        canonical_client_rect: PresentationRect,
+        canonical_visual_rect: PresentationRect,
+        presented_source_client_rect: PresentationRect,
+        anchor_rect: PresentationRect,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<Self> {
+        if !valid_lamp_rects(
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+        ) || !valid_rect(anchor_rect)
+        {
+            return None;
+        }
+        let presented_source_visual_rect = presented_visual_rect(
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+        )?;
+        Some(Self {
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+            presented_source_visual_rect,
+            anchor_rect,
+            // These Lamp-only members remain populated so retained payloads
+            // share one visual-group identity; Squash never consumes them.
+            portal_rect: anchor_rect,
+            sink_rect: anchor_rect,
+            lamp_direction: infer_lamp_direction(
+                presented_source_visual_rect,
+                anchor_rect,
+                output_width,
+                output_height,
+            ),
+            shape_factor: 0.0,
+            bump_distance: 0.0,
+        })
+    }
+
     pub fn from_bounds(
         canonical_client_rect: PresentationRect,
         canonical_visual_rect: PresentationRect,
@@ -148,30 +243,35 @@ pub struct LifecycleVisualSource {
     pub effect_scene: Arc<ResolvedEffectScene>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LifecycleMotionRequest {
+    pub(crate) presentation_identity: PresentationRetainedVisualIdentity,
+    pub(crate) direction: LifecycleDirection,
+    pub(crate) effect: LifecycleEffectKind,
+    pub(crate) canonical_opacity: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LifecycleMotionSample {
+    pub(crate) presentation_identity: PresentationRetainedVisualIdentity,
+    pub(crate) progress: f64,
+    pub(crate) effect_opacity: f64,
+    pub(crate) effect: LifecycleEffectKind,
+    pub(crate) direction: LifecycleDirection,
+    pub(crate) mathematically_settled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct LifecycleMotionRequest {
-    pub presentation_identity: PresentationRetainedVisualIdentity,
-    pub direction: LifecycleDirection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LifecycleMotionSample {
-    pub presentation_identity: PresentationRetainedVisualIdentity,
-    pub progress: f64,
-    pub opacity: f64,
-    pub direction: LifecycleDirection,
-    pub mathematically_settled: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LampWindowSample {
+pub struct LifecycleWindowSample {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
     pub payload_id: PresentationRetainedVisualPayloadId,
     pub visual_group: LifecycleVisualGroup,
+    pub visual_source: LifecycleVisualSource,
+    pub effect: LifecycleEffectKind,
     pub progress: f64,
-    pub opacity: f64,
+    pub effect_opacity: f64,
     pub direction: LifecycleDirection,
     pub mathematically_settled: bool,
 }
@@ -179,8 +279,7 @@ pub struct LampWindowSample {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleSceneSample {
     pub sampled_at: AnimationTime,
-    pub lamps: Vec<LampWindowSample>,
-    pub visual_sources: Vec<LifecycleVisualSource>,
+    pub samples: Vec<LifecycleWindowSample>,
 }
 
 impl LifecycleSceneSample {
@@ -188,44 +287,48 @@ impl LifecycleSceneSample {
     /// authoritative sample. The set is a frame projection, never stored state.
     #[cfg(test)]
     pub(crate) fn restore_suppressed_roots(&self) -> std::collections::HashSet<u32> {
-        self.lamps
+        self.samples
             .iter()
-            .filter(|lamp| lamp.direction == LifecycleDirection::Restore)
-            .map(|lamp| lamp.root_surface_id)
+            .filter(|sample| sample.direction == LifecycleDirection::Restore)
+            .map(|sample| sample.root_surface_id)
             .collect()
     }
 
     pub(crate) fn restore_suppresses_root(&self, root_surface_id: u32) -> bool {
-        self.lamps.iter().any(|lamp| {
-            lamp.root_surface_id == root_surface_id && lamp.direction == LifecycleDirection::Restore
+        self.samples.iter().any(|sample| {
+            sample.root_surface_id == root_surface_id
+                && sample.direction == LifecycleDirection::Restore
         })
     }
 
     pub fn visual_source_for_window(&self, window_id: WindowId) -> Option<&LifecycleVisualSource> {
-        self.visual_sources
+        self.samples
             .iter()
-            .find(|source| source.window_id == window_id)
+            .find(|sample| sample.window_id == window_id)
+            .map(|sample| &sample.visual_source)
     }
 
     pub fn visual_source_for_identity(
         &self,
         presentation_identity: PresentationRetainedVisualIdentity,
     ) -> Option<&LifecycleVisualSource> {
-        self.visual_sources
+        self.samples
             .iter()
-            .find(|source| source.presentation_identity == presentation_identity)
+            .find(|sample| sample.presentation_identity == presentation_identity)
+            .map(|sample| &sample.visual_source)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LifecycleFrameLamp {
+pub struct LifecycleFrameSample {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
     pub payload_id: PresentationRetainedVisualPayloadId,
     pub visual_group: LifecycleVisualGroup,
+    pub effect: LifecycleEffectKind,
     pub progress: f64,
-    pub opacity: f64,
+    pub effect_opacity: f64,
     pub mathematically_settled: bool,
     pub direction: LifecycleDirection,
 }
@@ -233,31 +336,32 @@ pub struct LifecycleFrameLamp {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LifecycleFrameSnapshot {
     pub sampled_at: Option<AnimationTime>,
-    pub lamps: Vec<LifecycleFrameLamp>,
+    pub samples: Vec<LifecycleFrameSample>,
     pub signature: u64,
 }
 
 impl LifecycleFrameSnapshot {
     pub fn from_sample(sample: &LifecycleSceneSample) -> Self {
-        let lamps = sample
-            .lamps
+        let samples = sample
+            .samples
             .iter()
-            .map(|lamp| LifecycleFrameLamp {
-                window_id: lamp.window_id,
-                root_surface_id: lamp.root_surface_id,
-                presentation_identity: lamp.presentation_identity,
-                payload_id: lamp.payload_id,
-                visual_group: lamp.visual_group,
-                progress: lamp.progress,
-                opacity: lamp.opacity,
-                mathematically_settled: lamp.mathematically_settled,
-                direction: lamp.direction,
+            .map(|sample| LifecycleFrameSample {
+                window_id: sample.window_id,
+                root_surface_id: sample.root_surface_id,
+                presentation_identity: sample.presentation_identity,
+                payload_id: sample.payload_id,
+                visual_group: sample.visual_group,
+                effect: sample.effect,
+                progress: sample.progress,
+                effect_opacity: sample.effect_opacity,
+                mathematically_settled: sample.mathematically_settled,
+                direction: sample.direction,
             })
             .collect::<Vec<_>>();
-        let signature = lifecycle_snapshot_signature(&lamps);
+        let signature = lifecycle_snapshot_signature(&samples);
         Self {
             sampled_at: Some(sample.sampled_at),
-            lamps,
+            samples,
             signature,
         }
     }
@@ -267,11 +371,11 @@ impl LifecycleFrameSnapshot {
         evidence: &LifecycleRenderEvidence,
     ) -> Self {
         let mut snapshot = Self::from_sample(sample);
-        snapshot.lamps.retain(|lamp| {
+        snapshot.samples.retain(|sample| {
             evidence.contains(
-                lamp.presentation_identity,
-                lamp.payload_id,
-                lamp.root_surface_id,
+                sample.presentation_identity,
+                sample.payload_id,
+                sample.root_surface_id,
             )
         });
         snapshot.refresh_signature();
@@ -279,17 +383,17 @@ impl LifecycleFrameSnapshot {
     }
 
     pub const fn is_empty(&self) -> bool {
-        self.lamps.is_empty()
+        self.samples.is_empty()
     }
 
     pub fn contains_visible_non_identity(&self) -> bool {
-        self.lamps
+        self.samples
             .iter()
-            .any(|lamp| !lamp.mathematically_settled && lamp.opacity > f64::EPSILON)
+            .any(|sample| !sample.mathematically_settled && sample.effect_opacity > f64::EPSILON)
     }
 
     pub fn refresh_signature(&mut self) {
-        self.signature = lifecycle_snapshot_signature(&self.lamps);
+        self.signature = lifecycle_snapshot_signature(&self.samples);
     }
 }
 
@@ -353,6 +457,7 @@ pub struct LifecycleRenderFallbackEntry {
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
     pub payload_id: PresentationRetainedVisualPayloadId,
+    pub effect: LifecycleEffectKind,
     pub reason: LifecycleRenderFallbackReason,
 }
 
@@ -440,74 +545,215 @@ pub fn lamp_footprint_intersects_output(
         && footprint.y() + footprint.height() > 0.0
 }
 
-fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
+pub fn lifecycle_visual_transition_bounds(
+    effect: LifecycleEffectKind,
+    visual_group: LifecycleVisualGroup,
+    progress: f64,
+) -> Option<PresentationRect> {
+    match effect {
+        LifecycleEffectKind::Lamp => lamp_footprint(visual_group),
+        LifecycleEffectKind::Squash => {
+            let _current_visual = crate::window_lifecycle_squash::squash_visual_rect(
+                visual_group.presented_source_client_rect,
+                visual_group.anchor_rect,
+                visual_group.presented_source_visual_rect,
+                progress,
+            )?;
+            crate::window_lifecycle_squash::squash_visual_transition_bounds(
+                visual_group.presented_source_client_rect,
+                visual_group.anchor_rect,
+                visual_group.presented_source_visual_rect,
+            )
+        }
+    }
+}
+
+pub(crate) fn lifecycle_visual_bounds_intersect_output(
+    effect: LifecycleEffectKind,
+    visual_group: LifecycleVisualGroup,
+    progress: f64,
+    output_width: u32,
+    output_height: u32,
+) -> bool {
+    lifecycle_visual_transition_bounds(effect, visual_group, progress).is_some_and(|bounds| {
+        bounds.x() < f64::from(output_width)
+            && bounds.y() < f64::from(output_height)
+            && bounds.x() + bounds.width() > 0.0
+            && bounds.y() + bounds.height() > 0.0
+    })
+}
+
+pub fn visible_lifecycle_samples(
+    samples: &[LifecycleFrameSample],
+    output_scale: f64,
+    output_width: u32,
+    output_height: u32,
+) -> impl Iterator<Item = LifecycleFrameSample> + '_ {
+    let output_scale = if output_scale.is_finite() {
+        output_scale.max(1.0)
+    } else {
+        1.0
+    };
+    samples.iter().copied().filter(move |sample| {
+        lifecycle_visual_transition_bounds(sample.effect, sample.visual_group, sample.progress)
+            .is_some_and(|bounds| {
+                let x = bounds.x() * output_scale;
+                let y = bounds.y() * output_scale;
+                let width = bounds.width() * output_scale;
+                let height = bounds.height() * output_scale;
+                x < f64::from(output_width)
+                    && y < f64::from(output_height)
+                    && x + width > 0.0
+                    && y + height > 0.0
+            })
+    })
+}
+
+pub(crate) fn lifecycle_sample_requires_physical_ack(
+    effect: LifecycleEffectKind,
+    visual_group: LifecycleVisualGroup,
+    progress: f64,
+    effect_opacity: f64,
+    mathematically_settled: bool,
+    output_width: u32,
+    output_height: u32,
+) -> bool {
+    lifecycle_visual_bounds_intersect_output(
+        effect,
+        visual_group,
+        progress,
+        output_width,
+        output_height,
+    ) && (effect_opacity > f64::EPSILON
+        || (effect == LifecycleEffectKind::Squash && mathematically_settled))
+}
+
+pub fn squash_client_rect_at_progress(
+    source_client_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    progress: f64,
+) -> Option<PresentationRect> {
+    crate::window_lifecycle_squash::squash_client_rect(source_client_rect, anchor_rect, progress)
+}
+
+pub fn squash_transform_rect(
+    source_client_rect: PresentationRect,
+    current_client_rect: PresentationRect,
+    source_rect: PresentationRect,
+) -> Option<PresentationRect> {
+    crate::window_lifecycle_squash::squash_transform_rect(
+        source_client_rect,
+        current_client_rect,
+        source_rect,
+    )
+}
+
+pub fn squash_visual_rect_at_progress(
+    source_client_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    source_visual_rect: PresentationRect,
+    progress: f64,
+) -> Option<PresentationRect> {
+    crate::window_lifecycle_squash::squash_visual_rect(
+        source_client_rect,
+        anchor_rect,
+        source_visual_rect,
+        progress,
+    )
+}
+
+fn lifecycle_snapshot_signature(samples: &[LifecycleFrameSample]) -> u64 {
     let mut signature = 0xcbf2_9ce4_8422_2325_u64;
-    for lamp in lamps {
+    for sample in samples {
         for value in [
-            lamp.window_id.get(),
-            u64::from(lamp.root_surface_id),
-            lamp.presentation_identity.scene_node_id().get(),
-            match lamp.presentation_identity.kind() {
+            sample.window_id.get(),
+            u64::from(sample.root_surface_id),
+            sample.presentation_identity.scene_node_id().get(),
+            match sample.presentation_identity.kind() {
                 crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle => 1,
                 crate::presentation_animation::PresentationRetainedVisualKind::WindowExit => 2,
             },
-            lamp.presentation_identity.transaction_id().get(),
-            lamp.presentation_identity.revision_id().get(),
-            lamp.payload_id.get(),
-            lamp.visual_group.canonical_client_rect.x().to_bits(),
-            lamp.visual_group.canonical_client_rect.y().to_bits(),
-            lamp.visual_group.canonical_client_rect.width().to_bits(),
-            lamp.visual_group.canonical_client_rect.height().to_bits(),
-            lamp.visual_group.canonical_visual_rect.x().to_bits(),
-            lamp.visual_group.canonical_visual_rect.y().to_bits(),
-            lamp.visual_group.canonical_visual_rect.width().to_bits(),
-            lamp.visual_group.canonical_visual_rect.height().to_bits(),
-            lamp.visual_group.presented_source_client_rect.x().to_bits(),
-            lamp.visual_group.presented_source_client_rect.y().to_bits(),
-            lamp.visual_group
+            sample.presentation_identity.transaction_id().get(),
+            sample.presentation_identity.revision_id().get(),
+            sample.payload_id.get(),
+            sample.visual_group.canonical_client_rect.x().to_bits(),
+            sample.visual_group.canonical_client_rect.y().to_bits(),
+            sample.visual_group.canonical_client_rect.width().to_bits(),
+            sample.visual_group.canonical_client_rect.height().to_bits(),
+            sample.visual_group.canonical_visual_rect.x().to_bits(),
+            sample.visual_group.canonical_visual_rect.y().to_bits(),
+            sample.visual_group.canonical_visual_rect.width().to_bits(),
+            sample.visual_group.canonical_visual_rect.height().to_bits(),
+            sample
+                .visual_group
+                .presented_source_client_rect
+                .x()
+                .to_bits(),
+            sample
+                .visual_group
+                .presented_source_client_rect
+                .y()
+                .to_bits(),
+            sample
+                .visual_group
                 .presented_source_client_rect
                 .width()
                 .to_bits(),
-            lamp.visual_group
+            sample
+                .visual_group
                 .presented_source_client_rect
                 .height()
                 .to_bits(),
-            lamp.visual_group.presented_source_visual_rect.x().to_bits(),
-            lamp.visual_group.presented_source_visual_rect.y().to_bits(),
-            lamp.visual_group
+            sample
+                .visual_group
+                .presented_source_visual_rect
+                .x()
+                .to_bits(),
+            sample
+                .visual_group
+                .presented_source_visual_rect
+                .y()
+                .to_bits(),
+            sample
+                .visual_group
                 .presented_source_visual_rect
                 .width()
                 .to_bits(),
-            lamp.visual_group
+            sample
+                .visual_group
                 .presented_source_visual_rect
                 .height()
                 .to_bits(),
-            lamp.visual_group.anchor_rect.x().to_bits(),
-            lamp.visual_group.anchor_rect.y().to_bits(),
-            lamp.visual_group.anchor_rect.width().to_bits(),
-            lamp.visual_group.anchor_rect.height().to_bits(),
-            lamp.visual_group.portal_rect.x().to_bits(),
-            lamp.visual_group.portal_rect.y().to_bits(),
-            lamp.visual_group.portal_rect.width().to_bits(),
-            lamp.visual_group.portal_rect.height().to_bits(),
-            lamp.visual_group.sink_rect.x().to_bits(),
-            lamp.visual_group.sink_rect.y().to_bits(),
-            lamp.visual_group.sink_rect.width().to_bits(),
-            lamp.visual_group.sink_rect.height().to_bits(),
-            lamp.visual_group.shape_factor.to_bits(),
-            lamp.visual_group.bump_distance.to_bits(),
-            lamp.progress.to_bits(),
-            lamp.opacity.to_bits(),
-            u64::from(lamp.mathematically_settled),
-            match lamp.direction {
+            sample.visual_group.anchor_rect.x().to_bits(),
+            sample.visual_group.anchor_rect.y().to_bits(),
+            sample.visual_group.anchor_rect.width().to_bits(),
+            sample.visual_group.anchor_rect.height().to_bits(),
+            sample.visual_group.portal_rect.x().to_bits(),
+            sample.visual_group.portal_rect.y().to_bits(),
+            sample.visual_group.portal_rect.width().to_bits(),
+            sample.visual_group.portal_rect.height().to_bits(),
+            sample.visual_group.sink_rect.x().to_bits(),
+            sample.visual_group.sink_rect.y().to_bits(),
+            sample.visual_group.sink_rect.width().to_bits(),
+            sample.visual_group.sink_rect.height().to_bits(),
+            sample.visual_group.shape_factor.to_bits(),
+            sample.visual_group.bump_distance.to_bits(),
+            sample.progress.to_bits(),
+            sample.effect_opacity.to_bits(),
+            u64::from(sample.mathematically_settled),
+            match sample.direction {
                 LifecycleDirection::Minimize => 1,
                 LifecycleDirection::Restore => 2,
             },
-            match lamp.visual_group.lamp_direction {
+            match sample.visual_group.lamp_direction {
                 LampDirection::Top => 3,
                 LampDirection::Right => 4,
                 LampDirection::Bottom => 5,
                 LampDirection::Left => 6,
+            },
+            match sample.effect {
+                LifecycleEffectKind::Lamp => 7,
+                LifecycleEffectKind::Squash => 8,
             },
         ] {
             signature ^= value;
@@ -521,6 +767,8 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
 struct LifecycleMotionState {
     presentation_identity: PresentationRetainedVisualIdentity,
     direction: LifecycleDirection,
+    effect: LifecycleEffectKind,
+    canonical_opacity: f64,
     start_progress: f64,
     target_progress: f64,
     started_at: AnimationTime,
@@ -575,7 +823,7 @@ impl WindowLifecycleAnimator {
         self.enabled = enabled;
     }
 
-    pub fn start_or_reverse(
+    pub(crate) fn start_or_reverse(
         &mut self,
         request: LifecycleMotionRequest,
         previous_identity: Option<PresentationRetainedVisualIdentity>,
@@ -589,6 +837,8 @@ impl WindowLifecycleAnimator {
         let LifecycleMotionRequest {
             presentation_identity,
             direction,
+            effect: requested_effect,
+            canonical_opacity: requested_canonical_opacity,
         } = request;
         if presentation_identity.kind()
             != crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle
@@ -606,6 +856,12 @@ impl WindowLifecycleAnimator {
         } else {
             None
         };
+        let effect = previous
+            .map(|transition| transition.effect)
+            .unwrap_or(requested_effect);
+        let canonical_opacity = previous
+            .map(|transition| transition.canonical_opacity)
+            .unwrap_or(requested_canonical_opacity);
         let start_progress = previous
             .as_ref()
             .map(|transition| transition_progress(transition, now))
@@ -613,12 +869,28 @@ impl WindowLifecycleAnimator {
                 LifecycleDirection::Minimize => 0.0,
                 LifecycleDirection::Restore => 1.0,
             });
-        let base_duration_nanos = effective_duration_nanos(speed);
         let remaining = (direction.target_progress() - start_progress).abs();
-        let duration_nanos = (base_duration_nanos as f64 * remaining).round() as u64;
+        let duration_nanos = if !self.enabled {
+            0
+        } else {
+            match effect {
+                LifecycleEffectKind::Lamp => {
+                    crate::window_lifecycle_squash::lifecycle_duration_nanos(
+                        effect.base_duration_ms(),
+                        speed,
+                        remaining,
+                    )
+                }
+                LifecycleEffectKind::Squash => {
+                    crate::window_lifecycle_squash::squash_duration_nanos(speed, remaining)
+                }
+            }
+        };
         let transition = LifecycleMotionState {
             presentation_identity,
             direction,
+            effect,
+            canonical_opacity,
             start_progress,
             target_progress: direction.target_progress(),
             started_at: now,
@@ -664,7 +936,7 @@ impl WindowLifecycleAnimator {
         identities
     }
 
-    pub fn sample(
+    pub(crate) fn sample(
         &self,
         presentation_identity: PresentationRetainedVisualIdentity,
         now: AnimationTime,
@@ -745,7 +1017,14 @@ fn sample_transition(
     LifecycleMotionSample {
         presentation_identity: transition.presentation_identity,
         progress,
-        opacity: lamp_opacity(progress),
+        effect_opacity: match transition.effect {
+            LifecycleEffectKind::Lamp => lamp_opacity(progress),
+            LifecycleEffectKind::Squash => crate::window_lifecycle_squash::squash_opacity(
+                progress,
+                transition.canonical_opacity,
+            ),
+        },
+        effect: transition.effect,
         direction: transition.direction,
         mathematically_settled: (progress - transition.target_progress).abs() <= f64::EPSILON,
     }
@@ -762,15 +1041,6 @@ fn transition_progress(transition: &LifecycleMotionState, now: AnimationTime) ->
     (transition.start_progress
         + (transition.target_progress - transition.start_progress) * timeline)
         .clamp(0.0, 1.0)
-}
-
-fn effective_duration_nanos(speed: f64) -> u64 {
-    let speed = if speed.is_finite() {
-        speed.clamp(0.5, 2.0)
-    } else {
-        1.0
-    };
-    ((ASTREA_LAMP_BASE_DURATION_MS as f64 * 1_000_000.0) / speed).round() as u64
 }
 
 pub fn canonical_visual_rect(

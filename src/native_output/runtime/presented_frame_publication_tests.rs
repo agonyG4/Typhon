@@ -12,7 +12,7 @@ use oblivion_one::presentation_animation::{
 };
 use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use oblivion_one::window_lifecycle_animation::{
-    LifecycleDirection, LifecycleFrameLamp, LifecycleFrameSnapshot, LifecycleVisualGroup,
+    LifecycleDirection, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleVisualGroup,
 };
 use std::process;
 use wayland_server::protocol::wl_output;
@@ -109,7 +109,7 @@ fn old_physical_lifecycle_lamp(root_surface_id: u32) -> LifecycleFrameSnapshot {
     .expect("valid lifecycle group");
     let mut snapshot = LifecycleFrameSnapshot {
         sampled_at: Some(AnimationTime::from_nanos(1)),
-        lamps: vec![LifecycleFrameLamp {
+        samples: vec![LifecycleFrameSample {
             window_id,
             root_surface_id,
             presentation_identity: retained_identity(window_id, 1),
@@ -118,8 +118,9 @@ fn old_physical_lifecycle_lamp(root_surface_id: u32) -> LifecycleFrameSnapshot {
                     retained_identity(window_id, 1),
                 ),
             visual_group,
+            effect: oblivion_one::window_lifecycle_animation::LifecycleEffectKind::Lamp,
             progress: 0.5,
-            opacity: 1.0,
+            effect_opacity: 1.0,
             mathematically_settled: false,
             direction: LifecycleDirection::Minimize,
         }],
@@ -149,8 +150,8 @@ fn pageflip_promotion_publishes_presentation_and_lifecycle_together() {
         Some(&physical.presentation)
     );
     assert_eq!(
-        server.presented_lifecycle_snapshot_for_test().lamps,
-        physical.lifecycle.lamps
+        server.presented_lifecycle_snapshot_for_test().samples,
+        physical.lifecycle.samples
     );
 }
 
@@ -174,8 +175,8 @@ fn immediate_promotion_publishes_presentation_and_lifecycle_together() {
         Some(&physical.presentation)
     );
     assert_eq!(
-        server.presented_lifecycle_snapshot_for_test().lamps,
-        physical.lifecycle.lamps
+        server.presented_lifecycle_snapshot_for_test().samples,
+        physical.lifecycle.samples
     );
 }
 
@@ -219,7 +220,7 @@ fn pageflip_uses_the_promoted_snapshot_roots_after_canonical_scene_changes() {
     );
     assert_eq!(frozen_roots, [FROZEN_ROOT]);
     assert_eq!(
-        server.presented_lifecycle_snapshot_for_test().lamps.len(),
+        server.presented_lifecycle_snapshot_for_test().samples.len(),
         1
     );
 
@@ -237,8 +238,8 @@ fn pageflip_uses_the_promoted_snapshot_roots_after_canonical_scene_changes() {
         Some(&physical.presentation)
     );
     assert_eq!(
-        server.presented_lifecycle_snapshot_for_test().lamps,
-        physical.lifecycle.lamps,
+        server.presented_lifecycle_snapshot_for_test().samples,
+        physical.lifecycle.samples,
         "exact replacement publication retires the old physical Lamp fallback"
     );
 }
