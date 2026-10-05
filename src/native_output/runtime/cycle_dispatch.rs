@@ -12,11 +12,11 @@ use oblivion_one::control::{
 use oblivion_one::control_snapshots::{
     ActiveWindowSnapshot, ControlStatusSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot, FeatureState,
-    FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputMutationCapabilitiesSnapshot,
-    OutputSnapshot, OutputTransactionSnapshot, OutputTransactionStateSnapshot,
-    OutputTransformSnapshot, PositionSnapshot, ScaleMutationCapabilitySnapshot, StatusSnapshot,
-    TransformMutationCapabilitySnapshot, TrustedEffectsReloadSnapshot, VersionSnapshot,
-    XwaylandStatusSnapshot,
+    FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputModeSnapshot,
+    OutputMutationCapabilitiesSnapshot, OutputSnapshot, OutputTransactionSnapshot,
+    OutputTransactionStateSnapshot, OutputTransformSnapshot, PositionSnapshot,
+    ScaleMutationCapabilitySnapshot, StatusSnapshot, TransformMutationCapabilitySnapshot,
+    TrustedEffectsReloadSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
@@ -147,6 +147,101 @@ impl OutputConfigureArgs {
             && self.mode_id > 0
             && self.scale_milli > 0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputConfigureValidationError {
+    code: ControlErrorCode,
+    message: &'static str,
+}
+
+fn validate_output_configuration_change(
+    args: &OutputConfigureArgs,
+    expected_output_id: &str,
+    output_available: bool,
+    current: NativeAppliedOutputConfiguration,
+    generation: OutputConfigurationGeneration,
+    public_modes: &[OutputModeSnapshot],
+    mode_inventory: &NativeOutputModeInventory,
+    mutation_busy: bool,
+    mode_selection_supported: bool,
+) -> Result<Option<NativeAppliedOutputConfiguration>, OutputConfigureValidationError> {
+    let reject = |code, message| Err(OutputConfigureValidationError { code, message });
+
+    if !args.valid() {
+        return reject(
+            ControlErrorCode::InvalidArgument,
+            "invalid output configuration request",
+        );
+    }
+    if !output_available || args.output_id != expected_output_id {
+        return reject(
+            ControlErrorCode::UnknownOutput,
+            "the requested output is not available",
+        );
+    }
+    if args.base_configuration_generation != generation.get() {
+        return reject(
+            ControlErrorCode::StaleOutputGeneration,
+            "the output configuration generation has changed",
+        );
+    }
+
+    let mode_is_in_public_projection =
+        args.mode_id == current.mode_id || public_modes.iter().any(|mode| mode.id == args.mode_id);
+    let mode = match mode_inventory.resolve(generation, args.mode_id) {
+        Ok(mode) if mode_is_in_public_projection => *mode,
+        _ => {
+            return reject(
+                ControlErrorCode::UnknownOutputMode,
+                "the mode ID is not part of this output configuration generation",
+            );
+        }
+    };
+
+    if mutation_busy {
+        return reject(
+            ControlErrorCode::OutputTransactionActive,
+            "an output configuration transaction is already active",
+        );
+    }
+
+    let no_change = args.mode_id == current.mode_id
+        && args.scale_milli == current.scale_milli
+        && args.transform == current.transform;
+    if no_change {
+        return Ok(None);
+    }
+
+    if args.scale_milli != current.scale_milli {
+        return reject(
+            ControlErrorCode::UnsupportedOutputScale,
+            "canonical output scale mutation is unavailable",
+        );
+    }
+    if args.transform != current.transform {
+        return reject(
+            ControlErrorCode::UnsupportedOutputTransform,
+            "canonical output transform mutation is unavailable",
+        );
+    }
+    if !mode_selection_supported {
+        return reject(
+            ControlErrorCode::UnsupportedOutputMode,
+            "runtime mode selection is unavailable for this output backend",
+        );
+    }
+
+    Ok(Some(NativeAppliedOutputConfiguration {
+        connector_id: current.connector_id,
+        crtc_id: current.crtc_id,
+        mode_id: mode.id,
+        mode: mode.mode,
+        width: u32::from(mode.mode.hdisplay),
+        height: u32::from(mode.mode.vdisplay),
+        scale_milli: current.scale_milli,
+        transform: current.transform,
+    }))
 }
 
 fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
@@ -4090,8 +4185,8 @@ impl NativeRuntime {
         value: serde_json::Value,
     ) -> Option<ControlResponse> {
         let args = match serde_json::from_value::<OutputConfigureArgs>(value) {
-            Ok(args) if args.valid() => args,
-            _ => {
+            Ok(args) => args,
+            Err(_) => {
                 return Some(output_mutation_rejection(
                     request_id,
                     oblivion_one::control::ControlErrorCode::InvalidArgument,
@@ -4100,103 +4195,42 @@ impl NativeRuntime {
             }
         };
         let output_id = format!("output-{}", self.output_id.get());
-        if self.scanout_destroyed || args.output_id != output_id {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::UnknownOutput,
-                "the requested output is not available",
-            ));
-        }
-        if args.base_configuration_generation != self.output_configuration_generation.get() {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::StaleOutputGeneration,
-                "the output configuration generation has changed",
-            ));
-        }
-        let mode_is_in_public_projection = args.mode_id == self.target.mode_id
-            || self
-                .output_capabilities
-                .modes
-                .iter()
-                .any(|mode| mode.id == args.mode_id);
-        if self
-            .output_capabilities
-            .mode_inventory
-            .resolve(self.output_configuration_generation, args.mode_id)
-            .is_err()
-            || !mode_is_in_public_projection
-        {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::UnknownOutputMode,
-                "the mode ID is not part of this output configuration generation",
-            ));
-        }
-        if self.pending_output_configuration.is_some()
+        let mutation_busy = self.pending_output_configuration.is_some()
             || self.output_configuration_transactions.active().is_some()
             || !self.output_configuration_transactions.can_begin()
             || self.pending_output_persistence.is_some()
-            || self.output_persistence_compensation_required
-        {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::OutputTransactionActive,
-                "an output configuration transaction is already active",
-            ));
-        }
-
-        let no_change = args.mode_id == self.target.mode_id
-            && args.scale_milli == self.target.scale_milli
-            && args.transform == self.target.transform;
-        if no_change {
+            || self.output_persistence_compensation_required;
+        let target = match validate_output_configuration_change(
+            &args,
+            &output_id,
+            !self.scanout_destroyed,
+            self.target,
+            self.output_configuration_generation,
+            &self.output_capabilities.modes,
+            &self.output_capabilities.mode_inventory,
+            mutation_busy,
+            self.mode_selection_supported(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                return Some(output_mutation_rejection(
+                    request_id,
+                    error.code,
+                    error.message,
+                ));
+            }
+        };
+        let Some(target) = target else {
             return Some(
                 match serde_json::to_value(self.control_output_list_snapshot()) {
                     Ok(snapshot) => ControlResponse::success(request_id, snapshot),
                     Err(_) => output_mutation_rejection(
                         request_id,
-                        oblivion_one::control::ControlErrorCode::Internal,
+                        ControlErrorCode::Internal,
                         "output snapshot serialization failed",
                     ),
                 },
             );
-        }
-
-        if args.scale_milli != self.target.scale_milli {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::UnsupportedOutputScale,
-                "canonical output scale mutation is unavailable",
-            ));
-        }
-        if args.transform != self.target.transform {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::UnsupportedOutputTransform,
-                "canonical output transform mutation is unavailable",
-            ));
-        }
-        if !self.mode_selection_supported() {
-            return Some(output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::UnsupportedOutputMode,
-                "runtime mode selection is unavailable for this output backend",
-            ));
-        }
-        let mode = *self
-            .output_capabilities
-            .mode_inventory
-            .resolve(self.output_configuration_generation, args.mode_id)
-            .expect("mode resolution was validated above");
-        let target = NativeAppliedOutputConfiguration {
-            connector_id: self.target.connector_id,
-            crtc_id: self.target.crtc_id,
-            mode_id: mode.id,
-            mode: mode.mode,
-            width: u32::from(mode.mode.hdisplay),
-            height: u32::from(mode.mode.vdisplay),
-            scale_milli: self.target.scale_milli,
-            transform: self.target.transform,
         };
         self.enqueue_temporary_output_configuration(token, request_id, target);
         None
@@ -4422,5 +4456,158 @@ mod cursor_doctor_tests {
                 expected,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod output_configuration_validation_tests {
+    use super::*;
+
+    fn native_mode(width: u16, height: u16, clock: u32) -> drm_sys::drm_mode_modeinfo {
+        drm_sys::drm_mode_modeinfo {
+            clock,
+            hdisplay: width,
+            hsync_start: width + 8,
+            hsync_end: width + 16,
+            htotal: width + 32,
+            vdisplay: height,
+            vsync_start: height + 2,
+            vsync_end: height + 4,
+            vtotal: height + 8,
+            vrefresh: 60,
+            ..Default::default()
+        }
+    }
+
+    fn current_configuration() -> NativeAppliedOutputConfiguration {
+        NativeAppliedOutputConfiguration {
+            connector_id: 11,
+            crtc_id: 12,
+            mode_id: 1,
+            mode: native_mode(1920, 1080, 148_352),
+            width: 1920,
+            height: 1080,
+            scale_milli: 1000,
+            transform: OutputTransformSnapshot::Normal,
+        }
+    }
+
+    fn test_inventory() -> (
+        Vec<oblivion_one::control_snapshots::OutputModeSnapshot>,
+        NativeOutputModeInventory,
+    ) {
+        let generation = OutputConfigurationGeneration::initial();
+        let native_modes = [
+            native_mode(1920, 1080, 148_352),
+            native_mode(1280, 720, 74_176),
+        ];
+        let projected = vec![
+            oblivion_one::control_snapshots::OutputModeSnapshot {
+                id: 1,
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60_000,
+                preferred: true,
+                interlaced: false,
+            },
+            oblivion_one::control_snapshots::OutputModeSnapshot {
+                id: 2,
+                width: 1280,
+                height: 720,
+                refresh_millihz: 60_000,
+                preferred: false,
+                interlaced: false,
+            },
+        ];
+        (
+            projected,
+            NativeOutputModeInventory::from_native_modes(generation, &native_modes),
+        )
+    }
+
+    fn args(mode_id: u32) -> OutputConfigureArgs {
+        OutputConfigureArgs {
+            version: 1,
+            output_id: String::from("output-11"),
+            base_configuration_generation: OutputConfigurationGeneration::initial().get(),
+            mode_id,
+            scale_milli: 1000,
+            transform: OutputTransformSnapshot::Normal,
+        }
+    }
+
+    fn validate(
+        args: &OutputConfigureArgs,
+        mutation_busy: bool,
+        mode_selection_supported: bool,
+    ) -> Result<Option<NativeAppliedOutputConfiguration>, OutputConfigureValidationError> {
+        let (public_modes, inventory) = test_inventory();
+        validate_output_configuration_change(
+            args,
+            "output-11",
+            true,
+            current_configuration(),
+            OutputConfigurationGeneration::initial(),
+            &public_modes,
+            &inventory,
+            mutation_busy,
+            mode_selection_supported,
+        )
+    }
+
+    #[test]
+    fn stale_configuration_generation_rejects_before_unknown_mode_resolution() {
+        let mut request = args(99);
+        request.base_configuration_generation += 1;
+
+        let error = validate(&request, false, true).unwrap_err();
+
+        assert_eq!(error.code, ControlErrorCode::StaleOutputGeneration);
+    }
+
+    #[test]
+    fn changed_mode_resolves_to_the_exact_native_timing() {
+        let resolved = validate(&args(2), false, true)
+            .unwrap()
+            .expect("changed mode is queued for asynchronous apply");
+
+        assert_eq!(resolved.mode.clock, 74_176);
+        assert_eq!((resolved.width, resolved.height), (1280, 720));
+    }
+
+    #[test]
+    fn active_mutation_rejects_a_second_changed_request() {
+        let error = validate(&args(2), true, true).unwrap_err();
+
+        assert_eq!(error.code, ControlErrorCode::OutputTransactionActive);
+    }
+
+    #[test]
+    fn atomic_mutation_unavailability_rejects_changed_modes() {
+        let error = validate(&args(2), false, false).unwrap_err();
+
+        assert_eq!(error.code, ControlErrorCode::UnsupportedOutputMode);
+    }
+
+    #[test]
+    fn exact_current_configuration_is_a_noop() {
+        assert!(validate(&args(1), false, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn scale_and_transform_changes_are_rejected() {
+        let mut scale = args(2);
+        scale.scale_milli = 1250;
+        assert_eq!(
+            validate(&scale, false, true).unwrap_err().code,
+            ControlErrorCode::UnsupportedOutputScale
+        );
+
+        let mut transform = args(2);
+        transform.transform = OutputTransformSnapshot::Rotate90;
+        assert_eq!(
+            validate(&transform, false, true).unwrap_err().code,
+            ControlErrorCode::UnsupportedOutputTransform
+        );
     }
 }
