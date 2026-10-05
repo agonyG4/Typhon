@@ -1,6 +1,10 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn notify_user_activity_at(&mut self, now: std::time::Instant) {
+        self.idle_manager.notify_activity_at(now);
+    }
+
     pub(in crate::compositor) fn refresh_input_serial_focus_generation(&mut self, serial: u32) {
         let focus_generation = self.focus_generation;
         if let Some(input) = self
@@ -1230,6 +1234,29 @@ impl CompositorState {
         {
             send_pointer_axis_frame_to_resource(pointer, frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod user_activity_tests {
+    use super::*;
+    use crate::compositor::{IdleManager, IdleState};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn canonical_user_activity_entry_resets_the_idle_authority() {
+        let start = Instant::now();
+        let mut state = CompositorState {
+            idle_manager: IdleManager::new(Duration::from_secs(5), Duration::from_secs(10), start),
+            ..CompositorState::default()
+        };
+
+        state.notify_user_activity_at(start + Duration::from_secs(8));
+
+        assert_eq!(
+            state.idle_manager.state_at(start + Duration::from_secs(12)),
+            IdleState::Active
+        );
     }
 }
 

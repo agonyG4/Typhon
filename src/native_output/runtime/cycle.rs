@@ -199,7 +199,6 @@ impl NativeRuntime {
             self.pointer_timing.record_next_reactor_wake(now_ns);
             self.pointer_timing.record_reactor_wake_return(now_ns);
         }
-        self.service_due_dmabuf_release_retry(now_ns)?;
         let runtime_state = self.native_runtime_state(&cycle, now_ns);
         let work_domains = NativeWorkDomains::classify(&cycle.wakeup, &runtime_state);
         if slow_cycle_enabled {
@@ -225,6 +224,17 @@ impl NativeRuntime {
                 metrics.record_wayland_read_dispatch_cycle();
             }
         }
+        if work_domains.only_controller_work()
+            && !cycle.wakeup.reasons.timer()
+            && !self.dmabuf_gpu_release_registry.retry_due(now_ns)
+        {
+            if self.session.permits_output() && self.shutdown.is_running() {
+                self.service_controller_work(&cycle)?;
+            }
+            self.finish_slow_cycle(&cycle, render_attempted)?;
+            return Ok(());
+        }
+        self.service_due_dmabuf_release_retry(now_ns)?;
         self.server.set_commit_debug_pageflip_pending(
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );
@@ -329,6 +339,9 @@ impl NativeRuntime {
             self.quiesce_control_server()?;
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
+        }
+        if operation_plan.service_controller {
+            self.service_controller_work(&cycle)?;
         }
         let slow_wayland_phase_started_at_ns = (slow_cycle_enabled
             && (work_domains.wayland_dispatch || work_domains.input))

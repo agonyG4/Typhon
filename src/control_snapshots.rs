@@ -211,6 +211,44 @@ pub struct ControlStatusSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ControllerObserverSnapshot {
+    pub policy: String,
+    pub connected_devices: u32,
+    pub device_adds: u64,
+    pub device_removes: u64,
+    pub raw_events: u64,
+    pub logical_frames: u64,
+    pub activity_transitions: u64,
+    pub drain_budget_exhaustions: u64,
+    pub backlog_continuations: u64,
+    #[serde(default)]
+    pub synchronization_recoveries: Option<u64>,
+    pub read_failures: u64,
+    pub hotplug_failures: u64,
+}
+
+impl Default for ControllerObserverSnapshot {
+    fn default() -> Self {
+        Self {
+            policy: "off".to_string(),
+            connected_devices: 0,
+            device_adds: 0,
+            device_removes: 0,
+            raw_events: 0,
+            logical_frames: 0,
+            activity_transitions: 0,
+            drain_budget_exhaustions: 0,
+            backlog_continuations: 0,
+            synchronization_recoveries: None,
+            read_failures: 0,
+            hotplug_failures: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct StatusSnapshot {
     pub instance: String,
     pub wayland_display: String,
@@ -224,6 +262,8 @@ pub struct StatusSnapshot {
     pub active_window: Option<ControlWindowId>,
     pub xwayland: XwaylandStatusSnapshot,
     pub control: ControlStatusSnapshot,
+    #[serde(default)]
+    pub controllers: ControllerObserverSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

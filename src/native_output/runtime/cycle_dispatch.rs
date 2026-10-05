@@ -1333,6 +1333,7 @@ impl NativeRuntime {
                             .unwrap_or(u32::MAX),
                         accepted: self.control_server.counters().accepted,
                     },
+                    controllers: self.controller_observer_snapshot(),
                 })
             }
             ControlCommand::Performance => serde_json::to_value(self.performance_snapshot()),
@@ -2222,6 +2223,14 @@ impl NativeRuntime {
                 .max();
             input_batch.coalesce_pointer_motion_events();
             coalesced_input_events = input_batch.coalesced.len();
+            if input_batch
+                .coalesced
+                .iter()
+                .copied()
+                .any(NativeHardwareInputEvent::is_meaningful_user_activity)
+            {
+                server.notify_user_activity();
+            }
             let timing_batch = NativePointerTimingBatch {
                 raw_events: raw_input_events as u32,
                 coalesced_events: coalesced_input_events as u32,

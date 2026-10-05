@@ -183,6 +183,7 @@ struct NativeRuntimeBootstrapTail {
     pre_kms_legacy_cursor: Option<NativeLegacyHardwareCursor>,
     cursor_render_mode: NativeCursorRenderMode,
     input_plan: NativeInputBackendPlan,
+    controller_policy: ControllerPolicy,
     seat_session: Option<NativeSeatSession>,
     startup_app: Option<Vec<String>>,
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
@@ -220,6 +221,7 @@ impl NativeRuntime {
             pre_kms_legacy_cursor,
             mut cursor_render_mode,
             input_plan,
+            controller_policy,
             seat_session,
             startup_app,
             effective_app_gpu_policy,
@@ -390,6 +392,8 @@ impl NativeRuntime {
             ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
+        let controller_manager = (controller_policy == ControllerPolicy::Observe)
+            .then(|| ControllerManager::new(controller_policy));
         let control_server = create_native_control_server(&mut event_loop, &server)?;
         let dmem_foreground = DmemForeground::start(
             DmemForegroundPolicy::from_env(),
@@ -656,6 +660,9 @@ impl NativeRuntime {
             atomic_cursor,
             legacy_cursor,
             input_devices,
+            controller_manager,
+            controller_monitor_reactor_token: None,
+            controller_device_reactor_tokens: HashMap::new(),
             input_batch: NativeInputBatch::default(),
             input_epoch: NativeInputEpoch::default(),
             seat_session,
@@ -766,11 +773,13 @@ impl NativeRuntime {
                 .resource_efficiency_mut()
                 .record_xwayland_environment_materialization();
         }
+        runtime.sync_controller_reactor_sources()?;
         runtime.install_native_wake_plan(initial_wake_plan, scheduler_anchor_ns)?;
         runtime.attach_xwayland_private_client()?;
         Ok(runtime)
     }
     pub(super) fn bootstrap_native(config: NativeRuntimeConfig) -> NativeResult<Self> {
+        let controller_policy = ControllerPolicy::from_env()?;
         let NativeRuntimeConfig {
             mut server,
             app,
@@ -1659,6 +1668,7 @@ impl NativeRuntime {
             pre_kms_legacy_cursor,
             cursor_render_mode,
             input_plan,
+            controller_policy,
             seat_session,
             startup_app,
             effective_app_gpu_policy,

@@ -112,6 +112,7 @@ pub(crate) enum NativeSessionRecoveryFenceRegistration {
 #[cfg(test)]
 pub(crate) static ASTREA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+mod controller;
 mod input;
 mod kms_worker;
 mod launch;

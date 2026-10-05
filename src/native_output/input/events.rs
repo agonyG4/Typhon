@@ -234,6 +234,20 @@ impl AstreaShortcutEvent {
 }
 
 impl NativeHardwareInputEvent {
+    pub(crate) fn is_meaningful_user_activity(self) -> bool {
+        match self {
+            Self::Key { value, .. } => value != 2,
+            Self::PointerButton { .. } => true,
+            Self::PointerMotion(sample) => {
+                sample.absolute.is_some() || sample.relative.is_some_and(|motion| !motion.is_zero())
+            }
+            Self::PointerAxis(frame) => {
+                pointer_axis_component_has_activity(frame.horizontal)
+                    || pointer_axis_component_has_activity(frame.vertical)
+            }
+        }
+    }
+
     pub(crate) const fn may_change_pointer_constraints(self) -> bool {
         matches!(self, Self::Key { .. } | Self::PointerButton { .. })
     }
@@ -288,6 +302,13 @@ impl NativeHardwareInputEvent {
             _ => None,
         }
     }
+}
+
+fn pointer_axis_component_has_activity(component: PointerAxisComponent) -> bool {
+    component.continuous.is_some_and(|value| value != 0.0)
+        || component.value120.is_some_and(|value| value != 0)
+        || component.discrete.is_some_and(|value| value != 0)
+        || component.stopped
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -454,5 +475,45 @@ impl NativeInputEffect {
             return false;
         }
         self.visual_redraw_requested || (cursor_mode.is_software() && self.cursor_moved)
+    }
+}
+
+#[cfg(test)]
+mod user_activity_tests {
+    use super::*;
+
+    #[test]
+    fn native_input_activity_ignores_keyboard_repeat_but_accepts_transitions() {
+        assert!(NativeHardwareInputEvent::Key { code: 30, value: 1 }.is_meaningful_user_activity());
+        assert!(NativeHardwareInputEvent::Key { code: 30, value: 0 }.is_meaningful_user_activity());
+        assert!(
+            !NativeHardwareInputEvent::Key { code: 30, value: 2 }.is_meaningful_user_activity()
+        );
+    }
+
+    #[test]
+    fn native_input_activity_ignores_zero_motion_and_axis_samples() {
+        assert!(
+            !NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                0,
+                RelativeMotion::accelerated_only(0.0, 0.0),
+            ))
+            .is_meaningful_user_activity()
+        );
+        assert!(
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                0,
+                RelativeMotion::accelerated_only(1.0, 0.0),
+            ))
+            .is_meaningful_user_activity()
+        );
+        assert!(
+            !NativeHardwareInputEvent::PointerAxis(PointerAxisFrame::unknown(0, 0.0, 0.0))
+                .is_meaningful_user_activity()
+        );
+        assert!(
+            NativeHardwareInputEvent::PointerAxis(PointerAxisFrame::unknown(0, 1.0, 0.0))
+                .is_meaningful_user_activity()
+        );
     }
 }

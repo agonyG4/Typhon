@@ -18,6 +18,8 @@ pub enum NativeEventSource {
     WaylandListener,
     WaylandClients,
     Input(u16),
+    ControllerMonitor,
+    ControllerDevice(u32),
     Timer,
     ExplicitSyncAcquire,
     OutputRenderFence,
@@ -81,6 +83,7 @@ impl WakeReasons {
     const CURSOR_IO_WORKER: u32 = 1 << 15;
     const KEYBOARD_PERSISTENCE_WORKER: u32 = 1 << 18;
     const OUTPUT_CONFIGURATION_PERSISTENCE_WORKER: u32 = 1 << 19;
+    const CONTROLLER: u32 = 1 << 20;
     const SEAT: u32 = 1 << 7;
     const WAYLAND_LISTENER: u32 = 1 << 1;
     const WAYLAND_CLIENTS: u32 = 1 << 2;
@@ -115,6 +118,10 @@ impl WakeReasons {
 
     pub const fn output_configuration_persistence_worker(self) -> bool {
         self.0 & Self::OUTPUT_CONFIGURATION_PERSISTENCE_WORKER != 0
+    }
+
+    pub const fn controller(self) -> bool {
+        self.0 & Self::CONTROLLER != 0
     }
 
     pub const fn seat(self) -> bool {
@@ -190,6 +197,9 @@ impl WakeReasons {
             NativeEventSource::WaylandListener => Self::WAYLAND_LISTENER,
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
             NativeEventSource::Input(_) => Self::INPUT,
+            NativeEventSource::ControllerMonitor | NativeEventSource::ControllerDevice(_) => {
+                Self::CONTROLLER
+            }
             NativeEventSource::Timer => Self::TIMER,
             NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
             NativeEventSource::OutputRenderFence => Self::OUTPUT_RENDER_FENCE,
@@ -246,6 +256,15 @@ pub struct NativeWakeup {
     pub control_events: Vec<ControlReadyEvent>,
     pub cursor_io_events: Vec<CursorIoReadyEvent>,
     pub keyboard_persistence_events: Vec<KeyboardPersistenceReadyEvent>,
+    pub controller_monitor_ready: bool,
+    pub controller_device_events: Vec<ControllerDeviceReadyEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControllerDeviceReadyEvent {
+    pub device_id: u32,
+    pub token: ReactorToken,
+    pub flags: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +276,7 @@ pub enum NativeContinuationReason {
     ControlTimeout,
     SceneVisualDebt,
     FrameScheduler,
+    ControllerBacklog,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -270,6 +290,7 @@ impl NativeContinuationReasons {
     const CONTROL_TIMEOUT: u32 = 1 << 4;
     const SCENE_VISUAL_DEBT: u32 = 1 << 5;
     const FRAME_SCHEDULER: u32 = 1 << 6;
+    const CONTROLLER_BACKLOG: u32 = 1 << 7;
 
     pub const fn contains(self, reason: NativeContinuationReason) -> bool {
         self.0 & reason.bit() != 0
@@ -307,6 +328,7 @@ impl NativeContinuationReason {
             Self::ControlTimeout => NativeContinuationReasons::CONTROL_TIMEOUT,
             Self::SceneVisualDebt => NativeContinuationReasons::SCENE_VISUAL_DEBT,
             Self::FrameScheduler => NativeContinuationReasons::FRAME_SCHEDULER,
+            Self::ControllerBacklog => NativeContinuationReasons::CONTROLLER_BACKLOG,
         }
     }
 }
@@ -451,7 +473,9 @@ impl NativeEventLoop {
                 return Ok(true);
             }
             Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
-                if is_xwayland_source(registration.source) {
+                if is_xwayland_source(registration.source)
+                    || is_optional_controller_source(registration.source)
+                {
                     self.benign_unregistration_count =
                         self.benign_unregistration_count.saturating_add(1);
                     let _ = unsafe {
@@ -479,7 +503,8 @@ impl NativeEventLoop {
         };
         if result < 0 {
             let error = io::Error::last_os_error();
-            if is_xwayland_source(registration.source)
+            if (is_xwayland_source(registration.source)
+                || is_optional_controller_source(registration.source))
                 && matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOENT))
             {
                 self.benign_unregistration_count =
@@ -626,6 +651,8 @@ impl NativeEventLoop {
         let mut control_events = Vec::new();
         let mut cursor_io_events = Vec::new();
         let mut keyboard_persistence_events = Vec::new();
+        let mut controller_monitor_ready = false;
+        let mut controller_device_events = Vec::new();
 
         for index in 0..ready {
             let event = self.events[index];
@@ -648,6 +675,21 @@ impl NativeEventLoop {
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
+                if is_optional_controller_source(registration_source) {
+                    reasons.insert(registration_source);
+                    match registration_source {
+                        NativeEventSource::ControllerMonitor => controller_monitor_ready = true,
+                        NativeEventSource::ControllerDevice(device_id) => {
+                            controller_device_events.push(ControllerDeviceReadyEvent {
+                                device_id,
+                                token,
+                                flags: event_flags,
+                            });
+                        }
+                        _ => unreachable!("only controller sources are optional here"),
+                    }
+                    continue;
+                }
                 if is_xwayland_source(registration_source)
                     || is_control_source(registration_source)
                     || registration_source == NativeEventSource::CursorIoWorker
@@ -696,6 +738,14 @@ impl NativeEventLoop {
             if event_flags & (libc::EPOLLIN | libc::EPOLLOUT) as u32 != 0 {
                 reasons.insert(registration_source);
                 match registration_source {
+                    NativeEventSource::ControllerMonitor => controller_monitor_ready = true,
+                    NativeEventSource::ControllerDevice(device_id) => {
+                        controller_device_events.push(ControllerDeviceReadyEvent {
+                            device_id,
+                            token,
+                            flags: event_flags,
+                        });
+                    }
                     NativeEventSource::ExplicitSyncAcquire => {
                         explicit_sync_acquire_tokens.push(token);
                     }
@@ -764,6 +814,8 @@ impl NativeEventLoop {
             control_events,
             cursor_io_events,
             keyboard_persistence_events,
+            controller_monitor_ready,
+            controller_device_events,
         })
     }
 
@@ -963,6 +1015,13 @@ fn is_xwayland_source(source: NativeEventSource) -> bool {
     )
 }
 
+fn is_optional_controller_source(source: NativeEventSource) -> bool {
+    matches!(
+        source,
+        NativeEventSource::ControllerMonitor | NativeEventSource::ControllerDevice(_)
+    )
+}
+
 fn is_control_source(source: NativeEventSource) -> bool {
     matches!(
         source,
@@ -1090,6 +1149,88 @@ mod tests {
 
         assert!(wakeup.reasons.input());
         assert!(!wakeup.reasons.timer());
+    }
+
+    #[test]
+    fn controller_monitor_and_device_wakes_have_dedicated_readiness() {
+        let monitor = event_fd();
+        let device = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(monitor.as_raw_fd(), NativeEventSource::ControllerMonitor)
+            .unwrap();
+        let device_token = event_loop
+            .register(device.as_raw_fd(), NativeEventSource::ControllerDevice(41))
+            .unwrap();
+
+        signal(monitor.as_raw_fd());
+        signal(device.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.controller());
+        assert!(wakeup.controller_monitor_ready);
+        assert_eq!(wakeup.controller_device_events.len(), 1);
+        assert_eq!(wakeup.controller_device_events[0].device_id, 41);
+        assert_eq!(wakeup.controller_device_events[0].token, device_token);
+        assert_eq!(
+            event_loop.source_for_token(token),
+            Some(NativeEventSource::ControllerMonitor)
+        );
+    }
+
+    #[test]
+    fn controller_device_hup_is_optional_and_token_can_be_retired() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(read.as_raw_fd(), NativeEventSource::ControllerDevice(73))
+            .unwrap();
+        drop(write);
+
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.controller());
+        assert_eq!(wakeup.controller_device_events[0].device_id, 73);
+        assert_ne!(
+            wakeup.controller_device_events[0].flags & libc::EPOLLHUP as u32,
+            0
+        );
+        assert!(event_loop.unregister(token).unwrap());
+        event_loop
+            .arm_deadline(Some(monotonic_now_ns().unwrap()))
+            .unwrap();
+        let next = event_loop.wait().unwrap();
+        assert!(next.reasons.timer());
+        assert!(!next.reasons.controller());
+    }
+
+    #[test]
+    fn controller_registration_slot_reuse_keeps_a_new_generation() {
+        let first = event_fd();
+        let second = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let old_token = event_loop
+            .register(first.as_raw_fd(), NativeEventSource::ControllerDevice(1))
+            .unwrap();
+        assert!(event_loop.unregister(old_token).unwrap());
+        let new_token = event_loop
+            .register(second.as_raw_fd(), NativeEventSource::ControllerDevice(2))
+            .unwrap();
+
+        signal(second.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert_ne!(old_token, new_token);
+        assert_eq!(event_loop.source_for_token(old_token), None);
+        assert_eq!(wakeup.controller_device_events.len(), 1);
+        assert_eq!(wakeup.controller_device_events[0].device_id, 2);
+        assert_eq!(wakeup.controller_device_events[0].token, new_token);
     }
 
     #[test]
@@ -1691,6 +1832,28 @@ mod tests {
         assert_eq!(event_loop.continuation_requests(), 6);
         assert_eq!(event_loop.continuation_coalesced(), 5);
         assert_eq!(event_loop.continuation_wakes(), 1);
+    }
+
+    #[test]
+    fn controller_backlog_continuation_is_dedicated() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::ControllerBacklog)
+            .unwrap();
+
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.runtime_continuation());
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::ControllerBacklog)
+        );
+        assert!(
+            !wakeup
+                .continuation
+                .contains(NativeContinuationReason::InputBacklog)
+        );
     }
 
     #[test]

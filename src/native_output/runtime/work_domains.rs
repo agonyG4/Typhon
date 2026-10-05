@@ -30,6 +30,7 @@ pub(crate) struct NativeRuntimeState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeWorkDomains {
     pub(super) input: bool,
+    pub(super) controller: bool,
     pub(super) wayland_protocol: bool,
     pub(super) astrea_publication: bool,
     pub(super) commit_timing_planning: bool,
@@ -50,6 +51,7 @@ pub(crate) struct NativeWorkDomains {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeCycleOperationPlan {
     pub(super) service_input: bool,
+    pub(super) service_controller: bool,
     pub(super) dispatch_wayland_read_side: bool,
     pub(super) service_screen_capture: bool,
     pub(super) service_acquire_and_prepare: bool,
@@ -124,7 +126,30 @@ impl NativeWorkDomains {
         if self.shutdown {
             bits |= 1 << 14;
         }
+        if self.controller {
+            bits |= 1 << 16;
+        }
         bits
+    }
+
+    pub(super) const fn only_controller_work(self) -> bool {
+        self.controller
+            && !self.input
+            && !self.wayland_protocol
+            && !self.astrea_publication
+            && !self.commit_timing_planning
+            && !self.wayland_dispatch
+            && !self.scene
+            && !self.cursor
+            && !self.screen_capture
+            && !self.presentation
+            && !self.explicit_sync
+            && !self.surface_pacing
+            && !self.xwayland
+            && !self.control
+            && !self.children
+            && !self.session
+            && !self.shutdown
     }
 
     pub(super) const fn should_service_surface_pacing(self) -> bool {
@@ -151,6 +176,7 @@ impl NativeWorkDomains {
     pub(super) const fn operation_plan(self) -> NativeCycleOperationPlan {
         NativeCycleOperationPlan {
             service_input: self.input,
+            service_controller: self.controller,
             dispatch_wayland_read_side: self.wayland_dispatch,
             service_screen_capture: self.screen_capture,
             service_acquire_and_prepare: self.scene || self.explicit_sync || self.screen_capture,
@@ -174,6 +200,10 @@ impl NativeWorkDomains {
             || wakeup
                 .continuation
                 .contains(NativeContinuationReason::InputBacklog);
+        let controller = reasons.controller()
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::ControllerBacklog);
         let wayland_protocol = reasons.wayland_listener() || reasons.wayland_clients();
         let control = reasons.control()
             || wakeup
@@ -228,6 +258,7 @@ impl NativeWorkDomains {
 
         Self {
             input,
+            controller,
             wayland_protocol,
             astrea_publication,
             commit_timing_planning,
@@ -287,6 +318,7 @@ mod tests {
     const XWAYLAND_XWM: u32 = 1 << 11;
     const CONTROL: u32 = 1 << 14;
     const DMABUF_GPU_RELEASE: u32 = 1 << 16;
+    const CONTROLLER: u32 = 1 << 20;
 
     fn wakeup(bits: u32) -> NativeWakeup {
         NativeWakeup {
@@ -301,6 +333,8 @@ mod tests {
             control_events: Vec::new(),
             cursor_io_events: Vec::new(),
             keyboard_persistence_events: Vec::new(),
+            controller_monitor_ready: false,
+            controller_device_events: Vec::new(),
         }
     }
 
@@ -326,6 +360,43 @@ mod tests {
         let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
 
         assert!(!domains.wayland_dispatch);
+    }
+
+    #[test]
+    fn controller_only_readiness_is_a_separate_work_domain() {
+        const CONTROLLER_DOMAIN: u32 = 1 << 16;
+
+        let domains = NativeWorkDomains::classify(&wakeup(CONTROLLER), &state());
+        let plan = domains.operation_plan();
+
+        assert_eq!(domains.diagnostic_bits(), CONTROLLER_DOMAIN);
+        assert!(domains.only_controller_work());
+        assert!(plan.service_controller);
+        assert!(!plan.service_input);
+        assert!(!plan.dispatch_wayland_read_side);
+        assert!(!plan.service_screen_capture);
+        assert!(!plan.service_acquire_and_prepare);
+        assert!(!plan.presentation_due);
+        assert!(!plan.visual_scene_debt);
+        assert!(!domains.scene);
+        assert!(!domains.cursor);
+        assert!(!domains.presentation);
+    }
+
+    #[test]
+    fn controller_backlog_continuation_is_controller_only() {
+        let mut wake = wakeup(0);
+        wake.continuation = NativeContinuationReasons::default()
+            .insert(NativeContinuationReason::ControllerBacklog);
+
+        let domains = NativeWorkDomains::classify(&wake, &state());
+        let plan = domains.operation_plan();
+
+        assert!(domains.only_controller_work());
+        assert!(plan.service_controller);
+        assert!(!plan.service_input);
+        assert!(!plan.dispatch_wayland_read_side);
+        assert!(!plan.presentation_due);
     }
 
     #[test]

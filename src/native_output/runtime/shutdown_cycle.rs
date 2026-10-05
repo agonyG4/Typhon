@@ -102,6 +102,8 @@ impl NativeRuntime {
                 control_events: Vec::new(),
                 cursor_io_events: Vec::new(),
                 keyboard_persistence_events: Vec::new(),
+                controller_monitor_ready: false,
+                controller_device_events: Vec::new(),
             },
             work_class: NativeWorkClass::NoOutputWork,
             fast_path_completed: false,

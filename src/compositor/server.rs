@@ -4,6 +4,7 @@ use std::{
     io,
     os::fd::{AsFd, BorrowedFd},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -148,6 +149,11 @@ impl Drop for OwnCompositorServer {
     }
 }
 impl OwnCompositorServer {
+    /// Records meaningful user input through the compositor's shared idle authority.
+    pub fn notify_user_activity(&mut self) {
+        self.state.notify_user_activity_at(Instant::now());
+    }
+
     pub fn native_output_id(&self) -> Option<OutputId> {
         self.state.native_output_id()
     }

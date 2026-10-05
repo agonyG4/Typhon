@@ -231,6 +231,7 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn suspend_input(&mut self) -> NativeResult<()> {
+        self.suspend_controller_observation()?;
         self.server.cancel_window_interaction_for_session_suspend();
         self.server
             .clear_keyboard_transient_state_for_session_switch();
@@ -651,6 +652,7 @@ impl NativeSessionIo for NativeRuntime {
 
     fn resume_input(&mut self) -> NativeResult<()> {
         self.input_devices.resume_after_session()?;
+        self.resume_controller_observation()?;
         self.server.restore_keyboard_focus_after_session_switch();
         self.server.reconcile_window_interaction_trigger(false);
         Ok(())

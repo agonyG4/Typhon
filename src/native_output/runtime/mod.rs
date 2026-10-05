@@ -1,4 +1,7 @@
 use super::*;
+use crate::native_output::controller::{
+    ControllerDeviceId, ControllerManager, ControllerPolicy, MAX_CONTROLLER_DEVICES,
+};
 use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
 use oblivion_one::core::OutputId;
 
@@ -80,6 +83,7 @@ mod bootstrap;
 #[cfg(test)]
 mod bootstrap_runtime_capabilities_tests;
 mod commit_timing;
+mod controller_io;
 mod cursor_cycle;
 mod cycle;
 mod cycle_dispatch;
@@ -381,6 +385,8 @@ mod microturn_tests {
                 control_events: Vec::new(),
                 cursor_io_events: Vec::new(),
                 keyboard_persistence_events: Vec::new(),
+                controller_monitor_ready: false,
+                controller_device_events: Vec::new(),
             },
             work_class: NativeWorkClass::ProtocolOnly,
             fast_path_completed: true,
@@ -643,6 +649,9 @@ pub(crate) struct NativeRuntime {
     legacy_cursor: Option<NativeLegacyHardwareCursor>,
     kms: NativeDrmDevice,
     input_devices: NativeInputBackend,
+    controller_manager: Option<ControllerManager>,
+    controller_monitor_reactor_token: Option<ReactorToken>,
+    controller_device_reactor_tokens: HashMap<ControllerDeviceId, ReactorToken>,
     input_batch: NativeInputBatch,
     input_epoch: NativeInputEpoch,
     seat_session: Option<NativeSeatSession>,
