@@ -706,6 +706,190 @@ fn presentation_state_pipeline() -> AtomicPipelineProperties {
     }
 }
 
+#[derive(Debug)]
+struct FakeRuntimeModeBlobIo {
+    next: Cell<u32>,
+    destroyed: Rc<std::cell::RefCell<Vec<u32>>>,
+}
+
+impl ModeBlobIo for FakeRuntimeModeBlobIo {
+    fn create_mode_blob(
+        &self,
+        _mode: &drm_sys::drm_mode_modeinfo,
+    ) -> Result<BlobId, AtomicKmsError> {
+        let id = self.next.get();
+        self.next.set(id.saturating_add(1));
+        Ok(BlobId::new(id).expect("fake blob IDs are nonzero"))
+    }
+
+    fn destroy_mode_blob(&self, blob: BlobId) -> Result<(), AtomicKmsError> {
+        self.destroyed.borrow_mut().push(blob.get());
+        Ok(())
+    }
+}
+
+fn atomic_request_assignments(
+    request: &AtomicRequest,
+) -> std::collections::BTreeMap<(u32, u32), u64> {
+    let serialized = request.serialize();
+    let mut result = std::collections::BTreeMap::new();
+    let mut index = 0usize;
+    for (object, count) in serialized.objects.iter().zip(&serialized.property_counts) {
+        for _ in 0..*count {
+            result.insert(
+                (*object, serialized.properties[index]),
+                serialized.values[index],
+            );
+            index += 1;
+        }
+    }
+    result
+}
+
+#[test]
+fn runtime_modeset_test_and_commit_share_one_candidate_and_adopt_after_commit() {
+    let mut pipeline = explicit_fence_pipeline();
+    pipeline.cursor_plane = Some(cursor_properties());
+    let mode = drm_sys::drm_mode_modeinfo {
+        clock: 148_352,
+        hdisplay: 1920,
+        hsync_start: 2008,
+        hsync_end: 2052,
+        htotal: 2200,
+        vdisplay: 1080,
+        vsync_start: 1084,
+        vsync_end: 1089,
+        vtotal: 1125,
+        vrefresh: 60,
+        ..Default::default()
+    };
+    let destroyed = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let io = FakeRuntimeModeBlobIo {
+        next: Cell::new(500),
+        destroyed: Rc::clone(&destroyed),
+    };
+    let current_blob = ModeBlob::create(
+        FakeRuntimeModeBlobIo {
+            next: Cell::new(499),
+            destroyed: Rc::clone(&destroyed),
+        },
+        &mode,
+    )
+    .unwrap();
+    let previous_blob_id = current_blob.id();
+    let framebuffer = FramebufferId::new(73).unwrap();
+    let cursor = visible_cursor();
+    let mut candidate = PreparedAtomicRuntimeModeset::prepare(
+        io,
+        &pipeline,
+        mode,
+        1920,
+        1080,
+        framebuffer,
+        Some(cursor),
+    )
+    .unwrap();
+    let (candidate_blob_id, candidate_mode, candidate_geometry, candidate_fb, candidate_cursor) =
+        candidate.candidate_parts();
+    assert_ne!(candidate_blob_id, previous_blob_id);
+    assert_eq!(candidate_mode.clock, mode.clock);
+    assert_eq!(candidate_geometry.crtc_w, 1920);
+    assert_eq!(candidate_geometry.crtc_h, 1080);
+    assert_eq!(candidate_fb, framebuffer);
+    assert_eq!(candidate_cursor, Some(cursor));
+
+    let test_submission = std::cell::RefCell::new(None);
+    candidate
+        .test_only_with(
+            |submission| {
+                *test_submission.borrow_mut() = Some(submission.clone());
+                assert!(submission.flags.contains_test_only());
+                assert!(submission.flags.contains_allow_modeset());
+                assert_eq!(submission.user_data, 0);
+                Ok(())
+            },
+            &pipeline,
+        )
+        .unwrap();
+    assert!(destroyed.borrow().is_empty());
+
+    let real_submission = std::cell::RefCell::new(None);
+    candidate
+        .commit_with(
+            |submission| {
+                *real_submission.borrow_mut() = Some(submission.clone());
+                assert!(!submission.flags.contains_test_only());
+                assert!(submission.flags.contains_allow_modeset());
+                assert_eq!(submission.user_data, 0);
+                Ok(())
+            },
+            &pipeline,
+        )
+        .unwrap();
+    let test_submission = test_submission.into_inner().unwrap();
+    let real_submission = real_submission.into_inner().unwrap();
+    let mut test_assignments = atomic_request_assignments(&test_submission.request);
+    let real_assignments = atomic_request_assignments(&real_submission.request);
+    if let Some(in_fence) = pipeline.plane_props.in_fence_fd {
+        test_assignments.remove(&(pipeline.plane.get(), in_fence.0.get()));
+    }
+    assert_eq!(test_assignments, real_assignments);
+    assert_eq!(candidate.request(), &real_submission.request);
+
+    let adopted = candidate.adopt().expect("real commit adopts the candidate");
+    assert_eq!(adopted.mode_blob_id(), candidate_blob_id);
+    assert_eq!(adopted.mode().clock, mode.clock);
+    assert_eq!(adopted.geometry().crtc_w, 1920);
+    drop(current_blob);
+    assert_eq!(*destroyed.borrow(), vec![previous_blob_id.get()]);
+    assert_eq!(adopted.mode_blob_id(), candidate_blob_id);
+    drop(adopted);
+    assert_eq!(destroyed.borrow().len(), 2);
+}
+
+#[test]
+fn rejected_runtime_modeset_candidate_does_not_adopt_and_destroys_its_blob_once() {
+    let pipeline = presentation_state_pipeline();
+    let mode = drm_sys::drm_mode_modeinfo {
+        clock: 74_176,
+        hdisplay: 1280,
+        hsync_start: 1390,
+        hsync_end: 1430,
+        htotal: 1650,
+        vdisplay: 720,
+        vsync_start: 725,
+        vsync_end: 730,
+        vtotal: 750,
+        vrefresh: 60,
+        ..Default::default()
+    };
+    let destroyed = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let io = FakeRuntimeModeBlobIo {
+        next: Cell::new(600),
+        destroyed: Rc::clone(&destroyed),
+    };
+    let mut candidate = PreparedAtomicRuntimeModeset::prepare(
+        io,
+        &pipeline,
+        mode,
+        1280,
+        720,
+        FramebufferId::new(81).unwrap(),
+        None,
+    )
+    .unwrap();
+    let candidate_blob_id = candidate.candidate_parts().0;
+    let error = AtomicKmsError::new(AtomicKmsErrorKind::TestOnlyRejected, "injected rejection");
+    assert!(
+        candidate
+            .test_only_with(|_| Err(error.clone()), &pipeline)
+            .is_err()
+    );
+    assert!(destroyed.borrow().is_empty());
+    assert!(candidate.adopt().is_err());
+    assert_eq!(destroyed.borrow().as_slice(), &[candidate_blob_id.get()]);
+}
+
 #[test]
 fn adaptive_sync_allows_cursor_mutation_but_adaptive_async_rejects_it() {
     use crate::compositor::OutputPresentationMode::{AdaptiveAsync, AdaptiveSync};

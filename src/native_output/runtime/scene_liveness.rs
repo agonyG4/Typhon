@@ -41,6 +41,7 @@ impl NativeRuntime {
             cursor_response_deadline_ns: self.cursor_output_arbitration.wake_deadline_ns(now_ns),
             control_timeout_deadline_ns: control_timeout_deadline
                 .filter(|deadline| *deadline > now_ns),
+            output_configuration_deadline_ns: self.output_configuration_transactions.deadline_ns(),
             surface_pacing_deadline_ns: surface_pacing_deadline,
             dmabuf_retry_deadline_ns: dmabuf_retry_deadline,
             input_backlog: self.input_epoch.backlog_pending(),
@@ -74,6 +75,7 @@ impl NativeRuntime {
                     NativeDeadlineOwner::ControlTimeout => "deadline:control_timeout",
                     NativeDeadlineOwner::SurfacePacing => "deadline:surface_pacing",
                     NativeDeadlineOwner::DmabufRetry => "deadline:dmabuf_retry",
+                    NativeDeadlineOwner::OutputConfiguration => "deadline:output_configuration",
                 }
             } else if plan
                 .continuation

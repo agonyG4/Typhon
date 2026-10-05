@@ -3,12 +3,114 @@ use oblivion_one::control_snapshots::{
     FeatureState, MAX_CONTROL_OUTPUT_MODES, OutputModeSnapshot, PhysicalSizeSnapshot,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeOutputModeEntry {
+    pub(crate) id: u32,
+    pub(crate) mode: drm_sys::drm_mode_modeinfo,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeOutputModeInventory {
+    generation: OutputConfigurationGeneration,
+    entries: Vec<NativeOutputModeEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeOutputModeResolveError {
+    StaleGeneration,
+    UnknownMode,
+}
+
+impl NativeOutputModeInventory {
+    pub(crate) fn from_native_modes(
+        generation: OutputConfigurationGeneration,
+        modes: &[drm_sys::drm_mode_modeinfo],
+    ) -> Self {
+        let entries = modes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mode)| {
+                Some(NativeOutputModeEntry {
+                    id: u32::try_from(index.checked_add(1)?).ok()?,
+                    mode: *mode,
+                })
+            })
+            .collect();
+        Self {
+            generation,
+            entries,
+        }
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        generation: OutputConfigurationGeneration,
+        id: u32,
+    ) -> Result<&NativeOutputModeEntry, NativeOutputModeResolveError> {
+        if generation != self.generation {
+            return Err(NativeOutputModeResolveError::StaleGeneration);
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(NativeOutputModeResolveError::UnknownMode)
+    }
+
+    pub(crate) fn entries(&self) -> &[NativeOutputModeEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn requalify(&mut self, generation: OutputConfigurationGeneration) {
+        self.generation = generation;
+    }
+
+    fn project(&self) -> (Vec<OutputModeSnapshot>, bool) {
+        let mut projected = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let mode = &entry.mode;
+                let width = u32::from(mode.hdisplay);
+                let height = u32::from(mode.vdisplay);
+                let refresh_millihz = drm_mode_refresh_millihz(mode)?;
+                (width > 0 && height > 0 && refresh_millihz > 0).then_some((
+                    entry.id,
+                    OutputModeSnapshot {
+                        id: entry.id,
+                        width,
+                        height,
+                        refresh_millihz,
+                        preferred: mode.type_ & drm_sys::DRM_MODE_TYPE_PREFERRED != 0,
+                        interlaced: mode.flags & drm_sys::DRM_MODE_FLAG_INTERLACE != 0,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        projected.sort_by_key(|(_, mode)| {
+            (
+                mode.width,
+                mode.height,
+                mode.refresh_millihz,
+                mode.interlaced,
+            )
+        });
+
+        let modes_truncated = projected.len() > MAX_CONTROL_OUTPUT_MODES;
+        projected.truncate(MAX_CONTROL_OUTPUT_MODES);
+        (
+            projected.into_iter().map(|(_, mode)| mode).collect(),
+            modes_truncated,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct NativeOutputCapabilities {
     pub(crate) connector_name: String,
     pub(crate) physical_size_mm: Option<PhysicalSizeSnapshot>,
     pub(crate) modes: Vec<OutputModeSnapshot>,
     pub(crate) modes_truncated: bool,
+    pub(crate) mode_inventory: NativeOutputModeInventory,
     pub(crate) sysfs_vrr_capable: Option<bool>,
 }
 
@@ -25,7 +127,7 @@ impl NativeOutputCapabilities {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeKmsTargetSelection {
-    pub(crate) target: KmsTarget,
+    pub(crate) target: NativeAppliedOutputConfiguration,
     pub(crate) capabilities: NativeOutputCapabilities,
 }
 
@@ -93,7 +195,7 @@ pub(crate) fn query_kms_resources(
 pub(crate) fn select_kms_target(
     file: &fs::File,
     mode_preference: NativeModePreference,
-) -> io::Result<KmsTarget> {
+) -> io::Result<NativeAppliedOutputConfiguration> {
     select_kms_target_with_capabilities(file, mode_preference).map(|selection| selection.target)
 }
 
@@ -101,6 +203,21 @@ pub(crate) fn select_kms_target_with_capabilities(
     file: &fs::File,
     mode_preference: NativeModePreference,
 ) -> io::Result<NativeKmsTargetSelection> {
+    select_kms_target_internal(file, mode_preference, None)?.ok_or_else(no_connected_kms_target)
+}
+
+pub(crate) fn select_kms_target_with_persisted_configuration(
+    file: &fs::File,
+    configuration: &PersistedOutputConfiguration,
+) -> io::Result<Option<NativeKmsTargetSelection>> {
+    select_kms_target_internal(file, NativeModePreference::Auto, Some(configuration))
+}
+
+fn select_kms_target_internal(
+    file: &fs::File,
+    mode_preference: NativeModePreference,
+    persisted_configuration: Option<&PersistedOutputConfiguration>,
+) -> io::Result<Option<NativeKmsTargetSelection>> {
     let mut crtcs = Vec::new();
     let mut connector_ids = Vec::new();
     drm_ffi::mode::get_resources(
@@ -126,7 +243,24 @@ pub(crate) fn select_kms_target_with_capabilities(
         if connector.connection != 1 {
             continue;
         }
-        let Some(mode) = select_kms_mode(&modes, mode_preference) else {
+        let connector_name = drm_connector_presentation_name(&connector);
+        let physical_size = physical_size_snapshot(connector.mm_width, connector.mm_height);
+        let mode = if let Some(configuration) = persisted_configuration {
+            let inventory = NativeOutputModeInventory::from_native_modes(
+                OutputConfigurationGeneration::initial(),
+                &modes,
+            );
+            configuration
+                .resolve_mode(
+                    &connector_name,
+                    physical_size.map(|size| (size.width_mm, size.height_mm)),
+                    &inventory,
+                )
+                .map(|entry| entry.mode)
+        } else {
+            select_kms_mode(&modes, mode_preference)
+        };
+        let Some(mode) = mode else {
             continue;
         };
 
@@ -143,37 +277,48 @@ pub(crate) fn select_kms_target_with_capabilities(
                             "selected native mode is absent from its connector inventory",
                         )
                     })?;
-                return Ok(NativeKmsTargetSelection {
-                    target: KmsTarget {
+                return Ok(Some(NativeKmsTargetSelection {
+                    target: NativeAppliedOutputConfiguration {
                         connector_id,
                         crtc_id,
                         mode_id,
                         mode,
                         width: u32::from(mode.hdisplay),
                         height: u32::from(mode.vdisplay),
+                        scale_milli: 1000,
+                        transform: oblivion_one::control_snapshots::OutputTransformSnapshot::Normal,
                     },
                     capabilities: native_output_capabilities(&connector, &modes),
-                });
+                }));
             }
         }
     }
 
-    Err(io::Error::new(
+    Ok(None)
+}
+
+fn no_connected_kms_target() -> io::Error {
+    io::Error::new(
         io::ErrorKind::NotFound,
         "no connected KMS connector with a usable CRTC was found",
-    ))
+    )
 }
 
 pub(crate) fn native_output_capabilities(
     connector: &drm_sys::drm_mode_get_connector,
     modes: &[drm_sys::drm_mode_modeinfo],
 ) -> NativeOutputCapabilities {
-    let (modes, modes_truncated) = project_native_output_modes(modes);
+    let mode_inventory = NativeOutputModeInventory::from_native_modes(
+        OutputConfigurationGeneration::initial(),
+        modes,
+    );
+    let (projected_modes, modes_truncated) = mode_inventory.project();
     NativeOutputCapabilities {
         connector_name: drm_connector_presentation_name(connector),
         physical_size_mm: physical_size_snapshot(connector.mm_width, connector.mm_height),
-        modes,
+        modes: projected_modes,
         modes_truncated,
+        mode_inventory,
         sysfs_vrr_capable: None,
     }
 }
@@ -181,42 +326,8 @@ pub(crate) fn native_output_capabilities(
 pub(crate) fn project_native_output_modes(
     modes: &[drm_sys::drm_mode_modeinfo],
 ) -> (Vec<OutputModeSnapshot>, bool) {
-    let mut projected = modes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, mode)| {
-            let width = u32::from(mode.hdisplay);
-            let height = u32::from(mode.vdisplay);
-            let refresh_millihz = drm_mode_refresh_millihz(mode)?;
-            let id = u32::try_from(index + 1).ok()?;
-            (width > 0 && height > 0 && refresh_millihz > 0).then_some((
-                id,
-                OutputModeSnapshot {
-                    id,
-                    width,
-                    height,
-                    refresh_millihz,
-                    preferred: mode.type_ & drm_sys::DRM_MODE_TYPE_PREFERRED != 0,
-                    interlaced: mode.flags & drm_sys::DRM_MODE_FLAG_INTERLACE != 0,
-                },
-            ))
-        })
-        .collect::<Vec<_>>();
-    projected.sort_by_key(|(_, mode)| {
-        (
-            mode.width,
-            mode.height,
-            mode.refresh_millihz,
-            mode.interlaced,
-        )
-    });
-
-    let modes_truncated = projected.len() > MAX_CONTROL_OUTPUT_MODES;
-    projected.truncate(MAX_CONTROL_OUTPUT_MODES);
-    (
-        projected.into_iter().map(|(_, mode)| mode).collect(),
-        modes_truncated,
-    )
+    NativeOutputModeInventory::from_native_modes(OutputConfigurationGeneration::initial(), modes)
+        .project()
 }
 
 fn native_mode_identity_eq(

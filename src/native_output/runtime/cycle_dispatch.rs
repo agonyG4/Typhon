@@ -13,9 +13,10 @@ use oblivion_one::control_snapshots::{
     ActiveWindowSnapshot, ControlStatusSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot, FeatureState,
     FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputMutationCapabilitiesSnapshot,
-    OutputSnapshot, OutputTransformSnapshot, PositionSnapshot, ScaleMutationCapabilitySnapshot,
-    StatusSnapshot, TransformMutationCapabilitySnapshot, TrustedEffectsReloadSnapshot,
-    VersionSnapshot, XwaylandStatusSnapshot,
+    OutputSnapshot, OutputTransactionSnapshot, OutputTransactionStateSnapshot,
+    OutputTransformSnapshot, PositionSnapshot, ScaleMutationCapabilitySnapshot, StatusSnapshot,
+    TransformMutationCapabilitySnapshot, TrustedEffectsReloadSnapshot, VersionSnapshot,
+    XwaylandStatusSnapshot,
 };
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
@@ -3939,6 +3940,34 @@ fn format_direct_scanout_counters(counters: Option<&DirectScanoutCounters>) -> S
 
 impl NativeRuntime {
     fn control_output_list_snapshot(&self) -> OutputListSnapshot {
+        let now_ns = oblivion_one::native::event_loop::monotonic_now_ns().unwrap_or(0);
+        let transaction = self
+            .output_configuration_transactions
+            .active()
+            .map(|transaction| {
+                let (state, error_code) = match &transaction.phase {
+                    OutputConfigurationTransactionPhase::RollbackFailed { error_code } => {
+                        (OutputTransactionStateSnapshot::RollbackFailed, Some(error_code.clone()))
+                    }
+                    OutputConfigurationTransactionPhase::PendingConfirmation
+                    | OutputConfigurationTransactionPhase::PersistencePending
+                    | OutputConfigurationTransactionPhase::RollingBack => {
+                        (OutputTransactionStateSnapshot::PendingConfirmation, None)
+                    }
+                };
+                OutputTransactionSnapshot {
+                    id: transaction.id.get(),
+                    output_id: transaction.output_id.clone(),
+                    state,
+                    applied_configuration_generation: transaction
+                        .applied_configuration_generation,
+                    remaining_ms: self
+                        .output_configuration_transactions
+                        .remaining_ms(now_ns)
+                        .unwrap_or(0),
+                    error_code,
+                }
+            });
         OutputListSnapshot {
             outputs: if self.scanout_destroyed {
                 Vec::new()
@@ -3947,7 +3976,7 @@ impl NativeRuntime {
             },
             total: if self.scanout_destroyed { 0 } else { 1 },
             truncated: false,
-            transaction: None,
+            transaction,
         }
     }
 
@@ -3981,13 +4010,15 @@ impl NativeRuntime {
                 "the output configuration generation has changed",
             );
         }
-        let mode_is_known = args.mode_id == self.target.mode_id
-            || self
-                .output_capabilities
-                .modes
-                .iter()
-                .any(|mode| mode.id == args.mode_id);
-        if !mode_is_known {
+        let mode_is_in_public_projection = args.mode_id == self.target.mode_id
+            || self.output_capabilities.modes.iter().any(|mode| mode.id == args.mode_id);
+        if self
+            .output_capabilities
+            .mode_inventory
+            .resolve(self.output_configuration_generation, args.mode_id)
+            .is_err()
+            || !mode_is_in_public_projection
+        {
             return output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnknownOutputMode,
@@ -3996,8 +4027,8 @@ impl NativeRuntime {
         }
 
         let no_change = args.mode_id == self.target.mode_id
-            && args.scale_milli == 1000
-            && args.transform == OutputTransformSnapshot::Normal;
+            && args.scale_milli == self.target.scale_milli
+            && args.transform == self.target.transform;
         if no_change {
             return match serde_json::to_value(self.control_output_list_snapshot()) {
                 Ok(snapshot) => ControlResponse::success(request_id, snapshot),
@@ -4009,14 +4040,14 @@ impl NativeRuntime {
             };
         }
 
-        if args.scale_milli != 1000 {
+        if args.scale_milli != self.target.scale_milli {
             return output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnsupportedOutputScale,
                 "canonical output scale mutation is unavailable",
             );
         }
-        if args.transform != OutputTransformSnapshot::Normal {
+        if args.transform != self.target.transform {
             return output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnsupportedOutputTransform,
@@ -4064,8 +4095,8 @@ impl NativeRuntime {
             }),
             physical_size_mm: self.output_capabilities.physical_size_mm.clone(),
             configuration_generation: self.output_configuration_generation.get(),
-            scale_milli: 1000,
-            transform: OutputTransformSnapshot::Normal,
+            scale_milli: self.target.scale_milli,
+            transform: self.target.transform,
             mutation_capabilities: OutputMutationCapabilitiesSnapshot {
                 // The current NativeRuntime has no runtime output reconfiguration
                 // owner yet. Do not advertise mode mutation until worker drain,

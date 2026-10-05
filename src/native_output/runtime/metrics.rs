@@ -3,7 +3,7 @@ use super::resource_efficiency::ResourceEfficiencyMetrics;
 use super::*;
 use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
 use crate::native_output::{
-    KmsTarget,
+    NativeAppliedOutputConfiguration,
     kms_worker::{KmsCommitWorkerTransport, WorkerMetricsSnapshot, WorkerTimingSnapshot},
     scanout::NativePaintStats,
 };
@@ -77,7 +77,7 @@ impl NativeRenderTelemetry {
         &mut self,
         render_us: u64,
         stats: GlesSceneFrameStats,
-        target: KmsTarget,
+        target: NativeAppliedOutputConfiguration,
     ) {
         self.record_rendered(render_us, stats, target.width, target.height);
     }

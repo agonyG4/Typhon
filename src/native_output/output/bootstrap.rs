@@ -88,16 +88,6 @@ pub(crate) struct KmsResources {
     pub(crate) connected_connector_count: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct KmsTarget {
-    pub(crate) connector_id: u32,
-    pub(crate) crtc_id: u32,
-    pub(crate) mode_id: u32,
-    pub(crate) mode: drm_sys::drm_mode_modeinfo,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeModePreference {
     Auto,
@@ -111,17 +101,44 @@ pub(crate) enum NativeModePreference {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeModeStartupSource {
+    EnvironmentOverride,
+    Persisted,
+    NormalSelection,
+}
+
+pub(crate) fn native_mode_startup_source(
+    environment_override: Option<NativeModePreference>,
+    persisted_mode_resolved: bool,
+) -> NativeModeStartupSource {
+    if environment_override.is_some() {
+        NativeModeStartupSource::EnvironmentOverride
+    } else if persisted_mode_resolved {
+        NativeModeStartupSource::Persisted
+    } else {
+        NativeModeStartupSource::NormalSelection
+    }
+}
+
 impl NativeModePreference {
     pub(crate) fn from_env() -> Self {
+        Self::from_env_override().unwrap_or(Self::Auto)
+    }
+
+    pub(crate) fn from_env_override() -> Option<Self> {
         let Some(value) = std::env::var_os("OBLIVION_ONE_MODE") else {
-            return Self::Auto;
+            return None;
         };
         let value = value.to_string_lossy();
         let preference = Self::parse(&value);
-        if preference == Self::Auto && !value.eq_ignore_ascii_case("auto") {
-            eprintln!("native KMS: unknown OBLIVION_ONE_MODE={value:?}; using auto");
+        if preference == Self::Auto {
+            if !value.eq_ignore_ascii_case("auto") {
+                eprintln!("native KMS: unknown OBLIVION_ONE_MODE={value:?}; using auto");
+            }
+            return None;
         }
-        preference
+        Some(preference)
     }
 
     pub(crate) fn parse(value: &str) -> Self {

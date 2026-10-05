@@ -9,6 +9,7 @@ use crate::egl_renderer::{BufferAge, EglPartialRepaintCapabilities, PartialRepai
 use oblivion_one::effects::{EffectRect, EffectRegion};
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
 use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+use std::collections::HashSet;
 
 #[test]
 fn native_partial_damage_matches_render_element_visible_projection() {
@@ -222,6 +223,10 @@ fn selected_sysfs_output_uses_connector_id_not_directory_sort_order() {
         physical_size_mm: None,
         modes: Vec::new(),
         modes_truncated: false,
+        mode_inventory: NativeOutputModeInventory::from_native_modes(
+            OutputConfigurationGeneration::initial(),
+            &[],
+        ),
         sysfs_vrr_capable: None,
     };
     capabilities.qualify_sysfs_connector(Some(&connector));
@@ -363,6 +368,77 @@ fn equivalent_presentation_modes_keep_distinct_native_mode_ids() {
 }
 
 #[test]
+fn native_mode_inventory_resolves_the_exact_generation_qualified_mode() {
+    let generation = OutputConfigurationGeneration::initial();
+    let first = drm_sys::drm_mode_modeinfo {
+        clock: 148_352,
+        hdisplay: 1920,
+        hsync_start: 2008,
+        hsync_end: 2052,
+        htotal: 2200,
+        vdisplay: 1080,
+        vsync_start: 1084,
+        vsync_end: 1089,
+        vtotal: 1125,
+        vrefresh: 60,
+        ..Default::default()
+    };
+    let second = drm_sys::drm_mode_modeinfo {
+        clock: 74_176,
+        hdisplay: 1280,
+        hsync_start: 1390,
+        hsync_end: 1430,
+        htotal: 1650,
+        vdisplay: 720,
+        vsync_start: 725,
+        vsync_end: 730,
+        vtotal: 750,
+        vrefresh: 60,
+        ..Default::default()
+    };
+    let inventory = NativeOutputModeInventory::from_native_modes(generation, &[first, second]);
+
+    let resolved = inventory
+        .resolve(generation, 2)
+        .expect("second opaque id resolves in the generation that created it");
+    assert_eq!(resolved.clock, second.clock);
+    assert_eq!(resolved.hsync_start, second.hsync_start);
+    assert_eq!(resolved.htotal, second.htotal);
+    assert_eq!(resolved.vsync_end, second.vsync_end);
+    assert_eq!(resolved.vtotal, second.vtotal);
+
+    let mut stale = generation;
+    stale.advance();
+    assert!(matches!(
+        inventory.resolve(stale, 2),
+        Err(NativeOutputModeResolveError::StaleGeneration)
+    ));
+}
+
+#[test]
+fn truncated_public_modes_keep_unique_ids_that_resolve_to_their_original_entries() {
+    let generation = OutputConfigurationGeneration::initial();
+    let native_modes = (0..(MAX_CONTROL_OUTPUT_MODES + 2))
+        .map(|index| native_test_drm_mode(640 + index as u16, 480, 60, false))
+        .collect::<Vec<_>>();
+    let inventory = NativeOutputModeInventory::from_native_modes(generation, &native_modes);
+    let (projected, truncated) = project_native_output_modes(&native_modes);
+    let ids = projected.iter().map(|mode| mode.id).collect::<HashSet<_>>();
+
+    assert!(truncated);
+    assert_eq!(projected.len(), MAX_CONTROL_OUTPUT_MODES);
+    assert_eq!(ids.len(), projected.len());
+    assert!(!ids.contains(&u32::try_from(native_modes.len()).unwrap()));
+    for mode in &projected {
+        let resolved = inventory
+            .resolve(generation, mode.id)
+            .expect("each publicly projected mode retains its original native entry");
+        assert_eq!(u32::from(resolved.hdisplay), mode.width);
+        assert_eq!(u32::from(resolved.vdisplay), mode.height);
+    }
+}
+
+#[test]
 fn available_kms_modes_are_bounded_and_sorted_deterministically() {
     let input = (0..(MAX_CONTROL_OUTPUT_MODES + 2))
         .map(|index| native_test_drm_mode(640 + index as u16, 480, 60, false))
@@ -405,6 +481,28 @@ fn current_mode_selection_remains_separate_from_preferred_capability() {
         available
             .iter()
             .any(|mode| mode.width == 1920 && !mode.preferred)
+    );
+}
+
+#[test]
+fn explicit_non_auto_environment_mode_precedes_persistence_and_auto_falls_through() {
+    let explicit = NativeModePreference::Exact {
+        width: 1280,
+        height: 720,
+        refresh_hz: Some(60),
+    };
+
+    assert_eq!(
+        native_mode_startup_source(Some(explicit), true),
+        NativeModeStartupSource::EnvironmentOverride
+    );
+    assert_eq!(
+        native_mode_startup_source(None, true),
+        NativeModeStartupSource::Persisted
+    );
+    assert_eq!(
+        native_mode_startup_source(None, false),
+        NativeModeStartupSource::NormalSelection
     );
 }
 
@@ -482,6 +580,10 @@ fn control_snapshot_vrr_state_uses_atomic_capability_and_confirmed_pageflip_stat
             physical_size_mm: None,
             modes: Vec::new(),
             modes_truncated: false,
+            mode_inventory: NativeOutputModeInventory::from_native_modes(
+                OutputConfigurationGeneration::initial(),
+                &[],
+            ),
             sysfs_vrr_capable,
         };
         assert_eq!(capabilities.sysfs_vrr_capable, sysfs_vrr_capable);

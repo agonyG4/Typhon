@@ -162,7 +162,7 @@ struct NativeRuntimeBootstrapTail {
     perf: NativePerfLogger,
     kms: NativeDrmDevice,
     kms_backend: KmsBackendSelection,
-    target: KmsTarget,
+    target: NativeAppliedOutputConfiguration,
     output_capabilities: NativeOutputCapabilities,
     mode_label: String,
     refresh_hz: u32,
@@ -621,6 +621,7 @@ impl NativeRuntime {
             target,
             output_capabilities,
             output_configuration_generation: OutputConfigurationGeneration::initial(),
+            output_configuration_transactions: OutputConfigurationTransactions::new(),
             mode_label,
             refresh_hz,
             drm_file_generation,
@@ -808,8 +809,48 @@ impl NativeRuntime {
             DrmTimestampClock::Realtime => PresentationClock::Realtime,
         };
         server.set_presentation_clock(presentation_clock);
-        let mode_preference = NativeModePreference::from_env();
-        let selection = select_kms_target_with_capabilities(kms.file(), mode_preference)?;
+        let environment_override = NativeModePreference::from_env_override();
+        let persisted_configuration = if environment_override.is_none() {
+            match load_persisted_output_configuration() {
+                Ok(configuration) => configuration,
+                Err(_) => {
+                    eprintln!(
+                        "native KMS: persisted output configuration is invalid or unavailable; using normal mode selection"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let persisted_selection = persisted_configuration
+            .as_ref()
+            .map(|configuration| {
+                select_kms_target_with_persisted_configuration(kms.file(), configuration)
+            })
+            .transpose()?;
+        let mode_startup_source = native_mode_startup_source(
+            environment_override,
+            persisted_selection.as_ref().is_some_and(Option::is_some),
+        );
+        let mode_preference = environment_override.unwrap_or(NativeModePreference::Auto);
+        let selection = match mode_startup_source {
+            NativeModeStartupSource::EnvironmentOverride => {
+                select_kms_target_with_capabilities(kms.file(), mode_preference)?
+            }
+            NativeModeStartupSource::Persisted => persisted_selection
+                .flatten()
+                .expect("persisted selection source has an exact connector mode"),
+            NativeModeStartupSource::NormalSelection => {
+                if persisted_configuration.is_some() {
+                    eprintln!(
+                        "native KMS: persisted output identity or mode did not resolve; using normal mode selection"
+                    );
+                }
+                select_kms_target_with_capabilities(kms.file(), NativeModePreference::Auto)?
+            }
+        };
+        println!("native output startup mode source: {mode_startup_source:?}");
         let target = selection.target;
         let mut output_capabilities = selection.capabilities;
         let selected_sysfs_connector = selected_connector_for_kms_target(

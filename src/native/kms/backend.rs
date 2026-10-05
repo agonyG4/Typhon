@@ -12,11 +12,12 @@ use super::{
     AtomicPipelineProperties, AtomicPipelineSnapshot, AtomicPlaneGeometry, AtomicPlaneProperties,
     AtomicRequest, AtomicSubmission, BlobId, ConnectorId, CrtcId, DrmFormatModifierPair,
     DrmModeBlobIo, DrmObjectKind, DrmProperty, FramebufferId, KmsBackendKind, KmsPolicy,
-    LegacyKmsBackend, ModeBlob, PageFlipToken, PlaneCandidate, PlaneId, PlaneType, PropertySet,
-    RestorationOutcome, cursor_dimension_from_capability, disable_atomic_client_capability,
-    enable_atomic_client_capability, enable_universal_planes_client_capability, object_properties,
-    parse_in_formats_blob, plane_type_from_value, property_blob, select_cursor_format_modifier,
-    select_cursor_plane, select_primary_plane, submit_atomic,
+    LegacyKmsBackend, ModeBlob, ModeBlobIo, PageFlipToken, PlaneCandidate, PlaneId, PlaneType,
+    PropertySet, RestorationOutcome, cursor_dimension_from_capability,
+    disable_atomic_client_capability, enable_atomic_client_capability,
+    enable_universal_planes_client_capability, object_properties, parse_in_formats_blob,
+    plane_type_from_value, property_blob, select_cursor_format_modifier, select_cursor_plane,
+    select_primary_plane, submit_atomic,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,9 +532,278 @@ pub struct DrmAtomicBackend {
     restore_on_drop: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AtomicModesetPipelineIdentity {
+    connector: ConnectorId,
+    crtc: CrtcId,
+    primary_plane: PlaneId,
+}
+
+/// A single validated runtime modeset request. TEST_ONLY and the real commit
+/// clone this stored request, so candidate geometry and framebuffer selection
+/// cannot drift between the two submissions.
+#[derive(Debug)]
+pub(crate) struct PreparedAtomicRuntimeModeset<I: ModeBlobIo> {
+    mode_blob: ModeBlob<I>,
+    mode: Box<drm_sys::drm_mode_modeinfo>,
+    geometry: AtomicPlaneGeometry,
+    framebuffer: FramebufferId,
+    cursor: Option<AtomicCursorVisualState>,
+    pipeline: AtomicModesetPipelineIdentity,
+    request: AtomicRequest,
+    tested: bool,
+    committed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveAtomicRuntimeMode<I: ModeBlobIo> {
+    mode_blob: ModeBlob<I>,
+    mode: Box<drm_sys::drm_mode_modeinfo>,
+    geometry: AtomicPlaneGeometry,
+}
+
+impl<I: ModeBlobIo> ActiveAtomicRuntimeMode<I> {
+    #[cfg(test)]
+    pub(crate) fn mode_blob_id(&self) -> BlobId {
+        self.mode_blob.id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> &drm_sys::drm_mode_modeinfo {
+        &self.mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn geometry(&self) -> AtomicPlaneGeometry {
+        self.geometry
+    }
+}
+
+impl<I: ModeBlobIo> PreparedAtomicRuntimeModeset<I> {
+    pub(crate) fn prepare(
+        io: I,
+        pipeline: &AtomicPipelineProperties,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        if width == 0
+            || height == 0
+            || u32::from(mode.hdisplay) != width
+            || u32::from(mode.vdisplay) != height
+        {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::InvalidGeometry,
+                "runtime Atomic modeset dimensions do not match the exact DRM mode",
+            ));
+        }
+        let mode_blob = ModeBlob::create(io, &mode)?;
+        let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
+        let mut request = AtomicRequest::initial_modeset_for_pipeline(
+            pipeline,
+            mode_blob.id(),
+            framebuffer,
+            geometry,
+            cursor.as_ref(),
+        )?;
+        request.set_connector_content_type(pipeline, DrmContentType::Graphics.as_str())?;
+        Ok(Self {
+            mode_blob,
+            mode: Box::new(mode),
+            geometry,
+            framebuffer,
+            cursor,
+            pipeline: AtomicModesetPipelineIdentity {
+                connector: pipeline.connector,
+                crtc: pipeline.crtc,
+                primary_plane: pipeline.plane,
+            },
+            request,
+            tested: false,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn test_only_with(
+        &mut self,
+        mut submit: impl FnMut(&AtomicSubmission) -> Result<(), AtomicKmsError>,
+        pipeline: &AtomicPipelineProperties,
+    ) -> Result<(), AtomicKmsError> {
+        self.ensure_pipeline(pipeline)?;
+        let mut request = self.request.clone();
+        request.set_test_input_fence_none(pipeline)?;
+        let submission = AtomicSubmission {
+            request,
+            flags: AtomicCommitFlags::test_only_allow_modeset(),
+            user_data: 0,
+        };
+        submit(&submission).map_err(|error| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::TestOnlyRejected,
+                format!("runtime atomic TEST_ONLY modeset rejected: {error}"),
+            )
+        })?;
+        self.tested = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_with(
+        &mut self,
+        mut submit: impl FnMut(&AtomicSubmission) -> Result<(), AtomicKmsError>,
+        pipeline: &AtomicPipelineProperties,
+    ) -> Result<(), AtomicKmsError> {
+        self.ensure_pipeline(pipeline)?;
+        if !self.tested {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "runtime Atomic modeset candidate must pass TEST_ONLY before commit",
+            ));
+        }
+        let submission = AtomicSubmission {
+            request: self.request.clone(),
+            flags: AtomicCommitFlags::allow_modeset(),
+            user_data: 0,
+        };
+        submit(&submission).map_err(|error| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::InitialCommitRejected,
+                format!("runtime atomic modeset commit rejected: {error}"),
+            )
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+
+    fn ensure_pipeline(&self, pipeline: &AtomicPipelineProperties) -> Result<(), AtomicKmsError> {
+        let matches = self.pipeline
+            == (AtomicModesetPipelineIdentity {
+                connector: pipeline.connector,
+                crtc: pipeline.crtc,
+                primary_plane: pipeline.plane,
+            });
+        if matches {
+            Ok(())
+        } else {
+            Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                "runtime Atomic modeset candidate pipeline identity changed",
+            ))
+        }
+    }
+
+    pub(crate) fn adopt(self) -> Result<ActiveAtomicRuntimeMode<I>, AtomicKmsError> {
+        if !self.committed {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "runtime Atomic mode cannot be adopted before real commit",
+            ));
+        }
+        Ok(ActiveAtomicRuntimeMode {
+            mode_blob: self.mode_blob,
+            mode: self.mode,
+            geometry: self.geometry,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request(&self) -> &AtomicRequest {
+        &self.request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_parts(
+        &self,
+    ) -> (
+        BlobId,
+        drm_sys::drm_mode_modeinfo,
+        AtomicPlaneGeometry,
+        FramebufferId,
+        Option<AtomicCursorVisualState>,
+    ) {
+        (
+            self.mode_blob.id(),
+            *self.mode,
+            self.geometry,
+            self.framebuffer,
+            self.cursor,
+        )
+    }
+}
+
 impl DrmAtomicBackend {
     pub fn commit_submitter(&self) -> AtomicCommitSubmitter {
         AtomicCommitSubmitter::new(self.fd, self.discovery.pipeline.clone())
+    }
+
+    pub(crate) fn prepare_runtime_modeset_candidate(
+        &self,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<AtomicCursorVisualState>,
+    ) -> Result<PreparedAtomicRuntimeModeset<DrmModeBlobIo>, AtomicKmsError> {
+        PreparedAtomicRuntimeModeset::prepare(
+            DrmModeBlobIo::new(self.fd),
+            &self.discovery.pipeline,
+            mode,
+            width,
+            height,
+            framebuffer,
+            cursor,
+        )
+    }
+
+    pub(crate) fn test_runtime_modeset_candidate(
+        &self,
+        candidate: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) -> Result<(), AtomicKmsError> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        candidate.test_only_with(
+            |submission| {
+                submit_atomic(
+                    fd,
+                    submission,
+                    AtomicKmsErrorKind::TestOnlyRejected,
+                    "runtime atomic TEST_ONLY modeset",
+                )
+            },
+            &self.discovery.pipeline,
+        )
+    }
+
+    pub(crate) fn commit_runtime_modeset_candidate(
+        &self,
+        candidate: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) -> Result<(), AtomicKmsError> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        candidate.commit_with(
+            |submission| {
+                submit_atomic(
+                    fd,
+                    submission,
+                    AtomicKmsErrorKind::InitialCommitRejected,
+                    "runtime atomic modeset commit",
+                )
+            },
+            &self.discovery.pipeline,
+        )
+    }
+
+    pub(crate) fn adopt_runtime_modeset_candidate(
+        &mut self,
+        candidate: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) -> Result<(), AtomicKmsError> {
+        candidate.ensure_pipeline(&self.discovery.pipeline)?;
+        let assignment_count = candidate.request.assignment_count();
+        let active = candidate.adopt()?;
+        self.mode_blob = active.mode_blob;
+        self.mode = active.mode;
+        self.geometry = active.geometry;
+        self.initial_property_count = assignment_count;
+        Ok(())
     }
 
     pub fn test_initial_from_discovery(
