@@ -36,13 +36,15 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
         1,
         OutputFramebufferOrigin::BottomLeft,
     );
-    harness.renderer.commands[0].visual_group = Some(group);
-    harness.renderer.commands[0].presentation_clip = Some(EglRect::new(1.0, 0.0, 2.0, 1.0));
+    harness.renderer.scene_state.commands[0].visual_group = Some(group);
+    harness.renderer.scene_state.commands[0].presentation_clip =
+        Some(EglRect::new(1.0, 0.0, 2.0, 1.0));
     harness
         .renderer
+        .scene_state
         .presentation_visual_group_owners
         .insert(group, 7);
-    harness.renderer.presentation_opacities = vec![1.0];
+    harness.renderer.scene_state.presentation_opacities = vec![1.0];
 
     clear_pbuffer(&harness);
     harness
@@ -56,24 +58,36 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
     assert_effect_test_pixel(&clipped, 4, 3, 0, [0, 0, 0, 0]);
 
     clear_pbuffer(&harness);
-    harness.renderer.capture_unclipped_presentation_owner = Some(7);
+    harness
+        .renderer
+        .scene_state
+        .capture_unclipped_presentation_owner = Some(7);
     harness
         .renderer
         .draw_command_batch_with_visibility(true, None, false)
         .expect("same-owner unclipped capture draw succeeds");
-    harness.renderer.capture_unclipped_presentation_owner = None;
+    harness
+        .renderer
+        .scene_state
+        .capture_unclipped_presentation_owner = None;
     let captured = read_effect_test_pixels(&harness.gl, 4, 1);
     for x in 0..4 {
         assert_effect_test_pixel(&captured, 4, x, 0, [255, 0, 0, 255]);
     }
 
     clear_pbuffer(&harness);
-    harness.renderer.capture_unclipped_presentation_owner = Some(8);
+    harness
+        .renderer
+        .scene_state
+        .capture_unclipped_presentation_owner = Some(8);
     harness
         .renderer
         .draw_command_batch_with_visibility(true, None, false)
         .expect("other-owner capture draw succeeds");
-    harness.renderer.capture_unclipped_presentation_owner = None;
+    harness
+        .renderer
+        .scene_state
+        .capture_unclipped_presentation_owner = None;
     let other_owner = read_effect_test_pixels(&harness.gl, 4, 1);
     assert_effect_test_pixel(&other_owner, 4, 0, 0, [0, 0, 0, 0]);
     assert_effect_test_pixel(&other_owner, 4, 1, 0, [255, 0, 0, 255]);
@@ -110,9 +124,10 @@ fn real_gles_clip_intersects_frame_damage_scissor() {
         1,
         OutputFramebufferOrigin::BottomLeft,
     );
-    harness.renderer.commands[0].visual_group = Some(group);
-    harness.renderer.commands[0].presentation_clip = Some(EglRect::new(1.0, 0.0, 2.0, 1.0));
-    harness.renderer.presentation_opacities = vec![1.0];
+    harness.renderer.scene_state.commands[0].visual_group = Some(group);
+    harness.renderer.scene_state.commands[0].presentation_clip =
+        Some(EglRect::new(1.0, 0.0, 2.0, 1.0));
+    harness.renderer.scene_state.presentation_opacities = vec![1.0];
 
     clear_pbuffer(&harness);
     harness
@@ -175,12 +190,14 @@ fn popup_visual_group_inherits_window_group_clip_from_its_presentation_owner() {
 
     let root_command = harness
         .renderer
+        .scene_state
         .commands
         .iter()
         .find(|command| command.layer == EglDrawLayer::Surface(7))
         .expect("toplevel command");
     let popup_command = harness
         .renderer
+        .scene_state
         .commands
         .iter()
         .find(|command| command.layer == EglDrawLayer::Surface(8))
@@ -228,6 +245,7 @@ fn real_gles_blur_effects_keep_kernel_source_and_clip_final_contribution() {
     install_visual_group_scene_commands(&mut harness.renderer, rect, visual_group);
     let target_command = harness
         .renderer
+        .scene_state
         .commands
         .iter_mut()
         .find(|command| command.layer == EglDrawLayer::Surface(owner_root))
@@ -235,10 +253,12 @@ fn real_gles_blur_effects_keep_kernel_source_and_clip_final_contribution() {
     target_command.presentation_clip = Some(clip);
     harness
         .renderer
+        .scene_state
         .presentation_visual_group_clips
         .insert(visual_group, clip);
     harness
         .renderer
+        .scene_state
         .presentation_visual_group_owners
         .insert(visual_group, owner_root);
     assert_eq!(
