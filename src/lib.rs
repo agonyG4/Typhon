@@ -28,7 +28,7 @@ mod pointer_debug;
 pub mod portal;
 pub mod presentation_animation;
 pub mod presentation_animation_policy;
-mod private_config;
+pub mod private_config;
 pub mod process;
 pub mod render_backend;
 pub mod session;

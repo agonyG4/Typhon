@@ -1032,6 +1032,25 @@ impl NativeAtomicCursor {
         self.client_image_failure = None;
     }
 
+    pub(crate) fn reconfigure_output_identity(
+        &mut self,
+        generation: u64,
+        crtc_id: u32,
+        mode_width: u32,
+        mode_height: u32,
+        committed_state: Option<&AtomicCursorVisualState>,
+    ) {
+        self.generation = generation;
+        self.crtc_id = crtc_id;
+        self.mode_width = mode_width.max(1);
+        self.mode_height = mode_height.max(1);
+        self.capability_cache.clear();
+        if let Some(committed_state) = committed_state {
+            self.desired = committed_state.clone();
+        }
+        self.mark_synchronous_modeset_submitted(committed_state);
+    }
+
     pub(crate) fn disarm_drm_cleanup(&mut self) {
         self.drm_cleanup_armed = false;
         self.resources.disarm_drm_cleanup();

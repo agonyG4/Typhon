@@ -13,6 +13,7 @@ pub enum NativeEventSource {
     KmsCommitWorker,
     CursorIoWorker,
     KeyboardPersistenceWorker,
+    OutputConfigurationPersistenceWorker,
     Seat,
     WaylandListener,
     WaylandClients,
@@ -79,6 +80,7 @@ impl WakeReasons {
     const KMS_COMMIT_WORKER: u32 = 1 << 13;
     const CURSOR_IO_WORKER: u32 = 1 << 15;
     const KEYBOARD_PERSISTENCE_WORKER: u32 = 1 << 18;
+    const OUTPUT_CONFIGURATION_PERSISTENCE_WORKER: u32 = 1 << 19;
     const SEAT: u32 = 1 << 7;
     const WAYLAND_LISTENER: u32 = 1 << 1;
     const WAYLAND_CLIENTS: u32 = 1 << 2;
@@ -109,6 +111,10 @@ impl WakeReasons {
 
     pub const fn keyboard_persistence_worker(self) -> bool {
         self.0 & Self::KEYBOARD_PERSISTENCE_WORKER != 0
+    }
+
+    pub const fn output_configuration_persistence_worker(self) -> bool {
+        self.0 & Self::OUTPUT_CONFIGURATION_PERSISTENCE_WORKER != 0
     }
 
     pub const fn seat(self) -> bool {
@@ -177,6 +183,9 @@ impl WakeReasons {
             NativeEventSource::KmsCommitWorker => Self::KMS_COMMIT_WORKER,
             NativeEventSource::CursorIoWorker => Self::CURSOR_IO_WORKER,
             NativeEventSource::KeyboardPersistenceWorker => Self::KEYBOARD_PERSISTENCE_WORKER,
+            NativeEventSource::OutputConfigurationPersistenceWorker => {
+                Self::OUTPUT_CONFIGURATION_PERSISTENCE_WORKER
+            }
             NativeEventSource::Seat => Self::SEAT,
             NativeEventSource::WaylandListener => Self::WAYLAND_LISTENER,
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
@@ -643,6 +652,8 @@ impl NativeEventLoop {
                     || is_control_source(registration_source)
                     || registration_source == NativeEventSource::CursorIoWorker
                     || registration_source == NativeEventSource::KeyboardPersistenceWorker
+                    || registration_source
+                        == NativeEventSource::OutputConfigurationPersistenceWorker
                     || registration_source == NativeEventSource::DmabufGpuRelease
                 {
                     reasons.insert(registration_source);
@@ -661,6 +672,11 @@ impl NativeEventLoop {
                             token,
                             flags: event_flags,
                         });
+                    } else if registration_source
+                        == NativeEventSource::OutputConfigurationPersistenceWorker
+                    {
+                        // The output persistence worker has one bounded job
+                        // and is serviced from the dedicated wake reason.
                     } else if registration_source == NativeEventSource::DmabufGpuRelease {
                         dmabuf_gpu_release_tokens.push(token);
                     } else {
@@ -713,6 +729,7 @@ impl NativeEventLoop {
                             flags: event_flags,
                         });
                     }
+                    NativeEventSource::OutputConfigurationPersistenceWorker => {}
                     _ => {}
                 }
             }

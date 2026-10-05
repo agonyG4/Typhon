@@ -682,6 +682,7 @@ impl NativeRuntime {
             dmabuf_gpu_release_registry,
             drm_reactor_token: _,
             output_render_fence_token,
+            pending_output_configuration,
             kms_commit_worker,
             kms_commit_worker_transport,
             submitted_worker_ownership,
@@ -750,82 +751,94 @@ impl NativeRuntime {
             });
         }
         if wakeup.reasons.output_render_fence() && !resuming_recovery_wake && !disabled_observed {
-            if let Some(token) = output_render_fence_token.take() {
-                event_loop.unregister(token)?;
-            }
-            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                if explicit.recover_suspended_ready_if_signaled()? {
-                    *queued_redraw_requested = true;
-                }
-                register_suspended_fence_if_needed(
-                    explicit,
-                    event_loop,
-                    output_render_fence_token,
-                )?;
-            }
-            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
-                && let Some(timing) = explicit
-                    .sample_pending_timing(MonotonicTimestampNs::new(monotonic_now_ns()?))?
+            if pending_output_configuration
+                .as_ref()
+                .is_some_and(PendingOutputConfigurationRequest::waiting_on_render_fence)
             {
-                frame_pacing.note_fence_timestamp_quality(timing.quality);
-                render_journal.record_render_sample(
-                    timing
-                        .signaled_at
-                        .get()
-                        .saturating_sub(timing.composite_started_at.get()),
-                    timing.signaled_at,
-                );
-                let before = render_journal.prediction_with_kms_guard(
-                    timing.target.refresh_interval,
-                    presentation_timing.apply_guard_ns(),
-                );
-                let commit_deadline_ns = timing.submit_window.commit_complete_deadline_ns();
-                let observed_miss = match timing.quality {
-                    FenceTimestampQuality::ExactSyncFile
-                        if timing.signaled_at.get() > commit_deadline_ns =>
-                    {
-                        Some(ProvenDeadlineMiss::ExactRender)
-                    }
-                    FenceTimestampQuality::ObservedApproximate
-                        if approximate_observation_is_late(
-                            timing.signaled_at.get(),
-                            commit_deadline_ns,
-                            before.p95_wake_lateness_ns,
-                        ) =>
-                    {
-                        Some(ProvenDeadlineMiss::GuardedApproximateRender)
-                    }
-                    _ => None,
-                };
-                if let Some(miss) = observed_miss {
-                    pending_proven_deadline_miss.get_or_insert((timing.frame_id, miss));
-                    let desired_credit_before = adaptive_buffering.desired_credit();
-                    let buffering_mode_before = adaptive_buffering.mode();
-                    adaptive_buffering.observe_o1_outcome(Some(miss));
-                    if desired_credit_before == 1 && adaptive_buffering.desired_credit() == 2 {
-                        frame_pacing.note_o1_credit2_grant();
-                    }
-                    frame_pacing.note_adaptive_transition(
-                        buffering_mode_before,
-                        adaptive_buffering.mode(),
-                        Some(miss),
-                    );
+                if let Some(token) = output_render_fence_token.take() {
+                    event_loop.unregister(token)?;
                 }
-                perf.log("native.render_fence", || {
-                    vec![
-                        NativePerfField::u64("frame_id", timing.frame_id),
-                        NativePerfField::u64("signal_ns", timing.signaled_at.get()),
-                        NativePerfField::u64("target_ns", timing.target.presentation_time.get()),
-                        NativePerfField::u64(
-                            "render_fence_signal_latency_ns",
-                            timing
-                                .signaled_at
-                                .get()
-                                .saturating_sub(timing.composite_started_at.get()),
-                        ),
-                        NativePerfField::str("quality", format!("{:?}", timing.quality)),
-                    ]
-                });
+            } else {
+                if let Some(token) = output_render_fence_token.take() {
+                    event_loop.unregister(token)?;
+                }
+                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                    if explicit.recover_suspended_ready_if_signaled()? {
+                        *queued_redraw_requested = true;
+                    }
+                    register_suspended_fence_if_needed(
+                        explicit,
+                        event_loop,
+                        output_render_fence_token,
+                    )?;
+                }
+                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
+                    && let Some(timing) = explicit
+                        .sample_pending_timing(MonotonicTimestampNs::new(monotonic_now_ns()?))?
+                {
+                    frame_pacing.note_fence_timestamp_quality(timing.quality);
+                    render_journal.record_render_sample(
+                        timing
+                            .signaled_at
+                            .get()
+                            .saturating_sub(timing.composite_started_at.get()),
+                        timing.signaled_at,
+                    );
+                    let before = render_journal.prediction_with_kms_guard(
+                        timing.target.refresh_interval,
+                        presentation_timing.apply_guard_ns(),
+                    );
+                    let commit_deadline_ns = timing.submit_window.commit_complete_deadline_ns();
+                    let observed_miss = match timing.quality {
+                        FenceTimestampQuality::ExactSyncFile
+                            if timing.signaled_at.get() > commit_deadline_ns =>
+                        {
+                            Some(ProvenDeadlineMiss::ExactRender)
+                        }
+                        FenceTimestampQuality::ObservedApproximate
+                            if approximate_observation_is_late(
+                                timing.signaled_at.get(),
+                                commit_deadline_ns,
+                                before.p95_wake_lateness_ns,
+                            ) =>
+                        {
+                            Some(ProvenDeadlineMiss::GuardedApproximateRender)
+                        }
+                        _ => None,
+                    };
+                    if let Some(miss) = observed_miss {
+                        pending_proven_deadline_miss.get_or_insert((timing.frame_id, miss));
+                        let desired_credit_before = adaptive_buffering.desired_credit();
+                        let buffering_mode_before = adaptive_buffering.mode();
+                        adaptive_buffering.observe_o1_outcome(Some(miss));
+                        if desired_credit_before == 1 && adaptive_buffering.desired_credit() == 2 {
+                            frame_pacing.note_o1_credit2_grant();
+                        }
+                        frame_pacing.note_adaptive_transition(
+                            buffering_mode_before,
+                            adaptive_buffering.mode(),
+                            Some(miss),
+                        );
+                    }
+                    perf.log("native.render_fence", || {
+                        vec![
+                            NativePerfField::u64("frame_id", timing.frame_id),
+                            NativePerfField::u64("signal_ns", timing.signaled_at.get()),
+                            NativePerfField::u64(
+                                "target_ns",
+                                timing.target.presentation_time.get(),
+                            ),
+                            NativePerfField::u64(
+                                "render_fence_signal_latency_ns",
+                                timing
+                                    .signaled_at
+                                    .get()
+                                    .saturating_sub(timing.composite_started_at.get()),
+                            ),
+                            NativePerfField::str("quality", format!("{:?}", timing.quality)),
+                        ]
+                    });
+                }
             }
         }
         if !self.session.permits_output() {

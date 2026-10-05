@@ -593,6 +593,41 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn release_direct_after_synchronous_modeset(&mut self) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.release_direct_after_synchronous_modeset(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn abandon_unsubmitted_compatibility_ready(&mut self) -> io::Result<bool> {
+        match self {
+            Self::NativeEglGbm(scanout) => {
+                if scanout.page_flip.pending_token().is_some() || scanout.worker_queued.is_some() {
+                    return Err(io::Error::other(
+                        "cannot abandon EGL/GBM READY buffer while KMS ownership is pending",
+                    ));
+                }
+                Ok(scanout.buffers.take_ready().is_some())
+            }
+            Self::Gbm(scanout) => {
+                if scanout.page_flip.pending_token().is_some()
+                    || scanout.worker_queued_index.is_some()
+                    || scanout.pending_index.is_some()
+                {
+                    return Err(io::Error::other(
+                        "cannot abandon GBM READY buffer while KMS ownership is pending",
+                    ));
+                }
+                Ok(scanout.ready_index.take().is_some())
+            }
+            Self::Dumb(_) => Ok(false),
+            Self::AtomicEglGbm(_) => Err(io::Error::other(
+                "explicit Atomic READY buffers require transaction-aware retirement",
+            )),
+        }
+    }
+
     pub(crate) fn retain_direct_for_unproven_teardown(&mut self) {
         if let Self::AtomicEglGbm(scanout) = self {
             scanout.retain_direct_for_unproven_teardown();

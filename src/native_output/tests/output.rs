@@ -401,11 +401,11 @@ fn native_mode_inventory_resolves_the_exact_generation_qualified_mode() {
     let resolved = inventory
         .resolve(generation, 2)
         .expect("second opaque id resolves in the generation that created it");
-    assert_eq!(resolved.clock, second.clock);
-    assert_eq!(resolved.hsync_start, second.hsync_start);
-    assert_eq!(resolved.htotal, second.htotal);
-    assert_eq!(resolved.vsync_end, second.vsync_end);
-    assert_eq!(resolved.vtotal, second.vtotal);
+    assert_eq!(resolved.mode.clock, second.clock);
+    assert_eq!(resolved.mode.hsync_start, second.hsync_start);
+    assert_eq!(resolved.mode.htotal, second.htotal);
+    assert_eq!(resolved.mode.vsync_end, second.vsync_end);
+    assert_eq!(resolved.mode.vtotal, second.vtotal);
 
     let mut stale = generation;
     stale.advance();
@@ -433,8 +433,8 @@ fn truncated_public_modes_keep_unique_ids_that_resolve_to_their_original_entries
         let resolved = inventory
             .resolve(generation, mode.id)
             .expect("each publicly projected mode retains its original native entry");
-        assert_eq!(u32::from(resolved.hdisplay), mode.width);
-        assert_eq!(u32::from(resolved.vdisplay), mode.height);
+        assert_eq!(u32::from(resolved.mode.hdisplay), mode.width);
+        assert_eq!(u32::from(resolved.mode.vdisplay), mode.height);
     }
 }
 

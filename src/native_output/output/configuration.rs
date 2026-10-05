@@ -101,12 +101,40 @@ pub(crate) struct OutputConfigurationSafeBoundary {
     pub(crate) presentation_transaction_owned: bool,
     pub(crate) direct_scanout_pageflip_owned: bool,
     pub(crate) cursor_plane_work_owned: bool,
+    pub(crate) output_render_fence_owned: bool,
     pub(crate) deferred_worker_event_owned: bool,
     pub(crate) explicit_sync_obligation_owned: bool,
 }
 
 impl OutputConfigurationSafeBoundary {
     pub(crate) const fn is_safe(self) -> bool {
+        self.is_safe_ignoring_output_render_fence() && !self.output_render_fence_owned
+    }
+
+    pub(crate) const fn is_safe_with_candidate_render_fence(
+        self,
+        candidate_render_fence_owned: bool,
+    ) -> bool {
+        if candidate_render_fence_owned {
+            self.is_safe_ignoring_output_render_fence()
+        } else {
+            self.is_safe()
+        }
+    }
+
+    pub(crate) const fn is_safe_to_retire_unsubmitted_ready_frame(self) -> bool {
+        !(self.main_thread_pageflip_owned
+            || self.worker_in_flight_owned
+            || self.worker_queued_next_owned
+            || self.atomic_commit_arbiter_owned
+            || self.direct_scanout_pageflip_owned
+            || self.cursor_plane_work_owned
+            || self.output_render_fence_owned
+            || self.deferred_worker_event_owned
+            || self.explicit_sync_obligation_owned)
+    }
+
+    const fn is_safe_ignoring_output_render_fence(self) -> bool {
         !(self.main_thread_pageflip_owned
             || self.worker_in_flight_owned
             || self.worker_queued_next_owned
@@ -137,6 +165,10 @@ impl OutputConfigurationTransactions {
 
     pub(crate) fn active(&self) -> Option<&OutputConfigurationTransaction> {
         self.active.as_ref()
+    }
+
+    pub(crate) fn can_begin(&self) -> bool {
+        self.active.is_none() && self.next_id.is_some()
     }
 
     pub(crate) fn begin_temporary_apply(
@@ -198,7 +230,6 @@ impl OutputConfigurationTransactions {
             .filter(|transaction| transaction.id == id)
             .ok_or(OutputConfigurationTransactionError::StaleTransaction)?;
         if now_ns >= transaction.rollback_deadline_ns {
-            transaction.phase = OutputConfigurationTransactionPhase::RollingBack;
             return Err(OutputConfigurationTransactionError::NotConfirmable);
         }
         if transaction.phase != OutputConfigurationTransactionPhase::PendingConfirmation {
@@ -225,7 +256,6 @@ impl OutputConfigurationTransactions {
             return OutputConfigurationConfirmCompletion::RollbackOwns;
         }
         if now_ns >= transaction.rollback_deadline_ns {
-            transaction.phase = OutputConfigurationTransactionPhase::RollingBack;
             return OutputConfigurationConfirmCompletion::RollbackOwns;
         }
         if persisted {
@@ -246,11 +276,7 @@ impl OutputConfigurationTransactions {
             .as_mut()
             .filter(|transaction| transaction.id == id)
             .ok_or(OutputConfigurationTransactionError::StaleTransaction)?;
-        if matches!(
-            transaction.phase,
-            OutputConfigurationTransactionPhase::RollbackFailed { .. }
-                | OutputConfigurationTransactionPhase::RollingBack
-        ) {
+        if transaction.phase == OutputConfigurationTransactionPhase::RollingBack {
             return Err(OutputConfigurationTransactionError::NotConfirmable);
         }
         transaction.phase = OutputConfigurationTransactionPhase::RollingBack;
@@ -441,7 +467,7 @@ impl PersistedOutputConfiguration {
         if self.validate().is_err()
             || self.connector_name != connector_name
             || self.physical_size_mm.is_some_and(|saved| {
-                physical_size_mm.is_some_and(|(width, height)| {
+                physical_size_mm.is_none_or(|(width, height)| {
                     (saved.width_mm, saved.height_mm) != (width, height)
                 })
             })
@@ -482,12 +508,13 @@ impl PersistedOutputConfiguration {
 
 pub(crate) fn load_persisted_output_configuration()
 -> Result<Option<PersistedOutputConfiguration>, PersistedOutputConfigurationError> {
-    let file =
-        crate::private_config::PrivateConfigFile::from_environment(OUTPUT_CONFIGURATION_FILE_NAME)
-            .map_err(|_| PersistedOutputConfigurationError::Invalid)?;
+    let file = oblivion_one::private_config::PrivateConfigFile::from_environment(
+        OUTPUT_CONFIGURATION_FILE_NAME,
+    )
+    .map_err(|_| PersistedOutputConfigurationError::Invalid)?;
     match file.read_bytes(MAX_OUTPUT_CONFIGURATION_BYTES) {
         Ok(bytes) => PersistedOutputConfiguration::parse(&bytes).map(Some),
-        Err(crate::private_config::PrivateConfigError::Missing) => Ok(None),
+        Err(oblivion_one::private_config::PrivateConfigError::Missing) => Ok(None),
         Err(_) => Err(PersistedOutputConfigurationError::Invalid),
     }
 }
@@ -566,10 +593,10 @@ mod tests {
         );
 
         let stale = OutputConfigurationTransactionId::new(id.get() + 1).unwrap();
-        assert_eq!(
+        assert!(matches!(
             transactions.begin_confirm(stale, 6_000_000_000),
             Err(OutputConfigurationTransactionError::StaleTransaction)
-        );
+        ));
         assert_eq!(
             transactions
                 .begin_confirm(id, 6_000_000_000)
@@ -627,6 +654,39 @@ mod tests {
     }
 
     #[test]
+    fn candidate_render_fence_is_allowed_without_ignoring_other_deferred_events() {
+        let candidate_fence = OutputConfigurationSafeBoundary {
+            output_render_fence_owned: true,
+            ..Default::default()
+        };
+        assert!(!candidate_fence.is_safe());
+        assert!(candidate_fence.is_safe_with_candidate_render_fence(true));
+
+        let stale_worker_event = OutputConfigurationSafeBoundary {
+            output_render_fence_owned: true,
+            deferred_worker_event_owned: true,
+            ..Default::default()
+        };
+        assert!(!stale_worker_event.is_safe_with_candidate_render_fence(true));
+    }
+
+    #[test]
+    fn ready_frame_may_be_retired_only_after_all_kms_owners_are_idle() {
+        let ready_frame = OutputConfigurationSafeBoundary {
+            presentation_transaction_owned: true,
+            ..Default::default()
+        };
+        assert!(ready_frame.is_safe_to_retire_unsubmitted_ready_frame());
+
+        let in_flight_pageflip = OutputConfigurationSafeBoundary {
+            presentation_transaction_owned: true,
+            main_thread_pageflip_owned: true,
+            ..Default::default()
+        };
+        assert!(!in_flight_pageflip.is_safe_to_retire_unsubmitted_ready_frame());
+    }
+
+    #[test]
     fn display_transaction_expiry_wins_over_a_late_persistence_completion() {
         let mut transactions = OutputConfigurationTransactions::new();
         let previous = applied_configuration(1920, 1080, 148_352);
@@ -637,8 +697,10 @@ mod tests {
         transactions.begin_confirm(id, 20).unwrap();
 
         assert_eq!(
-            transactions.begin_expired_rollback(OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS + 10),
-            Some((id, previous))
+            transactions
+                .begin_expired_rollback(OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS + 10)
+                .map(|(rollback_id, configuration)| (rollback_id.get(), configuration.mode.clock)),
+            Some((id.get(), previous.mode.clock))
         );
         assert_eq!(transactions.deadline_ns(), None);
         assert_eq!(
@@ -652,6 +714,32 @@ mod tests {
 
         transactions.complete_rollback(id).unwrap();
         assert!(transactions.active().is_none());
+    }
+
+    #[test]
+    fn late_persistence_completion_keeps_expiry_rollback_schedulable() {
+        let mut transactions = OutputConfigurationTransactions::new();
+        let previous = applied_configuration(1920, 1080, 148_352);
+        let temporary = applied_configuration(1280, 720, 74_176);
+        let id = transactions
+            .begin_temporary_apply("output-1", previous, temporary, 2, 0)
+            .unwrap();
+        transactions.begin_confirm(id, 1).unwrap();
+
+        assert_eq!(
+            transactions.complete_confirm(id, true, OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS),
+            OutputConfigurationConfirmCompletion::RollbackOwns
+        );
+        assert_eq!(
+            transactions.active().map(|transaction| &transaction.phase),
+            Some(&OutputConfigurationTransactionPhase::PersistencePending)
+        );
+        assert_eq!(
+            transactions
+                .begin_expired_rollback(OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS)
+                .map(|(rollback_id, configuration)| (rollback_id.get(), configuration.mode.clock)),
+            Some((id.get(), previous.mode.clock))
+        );
     }
 
     #[test]
@@ -731,6 +819,7 @@ mod tests {
                 .resolve_mode("HDMI-A-1", Some((600, 340)), &inventory)
                 .is_none()
         );
+        assert!(saved.resolve_mode("DP-1", None, &inventory).is_none());
         assert!(
             saved
                 .resolve_mode("DP-1", Some((610, 340)), &inventory)

@@ -322,10 +322,15 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn release_direct_for_target_destroyed(&mut self) -> io::Result<()> {
-        match self
-            .direct
-            .request_direct_release(DirectReleaseProof::TargetDestroyed, false)
-        {
+        self.release_direct_with_proof(DirectReleaseProof::TargetDestroyed)
+    }
+
+    pub(crate) fn release_direct_after_synchronous_modeset(&mut self) -> io::Result<()> {
+        self.release_direct_with_proof(DirectReleaseProof::SynchronousModeset)
+    }
+
+    fn release_direct_with_proof(&mut self, proof: DirectReleaseProof) -> io::Result<()> {
+        match self.direct.request_direct_release(proof, false) {
             DirectReleaseOutcome::Released {
                 presented,
                 suspended,

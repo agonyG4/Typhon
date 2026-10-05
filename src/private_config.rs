@@ -23,7 +23,7 @@ enum DirectorySyncPoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PrivateConfigError {
+pub enum PrivateConfigError {
     Missing,
     Invalid,
     Insecure,
@@ -31,7 +31,7 @@ pub(crate) enum PrivateConfigError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PrivateConfigFile {
+pub struct PrivateConfigFile {
     config_home: PathBuf,
     directory: PathBuf,
     file: PathBuf,
@@ -40,7 +40,7 @@ pub(crate) struct PrivateConfigFile {
 }
 
 impl PrivateConfigFile {
-    pub(crate) fn from_environment(file_name: &str) -> Result<Self, PrivateConfigError> {
+    pub fn from_environment(file_name: &str) -> Result<Self, PrivateConfigError> {
         let (config_home, create_missing_config_home) = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(value) if !value.is_empty() => (PathBuf::from(value), false),
             _ => {
@@ -97,7 +97,7 @@ impl PrivateConfigFile {
         &self.file
     }
 
-    pub(crate) fn read_bytes(&self, maximum_bytes: usize) -> Result<Vec<u8>, PrivateConfigError> {
+    pub fn read_bytes(&self, maximum_bytes: usize) -> Result<Vec<u8>, PrivateConfigError> {
         self.validate_existing_directories()?;
         let metadata = match fs::symlink_metadata(&self.file) {
             Ok(metadata) => metadata,
@@ -126,7 +126,7 @@ impl PrivateConfigFile {
         Ok(bytes)
     }
 
-    pub(crate) fn write_bytes(
+    pub fn write_bytes(
         &self,
         bytes: &[u8],
         maximum_bytes: usize,

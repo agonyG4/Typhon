@@ -450,6 +450,54 @@ fn presented_direct_release_is_deferred_until_replacement() {
 }
 
 #[test]
+fn synchronous_modeset_retires_direct_primary_once_after_proof() {
+    let key = test_key();
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 43);
+    let mut ownership = DirectPrimaryOwnership::default();
+    ownership
+        .accept_submitted(test_submitted(143, lease))
+        .expect("accept direct resource");
+    ownership
+        .complete_pageflip(
+            OutputTransactionId::new(std::num::NonZeroU64::new(143).unwrap()),
+            PageFlipToken::new(143).unwrap(),
+            MonotonicTimestampNs::new(144),
+        )
+        .expect("present direct resource");
+
+    assert!(matches!(
+        ownership.request_direct_release(DirectReleaseProof::Unproven, false),
+        DirectReleaseOutcome::Deferred {
+            reason: DirectReleaseDeferral::UnprovenTeardown
+        }
+    ));
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 0);
+    assert!(ownership.presented.is_some());
+
+    let DirectReleaseOutcome::Released {
+        presented,
+        suspended,
+    } = ownership.request_direct_release(DirectReleaseProof::SynchronousModeset, false)
+    else {
+        panic!("synchronous modeset proves the old primary is no longer scanned out");
+    };
+    assert!(suspended.is_empty());
+    assert!(ownership.presented.is_none());
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 0);
+
+    drop(presented);
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        ownership.request_direct_release(DirectReleaseProof::SynchronousModeset, false),
+        DirectReleaseOutcome::Released {
+            presented: None,
+            suspended
+        } if suspended.is_empty()
+    ));
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn composed_assignment_is_published_only_after_direct_release() {
     let mut control = direct_control_for_transition_test();
     control.ownership = presented_ownership_for_release_test();

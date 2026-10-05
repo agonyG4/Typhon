@@ -318,6 +318,7 @@ impl NativeRuntime {
                 self.service_cursor_io_completions(&cycle.wakeup)?;
             }
             self.service_keyboard_persistence_completions(&cycle.wakeup)?;
+            self.service_output_persistence_completions(&cycle.wakeup)?;
             self.reconcile_dmem_foreground();
             self.arm_suspended_deadline()?;
             self.fail_pending_screen_captures("session_inactive");
@@ -442,6 +443,17 @@ impl NativeRuntime {
             self.service_cursor_io_completions(&cycle.wakeup)?;
         }
         self.service_keyboard_persistence_completions(&cycle.wakeup)?;
+        self.service_output_persistence_completions(&cycle.wakeup)?;
+        let output_configuration_cycle = output_configuration_cycle_is_due(
+            self.pending_output_configuration.is_some(),
+            self.output_configuration_transactions
+                .deadline_ns()
+                .is_some_and(|deadline| deadline <= monotonic_now_ns().unwrap_or(0)),
+            self.output_persistence_compensation_required,
+        );
+        if output_configuration_cycle {
+            let _ = self.advance_output_configuration(monotonic_now_ns()?)?;
+        }
         if let Some(start_ns) = cursor_control_started_at_ns {
             self.pointer_timing.record_phase(
                 NativePointerTimingPhase::CursorAndControl,
@@ -499,6 +511,11 @@ impl NativeRuntime {
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
             }
+            self.finish_slow_cycle(&cycle, render_attempted)?;
+            return Ok(());
+        }
+        if output_configuration_cycle || self.pending_output_configuration.is_some() {
+            self.arm_runtime_deadline()?;
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
@@ -878,6 +895,10 @@ impl NativeRuntime {
                 }),
             control_timeout_deadline_ns: control_timeout_deadline
                 .filter(|deadline| *deadline > now_ns),
+            output_configuration_deadline_ns: self
+                .output_configuration_transactions
+                .deadline_ns()
+                .filter(|deadline| *deadline > now_ns),
             surface_pacing_deadline_ns: (!self.server.has_surface_pacing_readiness_pending())
                 .then(|| self.server.next_surface_pacing_deadline_ns())
                 .flatten(),
@@ -900,6 +921,10 @@ impl NativeRuntime {
                 }
             }),
             control_timeout_deadline_ns: control_timeout_deadline
+                .filter(|deadline| *deadline > now_ns),
+            output_configuration_deadline_ns: self
+                .output_configuration_transactions
+                .deadline_ns()
                 .filter(|deadline| *deadline > now_ns),
             surface_pacing_deadline_ns: (!self.server.has_surface_pacing_readiness_pending())
                 .then(|| self.server.next_surface_pacing_deadline_ns())

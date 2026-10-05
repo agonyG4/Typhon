@@ -118,6 +118,10 @@ impl PlaneCapabilityCache {
             .retain(|key, _| key.output_generation == output_generation);
         before.saturating_sub(self.entries.len())
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[cfg(test)]

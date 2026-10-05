@@ -412,6 +412,18 @@ impl NativeRuntime {
                 )
             })
             .transpose()?;
+        let output_configuration_persistence_worker =
+            OutputConfigurationPersistenceWorker::from_environment().ok();
+        let output_configuration_persistence_worker_reactor_token =
+            output_configuration_persistence_worker
+                .as_ref()
+                .map(|worker| {
+                    event_loop.register(
+                        worker.event_fd(),
+                        NativeEventSource::OutputConfigurationPersistenceWorker,
+                    )
+                })
+                .transpose()?;
         let mut xwayland = XwaylandService::bootstrap()?;
         let mut xwayland_reactor_tokens = Vec::new();
         sync_xwayland_bootstrap_sources(
@@ -625,6 +637,7 @@ impl NativeRuntime {
             output_capabilities,
             output_configuration_generation: OutputConfigurationGeneration::initial(),
             output_configuration_transactions: OutputConfigurationTransactions::new(),
+            pending_output_configuration: None,
             mode_label,
             refresh_hz,
             drm_file_generation,
@@ -676,6 +689,12 @@ impl NativeRuntime {
             keyboard_persistence_worker_reactor_token,
             pending_keyboard_job: None,
             next_keyboard_job_id: 1,
+            output_configuration_persistence_worker,
+            output_configuration_persistence_worker_reactor_token,
+            pending_output_persistence: None,
+            next_output_persistence_job_id: 1,
+            output_persistence_compensation_required: false,
+            output_persistence_compensation_failed: false,
             kms_commit_worker_policy: requested_worker_policy,
             kms_commit_worker_transport,
             kms_commit_worker_startup,

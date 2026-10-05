@@ -84,18 +84,6 @@ persistence leaves the active generation unchanged. Old cursor generations
 remain retained while KMS transactions, worker jobs, cursor-plane owners, or
 software frames still reference them.
 
-`window.decoration-policy.set` is a targeted per-window qualification command.
-It accepts `{"id":109,"policy":"server"}` or
-`{"id":109,"policy":"client_preference"}` and returns that window's
-snapshot. The `windows` snapshot includes `decorationPolicy` and
-`decorationMode`. The `astreactl` form is
-`astreactl window decoration-policy 109 server` or
-`astreactl window decoration-policy 109 client-preference`. A live XDG
-decoration object changes only after its normal configure/ack/commit
-transaction; without an object, Typhon applies its own SSD directly. X11
-updates its frame extents with the same runtime policy change. This command
-does not define persistent window rules.
-
 The v1 Display request shapes are `outputs.configure`,
 `outputs.configure.confirm`, and `outputs.configure.revert`. Configure carries
 the output ID, base configuration generation, opaque native mode ID, scale,
@@ -107,16 +95,76 @@ the captured exact configuration. Structured rejection codes distinguish
 unknown outputs, stale generations, unknown modes, unsupported dimensions,
 and transaction or persistence failures.
 
-The current native output runtime does not yet own a safe runtime KMS mode
-reconfiguration and rollback path. It advertises mode, scale, and transform
-mutation as unsupported; changed configurations receive structured rejection,
-and no active output transaction is created. The exact-current no-op configure
-request is accepted without a transaction. Scale, transform, enable/disable,
-topology, and VRR mutation are unavailable. There is no Display configuration
-persistence or startup restore path yet. Settings remains read-only until the
-KMS worker/pageflip drain, scanout lifecycle, atomic candidate, server
-deadline, persistence, and rollback path are owned by the native output
-runtime.
+Runtime Display mode mutation is qualified only for Atomic KMS and a scanout
+backend with a same-kind replacement path. Mode-selection capability is
+published only when the runtime has an exact native mode inventory, Atomic
+`TEST_ONLY`, the replacement scanout path, and the persistence worker. Legacy
+KMS remains unsupported. Scale and transform must retain their authoritative
+current values; output enable/disable, topology, positioning, and VRR mutation
+remain unsupported. This is for Typhon's currently owned output and does not
+claim general multi-output support.
+
+Mode IDs are opaque IDs into the current connector's exact DRM mode inventory
+and are valid only with the matching semantic output configuration generation.
+They are never persisted. A successful temporary apply advances that
+generation; a successful rollback advances it again; Keep does not. Requests
+with stale generations are rejected before an ID is resolved. The public mode
+list may be truncated, but every published ID remains unique and resolves to
+one retained `drm_mode_modeinfo`; modes omitted from the public list cannot be
+selected through the control protocol.
+
+A changed configure request is queued as the runtime's single bounded Display
+mutation. It stops new frame admission and waits for pageflip and KMS worker
+ownership, the Atomic commit arbiter, presentation transactions, Direct
+Scanout, cursor work, deferred completion events, and explicit-sync watches to
+reach a safe boundary. READY work is retired through its existing abandonment
+path. Typhon prepares a full-frame replacement scanout at the candidate
+dimensions, then sends one stored Atomic request through `TEST_ONLY` and the
+real modeset. Runtime state and the scanout swap are published only after the
+real submit succeeds. A synchronous modeset disables VRR and uses Graphics
+content type. Old Direct Scanout ownership is released only after that commit
+proves KMS switched away from its buffer.
+
+After temporary apply, Typhon owns one confirmation transaction with a
+15-second monotonic deadline. `outputs` refresh returns its authoritative
+transaction ID, state, applied generation, remaining time, and rollback error
+if present. Settings can disconnect without affecting the deadline. Explicit
+Revert and timeout use the same exact-mode reconfiguration path. A failed
+rollback remains a terminal `rollback_failed` transaction and blocks another
+Display mutation until an explicit recovery succeeds.
+
+Keep writes before it clears rollback protection. The versioned strict
+configuration is stored at
+`$XDG_CONFIG_HOME/AstreaOS/typhon/output.json`, or
+`$HOME/.config/AstreaOS/typhon/output.json` when `XDG_CONFIG_HOME` is unset.
+It uses Typhon's private configuration file infrastructure, bounded reads and
+writes, private directory and file modes, no-follow validation, and atomic
+replacement. The document stores the connector identity Typhon owns, optional
+physical-size evidence, and a stable native timing fingerprint containing the
+pixel clock, active dimensions, sync and total timing, skew, scan multiplier,
+and timing flags. DRM names and preferred-type metadata are excluded from the
+timing identity. The fingerprint must resolve to exactly one current mode.
+Typhon does not currently own EDID identity, so connector name is the strongest
+persisted identity; physical-size evidence is an additional qualifier when
+available.
+
+Persistence runs on one bounded worker and does not block the compositor event
+loop. A write failure returns `output_persist_failed` and leaves the
+confirmation deadline armed. If expiry wins while a Keep write is outstanding,
+the transaction remains rollback-owned; a late completion cannot confirm it,
+and a successful late write is followed by a compensating write of the
+restored mode. A failed compensation is logged and disables further mode
+mutation for the runtime.
+
+Startup chooses an explicit non-`auto` `OBLIVION_ONE_MODE` first, then a valid
+persisted connector and exact timing match, then normal auto/preferred
+selection. Persisted mode IDs are never consulted. Missing, ambiguous,
+disconnected, or invalid persisted selections produce one bounded diagnostic
+and fall back to normal selection without rewriting the file. Settings' Display
+page remains read-only; Apply, Keep, and Revert controls are not enabled yet.
+Deterministic tests qualify the state machine and injected Atomic submission
+candidate lifecycle. Live hardware mode-mutation qualification has not been
+performed.
 
 Cursor configuration is persisted at
 `$XDG_CONFIG_HOME/AstreaOS/input/cursor.json`, or

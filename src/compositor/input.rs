@@ -85,6 +85,34 @@ impl OutputRegion {
         Self { rects: vec![rect] }
     }
 
+    /// Reconcile a pointer confinement region with the logical output bounds.
+    /// Rectangles outside a newly resized output are dropped. If none remain,
+    /// use the whole output so the pointer cannot become stranded beyond its
+    /// bounds while the client updates its constraint region.
+    pub fn clipped_to_output(&self, width: u32, height: u32) -> Self {
+        let width = f64::from(width.max(1));
+        let height = f64::from(height.max(1));
+        let rects = self
+            .rects
+            .iter()
+            .filter_map(|rect| {
+                let left = rect.x.max(0.0);
+                let top = rect.y.max(0.0);
+                let right = (rect.x + rect.width - 1.0).min(width - 1.0);
+                let bottom = (rect.y + rect.height - 1.0).min(height - 1.0);
+                OutputRect::new(left, top, right - left + 1.0, bottom - top + 1.0)
+            })
+            .collect::<Vec<_>>();
+        if rects.is_empty() {
+            Self::from_rect(
+                OutputRect::new(0.0, 0.0, width, height)
+                    .expect("positive output bounds form a valid rectangle"),
+            )
+        } else {
+            Self { rects }
+        }
+    }
+
     pub fn closest_point(&self, position: OutputPosition) -> OutputPosition {
         let Some(first) = self.rects.first().copied() else {
             return position;

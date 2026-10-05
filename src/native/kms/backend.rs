@@ -543,11 +543,13 @@ struct AtomicModesetPipelineIdentity {
 /// clone this stored request, so candidate geometry and framebuffer selection
 /// cannot drift between the two submissions.
 #[derive(Debug)]
-pub(crate) struct PreparedAtomicRuntimeModeset<I: ModeBlobIo> {
+pub struct PreparedAtomicRuntimeModeset<I: ModeBlobIo> {
     mode_blob: ModeBlob<I>,
     mode: Box<drm_sys::drm_mode_modeinfo>,
     geometry: AtomicPlaneGeometry,
+    #[cfg(test)]
     framebuffer: FramebufferId,
+    #[cfg(test)]
     cursor: Option<AtomicCursorVisualState>,
     pipeline: AtomicModesetPipelineIdentity,
     request: AtomicRequest,
@@ -613,7 +615,9 @@ impl<I: ModeBlobIo> PreparedAtomicRuntimeModeset<I> {
             mode_blob,
             mode: Box::new(mode),
             geometry,
+            #[cfg(test)]
             framebuffer,
+            #[cfg(test)]
             cursor,
             pipeline: AtomicModesetPipelineIdentity {
                 connector: pipeline.connector,
@@ -737,7 +741,7 @@ impl DrmAtomicBackend {
         AtomicCommitSubmitter::new(self.fd, self.discovery.pipeline.clone())
     }
 
-    pub(crate) fn prepare_runtime_modeset_candidate(
+    pub fn prepare_runtime_modeset_candidate(
         &self,
         mode: drm_sys::drm_mode_modeinfo,
         width: u32,
@@ -756,7 +760,7 @@ impl DrmAtomicBackend {
         )
     }
 
-    pub(crate) fn test_runtime_modeset_candidate(
+    pub fn test_runtime_modeset_candidate(
         &self,
         candidate: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
     ) -> Result<(), AtomicKmsError> {
@@ -774,7 +778,7 @@ impl DrmAtomicBackend {
         )
     }
 
-    pub(crate) fn commit_runtime_modeset_candidate(
+    pub fn commit_runtime_modeset_candidate(
         &self,
         candidate: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
     ) -> Result<(), AtomicKmsError> {
@@ -792,7 +796,7 @@ impl DrmAtomicBackend {
         )
     }
 
-    pub(crate) fn adopt_runtime_modeset_candidate(
+    pub fn adopt_runtime_modeset_candidate(
         &mut self,
         candidate: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
     ) -> Result<(), AtomicKmsError> {
@@ -1816,6 +1820,67 @@ impl KmsBackendSelection {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend) => Some(backend),
             KmsDisplayBackend::Legacy(_) => None,
+        }
+    }
+
+    pub fn prepare_runtime_modeset_candidate(
+        &self,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<AtomicCursorVisualState>,
+    ) -> Result<PreparedAtomicRuntimeModeset<DrmModeBlobIo>, AtomicKmsError> {
+        self.atomic()
+            .ok_or_else(|| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "legacy KMS does not support runtime Atomic mode selection",
+                )
+            })?
+            .prepare_runtime_modeset_candidate(mode, width, height, framebuffer, cursor)
+    }
+
+    pub fn test_runtime_modeset_candidate(
+        &self,
+        candidate: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) -> Result<(), AtomicKmsError> {
+        self.atomic()
+            .ok_or_else(|| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "legacy KMS does not support runtime Atomic mode selection",
+                )
+            })?
+            .test_runtime_modeset_candidate(candidate)
+    }
+
+    pub fn commit_runtime_modeset_candidate(
+        &self,
+        candidate: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) -> Result<(), AtomicKmsError> {
+        self.atomic()
+            .ok_or_else(|| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "legacy KMS does not support runtime Atomic mode selection",
+                )
+            })?
+            .commit_runtime_modeset_candidate(candidate)
+    }
+
+    pub fn adopt_runtime_modeset_candidate(
+        &mut self,
+        candidate: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) -> Result<(), AtomicKmsError> {
+        match &mut self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.adopt_runtime_modeset_candidate(candidate)
+            }
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS does not support runtime Atomic mode selection",
+            )),
         }
     }
 

@@ -145,6 +145,16 @@ impl NativeInputBackend {
         }
     }
 
+    pub(crate) fn reconfigure_output_dimensions(&mut self, width: u32, height: u32) {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                backend.output_width = width.max(1);
+                backend.output_height = height.max(1);
+            }
+            Self::RawEvdev(_) => {}
+        }
+    }
+
     pub(crate) fn event_fds(&self) -> NativeInputEventFds<'_> {
         match self {
             Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {

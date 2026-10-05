@@ -124,6 +124,7 @@ pub(crate) struct PreparedDirectPageflip {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectReleaseProof {
     ComposedPageflip,
+    SynchronousModeset,
     Restored,
     TargetDestroyed,
     Unproven,
@@ -449,7 +450,9 @@ impl DirectPrimaryOwnership {
                     }
                 }
             }
-            DirectReleaseProof::Restored | DirectReleaseProof::TargetDestroyed => {
+            DirectReleaseProof::SynchronousModeset
+            | DirectReleaseProof::Restored
+            | DirectReleaseProof::TargetDestroyed => {
                 if self.submitted.is_some() {
                     return DirectReleaseOutcome::Deferred {
                         reason: DirectReleaseDeferral::SubmittedOwnership,

@@ -18,6 +18,10 @@ impl NativeRuntime {
             .flatten();
         let control_timeout_deadline = self.control_server.next_deadline_ns();
         let scheduler_wake_requirement = self.current_scheduler_wake_requirement(now_ns)?;
+        let scheduler_wake_requirement = gate_scheduler_for_output_configuration(
+            self.pending_output_configuration.is_some(),
+            scheduler_wake_requirement,
+        );
         let visual_scene_debt = super::commit_timing::logical_scene_changed(
             self.last_rendered_scene_generation,
             self.server.scene_render_generation(),
@@ -114,5 +118,36 @@ impl NativeRuntime {
             });
         }
         self.install_native_wake_plan(plan, now_ns)
+    }
+}
+
+fn gate_scheduler_for_output_configuration(
+    configuration_pending: bool,
+    scheduler: NativeSchedulerWakeRequirement,
+) -> NativeSchedulerWakeRequirement {
+    if configuration_pending {
+        NativeSchedulerWakeRequirement::None
+    } else {
+        scheduler
+    }
+}
+
+#[cfg(test)]
+mod output_configuration_scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn pending_output_configuration_suppresses_scheduler_admission_wakes() {
+        let scheduler = NativeSchedulerWakeRequirement::ImmediatePresentation {
+            action: SchedulerDecision::Render,
+        };
+        assert_eq!(
+            gate_scheduler_for_output_configuration(true, scheduler),
+            NativeSchedulerWakeRequirement::None
+        );
+        assert_eq!(
+            gate_scheduler_for_output_configuration(false, scheduler),
+            scheduler
+        );
     }
 }

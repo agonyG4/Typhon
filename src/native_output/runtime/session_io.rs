@@ -490,7 +490,7 @@ impl NativeSessionIo for NativeRuntime {
                     )
                 });
         self.presented_planes
-            .rebase_after_session_recovery(recovery.cursor);
+            .rebase_after_synchronous_modeset(recovery.cursor);
         self.perf.log("native.session_generation_barrier", || {
             vec![
                 NativePerfField::u64("old_generation", self.drm_file_generation),
@@ -569,11 +569,10 @@ impl NativeSessionIo for NativeRuntime {
         self.acquire_watches.set_drm_file_generation(generation);
         self.restart_kms_commit_worker_after_recovery()?;
         self.rearm_parked_acquire_watches()?;
-        let generation = self.output_configuration_generation.advance();
+        let configuration_generation = self.output_configuration_generation.advance();
         self.output_capabilities
             .mode_inventory
-            .requalify(generation);
-        self.drm_file_generation = generation;
+            .requalify(configuration_generation);
         self.pending_session_recovery = None;
         Ok(())
     }

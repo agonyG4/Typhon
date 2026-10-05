@@ -149,13 +149,6 @@ impl OutputConfigureArgs {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OutputTransactionArgs {
-    version: u8,
-    transaction_id: u64,
-}
-
 fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
     serde_json::from_value::<EmptyCursorArgs>(args).is_ok()
 }
@@ -789,16 +782,18 @@ impl NativeRuntime {
             });
         }
         if command == ControlCommand::OutputsConfigure {
-            return Some(self.dispatch_output_configure(request.id, request.args));
+            return self.dispatch_output_configure(token, request.id, request.args);
         }
         if matches!(
             command,
             ControlCommand::OutputsConfigureConfirm | ControlCommand::OutputsConfigureRevert
         ) {
-            return Some(dispatch_output_transaction_command(
+            return self.dispatch_output_transaction_command(
+                token,
                 request.id,
+                command,
                 request.args,
-            ));
+            );
         }
         if matches!(
             command,
@@ -4047,7 +4042,7 @@ fn format_direct_scanout_counters(counters: Option<&DirectScanoutCounters>) -> S
 }
 
 impl NativeRuntime {
-    fn control_output_list_snapshot(&self) -> OutputListSnapshot {
+    pub(super) fn control_output_list_snapshot(&self) -> OutputListSnapshot {
         let now_ns = oblivion_one::native::event_loop::monotonic_now_ns().unwrap_or(0);
         let transaction = self
             .output_configuration_transactions
@@ -4089,34 +4084,35 @@ impl NativeRuntime {
     }
 
     fn dispatch_output_configure(
-        &self,
+        &mut self,
+        token: oblivion_one::native::event_loop::ReactorToken,
         request_id: u64,
         value: serde_json::Value,
-    ) -> ControlResponse {
+    ) -> Option<ControlResponse> {
         let args = match serde_json::from_value::<OutputConfigureArgs>(value) {
             Ok(args) if args.valid() => args,
             _ => {
-                return output_mutation_rejection(
+                return Some(output_mutation_rejection(
                     request_id,
                     oblivion_one::control::ControlErrorCode::InvalidArgument,
                     "invalid output configuration request",
-                );
+                ));
             }
         };
         let output_id = format!("output-{}", self.output_id.get());
         if self.scanout_destroyed || args.output_id != output_id {
-            return output_mutation_rejection(
+            return Some(output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnknownOutput,
                 "the requested output is not available",
-            );
+            ));
         }
         if args.base_configuration_generation != self.output_configuration_generation.get() {
-            return output_mutation_rejection(
+            return Some(output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::StaleOutputGeneration,
                 "the output configuration generation has changed",
-            );
+            ));
         }
         let mode_is_in_public_projection = args.mode_id == self.target.mode_id
             || self
@@ -4131,46 +4127,79 @@ impl NativeRuntime {
             .is_err()
             || !mode_is_in_public_projection
         {
-            return output_mutation_rejection(
+            return Some(output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnknownOutputMode,
                 "the mode ID is not part of this output configuration generation",
-            );
+            ));
+        }
+        if self.pending_output_configuration.is_some()
+            || self.output_configuration_transactions.active().is_some()
+            || !self.output_configuration_transactions.can_begin()
+            || self.pending_output_persistence.is_some()
+            || self.output_persistence_compensation_required
+        {
+            return Some(output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::OutputTransactionActive,
+                "an output configuration transaction is already active",
+            ));
         }
 
         let no_change = args.mode_id == self.target.mode_id
             && args.scale_milli == self.target.scale_milli
             && args.transform == self.target.transform;
         if no_change {
-            return match serde_json::to_value(self.control_output_list_snapshot()) {
-                Ok(snapshot) => ControlResponse::success(request_id, snapshot),
-                Err(_) => output_mutation_rejection(
-                    request_id,
-                    oblivion_one::control::ControlErrorCode::Internal,
-                    "output snapshot serialization failed",
-                ),
-            };
+            return Some(
+                match serde_json::to_value(self.control_output_list_snapshot()) {
+                    Ok(snapshot) => ControlResponse::success(request_id, snapshot),
+                    Err(_) => output_mutation_rejection(
+                        request_id,
+                        oblivion_one::control::ControlErrorCode::Internal,
+                        "output snapshot serialization failed",
+                    ),
+                },
+            );
         }
 
         if args.scale_milli != self.target.scale_milli {
-            return output_mutation_rejection(
+            return Some(output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnsupportedOutputScale,
                 "canonical output scale mutation is unavailable",
-            );
+            ));
         }
         if args.transform != self.target.transform {
-            return output_mutation_rejection(
+            return Some(output_mutation_rejection(
                 request_id,
                 oblivion_one::control::ControlErrorCode::UnsupportedOutputTransform,
                 "canonical output transform mutation is unavailable",
-            );
+            ));
         }
-        output_mutation_rejection(
-            request_id,
-            oblivion_one::control::ControlErrorCode::UnsupportedOutputMode,
-            "runtime output mode reconfiguration is unavailable",
-        )
+        if !self.mode_selection_supported() {
+            return Some(output_mutation_rejection(
+                request_id,
+                oblivion_one::control::ControlErrorCode::UnsupportedOutputMode,
+                "runtime mode selection is unavailable for this output backend",
+            ));
+        }
+        let mode = *self
+            .output_capabilities
+            .mode_inventory
+            .resolve(self.output_configuration_generation, args.mode_id)
+            .expect("mode resolution was validated above");
+        let target = NativeAppliedOutputConfiguration {
+            connector_id: self.target.connector_id,
+            crtc_id: self.target.crtc_id,
+            mode_id: mode.id,
+            mode: mode.mode,
+            width: u32::from(mode.mode.hdisplay),
+            height: u32::from(mode.mode.vdisplay),
+            scale_milli: self.target.scale_milli,
+            transform: self.target.transform,
+        };
+        self.enqueue_temporary_output_configuration(token, request_id, target);
+        None
     }
 
     fn direct_scanout_state(&self) -> FeatureState {
@@ -4210,10 +4239,7 @@ impl NativeRuntime {
             scale_milli: self.target.scale_milli,
             transform: self.target.transform,
             mutation_capabilities: OutputMutationCapabilitiesSnapshot {
-                // The current NativeRuntime has no runtime output reconfiguration
-                // owner yet. Do not advertise mode mutation until worker drain,
-                // scanout invalidation, and canonical KMS apply/rollback are wired.
-                mode_selection_supported: false,
+                mode_selection_supported: self.mode_selection_supported(),
                 scale: ScaleMutationCapabilitySnapshot {
                     supported: false,
                     min_milli: None,
@@ -4245,28 +4271,6 @@ impl NativeRuntime {
             modes_truncated: self.output_capabilities.modes_truncated,
         }
     }
-}
-
-fn dispatch_output_transaction_command(
-    request_id: u64,
-    value: serde_json::Value,
-) -> ControlResponse {
-    let args = match serde_json::from_value::<OutputTransactionArgs>(value) {
-        Ok(args) if args.version == 1 && args.transaction_id > 0 => args,
-        _ => {
-            return output_mutation_rejection(
-                request_id,
-                oblivion_one::control::ControlErrorCode::InvalidArgument,
-                "invalid output transaction request",
-            );
-        }
-    };
-    let _requested_id = args.transaction_id;
-    output_mutation_rejection(
-        request_id,
-        oblivion_one::control::ControlErrorCode::OutputTransactionNotFound,
-        "there is no active output configuration transaction",
-    )
 }
 
 fn output_mutation_rejection(

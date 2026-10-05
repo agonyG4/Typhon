@@ -359,10 +359,14 @@ impl PresentedPlaneSnapshot {
     /// A synchronous recovery modeset establishes physical state without
     /// creating pageflip provenance. Retire the old primary identity and
     /// promote the exact cursor baseline programmed by that modeset.
-    pub(crate) fn rebase_after_session_recovery(&mut self, cursor: PresentedCursorState) {
+    pub(crate) fn rebase_after_synchronous_modeset(&mut self, cursor: PresentedCursorState) {
         self.primary = None;
         self.cursor = cursor;
         self.revision = self.revision.next();
+    }
+
+    pub(crate) fn rebase_after_session_recovery(&mut self, cursor: PresentedCursorState) {
+        self.rebase_after_synchronous_modeset(cursor);
     }
 
     pub(crate) fn promote_cursor(

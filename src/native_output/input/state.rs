@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NativeInputState {
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
@@ -52,6 +52,36 @@ impl NativeInputState {
             physically_pressed_keys: Vec::new(),
             pressed_pointer_buttons: Vec::new(),
         }
+    }
+
+    pub(crate) fn reconfigure_output_bounds(
+        &mut self,
+        output_width: u32,
+        output_height: u32,
+    ) -> NativeInputEffect {
+        self.output_width = output_width.max(1);
+        self.output_height = output_height.max(1);
+        match &mut self.pointer_constraint {
+            NativePointerConstraintState::None => {}
+            NativePointerConstraintState::Locked { anchor } => {
+                anchor.x = anchor.x.clamp(0.0, f64::from(self.output_width - 1));
+                anchor.y = anchor.y.clamp(0.0, f64::from(self.output_height - 1));
+            }
+            NativePointerConstraintState::Confined { region } => {
+                *region = region.clipped_to_output(self.output_width, self.output_height);
+            }
+        }
+        let position = self
+            .pointer_constraint
+            .constrain_position(CompositorOutputPosition {
+                x: self.cursor_x.clamp(0.0, f64::from(self.output_width - 1)),
+                y: self.cursor_y.clamp(0.0, f64::from(self.output_height - 1)),
+            });
+        self.cursor_x = position.x;
+        self.cursor_y = position.y;
+        let mut effect = NativeInputEffect::default();
+        effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
+        effect
     }
 
     pub(crate) fn reconcile_keyboard_shortcut_inhibition(

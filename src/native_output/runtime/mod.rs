@@ -96,6 +96,7 @@ mod kms_worker_teardown;
 #[cfg(test)]
 mod kms_worker_tests;
 mod metrics;
+mod output_configuration;
 #[cfg(test)]
 mod physical_effect_damage_tests;
 mod plane_cycle;
@@ -147,6 +148,10 @@ pub(crate) use kms_worker_teardown::{
     settle_returned_worker_pacing, settle_submitted_worker_pacing,
 };
 use metrics::NativeRenderTelemetry;
+pub(crate) use output_configuration::{
+    OutputConfigurationPersistenceWorker, PendingOutputConfigurationRequest,
+    PendingOutputPersistence, output_configuration_cycle_is_due,
+};
 pub(crate) use pointer_timing::{
     NativePointerPreReadObservation, NativePointerTimingBatch, NativePointerTimingPhase,
     NativePointerTimingPoint, NativePointerTimingTrace, NativePointerTimingTransition,
@@ -618,6 +623,7 @@ pub(crate) struct NativeRuntime {
     output_capabilities: NativeOutputCapabilities,
     output_configuration_generation: OutputConfigurationGeneration,
     output_configuration_transactions: OutputConfigurationTransactions,
+    pending_output_configuration: Option<PendingOutputConfigurationRequest>,
     mode_label: String,
     refresh_hz: u32,
     drm_file_generation: u64,
@@ -671,6 +677,12 @@ pub(crate) struct NativeRuntime {
     keyboard_persistence_worker_reactor_token: Option<ReactorToken>,
     pending_keyboard_job: Option<PendingKeyboardJob>,
     next_keyboard_job_id: u64,
+    output_configuration_persistence_worker: Option<OutputConfigurationPersistenceWorker>,
+    output_configuration_persistence_worker_reactor_token: Option<ReactorToken>,
+    pending_output_persistence: Option<PendingOutputPersistence>,
+    next_output_persistence_job_id: u64,
+    output_persistence_compensation_required: bool,
+    output_persistence_compensation_failed: bool,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
     kms_commit_worker_startup: super::kms_worker::KmsCommitWorkerStartup,
@@ -899,6 +911,14 @@ impl Drop for NativeRuntime {
         }
         self.pending_keyboard_job = None;
         self.keyboard_persistence_worker.take();
+        if let Some(token) = self
+            .output_configuration_persistence_worker_reactor_token
+            .take()
+        {
+            let _ = self.event_loop.unregister(token);
+        }
+        self.pending_output_persistence = None;
+        self.output_configuration_persistence_worker.take();
         if let Some(worker) = self.kms_commit_worker.take() {
             if let Some(token) = self.kms_commit_worker_reactor_token.take() {
                 let _ = self.event_loop.unregister(token);

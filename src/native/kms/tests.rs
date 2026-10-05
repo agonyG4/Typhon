@@ -848,6 +848,54 @@ fn runtime_modeset_test_and_commit_share_one_candidate_and_adopt_after_commit() 
 }
 
 #[test]
+fn rejected_runtime_modeset_real_commit_does_not_adopt_and_destroys_its_blob_once() {
+    let pipeline = presentation_state_pipeline();
+    let mode = drm_sys::drm_mode_modeinfo {
+        clock: 74_176,
+        hdisplay: 1280,
+        hsync_start: 1390,
+        hsync_end: 1430,
+        htotal: 1650,
+        vdisplay: 720,
+        vsync_start: 725,
+        vsync_end: 730,
+        vtotal: 750,
+        vrefresh: 60,
+        ..Default::default()
+    };
+    let destroyed = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut candidate = PreparedAtomicRuntimeModeset::prepare(
+        FakeRuntimeModeBlobIo {
+            next: Cell::new(650),
+            destroyed: Rc::clone(&destroyed),
+        },
+        &pipeline,
+        mode,
+        1280,
+        720,
+        FramebufferId::new(91).unwrap(),
+        None,
+    )
+    .unwrap();
+    let candidate_blob_id = candidate.candidate_parts().0;
+    candidate
+        .test_only_with(|_| Ok(()), &pipeline)
+        .expect("the injected TEST_ONLY submission succeeds");
+
+    let rejection = AtomicKmsError::new(
+        AtomicKmsErrorKind::InitialCommitRejected,
+        "injected real commit rejection",
+    );
+    assert!(
+        candidate
+            .commit_with(|_| Err(rejection.clone()), &pipeline)
+            .is_err()
+    );
+    assert!(candidate.adopt().is_err());
+    assert_eq!(destroyed.borrow().as_slice(), &[candidate_blob_id.get()]);
+}
+
+#[test]
 fn rejected_runtime_modeset_candidate_does_not_adopt_and_destroys_its_blob_once() {
     let pipeline = presentation_state_pipeline();
     let mode = drm_sys::drm_mode_modeinfo {
