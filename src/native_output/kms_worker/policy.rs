@@ -10,6 +10,12 @@ pub(crate) enum KmsCommitWorkerPolicy {
     Force,
 }
 
+impl Default for KmsCommitWorkerPolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KmsCommitWorkerPolicyError {
     InvalidValue(String),
@@ -81,11 +87,12 @@ impl Error for KmsCommitWorkerStartupError {}
 
 impl KmsCommitWorkerPolicy {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, KmsCommitWorkerPolicyError> {
-        match value.unwrap_or("off") {
-            "off" => Ok(Self::Off),
-            "auto" => Ok(Self::Auto),
-            "force" => Ok(Self::Force),
-            value => Err(KmsCommitWorkerPolicyError::InvalidValue(value.to_string())),
+        match value {
+            None => Ok(Self::default()),
+            Some("off") => Ok(Self::Off),
+            Some("auto") => Ok(Self::Auto),
+            Some("force") => Ok(Self::Force),
+            Some(value) => Err(KmsCommitWorkerPolicyError::InvalidValue(value.to_string())),
         }
     }
 
@@ -154,6 +161,42 @@ pub(crate) fn kms_worker_doctor_severity(
                 DoctorSeverity::Error
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_explicit_worker_policy_is_rejected() {
+        assert!(KmsCommitWorkerPolicy::parse(Some("sometimes")).is_err());
+    }
+
+    #[test]
+    fn off_policy_keeps_atomic_submission_synchronous() {
+        assert_eq!(
+            KmsCommitWorkerPolicy::Off.effective(KmsBackendKind::Atomic, true),
+            Ok(KmsCommitWorkerTransport::Synchronous)
+        );
+    }
+
+    #[test]
+    fn auto_legacy_uses_synchronous_submission() {
+        assert_eq!(
+            KmsCommitWorkerPolicy::Auto
+                .effective(KmsBackendKind::Legacy, true)
+                .unwrap(),
+            KmsCommitWorkerTransport::Synchronous
+        );
+    }
+
+    #[test]
+    fn force_atomic_startup_failure_remains_fatal() {
+        assert_eq!(
+            KmsCommitWorkerPolicy::Force.effective(KmsBackendKind::Atomic, false),
+            Err(KmsCommitWorkerStartupError::StartupFailed)
+        );
     }
 }
 

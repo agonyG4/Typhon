@@ -101,3 +101,17 @@ impl DirectScanoutQualificationState {
         self.last_qualified_content = None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_direct_scanout_qualification_starts_without_a_proven_candidate() {
+        let state = DirectScanoutQualificationState::default();
+
+        assert!(!state.is_qualified());
+        assert_eq!(state.status_str(), "not_qualified");
+        assert_eq!(state.last_qualified_content, None);
+    }
+}

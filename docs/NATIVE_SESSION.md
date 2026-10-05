@@ -35,17 +35,33 @@ the compositor launch environment.
 ## Native settings
 
 - `OBLIVION_ONE_MODE=auto|preferred|highres|highrr|WIDTHxHEIGHT[@HZ]`
-- `OBLIVION_ONE_KMS_MODE=auto|atomic|legacy`
-- `OBLIVION_ONE_SCANOUT_BACKEND=auto|gpu|native-egl-gbm|native-egl-gbm-opaque|gbm-cpu-write|cpu|dumb`
-
-`auto`, `gpu`, and `native-egl-gbm` select the explicit Atomic EGL/GBM path.
-The exact `native-egl-gbm-opaque` value is the rollback-only opaque window
-surface implementation and is never selected by `auto`.
-- `OBLIVION_ONE_CURSOR=auto|hardware|software`
 - `OBLIVION_ONE_CURSOR_THEME=<theme>` and `OBLIVION_ONE_CURSOR_SIZE=<pixels>`
 - `OBLIVION_ONE_NATIVE_APP_GPU=auto|gpu|cpu`
 - `OBLIVION_ONE_SHELL_COMMAND='...'`
 - `OBLIVION_ONE_PERF_LOG=1`
+
+### Presentation and runtime policy defaults
+
+These are the native parser values and runtime fallbacks. `auto` policies remain
+bounded by discovered capabilities and transaction validation.
+
+| Policy | Accepted values | Default | Effective fallback and status |
+| --- | --- | --- | --- |
+| `OBLIVION_ONE_KMS_MODE` | `auto`, `atomic`, `legacy` | `auto` | `auto` selects Atomic first and falls back to Legacy only for Atomic capability, discovery, or initial `TEST_ONLY` failures. Later Atomic failures remain fatal. Explicit `atomic` failures are fatal. |
+| `OBLIVION_ONE_SCANOUT_BACKEND` | `auto`; Atomic aliases `gpu`, `native`, `native-gpu`, `native-egl-gbm`, `egl-gbm`, `gles-gbm`, `egl-gles-gbm`; rollback `native-egl-gbm-opaque`; CPU GBM aliases `gbm-cpu-write`, `gbm-cpu-write-pageflip`, `cpu-gbm-write`, `cpu-gbm-pageflip`, `cpu`, `cpu-gbm`, `gbm`, `egl`, `pageflip`, `gbm-egl`, `gbm-egl-pageflip`; dumb aliases `dumb`, `framebuffer`, `legacy` | `auto` | Auto chooses explicit Atomic EGL/GBM, then CPU GBM, then dumb when those capabilities are available. Explicit backend choices do not walk that fallback list. Unknown values warn and use `auto`. The opaque path is rollback-only and is never selected automatically. |
+| `OBLIVION_ONE_KMS_COMMIT_WORKER` | `off`, `auto`, `force` | `auto` | Auto uses the worker on Atomic KMS; worker startup failure warns and continues synchronously. Legacy KMS remains synchronous. `force` fails on Legacy KMS or Atomic worker startup failure; `off` is intentionally synchronous. Invalid explicit values are configuration errors. |
+| `OBLIVION_ONE_TRIPLE_BUFFERING` | `auto`, `off`, `force` | `auto` | Auto selects triple buffering only with proven capabilities and useful overlap; otherwise it stays double-buffered. `force` does not bypass capability blockers and falls back to double buffering with a doctor warning. Invalid values are configuration errors. |
+| `OBLIVION_ONE_DIRECT_SCANOUT` | `auto`, `off`; deprecated alias `experimental-auto` | `auto` | Direct Scanout is project-qualified for production automatic use. Auto attempts eligible candidates opportunistically; exact scene, device, format/modifier, plane, generation, sync, cursor, presentation-state, and KMS `TEST_ONLY` proof still apply. A candidate that cannot be proven falls back to composition. Unknown values, including `force`, warn and resolve to `off`. Runtime candidate qualification starts unproven and is separate from project-level feature qualification. |
+| `OBLIVION_ONE_VRR` | `off`, `auto`, `on`; aliases `0`/`false`/`no`/`disable`/`disabled` and `1`/`true`/`yes`/`enable`/`enabled` | `auto` | Phase 1 is implemented. Auto requests Adaptive Sync only for eligible solitary-fullscreen candidates; Atomic connector/CRTC capability and exact request validation still govern. Unknown values warn and resolve to `auto`. Further scheduler and final target-hardware qualification work is intentionally deferred; see [Presentation Modes v1](wayland/PRESENTATION_MODES_V1.md#phase-1-qualification-boundary). |
+| `OBLIVION_ONE_TEARING` | `off`, `auto` | `off` | Auto may request async page-flip only when its surface hint, fullscreen, cursor/plane, sync, timing, format, and exact KMS checks allow it. Missing or unrecognized values resolve to `off`. |
+| `OBLIVION_ONE_CURSOR` | `auto`, `hardware` (`hw`, `drm`), `software` (`sw`, `cpu`) | `auto` | Auto uses an available safe hardware cursor and falls back to software. Explicit `hardware` fails startup if its requested hardware path cannot be established. Unknown values warn and use `auto`. |
+| `OBLIVION_ONE_CURSOR_SCHEDULING` | `auto`, `piggyback`, `software` | `auto` | Auto uses normal cursor/output arbitration; `piggyback` prioritizes primary work, and `software` selects software cursor scheduling. Unknown values warn and use `auto`. |
+| `OBLIVION_ONE_DMABUF_KMS_PREFERRED` | `auto`, `off`, `force` | `auto` | Auto prefers exact same-FOURCC renderer/KMS modifier intersections only on NVIDIA EGL. Force removes incompatible advertised choices only when a safe replacement exists; it cannot create a missing intersection. Unknown values warn and use `off`. |
+
+`experimental-auto` is accepted temporarily for existing launch scripts and emits
+a deprecation warning; `auto` is the canonical Direct Scanout policy. The
+runtime's `not_qualified` telemetry describes current candidate proof, not the
+production maturity of the feature.
 
 With Atomic KMS, `OBLIVION_ONE_CURSOR=auto` selects the discovered universal
 cursor plane when its ARGB8888 storage can be allocated safely. This applies to

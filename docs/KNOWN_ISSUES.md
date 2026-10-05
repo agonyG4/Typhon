@@ -11,26 +11,26 @@ required evidence are in `docs/EFFECTS_QUALIFICATION.md`.
 The first effects milestone is linear-sRGB-only. HDR, wide-gamut color
 management, and trusted static texture assets are not advertised or accepted.
 
-## Direct Scanout 2.0 remains experimental
+## Direct Scanout remains opportunistic
 
-Direct Scanout 2.0 is implemented as a conservative primary-plane assignment
-inside the output transaction and KMS worker pipeline. It remains disabled by
-default: `OBLIVION_ONE_DIRECT_SCANOUT=off` and
-`OBLIVION_ONE_KMS_COMMIT_WORKER=off`. Experimental qualification requires the
-Stage 3 KMS worker and the explicit `experimental-auto` direct policy. Real
-TTY/DRM qualification is still pending and belongs to the next task.
+Direct Scanout is project-qualified for production automatic use and defaults
+to `OBLIVION_ONE_DIRECT_SCANOUT=auto`. This does not qualify every buffer or turn
+the feature into arbitrary hardware-plane composition. Runtime eligibility and
+KMS proof remain exact for each candidate; an ineligible or rejected candidate
+returns to composition.
 
-The supported Stage 4 candidate is limited to one opaque solitary fullscreen
-surface on one output: XRGB dmabuf content on the selected DRM device, an
-exactly supported primary-plane format/modifier, identity geometry, identity
-scaling, identity transform, and a supported explicit-synchronization
-contract. Hardware cursor composition is allowed only when the complete
-primary-plus-cursor atomic assignment validates. Any rejection falls back to
-composition.
+The current path assigns the primary plane on the selected output. It does not
+provide generalized overlay/underlay allocation, multi-output scanout,
+cross-device or multi-GPU scanout, HDR/color-equivalence handling, arbitrary
+scaling or transforms, arbitrary primary-plane blending, or unrestricted
+formats and modifiers. Presentation mode and content type are part of the
+Direct Scanout validation identity, so VRR and tearing are not blanket
+exclusions: each still depends on its own eligibility and exact KMS validation.
 
-Stage 4 explicitly excludes overlay planes, VRR, tearing, multi-output,
-hotplug, scaling, transforms, color conversion, HDR, cross-device or
-multi-GPU scanout, primary-plane blending, and broad format expansion.
+Startup runtime qualification may correctly remain unproven until a current
+candidate passes scene, device, plane, format/modifier, synchronization,
+cursor, generation, presentation-mode, and `TEST_ONLY` checks. Those runtime
+blockers and counters remain useful diagnostics.
 
 ## Native SDDM and TTY validation is incomplete
 

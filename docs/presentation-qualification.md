@@ -1,9 +1,18 @@
-# Presentation qualification
+# Presentation regression and requalification
 
-Typhon keeps direct scanout disabled by default. Set
-`OBLIVION_ONE_DIRECT_SCANOUT=experimental-auto` only for an explicitly labeled
-qualification run; `auto` is retained as a compatibility alias and is not a
-production default.
+Direct Scanout has completed project hardware qualification and is qualified
+for production automatic use; `OBLIVION_ONE_DIRECT_SCANOUT=auto` is the default.
+Runtime qualification is separate: a new compositor starts without a proven
+current content/KMS candidate, and every candidate must still pass the exact
+scene, device, plane,
+format/modifier, generation, synchronization, cursor, presentation-state, and
+KMS `TEST_ONLY` checks before it can be submitted. A failed proof falls back to
+composition.
+
+This procedure is for regression and hardware requalification of that
+production default. The canonical matrix values are `off` and `auto`.
+`experimental-auto` remains a deprecated compatibility alias for existing
+launch scripts; new procedures should use `auto`.
 
 Direct Scanout presentation-property qualification uses the stable WindowGroup
 `SceneNodeId` for active, canonical, and physically presented Geometry/Opacity
@@ -18,8 +27,8 @@ The reproducible matrix tool is:
 bin/qualify-presentation --dry-run
 ```
 
-It prints the sequential matrix across direct policy (`off`,
-`experimental-auto`), triple buffering (`off`, `auto`, `force`), and cursor
+It prints the sequential matrix across direct policy (`off`, `auto`), triple
+buffering (`off`, `auto`, `force`), and cursor
 scheduling (`auto`, `piggyback`, `software`). Every combination has a distinct
 phase label. No result is considered a qualification until it has been run on
 a real TTY with the same hardware and driver.
@@ -35,9 +44,9 @@ Each phase writes bounded, labeled artifacts under
 `~/.local/state/oblivion-one/qualifications/<timestamp>/`, including the
 session log, trace placeholder, metrics placeholder, environment snapshot,
 and summary. The summary reports trace drops when the running compositor emits
-that metric. The tool does not change the default direct policy or silently
-enable a presentation policy. Adaptive Sync and tearing qualification must be
-selected explicitly for the live phase being run.
+that metric. Each phase explicitly selects its Direct Scanout policy. Adaptive
+Sync and tearing qualification remain independent and must be selected
+explicitly for the live phase being run.
 
 ## Adaptive Sync Phase 1 qualification
 
@@ -65,12 +74,12 @@ TEST_ONLY and real-submit rejection fallback, session suspend/resume, and
 shutdown restore on the target kernel, driver, connector, and monitor.
 
 Phase 1 deliberately keeps Adaptive Sync on conservative `ReactiveDouble`
-pacing; it does not implement the final phase-free VRR scheduler. VRR
-range/min-refresh handling, overlay coalescing, cursor timing optimization,
-anti-flicker cadence ownership, and VRR-specific late rendering belong to the
-next scheduler phase. Fixed-refresh VSync, Async, FIFO, Commit Timing,
-Predictive O1, and presentation-feedback ownership must continue to pass their
-existing tests independently of physical hardware qualification.
+pacing. Further VRR scheduler and final hardware qualification work is
+intentionally deferred while the project waits for the required NVIDIA driver
+support on the Astrea/Typhon target hardware. This target-hardware qualification
+hold does not disable or remove Phase 1. Fixed-refresh VSync, Direct Scanout,
+Async/tearing, FIFO, Commit Timing, Predictive O1, and presentation-feedback
+ownership remain independent and must continue to pass their existing tests.
 
 Each live phase must exercise and inspect:
 

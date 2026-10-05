@@ -1,5 +1,10 @@
 # Typhon Documentation Architecture Study
 
+> Historical architecture study.
+> This document describes the source snapshot identified below and is not the
+> source of truth for current runtime defaults, feature maturity, or
+> qualification status.
+
 **Study date:** 2026-09-24  
 **Authoritative source snapshot:** `Typhon-source(20260923-213927).zip`  
 **Historical supporting baseline:** `TYPHON_ARCHITECTURE_FEATURES_READINESS_AUDIT_2026-09-14(1).md`  

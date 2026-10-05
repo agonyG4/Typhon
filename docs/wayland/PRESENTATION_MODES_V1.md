@@ -137,6 +137,12 @@ mode, so their proofs cannot alias across modes or output generations.
 
 The existing fixed-refresh `PresentationDeadlinePlanner` and Predictive O1
 physical opportunity model remain unchanged. Adaptive presentations use
-conservative `ReactiveDouble` pacing. Phase 2 owns phase-free `VrrWindow`
-scheduling, VRR range/min-refresh handling, overlay coalescing, cursor timing
-optimization, anti-flicker cadence ownership, and VRR-specific late rendering.
+conservative `ReactiveDouble` pacing.
+
+**Project status:** VRR Phase 1 is implemented. Further scheduler work and final
+hardware qualification are intentionally deferred while the project waits for
+the required NVIDIA driver support on the Astrea/Typhon target hardware. This is
+a target-hardware qualification blocker, not a claim about NVIDIA support in
+general, and it does not disable or remove the existing Phase 1 implementation.
+Fixed-refresh presentation, Direct Scanout, Predictive O1, FIFO, Commit Timing,
+and tearing remain independent.

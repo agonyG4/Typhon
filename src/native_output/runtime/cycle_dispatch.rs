@@ -1393,7 +1393,11 @@ impl NativeRuntime {
                             self.direct_scanout_preference.enabled(),
                             direct_state,
                         ),
-                        direct_state.as_str(),
+                        format!(
+                            "policy={} runtime_state={}",
+                            self.direct_scanout_preference.as_str(),
+                            direct_state.as_str()
+                        ),
                         direct_detail,
                     ),
                     doctor_check(

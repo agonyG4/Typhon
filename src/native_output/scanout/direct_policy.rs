@@ -1,22 +1,39 @@
+/// Product policy for attempting exact per-candidate Direct Scanout validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeDirectScanoutPreference {
     Off,
-    ExperimentalAuto,
+    Auto,
+}
+
+fn direct_scanout_deprecation_warning(value: Option<&str>) -> Option<&'static str> {
+    match value {
+        Some("experimental-auto") => {
+            Some("OBLIVION_ONE_DIRECT_SCANOUT=experimental-auto is deprecated; use auto")
+        }
+        _ => None,
+    }
+}
+
+impl Default for NativeDirectScanoutPreference {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl NativeDirectScanoutPreference {
     pub(crate) fn from_env() -> Self {
         let value = std::env::var("OBLIVION_ONE_DIRECT_SCANOUT").ok();
         let preference = Self::from_value(value.as_deref());
-        if value.as_deref() == Some("auto") {
-            eprintln!(
-                "native scanout: OBLIVION_ONE_DIRECT_SCANOUT=auto is deprecated; using experimental-auto"
-            );
-        } else if value.is_some() && preference == Self::Off && value.as_deref() != Some("off") {
+        if let Some(warning) = direct_scanout_deprecation_warning(value.as_deref()) {
+            eprintln!("native scanout: {warning}");
+        } else if let Some(value) = value.as_deref()
+            && value != "off"
+            && value != "auto"
+        {
             eprintln!("native scanout: unknown OBLIVION_ONE_DIRECT_SCANOUT={value:?}; using off");
         }
         eprintln!(
-            "native scanout: direct_scanout_policy={} qualification=not_qualified",
+            "native scanout: direct_scanout_policy={}",
             preference.as_str()
         );
         preference
@@ -24,8 +41,9 @@ impl NativeDirectScanoutPreference {
 
     pub(crate) fn from_value(value: Option<&str>) -> Self {
         match value {
-            None | Some("off") => Self::Off,
-            Some("experimental-auto" | "auto") => Self::ExperimentalAuto,
+            None => Self::default(),
+            Some("off") => Self::Off,
+            Some("experimental-auto" | "auto") => Self::Auto,
             Some(_) => Self::Off,
         }
     }
@@ -36,13 +54,13 @@ impl NativeDirectScanoutPreference {
     }
 
     pub(crate) const fn enabled(self) -> bool {
-        matches!(self, Self::ExperimentalAuto)
+        matches!(self, Self::Auto)
     }
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::ExperimentalAuto => "experimental-auto",
+            Self::Auto => "auto",
         }
     }
 }
@@ -76,7 +94,7 @@ pub(crate) fn direct_scanout_doctor_severity(
         return DoctorSeverity::Ok;
     }
     match state {
-        FeatureState::Configured => DoctorSeverity::Warning,
+        FeatureState::Configured => DoctorSeverity::Ok,
         FeatureState::Unavailable | FeatureState::Degraded => DoctorSeverity::Warning,
         FeatureState::Available | FeatureState::Active => DoctorSeverity::Ok,
     }
@@ -87,51 +105,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_scanout_defaults_to_off_until_qualified() {
+    fn direct_scanout_defaults_to_canonical_auto_and_unknown_values_stay_off() {
+        assert_eq!(NativeDirectScanoutPreference::default().as_str(), "auto");
         assert_eq!(
-            NativeDirectScanoutPreference::from_value(None),
-            NativeDirectScanoutPreference::Off
+            NativeDirectScanoutPreference::from_value(None).as_str(),
+            "auto"
         );
         assert_eq!(
-            NativeDirectScanoutPreference::from_value(Some("experimental-auto")),
-            NativeDirectScanoutPreference::ExperimentalAuto
+            NativeDirectScanoutPreference::from_value(Some("auto")).as_str(),
+            "auto"
+        );
+        assert_eq!(
+            NativeDirectScanoutPreference::parse("auto").as_str(),
+            "auto"
+        );
+        assert_eq!(
+            NativeDirectScanoutPreference::from_value(Some("experimental-auto")).as_str(),
+            "auto"
+        );
+        assert_eq!(
+            NativeDirectScanoutPreference::parse("experimental-auto").as_str(),
+            "auto"
+        );
+        assert_eq!(
+            NativeDirectScanoutPreference::from_value(Some("off")).as_str(),
+            "off"
+        );
+        assert_eq!(
+            NativeDirectScanoutPreference::from_value(Some("force")).as_str(),
+            "off"
+        );
+        assert_eq!(
+            NativeDirectScanoutPreference::from_value(Some("unknown")).as_str(),
+            "off"
+        );
+        assert!(NativeDirectScanoutPreference::from_value(None).enabled());
+        assert!(!NativeDirectScanoutPreference::from_value(Some("off")).enabled());
+    }
+
+    #[test]
+    fn experimental_auto_warns_with_the_canonical_value_but_auto_does_not_warn() {
+        assert_eq!(direct_scanout_deprecation_warning(Some("auto")), None);
+        assert_eq!(
+            direct_scanout_deprecation_warning(Some("experimental-auto")),
+            Some("OBLIVION_ONE_DIRECT_SCANOUT=experimental-auto is deprecated; use auto")
         );
     }
 
     #[test]
-    fn doctor_severity_distinguishes_disabled_qualification_and_active_states() {
+    fn doctor_treats_unproven_auto_candidates_as_healthy() {
         use oblivion_one::control_snapshots::{DoctorSeverity, FeatureState};
 
         assert_eq!(
             direct_scanout_doctor_severity(false, FeatureState::Unavailable),
             DoctorSeverity::Ok
         );
-        assert_eq!(
-            direct_scanout_doctor_severity(true, FeatureState::Configured),
-            DoctorSeverity::Warning
-        );
-        assert_eq!(
-            direct_scanout_doctor_severity(true, FeatureState::Active),
-            DoctorSeverity::Ok
-        );
-    }
-
-    #[test]
-    fn compatibility_auto_alias_enables_only_experimental_mode() {
-        assert_eq!(
-            NativeDirectScanoutPreference::parse("auto"),
-            NativeDirectScanoutPreference::ExperimentalAuto
-        );
-        assert_eq!(
-            NativeDirectScanoutPreference::parse("off"),
-            NativeDirectScanoutPreference::Off
-        );
-        assert_eq!(
-            NativeDirectScanoutPreference::parse("force"),
-            NativeDirectScanoutPreference::Off
-        );
-        assert!(NativeDirectScanoutPreference::ExperimentalAuto.enabled());
-        assert!(!NativeDirectScanoutPreference::Off.enabled());
+        for state in [
+            FeatureState::Configured,
+            FeatureState::Available,
+            FeatureState::Active,
+        ] {
+            assert_eq!(
+                direct_scanout_doctor_severity(true, state),
+                DoctorSeverity::Ok
+            );
+        }
+        for state in [FeatureState::Unavailable, FeatureState::Degraded] {
+            assert_eq!(
+                direct_scanout_doctor_severity(true, state),
+                DoctorSeverity::Warning
+            );
+        }
     }
 
     #[test]

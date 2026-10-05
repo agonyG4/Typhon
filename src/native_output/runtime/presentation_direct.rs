@@ -457,7 +457,7 @@ mod tests {
             false,
         ));
         assert!(should_inspect_direct_scanout(
-            NativeDirectScanoutPreference::ExperimentalAuto,
+            NativeDirectScanoutPreference::Auto,
             false,
         ));
         assert!(should_inspect_direct_scanout(

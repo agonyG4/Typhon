@@ -49,9 +49,9 @@ isolated `native_output` attempt reproduced a timing-sensitive failure; its
 final isolated rerun passed 1175/1175, and the fresh serial suite also passed.
 The dry-run enumerated all 18 phases.
 
-The dry-run enumerates 18 labeled combinations across direct scanout policy,
-triple buffering, and cursor scheduling. It starts no compositor and measures no
-GPU or presentation timing.
+The current dry-run enumerates 18 labeled combinations across Direct Scanout
+policies `off`/`auto`, triple buffering, and cursor scheduling. It starts no
+compositor and measures no GPU or presentation timing.
 
 ## Checkpoint capture path policy
 

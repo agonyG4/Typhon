@@ -126,7 +126,7 @@ if [[ "$dry_run" == "0" ]]; then
     printf 'qualification_root=%s\n' "$run_root"
 fi
 
-for direct in off experimental-auto; do
+for direct in off auto; do
     for triple in off auto force; do
         for cursor in auto piggyback software; do
             run_phase "$direct" "$triple" "$cursor"

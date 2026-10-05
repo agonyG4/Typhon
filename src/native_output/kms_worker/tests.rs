@@ -18,10 +18,14 @@ use std::{
 };
 
 #[test]
-fn worker_policy_defaults_to_off() {
+fn worker_policy_defaults_to_auto() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::default(),
+        KmsCommitWorkerPolicy::Auto
+    );
     assert_eq!(
         KmsCommitWorkerPolicy::from_env_value(None),
-        KmsCommitWorkerPolicy::Off
+        KmsCommitWorkerPolicy::Auto
     );
 }
 

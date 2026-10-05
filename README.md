@@ -31,14 +31,11 @@ and rendering support. `oblivion-one doctor` reports the detected prerequisites.
 
 ## Native configuration
 
-Current native controls are environment-based:
+Current native controls are environment-based. The native session guide is the
+source of truth for accepted values, defaults, maturity, and fallback behavior
+for presentation and runtime policies: [Native session configuration](docs/NATIVE_SESSION.md#presentation-and-runtime-policy-defaults).
 
 - `OBLIVION_ONE_MODE` selects the KMS mode.
-- `OBLIVION_ONE_KMS_MODE` selects atomic or legacy KMS policy.
-- `OBLIVION_ONE_SCANOUT_BACKEND=auto|gpu|native-egl-gbm` selects the explicit
-  Atomic EGL/GBM path. The old opaque path is rollback-only under the exact
-  value `native-egl-gbm-opaque`; CPU GBM and dumb remain separate fallbacks.
-- `OBLIVION_ONE_CURSOR` selects hardware or software cursor policy.
 - `OBLIVION_ONE_NATIVE_APP_GPU` selects the GPU policy for launched clients.
 - `OBLIVION_ONE_SHELL_COMMAND` starts the session shell.
 - `OBLIVION_ONE_PERF_LOG=1` enables structured native performance logs.

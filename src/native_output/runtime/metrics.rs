@@ -1007,6 +1007,7 @@ impl NativeRuntime {
                     NativePerfField::u64("egl_draw_max_us", summary.max_ns / 1_000),
                 ]);
             }
+            let direct_scanout_policy = self.direct_scanout_preference.as_str();
             fields.extend([
                 NativePerfField::bool(
                     "atomic_cursor_plane_available",
@@ -1019,6 +1020,7 @@ impl NativeRuntime {
                     self.atomic_cursor.is_some()
                         && self.cursor_render_mode == NativeCursorRenderMode::Hardware,
                 ),
+                NativePerfField::str("direct_scanout_policy", direct_scanout_policy),
                 NativePerfField::bool(
                     "direct_scanout_active",
                     self.presented_planes
