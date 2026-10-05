@@ -126,3 +126,9 @@ The native matrix remains environment-dependent. Hardware KMS ownership,
 GTK/Qt/Steam/Proton availability, and a running X11 client suite must be
 validated on the target session; ignored tests report skips rather than
 claiming those external programs are installed.
+
+The 2026-10-05 F11-D environment review found an active Hyprland session and
+Hyprland-managed Xwayland, with no native Typhon XWM available. No real-client
+case was qualified. F11-D remains partially qualified pending a managed native
+Typhon session; the installed-client inventory and blocked matrix are recorded
+in [XWAYLAND_INTEROP_QUALIFICATION.md](XWAYLAND_INTEROP_QUALIFICATION.md).
