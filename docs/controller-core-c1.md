@@ -22,9 +22,11 @@ validates candidate event devices by their evdev capabilities, rejecting
 ordinary keyboard, mouse, and touchpad devices. Device IDs are process-local
 monotonic identities; event-node paths are transport details and are not
 logical controller identities. Device reads are non-blocking and use evdev's
-synchronized event API. A fixed global budget bounds raw event processing per
-reactor cycle. Exhausted work continues through a controller-specific
-continuation, without promoting the ordinary input or render domains. An idle
+synchronized event API. A fixed global 384-event target controls batch
+admission per reactor cycle. Each admitted synchronized batch is consumed in
+full and can exceed the target by the remainder of that indivisible batch.
+Exhausted work continues through a controller-specific continuation, without
+promoting the ordinary input or render domains. An idle
 connected controller costs no processing until its FD becomes readable; there
 is no controller thread, timer, or polling loop.
 
@@ -60,11 +62,14 @@ pre-suspend handles are not replayed.
 C1 does not maintain a source-aware aggregate keyboard or pointer ownership
 ledger because it injects no synthetic seat state. This avoids release
 collisions between physical devices and future controller-generated input.
-Controller policy, connection counts, topology counters, drain counters,
-activity transitions, and failures are available in the control status
-snapshot. The evdev synchronized path repairs `SYN_DROPPED`, but the crate does
-not expose a recovery counter, so that telemetry field is reported as
-unavailable.
+Controller policy, connection counts, observer open/close counts, drain
+counters, activity transitions, and failures are available in the control
+status snapshot. Open/close counts describe Typhon's observation-handle
+lifecycle; session suspend and resume affect them, so they are not physical
+hotplug counts. The raw-event counter counts events yielded by evdev's
+synchronized iterator, including synthetic synchronization-repair events. The
+evdev synchronized path repairs `SYN_DROPPED`, but the crate does not expose a
+recovery counter, so that telemetry field is reported as unavailable.
 
 ## Future boundaries
 

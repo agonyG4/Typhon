@@ -145,8 +145,8 @@ impl NativeRuntime {
         ControllerObserverSnapshot {
             policy: manager.policy().as_str().to_string(),
             connected_devices: u32::try_from(manager.connected_count()).unwrap_or(u32::MAX),
-            device_adds: telemetry.device_adds,
-            device_removes: telemetry.device_removes,
+            device_opens: telemetry.device_opens,
+            device_closes: telemetry.device_closes,
             raw_events: telemetry.raw_events,
             logical_frames: telemetry.logical_frames,
             activity_transitions: telemetry.activity_transitions,

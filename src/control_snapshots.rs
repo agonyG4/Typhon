@@ -214,8 +214,8 @@ pub struct ControlStatusSnapshot {
 pub struct ControllerObserverSnapshot {
     pub policy: String,
     pub connected_devices: u32,
-    pub device_adds: u64,
-    pub device_removes: u64,
+    pub device_opens: u64,
+    pub device_closes: u64,
     pub raw_events: u64,
     pub logical_frames: u64,
     pub activity_transitions: u64,
@@ -232,8 +232,8 @@ impl Default for ControllerObserverSnapshot {
         Self {
             policy: "off".to_string(),
             connected_devices: 0,
-            device_adds: 0,
-            device_removes: 0,
+            device_opens: 0,
+            device_closes: 0,
             raw_events: 0,
             logical_frames: 0,
             activity_transitions: 0,

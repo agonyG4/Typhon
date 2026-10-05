@@ -8,19 +8,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use evdev::InputEvent;
-
 use oblivion_one::native::event_loop::{ControllerDeviceReadyEvent, ReactorToken};
 
 use super::{
-    device::{ControllerDevice, ControllerDeviceId, ControllerIdAllocator, TransportFingerprint},
-    frame::ControllerFrame,
+    device::{
+        ControllerBatchStats, ControllerDevice, ControllerDeviceId, ControllerIdAllocator,
+        TransportFingerprint,
+    },
     policy::ControllerPolicy,
 };
 
+/// Target admission budget. An admitted synchronized batch is indivisible and may exceed it.
 pub(crate) const MAX_RAW_EVENTS_PER_CYCLE: usize = 384;
 pub(crate) const MAX_CONTROLLER_DEVICES: usize = 32;
-const MAX_DISCOVERY_CANDIDATES: usize = 128;
+pub(super) const MAX_DISCOVERY_CANDIDATES: usize = 128;
 const MONITOR_READ_BYTES: usize = 4096;
 const MONITOR_READS_PER_CYCLE: usize = 4;
 
@@ -35,8 +36,8 @@ const TERMINAL_EVENTS: u32 =
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ControllerTelemetry {
-    pub(crate) device_adds: u64,
-    pub(crate) device_removes: u64,
+    pub(crate) device_opens: u64,
+    pub(crate) device_closes: u64,
     pub(crate) raw_events: u64,
     pub(crate) logical_frames: u64,
     pub(crate) activity_transitions: u64,
@@ -55,59 +56,59 @@ pub(crate) struct ControllerDrainOutcome {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ControllerEventBudget {
     remaining: usize,
-    used: usize,
+    processed: usize,
 }
 
 impl Default for ControllerEventBudget {
     fn default() -> Self {
         Self {
             remaining: MAX_RAW_EVENTS_PER_CYCLE,
-            used: 0,
+            processed: 0,
         }
     }
 }
 
 impl ControllerEventBudget {
-    #[cfg(test)]
-    pub(super) fn take(&mut self) -> bool {
-        if self.remaining == 0 {
-            return false;
-        }
-        self.remaining -= 1;
-        self.used += 1;
-        true
+    pub(super) const fn can_admit_batch(self) -> bool {
+        self.remaining > 0
     }
 
+    #[cfg(test)]
     pub(super) fn remaining(self) -> usize {
         self.remaining
     }
 
-    pub(super) fn consume(&mut self, count: usize) {
-        let consumed = count.min(self.remaining);
-        self.remaining -= consumed;
-        self.used += consumed;
-    }
-
-    pub(super) fn exhausted(self) -> bool {
+    /// Accounts a fully consumed synchronized batch and closes admission at the target.
+    pub(super) fn account_batch(&mut self, count: usize) -> bool {
+        self.processed = self.processed.saturating_add(count);
+        self.remaining = self.remaining.saturating_sub(count);
         self.remaining == 0
     }
 
     #[cfg(test)]
-    pub(super) fn used(self) -> usize {
-        self.used
+    pub(super) fn processed(self) -> usize {
+        self.processed
     }
+}
+
+/// Admits at most one batch and accounts it only after the drain closure completes.
+pub(super) fn drain_admitted_batch(
+    budget: &mut ControllerEventBudget,
+    drain: impl FnOnce() -> io::Result<ControllerBatchStats>,
+) -> io::Result<Option<(ControllerBatchStats, bool)>> {
+    if !budget.can_admit_batch() {
+        return Ok(None);
+    }
+
+    let batch = drain()?;
+    let exhausted = budget.account_batch(batch.raw_events);
+    Ok(Some((batch, exhausted)))
 }
 
 #[derive(Debug)]
 struct CandidatePath {
     path: PathBuf,
     fingerprint: TransportFingerprint,
-}
-
-#[derive(Debug)]
-struct QueuedControllerEvent {
-    device_index: usize,
-    event: InputEvent,
 }
 
 #[derive(Debug)]
@@ -123,7 +124,6 @@ pub(crate) struct ControllerManager {
     ready_work: Vec<ControllerDeviceId>,
     pending_ready: Vec<ControllerDeviceId>,
     failed_devices: Vec<ControllerDeviceId>,
-    event_buffer: Vec<Option<QueuedControllerEvent>>,
     last_serviced: Option<ControllerDeviceId>,
 }
 
@@ -153,7 +153,6 @@ impl ControllerManager {
             ready_work: Vec::with_capacity(MAX_CONTROLLER_DEVICES),
             pending_ready: Vec::with_capacity(MAX_CONTROLLER_DEVICES),
             failed_devices: Vec::with_capacity(MAX_CONTROLLER_DEVICES),
-            event_buffer: (0..MAX_RAW_EVENTS_PER_CYCLE).map(|_| None).collect(),
             last_serviced: None,
         };
         if policy == ControllerPolicy::Observe {
@@ -252,16 +251,10 @@ impl ControllerManager {
             }
             self.ready_work.push(id);
         }
-        if let Some(last) = self.last_serviced
-            && let Some(index) = self.ready_work.iter().position(|id| *id == last)
-        {
-            let next = (index + 1) % self.ready_work.len().max(1);
-            self.ready_work.rotate_left(next);
-        }
+        rotate_ready_work_after_last_serviced(&mut self.ready_work, self.last_serviced);
 
         self.failed_devices.clear();
         let mut budget = ControllerEventBudget::default();
-        let mut buffered = 0usize;
         let work_count = self.ready_work.len();
         let mut outcome = ControllerDrainOutcome::default();
 
@@ -275,62 +268,36 @@ impl ControllerManager {
                 self.failed_devices.push(id);
                 continue;
             }
-            if budget.exhausted() {
-                self.pending_ready.push(id);
-                continue;
-            }
             let Some(device_index) = self.device_index(id) else {
                 continue;
             };
-            let limit = budget.remaining();
-            match fetch_events_bounded(
-                &mut self.devices[device_index],
-                device_index,
-                &mut self.event_buffer[buffered..buffered + limit],
-                limit,
-            ) {
-                Ok(count) => {
-                    buffered += count;
-                    budget.consume(count);
-                    self.telemetry.raw_events =
-                        self.telemetry.raw_events.saturating_add(count as u64);
+            match drain_admitted_batch(&mut budget, || {
+                self.devices[device_index].drain_synchronized_batch()
+            }) {
+                Ok(Some((batch, exhausted))) => {
+                    self.record_batch(batch, &mut outcome);
+                    self.telemetry.raw_events = self
+                        .telemetry
+                        .raw_events
+                        .saturating_add(batch.raw_events as u64);
                     self.last_serviced = Some(id);
-                    if budget.exhausted() {
+                    if exhausted {
                         self.telemetry.drain_budget_exhaustions =
                             self.telemetry.drain_budget_exhaustions.saturating_add(1);
-                        self.pending_ready.push(id);
-                        for pending_index in work_index + 1..self.ready_work.len() {
-                            let pending = self.ready_work[pending_index];
-                            self.push_pending_if_known(pending);
-                        }
+                        // Preserve this device and its peers for the next reactor turn. The next
+                        // turn rotates after `last_serviced`, so a noisy device cannot stay first.
+                        self.defer_ready_work_from(work_index);
                         break;
                     }
+                }
+                Ok(None) => {
+                    self.defer_ready_work_from(work_index);
+                    break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     self.telemetry.read_failures = self.telemetry.read_failures.saturating_add(1);
                     self.failed_devices.push(id);
-                }
-            }
-        }
-
-        for index in 0..buffered {
-            let Some(queued) = self.event_buffer[index].take() else {
-                continue;
-            };
-            let Some(device) = self.devices.get_mut(queued.device_index) else {
-                continue;
-            };
-            if let Some(ControllerFrame {
-                activity_transition,
-                ..
-            }) = device.process_evdev_event(queued.event)
-            {
-                self.telemetry.logical_frames = self.telemetry.logical_frames.saturating_add(1);
-                if activity_transition {
-                    outcome.meaningful_activity = true;
-                    self.telemetry.activity_transitions =
-                        self.telemetry.activity_transitions.saturating_add(1);
                 }
             }
         }
@@ -358,13 +325,12 @@ impl ControllerManager {
         self.ready_work.clear();
         self.failed_devices.clear();
         self.last_serviced = None;
-        self.event_buffer.fill_with(|| None);
         for device in &mut self.devices {
             device.clear_session_state();
         }
         let removed = self.devices.len() as u64;
         self.devices.clear();
-        self.telemetry.device_removes = self.telemetry.device_removes.saturating_add(removed);
+        self.telemetry.device_closes = self.telemetry.device_closes.saturating_add(removed);
     }
 
     pub(crate) fn resume(&mut self) {
@@ -412,19 +378,9 @@ impl ControllerManager {
                 return;
             }
         };
+        let entry_paths = entries.filter_map(Result::ok).map(|entry| entry.path());
         let mut candidates = Vec::with_capacity(MAX_DISCOVERY_CANDIDATES);
-        for entry in entries
-            .take(MAX_DISCOVERY_CANDIDATES)
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            let is_event_node = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("event"));
-            if !is_event_node {
-                continue;
-            }
+        for path in event_candidate_paths(entry_paths) {
             match TransportFingerprint::read(&path) {
                 Ok(fingerprint) => candidates.push(CandidatePath { path, fingerprint }),
                 Err(_) => {
@@ -462,7 +418,7 @@ impl ControllerManager {
             match ControllerDevice::open(&candidate.path, &self.udev_data_root, &mut self.ids) {
                 Ok(Some(device)) => {
                     self.devices.push(device);
-                    self.telemetry.device_adds = self.telemetry.device_adds.saturating_add(1);
+                    self.telemetry.device_opens = self.telemetry.device_opens.saturating_add(1);
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -486,6 +442,25 @@ impl ControllerManager {
         }
     }
 
+    fn defer_ready_work_from(&mut self, first_index: usize) {
+        for pending_index in first_index..self.ready_work.len() {
+            let id = self.ready_work[pending_index];
+            self.push_pending_if_known(id);
+        }
+    }
+
+    fn record_batch(&mut self, batch: ControllerBatchStats, outcome: &mut ControllerDrainOutcome) {
+        self.telemetry.logical_frames = self
+            .telemetry
+            .logical_frames
+            .saturating_add(batch.logical_frames as u64);
+        self.telemetry.activity_transitions = self
+            .telemetry
+            .activity_transitions
+            .saturating_add(batch.activity_transitions as u64);
+        outcome.meaningful_activity |= batch.activity_transitions > 0;
+    }
+
     fn remove_device(&mut self, id: ControllerDeviceId) -> bool {
         let Some(index) = self.device_index(id) else {
             self.pending_ready.retain(|pending| *pending != id);
@@ -494,27 +469,35 @@ impl ControllerManager {
         self.devices[index].clear_session_state();
         self.devices.remove(index);
         self.pending_ready.retain(|pending| *pending != id);
-        self.telemetry.device_removes = self.telemetry.device_removes.saturating_add(1);
+        self.telemetry.device_closes = self.telemetry.device_closes.saturating_add(1);
         true
     }
 }
 
-fn fetch_events_bounded(
-    device: &mut ControllerDevice,
-    device_index: usize,
-    buffer: &mut [Option<QueuedControllerEvent>],
-    limit: usize,
-) -> io::Result<usize> {
-    let mut events = device.fetch_events()?;
-    let mut count = 0;
-    for event in events.by_ref().take(limit) {
-        buffer[count] = Some(QueuedControllerEvent {
-            device_index,
-            event,
-        });
-        count += 1;
+pub(super) fn rotate_ready_work_after_last_serviced(
+    ready_work: &mut [ControllerDeviceId],
+    last_serviced: Option<ControllerDeviceId>,
+) {
+    if let Some(last) = last_serviced
+        && let Some(index) = ready_work.iter().position(|id| *id == last)
+    {
+        let next = (index + 1) % ready_work.len().max(1);
+        ready_work.rotate_left(next);
     }
-    Ok(count)
+}
+
+fn is_event_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("event"))
+}
+
+pub(super) fn event_candidate_paths(
+    paths: impl Iterator<Item = PathBuf>,
+) -> impl Iterator<Item = PathBuf> {
+    paths
+        .filter(|path| is_event_path(path))
+        .take(MAX_DISCOVERY_CANDIDATES)
 }
 
 fn open_input_monitor(input_root: &Path) -> io::Result<OwnedFd> {

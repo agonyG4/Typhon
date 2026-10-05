@@ -231,6 +231,13 @@ pub(crate) struct ControllerDevice {
     frame_builder: ControllerFrameBuilder,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ControllerBatchStats {
+    pub(super) raw_events: usize,
+    pub(super) logical_frames: usize,
+    pub(super) activity_transitions: usize,
+}
+
 impl ControllerDevice {
     pub(crate) fn open(
         path: &Path,
@@ -312,31 +319,63 @@ impl ControllerDevice {
         self.evdev.as_raw_fd()
     }
 
-    pub(crate) fn fetch_events(&mut self) -> io::Result<evdev::FetchEventsSynced<'_>> {
-        self.evdev.fetch_events()
-    }
-
-    pub(crate) fn process_evdev_event(&mut self, event: InputEvent) -> Option<ControllerFrame> {
-        let event = match event.destructure() {
-            EventSummary::Key(_, code, value) => ControllerInputEvent::Key {
-                code: code.0,
-                value,
-            },
-            EventSummary::AbsoluteAxis(_, code, value) => ControllerInputEvent::Absolute {
-                code: code.0,
-                value,
-            },
-            EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
-                ControllerInputEvent::SynReport
-            }
-            _ => ControllerInputEvent::Other,
-        };
-        self.frame_builder.process(event)
+    /// Drains one evdev synchronized batch atomically before exposing its statistics.
+    pub(crate) fn drain_synchronized_batch(&mut self) -> io::Result<ControllerBatchStats> {
+        let Self {
+            evdev,
+            frame_builder,
+            ..
+        } = self;
+        let events = evdev.fetch_events()?;
+        Ok(process_synchronized_events(
+            events.map(controller_input_event),
+            frame_builder,
+        ))
     }
 
     pub(crate) fn clear_session_state(&mut self) {
         self.frame_builder.clear_session_state();
     }
+}
+
+fn controller_input_event(event: InputEvent) -> ControllerInputEvent {
+    match event.destructure() {
+        EventSummary::Key(_, code, value) => ControllerInputEvent::Key {
+            code: code.0,
+            value,
+        },
+        EventSummary::AbsoluteAxis(_, code, value) => ControllerInputEvent::Absolute {
+            code: code.0,
+            value,
+        },
+        EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
+            ControllerInputEvent::SynReport
+        }
+        _ => ControllerInputEvent::Other,
+    }
+}
+
+pub(super) fn process_synchronized_events(
+    events: impl IntoIterator<Item = ControllerInputEvent>,
+    frame_builder: &mut ControllerFrameBuilder,
+) -> ControllerBatchStats {
+    let mut stats = ControllerBatchStats::default();
+    // FetchEventsSynced drops complete SYN_REPORT blocks through its consumed_to marker, so this
+    // traversal must exhaust the iterator before returning.
+    for event in events {
+        stats.raw_events = stats.raw_events.saturating_add(1);
+        if let Some(ControllerFrame {
+            activity_transition,
+            ..
+        }) = frame_builder.process(event)
+        {
+            stats.logical_frames = stats.logical_frames.saturating_add(1);
+            if activity_transition {
+                stats.activity_transitions = stats.activity_transitions.saturating_add(1);
+            }
+        }
+    }
+    stats
 }
 
 fn has_udev_tag(contents: &str, name: &str) -> bool {

@@ -1,11 +1,18 @@
 use super::{
     ControllerDeviceId,
-    device::{ControllerIdAllocator, InputDeviceMetadata, classify_controller_capabilities},
+    device::{
+        ControllerIdAllocator, InputDeviceMetadata, classify_controller_capabilities,
+        process_synchronized_events,
+    },
     frame::{
         ABS_HAT0X, ABS_RX, ABS_RY, ABS_X, ABS_Y, AxisRange, ControllerFrameBuilder,
         ControllerInputEvent,
     },
-    manager::{ControllerEventBudget, ControllerManager, MAX_RAW_EVENTS_PER_CYCLE},
+    manager::{
+        ControllerEventBudget, ControllerManager, MAX_DISCOVERY_CANDIDATES,
+        MAX_RAW_EVENTS_PER_CYCLE, drain_admitted_batch, event_candidate_paths,
+        rotate_ready_work_after_last_serviced,
+    },
     policy::{ControllerPolicy, parse_controller_policy},
 };
 use oblivion_one::compositor::{IdleManager, IdleState};
@@ -13,8 +20,11 @@ use oblivion_one::native::event_loop::{
     ControllerDeviceReadyEvent, NativeEventLoop, NativeEventSource,
 };
 use std::{
+    cell::Cell,
     fs,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    path::PathBuf,
+    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -301,17 +311,157 @@ fn controller_id_allocator_never_reuses_a_prior_id() {
 }
 
 #[test]
-fn controller_drain_budget_is_fixed_and_bounded() {
+fn controller_batch_admission_budget_counts_whole_batches() {
     let mut budget = ControllerEventBudget::default();
 
-    for _ in 0..MAX_RAW_EVENTS_PER_CYCLE {
-        assert!(budget.take());
-    }
-
-    assert!(!budget.take());
-    assert!(budget.exhausted());
-    assert_eq!(budget.used(), MAX_RAW_EVENTS_PER_CYCLE);
+    assert!(budget.can_admit_batch());
+    assert!(!budget.account_batch(MAX_RAW_EVENTS_PER_CYCLE - 1));
+    assert!(budget.can_admit_batch());
+    assert!(budget.account_batch(2));
+    assert!(!budget.can_admit_batch());
+    assert_eq!(budget.processed(), MAX_RAW_EVENTS_PER_CYCLE + 1);
     assert_eq!(MAX_RAW_EVENTS_PER_CYCLE, 384);
+}
+
+#[test]
+fn synchronized_batch_is_fully_consumed_before_budget_admission() {
+    let mut budget = ControllerEventBudget::default();
+    budget.account_batch(MAX_RAW_EVENTS_PER_CYCLE - 2);
+    assert_eq!(budget.remaining(), 2);
+
+    let events = [
+        ControllerInputEvent::Other,
+        ControllerInputEvent::Other,
+        ControllerInputEvent::Key {
+            code: BTN_GAMEPAD,
+            value: 1,
+        },
+        ControllerInputEvent::SynReport,
+    ];
+    let consumed = Rc::new(Cell::new(0));
+    let fully_consumed_on_drop = Rc::new(Cell::new(false));
+    let batch = DropObservedBatch::new(
+        events,
+        Rc::clone(&consumed),
+        Rc::clone(&fully_consumed_on_drop),
+    );
+    let mut builder = frame_builder();
+    let mut admitted_batches = 0;
+
+    let (stats, exhausted) = drain_admitted_batch(&mut budget, || {
+        admitted_batches += 1;
+        Ok(process_synchronized_events(batch, &mut builder))
+    })
+    .expect("admitted fetch batch drains successfully")
+    .expect("remaining budget admits the first batch");
+
+    assert!(fully_consumed_on_drop.get());
+    assert_eq!(consumed.get(), events.len());
+    assert_eq!(stats.raw_events, events.len());
+    assert_eq!(
+        stats.logical_frames, 1,
+        "tail SYN_REPORT must finish the frame"
+    );
+    assert_eq!(
+        stats.activity_transitions, 1,
+        "tail button activity must survive"
+    );
+
+    assert!(exhausted);
+    assert_eq!(budget.processed(), MAX_RAW_EVENTS_PER_CYCLE + 2);
+    assert!(
+        !budget.can_admit_batch(),
+        "the over-budget batch closes admission"
+    );
+    let second_batch = drain_admitted_batch(&mut budget, || {
+        admitted_batches += 1;
+        Ok(Default::default())
+    })
+    .expect("budget exhaustion is not an I/O error");
+    assert!(second_batch.is_none());
+    assert_eq!(
+        admitted_batches, 1,
+        "no second batch is admitted after exhaustion"
+    );
+}
+
+#[test]
+fn budget_exhaustion_rotates_the_next_pending_controller_to_the_front() {
+    let first = ControllerDeviceId::from_raw(1).expect("first controller ID");
+    let second = ControllerDeviceId::from_raw(2).expect("second controller ID");
+    let third = ControllerDeviceId::from_raw(3).expect("third controller ID");
+    let mut ready = [first, second, third];
+
+    rotate_ready_work_after_last_serviced(&mut ready, Some(first));
+
+    assert_eq!(ready, [second, third, first]);
+}
+
+#[test]
+fn discovery_cap_counts_event_paths_after_filtering_other_entries() {
+    let mut paths: Vec<_> = (0..MAX_DISCOVERY_CANDIDATES * 2)
+        .map(|index| PathBuf::from(format!("/dev/input/by-id/controller-{index}")))
+        .collect();
+    paths.push(PathBuf::from("/dev/input/event17"));
+    paths.push(PathBuf::from("/dev/input/event18"));
+
+    let candidates: Vec<_> = event_candidate_paths(paths.into_iter()).collect();
+
+    assert_eq!(
+        candidates,
+        [
+            PathBuf::from("/dev/input/event17"),
+            PathBuf::from("/dev/input/event18")
+        ]
+    );
+    let too_many_events = (0..MAX_DISCOVERY_CANDIDATES + 1)
+        .map(|index| PathBuf::from(format!("/dev/input/event{index}")));
+    assert_eq!(
+        event_candidate_paths(too_many_events).count(),
+        MAX_DISCOVERY_CANDIDATES
+    );
+}
+
+struct DropObservedBatch {
+    events: std::array::IntoIter<ControllerInputEvent, 4>,
+    consumed: Rc<Cell<usize>>,
+    fully_consumed_on_drop: Rc<Cell<bool>>,
+    total: usize,
+}
+
+impl DropObservedBatch {
+    fn new(
+        events: [ControllerInputEvent; 4],
+        consumed: Rc<Cell<usize>>,
+        fully_consumed_on_drop: Rc<Cell<bool>>,
+    ) -> Self {
+        let total = events.len();
+        Self {
+            events: events.into_iter(),
+            consumed,
+            fully_consumed_on_drop,
+            total,
+        }
+    }
+}
+
+impl Iterator for DropObservedBatch {
+    type Item = ControllerInputEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let event = self.events.next();
+        if event.is_some() {
+            self.consumed.set(self.consumed.get() + 1);
+        }
+        event
+    }
+}
+
+impl Drop for DropObservedBatch {
+    fn drop(&mut self) {
+        self.fully_consumed_on_drop
+            .set(self.consumed.get() == self.total);
+    }
 }
 
 #[test]
