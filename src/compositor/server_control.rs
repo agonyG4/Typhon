@@ -371,6 +371,8 @@ impl OwnCompositorServer {
             minimized: window.state.is_minimized(),
             maximized: matches!(mode, ToplevelMode::Maximized),
             fullscreen: matches!(mode, ToplevelMode::Fullscreen),
+            decoration_policy: window.decoration_policy.as_str().to_string(),
+            decoration_mode: format!("{:?}", self.state.effective_window_decoration_mode(id)),
             urgent: None,
             skip_taskbar: x11 && window.is_auxiliary_x11_role(),
             workspace: control_workspace_label(window.management),
@@ -378,6 +380,20 @@ impl OwnCompositorServer {
             geometry,
             focus_serial: None,
         })
+    }
+
+    pub fn set_window_decoration_policy(
+        &mut self,
+        id: u64,
+        policy: crate::wm::WindowDecorationPolicy,
+    ) -> Option<(WindowSnapshot, bool)> {
+        let id = std::num::NonZeroU64::new(id).map(crate::core::WindowId::new)?;
+        self.state.window(id)?;
+        let previous_generation = self.state.scene_render_generation;
+        self.state.set_window_decoration_policy(id, policy);
+        let visual_changed = self.state.scene_render_generation != previous_generation;
+        self.control_window_snapshot(id)
+            .map(|snapshot| (snapshot, visual_changed))
     }
 
     pub fn control_window_list_snapshot(&self) -> Result<WindowListSnapshot, serde_json::Error> {

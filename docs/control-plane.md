@@ -84,6 +84,18 @@ persistence leaves the active generation unchanged. Old cursor generations
 remain retained while KMS transactions, worker jobs, cursor-plane owners, or
 software frames still reference them.
 
+`window.decoration-policy.set` is a targeted per-window qualification command.
+It accepts `{"id":109,"policy":"server"}` or
+`{"id":109,"policy":"client_preference"}` and returns that window's
+snapshot. The `windows` snapshot includes `decorationPolicy` and
+`decorationMode`. The `astreactl` form is
+`astreactl window decoration-policy 109 server` or
+`astreactl window decoration-policy 109 client-preference`. A live XDG
+decoration object changes only after its normal configure/ack/commit
+transaction; without an object, Typhon applies its own SSD directly. X11
+updates its frame extents with the same runtime policy change. This command
+does not define persistent window rules.
+
 The v1 Display request shapes are `outputs.configure`,
 `outputs.configure.confirm`, and `outputs.configure.revert`. Configure carries
 the output ID, base configuration generation, opaque native mode ID, scale,

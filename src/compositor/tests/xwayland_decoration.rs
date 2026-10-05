@@ -103,6 +103,112 @@ fn admitted_x11_decoration_hint_change_reconfigures_without_geometry_drift() {
 }
 
 #[test]
+fn runtime_decoration_policy_reconfigures_x11_frame_extents_and_snapshot() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("managed X11 window");
+    let geometry_before = fixture
+        .server
+        .state
+        .x11_authoritative_geometry(handle)
+        .expect("X11 frame geometry");
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::MetadataChanged {
+            window: handle,
+            delta: X11MetadataDelta::DecorationHints(X11DecorationHints {
+                motif: X11MotifDecorationHint::Undecorated,
+                gtk_frame_extents: Some(X11FrameExtents {
+                    left: 4,
+                    right: 4,
+                    top: 24,
+                    bottom: 4,
+                }),
+            }),
+        });
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        fixture.server.state.x11_effective_decoration_mode(handle),
+        crate::compositor::decoration::types::DecorationMode::ClientSide
+    );
+
+    let (server_snapshot, visual_changed) = fixture
+        .server
+        .set_window_decoration_policy(window_id.get(), crate::wm::WindowDecorationPolicy::Server)
+        .expect("window policy update");
+    assert!(visual_changed);
+    assert_eq!(server_snapshot.decoration_policy, "server");
+    assert_eq!(server_snapshot.decoration_mode, "ServerSide");
+    assert_eq!(
+        fixture.server.state.x11_effective_decoration_mode(handle),
+        crate::compositor::decoration::types::DecorationMode::ServerSide
+    );
+    assert_eq!(
+        fixture.server.state.x11_decoration_frame_extents(handle),
+        [0, 0, 26, 0]
+    );
+    let commands = fixture.server.take_xwayland_backend_commands(0);
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        } if *window == handle
+            && *geometry == geometry_before
+            && *frame_extents == [0, 0, 26, 0]
+    )));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .native_decoration_render_instances(fixture.server.renderable_surfaces())
+            .len(),
+        1
+    );
+
+    let (client_snapshot, visual_changed) = fixture
+        .server
+        .set_window_decoration_policy(
+            window_id.get(),
+            crate::wm::WindowDecorationPolicy::ClientPreference,
+        )
+        .expect("client-preference policy update");
+    assert!(visual_changed);
+    assert_eq!(client_snapshot.decoration_policy, "client_preference");
+    assert_eq!(client_snapshot.decoration_mode, "ClientSide");
+    let commands = fixture.server.take_xwayland_backend_commands(0);
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        } if *window == handle
+            && *geometry == geometry_before
+            && *frame_extents == [0; 4]
+    )));
+    assert!(
+        fixture
+            .server
+            .state
+            .native_decoration_render_instances(fixture.server.renderable_surfaces())
+            .is_empty()
+    );
+}
+
+#[test]
 fn x11_mode_transitions_publish_frame_extents_with_the_single_geometry_configure() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();

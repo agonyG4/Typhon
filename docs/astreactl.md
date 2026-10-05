@@ -14,6 +14,8 @@ astreactl doctor
 astreactl outputs
 astreactl windows
 astreactl activewindow
+astreactl window decoration-policy WINDOW_ID server
+astreactl window decoration-policy WINDOW_ID client-preference
 astreactl keyboard config
 astreactl keyboard layout
 astreactl keyboard next
@@ -29,6 +31,11 @@ astreactl cursor reload
 
 `astreactl --version` reports the client build. `astreactl version` queries the
 running compositor.
+
+`window decoration-policy` changes the explicit compositor policy for one
+window ID returned by `astreactl windows`. Its response reports that window's
+current policy and effective decoration mode. `astreactl windows` includes
+both values for qualification and diagnosis.
 
 ## Options
 
@@ -191,12 +198,12 @@ keymap/repeat/modifier events.
 
 ## Scope
 
-Window commands remain read-only: M3 does not activate, minimize, restore, or
-close windows; or provide subscriptions, remote access, DBus, or Dock
-integration. Runtime keyboard layout control remains available for ephemeral
-locked-layout changes, while v3 adds typed transactional RMLVO/repeat
-configuration. It does not add window mutation, process launch, or streaming
-events.
+Window commands remain read-only except for the narrow per-window decoration
+policy setter: they do not activate, minimize, restore, or close windows, or
+provide subscriptions, remote access, DBus, or Dock integration. Runtime
+keyboard layout control remains available for ephemeral locked-layout changes,
+while v3 adds typed transactional RMLVO/repeat configuration. It does not add
+process launch or streaming events.
 
 ## Packaging
 

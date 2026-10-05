@@ -19,15 +19,18 @@ use super::surface_focus::WindowFocusReason;
 use crate::compositor::render;
 use crate::compositor::runtime_files::compositor_debug_surface_logging_enabled;
 use crate::compositor::{WEnum, zxdg_toplevel_decoration_v1};
+use crate::wm::WindowDecorationPolicy;
 use wayland_server::Resource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct WindowDecorationState {
     preference: DecorationPreference,
     applied_mode: DecorationMode,
+    applied_generation: Option<DecorationObjectGeneration>,
     current_generation: Option<DecorationObjectGeneration>,
     next_generation: u64,
     destruction_pending_commit: Option<DecorationObjectGeneration>,
+    destruction_publication_pending: Option<DecorationObjectGeneration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +46,11 @@ impl Default for WindowDecorationState {
         Self {
             preference: DecorationPreference::Unset,
             applied_mode: DecorationMode::ClientSide,
+            applied_generation: Some(DecorationObjectGeneration(1)),
             current_generation: Some(DecorationObjectGeneration(1)),
             next_generation: 2,
             destruction_pending_commit: None,
+            destruction_publication_pending: None,
         }
     }
 }
@@ -55,9 +60,18 @@ impl WindowDecorationState {
         Self {
             preference: DecorationPreference::Unset,
             applied_mode: DecorationMode::ClientSide,
+            applied_generation: Some(DecorationObjectGeneration(1)),
             current_generation: Some(DecorationObjectGeneration(1)),
             next_generation: 2,
             destruction_pending_commit: None,
+            destruction_publication_pending: None,
+        }
+    }
+
+    pub(in crate::compositor) const fn with_published_mode(applied_mode: DecorationMode) -> Self {
+        Self {
+            applied_mode,
+            ..Self::new()
         }
     }
 
@@ -68,6 +82,12 @@ impl WindowDecorationState {
 
     pub(in crate::compositor) const fn applied_mode(self) -> DecorationMode {
         self.applied_mode
+    }
+
+    pub(in crate::compositor) const fn has_published_object_mode(self) -> bool {
+        self.current_generation.is_some()
+            || self.destruction_pending_commit.is_some()
+            || self.destruction_publication_pending.is_some()
     }
 
     pub(in crate::compositor) fn set_preference(
@@ -118,9 +138,23 @@ impl WindowDecorationState {
         true
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn recreate_object(&mut self) -> DecorationObjectGeneration {
+        let baseline = self.applied_mode;
+        self.recreate_object_with_published_mode(baseline)
+    }
+
+    pub(in crate::compositor) fn recreate_object_with_published_mode(
+        &mut self,
+        applied_mode: DecorationMode,
+    ) -> DecorationObjectGeneration {
         if let Some(generation) = self.current_generation {
             return generation;
+        }
+        if self.destruction_pending_commit.is_none()
+            && self.destruction_publication_pending.is_none()
+        {
+            self.applied_mode = applied_mode;
         }
         let generation = DecorationObjectGeneration(self.next_generation);
         self.next_generation = self
@@ -129,6 +163,11 @@ impl WindowDecorationState {
             .expect("XDG decoration generation exhausted");
         self.current_generation = Some(generation);
         self.preference = DecorationPreference::Unset;
+        if self.destruction_pending_commit.is_none()
+            && self.destruction_publication_pending.is_none()
+        {
+            self.applied_generation = Some(generation);
+        }
         generation
     }
 
@@ -149,40 +188,209 @@ impl WindowDecorationState {
         let captured = if let Some(generation) = self.destruction_pending_commit.take()
             && self.current_generation.is_none()
         {
+            self.destruction_publication_pending = Some(generation);
             Some(CapturedXdgDecorationCommitState::DecorationDestroyed { generation })
         } else {
             configured
         };
         (captured, stale_generation)
     }
+
+    fn apply_captured_commit(&mut self, captured: CapturedXdgDecorationCommitState) -> bool {
+        match captured {
+            CapturedXdgDecorationCommitState::Configured(configured) => {
+                if self.current_generation != Some(configured.generation) {
+                    return false;
+                }
+                let changed = self.apply_configured_mode(configured.mode);
+                self.applied_generation = Some(configured.generation);
+                changed
+            }
+            CapturedXdgDecorationCommitState::DecorationDestroyed { generation } => {
+                if self.destruction_publication_pending != Some(generation) {
+                    return false;
+                }
+                self.destruction_publication_pending = None;
+                if self.applied_generation != Some(generation) {
+                    return false;
+                }
+                let changed = self.apply_configured_mode(DecorationMode::ClientSide);
+                self.applied_generation = None;
+                changed
+            }
+        }
+    }
 }
 
-fn effective_x11_decoration_mode(window: &DesktopWindow, mode: ToplevelMode) -> DecorationMode {
-    if !matches!(window.backend, WindowBackend::X11(_))
-        || window.kind != DesktopWindowKind::Managed
-        || !window.is_normal_x11_role()
-    {
+fn effective_decoration_mode(
+    window: &DesktopWindow,
+    xdg_state: Option<&WindowDecorationState>,
+    mode: ToplevelMode,
+) -> DecorationMode {
+    if window.kind != DesktopWindowKind::Managed {
         return DecorationMode::None;
     }
-    if mode == ToplevelMode::Fullscreen {
-        return DecorationMode::None;
+    match window.backend {
+        WindowBackend::Xdg(_) => {
+            if let Some(decoration_state) = xdg_state
+                && decoration_state.has_published_object_mode()
+                && decoration_state.applied_generation.is_some()
+            {
+                return decoration_state.applied_mode();
+            }
+            if mode == ToplevelMode::Fullscreen {
+                return DecorationMode::None;
+            }
+            match window.decoration_policy {
+                WindowDecorationPolicy::ClientPreference => DecorationMode::ClientSide,
+                WindowDecorationPolicy::Server => DecorationMode::ServerSide,
+            }
+        }
+        WindowBackend::X11(_) => {
+            if !window.is_normal_x11_role() || mode == ToplevelMode::Fullscreen {
+                return DecorationMode::None;
+            }
+            if window.decoration_policy == WindowDecorationPolicy::Server {
+                return DecorationMode::ServerSide;
+            }
+            if window
+                .x11_decoration_hints
+                .gtk_frame_extents
+                .is_some_and(|extents| extents.is_non_zero())
+            {
+                return DecorationMode::ClientSide;
+            }
+            if window.x11_decoration_hints.motif
+                == crate::xwayland::xwm::X11MotifDecorationHint::Undecorated
+            {
+                return DecorationMode::None;
+            }
+            DecorationMode::ServerSide
+        }
     }
-    if window
-        .x11_decoration_hints
-        .gtk_frame_extents
-        .is_some_and(|extents| extents.is_non_zero())
-    {
-        return DecorationMode::ClientSide;
-    }
-    if window.x11_decoration_hints.motif
-        == crate::xwayland::xwm::X11MotifDecorationHint::Undecorated
-    {
-        return DecorationMode::None;
-    }
-    DecorationMode::ServerSide
 }
 
 impl super::super::CompositorState {
+    fn effective_decoration_mode_for_window(
+        &self,
+        window: &DesktopWindow,
+        mode: ToplevelMode,
+    ) -> DecorationMode {
+        let xdg_state = matches!(window.backend, WindowBackend::Xdg(_))
+            .then(|| self.xdg_decoration_states.get(&window.root_surface_id))
+            .flatten();
+        effective_decoration_mode(window, xdg_state, mode)
+    }
+
+    pub(in crate::compositor) fn effective_window_decoration_mode(
+        &self,
+        window_id: WindowId,
+    ) -> DecorationMode {
+        self.window(window_id)
+            .map_or(DecorationMode::None, |window| {
+                self.effective_decoration_mode_for_window(window, window.state.mode())
+            })
+    }
+
+    pub(in crate::compositor) fn effective_window_decoration_mode_for_surface(
+        &self,
+        surface_id: u32,
+        mode: ToplevelMode,
+    ) -> DecorationMode {
+        self.window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .map_or(DecorationMode::None, |window| {
+                self.effective_decoration_mode_for_window(window, mode)
+            })
+    }
+
+    pub(in crate::compositor) fn set_window_decoration_policy(
+        &mut self,
+        window_id: WindowId,
+        policy: WindowDecorationPolicy,
+    ) -> bool {
+        let Some(window) = self.window(window_id) else {
+            return false;
+        };
+        let old_policy = window.decoration_policy;
+        if old_policy == policy {
+            return false;
+        }
+        let root_surface_id = window.root_surface_id;
+        let backend = window.backend;
+        let mode = window.state.mode();
+        let old_effective = self.effective_decoration_mode_for_window(window, mode);
+        let old_xdg_configure = matches!(backend, WindowBackend::Xdg(_))
+            .then(|| self.xdg_decoration_mode_for_configure(root_surface_id))
+            .flatten()
+            .map(|configured| configured.mode);
+        let old_frame_extents = matches!(backend, WindowBackend::X11(_))
+            .then(|| match backend {
+                WindowBackend::X11(handle) => self.x11_decoration_frame_extents(handle),
+                WindowBackend::Xdg(_) => [0; 4],
+            })
+            .unwrap_or([0; 4]);
+
+        self.window_mut(window_id)
+            .expect("window was resolved before policy update")
+            .decoration_policy = policy;
+
+        let new_effective = self.effective_window_decoration_mode(window_id);
+        if let WindowBackend::Xdg(_) = backend {
+            let new_xdg_configure = self
+                .xdg_decoration_mode_for_configure(root_surface_id)
+                .map(|configured| configured.mode);
+            if old_xdg_configure != new_xdg_configure
+                && self.xdg_decoration_resources.contains_key(&root_surface_id)
+            {
+                self.configure_xdg_surface_for_decoration(root_surface_id);
+            }
+        }
+
+        if let WindowBackend::X11(handle) = backend {
+            let new_frame_extents = self.x11_decoration_frame_extents(handle);
+            if (old_effective != new_effective || old_frame_extents != new_frame_extents)
+                && let Some(geometry) = self
+                    .window(window_id)
+                    .and_then(|window| window.x11_geometry)
+                    .map(|geometry| geometry.frame)
+            {
+                self.queue_backend_configure(window_id, geometry, mode, false);
+            }
+            if old_effective != new_effective {
+                self.reconcile_x11_decoration_transition(handle, old_effective, new_effective);
+            }
+        } else if old_effective != new_effective {
+            self.reconcile_native_decoration_transition(window_id, root_surface_id, new_effective);
+        }
+
+        if old_effective != new_effective {
+            self.advance_render_generation(RenderGenerationCause::WindowDecoration);
+            self.refresh_pointer_focus_at_last_position();
+        }
+
+        if compositor_debug_surface_logging_enabled() {
+            let backend_name = match backend {
+                WindowBackend::Xdg(_) => "Xdg",
+                WindowBackend::X11(_) => "X11",
+            };
+            let has_xdg_decoration_object =
+                self.xdg_decoration_resources.contains_key(&root_surface_id);
+            let chrome = self
+                .window(window_id)
+                .and_then(|window| window.management)
+                .map_or(crate::wm::WindowChromePolicy::Full, |management| {
+                    management.chrome_policy()
+                });
+            eprintln!(
+                "oblivion-one compositor: event=window_decoration_policy_change window_id={} backend={backend_name} old_policy={old_policy:?} new_policy={policy:?} old_effective={old_effective:?} new_effective={new_effective:?} has_xdg_decoration_object={has_xdg_decoration_object} fullscreen={} chrome={chrome:?}",
+                window_id.get(),
+                mode == ToplevelMode::Fullscreen,
+            );
+        }
+        true
+    }
+
     pub(in crate::compositor) fn x11_effective_decoration_mode(
         &self,
         handle: crate::xwayland::X11WindowHandle,
@@ -190,10 +398,7 @@ impl super::super::CompositorState {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return DecorationMode::None;
         };
-        self.window(window_id)
-            .map_or(DecorationMode::None, |window| {
-                effective_x11_decoration_mode(window, window.state.mode())
-            })
+        self.effective_window_decoration_mode(window_id)
     }
 
     pub(in crate::compositor) fn reconcile_x11_decoration_transition(
@@ -254,13 +459,9 @@ impl super::super::CompositorState {
         let Some(window) = self.window(window_id) else {
             return false;
         };
-        if let Some(decoration_state) = self.xdg_decoration_states.get(&surface_id) {
-            return decoration_state.applied_mode() == DecorationMode::ServerSide;
-        }
-        if mode == ToplevelMode::Fullscreen {
-            return false;
-        }
-        effective_x11_decoration_mode(window, mode) == DecorationMode::ServerSide
+        let _ = window;
+        self.effective_window_decoration_mode_for_surface(surface_id, mode)
+            == DecorationMode::ServerSide
     }
 
     pub(in crate::compositor) fn reconcile_native_decoration_transition(
@@ -306,14 +507,18 @@ impl super::super::CompositorState {
     ) -> Option<ConfiguredXdgDecorationState> {
         let decoration_state = self.xdg_decoration_states.get(&surface_id)?;
         let generation = decoration_state.current_generation()?;
-        let fullscreen = self
+        let window = self
             .window_id_for_surface(surface_id)
-            .and_then(|window_id| self.window(window_id))
-            .is_some_and(|window| window.state.mode() == ToplevelMode::Fullscreen);
-        Some(ConfiguredXdgDecorationState {
-            generation,
-            mode: decoration_state.requested_mode(fullscreen),
-        })
+            .and_then(|window_id| self.window(window_id))?;
+        let fullscreen = window.state.mode() == ToplevelMode::Fullscreen;
+        let mode = if fullscreen {
+            DecorationMode::None
+        } else if window.decoration_policy == WindowDecorationPolicy::Server {
+            DecorationMode::ServerSide
+        } else {
+            decoration_state.requested_mode(false)
+        };
+        Some(ConfiguredXdgDecorationState { generation, mode })
     }
 
     pub(in crate::compositor) fn xdg_decoration_configure_event_needed(
@@ -431,6 +636,9 @@ impl super::super::CompositorState {
                 (generation, DecorationMode::ClientSide)
             }
         };
+        let window_id = self.window_id_for_surface(surface_id);
+        let old_effective_mode =
+            window_id.map(|window_id| self.effective_window_decoration_mode(window_id));
         let Some(decoration_state) = self.xdg_decoration_states.get_mut(&surface_id) else {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -440,17 +648,22 @@ impl super::super::CompositorState {
             }
             return false;
         };
-        let changed = decoration_state.apply_configured_mode(mode);
-        if changed && let Some(window_id) = self.window_id_for_surface(surface_id) {
-            self.reconcile_native_decoration_transition(window_id, surface_id, mode);
+        let raw_mode_changed = decoration_state.apply_captured_commit(captured.state);
+        let new_effective_mode =
+            window_id.map(|window_id| self.effective_window_decoration_mode(window_id));
+        let effective_mode_changed = old_effective_mode != new_effective_mode;
+        if effective_mode_changed
+            && let (Some(window_id), Some(new_mode)) = (window_id, new_effective_mode)
+        {
+            self.reconcile_native_decoration_transition(window_id, surface_id, new_mode);
         }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
-                "oblivion-one compositor: event=xdg_decoration_publish surface={surface_id} commit_sequence={} captured_commit_sequence={} generation={} mode={mode:?} applied={changed}",
+                "oblivion-one compositor: event=xdg_decoration_publish surface={surface_id} commit_sequence={} captured_commit_sequence={} generation={} mode={mode:?} applied={raw_mode_changed} effective_changed={effective_mode_changed}",
                 commit_sequence.0, captured_commit_sequence.0, generation.0,
             );
         }
-        changed
+        effective_mode_changed
     }
 
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {
@@ -489,14 +702,7 @@ impl super::super::CompositorState {
         let visual_geometry = self.current_visual_root_window_geometry(root_surface_id)?;
         let mode = window.state.mode();
         let fullscreen = mode == ToplevelMode::Fullscreen;
-        let decoration_mode =
-            if let Some(decoration_state) = self.xdg_decoration_states.get(&root_surface_id) {
-                decoration_state.applied_mode()
-            } else if matches!(window.backend, WindowBackend::X11(_)) {
-                effective_x11_decoration_mode(window, mode)
-            } else {
-                return None;
-            };
+        let decoration_mode = self.effective_decoration_mode_for_window(window, mode);
         let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
         let chrome_policy = window
             .management
@@ -788,15 +994,7 @@ impl super::super::CompositorState {
                 let window = self.window(window_id)?;
                 let mode = window.state.mode();
                 let fullscreen = mode == ToplevelMode::Fullscreen;
-                let decoration_mode = if let Some(decoration_state) =
-                    self.xdg_decoration_states.get(&surface.surface_id)
-                {
-                    decoration_state.applied_mode()
-                } else if matches!(window.backend, WindowBackend::X11(_)) {
-                    effective_x11_decoration_mode(window, mode)
-                } else {
-                    return None;
-                };
+                let decoration_mode = self.effective_decoration_mode_for_window(window, mode);
                 let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
                 if decoration_mode != DecorationMode::ServerSide {
                     return None;
@@ -873,7 +1071,8 @@ impl super::super::CompositorState {
         let Some(window) = self.window(window_id) else {
             return [0; 4];
         };
-        let decoration_mode = effective_x11_decoration_mode(window, window.state.mode());
+        let decoration_mode =
+            self.effective_decoration_mode_for_window(window, window.state.mode());
         if decoration_mode != DecorationMode::ServerSide {
             return [0; 4];
         }

@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -283,6 +283,17 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             ));
         }
         parse_decoration_command(&positionals[1..])?
+    } else if command == "window" {
+        if keyboard_configure.has_any()
+            || cursor_theme.is_some()
+            || cursor_size.is_some()
+            || wallpaper_fit.is_some()
+        {
+            return Err(AstreactlError::Usage(
+                "window commands do not accept unrelated options".to_string(),
+            ));
+        }
+        parse_window_command(&positionals[1..])?
     } else if command == "effects" {
         if keyboard_configure.has_any() {
             return Err(AstreactlError::Usage(
@@ -684,6 +695,35 @@ fn parse_decoration_command(
     }
 }
 
+fn parse_window_command(
+    positionals: &[String],
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    if positionals.len() != 3 || positionals[0] != "decoration-policy" {
+        return Err(AstreactlError::Usage(
+            "window command requires decoration-policy ID server|client-preference".to_string(),
+        ));
+    }
+    let id = positionals[1]
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .ok_or_else(|| AstreactlError::Usage("invalid window ID".to_string()))?;
+    let policy = match positionals[2].as_str() {
+        "server" => "server",
+        "client-preference" => "client_preference",
+        _ => {
+            return Err(AstreactlError::Usage(
+                "window decoration policy must be server or client-preference".to_string(),
+            ));
+        }
+    };
+    Ok((
+        "window.decoration-policy.set",
+        "window.decoration-policy.set",
+        serde_json::json!({"id": id, "policy": policy}),
+    ))
+}
+
 fn parse_effects_command(
     positionals: &[String],
 ) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
@@ -839,7 +879,7 @@ fn exit_code(error: &AstreactlError) -> u8 {
 mod tests {
     use super::{
         KeyboardConfigureOptions, parse_keyboard_command, parse_keyboard_configure_command,
-        parse_wallpaper_command,
+        parse_wallpaper_command, parse_window_command,
     };
     use oblivion_one::astreactl::wallpaper::DEFAULT_WALLPAPER_TIMEOUT;
     use oblivion_one::control_snapshots::AstreactlResult;
@@ -914,6 +954,55 @@ mod tests {
         let (_, wire, args) = parse_keyboard_command(&["config".to_string()]).unwrap();
         assert_eq!(wire, "keyboard.config.get");
         assert_eq!(args, serde_json::json!({}));
+    }
+
+    #[test]
+    fn window_decoration_policy_parser_builds_typed_runtime_request() {
+        let (display, wire, args) = parse_window_command(&[
+            "decoration-policy".to_string(),
+            "109".to_string(),
+            "server".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(display, "window.decoration-policy.set");
+        assert_eq!(wire, "window.decoration-policy.set");
+        assert_eq!(args, serde_json::json!({"id": 109, "policy": "server"}));
+
+        let (_, wire, args) = parse_window_command(&[
+            "decoration-policy".to_string(),
+            "109".to_string(),
+            "client-preference".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(wire, "window.decoration-policy.set");
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "id": 109,
+                "policy": "client_preference"
+            })
+        );
+
+        for arguments in [
+            vec![
+                "decoration-policy".to_string(),
+                "0".to_string(),
+                "server".to_string(),
+            ],
+            vec![
+                "decoration-policy".to_string(),
+                "109".to_string(),
+                "shadow".to_string(),
+            ],
+            vec![
+                "decoration-policy".to_string(),
+                "109".to_string(),
+                "server".to_string(),
+                "extra".to_string(),
+            ],
+        ] {
+            assert!(parse_window_command(&arguments).is_err());
+        }
     }
 
     #[test]

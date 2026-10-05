@@ -285,6 +285,198 @@ fn dynamic_client_to_server_waits_for_ack_and_commit() {
 }
 
 #[test]
+fn compositor_server_policy_keeps_live_csd_until_commit_and_restores_client_preference() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ClientSide,
+    )
+    .expect("connect decoration client");
+    let generation_before = capture_scene_render_generation(&commands);
+    let serial_count_before = client.state.surface_configure_count;
+    let decoration_count_before = client.state.decoration_configure_count;
+    assert_eq!(client.decoration_count(&commands), 0);
+
+    assert!(set_most_recent_window_decoration_policy(
+        &commands,
+        crate::wm::WindowDecorationPolicy::Server,
+    ));
+    client.pump(&commands).unwrap();
+    assert_eq!(
+        client.state.surface_configure_count,
+        serial_count_before + 1
+    );
+    assert_eq!(
+        client.state.decoration_configure_count,
+        decoration_count_before + 1
+    );
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(client.decoration_count(&commands), 0);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
+
+    let server_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.xdg_surface.ack_configure(server_serial);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 0);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before
+    );
+
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before + 1
+    );
+
+    let stable_serial_count = client.state.surface_configure_count;
+    let stable_decoration_count = client.state.decoration_configure_count;
+    client
+        .decoration
+        .set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.state.surface_configure_count, stable_serial_count);
+    assert_eq!(
+        client.state.decoration_configure_count,
+        stable_decoration_count
+    );
+    assert_eq!(client.decoration_count(&commands), 1);
+
+    assert!(set_most_recent_window_decoration_policy(
+        &commands,
+        crate::wm::WindowDecorationPolicy::ClientPreference,
+    ));
+    client.pump(&commands).unwrap();
+    assert_eq!(
+        client.state.surface_configure_count,
+        stable_serial_count + 1
+    );
+    assert_eq!(
+        client.state.decoration_configure_count,
+        stable_decoration_count + 1
+    );
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&1));
+    assert_eq!(client.decoration_count(&commands), 1);
+
+    let client_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.xdg_surface.ack_configure(client_serial);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 1);
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.decoration_count(&commands), 0);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before + 2
+    );
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn late_decoration_object_inherits_forced_server_visual_baseline() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 1)
+        .expect("connect mapped XDG client without decorations");
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    assert!(set_most_recent_window_decoration_policy(
+        &commands,
+        crate::wm::WindowDecorationPolicy::Server,
+    ));
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    let generation_before_creation = capture_scene_render_generation(&commands);
+
+    let qh = client.queue.handle();
+    let decoration = client
+        .manager
+        .get_toplevel_decoration(&client.toplevel, &qh, ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before_creation
+    );
+
+    let serial = *client.state.surface_configure_serials.last().unwrap();
+    client.xdg_surface.ack_configure(serial);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before_creation
+    );
+
+    decoration.destroy();
+    client.connection.flush().unwrap();
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before_creation
+    );
+
+    let recreated =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before_creation
+    );
+    let recreated_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.xdg_surface.ack_configure(recreated_serial);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before_creation
+    );
+
+    recreated.destroy();
+    client.connection.flush().unwrap();
+    client.surface.commit();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        generation_before_creation
+    );
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
 fn dynamic_server_to_client_waits_for_ack_and_commit() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = DecorationClient::connect(

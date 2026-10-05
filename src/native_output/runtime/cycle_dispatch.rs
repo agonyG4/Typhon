@@ -164,6 +164,13 @@ fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
 #[serde(deny_unknown_fields)]
 struct EmptyKeyboardLayoutArgs {}
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowDecorationPolicySetArgs {
+    id: u64,
+    policy: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -717,6 +724,70 @@ impl NativeRuntime {
                 ControlError::new(ControlErrorCode::InvalidCommand, "unknown control command"),
             ));
         };
+        if command == ControlCommand::WindowDecorationPolicySet {
+            let args = match serde_json::from_value::<WindowDecorationPolicySetArgs>(request.args) {
+                Ok(args) => args,
+                Err(_) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "window.decoration-policy.set requires an id and policy",
+                        ),
+                    ));
+                }
+            };
+            let Some(policy) = oblivion_one::wm::WindowDecorationPolicy::parse(&args.policy) else {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "policy must be server or client_preference",
+                    ),
+                ));
+            };
+            let Some((snapshot, visual_changed)) =
+                self.server.set_window_decoration_policy(args.id, policy)
+            else {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(ControlErrorCode::InvalidArgument, "unknown window id"),
+                ));
+            };
+            if visual_changed {
+                self.queued_redraw_requested = true;
+                if matches!(
+                    snapshot.kind.clone(),
+                    oblivion_one::control_snapshots::WindowKindSnapshot::X11
+                ) {
+                    match self.dispatch_xwayland_scene_batch() {
+                        Ok(repaint_requested) => {
+                            self.queued_redraw_requested |= repaint_requested;
+                        }
+                        Err(error) => {
+                            return Some(ControlResponse::failure(
+                                request.id,
+                                ControlError::new(
+                                    ControlErrorCode::Internal,
+                                    "failed to configure X11 window decoration frame",
+                                )
+                                .with_detail(format!("{error:?}")),
+                            ));
+                        }
+                    }
+                }
+            }
+            return Some(match serde_json::to_value(snapshot) {
+                Ok(result) => ControlResponse::success(request.id, result),
+                Err(_) => ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "window snapshot failed after decoration policy change",
+                    ),
+                ),
+            });
+        }
         if command == ControlCommand::OutputsConfigure {
             return Some(self.dispatch_output_configure(request.id, request.args));
         }
@@ -2397,13 +2468,13 @@ mod tests {
         AnimationConfigurationSetArgs, DirectScanoutCounters, DirectScanoutDoctorFormat,
         DirectScanoutDoctorRuntime, DirectScanoutDoctorScene, EmptyKeyboardLayoutArgs,
         KeyboardConfigurationSetArgs, KeyboardLayoutSetArgs, MaterialSetError,
-        NativePreReadInputDecision, decide_native_pre_read_input, dispatch_keyboard_layout_command,
-        format_direct_scanout_doctor_detail, format_dmabuf_feedback_source_format,
-        input_requires_full_server_progression, keyboard_layout_failure,
-        material_program_get_args_are_empty, material_program_parameter_set_failure_response,
-        material_program_selection_response, material_program_set_failure_response,
-        material_set_failure_response, material_snapshot_response,
-        promote_native_input_before_wayland_read,
+        NativePreReadInputDecision, WindowDecorationPolicySetArgs, decide_native_pre_read_input,
+        dispatch_keyboard_layout_command, format_direct_scanout_doctor_detail,
+        format_dmabuf_feedback_source_format, input_requires_full_server_progression,
+        keyboard_layout_failure, material_program_get_args_are_empty,
+        material_program_parameter_set_failure_response, material_program_selection_response,
+        material_program_set_failure_response, material_set_failure_response,
+        material_snapshot_response, promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -2802,6 +2873,43 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<KeyboardLayoutSetArgs>(value).is_err());
         }
+    }
+
+    #[test]
+    fn window_decoration_policy_control_arguments_are_strict() {
+        let server = serde_json::from_value::<WindowDecorationPolicySetArgs>(serde_json::json!({
+            "id": 7,
+            "policy": "server"
+        }))
+        .expect("server policy arguments");
+        assert_eq!(server.id, 7);
+        assert_eq!(
+            oblivion_one::wm::WindowDecorationPolicy::parse(&server.policy),
+            Some(oblivion_one::wm::WindowDecorationPolicy::Server)
+        );
+
+        let client_preference =
+            serde_json::from_value::<WindowDecorationPolicySetArgs>(serde_json::json!({
+                "id": 9,
+                "policy": "client_preference"
+            }))
+            .expect("client preference arguments");
+        assert_eq!(
+            oblivion_one::wm::WindowDecorationPolicy::parse(&client_preference.policy),
+            Some(oblivion_one::wm::WindowDecorationPolicy::ClientPreference)
+        );
+        assert!(
+            serde_json::from_value::<WindowDecorationPolicySetArgs>(serde_json::json!({
+                "id": 7,
+                "policy": "server",
+                "extra": true
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            oblivion_one::wm::WindowDecorationPolicy::parse("shadow"),
+            None
+        );
     }
 
     #[test]
@@ -3946,9 +4054,10 @@ impl NativeRuntime {
             .active()
             .map(|transaction| {
                 let (state, error_code) = match &transaction.phase {
-                    OutputConfigurationTransactionPhase::RollbackFailed { error_code } => {
-                        (OutputTransactionStateSnapshot::RollbackFailed, Some(error_code.clone()))
-                    }
+                    OutputConfigurationTransactionPhase::RollbackFailed { error_code } => (
+                        OutputTransactionStateSnapshot::RollbackFailed,
+                        Some(error_code.clone()),
+                    ),
                     OutputConfigurationTransactionPhase::PendingConfirmation
                     | OutputConfigurationTransactionPhase::PersistencePending
                     | OutputConfigurationTransactionPhase::RollingBack => {
@@ -3959,8 +4068,7 @@ impl NativeRuntime {
                     id: transaction.id.get(),
                     output_id: transaction.output_id.clone(),
                     state,
-                    applied_configuration_generation: transaction
-                        .applied_configuration_generation,
+                    applied_configuration_generation: transaction.applied_configuration_generation,
                     remaining_ms: self
                         .output_configuration_transactions
                         .remaining_ms(now_ns)
@@ -4011,7 +4119,11 @@ impl NativeRuntime {
             );
         }
         let mode_is_in_public_projection = args.mode_id == self.target.mode_id
-            || self.output_capabilities.modes.iter().any(|mode| mode.id == args.mode_id);
+            || self
+                .output_capabilities
+                .modes
+                .iter()
+                .any(|mode| mode.id == args.mode_id);
         if self
             .output_capabilities
             .mode_inventory

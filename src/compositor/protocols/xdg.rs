@@ -1,5 +1,7 @@
 use super::super::*;
-use crate::compositor::decoration::types::{DecorationObjectGeneration, DecorationPreference};
+use crate::compositor::decoration::types::{
+    DecorationMode, DecorationObjectGeneration, DecorationPreference,
+};
 
 #[derive(Debug, Clone)]
 struct XdgToplevelDecorationData {
@@ -229,12 +231,17 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                         resource.version(),
                     );
                 }
+                let published_baseline = state
+                    .window_id_for_surface(surface_id)
+                    .map(|window_id| state.effective_window_decoration_mode(window_id))
+                    .unwrap_or(DecorationMode::ClientSide);
                 let generation = if let Some(decoration_state) =
                     state.xdg_decoration_states.get_mut(&surface_id)
                 {
-                    decoration_state.recreate_object()
+                    decoration_state.recreate_object_with_published_mode(published_baseline)
                 } else {
-                    let decoration_state = WindowDecorationState::new();
+                    let decoration_state =
+                        WindowDecorationState::with_published_mode(published_baseline);
                     let generation = decoration_state
                         .current_generation()
                         .expect("new decoration state has an object generation");

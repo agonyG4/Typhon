@@ -14,7 +14,8 @@ use crate::compositor::decoration::{
 };
 use crate::presentation_animation::PresentationOpacity;
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
-use crate::xwayland::xwm::{X11FrameExtents, X11MotifDecorationHint};
+use crate::wm::WindowDecorationPolicy;
+use crate::xwayland::xwm::{X11DecorationHints, X11FrameExtents, X11MotifDecorationHint};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 use std::{num::NonZeroU64, time::Instant};
 
@@ -2739,6 +2740,280 @@ fn csd_and_fullscreen_have_no_server_decoration_instance() {
         ToplevelMode::Fullscreen,
     );
     assert!(decoration_instances(&fullscreen).is_empty());
+}
+
+#[test]
+fn forced_xdg_server_decoration_without_protocol_object_renders_and_hits_titlebar() {
+    let surface = test_surface(450);
+    let surface_id = surface.surface_id;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("insert XDG window");
+    state.append_renderable_surface(surface);
+    state.rebuild_active_scene_view();
+    let client_geometry_before = state.current_root_window_geometry(surface_id);
+
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ClientSide
+    );
+    assert!(decoration_instances(&state).is_empty());
+    assert!(!state.xdg_decoration_resources.contains_key(&surface_id));
+    assert!(
+        state
+            .decoration_hit_for_root_at(surface_id, (0, 0), 100.0, -10.0)
+            .is_none()
+    );
+
+    state.set_window_decoration_policy(window_id, WindowDecorationPolicy::Server);
+
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ServerSide
+    );
+    assert!(state.surface_uses_server_side_decorations(surface_id, ToplevelMode::Normal));
+    let instances = decoration_instances(&state);
+    assert_eq!(instances.len(), 1);
+    assert_eq!(
+        instances[0].plan.layout.titlebar.bottom(),
+        instances[0].plan.layout.client.y
+    );
+    assert!(instances[0].plan.layout.titlebar.height > 0);
+    assert_eq!(
+        state.current_root_window_geometry(surface_id),
+        client_geometry_before
+    );
+    assert!(matches!(
+        state.decoration_hit_for_root_at(surface_id, (0, 0), 100.0, -10.0),
+        Some(DecorationHit::Titlebar)
+    ));
+}
+
+#[test]
+fn forced_xdg_ssd_is_in_presentation_coverage_and_blocks_direct_scanout() {
+    let surface_id = 454;
+    let mut state = CompositorState::new(None);
+    let surface = super::desktop_window_tests::x11_scanout_surface(
+        surface_id,
+        state.output_size.width,
+        state.output_size.height,
+        super::super::SurfacePlacement::absolute_root_at(0, 0),
+        crate::render_backend::buffer::DrmFormat::Xrgb8888,
+    );
+    let mut surface = surface;
+    surface.render_backend = super::super::SurfaceRenderBackend::NativeWayland;
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("insert XDG window");
+    assert!(state.set_window_decoration_policy(window_id, WindowDecorationPolicy::Server));
+    state.append_renderable_surface(surface);
+    state.surface_presentation_generations.insert(surface_id, 1);
+    state.rebuild_active_scene_view();
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(analysis.coverage.visible_content_above.contains(
+        &super::super::PresentationCoverageContent {
+            root_surface_id: surface_id,
+            kind: super::super::PresentationCoverageContentKind::ServerSideDecoration,
+        }
+    ));
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&super::super::DirectScanoutSceneRejection::ServerSideDecorationVisible)
+    );
+    assert!(analysis.candidate.is_none());
+}
+
+#[test]
+fn forced_server_destroy_recreate_keeps_the_effective_mode_generation_bound() {
+    let surface_id = 452;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    let window_id = state.window_id_for_surface(surface_id).expect("window id");
+    assert!(state.set_window_decoration_policy(window_id, WindowDecorationPolicy::Server));
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ServerSide
+    );
+
+    let decoration_state = state
+        .xdg_decoration_states
+        .get_mut(&surface_id)
+        .expect("decoration state");
+    let old_generation = decoration_state
+        .current_generation()
+        .expect("live decoration generation");
+    assert!(decoration_state.destroy_object(old_generation));
+    let commit_sequence = super::super::SurfaceCommitSequence(700);
+    let captured = state.capture_xdg_decoration_commit_state(surface_id, commit_sequence);
+    assert!(captured.is_some());
+
+    let baseline = state.effective_window_decoration_mode(window_id);
+    let new_generation = state
+        .xdg_decoration_states
+        .get_mut(&surface_id)
+        .expect("decoration state")
+        .recreate_object_with_published_mode(baseline);
+    assert_ne!(old_generation, new_generation);
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ServerSide
+    );
+
+    let generation_before_publish = state.scene_render_generation;
+    assert!(!state.apply_captured_xdg_decoration(surface_id, commit_sequence, captured));
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(state.scene_render_generation, generation_before_publish);
+    assert_eq!(
+        state
+            .xdg_decoration_mode_for_configure(surface_id)
+            .expect("forced configure")
+            .mode,
+        DecorationMode::ServerSide
+    );
+}
+
+#[test]
+fn forced_xdg_decoration_disappears_in_fullscreen_and_returns_afterward() {
+    let surface = test_surface(451);
+    let surface_id = surface.surface_id;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("insert XDG window");
+    state.append_renderable_surface(surface);
+    state.rebuild_active_scene_view();
+    state.set_window_decoration_policy(window_id, WindowDecorationPolicy::Server);
+
+    state
+        .window_mut(window_id)
+        .expect("XDG window")
+        .state
+        .set_mode(ToplevelMode::Fullscreen);
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::None
+    );
+    assert!(decoration_instances(&state).is_empty());
+    assert!(
+        state
+            .decoration_hit_for_root_at(surface_id, (0, 0), 100.0, -10.0)
+            .is_none()
+    );
+
+    state
+        .window_mut(window_id)
+        .expect("XDG window")
+        .state
+        .set_mode(ToplevelMode::Normal);
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(decoration_instances(&state).len(), 1);
+}
+
+#[test]
+fn forced_server_policy_keeps_tiled_minimal_chrome() {
+    let surface = test_surface(452);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface.surface_id))
+        .expect("insert XDG window");
+    let management = state
+        .window(window_id)
+        .and_then(|window| window.management)
+        .expect("inserted windows get management");
+    state.window_mut(window_id).expect("XDG window").management =
+        Some(management.with_layout(crate::wm::LayoutMembership::Tiled));
+    state.append_renderable_surface(surface);
+    state.rebuild_active_scene_view();
+
+    state.set_window_decoration_policy(window_id, WindowDecorationPolicy::Server);
+
+    assert_eq!(
+        state
+            .window(window_id)
+            .and_then(|window| window.management)
+            .expect("window management")
+            .chrome_policy(),
+        crate::wm::WindowChromePolicy::Minimal
+    );
+    assert_eq!(
+        state.effective_window_decoration_mode(window_id),
+        DecorationMode::ServerSide
+    );
+}
+
+#[test]
+fn x11_server_policy_overrides_client_hints_but_not_role_or_fullscreen() {
+    let mut state = x11_state(test_surface(453));
+    let handle = x11_test_handle();
+    let window_id = state.window_id_for_x11_handle(handle).expect("X11 window");
+    let window = state.window_mut(window_id).expect("X11 window");
+    window.x11_decoration_hints = X11DecorationHints {
+        motif: X11MotifDecorationHint::Undecorated,
+        gtk_frame_extents: Some(X11FrameExtents {
+            left: 4,
+            right: 4,
+            top: 24,
+            bottom: 4,
+        }),
+    };
+
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::ClientSide
+    );
+    state.set_window_decoration_policy(window_id, WindowDecorationPolicy::Server);
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(state.x11_decoration_frame_extents(handle), [0, 0, 26, 0]);
+    assert_eq!(decoration_instances(&state).len(), 1);
+    assert!(matches!(
+        state.decoration_hit_for_root_at(453, (0, 0), 100.0, -10.0),
+        Some(DecorationHit::Titlebar)
+    ));
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Fullscreen);
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::None
+    );
+    assert_eq!(state.x11_decoration_frame_extents(handle), [0; 4]);
+    assert!(decoration_instances(&state).is_empty());
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Normal);
+    state.window_mut(window_id).expect("X11 window").x11_role =
+        Some(crate::compositor::desktop_window::X11DesktopRole::AuxiliaryPopup);
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::None
+    );
+    assert_eq!(state.x11_decoration_frame_extents(handle), [0; 4]);
 }
 
 #[test]

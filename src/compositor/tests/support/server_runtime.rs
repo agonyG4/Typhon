@@ -258,6 +258,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureNativeDecorationCount(Sender<usize>),
+    SetMostRecentWindowDecorationPolicy {
+        policy: crate::wm::WindowDecorationPolicy,
+        reply: Sender<bool>,
+    },
     CaptureNativeFrameSurfaceIds(Sender<Vec<u32>>),
     CaptureDirectScanoutSceneAnalysis(Sender<crate::compositor::DirectScanoutSceneAnalysis>),
     SetDirectScanoutTestBlurEffect {
@@ -1156,6 +1160,18 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .native_decoration_render_instances(server.renderable_surfaces())
                             .len();
                         let _ = reply.send(count);
+                    }
+                    ServerCommand::SetMostRecentWindowDecorationPolicy { policy, reply } => {
+                        let changed =
+                            server
+                                .state
+                                .window_stacking
+                                .last()
+                                .copied()
+                                .is_some_and(|window_id| {
+                                    server.state.set_window_decoration_policy(window_id, policy)
+                                });
+                        let _ = reply.send(changed);
                     }
                     ServerCommand::CaptureNativeFrameSurfaceIds(reply) => {
                         let _ = reply.send(
@@ -2763,6 +2779,19 @@ pub(in crate::compositor::tests) fn capture_native_decoration_count(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report native decoration count")
+}
+
+pub(in crate::compositor::tests) fn set_most_recent_window_decoration_policy(
+    commands: &Sender<ServerCommand>,
+    policy: crate::wm::WindowDecorationPolicy,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetMostRecentWindowDecorationPolicy { policy, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should update the most recent window decoration policy")
 }
 
 pub(in crate::compositor::tests) fn capture_surface_resource_count(

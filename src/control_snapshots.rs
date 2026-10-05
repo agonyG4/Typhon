@@ -530,6 +530,10 @@ pub struct WindowSnapshot {
     pub minimized: bool,
     pub maximized: bool,
     pub fullscreen: bool,
+    #[serde(default)]
+    pub decoration_policy: String,
+    #[serde(default)]
+    pub decoration_mode: String,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub urgent: Option<bool>,
     pub skip_taskbar: bool,
@@ -875,6 +879,7 @@ pub enum AstreactlResult {
     Doctor(DoctorSnapshot),
     Outputs(OutputListSnapshot),
     Windows(WindowListSnapshot),
+    Window(WindowSnapshot),
     ActiveWindow(ActiveWindowSnapshot),
     KeyboardLayout(KeyboardLayoutSnapshot),
     KeyboardConfiguration(KeyboardConfigurationSnapshot),
@@ -1244,6 +1249,8 @@ mod tests {
             minimized: false,
             maximized: false,
             fullscreen: false,
+            decoration_policy: "client_preference".to_string(),
+            decoration_mode: "ServerSide".to_string(),
             urgent: Some(true),
             skip_taskbar: false,
             workspace: Some("w".repeat(MAX_CONTROL_NAME_BYTES)),

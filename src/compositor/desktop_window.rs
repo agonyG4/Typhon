@@ -4,7 +4,7 @@ use std::io;
 
 use crate::core::WindowId;
 use crate::presentation_animation::{PresentationClip, PresentationOpacity};
-use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
+use crate::wm::{WindowDecorationPolicy, WindowManagementState, WorkspaceId, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
 use crate::xwayland::xwm::{
     X11DecorationHints, X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes,
@@ -120,6 +120,7 @@ pub struct DesktopWindow {
     pub constraints: WindowConstraints,
     pub relationships: WindowRelationships,
     pub(crate) management: Option<WindowManagementState>,
+    pub(crate) decoration_policy: WindowDecorationPolicy,
     pub(crate) floating_geometry: Option<WindowGeometry>,
     pub state: WindowState,
     pub(crate) last_focus_serial: u64,
@@ -192,6 +193,7 @@ impl DesktopWindow {
             constraints: WindowConstraints::default(),
             relationships: WindowRelationships::default(),
             management: None,
+            decoration_policy: WindowDecorationPolicy::ClientPreference,
             floating_geometry: None,
             state: WindowState::default(),
             last_focus_serial: 0,
@@ -233,6 +235,7 @@ impl DesktopWindow {
             constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),
             management: None,
+            decoration_policy: WindowDecorationPolicy::ClientPreference,
             floating_geometry: None,
             state: WindowState::default(),
             last_focus_serial: 0,

@@ -21,6 +21,30 @@ impl WindowChromePolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowDecorationPolicy {
+    #[default]
+    ClientPreference,
+    Server,
+}
+
+impl WindowDecorationPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientPreference => "client_preference",
+            Self::Server => "server",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "client_preference" => Some(Self::ClientPreference),
+            "server" => Some(Self::Server),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowManagementState {
     location: WorkspaceLocation,

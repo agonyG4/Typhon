@@ -83,6 +83,7 @@ pub enum ControlCommand {
     WindowMinimize,
     WindowRestore,
     WindowClose,
+    WindowDecorationPolicySet,
 }
 
 impl ControlCommand {
@@ -130,6 +131,7 @@ impl ControlCommand {
             Self::WindowMinimize => "window.minimize",
             Self::WindowRestore => "window.restore",
             Self::WindowClose => "window.close",
+            Self::WindowDecorationPolicySet => "window.decoration-policy.set",
         }
     }
 
@@ -177,6 +179,7 @@ impl ControlCommand {
             "window.minimize" => Self::WindowMinimize,
             "window.restore" => Self::WindowRestore,
             "window.close" => Self::WindowClose,
+            "window.decoration-policy.set" => Self::WindowDecorationPolicySet,
             _ => return None,
         })
     }
@@ -608,5 +611,18 @@ mod tests {
         ] {
             assert_eq!(ControlCommand::parse(near_miss), None);
         }
+    }
+
+    #[test]
+    fn window_decoration_policy_command_has_one_canonical_name() {
+        assert_eq!(
+            ControlCommand::parse("window.decoration-policy.set"),
+            Some(ControlCommand::WindowDecorationPolicySet)
+        );
+        assert_eq!(
+            ControlCommand::WindowDecorationPolicySet.as_str(),
+            "window.decoration-policy.set"
+        );
+        assert_eq!(ControlCommand::parse("window.decoration-policy"), None);
     }
 }

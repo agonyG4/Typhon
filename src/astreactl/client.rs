@@ -18,7 +18,7 @@ use crate::control_snapshots::{
     ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorSnapshot, KeyboardConfigurationSnapshot, KeyboardLayoutSnapshot,
     OutputListSnapshot, PerformanceSnapshot, StatusSnapshot, TrustedEffectsReloadSnapshot,
-    VersionSnapshot, WindowListSnapshot,
+    VersionSnapshot, WindowListSnapshot, WindowSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -84,6 +84,9 @@ fn decode_command_result(
         }
         "windows" => {
             serde_json::from_value::<WindowListSnapshot>(value).map(AstreactlResult::Windows)
+        }
+        "window.decoration-policy.set" => {
+            serde_json::from_value::<WindowSnapshot>(value).map(AstreactlResult::Window)
         }
         "active-window" => {
             serde_json::from_value::<ActiveWindowSnapshot>(value).map(AstreactlResult::ActiveWindow)
