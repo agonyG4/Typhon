@@ -290,7 +290,7 @@ fn selection_none_malformed_property_and_stale_reply_do_not_renew_terminal_lease
 
     let (mut malformed_xwm, mut malformed_peer, offer_id, mime_atom, timestamp, mut sequence) =
         accepted_drop(Action::Copy);
-    let (_reader, _transfer_id, requestor, property) = begin_fake_selection_transfer_at(
+    let (_reader, transfer_id, requestor, property) = begin_fake_selection_transfer_at(
         &mut malformed_xwm,
         &mut malformed_peer,
         offer_id,
