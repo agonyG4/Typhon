@@ -25,11 +25,11 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
         .insert(DecorationResourceKey::Solid(pixel), resource);
 
     let group = oblivion_one::compositor::VisualGroupId::new(1).expect("visual group");
-    harness.renderer.vertices.clear();
-    harness.renderer.commands.clear();
+    harness.renderer.scene_state.vertices.clear();
+    harness.renderer.scene_state.commands.clear();
     push_draw_command(
-        &mut harness.renderer.vertices,
-        &mut harness.renderer.commands,
+        &mut harness.renderer.scene_state.vertices,
+        &mut harness.renderer.scene_state.commands,
         EglDrawLayer::SolidRgba(pixel),
         EglRect::new(0.0, 0.0, 4.0, 1.0),
         4,
@@ -99,11 +99,11 @@ fn real_gles_clip_intersects_frame_damage_scissor() {
         .decoration_resources
         .insert(DecorationResourceKey::Solid(pixel), resource);
     let group = oblivion_one::compositor::VisualGroupId::new(1).expect("visual group");
-    harness.renderer.vertices.clear();
-    harness.renderer.commands.clear();
+    harness.renderer.scene_state.vertices.clear();
+    harness.renderer.scene_state.commands.clear();
     push_draw_command(
-        &mut harness.renderer.vertices,
-        &mut harness.renderer.commands,
+        &mut harness.renderer.scene_state.vertices,
+        &mut harness.renderer.scene_state.commands,
         EglDrawLayer::SolidRgba(pixel),
         EglRect::new(0.0, 0.0, 4.0, 1.0),
         4,

@@ -4,6 +4,7 @@ mod executor;
 mod gpu_timing;
 mod metrics;
 mod resources;
+mod runtime;
 mod shader_cache;
 mod trace;
 
@@ -18,19 +19,16 @@ pub(crate) use executor::{
 pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;
 #[cfg(test)]
 pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_SHADER;
-#[cfg(test)]
-pub(crate) use executor::EffectExecutionStats;
+pub(super) use executor::EffectExecutionContext;
+pub(crate) use executor::SceneReplayWorkMode;
 #[cfg(test)]
 pub(crate) use executor::checkpoint_causal_stability_plan;
 pub(super) use executor::composition_range;
 #[cfg(test)]
-pub(crate) use executor::execute_effect_graph_with_debug_config;
+pub(crate) use executor::execute_effect_graph_with_debug_config_and_scene_replay_mode;
 #[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
-#[cfg(test)]
-pub(crate) use executor::{
-    SceneReplayWorkMode, execute_effect_graph_with_debug_config_and_scene_replay_mode,
-};
+pub(crate) use executor::{EffectExecutionSelection, EffectExecutionStats};
 #[cfg(test)]
 pub(crate) use executor::{
     capture_output_rects_to_graph_texture_shader_copy, checkpoint_update_rects_for_test,
@@ -41,19 +39,23 @@ pub(crate) use executor::{
 };
 #[cfg(test)]
 pub(crate) use executor::{capture_scene_work_preservation, restore_scene_work_preservation};
+#[cfg(test)]
+pub(crate) use executor::{execute_effect_graph, execute_effect_graph_with_debug_config};
 pub(crate) use executor::{
-    execute_effect_graph, execute_effect_graph_for_lifecycle, plan_effect_surface_consumers,
-    select_effect_execution,
+    execute_effect_graph_for_lifecycle, plan_effect_surface_consumers, select_effect_execution,
 };
-pub(crate) use gpu_timing::{EffectGpuProfiler, ReplayCaptureExecutionDetail};
+pub(super) use executor::{
+    execute_prepared_effect_graph_core, finish_prepared_effect_graph_execution,
+    prepare_effect_graph_execution,
+};
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
-pub(crate) use resources::EffectResourceBudgetConfig;
 #[cfg(test)]
 pub(crate) use resources::checkpoint_capture_cache_key;
 pub(crate) use resources::{
     EffectGlResourceCache, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
     PooledEffectTexture,
 };
+pub(super) use runtime::{EffectRuntime, EffectRuntimeCaptureSnapshot};
 #[cfg(test)]
 pub(crate) use shader_cache::ShaderProgramKey;
 #[cfg(test)]

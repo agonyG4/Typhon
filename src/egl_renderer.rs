@@ -4,7 +4,6 @@ use std::{
     ffi::c_void,
     io, ptr,
     sync::Arc,
-    time::Instant,
 };
 
 use glow::HasContext;
@@ -42,6 +41,7 @@ mod effects;
 mod geometry;
 pub(crate) mod native_fence;
 mod program;
+mod scene_state;
 
 pub(crate) use damage::{
     BufferAge, EglPartialRepaintCapabilities, FullRepaintReason, OutputDamage, OutputRect,
@@ -53,22 +53,23 @@ use damage::{
     RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
     resolve_effect_execution_for_repaint_plan_with_diagnostics,
 };
+#[cfg(test)]
+use effects::ShaderProgramCache;
 use effects::{
-    DamageTraceSnapshot, EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache,
-    EffectGpuProfiler, EffectGraphMetrics, EffectRepaintProvenanceSnapshot,
-    EffectResourceBudgetConfig, FrameTraceSummary, RepaintPlanTraceSnapshot,
-    ReplayCaptureExecutionDetail, ShaderProgramCache, builtin_shader_program_count, graph_metrics,
-    shader_cache_capacity_for_custom_shaders,
+    DamageTraceSnapshot, EffectExecutionContext, EffectExecutionTrace, EffectFailureReason,
+    EffectGlResourceCache, EffectGraphMetrics, EffectRepaintProvenanceSnapshot, EffectRuntime,
+    EffectRuntimeCaptureSnapshot, FrameTraceSummary, RepaintPlanTraceSnapshot, graph_metrics,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglLampDrawCommand, EglLampVertex, EglRect, EglTexturedVertex,
     EglUvRect, EglVisibilityDecision, MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan,
     SurfaceSampling, VERTEX_STRIDE, add_surface_consumers_for_command_range,
-    plan_capture_visibility, plan_surface_consumers, plan_visibility, push_draw_command,
-    push_draw_command_with_uv, surface_sampling_for_plan,
+    plan_surface_consumers, push_draw_command, push_draw_command_with_uv,
+    surface_sampling_for_plan,
 };
-use program::{create_capture_copy_program, create_texture_program};
+use program::create_texture_program;
+use scene_state::{SceneCaptureSnapshot, SceneRenderState, SceneTextureSources};
 
 pub(crate) type RendererResult<T> = Result<T, Box<dyn Error>>;
 pub(crate) type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
@@ -661,35 +662,8 @@ struct LampUniformLocations {
 pub(crate) struct GlesSceneRenderer {
     cursor_image: std::sync::Arc<CompositorCursorImage>,
     gl: glow::Context,
-    program: GlProgram,
-    capture_program: GlProgram,
-    capture_copy_program: GlProgram,
-    capture_uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
-    capture_copy_uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
-    presentation_opacity_location: Option<glow::UniformLocation>,
-    scene_vertex_array: GlVertexArray,
-    scene_vertex_buffer: GlBuffer,
-    scene_vertex_buffer_capacity: usize,
-    scene_geometry_dirty: bool,
-    overlay_vertex_array: GlVertexArray,
-    overlay_vertex_buffer: GlBuffer,
-    overlay_vertex_buffer_capacity: usize,
-    overlay_geometry_dirty: bool,
-    lamp_program: Option<GlProgram>,
-    lamp_uniform_locations: Option<LampUniformLocations>,
-    lamp_vertex_array: GlVertexArray,
-    lamp_vertex_buffer: GlBuffer,
-    lamp_vertex_buffer_capacity: usize,
-    lamp_geometry_dirty: bool,
-    lamp_geometry_key: Option<u64>,
-    lamp_vertices: Vec<EglLampVertex>,
-    lamp_commands: Vec<EglLampDrawCommand>,
-    squash_vertices: Vec<EglTexturedVertex>,
-    squash_commands: Vec<EglSquashDrawCommand>,
-    squash_vertex_array: GlVertexArray,
-    squash_vertex_buffer: GlBuffer,
-    squash_vertex_buffer_capacity: usize,
-    squash_geometry_dirty: bool,
+    effect_runtime: EffectRuntime,
+    scene_state: SceneRenderState,
     lifecycle_source_vertices:
         HashMap<compositor::PresentationRetainedVisualPayloadId, Vec<EglTexturedVertex>>,
     lifecycle_source_commands:
@@ -703,22 +677,7 @@ pub(crate) struct GlesSceneRenderer {
     lifecycle_samples: Vec<LifecycleFrameSample>,
     lifecycle_render_evidence: LifecycleRenderEvidence,
     lifecycle_render_fallbacks: LifecycleRenderFallbacks,
-    current_framebuffer_origin: OutputFramebufferOrigin,
-    current_size: (u32, u32),
     texture_upload_rgba: Vec<u8>,
-    vertices: Vec<EglTexturedVertex>,
-    commands: Vec<EglDrawCommand>,
-    cursor_vertices: Vec<EglTexturedVertex>,
-    cursor_commands: Vec<EglDrawCommand>,
-    presentation_opacities: Vec<f32>,
-    cursor_presentation_opacities: Vec<f32>,
-    presentation_visual_group_opacities: HashMap<VisualGroupId, f32>,
-    presentation_visual_group_clips: HashMap<VisualGroupId, EglRect>,
-    presentation_visual_group_owners: HashMap<VisualGroupId, u32>,
-    scene_visibility_plan: Vec<EglVisibilityDecision>,
-    scene_cache_key: Option<EglSceneCacheKey>,
-    presented_scene_key: Option<EglSceneCacheKey>,
-    current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
     cursor_resource: Option<EglImageResource>,
     cursor_resource_stale: bool,
     surface_resources: HashMap<u32, EglSurfaceResource>,
@@ -730,43 +689,27 @@ pub(crate) struct GlesSceneRenderer {
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
     decoration_resources: HashMap<DecorationResourceKey, EglImageResource>,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
-    damage_tracker: EglOutputDamageTracker,
-    repaint_planner: PartialRepaintPlanner,
-    effect_resources: EffectGlResourceCache,
-    effect_registry: EffectRegistry,
-    effect_registry_generation: u64,
-    failed_effect_generation: Option<u64>,
-    effect_shaders: ShaderProgramCache,
-    effect_quad: Option<(GlVertexArray, GlBuffer)>,
-    effect_trace: EffectExecutionTrace,
-    effect_gpu_profiler: EffectGpuProfiler,
-    active_output_framebuffer: Option<glow::Framebuffer>,
-    active_output_texture: Option<glow::Texture>,
-    frame_stats: GlesSceneFrameStats,
-    effect_clock_start: Instant,
-    effect_time_seconds: f32,
-    effect_delta_seconds: f32,
-    effect_output_scale: f32,
-    pub(crate) capture_in_progress: bool,
-    capture_unattenuated_visual_group: Option<VisualGroupId>,
-    capture_unclipped_presentation_owner: Option<u32>,
-    #[cfg(test)]
-    pub(crate) fail_next_dependency_free_replay_capture: bool,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for GlesSceneRenderer {
+    type Target = SceneRenderState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scene_state
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for GlesSceneRenderer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scene_state
+    }
 }
 
 struct CaptureRendererState {
-    current_framebuffer_origin: OutputFramebufferOrigin,
-    current_size: (u32, u32),
-    presented_scene_key: Option<EglSceneCacheKey>,
-    current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
-    damage_tracker: EglOutputDamageTracker,
-    repaint_planner: PartialRepaintPlanner,
-    failed_effect_generation: Option<u64>,
-    effect_trace: EffectExecutionTrace,
-    frame_stats: GlesSceneFrameStats,
-    effect_time_seconds: f32,
-    effect_delta_seconds: f32,
-    effect_output_scale: f32,
+    scene: SceneCaptureSnapshot,
+    effect_runtime: EffectRuntimeCaptureSnapshot,
     lifecycle_render_evidence: LifecycleRenderEvidence,
     lifecycle_render_fallbacks: LifecycleRenderFallbacks,
     lifecycle_samples: Vec<LifecycleFrameSample>,
@@ -775,67 +718,29 @@ struct CaptureRendererState {
         LifecycleVisualSource,
     >,
     failed_surface_generations: HashMap<u32, u64>,
-    active_output_framebuffer: Option<glow::Framebuffer>,
-    active_output_texture: Option<glow::Texture>,
-    capture_in_progress: bool,
-    capture_unattenuated_visual_group: Option<VisualGroupId>,
-    capture_unclipped_presentation_owner: Option<u32>,
 }
 
 impl CaptureRendererState {
     fn take(renderer: &GlesSceneRenderer) -> Self {
         Self {
-            current_framebuffer_origin: renderer.current_framebuffer_origin,
-            current_size: renderer.current_size,
-            presented_scene_key: renderer.presented_scene_key,
-            current_checkpoint_scene_causal_snapshot: renderer
-                .current_checkpoint_scene_causal_snapshot
-                .clone(),
-            damage_tracker: renderer.damage_tracker.clone(),
-            repaint_planner: renderer.repaint_planner.clone(),
-            failed_effect_generation: renderer.failed_effect_generation,
-            effect_trace: renderer.effect_trace,
-            frame_stats: renderer.frame_stats,
-            effect_time_seconds: renderer.effect_time_seconds,
-            effect_delta_seconds: renderer.effect_delta_seconds,
-            effect_output_scale: renderer.effect_output_scale,
+            scene: SceneCaptureSnapshot::take(&renderer.scene_state),
+            effect_runtime: EffectRuntimeCaptureSnapshot::take(&renderer.effect_runtime),
             lifecycle_render_evidence: renderer.lifecycle_render_evidence.clone(),
             lifecycle_render_fallbacks: renderer.lifecycle_render_fallbacks.clone(),
             lifecycle_samples: renderer.lifecycle_samples.clone(),
             lifecycle_visual_sources: renderer.lifecycle_visual_sources.clone(),
             failed_surface_generations: renderer.failed_surface_generations.clone(),
-            active_output_framebuffer: renderer.active_output_framebuffer,
-            active_output_texture: renderer.active_output_texture,
-            capture_in_progress: renderer.capture_in_progress,
-            capture_unattenuated_visual_group: renderer.capture_unattenuated_visual_group,
-            capture_unclipped_presentation_owner: renderer.capture_unclipped_presentation_owner,
         }
     }
 
     fn restore(self, renderer: &mut GlesSceneRenderer) {
-        renderer.current_framebuffer_origin = self.current_framebuffer_origin;
-        renderer.current_size = self.current_size;
-        renderer.presented_scene_key = self.presented_scene_key;
-        renderer.current_checkpoint_scene_causal_snapshot =
-            self.current_checkpoint_scene_causal_snapshot;
-        renderer.damage_tracker = self.damage_tracker;
-        renderer.repaint_planner = self.repaint_planner;
-        renderer.failed_effect_generation = self.failed_effect_generation;
-        renderer.effect_trace = self.effect_trace;
-        renderer.frame_stats = self.frame_stats;
-        renderer.effect_time_seconds = self.effect_time_seconds;
-        renderer.effect_delta_seconds = self.effect_delta_seconds;
-        renderer.effect_output_scale = self.effect_output_scale;
+        self.scene.restore(&mut renderer.scene_state);
+        self.effect_runtime.restore(&mut renderer.effect_runtime);
         renderer.lifecycle_render_evidence = self.lifecycle_render_evidence;
         renderer.lifecycle_render_fallbacks = self.lifecycle_render_fallbacks;
         renderer.lifecycle_samples = self.lifecycle_samples;
         renderer.lifecycle_visual_sources = self.lifecycle_visual_sources;
         renderer.failed_surface_generations = self.failed_surface_generations;
-        renderer.active_output_framebuffer = self.active_output_framebuffer;
-        renderer.active_output_texture = self.active_output_texture;
-        renderer.capture_in_progress = self.capture_in_progress;
-        renderer.capture_unattenuated_visual_group = self.capture_unattenuated_visual_group;
-        renderer.capture_unclipped_presentation_owner = self.capture_unclipped_presentation_owner;
     }
 }
 
@@ -1350,15 +1255,9 @@ pub(crate) fn replay_capture_region_layout(
     }
 }
 
-fn monotonic_elapsed_ns(start: Option<Instant>) -> u64 {
-    start.map_or(0, |start| {
-        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    })
-}
-
 impl GlesSceneRenderer {
     pub(crate) const fn lifecycle_animation_available(&self) -> bool {
-        self.lamp_program.is_some()
+        self.scene_state.lamp_program.is_some()
     }
 
     /// Squash reuses the mandatory textured scene program. Renderer creation
@@ -1368,9 +1267,10 @@ impl GlesSceneRenderer {
     }
 
     pub(crate) fn invalidate_presented_damage_history(&mut self) {
-        self.repaint_planner.invalidate();
-        self.presented_scene_key = None;
-        self.effect_resources
+        self.scene_state.repaint_planner.invalidate();
+        self.scene_state.presented_scene_key = None;
+        self.effect_runtime
+            .effect_resources
             .invalidate_checkpoint_capture_contents();
     }
 
@@ -1390,8 +1290,7 @@ impl GlesSceneRenderer {
             })
         };
         let program = create_texture_program(&gl)?;
-        let capture_program = program::create_capture_program(&gl)?;
-        let capture_copy_program = create_capture_copy_program(&gl)?;
+        let effect_programs = EffectRuntime::create_programs(&gl)?;
         let lamp_program = program::create_lamp_program(&gl).ok();
         let scene_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let scene_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
@@ -1439,19 +1338,7 @@ impl GlesSceneRenderer {
             if let Some(location) = gl.get_uniform_location(program, "u_opacity") {
                 gl.uniform_1_f32(Some(&location), 1.0);
             }
-            gl.use_program(Some(capture_program));
-            if let Some(location) = gl.get_uniform_location(capture_program, "u_texture") {
-                gl.uniform_1_i32(Some(&location), 0);
-            }
-            if let Some(location) = gl.get_uniform_location(capture_program, "u_opacity") {
-                gl.uniform_1_f32(Some(&location), 1.0);
-            }
-            gl.use_program(Some(capture_copy_program));
-            if let Some(location) =
-                gl.get_uniform_location(capture_copy_program, "u_output_texture")
-            {
-                gl.uniform_1_i32(Some(&location), 0);
-            }
+            effect_programs.initialize_uniforms(&gl);
             if let Some(lamp_program) = lamp_program {
                 gl.use_program(Some(lamp_program));
                 if let Some(location) = gl.get_uniform_location(lamp_program, "u_texture") {
@@ -1489,49 +1376,64 @@ impl GlesSceneRenderer {
                 texture: gl.get_uniform_location(program, "u_texture"),
             }
         });
-        let mut effect_shaders = ShaderProgramCache::new(builtin_shader_program_count())
-            .expect("built-in shader cache capacity is non-zero");
-        effect_shaders.prewarm_builtins(&gl)?;
-        let effect_gpu_profiler = EffectGpuProfiler::new(&gl, |name| {
-            egl.get_proc_address(name)
-                .map(|symbol| symbol as *const c_void)
-        });
-
+        let effect_runtime = EffectRuntime::new(&gl, egl, effect_programs)?;
         let presentation_opacity_location =
             unsafe { gl.get_uniform_location(program, "u_opacity") };
-        let effect_resources =
-            EffectGlResourceCache::with_budget_config(EffectResourceBudgetConfig::from_env())?;
         Ok(Self {
             gl,
-            program,
-            capture_program,
-            capture_copy_program,
-            capture_uniform_locations: HashMap::new(),
-            capture_copy_uniform_locations: HashMap::new(),
-            presentation_opacity_location,
-            scene_vertex_array,
-            scene_vertex_buffer,
-            scene_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
-            scene_geometry_dirty: true,
-            overlay_vertex_array,
-            overlay_vertex_buffer,
-            overlay_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
-            overlay_geometry_dirty: true,
-            lamp_program,
-            lamp_uniform_locations,
-            lamp_vertex_array,
-            lamp_vertex_buffer,
-            lamp_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
-            lamp_geometry_dirty: true,
-            lamp_geometry_key: None,
-            lamp_vertices: Vec::new(),
-            lamp_commands: Vec::new(),
-            squash_vertices: Vec::new(),
-            squash_commands: Vec::new(),
-            squash_vertex_array,
-            squash_vertex_buffer,
-            squash_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
-            squash_geometry_dirty: true,
+            effect_runtime,
+            scene_state: SceneRenderState {
+                program,
+                presentation_opacity_location,
+                scene_vertex_array,
+                scene_vertex_buffer,
+                scene_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+                scene_geometry_dirty: true,
+                overlay_vertex_array,
+                overlay_vertex_buffer,
+                overlay_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+                overlay_geometry_dirty: true,
+                lamp_program,
+                lamp_uniform_locations,
+                lamp_vertex_array,
+                lamp_vertex_buffer,
+                lamp_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+                lamp_geometry_dirty: true,
+                lamp_geometry_key: None,
+                lamp_vertices: Vec::new(),
+                lamp_commands: Vec::new(),
+                squash_vertices: Vec::new(),
+                squash_commands: Vec::new(),
+                squash_vertex_array,
+                squash_vertex_buffer,
+                squash_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+                squash_geometry_dirty: true,
+                current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+                current_size: (width, height),
+                vertices: Vec::new(),
+                commands: Vec::new(),
+                cursor_vertices: Vec::new(),
+                cursor_commands: Vec::new(),
+                presentation_opacities: Vec::new(),
+                cursor_presentation_opacities: Vec::new(),
+                presentation_visual_group_opacities: HashMap::new(),
+                presentation_visual_group_clips: HashMap::new(),
+                presentation_visual_group_owners: HashMap::new(),
+                scene_visibility_plan: Vec::new(),
+                scene_cache_key: None,
+                presented_scene_key: None,
+                current_checkpoint_scene_causal_snapshot: None,
+                damage_tracker: EglOutputDamageTracker::with_cursor_image(cursor_image.clone()),
+                repaint_planner: PartialRepaintPlanner::new_configured(
+                    (width, height),
+                    partial_repaint_capabilities,
+                ),
+                active_output_framebuffer: None,
+                active_output_texture: None,
+                frame_stats: GlesSceneFrameStats::default(),
+                capture_unattenuated_visual_group: None,
+                capture_unclipped_presentation_owner: None,
+            },
             lifecycle_source_vertices: HashMap::new(),
             lifecycle_source_commands: HashMap::new(),
             lifecycle_visual_resources: HashMap::new(),
@@ -1539,23 +1441,8 @@ impl GlesSceneRenderer {
             lifecycle_samples: Vec::new(),
             lifecycle_render_evidence: LifecycleRenderEvidence::default(),
             lifecycle_render_fallbacks: LifecycleRenderFallbacks::default(),
-            current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
-            cursor_image: cursor_image.clone(),
-            current_size: (width, height),
+            cursor_image,
             texture_upload_rgba: Vec::new(),
-            vertices: Vec::new(),
-            commands: Vec::new(),
-            cursor_vertices: Vec::new(),
-            cursor_commands: Vec::new(),
-            presentation_opacities: Vec::new(),
-            cursor_presentation_opacities: Vec::new(),
-            presentation_visual_group_opacities: HashMap::new(),
-            presentation_visual_group_clips: HashMap::new(),
-            presentation_visual_group_owners: HashMap::new(),
-            scene_visibility_plan: Vec::new(),
-            scene_cache_key: None,
-            presented_scene_key: None,
-            current_checkpoint_scene_causal_snapshot: None,
             cursor_resource: None,
             cursor_resource_stale: false,
             surface_resources: HashMap::new(),
@@ -1567,40 +1454,112 @@ impl GlesSceneRenderer {
             frame_resources: HashMap::new(),
             decoration_resources: HashMap::new(),
             egl_image_target_texture_2d,
-            damage_tracker: EglOutputDamageTracker::with_cursor_image(cursor_image),
-            repaint_planner: PartialRepaintPlanner::new_configured(
-                (width, height),
-                partial_repaint_capabilities,
-            ),
-            effect_resources,
-            effect_registry: EffectRegistry::with_builtin_background_blur(),
-            effect_registry_generation: 1,
-            failed_effect_generation: None,
-            effect_shaders,
-            effect_quad: None,
-            effect_trace: EffectExecutionTrace::new(None, None, None, None),
-            effect_gpu_profiler,
-            active_output_framebuffer: None,
-            active_output_texture: None,
-            frame_stats: GlesSceneFrameStats::default(),
-            effect_clock_start: Instant::now(),
-            effect_time_seconds: 0.0,
-            effect_delta_seconds: 0.0,
-            effect_output_scale: 1.0,
-            capture_in_progress: false,
-            capture_unattenuated_visual_group: None,
-            capture_unclipped_presentation_owner: None,
-            #[cfg(test)]
-            fail_next_dependency_free_replay_capture: false,
         })
     }
 
+    pub(in crate::egl_renderer) fn effect_execution_context(
+        &mut self,
+    ) -> EffectExecutionContext<'_> {
+        EffectExecutionContext::new(
+            &self.gl,
+            &mut self.scene_state,
+            &mut self.effect_runtime,
+            SceneTextureSources {
+                surfaces: &self.surface_resources,
+                frames: &self.frame_resources,
+                decorations: &self.decoration_resources,
+                lifecycle: &self.lifecycle_visual_resources,
+                cursor: self.cursor_resource.as_ref(),
+            },
+        )
+    }
+
+    fn execute_effect_graph_with_overlays(
+        &mut self,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        framebuffer_origin: OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &effects::EffectExecutionSelection,
+    ) -> RendererResult<effects::EffectExecutionStats> {
+        self.execute_effect_graph_with_overlays_config(
+            graph,
+            framebuffer_origin,
+            repaint_plan,
+            demand,
+            selection,
+            *effects::effect_debug_config(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::egl_renderer) fn execute_effect_graph_with_overlays_config(
+        &mut self,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        framebuffer_origin: OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &effects::EffectExecutionSelection,
+        debug_config: effects::EffectDebugConfig,
+        scene_replay_work_mode_override: Option<effects::SceneReplayWorkMode>,
+    ) -> RendererResult<effects::EffectExecutionStats> {
+        let mut prepared = {
+            let mut context = self.effect_execution_context();
+            effects::prepare_effect_graph_execution(
+                &mut context,
+                graph,
+                framebuffer_origin,
+                repaint_plan,
+                demand,
+                selection,
+                debug_config,
+                scene_replay_work_mode_override,
+            )?
+        };
+        let promotes_checkpoint_cache = prepared.promotes_checkpoint_cache();
+        let composition_target = prepared.composition_target();
+        let mut result = {
+            let mut context = self.effect_execution_context();
+            effects::execute_prepared_effect_graph_core(&mut context, &mut prepared)
+        };
+        if result.is_ok() {
+            let overlay_result = (|| {
+                if self.effect_runtime.effect_trace.enabled() {
+                    self.effect_runtime.effect_trace.overlay_boundary("begin");
+                }
+                self.draw_lifecycle_overlays(
+                    prepared.overlay_rects(),
+                    framebuffer_origin,
+                    repaint_plan,
+                )?;
+                self.draw_effect_overlays(prepared.overlay_rects(), framebuffer_origin)?;
+                if self.effect_runtime.effect_trace.enabled() {
+                    self.effect_runtime.effect_trace.overlay_boundary("end");
+                }
+                self.establish_effect_composition_state(composition_target);
+                Ok(())
+            })();
+            if let Err(error) = overlay_result {
+                result = Err(error);
+            }
+        }
+        let result = {
+            let mut context = self.effect_execution_context();
+            effects::finish_prepared_effect_graph_execution(&mut context, prepared, result)
+        };
+        if result.is_ok() && promotes_checkpoint_cache {
+            self.promote_checkpoint_cache_causal_state(graph);
+        }
+        result
+    }
+
     pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
-        self.frame_stats
+        self.scene_state.frame_stats
     }
 
     pub(crate) fn trace_render_fence_export_begin(&self) {
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "render_fence_export",
             "begin",
             FrameTraceSummary::default(),
@@ -1608,7 +1567,7 @@ impl GlesSceneRenderer {
     }
 
     pub(crate) fn trace_render_fence_export_end(&self) {
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "render_fence_export",
             "end",
             FrameTraceSummary::default(),
@@ -1617,72 +1576,64 @@ impl GlesSceneRenderer {
 
     pub(crate) fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
         self.cursor_image = cursor_image.clone();
-        self.damage_tracker.set_cursor_image(cursor_image);
+        self.scene_state
+            .damage_tracker
+            .set_cursor_image(cursor_image);
         self.cursor_resource_stale = true;
-        self.repaint_planner.invalidate();
-    }
-
-    pub(crate) fn bind_active_output_framebuffer(&self) {
-        unsafe {
-            self.gl
-                .bind_framebuffer(glow::FRAMEBUFFER, self.active_output_framebuffer);
-        }
+        self.scene_state.repaint_planner.invalidate();
     }
 
     /// Restore the complete state expected by ordinary scene drawing after an
     /// effect or other offscreen pass has changed GL state.
     pub(crate) fn establish_ordinary_scene_state(&self) {
-        self.establish_scene_state_for_framebuffer(self.active_output_framebuffer);
+        self.establish_scene_state_for_framebuffer(self.scene_state.active_output_framebuffer);
     }
 
     pub(crate) fn establish_effect_composition_state(&self, target: EffectFramebufferTarget) {
         self.establish_scene_state_for_framebuffer(target.framebuffer);
     }
 
-    fn establish_scene_state_for_framebuffer(&self, framebuffer: Option<glow::Framebuffer>) {
+    #[cfg(test)]
+    fn bind_active_output_framebuffer(&self) {
         unsafe {
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
-            self.gl
-                .viewport(0, 0, self.current_size.0 as i32, self.current_size.1 as i32);
-            self.gl.use_program(Some(self.program));
-            self.gl.active_texture(glow::TEXTURE0);
-            self.gl.disable(glow::SCISSOR_TEST);
-            self.gl.enable(glow::BLEND);
-            self.gl.blend_func_separate(
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
+            self.gl.bind_framebuffer(
+                glow::FRAMEBUFFER,
+                self.scene_state.active_output_framebuffer,
             );
         }
     }
 
-    pub(crate) fn presentation_opacity_for_visual_group(
-        &self,
-        visual_group: Option<VisualGroupId>,
-    ) -> f32 {
-        visual_group
-            .and_then(|group| {
-                self.presentation_visual_group_opacities
-                    .get(&group)
-                    .copied()
-            })
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0)
-    }
-
+    #[cfg(test)]
     fn presentation_clip_for_visual_group(
         &self,
         visual_group: Option<VisualGroupId>,
     ) -> Option<EglRect> {
-        visual_group.and_then(|group| self.presentation_visual_group_clips.get(&group).copied())
+        visual_group.and_then(|group| {
+            self.scene_state
+                .presentation_visual_group_clips
+                .get(&group)
+                .copied()
+        })
     }
 
-    pub(crate) fn presentation_owner_for_visual_group(
-        &self,
-        visual_group: Option<VisualGroupId>,
-    ) -> Option<u32> {
-        visual_group.and_then(|group| self.presentation_visual_group_owners.get(&group).copied())
+    #[cfg(test)]
+    fn ensure_effect_quad(&mut self) -> RendererResult<(GlVertexArray, GlBuffer)> {
+        self.effect_runtime.ensure_effect_quad(&self.gl)
+    }
+
+    #[cfg(test)]
+    fn begin_effect_repaint(
+        &mut self,
+        plan: &RepaintPlan,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<Vec<OutputRect>> {
+        self.scene_state
+            .begin_effect_repaint(&self.gl, plan, framebuffer_origin)
+    }
+
+    fn establish_scene_state_for_framebuffer(&self, framebuffer: Option<glow::Framebuffer>) {
+        self.scene_state
+            .establish_scene_state_for_framebuffer(&self.gl, framebuffer);
     }
 
     fn presentation_opacity_for_root(
@@ -1696,32 +1647,6 @@ impl GlesSceneRenderer {
             .clamp(0.0, 1.0)
     }
 
-    pub(crate) fn capture_uniform_location(&mut self, name: &str) -> Option<glow::UniformLocation> {
-        if let Some(location) = self.capture_uniform_locations.get(name) {
-            return *location;
-        }
-        let location = unsafe { self.gl.get_uniform_location(self.capture_program, name) };
-        self.capture_uniform_locations
-            .insert(name.to_owned(), location);
-        location
-    }
-
-    pub(crate) fn capture_copy_uniform_location(
-        &mut self,
-        name: &str,
-    ) -> Option<glow::UniformLocation> {
-        if let Some(location) = self.capture_copy_uniform_locations.get(name) {
-            return *location;
-        }
-        let location = unsafe {
-            self.gl
-                .get_uniform_location(self.capture_copy_program, name)
-        };
-        self.capture_copy_uniform_locations
-            .insert(name.to_owned(), location);
-        location
-    }
-
     pub(crate) fn renderer_info(&self) -> GlesRendererInfo {
         GlesRendererInfo {
             vendor: unsafe { self.gl.get_parameter_string(glow::VENDOR) },
@@ -1732,9 +1657,7 @@ impl GlesSceneRenderer {
 
     #[allow(dead_code)] // Populated by the trusted registry reload boundary.
     pub(crate) fn set_effect_registry(&mut self, registry: EffectRegistry) {
-        self.effect_registry = registry;
-        self.effect_registry_generation = self.effect_registry_generation.saturating_add(1);
-        self.failed_effect_generation = None;
+        self.effect_runtime.set_registry(registry);
         self.invalidate_presented_damage_history();
     }
 
@@ -1745,39 +1668,8 @@ impl GlesSceneRenderer {
         &mut self,
         generation: EffectRegistryGeneration,
     ) -> Result<(), RegistryReloadError> {
-        let capacity = shader_cache_capacity_for_custom_shaders(generation.shaders.len())
-            .expect("validated shader generation size fits cache capacity");
-        let mut next_shaders =
-            ShaderProgramCache::new(capacity).expect("shader cache capacity is non-zero");
-        let compile_result = (|| {
-            next_shaders.prewarm_builtins(&self.gl).map_err(|error| {
-                RegistryReloadError::ShaderCompile {
-                    module: oblivion_one::effects::ShaderModuleId::new(
-                        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
-                    )
-                    .expect("builtin shader ids are non-zero"),
-                    log: error.to_string(),
-                }
-            })?;
-            for shader in generation.shaders.values() {
-                next_shaders
-                    .prewarm_trusted_custom(&self.gl, shader)
-                    .map_err(|error| RegistryReloadError::ShaderCompile {
-                        module: shader.module,
-                        log: error.to_string(),
-                    })?;
-            }
-            Ok::<(), RegistryReloadError>(())
-        })();
-        if let Err(error) = compile_result {
-            next_shaders.clear(&self.gl);
-            return Err(error);
-        }
-        self.effect_shaders.clear(&self.gl);
-        self.effect_shaders = next_shaders;
-        self.effect_registry = generation.registry;
-        self.effect_registry_generation = generation.generation;
-        self.failed_effect_generation = None;
+        self.effect_runtime
+            .publish_registry_generation(&self.gl, generation)?;
         self.invalidate_presented_damage_history();
         Ok(())
     }
@@ -1789,9 +1681,7 @@ impl GlesSceneRenderer {
         &mut self,
         generation: &EffectRegistryGeneration,
     ) {
-        self.effect_registry = generation.registry.clone();
-        self.effect_registry_generation = generation.generation;
-        self.failed_effect_generation = None;
+        self.effect_runtime.publish_material_generation(generation);
         self.invalidate_presented_damage_history();
     }
 
@@ -1802,37 +1692,6 @@ impl GlesSceneRenderer {
         manifest: EffectManifest,
     ) -> Result<Arc<EffectRegistryGeneration>, RegistryReloadError> {
         reload_with_publisher(registry, manifest, self)
-    }
-
-    fn ensure_effect_quad(&mut self) -> RendererResult<(GlVertexArray, GlBuffer)> {
-        if let Some(quad) = self.effect_quad {
-            return Ok(quad);
-        }
-        let vertex_array = unsafe { self.gl.create_vertex_array().map_err(io::Error::other)? };
-        let vertex_buffer = unsafe { self.gl.create_buffer().map_err(io::Error::other)? };
-        let vertices: [f32; 24] = [
-            -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0,
-            1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 0.0,
-        ];
-        unsafe {
-            self.gl.bind_vertex_array(Some(vertex_array));
-            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
-            self.gl.buffer_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                bytemuck::cast_slice(&vertices),
-                glow::STATIC_DRAW,
-            );
-            self.gl.enable_vertex_attrib_array(0);
-            self.gl
-                .vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 16, 0);
-            self.gl.enable_vertex_attrib_array(1);
-            self.gl
-                .vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 16, 8);
-            self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            self.gl.bind_vertex_array(None);
-        }
-        self.effect_quad = Some((vertex_array, vertex_buffer));
-        Ok((vertex_array, vertex_buffer))
     }
 
     /// Render the current compositor scene into a private GLES target and
@@ -1850,7 +1709,7 @@ impl GlesSceneRenderer {
             request.height,
         )?;
         let snapshot = CaptureRendererState::take(self);
-        self.capture_in_progress = true;
+        self.effect_runtime.capture_in_progress = true;
 
         request.current_damage = Some(OutputDamage::Full);
         request.client_cursor = None;
@@ -2005,7 +1864,7 @@ impl GlesSceneRenderer {
             egl,
             egl_display,
             egl_surface,
-            self.repaint_planner.capabilities().buffer_age,
+            self.scene_state.repaint_planner.capabilities().buffer_age,
         );
         self.draw_scene_with_buffer_age(
             egl,
@@ -2026,10 +1885,10 @@ impl GlesSceneRenderer {
     ) -> RendererResult<EglFrameOutcome> {
         request.width = target.width;
         request.height = target.height;
-        let previous_output_framebuffer = self.active_output_framebuffer;
-        let previous_output_texture = self.active_output_texture;
-        self.active_output_framebuffer = Some(target.framebuffer);
-        self.active_output_texture = target.sampleable_texture;
+        let previous_output_framebuffer = self.scene_state.active_output_framebuffer;
+        let previous_output_texture = self.scene_state.active_output_texture;
+        self.scene_state.active_output_framebuffer = Some(target.framebuffer);
+        self.scene_state.active_output_texture = target.sampleable_texture;
         unsafe {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
@@ -2047,8 +1906,8 @@ impl GlesSceneRenderer {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, previous_output_framebuffer);
         }
-        self.active_output_framebuffer = previous_output_framebuffer;
-        self.active_output_texture = previous_output_texture;
+        self.scene_state.active_output_framebuffer = previous_output_framebuffer;
+        self.scene_state.active_output_texture = previous_output_texture;
         result
     }
 
@@ -2060,7 +1919,9 @@ impl GlesSceneRenderer {
         buffer_age: BufferAge,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<EglFrameOutcome> {
-        self.effect_resources.begin_checkpoint_frame();
+        self.effect_runtime
+            .effect_resources
+            .begin_checkpoint_frame();
         let EglSceneDrawRequest {
             width,
             height,
@@ -2087,24 +1948,25 @@ impl GlesSceneRenderer {
             lifecycle_surfaces,
             lifecycle_decorations,
         } = request;
-        self.effect_trace = self.effect_trace.with_frame_context(
+        self.effect_runtime.effect_trace = self.effect_runtime.effect_trace.with_frame_context(
             frame_id,
             render_generation,
             Some(scene_generation),
             Some(scene_signature),
         );
-        if !self.capture_in_progress {
-            self.effect_gpu_profiler
-                .collect(&self.gl, &self.effect_trace);
+        if !self.effect_runtime.capture_in_progress {
+            self.effect_runtime
+                .effect_gpu_profiler
+                .collect(&self.gl, &self.effect_runtime.effect_trace);
         }
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "effect_scene_resolve",
             "begin",
             FrameTraceSummary::default(),
         );
         let width = width.max(1);
         let height = height.max(1);
-        let input_damage_trace = if self.effect_trace.enabled() {
+        let input_damage_trace = if self.effect_runtime.effect_trace.enabled() {
             Some(DamageTraceSnapshot::from_optional(
                 current_damage.as_ref(),
                 width,
@@ -2113,7 +1975,7 @@ impl GlesSceneRenderer {
         } else {
             None
         };
-        self.current_framebuffer_origin = framebuffer_origin;
+        self.scene_state.current_framebuffer_origin = framebuffer_origin;
         self.lifecycle_samples.clear();
         self.lifecycle_samples
             .extend(LifecycleFrameSnapshot::from_sample(lifecycle).samples);
@@ -2133,29 +1995,30 @@ impl GlesSceneRenderer {
         if client_cursor.is_some() {
             scaled_visual_state.cursor = None;
         }
-        self.frame_stats = GlesSceneFrameStats::default();
-        let effect_time = self.effect_clock_start.elapsed().as_secs_f32();
-        self.effect_delta_seconds = if self.effect_time_seconds == 0.0 {
+        self.scene_state.frame_stats = GlesSceneFrameStats::default();
+        let effect_time = self.effect_runtime.effect_clock_elapsed_seconds();
+        self.effect_runtime.effect_delta_seconds = if self.effect_runtime.effect_time_seconds == 0.0
+        {
             0.0
         } else {
-            (effect_time - self.effect_time_seconds).clamp(0.0, 0.25)
+            (effect_time - self.effect_runtime.effect_time_seconds).clamp(0.0, 0.25)
         };
-        self.effect_time_seconds = effect_time;
-        self.effect_output_scale = output_scale.max(0.0) as f32;
+        self.effect_runtime.effect_time_seconds = effect_time;
+        self.effect_runtime.effect_output_scale = output_scale.max(0.0) as f32;
         self.ensure_output_size(width, height)?;
         self.release_stale_lifecycle_visual_resources();
-        self.frame_stats.effect_instances_visible = effects
+        self.scene_state.frame_stats.effect_instances_visible = effects
             .instances
             .iter()
             .filter(|instance| !instance.region.is_empty())
             .count();
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "effect_scene_resolve",
             "end",
             FrameTraceSummary {
                 scene_generation: Some(scene_generation),
                 scene_signature: Some(scene_signature),
-                visible_effect_count: Some(self.frame_stats.effect_instances_visible),
+                visible_effect_count: Some(self.scene_state.frame_stats.effect_instances_visible),
                 ..FrameTraceSummary::default()
             },
         );
@@ -2221,7 +2084,7 @@ impl GlesSceneRenderer {
             popup_surface_ids,
             framebuffer_origin,
         );
-        let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
+        let scene_changed = self.scene_state.presented_scene_key != Some(candidate_scene_key);
         let commands_changed = !self.scene_cache_is_current(
             width,
             height,
@@ -2252,7 +2115,7 @@ impl GlesSceneRenderer {
             )
         });
         let damage_authority_available = current_damage.is_some();
-        let output_damage = self.damage_tracker.damage_for_frame(
+        let output_damage = self.scene_state.damage_tracker.damage_for_frame(
             width,
             height,
             scene_changed,
@@ -2270,7 +2133,7 @@ impl GlesSceneRenderer {
             damage_authority_available,
             output_damage,
         );
-        let scene_damage_trace = if self.effect_trace.enabled() {
+        let scene_damage_trace = if self.effect_runtime.effect_trace.enabled() {
             Some(DamageTraceSnapshot::from_damage(
                 &output_damage,
                 width,
@@ -2279,7 +2142,7 @@ impl GlesSceneRenderer {
         } else {
             None
         };
-        self.frame_stats.contradictory_empty_damage = contradictory_empty_damage;
+        self.scene_state.frame_stats.contradictory_empty_damage = contradictory_empty_damage;
         let damage_state = EglOutputDamageTracker::candidate_state(
             width,
             height,
@@ -2289,7 +2152,7 @@ impl GlesSceneRenderer {
         );
 
         if commands_changed {
-            self.frame_stats.scene_rebuilt = true;
+            self.scene_state.frame_stats.scene_rebuilt = true;
             self.rebuild_scene_commands(
                 width,
                 height,
@@ -2317,14 +2180,14 @@ impl GlesSceneRenderer {
             output_scale,
             framebuffer_origin,
         );
-        self.current_checkpoint_scene_causal_snapshot =
+        self.scene_state.current_checkpoint_scene_causal_snapshot =
             Some(EglCheckpointSceneCausalSnapshot::new(
                 (width, height),
-                &self.commands,
-                &self.vertices,
+                &self.scene_state.commands,
+                &self.scene_state.vertices,
                 &surface_signatures,
-                &self.presentation_opacities,
-                &self.presentation_visual_group_owners,
+                &self.scene_state.presentation_opacities,
+                &self.scene_state.presentation_visual_group_owners,
             ));
         self.rebuild_lamp_commands_if_needed(
             lifecycle,
@@ -2341,25 +2204,31 @@ impl GlesSceneRenderer {
         let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
         let output_bounds = EffectRect::new(0, 0, width, height)
             .expect("non-zero renderer dimensions must form valid effect bounds");
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "effect_graph_compile",
             "begin",
             self.effect_trace_summary(effects, None, None, None),
         );
-        let execution_plan = if self.failed_effect_generation
-            == Some(self.effect_registry_generation)
-            && self.frame_stats.effect_instances_visible != 0
+        let execution_plan = if self.effect_runtime.failed_effect_generation
+            == Some(self.effect_runtime.effect_registry_generation)
+            && self.scene_state.frame_stats.effect_instances_visible != 0
         {
-            self.frame_stats.effect_fallbacks = self.frame_stats.effect_fallbacks.saturating_add(1);
-            self.frame_stats.effect_instances_failed = self.frame_stats.effect_instances_visible;
-            self.frame_stats.effect_failure_reason = Some(EffectFailureReason::GraphCompile);
+            self.scene_state.frame_stats.effect_fallbacks = self
+                .scene_state
+                .frame_stats
+                .effect_fallbacks
+                .saturating_add(1);
+            self.scene_state.frame_stats.effect_instances_failed =
+                self.scene_state.frame_stats.effect_instances_visible;
+            self.scene_state.frame_stats.effect_failure_reason =
+                Some(EffectFailureReason::GraphCompile);
             FrameExecutionPlan::LegacyScene
         } else {
             match compile_frame_execution_plan(
                 effects,
                 &effect_source_damage,
                 output_bounds,
-                &self.effect_registry,
+                &self.effect_runtime.effect_registry,
             ) {
                 Ok(FrameExecutionPlan::LegacyScene) => FrameExecutionPlan::LegacyScene,
                 Ok(FrameExecutionPlan::EffectGraph(graph)) => {
@@ -2367,25 +2236,31 @@ impl GlesSceneRenderer {
                     FrameExecutionPlan::EffectGraph(graph)
                 }
                 Err(_) => {
-                    self.frame_stats.effect_fallbacks =
-                        self.frame_stats.effect_fallbacks.saturating_add(1);
-                    self.frame_stats.effect_instances_failed =
-                        self.frame_stats.effect_instances_visible;
-                    self.frame_stats.effect_failure_reason =
+                    self.scene_state.frame_stats.effect_fallbacks = self
+                        .scene_state
+                        .frame_stats
+                        .effect_fallbacks
+                        .saturating_add(1);
+                    self.scene_state.frame_stats.effect_instances_failed =
+                        self.scene_state.frame_stats.effect_instances_visible;
+                    self.scene_state.frame_stats.effect_failure_reason =
                         Some(EffectFailureReason::GraphCompile);
-                    self.failed_effect_generation = Some(self.effect_registry_generation);
+                    self.effect_runtime.failed_effect_generation =
+                        Some(self.effect_runtime.effect_registry_generation);
                     FrameExecutionPlan::LegacyScene
                 }
             }
         };
         if matches!(&execution_plan, FrameExecutionPlan::LegacyScene) {
-            self.effect_resources.clear_checkpoint_capture_cache();
+            self.effect_runtime
+                .effect_resources
+                .clear_checkpoint_capture_cache();
         }
         let compiled_graph = match &execution_plan {
             FrameExecutionPlan::EffectGraph(graph) => Some(graph),
             FrameExecutionPlan::LegacyScene => None,
         };
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "effect_graph_compile",
             "end",
             self.effect_trace_summary(effects, None, compiled_graph, None),
@@ -2396,7 +2271,7 @@ impl GlesSceneRenderer {
                 merge_effect_damage(output_damage, &graph.final_damage, width, height)
             }
         };
-        let merged_damage_trace = if self.effect_trace.enabled() {
+        let merged_damage_trace = if self.effect_runtime.effect_trace.enabled() {
             Some(DamageTraceSnapshot::from_damage(
                 &output_damage,
                 width,
@@ -2405,30 +2280,37 @@ impl GlesSceneRenderer {
         } else {
             None
         };
-        let (mut plan, damage_complexity_shadow_trace) = if self.effect_trace.enabled() {
-            let (plan, shadow) = self
-                .repaint_planner
-                .plan_with_damage_complexity_shadow(output_damage, buffer_age);
-            (plan, Some(shadow))
-        } else {
-            (self.repaint_planner.plan(output_damage, buffer_age), None)
-        };
+        let (mut plan, damage_complexity_shadow_trace) =
+            if self.effect_runtime.effect_trace.enabled() {
+                let (plan, shadow) = self
+                    .scene_state
+                    .repaint_planner
+                    .plan_with_damage_complexity_shadow(output_damage, buffer_age);
+                (plan, Some(shadow))
+            } else {
+                (
+                    self.scene_state
+                        .repaint_planner
+                        .plan(output_damage, buffer_age),
+                    None,
+                )
+            };
         if plan.mode == RepaintMode::Skip {
-            self.frame_stats.surface_resource_candidates = surfaces.len();
-            self.frame_stats.surface_resource_deferred = surfaces.len();
+            self.scene_state.frame_stats.surface_resource_candidates = surfaces.len();
+            self.scene_state.frame_stats.surface_resource_deferred = surfaces.len();
             self.record_effect_resource_metrics();
             self.record_repaint_stats(&plan);
             return Ok(EglFrameOutcome::Skipped {
                 reason: FrameSkipReason::NoLogicalDamage,
-                stats: self.frame_stats,
+                stats: self.scene_state.frame_stats,
             });
         }
-        let initial_repaint_trace = if self.effect_trace.enabled() {
+        let initial_repaint_trace = if self.effect_runtime.effect_trace.enabled() {
             Some(RepaintPlanTraceSnapshot::from_plan(&plan, width, height))
         } else {
             None
         };
-        let demand_trace_seed = if self.effect_trace.enabled() {
+        let demand_trace_seed = if self.effect_runtime.effect_trace.enabled() {
             compiled_graph.map(|graph| oblivion_one::effects::EffectDemandPlanStats {
                 repair_rect_count: plan.repair_damage.rect_count(),
                 dependency_edge_count: graph.instances.iter().fold(0, |count, instance| {
@@ -2445,34 +2327,42 @@ impl GlesSceneRenderer {
         let mut demand_trace_begin_summary =
             self.effect_trace_summary(effects, Some(&plan), compiled_graph, None);
         demand_trace_begin_summary.demand_plan = demand_trace_seed;
-        self.effect_trace
-            .frame_boundary("effect_demand_plan", "begin", demand_trace_begin_summary);
+        self.effect_runtime.effect_trace.frame_boundary(
+            "effect_demand_plan",
+            "begin",
+            demand_trace_begin_summary,
+        );
         let effect_execution_demand = match &execution_plan {
             FrameExecutionPlan::LegacyScene => None,
-            FrameExecutionPlan::EffectGraph(graph) => Some(if self.effect_trace.enabled() {
-                let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
-                    &self.repaint_planner,
-                    graph,
-                    &mut plan,
-                    width,
-                    height,
-                );
-                self.effect_trace.effect_execution_resolution(|| snapshot);
-                demand
-            } else {
-                resolve_effect_execution_for_repaint_plan(
-                    &self.repaint_planner,
-                    graph,
-                    &mut plan,
-                    width,
-                    height,
-                )
-            }),
+            FrameExecutionPlan::EffectGraph(graph) => {
+                Some(if self.effect_runtime.effect_trace.enabled() {
+                    let (demand, snapshot) =
+                        resolve_effect_execution_for_repaint_plan_with_diagnostics(
+                            &self.scene_state.repaint_planner,
+                            graph,
+                            &mut plan,
+                            width,
+                            height,
+                        );
+                    self.effect_runtime
+                        .effect_trace
+                        .effect_execution_resolution(|| snapshot);
+                    demand
+                } else {
+                    resolve_effect_execution_for_repaint_plan(
+                        &self.scene_state.repaint_planner,
+                        graph,
+                        &mut plan,
+                        width,
+                        height,
+                    )
+                })
+            }
         };
         let selected_effect_count = effect_execution_demand
             .as_ref()
             .map(|demand| demand.instances.len());
-        let demand_trace_stats = if self.effect_trace.enabled() {
+        let demand_trace_stats = if self.effect_runtime.effect_trace.enabled() {
             effect_execution_demand
                 .as_ref()
                 .map(|demand| demand.plan_stats())
@@ -2482,29 +2372,36 @@ impl GlesSceneRenderer {
         let mut demand_trace_end_summary =
             self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count);
         demand_trace_end_summary.demand_plan = demand_trace_stats;
-        self.effect_trace
-            .frame_boundary("effect_demand_plan", "end", demand_trace_end_summary);
-        self.effect_trace.effect_repaint_provenance(|| {
-            EffectRepaintProvenanceSnapshot::new(
-                input_damage_trace.expect("enabled effect trace must capture input damage"),
-                scene_damage_trace.expect("enabled effect trace must capture scene damage"),
-                merged_damage_trace.expect("enabled effect trace must capture merged damage"),
-                initial_repaint_trace.expect("enabled effect trace must capture initial repaint"),
-                RepaintPlanTraceSnapshot::from_plan(&plan, width, height),
-                damage_complexity_shadow_trace
-                    .expect("enabled effect trace must capture damage complexity shadow"),
-            )
-        });
+        self.effect_runtime.effect_trace.frame_boundary(
+            "effect_demand_plan",
+            "end",
+            demand_trace_end_summary,
+        );
+        self.effect_runtime
+            .effect_trace
+            .effect_repaint_provenance(|| {
+                EffectRepaintProvenanceSnapshot::new(
+                    input_damage_trace.expect("enabled effect trace must capture input damage"),
+                    scene_damage_trace.expect("enabled effect trace must capture scene damage"),
+                    merged_damage_trace.expect("enabled effect trace must capture merged damage"),
+                    initial_repaint_trace
+                        .expect("enabled effect trace must capture initial repaint"),
+                    RepaintPlanTraceSnapshot::from_plan(&plan, width, height),
+                    damage_complexity_shadow_trace
+                        .expect("enabled effect trace must capture damage complexity shadow"),
+                )
+            });
         if let Some(demand) = &effect_execution_demand {
-            self.frame_stats.effect_instances_pruned = self
+            self.scene_state.frame_stats.effect_instances_pruned = self
+                .scene_state
                 .frame_stats
                 .effect_instances_visible
                 .saturating_sub(demand.instances.len());
         }
         let repair_rects = repaint_plan_output_rects(&plan, width, height);
-        let mut consumer_plan = plan_surface_consumers(&self.commands, &repair_rects);
+        let mut consumer_plan = plan_surface_consumers(&self.scene_state.commands, &repair_rects);
         consumer_plan.extend(&plan_lamp_surface_consumers(
-            &self.lamp_commands,
+            &self.scene_state.lamp_commands,
             &repair_rects,
         ));
         for commands in self.lifecycle_source_commands.values() {
@@ -2512,9 +2409,9 @@ impl GlesSceneRenderer {
         }
         add_surface_consumers_for_command_range(
             &mut consumer_plan,
-            &self.cursor_commands,
+            &self.scene_state.cursor_commands,
             0,
-            self.cursor_commands.len(),
+            self.scene_state.cursor_commands.len(),
             &repair_rects,
         );
         let effect_selection = match (&execution_plan, &effect_execution_demand) {
@@ -2524,7 +2421,7 @@ impl GlesSceneRenderer {
                     graph,
                     demand,
                     &selection,
-                    &self.commands,
+                    &self.scene_state.commands,
                     &repair_rects,
                     (width, height),
                 ));
@@ -2533,8 +2430,8 @@ impl GlesSceneRenderer {
             _ => None,
         };
         consumer_plan.finish();
-        self.frame_stats.surface_resource_candidates = surfaces.len();
-        self.frame_stats.surface_resource_consumers = consumer_plan
+        self.scene_state.frame_stats.surface_resource_candidates = surfaces.len();
+        self.scene_state.frame_stats.surface_resource_consumers = consumer_plan
             .surface_ids()
             .iter()
             .filter(|surface_id| {
@@ -2543,10 +2440,11 @@ impl GlesSceneRenderer {
                     .any(|surface| surface.surface_id == **surface_id)
             })
             .count();
-        self.frame_stats.surface_resource_deferred = self
+        self.scene_state.frame_stats.surface_resource_deferred = self
+            .scene_state
             .frame_stats
             .surface_resource_candidates
-            .saturating_sub(self.frame_stats.surface_resource_consumers);
+            .saturating_sub(self.scene_state.frame_stats.surface_resource_consumers);
         self.realize_surface_resources_for_consumers(
             egl,
             egl_display,
@@ -2558,7 +2456,7 @@ impl GlesSceneRenderer {
             &consumer_plan,
             &surface_resource_sync_states,
         )?;
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "renderer_draw_complete",
             "begin",
             self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
@@ -2572,8 +2470,7 @@ impl GlesSceneRenderer {
                 let selection = effect_selection
                     .as_ref()
                     .expect("effect graph execution must have an execution selection");
-                match effects::execute_effect_graph(
-                    self,
+                match self.execute_effect_graph_with_overlays(
                     graph,
                     framebuffer_origin,
                     &plan,
@@ -2581,31 +2478,42 @@ impl GlesSceneRenderer {
                     selection,
                 ) {
                     Ok(execution_stats) => {
-                        self.frame_stats.effect_instances_executed = execution_stats.instances;
-                        self.frame_stats.effect_passes_executed = execution_stats.passes;
-                        self.frame_stats.scene_replay_work_overflow_fallbacks =
+                        self.scene_state.frame_stats.effect_instances_executed =
+                            execution_stats.instances;
+                        self.scene_state.frame_stats.effect_passes_executed =
+                            execution_stats.passes;
+                        self.scene_state
+                            .frame_stats
+                            .scene_replay_work_overflow_fallbacks =
                             execution_stats.scene_replay_work_overflow_fallbacks;
-                        self.frame_stats.blur_downsample_passes = execution_stats.blur_downsamples;
-                        self.frame_stats.blur_upsample_passes = execution_stats.blur_upsamples;
-                        self.frame_stats.effect_capture_pixels_executed =
+                        self.scene_state.frame_stats.blur_downsample_passes =
+                            execution_stats.blur_downsamples;
+                        self.scene_state.frame_stats.blur_upsample_passes =
+                            execution_stats.blur_upsamples;
+                        self.scene_state.frame_stats.effect_capture_pixels_executed =
                             execution_stats.capture_execution_pixels;
-                        self.frame_stats.effect_resource_acquisitions =
+                        self.scene_state.frame_stats.effect_resource_acquisitions =
                             execution_stats.resource_acquisitions;
                         Ok(())
                     }
                     Err(error) => {
-                        self.effect_resources
+                        self.effect_runtime
+                            .effect_resources
                             .invalidate_checkpoint_capture_contents();
-                        self.frame_stats.effect_fallbacks =
-                            self.frame_stats.effect_fallbacks.saturating_add(1);
-                        self.frame_stats.effect_instances_failed =
-                            self.frame_stats.effect_instances_visible;
-                        self.frame_stats.effect_failure_reason =
+                        self.scene_state.frame_stats.effect_fallbacks = self
+                            .scene_state
+                            .frame_stats
+                            .effect_fallbacks
+                            .saturating_add(1);
+                        self.scene_state.frame_stats.effect_instances_failed =
+                            self.scene_state.frame_stats.effect_instances_visible;
+                        self.scene_state.frame_stats.effect_failure_reason =
                             Some(EffectFailureReason::from_error(error.as_ref()));
-                        if self.frame_stats.effect_failure_reason
+                        if self.scene_state.frame_stats.effect_failure_reason
                             == Some(EffectFailureReason::ShaderUnavailable)
                         {
-                            self.failed_effect_generation = Some(self.effect_registry_generation);
+                            self.effect_runtime.failed_effect_generation =
+                                Some(self.effect_runtime.effect_registry_generation);
                         }
                         self.draw_textured_layers(&plan, framebuffer_origin)
                     }
@@ -2613,7 +2521,7 @@ impl GlesSceneRenderer {
             }
         };
         if let Err(error) = draw_result {
-            self.effect_trace.frame_boundary(
+            self.effect_runtime.effect_trace.frame_boundary(
                 "renderer_draw_complete",
                 "end",
                 self.effect_trace_summary(
@@ -2623,19 +2531,19 @@ impl GlesSceneRenderer {
                     selected_effect_count,
                 ),
             );
-            self.repaint_planner.invalidate();
+            self.scene_state.repaint_planner.invalidate();
             return Err(error);
         }
-        self.effect_trace.frame_boundary(
+        self.effect_runtime.effect_trace.frame_boundary(
             "renderer_draw_complete",
             "end",
             self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
         );
         self.record_lifecycle_fallbacks_without_evidence();
         if !self.lifecycle_render_fallbacks.is_empty() {
-            self.repaint_planner.invalidate();
+            self.scene_state.repaint_planner.invalidate();
             return Ok(EglFrameOutcome::LifecycleFallback {
-                stats: self.frame_stats,
+                stats: self.scene_state.frame_stats,
                 fallbacks: self.lifecycle_render_fallbacks.clone(),
             });
         }
@@ -2647,7 +2555,7 @@ impl GlesSceneRenderer {
                 damage_state,
                 scene_key: candidate_scene_key,
             },
-            stats: self.frame_stats,
+            stats: self.scene_state.frame_stats,
             lifecycle_evidence: self.lifecycle_render_evidence.clone(),
         })
     }
@@ -2657,23 +2565,33 @@ impl GlesSceneRenderer {
         frame: EglSceneFrameCommit,
         presented_transition_damage: OutputDamage,
     ) {
-        self.repaint_planner
+        self.scene_state
+            .repaint_planner
             .commit_presented_transition(presented_transition_damage);
-        self.damage_tracker.commit_presented(frame.damage_state);
-        self.presented_scene_key = Some(frame.scene_key);
-        self.frame_stats.history_depth = self.repaint_planner.history_depth();
+        self.scene_state
+            .damage_tracker
+            .commit_presented(frame.damage_state);
+        self.scene_state.presented_scene_key = Some(frame.scene_key);
+        self.scene_state.frame_stats.history_depth =
+            self.scene_state.repaint_planner.history_depth();
     }
 
     pub(crate) fn promote_checkpoint_cache_causal_state(
         &mut self,
         graph: &oblivion_one::effects::CompiledFrameGraph,
     ) {
-        let frame_serial = self.effect_resources.checkpoint_frame_serial();
+        let frame_serial = self
+            .effect_runtime
+            .effect_resources
+            .checkpoint_frame_serial();
         if let Some(state) = self.checkpoint_causal_candidate_state(Some(graph)) {
-            self.effect_resources
+            self.effect_runtime
+                .effect_resources
                 .promote_checkpoint_causal_state(frame_serial, state);
         } else {
-            self.effect_resources.invalidate_checkpoint_causal_state();
+            self.effect_runtime
+                .effect_resources
+                .invalidate_checkpoint_causal_state();
         }
     }
 
@@ -2681,46 +2599,56 @@ impl GlesSceneRenderer {
         &self,
         graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
     ) -> Option<CheckpointCausalState> {
-        self.current_checkpoint_scene_causal_snapshot
+        self.scene_state
+            .current_checkpoint_scene_causal_snapshot
             .clone()
-            .map(|scene| CheckpointCausalState::new(scene, graph, &self.commands))
+            .map(|scene| CheckpointCausalState::new(scene, graph, &self.scene_state.commands))
     }
 
     pub(crate) fn discard_rendered(&mut self, frame: EglSceneFrameCommit) {
-        self.repaint_planner.discard_rendered(&frame.repaint_plan);
-        self.effect_resources
+        self.scene_state
+            .repaint_planner
+            .discard_rendered(&frame.repaint_plan);
+        self.effect_runtime
+            .effect_resources
             .invalidate_checkpoint_capture_contents();
     }
 
     pub(crate) fn frame_swap_failed(&mut self) {
-        self.repaint_planner.swap_failed();
-        self.frame_stats.history_depth = 0;
+        self.scene_state.repaint_planner.swap_failed();
+        self.scene_state.frame_stats.history_depth = 0;
     }
 
     fn record_repaint_stats(&mut self, plan: &RepaintPlan) {
-        let (width, height) = self.current_size;
-        self.frame_stats.repaint_mode = plan.mode;
-        self.frame_stats.partial_repaint_complexity_policy = plan.complexity_policy;
-        self.frame_stats.partial_repaint_complexity_action = plan.complexity_action;
-        self.frame_stats.buffer_age = plan.buffer_age;
-        self.frame_stats.current_damage_rects = plan.render_damage.rect_count();
-        self.frame_stats.current_damage_pixels =
+        let (width, height) = self.scene_state.current_size;
+        self.scene_state.frame_stats.repaint_mode = plan.mode;
+        self.scene_state
+            .frame_stats
+            .partial_repaint_complexity_policy = plan.complexity_policy;
+        self.scene_state
+            .frame_stats
+            .partial_repaint_complexity_action = plan.complexity_action;
+        self.scene_state.frame_stats.buffer_age = plan.buffer_age;
+        self.scene_state.frame_stats.current_damage_rects = plan.render_damage.rect_count();
+        self.scene_state.frame_stats.current_damage_pixels =
             plan.render_damage.pixels(width, height).unwrap_or(u64::MAX);
-        self.frame_stats.repair_damage_rects = plan.repair_damage.rect_count();
-        self.frame_stats.repair_damage_pixels =
+        self.scene_state.frame_stats.repair_damage_rects = plan.repair_damage.rect_count();
+        self.scene_state.frame_stats.repair_damage_pixels =
             plan.repair_damage.pixels(width, height).unwrap_or(u64::MAX);
-        self.frame_stats.fallback_reason = plan.fallback_reason;
-        self.frame_stats.partial_repaint_enabled = self.repaint_planner.partial_enabled();
-        self.frame_stats.history_depth = self.repaint_planner.history_depth();
+        self.scene_state.frame_stats.fallback_reason = plan.fallback_reason;
+        self.scene_state.frame_stats.partial_repaint_enabled =
+            self.scene_state.repaint_planner.partial_enabled();
+        self.scene_state.frame_stats.history_depth =
+            self.scene_state.repaint_planner.history_depth();
     }
 
     fn record_effect_graph_metrics(&mut self, metrics: EffectGraphMetrics) {
-        self.frame_stats.effect_instances_visible = metrics.instances;
-        self.frame_stats.render_graph_passes = metrics.passes;
-        self.frame_stats.render_graph_peak_live_textures = metrics.peak_live_textures;
-        self.frame_stats.effect_graph_peak_live_bytes = metrics.peak_live_bytes;
-        self.frame_stats.effect_capture_pixels = metrics.capture_pixels;
-        self.frame_stats.effect_output_pixels = metrics.output_pixels;
+        self.scene_state.frame_stats.effect_instances_visible = metrics.instances;
+        self.scene_state.frame_stats.render_graph_passes = metrics.passes;
+        self.scene_state.frame_stats.render_graph_peak_live_textures = metrics.peak_live_textures;
+        self.scene_state.frame_stats.effect_graph_peak_live_bytes = metrics.peak_live_bytes;
+        self.scene_state.frame_stats.effect_capture_pixels = metrics.capture_pixels;
+        self.scene_state.frame_stats.effect_output_pixels = metrics.output_pixels;
     }
 
     fn effect_trace_summary(
@@ -2737,7 +2665,7 @@ impl GlesSceneRenderer {
                 .map(|plan| plan.render_damage.identity_signature()),
             repair_damage_signature: repaint_plan
                 .map(|plan| plan.repair_damage.identity_signature()),
-            visible_effect_count: Some(self.frame_stats.effect_instances_visible),
+            visible_effect_count: Some(self.scene_state.frame_stats.effect_instances_visible),
             selected_effect_count,
             graph_pass_count: graph.map(|graph| graph.stats.passes),
             graph_texture_count: graph.map(|graph| graph.stats.textures),
@@ -2747,36 +2675,41 @@ impl GlesSceneRenderer {
     }
 
     fn record_effect_resource_metrics(&mut self) {
-        let metrics = self.effect_resources.metrics();
-        self.frame_stats.effect_resource_allocations = metrics.allocation_count;
-        self.frame_stats.effect_resource_reuses = metrics.reuse_count;
-        self.frame_stats.effect_resource_evictions = metrics.eviction_count;
-        self.frame_stats.effect_resource_allocations_total = metrics.allocation_count;
-        self.frame_stats.effect_resource_reuses_total = metrics.reuse_count;
-        self.frame_stats.effect_resource_evictions_total = metrics.eviction_count;
-        self.frame_stats.effect_gpu_cache_bytes = metrics.current_bytes;
-        self.frame_stats.effect_gpu_cache_peak_bytes = metrics.peak_bytes;
-        self.frame_stats.effect_gpu_budget_bytes = metrics.budget_bytes;
-        self.frame_stats.effect_gpu_cached_keys = metrics.cached_key_count;
-        self.frame_stats.effect_gpu_cached_textures = metrics.cached_texture_count;
-        self.frame_stats.effect_gpu_checked_out_textures = metrics.checked_out_texture_count;
-        let shader_metrics = self.effect_shaders.metrics();
-        self.frame_stats.shader_cache_capacity = shader_metrics.capacity;
-        self.frame_stats.shader_cache_entries = shader_metrics.resident_entries;
-        self.frame_stats.shader_cache_peak_entries = shader_metrics.peak_entries;
-        self.frame_stats.shader_cache_evictions_total = shader_metrics.eviction_count;
+        let metrics = self.effect_runtime.effect_resources.metrics();
+        self.scene_state.frame_stats.effect_resource_allocations = metrics.allocation_count;
+        self.scene_state.frame_stats.effect_resource_reuses = metrics.reuse_count;
+        self.scene_state.frame_stats.effect_resource_evictions = metrics.eviction_count;
+        self.scene_state
+            .frame_stats
+            .effect_resource_allocations_total = metrics.allocation_count;
+        self.scene_state.frame_stats.effect_resource_reuses_total = metrics.reuse_count;
+        self.scene_state.frame_stats.effect_resource_evictions_total = metrics.eviction_count;
+        self.scene_state.frame_stats.effect_gpu_cache_bytes = metrics.current_bytes;
+        self.scene_state.frame_stats.effect_gpu_cache_peak_bytes = metrics.peak_bytes;
+        self.scene_state.frame_stats.effect_gpu_budget_bytes = metrics.budget_bytes;
+        self.scene_state.frame_stats.effect_gpu_cached_keys = metrics.cached_key_count;
+        self.scene_state.frame_stats.effect_gpu_cached_textures = metrics.cached_texture_count;
+        self.scene_state.frame_stats.effect_gpu_checked_out_textures =
+            metrics.checked_out_texture_count;
+        let shader_metrics = self.effect_runtime.effect_shaders.metrics();
+        self.scene_state.frame_stats.shader_cache_capacity = shader_metrics.capacity;
+        self.scene_state.frame_stats.shader_cache_entries = shader_metrics.resident_entries;
+        self.scene_state.frame_stats.shader_cache_peak_entries = shader_metrics.peak_entries;
+        self.scene_state.frame_stats.shader_cache_evictions_total = shader_metrics.eviction_count;
     }
 
     fn ensure_output_size(&mut self, width: u32, height: u32) -> RendererResult<()> {
-        if self.current_size == (width, height) {
+        if self.scene_state.current_size == (width, height) {
             return Ok(());
         }
 
         self.release_all_lifecycle_visual_resources();
-        self.current_size = (width, height);
-        self.repaint_planner.resize((width, height));
-        self.scene_cache_key = None;
-        self.effect_resources.cleanup_size_history(&self.gl);
+        self.scene_state.current_size = (width, height);
+        self.scene_state.repaint_planner.resize((width, height));
+        self.scene_state.scene_cache_key = None;
+        self.effect_runtime
+            .effect_resources
+            .cleanup_size_history(&self.gl);
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
         }
@@ -2966,9 +2899,11 @@ impl GlesSceneRenderer {
             self.failed_surface_generations.remove(&surface_id);
         }
 
-        self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
-        self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
-        self.frame_stats.dmabuf_cache_max_entries_for_one_surface =
+        self.scene_state.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
+        self.scene_state.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        self.scene_state
+            .frame_stats
+            .dmabuf_cache_max_entries_for_one_surface =
             self.dmabuf_cache_max_entries_for_one_surface;
         Ok(())
     }
@@ -3006,9 +2941,11 @@ impl GlesSceneRenderer {
                 });
             self.realize_surface_resource(egl, egl_display, surface, sync_state)?;
         }
-        self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
-        self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
-        self.frame_stats.dmabuf_cache_max_entries_for_one_surface =
+        self.scene_state.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
+        self.scene_state.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        self.scene_state
+            .frame_stats
+            .dmabuf_cache_max_entries_for_one_surface =
             self.dmabuf_cache_max_entries_for_one_surface;
         Ok(())
     }
@@ -3038,17 +2975,20 @@ impl GlesSceneRenderer {
                 if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
                     resource.image.generation = surface.generation;
                 }
-                self.frame_stats.dmabuf_current_resource_reuses = self
+                self.scene_state.frame_stats.dmabuf_current_resource_reuses = self
+                    .scene_state
                     .frame_stats
                     .dmabuf_current_resource_reuses
                     .saturating_add(1);
-                self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
+                self.scene_state.frame_stats.dmabuf_reuses =
+                    self.scene_state.frame_stats.dmabuf_reuses.saturating_add(1);
                 return Ok(());
             }
             EglSurfaceResourceUpdate::UploadDamage | EglSurfaceResourceUpdate::FullShmResync => {
                 if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
                     let force_full = update == EglSurfaceResourceUpdate::FullShmResync;
-                    self.frame_stats.shm_upload_bytes = self
+                    self.scene_state.frame_stats.shm_upload_bytes = self
+                        .scene_state
                         .frame_stats
                         .shm_upload_bytes
                         .saturating_add(resource.write_shm_damage(
@@ -3059,8 +2999,11 @@ impl GlesSceneRenderer {
                             &mut self.texture_upload_rgba,
                         ));
                     if force_full {
-                        self.frame_stats.shm_full_resyncs =
-                            self.frame_stats.shm_full_resyncs.saturating_add(1);
+                        self.scene_state.frame_stats.shm_full_resyncs = self
+                            .scene_state
+                            .frame_stats
+                            .shm_full_resyncs
+                            .saturating_add(1);
                     }
                 }
                 return Ok(());
@@ -3104,16 +3047,21 @@ impl GlesSceneRenderer {
             if let Some(resource) = settle_dmabuf_import_result(
                 result,
                 context,
-                &mut self.frame_stats,
+                &mut self.scene_state.frame_stats,
                 &mut self.failed_surface_generations,
             )? {
-                self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+                self.scene_state.frame_stats.dmabuf_imports = self
+                    .scene_state
+                    .frame_stats
+                    .dmabuf_imports
+                    .saturating_add(1);
                 self.surface_resources.insert(surface.surface_id, resource);
             }
         } else {
             match result {
                 Ok(resource) => {
-                    self.frame_stats.shm_upload_bytes = self
+                    self.scene_state.frame_stats.shm_upload_bytes = self
+                        .scene_state
                         .frame_stats
                         .shm_upload_bytes
                         .saturating_add(surface_upload_byte_len(surface));
@@ -3166,9 +3114,13 @@ impl GlesSceneRenderer {
                 }
             }
             cached.image.generation = surface.generation;
-            self.frame_stats.dmabuf_cache_hits =
-                self.frame_stats.dmabuf_cache_hits.saturating_add(1);
-            self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
+            self.scene_state.frame_stats.dmabuf_cache_hits = self
+                .scene_state
+                .frame_stats
+                .dmabuf_cache_hits
+                .saturating_add(1);
+            self.scene_state.frame_stats.dmabuf_reuses =
+                self.scene_state.frame_stats.dmabuf_reuses.saturating_add(1);
             if let Some(old) = self.surface_resources.insert(
                 surface.surface_id,
                 EglSurfaceResource {
@@ -3190,8 +3142,11 @@ impl GlesSceneRenderer {
                 surface.dmabuf_handle(),
             );
         }
-        self.frame_stats.dmabuf_cache_misses =
-            self.frame_stats.dmabuf_cache_misses.saturating_add(1);
+        self.scene_state.frame_stats.dmabuf_cache_misses = self
+            .scene_state
+            .frame_stats
+            .dmabuf_cache_misses
+            .saturating_add(1);
 
         let Some(old) = self.surface_resources.remove(&surface.surface_id) else {
             let result = create_surface_resource(
@@ -3212,10 +3167,14 @@ impl GlesSceneRenderer {
             if let Some(resource) = settle_dmabuf_import_result(
                 result,
                 context,
-                &mut self.frame_stats,
+                &mut self.scene_state.frame_stats,
                 &mut self.failed_surface_generations,
             )? {
-                self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+                self.scene_state.frame_stats.dmabuf_imports = self
+                    .scene_state
+                    .frame_stats
+                    .dmabuf_imports
+                    .saturating_add(1);
                 self.surface_resources.insert(surface.surface_id, resource);
             }
             return Ok(());
@@ -3240,10 +3199,14 @@ impl GlesSceneRenderer {
         if let Some(resource) = settle_dmabuf_import_result(
             result,
             context,
-            &mut self.frame_stats,
+            &mut self.scene_state.frame_stats,
             &mut self.failed_surface_generations,
         )? {
-            self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+            self.scene_state.frame_stats.dmabuf_imports = self
+                .scene_state
+                .frame_stats
+                .dmabuf_imports
+                .saturating_add(1);
             self.surface_resources.insert(surface.surface_id, resource);
         }
         Ok(())
@@ -3271,9 +3234,13 @@ impl GlesSceneRenderer {
                 );
             }
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-            self.frame_stats.dmabuf_cache_evictions =
-                self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-            self.frame_stats.dmabuf_cache_evictions_dead = self
+            self.scene_state.frame_stats.dmabuf_cache_evictions = self
+                .scene_state
+                .frame_stats
+                .dmabuf_cache_evictions
+                .saturating_add(1);
+            self.scene_state.frame_stats.dmabuf_cache_evictions_dead = self
+                .scene_state
                 .frame_stats
                 .dmabuf_cache_evictions_dead
                 .saturating_add(1);
@@ -3291,8 +3258,11 @@ impl GlesSceneRenderer {
         ) {
             destroy_image_resource(&self.gl, egl, egl_display, replaced.image);
         }
-        self.frame_stats.dmabuf_cache_insertions =
-            self.frame_stats.dmabuf_cache_insertions.saturating_add(1);
+        self.scene_state.frame_stats.dmabuf_cache_insertions = self
+            .scene_state
+            .frame_stats
+            .dmabuf_cache_insertions
+            .saturating_add(1);
         let surface_entries = self
             .dmabuf_resource_cache
             .values()
@@ -3334,9 +3304,15 @@ impl GlesSceneRenderer {
                 );
             }
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-            self.frame_stats.dmabuf_cache_evictions =
-                self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-            self.frame_stats.dmabuf_cache_evictions_surface_bound = self
+            self.scene_state.frame_stats.dmabuf_cache_evictions = self
+                .scene_state
+                .frame_stats
+                .dmabuf_cache_evictions
+                .saturating_add(1);
+            self.scene_state
+                .frame_stats
+                .dmabuf_cache_evictions_surface_bound = self
+                .scene_state
                 .frame_stats
                 .dmabuf_cache_evictions_surface_bound
                 .saturating_add(1);
@@ -3362,9 +3338,15 @@ impl GlesSceneRenderer {
                     );
                 }
                 destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-                self.frame_stats.dmabuf_cache_evictions =
-                    self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-                self.frame_stats.dmabuf_cache_evictions_surface_destroyed = self
+                self.scene_state.frame_stats.dmabuf_cache_evictions = self
+                    .scene_state
+                    .frame_stats
+                    .dmabuf_cache_evictions
+                    .saturating_add(1);
+                self.scene_state
+                    .frame_stats
+                    .dmabuf_cache_evictions_surface_destroyed = self
+                    .scene_state
                     .frame_stats
                     .dmabuf_cache_evictions_surface_destroyed
                     .saturating_add(1);
@@ -3382,9 +3364,13 @@ impl GlesSceneRenderer {
                     );
                 }
                 destroy_image_resource(&self.gl, egl, egl_display, cached.image);
-                self.frame_stats.dmabuf_cache_evictions =
-                    self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-                self.frame_stats.dmabuf_cache_evictions_dead = self
+                self.scene_state.frame_stats.dmabuf_cache_evictions = self
+                    .scene_state
+                    .frame_stats
+                    .dmabuf_cache_evictions
+                    .saturating_add(1);
+                self.scene_state.frame_stats.dmabuf_cache_evictions_dead = self
+                    .scene_state
                     .frame_stats
                     .dmabuf_cache_evictions_dead
                     .saturating_add(1);
@@ -3409,7 +3395,7 @@ impl GlesSceneRenderer {
         presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
-        self.scene_cache_key.is_some_and(|key| {
+        self.scene_state.scene_cache_key.is_some_and(|key| {
             key.is_current_with_decorations_and_external_overlay_ids(
                 width,
                 height,
@@ -3447,21 +3433,21 @@ impl GlesSceneRenderer {
         presentation_owner_roots_by_surface: &HashMap<u32, u32>,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
-        self.frame_stats.orphan_decoration_count =
+        self.scene_state.frame_stats.orphan_decoration_count =
             compositor::WindowVisualGroup::orphan_decoration_count(surfaces, decoration_instances);
-        self.vertices.clear();
-        self.commands.clear();
-        self.presentation_opacities.clear();
-        self.presentation_visual_group_opacities.clear();
-        self.presentation_visual_group_clips.clear();
-        self.presentation_visual_group_owners.clear();
-        self.scene_geometry_dirty = true;
-        self.vertices.reserve((1 + surfaces.len()) * 6);
-        self.commands.reserve(1 + surfaces.len());
+        self.scene_state.vertices.clear();
+        self.scene_state.commands.clear();
+        self.scene_state.presentation_opacities.clear();
+        self.scene_state.presentation_visual_group_opacities.clear();
+        self.scene_state.presentation_visual_group_clips.clear();
+        self.scene_state.presentation_visual_group_owners.clear();
+        self.scene_state.scene_geometry_dirty = true;
+        self.scene_state.vertices.reserve((1 + surfaces.len()) * 6);
+        self.scene_state.commands.reserve(1 + surfaces.len());
 
         push_output_background_command(
-            &mut self.vertices,
-            &mut self.commands,
+            &mut self.scene_state.vertices,
+            &mut self.scene_state.commands,
             width,
             height,
             framebuffer_origin,
@@ -3477,7 +3463,7 @@ impl GlesSceneRenderer {
         .into_iter()
         .enumerate()
         {
-            let command_start = self.commands.len();
+            let command_start = self.scene_state.commands.len();
             let visual_group = VisualGroupId::new(
                 u32::try_from(group_index)
                     .unwrap_or(u32::MAX.saturating_sub(1))
@@ -3491,8 +3477,8 @@ impl GlesSceneRenderer {
                     continue;
                 };
                 push_egl_surface_commands(
-                    &mut self.vertices,
-                    &mut self.commands,
+                    &mut self.scene_state.vertices,
+                    &mut self.scene_state.commands,
                     width,
                     height,
                     surface,
@@ -3505,8 +3491,8 @@ impl GlesSceneRenderer {
                 && let Some(instance) = decoration_instances.get(decoration_index)
             {
                 push_egl_decoration_instance(
-                    &mut self.vertices,
-                    &mut self.commands,
+                    &mut self.scene_state.vertices,
+                    &mut self.scene_state.commands,
                     width,
                     height,
                     instance,
@@ -3522,9 +3508,11 @@ impl GlesSceneRenderer {
                 .unwrap_or(group_root);
             let opacity = Self::presentation_opacity_for_root(presentation_opacities, owner_root);
             if let Some(visual_group) = visual_group {
-                self.presentation_visual_group_owners
+                self.scene_state
+                    .presentation_visual_group_owners
                     .insert(visual_group, owner_root);
-                self.presentation_visual_group_opacities
+                self.scene_state
+                    .presentation_visual_group_opacities
                     .insert(visual_group, opacity);
                 if let Some(clip) = presentation_clips
                     .iter()
@@ -3532,7 +3520,7 @@ impl GlesSceneRenderer {
                     .and_then(|clip| clip.presented_clip)
                 {
                     let scale = output_scale.max(0.01);
-                    self.presentation_visual_group_clips.insert(
+                    self.scene_state.presentation_visual_group_clips.insert(
                         visual_group,
                         EglRect::new(
                             (clip.x() * scale) as f32,
@@ -3543,23 +3531,27 @@ impl GlesSceneRenderer {
                     );
                 }
             }
-            for _ in command_start..self.commands.len() {
-                self.presentation_opacities.push(opacity);
+            for _ in command_start..self.scene_state.commands.len() {
+                self.scene_state.presentation_opacities.push(opacity);
             }
             let presentation_clip = visual_group
-                .and_then(|visual_group| self.presentation_visual_group_clips.get(&visual_group))
+                .and_then(|visual_group| {
+                    self.scene_state
+                        .presentation_visual_group_clips
+                        .get(&visual_group)
+                })
                 .copied();
-            for command in &mut self.commands[command_start..] {
+            for command in &mut self.scene_state.commands[command_start..] {
                 command.presentation_clip = presentation_clip;
             }
             if opacity < 1.0 {
-                for command in &mut self.commands[command_start..] {
+                for command in &mut self.scene_state.commands[command_start..] {
                     command.opaque_regions.clear();
                 }
             }
         }
 
-        self.scene_cache_key = Some(
+        self.scene_state.scene_cache_key = Some(
             EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
                 width,
                 height,
@@ -3589,18 +3581,18 @@ impl GlesSceneRenderer {
         output_scale: f64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
-        self.cursor_vertices.clear();
-        self.cursor_commands.clear();
-        self.cursor_presentation_opacities.clear();
-        self.overlay_geometry_dirty = true;
+        self.scene_state.cursor_vertices.clear();
+        self.scene_state.cursor_commands.clear();
+        self.scene_state.cursor_presentation_opacities.clear();
+        self.scene_state.overlay_geometry_dirty = true;
 
         let render_assignments =
             compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
         for (surface, render_assignment) in overlay_surfaces.iter().zip(render_assignments) {
-            let command_start = self.cursor_commands.len();
+            let command_start = self.scene_state.cursor_commands.len();
             push_egl_surface_commands(
-                &mut self.cursor_vertices,
-                &mut self.cursor_commands,
+                &mut self.scene_state.cursor_vertices,
+                &mut self.scene_state.cursor_commands,
                 width,
                 height,
                 surface,
@@ -3608,10 +3600,14 @@ impl GlesSceneRenderer {
                 framebuffer_origin,
                 None,
             );
-            self.cursor_presentation_opacities
+            self.scene_state
+                .cursor_presentation_opacities
                 .extend(std::iter::repeat_n(
                     1.0,
-                    self.cursor_commands.len().saturating_sub(command_start),
+                    self.scene_state
+                        .cursor_commands
+                        .len()
+                        .saturating_sub(command_start),
                 ));
         }
 
@@ -3620,8 +3616,8 @@ impl GlesSceneRenderer {
         {
             let (top_left_x, top_left_y) = self.cursor_image.top_left(cursor_x, cursor_y);
             push_draw_command(
-                &mut self.cursor_vertices,
-                &mut self.cursor_commands,
+                &mut self.scene_state.cursor_vertices,
+                &mut self.scene_state.cursor_commands,
                 EglDrawLayer::Cursor,
                 EglRect::new(
                     top_left_x as f32,
@@ -3633,7 +3629,7 @@ impl GlesSceneRenderer {
                 height,
                 framebuffer_origin,
             );
-            self.cursor_presentation_opacities.push(1.0);
+            self.scene_state.cursor_presentation_opacities.push(1.0);
         }
 
         if let Some(cursor) = client_cursor {
@@ -3652,8 +3648,8 @@ impl GlesSceneRenderer {
             let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
             let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
             push_draw_command_with_uv(
-                &mut self.cursor_vertices,
-                &mut self.cursor_commands,
+                &mut self.scene_state.cursor_vertices,
+                &mut self.scene_state.cursor_commands,
                 EglDrawLayer::Surface(cursor.surface.surface_id),
                 EglRect::new(
                     render_plan.content_target.x() as f32,
@@ -3675,7 +3671,7 @@ impl GlesSceneRenderer {
                 height,
                 framebuffer_origin,
             );
-            self.cursor_presentation_opacities.push(1.0);
+            self.scene_state.cursor_presentation_opacities.push(1.0);
         }
     }
 
@@ -3688,7 +3684,11 @@ impl GlesSceneRenderer {
         unsafe { self.gl.clear_color(0.0, 0.0, 0.0, 1.0) };
 
         let execution = plan
-            .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
+            .render_execution(
+                self.scene_state.current_size.0,
+                self.scene_state.current_size.1,
+                framebuffer_origin,
+            )
             .ok_or_else(|| io::Error::other("repaint execution conversion failed"))?;
         match execution {
             RenderExecution::Full => {
@@ -3723,7 +3723,7 @@ impl GlesSceneRenderer {
                             }
                             let output_rect = gl_scissor_to_output_rect(
                                 [x, y, width, height],
-                                self.current_size.1,
+                                self.scene_state.current_size.1,
                                 framebuffer_origin,
                             );
                             draw_result = self.draw_command_batch(true, output_rect);
@@ -3743,7 +3743,7 @@ impl GlesSceneRenderer {
                             let [x, y, width, height] = scissors[index];
                             let output_rect = gl_scissor_to_output_rect(
                                 [x, y, width, height],
-                                self.current_size.1,
+                                self.scene_state.current_size.1,
                                 framebuffer_origin,
                             );
                             draw_result = self.draw_lamp_overlay(output_rect);
@@ -3752,7 +3752,7 @@ impl GlesSceneRenderer {
                             let [x, y, width, height] = scissors[index];
                             let output_rect = gl_scissor_to_output_rect(
                                 [x, y, width, height],
-                                self.current_size.1,
+                                self.scene_state.current_size.1,
                                 framebuffer_origin,
                             );
                             draw_result = self.draw_squash_overlay(output_rect);
@@ -3761,7 +3761,7 @@ impl GlesSceneRenderer {
                             let [x, y, width, height] = scissors[index];
                             let output_rect = gl_scissor_to_output_rect(
                                 [x, y, width, height],
-                                self.current_size.1,
+                                self.scene_state.current_size.1,
                                 framebuffer_origin,
                             );
                             draw_result = self.draw_command_batch(false, output_rect);
@@ -3774,7 +3774,7 @@ impl GlesSceneRenderer {
                     }
                 }
                 draw_result?;
-                self.frame_stats.scissor_passes = scissors.len();
+                self.scene_state.frame_stats.scissor_passes = scissors.len();
             }
         }
 
@@ -3797,15 +3797,15 @@ impl GlesSceneRenderer {
             lifecycle_surfaces,
             lifecycle_decorations,
             output_scale,
-            self.current_framebuffer_origin,
+            self.scene_state.current_framebuffer_origin,
         );
-        if self.lamp_geometry_key == Some(geometry_key) {
+        if self.scene_state.lamp_geometry_key == Some(geometry_key) {
             return;
         }
-        self.lamp_geometry_key = Some(geometry_key);
-        self.lamp_geometry_dirty = true;
-        self.lamp_vertices.clear();
-        self.lamp_commands.clear();
+        self.scene_state.lamp_geometry_key = Some(geometry_key);
+        self.scene_state.lamp_geometry_dirty = true;
+        self.scene_state.lamp_vertices.clear();
+        self.scene_state.lamp_commands.clear();
         if !lifecycle
             .samples
             .iter()
@@ -3862,11 +3862,11 @@ impl GlesSceneRenderer {
                         push_egl_surface_commands(
                             &mut vertices,
                             &mut commands,
-                            self.current_size.0,
-                            self.current_size.1,
+                            self.scene_state.current_size.0,
+                            self.scene_state.current_size.1,
                             surface,
                             assignment.clone(),
-                            self.current_framebuffer_origin,
+                            self.scene_state.current_framebuffer_origin,
                             visual_group,
                         );
                     }
@@ -3877,11 +3877,11 @@ impl GlesSceneRenderer {
                         push_egl_decoration_instance(
                             &mut vertices,
                             &mut commands,
-                            self.current_size.0,
-                            self.current_size.1,
+                            self.scene_state.current_size.0,
+                            self.scene_state.current_size.1,
                             decoration,
                             output_scale,
-                            self.current_framebuffer_origin,
+                            self.scene_state.current_framebuffer_origin,
                             visual_group,
                         );
                     }
@@ -3891,8 +3891,8 @@ impl GlesSceneRenderer {
                         lamp.visual_group.canonical_client_rect,
                         lamp.visual_group.presented_source_client_rect,
                         output_scale,
-                        self.current_size,
-                        self.current_framebuffer_origin,
+                        self.scene_state.current_size,
+                        self.scene_state.current_framebuffer_origin,
                     );
                     self.lifecycle_source_vertices
                         .insert(source.payload_id, vertices);
@@ -4025,9 +4025,9 @@ impl GlesSceneRenderer {
         lifecycle_decorations: &[DecorationRenderInstance],
         output_scale: f64,
     ) {
-        self.squash_vertices.clear();
-        self.squash_commands.clear();
-        self.squash_geometry_dirty = true;
+        self.scene_state.squash_vertices.clear();
+        self.scene_state.squash_commands.clear();
+        self.scene_state.squash_geometry_dirty = true;
         let assignments =
             compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
         for sample in lifecycle
@@ -4035,7 +4035,7 @@ impl GlesSceneRenderer {
             .iter()
             .filter(|sample| sample.effect == LifecycleEffectKind::Squash)
         {
-            let initial_command_count = self.squash_commands.len();
+            let initial_command_count = self.scene_state.squash_commands.len();
             if sample.visual_source.root_surface_id != sample.root_surface_id
                 || sample.visual_source.payload_id != sample.payload_id
                 || sample.visual_source.presentation_identity != sample.presentation_identity
@@ -4098,9 +4098,9 @@ impl GlesSceneRenderer {
                         target.width() as f32,
                         target.height() as f32,
                     ),
-                    self.current_size.0,
-                    self.current_size.1,
-                    self.current_framebuffer_origin,
+                    self.scene_state.current_size.0,
+                    self.scene_state.current_size.1,
+                    self.scene_state.current_framebuffer_origin,
                 );
                 self.append_squash_batch(sample.presentation_identity, vertices, commands);
             } else {
@@ -4115,11 +4115,11 @@ impl GlesSceneRenderer {
                     push_egl_surface_commands(
                         &mut vertices,
                         &mut commands,
-                        self.current_size.0,
-                        self.current_size.1,
+                        self.scene_state.current_size.0,
+                        self.scene_state.current_size.1,
                         surface,
                         assignment.clone(),
-                        self.current_framebuffer_origin,
+                        self.scene_state.current_framebuffer_origin,
                         None,
                     );
                     if transform_squash_geometry(
@@ -4128,8 +4128,8 @@ impl GlesSceneRenderer {
                         sample.visual_group,
                         sample.progress,
                         output_scale,
-                        self.current_size,
-                        self.current_framebuffer_origin,
+                        self.scene_state.current_size,
+                        self.scene_state.current_framebuffer_origin,
                     ) {
                         self.append_squash_batch(sample.presentation_identity, vertices, commands);
                     }
@@ -4143,11 +4143,11 @@ impl GlesSceneRenderer {
                     push_egl_decoration_instance(
                         &mut vertices,
                         &mut commands,
-                        self.current_size.0,
-                        self.current_size.1,
+                        self.scene_state.current_size.0,
+                        self.scene_state.current_size.1,
                         decoration,
                         output_scale,
-                        self.current_framebuffer_origin,
+                        self.scene_state.current_framebuffer_origin,
                         None,
                     );
                     if transform_squash_geometry(
@@ -4156,14 +4156,14 @@ impl GlesSceneRenderer {
                         sample.visual_group,
                         sample.progress,
                         output_scale,
-                        self.current_size,
-                        self.current_framebuffer_origin,
+                        self.scene_state.current_size,
+                        self.scene_state.current_framebuffer_origin,
                     ) {
                         self.append_squash_batch(sample.presentation_identity, vertices, commands);
                     }
                 }
             }
-            if self.squash_commands.len() == initial_command_count {
+            if self.scene_state.squash_commands.len() == initial_command_count {
                 self.record_lifecycle_render_fallback(
                     frame_sample,
                     LifecycleRenderFallbackReason::NoConsumedRepresentation,
@@ -4178,9 +4178,11 @@ impl GlesSceneRenderer {
         vertices: Vec<EglTexturedVertex>,
         commands: Vec<EglDrawCommand>,
     ) {
-        let vertex_offset = u32::try_from(self.squash_vertices.len()).unwrap_or(u32::MAX);
-        self.squash_vertices.extend(vertices);
-        self.squash_commands
+        let vertex_offset =
+            u32::try_from(self.scene_state.squash_vertices.len()).unwrap_or(u32::MAX);
+        self.scene_state.squash_vertices.extend(vertices);
+        self.scene_state
+            .squash_commands
             .extend(commands.into_iter().map(|mut command| {
                 command.vertex_start = command.vertex_start.saturating_add(vertex_offset);
                 EglSquashDrawCommand {
@@ -4207,10 +4209,17 @@ impl GlesSceneRenderer {
         }
         let start = *transition_starts
             .entry(lamp.presentation_identity)
-            .or_insert((self.lamp_vertices.len(), self.lamp_commands.len()));
-        if !append_lamp_grid(&mut self.lamp_vertices, &mut self.lamp_commands, spec) {
-            self.lamp_vertices.truncate(start.0);
-            self.lamp_commands.truncate(start.1);
+            .or_insert((
+                self.scene_state.lamp_vertices.len(),
+                self.scene_state.lamp_commands.len(),
+            ));
+        if !append_lamp_grid(
+            &mut self.scene_state.lamp_vertices,
+            &mut self.scene_state.lamp_commands,
+            spec,
+        ) {
+            self.scene_state.lamp_vertices.truncate(start.0);
+            self.scene_state.lamp_commands.truncate(start.1);
             rejected_transitions.insert(lamp.presentation_identity);
             self.record_lifecycle_render_fallback(lamp, LifecycleRenderFallbackReason::MeshBudget);
         }
@@ -4228,7 +4237,7 @@ impl GlesSceneRenderer {
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<()> {
         self.release_stale_lifecycle_visual_resources();
-        let output_scale = self.effect_output_scale.max(1.0) as f64;
+        let output_scale = self.effect_runtime.effect_output_scale.max(1.0) as f64;
         let sources = self
             .lifecycle_visual_sources
             .values()
@@ -4268,14 +4277,21 @@ impl GlesSceneRenderer {
                     resource.source_signature == source_signature
                         && resource.source_visual_rect
                             == lamp.visual_group.presented_source_visual_rect
-                        && self.effect_resources.texture(&resource.texture).is_some()
+                        && self
+                            .effect_runtime
+                            .effect_resources
+                            .texture(&resource.texture)
+                            .is_some()
                 });
             if ready {
                 continue;
             }
 
             if let Some(previous) = self.lifecycle_visual_resources.remove(&source.payload_id) {
-                let _ = self.effect_resources.release(previous.texture);
+                let _ = self
+                    .effect_runtime
+                    .effect_resources
+                    .release(previous.texture);
             }
             let texture_key = EffectTextureKey::new(
                 width,
@@ -4284,7 +4300,11 @@ impl GlesSceneRenderer {
                 EffectTextureFilter::Linear,
                 EffectWorkingSpace::OutputEncodedSrgb,
             );
-            let texture = match self.effect_resources.acquire(&self.gl, texture_key) {
+            let texture = match self
+                .effect_runtime
+                .effect_resources
+                .acquire(&self.gl, texture_key)
+            {
                 Ok(texture) => texture,
                 Err(error) => {
                     self.record_lifecycle_source_capture_failure(
@@ -4307,7 +4327,7 @@ impl GlesSceneRenderer {
                 framebuffer_origin,
             ) {
                 self.record_lifecycle_source_capture_failure(&error);
-                if let Err(release_error) = self.effect_resources.release(texture) {
+                if let Err(release_error) = self.effect_runtime.effect_resources.release(texture) {
                     self.record_lifecycle_source_capture_failure(
                         &LifecycleSourceCaptureFailure::new(
                             LifecycleSourceCaptureFailureStage::TargetRelease,
@@ -4350,7 +4370,7 @@ impl GlesSceneRenderer {
     }
 
     fn record_lifecycle_source_capture_failure(&self, failure: &LifecycleSourceCaptureFailure) {
-        self.effect_trace.event(|| {
+        self.effect_runtime.effect_trace.event(|| {
             format!(
                 "event=lifecycle_source_capture_failure stage={} error={}",
                 failure.stage.as_str(),
@@ -4373,13 +4393,14 @@ impl GlesSceneRenderer {
             )
         })?;
         let scratch_key = EffectTextureKey::new(
-            self.current_size.0.max(1),
-            self.current_size.1.max(1),
+            self.scene_state.current_size.0.max(1),
+            self.scene_state.current_size.1.max(1),
             EffectTextureFormat::Rgba8,
             EffectTextureFilter::Linear,
             EffectWorkingSpace::OutputEncodedSrgb,
         );
         let scratch = self
+            .effect_runtime
             .effect_resources
             .acquire(&self.gl, scratch_key)
             .map_err(|error| {
@@ -4396,6 +4417,7 @@ impl GlesSceneRenderer {
                 )
             })?;
             let scratch_framebuffer = self
+                .effect_runtime
                 .effect_resources
                 .bind_lifecycle_composition_target(&self.gl, &scratch)
                 .map_err(|error| {
@@ -4405,7 +4427,9 @@ impl GlesSceneRenderer {
                     )
                 })?;
             let targets = EffectExecutionTargets {
-                baseline_read: EffectFramebufferTarget::new(self.active_output_framebuffer),
+                baseline_read: EffectFramebufferTarget::new(
+                    self.scene_state.active_output_framebuffer,
+                ),
                 composition_draw: EffectFramebufferTarget::new(Some(scratch_framebuffer)),
             };
             if !targets.uses_separate_targets() {
@@ -4432,20 +4456,24 @@ impl GlesSceneRenderer {
                 ));
             }
 
-            let saved_vertices = std::mem::replace(&mut self.vertices, source_vertices);
-            let saved_commands = std::mem::replace(&mut self.commands, source_commands);
-            self.scene_geometry_dirty = true;
+            let saved_vertices = std::mem::replace(&mut self.scene_state.vertices, source_vertices);
+            let saved_commands = std::mem::replace(&mut self.scene_state.commands, source_commands);
+            self.scene_state.scene_geometry_dirty = true;
             let draw_result = (|| {
                 let source_damage =
                     lifecycle_visual_effect_damage(lamp.visual_group.presented_source_visual_rect);
-                let output_bounds =
-                    EffectRect::new(0, 0, self.current_size.0.max(1), self.current_size.1.max(1))
-                        .expect("non-zero renderer dimensions must form valid effect bounds");
+                let output_bounds = EffectRect::new(
+                    0,
+                    0,
+                    self.scene_state.current_size.0.max(1),
+                    self.scene_state.current_size.1.max(1),
+                )
+                .expect("non-zero renderer dimensions must form valid effect bounds");
                 let graph = match compile_frame_execution_plan(
                     &source.effect_scene,
                     &source_damage,
                     output_bounds,
-                    &self.effect_registry,
+                    &self.effect_runtime.effect_registry,
                 )
                 .map_err(|error| {
                     LifecycleSourceCaptureFailure::new(
@@ -4465,18 +4493,21 @@ impl GlesSceneRenderer {
                 };
                 let demand = plan_effect_execution_demand(&graph, &source_damage, true);
                 let selection = effects::select_effect_execution(&graph, &demand);
-                effects::execute_effect_graph_for_lifecycle(
-                    self,
-                    &graph,
-                    targets,
-                    framebuffer_origin,
-                    &[lifecycle_visual_output_rect(
-                        lamp.visual_group.presented_source_visual_rect,
-                        output_bounds,
-                    )],
-                    &demand,
-                    &selection,
-                )
+                {
+                    let mut context = self.effect_execution_context();
+                    effects::execute_effect_graph_for_lifecycle(
+                        &mut context,
+                        &graph,
+                        targets,
+                        framebuffer_origin,
+                        &[lifecycle_visual_output_rect(
+                            lamp.visual_group.presented_source_visual_rect,
+                            output_bounds,
+                        )],
+                        &demand,
+                        &selection,
+                    )
+                }
                 .map_err(|error| {
                     LifecycleSourceCaptureFailure::new(
                         LifecycleSourceCaptureFailureStage::EffectExecution,
@@ -4499,21 +4530,25 @@ impl GlesSceneRenderer {
                 })?;
                 Ok(())
             })();
-            self.vertices = saved_vertices;
-            self.commands = saved_commands;
+            self.scene_state.vertices = saved_vertices;
+            self.scene_state.commands = saved_commands;
             // The temporary source draw replaced the scene VBO contents.
             // Force the normal scene cache to upload its unchanged geometry
             // before the next ordinary scene draw.
-            self.scene_geometry_dirty = true;
+            self.scene_state.scene_geometry_dirty = true;
             draw_result
         })();
         self.establish_ordinary_scene_state();
-        let release_result = self.effect_resources.release(scratch).map_err(|error| {
-            LifecycleSourceCaptureFailure::new(
-                LifecycleSourceCaptureFailureStage::ScratchRelease,
-                Box::new(error),
-            )
-        });
+        let release_result = self
+            .effect_runtime
+            .effect_resources
+            .release(scratch)
+            .map_err(|error| {
+                LifecycleSourceCaptureFailure::new(
+                    LifecycleSourceCaptureFailureStage::ScratchRelease,
+                    Box::new(error),
+                )
+            });
         match (result, release_result) {
             (Err(error), Err(release_error)) => {
                 self.record_lifecycle_source_capture_failure(&release_error);
@@ -4539,7 +4574,10 @@ impl GlesSceneRenderer {
             .collect::<Vec<_>>();
         for payload_id in stale {
             if let Some(resource) = self.lifecycle_visual_resources.remove(&payload_id) {
-                let _ = self.effect_resources.release(resource.texture);
+                let _ = self
+                    .effect_runtime
+                    .effect_resources
+                    .release(resource.texture);
             }
         }
         self.lifecycle_source_vertices
@@ -4550,41 +4588,50 @@ impl GlesSceneRenderer {
 
     fn release_all_lifecycle_visual_resources(&mut self) {
         for (_, resource) in self.lifecycle_visual_resources.drain() {
-            let _ = self.effect_resources.release(resource.texture);
+            let _ = self
+                .effect_runtime
+                .effect_resources
+                .release(resource.texture);
         }
     }
 
     fn draw_lamp_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
-        let (Some(program), Some(uniforms)) = (self.lamp_program, self.lamp_uniform_locations)
-        else {
+        let (Some(program), Some(uniforms)) = (
+            self.scene_state.lamp_program,
+            self.scene_state.lamp_uniform_locations,
+        ) else {
             self.record_visible_lifecycle_fallbacks(
                 LifecycleRenderFallbackReason::LampProgramUnavailable,
             );
             return Ok(());
         };
-        if self.lamp_vertices.is_empty() || self.lamp_commands.is_empty() {
+        if self.scene_state.lamp_vertices.is_empty() || self.scene_state.lamp_commands.is_empty() {
             return Ok(());
         }
-        let required_size = self.lamp_vertices.len() * std::mem::size_of::<EglLampVertex>();
+        let required_size =
+            self.scene_state.lamp_vertices.len() * std::mem::size_of::<EglLampVertex>();
         ensure_vertex_buffer_capacity(
             &self.gl,
-            self.lamp_vertex_buffer,
-            &mut self.lamp_vertex_buffer_capacity,
+            self.scene_state.lamp_vertex_buffer,
+            &mut self.scene_state.lamp_vertex_buffer_capacity,
             required_size,
         );
-        if self.lamp_geometry_dirty {
+        if self.scene_state.lamp_geometry_dirty {
             unsafe {
-                self.gl
-                    .bind_buffer(glow::ARRAY_BUFFER, Some(self.lamp_vertex_buffer));
+                self.gl.bind_buffer(
+                    glow::ARRAY_BUFFER,
+                    Some(self.scene_state.lamp_vertex_buffer),
+                );
                 self.gl.buffer_sub_data_u8_slice(
                     glow::ARRAY_BUFFER,
                     0,
-                    bytemuck::cast_slice(self.lamp_vertices.as_slice()),
+                    bytemuck::cast_slice(self.scene_state.lamp_vertices.as_slice()),
                 );
             }
-            self.lamp_geometry_dirty = false;
+            self.scene_state.lamp_geometry_dirty = false;
         }
         let samples = self
+            .scene_state
             .lamp_commands
             .iter()
             .filter_map(|command| {
@@ -4612,7 +4659,8 @@ impl GlesSceneRenderer {
             .collect::<Vec<_>>();
         unsafe {
             self.gl.use_program(Some(program));
-            self.gl.bind_vertex_array(Some(self.lamp_vertex_array));
+            self.gl
+                .bind_vertex_array(Some(self.scene_state.lamp_vertex_array));
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.enable(glow::BLEND);
             self.gl.blend_func_separate(
@@ -4627,20 +4675,21 @@ impl GlesSceneRenderer {
             if let Some(location) = &uniforms.output_size {
                 self.gl.uniform_2_f32(
                     Some(location),
-                    self.current_size.0 as f32,
-                    self.current_size.1 as f32,
+                    self.scene_state.current_size.0 as f32,
+                    self.scene_state.current_size.1 as f32,
                 );
             }
             if let Some(location) = &uniforms.framebuffer_origin_bottom_left {
                 self.gl.uniform_1_i32(
                     Some(location),
                     i32::from(
-                        self.current_framebuffer_origin == OutputFramebufferOrigin::BottomLeft,
+                        self.scene_state.current_framebuffer_origin
+                            == OutputFramebufferOrigin::BottomLeft,
                     ),
                 );
             }
         }
-        let output_scale = self.effect_output_scale.max(1.0) as f64;
+        let output_scale = self.effect_runtime.effect_output_scale.max(1.0) as f64;
         let mut sampling = None;
         let missing_required_decoration_resources = samples
             .iter()
@@ -4747,39 +4796,48 @@ impl GlesSceneRenderer {
                     payload_id: sample.payload_id,
                 });
         }
-        self.frame_stats.missing_required_decoration_resources = self
+        self.scene_state
+            .frame_stats
+            .missing_required_decoration_resources = self
+            .scene_state
             .frame_stats
             .missing_required_decoration_resources
             .saturating_add(missing_required_decoration_resources);
         unsafe {
-            self.gl.use_program(Some(self.program));
-            self.gl.bind_vertex_array(Some(self.scene_vertex_array));
+            self.gl.use_program(Some(self.scene_state.program));
+            self.gl
+                .bind_vertex_array(Some(self.scene_state.scene_vertex_array));
         }
         Ok(())
     }
 
     fn draw_squash_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
-        if self.squash_vertices.is_empty() || self.squash_commands.is_empty() {
+        if self.scene_state.squash_vertices.is_empty()
+            || self.scene_state.squash_commands.is_empty()
+        {
             return Ok(());
         }
-        let required_size = self.squash_vertices.len() * std::mem::size_of::<EglTexturedVertex>();
+        let required_size =
+            self.scene_state.squash_vertices.len() * std::mem::size_of::<EglTexturedVertex>();
         ensure_vertex_buffer_capacity(
             &self.gl,
-            self.squash_vertex_buffer,
-            &mut self.squash_vertex_buffer_capacity,
+            self.scene_state.squash_vertex_buffer,
+            &mut self.scene_state.squash_vertex_buffer_capacity,
             required_size,
         );
-        if self.squash_geometry_dirty {
+        if self.scene_state.squash_geometry_dirty {
             unsafe {
-                self.gl
-                    .bind_buffer(glow::ARRAY_BUFFER, Some(self.squash_vertex_buffer));
+                self.gl.bind_buffer(
+                    glow::ARRAY_BUFFER,
+                    Some(self.scene_state.squash_vertex_buffer),
+                );
                 self.gl.buffer_sub_data_u8_slice(
                     glow::ARRAY_BUFFER,
                     0,
-                    bytemuck::cast_slice(self.squash_vertices.as_slice()),
+                    bytemuck::cast_slice(self.scene_state.squash_vertices.as_slice()),
                 );
             }
-            self.squash_geometry_dirty = false;
+            self.scene_state.squash_geometry_dirty = false;
         }
         let active = self
             .lifecycle_samples
@@ -4791,8 +4849,9 @@ impl GlesSceneRenderer {
         let mut texture_binds = 0_usize;
         let mut missing_required_decoration_resources = 0_usize;
         unsafe {
-            self.gl.use_program(Some(self.program));
-            self.gl.bind_vertex_array(Some(self.squash_vertex_array));
+            self.gl.use_program(Some(self.scene_state.program));
+            self.gl
+                .bind_vertex_array(Some(self.scene_state.squash_vertex_array));
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.enable(glow::BLEND);
             self.gl.blend_func_separate(
@@ -4805,6 +4864,7 @@ impl GlesSceneRenderer {
         let mut current_sampling = None;
         for sample in active {
             let commands = self
+                .scene_state
                 .squash_commands
                 .iter()
                 .filter(|entry| entry.presentation_identity == sample.presentation_identity)
@@ -4857,7 +4917,7 @@ impl GlesSceneRenderer {
                         );
                         current_sampling = Some(command.sampling);
                     }
-                    if let Some(location) = &self.presentation_opacity_location {
+                    if let Some(location) = &self.scene_state.presentation_opacity_location {
                         self.gl
                             .uniform_1_f32(Some(location), sample.effect_opacity as f32);
                     }
@@ -4877,20 +4937,32 @@ impl GlesSceneRenderer {
                     });
             }
         }
-        self.frame_stats.draw_calls = self.frame_stats.draw_calls.saturating_add(draw_calls);
-        self.frame_stats.commands_executed = self
+        self.scene_state.frame_stats.draw_calls = self
+            .scene_state
+            .frame_stats
+            .draw_calls
+            .saturating_add(draw_calls);
+        self.scene_state.frame_stats.commands_executed = self
+            .scene_state
             .frame_stats
             .commands_executed
             .saturating_add(draw_calls);
-        self.frame_stats.texture_binds =
-            self.frame_stats.texture_binds.saturating_add(texture_binds);
-        self.frame_stats.missing_required_decoration_resources = self
+        self.scene_state.frame_stats.texture_binds = self
+            .scene_state
+            .frame_stats
+            .texture_binds
+            .saturating_add(texture_binds);
+        self.scene_state
+            .frame_stats
+            .missing_required_decoration_resources = self
+            .scene_state
             .frame_stats
             .missing_required_decoration_resources
             .saturating_add(missing_required_decoration_resources);
         unsafe {
-            self.gl.use_program(Some(self.program));
-            self.gl.bind_vertex_array(Some(self.scene_vertex_array));
+            self.gl.use_program(Some(self.scene_state.program));
+            self.gl
+                .bind_vertex_array(Some(self.scene_state.scene_vertex_array));
         }
         Ok(())
     }
@@ -4898,9 +4970,9 @@ impl GlesSceneRenderer {
     fn record_visible_lifecycle_fallbacks(&mut self, reason: LifecycleRenderFallbackReason) {
         let visible = visible_lifecycle_samples(
             &self.lifecycle_samples,
-            f64::from(self.effect_output_scale),
-            self.current_size.0,
-            self.current_size.1,
+            f64::from(self.effect_runtime.effect_output_scale),
+            self.scene_state.current_size.0,
+            self.scene_state.current_size.1,
         )
         .collect::<Vec<_>>();
         for sample in visible {
@@ -4911,9 +4983,9 @@ impl GlesSceneRenderer {
     fn record_lifecycle_fallbacks_without_evidence(&mut self) {
         let missing = visible_lifecycle_samples(
             &self.lifecycle_samples,
-            f64::from(self.effect_output_scale),
-            self.current_size.0,
-            self.current_size.1,
+            f64::from(self.effect_runtime.effect_output_scale),
+            self.scene_state.current_size.0,
+            self.scene_state.current_size.1,
         )
         .filter(|sample| {
             !self.lifecycle_render_evidence.contains(
@@ -4941,6 +5013,7 @@ impl GlesSceneRenderer {
         for rect in rects {
             let y = match framebuffer_origin {
                 OutputFramebufferOrigin::BottomLeft => self
+                    .scene_state
                     .current_size
                     .1
                     .saturating_sub(rect.y.max(0) as u32 + rect.height)
@@ -4971,133 +5044,13 @@ impl GlesSceneRenderer {
             .copied()
     }
 
-    pub(crate) fn begin_effect_repaint(
-        &mut self,
-        plan: &RepaintPlan,
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) -> RendererResult<Vec<OutputRect>> {
-        self.establish_ordinary_scene_state();
-        unsafe { self.gl.clear_color(0.0, 0.0, 0.0, 1.0) };
-        let execution = plan
-            .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
-            .ok_or_else(|| io::Error::other("effect repaint conversion failed"))?;
-        let mut rects = Vec::new();
-        match execution {
-            RenderExecution::Full => unsafe {
-                self.gl.disable(glow::SCISSOR_TEST);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
-                rects.push(OutputRect::new(
-                    0,
-                    0,
-                    self.current_size.0,
-                    self.current_size.1,
-                ));
-            },
-            RenderExecution::Scissored { scissors, .. } => unsafe {
-                self.gl.enable(glow::SCISSOR_TEST);
-                for scissor in scissors {
-                    self.gl
-                        .scissor(scissor[0], scissor[1], scissor[2], scissor[3]);
-                    self.gl.clear(glow::COLOR_BUFFER_BIT);
-                    if let Some(rect) =
-                        gl_scissor_to_output_rect(scissor, self.current_size.1, framebuffer_origin)
-                    {
-                        rects.push(rect);
-                    }
-                }
-                self.gl.disable(glow::SCISSOR_TEST);
-            },
-        }
-        Ok(rects)
-    }
-
-    pub(crate) fn clear_effect_scene_work(
-        &mut self,
-        rects: &[OutputRect],
-        framebuffer_origin: OutputFramebufferOrigin,
-        composition_draw: EffectFramebufferTarget,
-    ) -> RendererResult<()> {
-        self.establish_effect_composition_state(composition_draw);
-        unsafe {
-            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            self.gl.enable(glow::SCISSOR_TEST);
-            for rect in rects {
-                let y = match framebuffer_origin {
-                    OutputFramebufferOrigin::BottomLeft => self
-                        .current_size
-                        .1
-                        .saturating_sub(rect.y.max(0) as u32 + rect.height)
-                        as i32,
-                    OutputFramebufferOrigin::TopLeftScanout => rect.y,
-                };
-                self.gl
-                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-            self.gl.disable(glow::SCISSOR_TEST);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn draw_effect_scene_range(
-        &mut self,
-        rects: &[OutputRect],
-        start: usize,
-        end: usize,
-        framebuffer_origin: OutputFramebufferOrigin,
-        composition_draw: EffectFramebufferTarget,
-    ) -> RendererResult<()> {
-        let end = end.min(self.commands.len());
-        let start = start.min(end);
-        for rect in rects {
-            let y = match framebuffer_origin {
-                OutputFramebufferOrigin::BottomLeft => self
-                    .current_size
-                    .1
-                    .saturating_sub(rect.y.max(0) as u32 + rect.height)
-                    as i32,
-                OutputFramebufferOrigin::TopLeftScanout => rect.y,
-            };
-            unsafe {
-                self.establish_effect_composition_state(composition_draw);
-                self.gl.enable(glow::SCISSOR_TEST);
-                self.gl
-                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
-            }
-            self.draw_command_batch_range(true, Some(*rect), start, end)?;
-        }
-        unsafe {
-            self.gl.disable(glow::SCISSOR_TEST);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn draw_effect_overlays(
+    fn draw_effect_overlays(
         &mut self,
         rects: &[OutputRect],
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<()> {
-        for rect in rects {
-            let y = match framebuffer_origin {
-                OutputFramebufferOrigin::BottomLeft => self
-                    .current_size
-                    .1
-                    .saturating_sub(rect.y.max(0) as u32 + rect.height)
-                    as i32,
-                OutputFramebufferOrigin::TopLeftScanout => rect.y,
-            };
-            unsafe {
-                self.establish_ordinary_scene_state();
-                self.gl.enable(glow::SCISSOR_TEST);
-                self.gl
-                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
-            }
-            self.draw_command_batch(false, Some(*rect))?;
-        }
-        unsafe {
-            self.gl.disable(glow::SCISSOR_TEST);
-        }
-        Ok(())
+        self.effect_execution_context()
+            .draw_effect_overlays(rects, framebuffer_origin)
     }
 
     fn draw_command_batch(
@@ -5105,40 +5058,22 @@ impl GlesSceneRenderer {
         scene: bool,
         scissor: Option<OutputRect>,
     ) -> RendererResult<()> {
-        self.draw_command_batch_with_visibility_and_range(scene, scissor, true, None, true)
+        self.effect_execution_context()
+            .draw_command_batch(scene, scissor)
     }
 
-    fn draw_command_batch_range(
-        &mut self,
-        scene: bool,
-        scissor: Option<OutputRect>,
-        start: usize,
-        end: usize,
-    ) -> RendererResult<()> {
-        self.draw_command_batch_with_visibility_and_range(
-            scene,
-            scissor,
-            false,
-            Some((start, end)),
-            false,
-        )
-    }
-
+    #[cfg(test)]
     fn draw_command_batch_with_visibility(
         &mut self,
         scene: bool,
         scissor: Option<OutputRect>,
         plan_scene_visibility: bool,
     ) -> RendererResult<()> {
-        self.draw_command_batch_with_visibility_and_range(
-            scene,
-            scissor,
-            plan_scene_visibility,
-            None,
-            true,
-        )
+        self.effect_execution_context()
+            .draw_command_batch_with_visibility(scene, scissor, plan_scene_visibility)
     }
 
+    #[cfg(test)]
     fn draw_command_batch_with_visibility_and_range(
         &mut self,
         scene: bool,
@@ -5147,460 +5082,28 @@ impl GlesSceneRenderer {
         command_range: Option<(usize, usize)>,
         use_visibility_plan: bool,
     ) -> RendererResult<()> {
-        if scene && plan_scene_visibility {
-            self.plan_scene_visibility(scissor);
-        }
-        let opacity_location =
-            if self.capture_in_progress || self.capture_unattenuated_visual_group.is_some() {
-                self.capture_uniform_location("u_opacity")
-            } else {
-                self.presentation_opacity_location
-            };
-        let (vertices, commands) = if scene {
-            (&self.vertices, &self.commands)
-        } else {
-            (&self.cursor_vertices, &self.cursor_commands)
-        };
-        let presentation_opacities = if scene {
-            &self.presentation_opacities
-        } else {
-            &self.cursor_presentation_opacities
-        };
-        if vertices.is_empty() || commands.is_empty() {
-            return Ok(());
-        }
-
-        let required_size = vertices.len() * std::mem::size_of::<EglTexturedVertex>();
-        let mut upload_bytes = 0;
-        let mut uploaded = false;
-        let vertex_array = if scene {
-            ensure_vertex_buffer_capacity(
-                &self.gl,
-                self.scene_vertex_buffer,
-                &mut self.scene_vertex_buffer_capacity,
-                required_size,
-            );
-            if self.scene_geometry_dirty {
-                upload_bytes = required_size;
-                unsafe {
-                    self.gl
-                        .bind_buffer(glow::ARRAY_BUFFER, Some(self.scene_vertex_buffer));
-                    self.gl.buffer_sub_data_u8_slice(
-                        glow::ARRAY_BUFFER,
-                        0,
-                        bytemuck::cast_slice(vertices.as_slice()),
-                    );
-                }
-                self.scene_geometry_dirty = false;
-                uploaded = true;
-            }
-            self.scene_vertex_array
-        } else {
-            ensure_vertex_buffer_capacity(
-                &self.gl,
-                self.overlay_vertex_buffer,
-                &mut self.overlay_vertex_buffer_capacity,
-                required_size,
-            );
-            if self.overlay_geometry_dirty {
-                upload_bytes = required_size;
-                unsafe {
-                    self.gl
-                        .bind_buffer(glow::ARRAY_BUFFER, Some(self.overlay_vertex_buffer));
-                    self.gl.buffer_sub_data_u8_slice(
-                        glow::ARRAY_BUFFER,
-                        0,
-                        bytemuck::cast_slice(vertices.as_slice()),
-                    );
-                }
-                self.overlay_geometry_dirty = false;
-                uploaded = true;
-            }
-            self.overlay_vertex_array
-        };
-        unsafe {
-            self.gl.bind_vertex_array(Some(vertex_array));
-        }
-
-        let mut current_sampling = None;
-        let initial_scissor = scissor;
-        let mut current_scissor = scissor;
-        let mut commands_considered = 0;
-        let mut commands_executed = 0;
-        let mut commands_rejected_outside_damage = 0;
-        let mut missing_required_decoration_resources: usize = 0;
-        let mut texture_binds = 0;
-        let mut draw_calls = 0;
-        for (command_index, command) in commands.iter().enumerate() {
-            if command_range
-                .is_some_and(|(start, end)| command_index < start || command_index >= end)
-            {
-                continue;
-            }
-            commands_considered += 1;
-            let bypass_presentation_clip =
-                self.capture_unclipped_presentation_owner
-                    .is_some_and(|owner| {
-                        command
-                            .visual_group
-                            .and_then(|group| self.presentation_visual_group_owners.get(&group))
-                            .is_some_and(|command_owner| *command_owner == owner)
-                    });
-            let presentation_clip = if bypass_presentation_clip {
-                None
-            } else {
-                command.presentation_clip
-            };
-            let effective_scissor = if let Some(clip) = presentation_clip {
-                let Some(clip) = output_rect_for_egl_clip(clip) else {
-                    continue;
-                };
-                let Some(effective) =
-                    scissor.map_or(Some(clip), |damage| intersect_output_rect(damage, clip))
-                else {
-                    continue;
-                };
-                Some(effective)
-            } else {
-                scissor
-            };
-            if current_scissor != effective_scissor {
-                self.set_scene_scissor(effective_scissor);
-                current_scissor = effective_scissor;
-            }
-            if effective_scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
-                commands_rejected_outside_damage += 1;
-                continue;
-            }
-            if scene && use_visibility_plan {
-                match self.scene_visibility_plan[command_index] {
-                    EglVisibilityDecision::Drawable => {}
-                    EglVisibilityDecision::OutsideRemaining | EglVisibilityDecision::Occluded => {
-                        continue;
-                    }
-                }
-            }
-            let Some(texture) = self.texture_for_layer(command.layer) else {
-                if Self::is_required_decoration_layer(command.layer) {
-                    missing_required_decoration_resources =
-                        missing_required_decoration_resources.saturating_add(1);
-                }
-                continue;
-            };
-            unsafe {
-                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                texture_binds += 1;
-                if current_sampling != Some(command.sampling) {
-                    let filter = match command.sampling {
-                        SurfaceSampling::ExactNearest => glow::NEAREST,
-                        SurfaceSampling::ScaledLinear => glow::LINEAR,
-                    } as i32;
-                    self.gl
-                        .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
-                    self.gl
-                        .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
-                    current_sampling = Some(command.sampling);
-                }
-                if let Some(location) = opacity_location.as_ref() {
-                    let presentation_opacity =
-                        if self.capture_unattenuated_visual_group == command.visual_group {
-                            1.0
-                        } else {
-                            presentation_opacities
-                                .get(command_index)
-                                .copied()
-                                .unwrap_or(1.0)
-                        };
-                    self.gl.uniform_1_f32(Some(location), presentation_opacity);
-                }
-                self.gl.draw_arrays(
-                    glow::TRIANGLES,
-                    command.vertex_start as i32,
-                    command.vertex_count as i32,
-                );
-            }
-            commands_executed += 1;
-            draw_calls += 1;
-        }
-        if current_scissor != initial_scissor {
-            self.set_scene_scissor(initial_scissor);
-        }
-        self.frame_stats.commands_considered = self
-            .frame_stats
-            .commands_considered
-            .saturating_add(commands_considered);
-        self.frame_stats.commands_executed = self
-            .frame_stats
-            .commands_executed
-            .saturating_add(commands_executed);
-        self.frame_stats.missing_required_decoration_resources = self
-            .frame_stats
-            .missing_required_decoration_resources
-            .saturating_add(missing_required_decoration_resources);
-        self.frame_stats.commands_rejected_outside_damage = self
-            .frame_stats
-            .commands_rejected_outside_damage
-            .saturating_add(commands_rejected_outside_damage);
-        self.frame_stats.texture_binds =
-            self.frame_stats.texture_binds.saturating_add(texture_binds);
-        self.frame_stats.draw_calls = self.frame_stats.draw_calls.saturating_add(draw_calls);
-        self.frame_stats.draw_command_replays = self
-            .frame_stats
-            .draw_command_replays
-            .saturating_add(commands_executed);
-        if uploaded {
-            if scene {
-                self.frame_stats.scene_vbo_uploads =
-                    self.frame_stats.scene_vbo_uploads.saturating_add(1);
-                self.frame_stats.scene_vbo_upload_bytes = self
-                    .frame_stats
-                    .scene_vbo_upload_bytes
-                    .saturating_add(upload_bytes);
-            } else {
-                self.frame_stats.overlay_vbo_uploads =
-                    self.frame_stats.overlay_vbo_uploads.saturating_add(1);
-                self.frame_stats.overlay_vbo_upload_bytes = self
-                    .frame_stats
-                    .overlay_vbo_upload_bytes
-                    .saturating_add(upload_bytes);
-            }
-        }
-        Ok(())
+        self.effect_execution_context()
+            .draw_command_batch_with_visibility_and_range(
+                scene,
+                scissor,
+                plan_scene_visibility,
+                command_range,
+                use_visibility_plan,
+            )
     }
 
-    fn set_scene_scissor(&self, scissor: Option<OutputRect>) {
-        unsafe {
-            if let Some(rect) = scissor {
-                let y = match self.current_framebuffer_origin {
-                    OutputFramebufferOrigin::BottomLeft => self
-                        .current_size
-                        .1
-                        .saturating_sub(rect.y.max(0) as u32 + rect.height)
-                        as i32,
-                    OutputFramebufferOrigin::TopLeftScanout => rect.y,
-                };
-                self.gl.enable(glow::SCISSOR_TEST);
-                self.gl
-                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
-            } else {
-                self.gl.disable(glow::SCISSOR_TEST);
-            }
-        }
-    }
-
-    fn draw_capture_commands(
-        &mut self,
-        command_indices: &[usize],
-        output_rect: OutputRect,
-        target_domain: EffectRect,
-        target_size: (u32, u32),
-        host_timing_enabled: bool,
-    ) -> RendererResult<ReplayCaptureExecutionDetail> {
-        let requested = EffectRect::new(
-            output_rect.x,
-            output_rect.y,
-            output_rect.width,
-            output_rect.height,
-        )
-        .and_then(|rect| rect.intersect(target_domain));
-        let Some(requested) = requested else {
-            return Ok(ReplayCaptureExecutionDetail::default());
-        };
-        let local_x = requested.x.saturating_sub(target_domain.x);
-        let local_y = requested.y.saturating_sub(target_domain.y);
-        let gl_y = i32::try_from(target_size.1)
-            .unwrap_or(i32::MAX)
-            .saturating_sub(local_y.saturating_add(requested.height as i32));
-        unsafe {
-            self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor(
-                local_x,
-                gl_y,
-                requested.width as i32,
-                requested.height as i32,
-            );
-        }
-        let saved_visibility = std::mem::take(&mut self.scene_visibility_plan);
-        let repair = EglRect::new(
-            output_rect.x as f32,
-            output_rect.y as f32,
-            output_rect.width as f32,
-            output_rect.height as f32,
-        );
-        let visibility_start = host_timing_enabled.then(Instant::now);
-        let unclipped_visual_groups = self
-            .capture_unclipped_presentation_owner
-            .map(|owner| {
-                self.presentation_visual_group_owners
-                    .iter()
-                    .filter_map(|(group, command_owner)| {
-                        (*command_owner == owner).then_some(*group)
-                    })
-                    .collect::<Vec<_>>()
+    fn lifecycle_visual_source_is_ready(
+        &self,
+        payload_id: compositor::PresentationRetainedVisualPayloadId,
+    ) -> bool {
+        self.lifecycle_visual_resources
+            .get(&payload_id)
+            .is_some_and(|resource| {
+                self.effect_runtime
+                    .effect_resources
+                    .texture(&resource.texture)
+                    .is_some()
             })
-            .unwrap_or_default();
-        let capture_stats = plan_capture_visibility(
-            &self.commands,
-            command_indices,
-            repair,
-            &unclipped_visual_groups,
-            &mut self.scene_visibility_plan,
-        );
-        let visibility_cpu_ns = monotonic_elapsed_ns(visibility_start);
-        let commands_considered_before = self.frame_stats.commands_considered;
-        let commands_executed_before = self.frame_stats.commands_executed;
-        let draw_calls_before = self.frame_stats.draw_calls;
-        let draw_submit_start = host_timing_enabled.then(Instant::now);
-        let result = self.draw_command_batch_with_visibility(true, Some(output_rect), false);
-        let draw_submit_cpu_ns = monotonic_elapsed_ns(draw_submit_start);
-        unsafe { self.gl.disable(glow::SCISSOR_TEST) };
-        self.frame_stats.planner_commands_visited = self
-            .frame_stats
-            .planner_commands_visited
-            .saturating_add(capture_stats.commands_visited);
-        self.scene_visibility_plan = saved_visibility;
-        let detail = ReplayCaptureExecutionDetail {
-            planner_commands_visited: capture_stats.commands_visited,
-            planner_commands_drawable: capture_stats.commands_drawable,
-            commands_considered: self
-                .frame_stats
-                .commands_considered
-                .saturating_sub(commands_considered_before),
-            commands_executed: self
-                .frame_stats
-                .commands_executed
-                .saturating_sub(commands_executed_before),
-            draw_calls: self
-                .frame_stats
-                .draw_calls
-                .saturating_sub(draw_calls_before),
-            visibility_cpu_ns,
-            draw_submit_cpu_ns,
-            ..Default::default()
-        };
-        result.map(|()| detail)
-    }
-
-    fn draw_capture_commands_for_regions(
-        &mut self,
-        command_indices: &[usize],
-        output_rects: &[OutputRect],
-        target_domain: EffectRect,
-        target_size: (u32, u32),
-        host_timing_enabled: bool,
-    ) -> RendererResult<ReplayCaptureExecutionDetail> {
-        let layout = replay_capture_region_layout(output_rects);
-        let mut detail = ReplayCaptureExecutionDetail {
-            execution_pixels: 0,
-            materialization_rects: layout.materialization_rects,
-            execution_regions: layout.execution_regions,
-            disjoint_overflowed: layout.disjoint_overflowed,
-            candidate_commands: command_indices.len(),
-            scene_commands_total: self.commands.len(),
-            ..Default::default()
-        };
-        for output_rect in layout
-            .execution_region
-            .rects()
-            .iter()
-            .copied()
-            .map(|rect| OutputRect::new(rect.x, rect.y, rect.width, rect.height))
-        {
-            let region_detail = self.draw_capture_commands(
-                command_indices,
-                output_rect,
-                target_domain,
-                target_size,
-                host_timing_enabled,
-            )?;
-            detail.planner_commands_visited = detail
-                .planner_commands_visited
-                .saturating_add(region_detail.planner_commands_visited);
-            detail.planner_commands_drawable = detail
-                .planner_commands_drawable
-                .saturating_add(region_detail.planner_commands_drawable);
-            detail.commands_considered = detail
-                .commands_considered
-                .saturating_add(region_detail.commands_considered);
-            detail.commands_executed = detail
-                .commands_executed
-                .saturating_add(region_detail.commands_executed);
-            detail.draw_calls = detail.draw_calls.saturating_add(region_detail.draw_calls);
-            detail.visibility_cpu_ns = detail
-                .visibility_cpu_ns
-                .saturating_add(region_detail.visibility_cpu_ns);
-            detail.draw_submit_cpu_ns = detail
-                .draw_submit_cpu_ns
-                .saturating_add(region_detail.draw_submit_cpu_ns);
-        }
-        detail.command_region_pairs = detail.planner_commands_visited;
-        detail.scene_scan_pairs = detail.commands_considered;
-        Ok(detail)
-    }
-
-    fn plan_scene_visibility(&mut self, scissor: Option<OutputRect>) {
-        let repair = scissor
-            .map(|rect| {
-                EglRect::new(
-                    rect.x as f32,
-                    rect.y as f32,
-                    rect.width as f32,
-                    rect.height as f32,
-                )
-            })
-            .unwrap_or_else(|| {
-                EglRect::new(
-                    0.0,
-                    0.0,
-                    self.current_size.0 as f32,
-                    self.current_size.1 as f32,
-                )
-            });
-        let stats = plan_visibility(&self.commands, repair, &mut self.scene_visibility_plan);
-        self.frame_stats.planner_passes = self.frame_stats.planner_passes.saturating_add(1);
-        self.frame_stats.planner_commands_visited = self
-            .frame_stats
-            .planner_commands_visited
-            .saturating_add(stats.commands_visited);
-        self.frame_stats.commands_drawable = self
-            .frame_stats
-            .commands_drawable
-            .saturating_add(stats.commands_drawable);
-        self.frame_stats.commands_rejected_outside_remaining = self
-            .frame_stats
-            .commands_rejected_outside_remaining
-            .saturating_add(stats.commands_rejected_outside_remaining);
-        self.frame_stats.commands_rejected_occluded = self
-            .frame_stats
-            .commands_rejected_occluded
-            .saturating_add(stats.commands_rejected_occluded);
-        self.frame_stats.opaque_rectangles_subtracted = self
-            .frame_stats
-            .opaque_rectangles_subtracted
-            .saturating_add(stats.opaque_rectangles_subtracted);
-        if stats.early_terminated {
-            self.frame_stats.planner_early_terminations = self
-                .frame_stats
-                .planner_early_terminations
-                .saturating_add(1);
-        }
-        if stats.overflow_fallback {
-            self.frame_stats.region_fragmentation_overflow_fallbacks = self
-                .frame_stats
-                .region_fragmentation_overflow_fallbacks
-                .saturating_add(1);
-        }
-        self.frame_stats.peak_region_piece_count = self
-            .frame_stats
-            .peak_region_piece_count
-            .max(stats.peak_region_pieces);
-    }
-
-    const fn is_required_decoration_layer(layer: EglDrawLayer) -> bool {
-        matches!(
-            layer,
-            EglDrawLayer::SolidRgba(_) | EglDrawLayer::DecorationAsset(_)
-        )
     }
 
     fn texture_for_layer(&self, layer: EglDrawLayer) -> Option<GlTexture> {
@@ -5624,7 +5127,11 @@ impl GlesSceneRenderer {
             EglDrawLayer::LifecycleResolvedVisual(payload_id) => self
                 .lifecycle_visual_resources
                 .get(&payload_id)
-                .and_then(|resource| self.effect_resources.texture(&resource.texture)),
+                .and_then(|resource| {
+                    self.effect_runtime
+                        .effect_resources
+                        .texture(&resource.texture)
+                }),
             EglDrawLayer::Cursor => self
                 .cursor_resource
                 .as_ref()
@@ -5632,13 +5139,11 @@ impl GlesSceneRenderer {
         }
     }
 
-    fn lifecycle_visual_source_is_ready(
-        &self,
-        payload_id: compositor::PresentationRetainedVisualPayloadId,
-    ) -> bool {
-        self.lifecycle_visual_resources
-            .get(&payload_id)
-            .is_some_and(|resource| self.effect_resources.texture(&resource.texture).is_some())
+    const fn is_required_decoration_layer(layer: EglDrawLayer) -> bool {
+        matches!(
+            layer,
+            EglDrawLayer::SolidRgba(_) | EglDrawLayer::DecorationAsset(_)
+        )
     }
 
     pub(crate) fn destroy(&mut self, egl: &EglInstance, egl_display: egl::Display) {
@@ -5658,32 +5163,10 @@ impl GlesSceneRenderer {
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
         }
         self.release_all_lifecycle_visual_resources();
-        self.effect_gpu_profiler.destroy(&self.gl);
-        self.effect_shaders.clear(&self.gl);
-        self.effect_resources.destroy(&self.gl);
-        if let Some((vertex_array, vertex_buffer)) = self.effect_quad.take() {
-            unsafe {
-                self.gl.delete_buffer(vertex_buffer);
-                self.gl.delete_vertex_array(vertex_array);
-            }
-        }
+        self.effect_runtime.destroy_persistent_resources(&self.gl);
 
-        unsafe {
-            if let Some(lamp_program) = self.lamp_program.take() {
-                self.gl.delete_program(lamp_program);
-            }
-            self.gl.delete_buffer(self.lamp_vertex_buffer);
-            self.gl.delete_vertex_array(self.lamp_vertex_array);
-            self.gl.delete_buffer(self.scene_vertex_buffer);
-            self.gl.delete_vertex_array(self.scene_vertex_array);
-            self.gl.delete_buffer(self.overlay_vertex_buffer);
-            self.gl.delete_vertex_array(self.overlay_vertex_array);
-            self.gl.delete_buffer(self.squash_vertex_buffer);
-            self.gl.delete_vertex_array(self.squash_vertex_array);
-            self.gl.delete_program(self.program);
-            self.gl.delete_program(self.capture_program);
-            self.gl.delete_program(self.capture_copy_program);
-        }
+        self.scene_state.destroy_gl_resources(&self.gl);
+        self.effect_runtime.destroy_programs(&self.gl);
     }
 }
 
@@ -7069,7 +6552,7 @@ fn copy_output_region_to_texture(
     rect: compositor::PresentationRect,
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> RendererResult<()> {
-    let output = EffectFramebufferTarget::new(renderer.active_output_framebuffer);
+    let output = EffectFramebufferTarget::new(renderer.scene_state.active_output_framebuffer);
     copy_framebuffer_region_to_texture(renderer, target, rect, framebuffer_origin, output, output)
 }
 
@@ -7082,16 +6565,17 @@ fn copy_framebuffer_region_to_texture(
     restore_target: EffectFramebufferTarget,
 ) -> RendererResult<()> {
     let Some(plan) = lifecycle_output_copy_region(
-        renderer.current_size,
+        renderer.scene_state.current_size,
         rect,
         (target.key.width, target.key.height),
-        f64::from(renderer.effect_output_scale),
+        f64::from(renderer.effect_runtime.effect_output_scale),
         framebuffer_origin,
     ) else {
         return Ok(());
     };
     let result = (|| {
         let draw_framebuffer = renderer
+            .effect_runtime
             .effect_resources
             .bind_draw_target(&renderer.gl, target)?;
         if source.framebuffer == Some(draw_framebuffer) {
@@ -7130,6 +6614,7 @@ fn clear_effect_texture(
 ) -> RendererResult<()> {
     let result = (|| {
         renderer
+            .effect_runtime
             .effect_resources
             .bind_render_target(&renderer.gl, target)?;
         unsafe {
@@ -7140,7 +6625,10 @@ fn clear_effect_texture(
             renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
             renderer.gl.clear(glow::COLOR_BUFFER_BIT);
         }
-        renderer.effect_resources.unbind_render_target(&renderer.gl);
+        renderer
+            .effect_runtime
+            .effect_resources
+            .unbind_render_target(&renderer.gl);
         Ok(())
     })();
     renderer.establish_ordinary_scene_state();
@@ -8130,6 +7618,7 @@ mod tests {
             .expect("test retained identity")
     }
 
+    mod effect_session;
     mod lamp_geometry_tests;
     mod presentation_clip;
 
@@ -8255,8 +7744,8 @@ mod tests {
 
         fn install_texture_backed_output(&mut self) {
             assert!(self.test_output_texture.is_none());
-            let width = self.renderer.current_size.0;
-            let height = self.renderer.current_size.1;
+            let width = self.renderer.scene_state.current_size.0;
+            let height = self.renderer.scene_state.current_size.1;
             let texture = unsafe { self.gl.create_texture().expect("output texture creates") };
             let framebuffer = unsafe {
                 self.gl
@@ -8311,8 +7800,8 @@ mod tests {
                     "test output framebuffer is complete"
                 );
             }
-            self.renderer.active_output_framebuffer = Some(framebuffer);
-            self.renderer.active_output_texture = Some(texture);
+            self.renderer.scene_state.active_output_framebuffer = Some(framebuffer);
+            self.renderer.scene_state.active_output_texture = Some(texture);
             self.test_output_texture = Some(texture);
             self.test_output_framebuffer = Some(framebuffer);
             self.renderer.establish_ordinary_scene_state();
@@ -8342,6 +7831,7 @@ mod tests {
         let harness = GlesEffectTestHarness::new(320, 200);
         let uniforms = harness
             .renderer
+            .scene_state
             .lamp_uniform_locations
             .expect("Lamp shader is available in the GLES test harness");
         assert!(uniforms.canonical_visual_rect.is_some());
@@ -8708,10 +8198,14 @@ mod tests {
 
         let translucent_command = harness
             .renderer
+            .scene_state
             .commands
             .last()
             .expect("surface command is emitted");
-        assert_eq!(harness.renderer.presentation_opacities, vec![0.5]);
+        assert_eq!(
+            harness.renderer.scene_state.presentation_opacities,
+            vec![0.5]
+        );
         assert!(translucent_command.opaque_regions.is_empty());
 
         let opaque = PresentationGroupOpacity::with_scene_node(
@@ -8740,10 +8234,14 @@ mod tests {
 
         let opaque_command = harness
             .renderer
+            .scene_state
             .commands
             .last()
             .expect("surface command is emitted");
-        assert_eq!(harness.renderer.presentation_opacities, vec![1.0]);
+        assert_eq!(
+            harness.renderer.scene_state.presentation_opacities,
+            vec![1.0]
+        );
         assert!(!opaque_command.opaque_regions.is_empty());
 
         let zero = PresentationGroupOpacity::with_scene_node(
@@ -8772,10 +8270,14 @@ mod tests {
 
         let zero_command = harness
             .renderer
+            .scene_state
             .commands
             .last()
             .expect("surface command is emitted");
-        assert_eq!(harness.renderer.presentation_opacities, vec![0.0]);
+        assert_eq!(
+            harness.renderer.scene_state.presentation_opacities,
+            vec![0.0]
+        );
         assert!(zero_command.opaque_regions.is_empty());
     }
 
@@ -8794,19 +8296,22 @@ mod tests {
                 .create_texture()
                 .expect("state test texture creates")
         };
-        harness.renderer.active_output_framebuffer = Some(framebuffer);
-        harness.renderer.active_output_texture = Some(texture);
+        harness.renderer.scene_state.active_output_framebuffer = Some(framebuffer);
+        harness.renderer.scene_state.active_output_texture = Some(texture);
 
         let snapshot = CaptureRendererState::take(&harness.renderer);
-        harness.renderer.active_output_framebuffer = None;
-        harness.renderer.active_output_texture = None;
+        harness.renderer.scene_state.active_output_framebuffer = None;
+        harness.renderer.scene_state.active_output_texture = None;
         snapshot.restore(&mut harness.renderer);
 
         assert_eq!(
-            harness.renderer.active_output_framebuffer,
+            harness.renderer.scene_state.active_output_framebuffer,
             Some(framebuffer)
         );
-        assert_eq!(harness.renderer.active_output_texture, Some(texture));
+        assert_eq!(
+            harness.renderer.scene_state.active_output_texture,
+            Some(texture)
+        );
 
         unsafe {
             harness.gl.delete_framebuffer(framebuffer);
@@ -9075,26 +8580,26 @@ mod tests {
         visual_group: VisualGroupId,
     ) {
         const BACKGROUND_COLOR: u32 = 0xff20_4060;
-        renderer.vertices.clear();
-        renderer.commands.clear();
+        renderer.scene_state.vertices.clear();
+        renderer.scene_state.commands.clear();
         push_draw_command(
-            &mut renderer.vertices,
-            &mut renderer.commands,
+            &mut renderer.scene_state.vertices,
+            &mut renderer.scene_state.commands,
             EglDrawLayer::SolidRgba(BACKGROUND_COLOR),
             EglRect::new(
                 0.0,
                 0.0,
-                renderer.current_size.0 as f32,
-                renderer.current_size.1 as f32,
+                renderer.scene_state.current_size.0 as f32,
+                renderer.scene_state.current_size.1 as f32,
             ),
-            renderer.current_size.0,
-            renderer.current_size.1,
+            renderer.scene_state.current_size.0,
+            renderer.scene_state.current_size.1,
             OutputFramebufferOrigin::BottomLeft,
         );
-        let target_command = renderer.commands.len();
+        let target_command = renderer.scene_state.commands.len();
         push_draw_command(
-            &mut renderer.vertices,
-            &mut renderer.commands,
+            &mut renderer.scene_state.vertices,
+            &mut renderer.scene_state.commands,
             EglDrawLayer::Surface(42),
             EglRect::new(
                 rect.x as f32,
@@ -9102,12 +8607,12 @@ mod tests {
                 rect.width as f32,
                 rect.height as f32,
             ),
-            renderer.current_size.0,
-            renderer.current_size.1,
+            renderer.scene_state.current_size.0,
+            renderer.scene_state.current_size.1,
             OutputFramebufferOrigin::BottomLeft,
         );
-        renderer.commands[target_command].visual_group = Some(visual_group);
-        renderer.scene_geometry_dirty = true;
+        renderer.scene_state.commands[target_command].visual_group = Some(visual_group);
+        renderer.scene_state.scene_geometry_dirty = true;
     }
 
     fn install_diagnostic_scene(
@@ -9115,8 +8620,8 @@ mod tests {
         rect: EffectRect,
         visual_group: VisualGroupId,
     ) {
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         let mut background = Vec::with_capacity(width as usize * height as usize * 4);
         for y in 0..height {
             for x in 0..width {
@@ -9165,21 +8670,21 @@ mod tests {
                 shm_synced_commit: None,
             },
         );
-        harness.renderer.vertices.clear();
-        harness.renderer.commands.clear();
+        harness.renderer.scene_state.vertices.clear();
+        harness.renderer.scene_state.commands.clear();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(7),
             EglRect::new(0.0, 0.0, width as f32, height as f32),
             width,
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        let target_command = harness.renderer.commands.len();
+        let target_command = harness.renderer.scene_state.commands.len();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(42),
             EglRect::new(
                 rect.x as f32,
@@ -9191,8 +8696,8 @@ mod tests {
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        harness.renderer.commands[target_command].visual_group = Some(visual_group);
-        harness.renderer.scene_geometry_dirty = true;
+        harness.renderer.scene_state.commands[target_command].visual_group = Some(visual_group);
+        harness.renderer.scene_state.scene_geometry_dirty = true;
     }
 
     #[derive(Clone, Copy)]
@@ -9236,8 +8741,8 @@ mod tests {
         harness: &mut GlesEffectTestHarness,
         spec: NativeStackedBackdropSceneSpec,
     ) {
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         let mut background = Vec::with_capacity(width as usize * height as usize * 4);
         for y in 0..height {
             for x in 0..width {
@@ -9309,21 +8814,21 @@ mod tests {
             },
         );
 
-        harness.renderer.vertices.clear();
-        harness.renderer.commands.clear();
+        harness.renderer.scene_state.vertices.clear();
+        harness.renderer.scene_state.commands.clear();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.background_surface),
             EglRect::new(0.0, 0.0, width as f32, height as f32),
             width,
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        let a_command = harness.renderer.commands.len();
+        let a_command = harness.renderer.scene_state.commands.len();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.a_surface),
             EglRect::new(
                 spec.a_content_bounds.x as f32,
@@ -9335,11 +8840,11 @@ mod tests {
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        harness.renderer.commands[a_command].visual_group = Some(spec.a_visual_group);
-        let b_command = harness.renderer.commands.len();
+        harness.renderer.scene_state.commands[a_command].visual_group = Some(spec.a_visual_group);
+        let b_command = harness.renderer.scene_state.commands.len();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.b_surface),
             EglRect::new(
                 spec.b_content_bounds.x as f32,
@@ -9351,16 +8856,16 @@ mod tests {
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        harness.renderer.commands[b_command].visual_group = Some(spec.b_visual_group);
-        harness.renderer.scene_geometry_dirty = true;
+        harness.renderer.scene_state.commands[b_command].visual_group = Some(spec.b_visual_group);
+        harness.renderer.scene_state.scene_geometry_dirty = true;
     }
 
     fn install_native_three_checkpoint_diagnostic_scene(
         harness: &mut GlesEffectTestHarness,
         spec: NativeThreeCheckpointSceneSpec,
     ) {
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         let mut background = Vec::with_capacity(width as usize * height as usize * 4);
         for y in 0..height {
             for x in 0..width {
@@ -9401,21 +8906,21 @@ mod tests {
             ],
         );
 
-        harness.renderer.vertices.clear();
-        harness.renderer.commands.clear();
+        harness.renderer.scene_state.vertices.clear();
+        harness.renderer.scene_state.commands.clear();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.background_surface),
             EglRect::new(0.0, 0.0, width as f32, height as f32),
             width,
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        let a_command = harness.renderer.commands.len();
+        let a_command = harness.renderer.scene_state.commands.len();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.a_surface),
             EglRect::new(
                 spec.a_content_bounds.x as f32,
@@ -9427,11 +8932,11 @@ mod tests {
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        harness.renderer.commands[a_command].visual_group = Some(spec.a_visual_group);
-        let c_command = harness.renderer.commands.len();
+        harness.renderer.scene_state.commands[a_command].visual_group = Some(spec.a_visual_group);
+        let c_command = harness.renderer.scene_state.commands.len();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.c_surface),
             EglRect::new(
                 spec.c_content_bounds.x as f32,
@@ -9443,11 +8948,11 @@ mod tests {
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        harness.renderer.commands[c_command].visual_group = Some(spec.c_visual_group);
-        let b_command = harness.renderer.commands.len();
+        harness.renderer.scene_state.commands[c_command].visual_group = Some(spec.c_visual_group);
+        let b_command = harness.renderer.scene_state.commands.len();
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::Surface(spec.b_surface),
             EglRect::new(
                 spec.b_content_bounds.x as f32,
@@ -9459,9 +8964,9 @@ mod tests {
             height,
             OutputFramebufferOrigin::BottomLeft,
         );
-        harness.renderer.commands[b_command].visual_group = Some(spec.b_visual_group);
+        harness.renderer.scene_state.commands[b_command].visual_group = Some(spec.b_visual_group);
         assert!(a_command < c_command && c_command < b_command);
-        harness.renderer.scene_geometry_dirty = true;
+        harness.renderer.scene_state.scene_geometry_dirty = true;
     }
 
     #[derive(Clone, Copy)]
@@ -9693,16 +9198,18 @@ mod tests {
             &[],
         )
         .expect("custom diagnostic shader wraps");
-        harness.renderer.effect_shaders =
+        harness.renderer.effect_runtime.effect_shaders =
             effects::ShaderProgramCache::new(effects::builtin_shader_program_count() + 1)
                 .expect("custom diagnostic shader cache creates");
         harness
             .renderer
+            .effect_runtime
             .effect_shaders
             .prewarm_builtins(&harness.gl)
             .expect("custom diagnostic builtins prewarm");
         harness
             .renderer
+            .effect_runtime
             .effect_shaders
             .prewarm(
                 &harness.gl,
@@ -9746,8 +9253,8 @@ mod tests {
     }
 
     fn read_diagnostic_pixels(harness: &GlesEffectTestHarness) -> Vec<u8> {
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         let mut pixels = vec![0_u8; width as usize * height as usize * 4];
         unsafe {
             harness.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
@@ -9807,8 +9314,8 @@ mod tests {
     }
 
     fn fill_non_uniform_diagnostic_output(harness: &GlesEffectTestHarness) {
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         harness.renderer.bind_active_output_framebuffer();
         unsafe {
             harness.gl.disable(glow::BLEND);
@@ -9831,8 +9338,8 @@ mod tests {
     }
 
     fn fill_shader_copy_test_pattern(harness: &GlesEffectTestHarness) {
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         harness.renderer.bind_active_output_framebuffer();
         unsafe {
             harness.gl.disable(glow::BLEND);
@@ -9867,7 +9374,7 @@ mod tests {
         harness: &GlesEffectTestHarness,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
-        let (width, height) = harness.renderer.current_size;
+        let (width, height) = harness.renderer.scene_state.current_size;
         harness.renderer.bind_active_output_framebuffer();
         unsafe {
             harness.gl.disable(glow::BLEND);
@@ -9912,6 +9419,7 @@ mod tests {
     ) -> Vec<u8> {
         harness
             .renderer
+            .effect_runtime
             .effect_resources
             .bind_read_target(&harness.gl, target)
             .expect("capture target binds for readback");
@@ -9938,6 +9446,7 @@ mod tests {
         harness.install_texture_backed_output();
         let target = harness
             .renderer
+            .effect_runtime
             .effect_resources
             .acquire(&harness.gl, lifecycle_transfer_test_texture_key(8, 6))
             .expect("lifecycle capture texture allocates");
@@ -10051,6 +9560,7 @@ mod tests {
             for rect in rects {
                 let target = harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .acquire(&harness.gl, lifecycle_transfer_test_texture_key(6, 6))
                     .expect("lifecycle capture texture allocates");
@@ -10084,6 +9594,7 @@ mod tests {
 
                 harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .release(target)
                     .expect("lifecycle capture texture releases");
@@ -10124,11 +9635,13 @@ mod tests {
                 };
                 let blit_target = harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .acquire_plan(&harness.gl, &blit_target_plan)
                     .expect("blit capture target acquires");
                 let shader_target = harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .acquire_plan(&harness.gl, &shader_target_plan)
                     .expect("shader-copy capture target acquires");
@@ -10147,6 +9660,7 @@ mod tests {
                 );
                 let output_texture = harness
                     .renderer
+                    .scene_state
                     .active_output_texture
                     .expect("shader-copy test output texture");
                 effects::capture_output_region_to_graph_texture_shader_copy(
@@ -10169,11 +9683,13 @@ mod tests {
                 );
                 harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .release(blit_target)
                     .expect("blit capture target releases");
                 harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .release(shader_target)
                     .expect("shader-copy capture target releases");
@@ -10187,7 +9703,7 @@ mod tests {
         rect: EffectRect,
         color: [u8; 4],
     ) {
-        let height = harness.renderer.current_size.1;
+        let height = harness.renderer.scene_state.current_size.1;
         let physical_y = match origin {
             OutputFramebufferOrigin::BottomLeft => {
                 i32::try_from(height).unwrap() - rect.y - rect.height as i32
@@ -10238,16 +9754,19 @@ mod tests {
         };
         let target = harness
             .renderer
+            .effect_runtime
             .effect_resources
             .acquire_plan(&harness.gl, &target_plan)
             .expect("persistent capture texture acquires");
         let reference = harness
             .renderer
+            .effect_runtime
             .effect_resources
             .acquire_plan(&harness.gl, &reference_plan)
             .expect("full reference texture acquires");
         let output_texture = harness
             .renderer
+            .scene_state
             .active_output_texture
             .expect("shader-copy test output texture");
 
@@ -10339,11 +9858,13 @@ mod tests {
 
         harness
             .renderer
+            .effect_runtime
             .effect_resources
             .release(target)
             .expect("incrementally updated texture releases");
         harness
             .renderer
+            .effect_runtime
             .effect_resources
             .release(reference)
             .expect("reference texture releases");
@@ -10397,10 +9918,11 @@ mod tests {
             };
             let target = harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .acquire_plan(&harness.gl, &target_plan)
                 .expect("cache target acquires");
-            let output_texture = harness.renderer.active_output_texture.unwrap();
+            let output_texture = harness.renderer.scene_state.active_output_texture.unwrap();
             effects::capture_output_region_to_graph_texture_shader_copy(
                 &mut harness.renderer,
                 &target,
@@ -10429,6 +9951,7 @@ mod tests {
             );
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .release(target)
                 .expect("cache target releases");
@@ -10594,11 +10117,13 @@ mod tests {
         ] {
             let poisoned = harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .acquire_plan(&harness.gl, &target)
                 .expect("translated capture poison texture acquires");
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .bind_render_target(&harness.gl, &poisoned)
                 .expect("translated capture poison target binds");
@@ -10610,10 +10135,12 @@ mod tests {
             }
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .unbind_render_target(&harness.gl);
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .release(poisoned)
                 .expect("translated capture poison texture releases");
@@ -10634,11 +10161,13 @@ mod tests {
 
             let inspected = harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .acquire_plan(&harness.gl, &target)
                 .expect("translated capture inspection texture acquires");
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .bind_render_target(&harness.gl, &inspected)
                 .expect("translated capture inspection target binds");
@@ -10657,10 +10186,12 @@ mod tests {
             }
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .unbind_render_target(&harness.gl);
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .release(inspected)
                 .expect("translated capture inspection texture releases");
@@ -10897,7 +10428,8 @@ mod tests {
         if let Some(poison) = poison {
             poison_diagnostic_output(&harness, poison);
         }
-        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        harness.renderer.effect_runtime.effect_trace =
+            effects::EffectExecutionTrace::enabled_for_test();
         effects::clear_effect_trace_test_events();
         let repair_region = diagnostic_region(fixture.repair);
         let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
@@ -10930,7 +10462,7 @@ mod tests {
             &graph,
             &demand,
             &selection,
-            &harness.renderer.commands,
+            &harness.renderer.scene_state.commands,
             &[fixture.repair],
             fixture.output_size,
             config,
@@ -11107,6 +10639,7 @@ mod tests {
         .map(|surface_id| {
             harness
                 .renderer
+                .scene_state
                 .commands
                 .iter()
                 .position(|command| command.layer == EglDrawLayer::Surface(surface_id))
@@ -11141,7 +10674,8 @@ mod tests {
             fixture.repair,
             [236, 28, 42, 255],
         );
-        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        harness.renderer.effect_runtime.effect_trace =
+            effects::EffectExecutionTrace::enabled_for_test();
         effects::clear_effect_trace_test_events();
 
         let repair_region = diagnostic_region(fixture.repair);
@@ -11156,7 +10690,7 @@ mod tests {
             &graph,
             &demand,
             &selection,
-            &harness.renderer.commands,
+            &harness.renderer.scene_state.commands,
             &[fixture.repair],
             fixture.output_size,
             config,
@@ -11730,8 +11264,8 @@ mod tests {
         )
         .expect("diagnostic partial frame renders");
         let after = read_diagnostic_pixels(&harness);
-        let width = harness.renderer.current_size.0;
-        let height = harness.renderer.current_size.1;
+        let width = harness.renderer.scene_state.current_size.0;
+        let height = harness.renderer.scene_state.current_size.1;
         for y in 0..height {
             for x in 0..width {
                 if repair.x <= x as i32
@@ -11906,6 +11440,7 @@ mod tests {
             assert!(
                 candidate
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .poison_cached_textures(&candidate.gl, poison)
                     > 0,
@@ -12274,6 +11809,7 @@ mod tests {
         let first_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
         incremental
             .renderer
+            .effect_runtime
             .effect_resources
             .begin_checkpoint_frame();
         execute_diagnostic_frame_with_origin(
@@ -12293,6 +11829,7 @@ mod tests {
         assert_eq!(
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_cache_stats()
                 .0,
@@ -12326,6 +11863,7 @@ mod tests {
         }
         incremental
             .renderer
+            .effect_runtime
             .effect_resources
             .begin_checkpoint_frame();
         execute_diagnostic_frame_with_origin(
@@ -12345,6 +11883,7 @@ mod tests {
         assert_eq!(
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_cache_stats()
                 .0,
@@ -12372,6 +11911,7 @@ mod tests {
                     .unwrap();
                 let texture = incremental
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_texture(&key)
                     .expect("incremental checkpoint texture remains cache-owned");
@@ -12411,6 +11951,7 @@ mod tests {
         let reference_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
         full_refresh
             .renderer
+            .effect_runtime
             .effect_resources
             .begin_checkpoint_frame();
         execute_diagnostic_frame_with_origin(
@@ -12431,6 +11972,7 @@ mod tests {
         {
             let reference_texture = full_refresh
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_capture_texture(key)
                 .expect("full-current checkpoint was fully populated");
@@ -12469,6 +12011,7 @@ mod tests {
         let uncached_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
         uncached_reference
             .renderer
+            .effect_runtime
             .effect_resources
             .begin_checkpoint_frame();
         execute_diagnostic_frame_with_origin(
@@ -12562,14 +12105,16 @@ mod tests {
             surface_signatures: &[EglSceneSurfaceSignature],
         ) {
             let snapshot = EglCheckpointSceneCausalSnapshot::new(
-                renderer.current_size,
-                &renderer.commands,
-                &renderer.vertices,
+                renderer.scene_state.current_size,
+                &renderer.scene_state.commands,
+                &renderer.scene_state.vertices,
                 surface_signatures,
-                &renderer.presentation_opacities,
-                &renderer.presentation_visual_group_owners,
+                &renderer.scene_state.presentation_opacities,
+                &renderer.scene_state.presentation_visual_group_owners,
             );
-            renderer.current_checkpoint_scene_causal_snapshot = Some(snapshot);
+            renderer
+                .scene_state
+                .current_checkpoint_scene_causal_snapshot = Some(snapshot);
         }
 
         fn promote_current_cache_causal_state(
@@ -12603,6 +12148,7 @@ mod tests {
                 .expect("checkpoint capture has a texture plan");
             let texture = harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_capture_texture(&key)
                 .expect("checkpoint texture remains cache-owned");
@@ -12695,7 +12241,11 @@ mod tests {
             config: effects::EffectDebugConfig,
         ) -> effects::EffectExecutionStats {
             set_current_snapshot(&mut harness.renderer, surface_signatures);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
                 graph,
                 &region,
@@ -12789,9 +12339,17 @@ mod tests {
                     .source_unchanged
             );
 
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             promote_current_cache_causal_state(&mut harness.renderer, &graph);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
 
             let unchanged = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(
@@ -12805,17 +12363,21 @@ mod tests {
 
             let original_current_scene = harness
                 .renderer
+                .scene_state
                 .current_checkpoint_scene_causal_snapshot
                 .clone()
                 .expect("diagnostic scene has a current snapshot");
             let changed_capture_owners = HashMap::from([(VisualGroupId::new(101).unwrap(), 900)]);
-            harness.renderer.current_checkpoint_scene_causal_snapshot =
+            harness
+                .renderer
+                .scene_state
+                .current_checkpoint_scene_causal_snapshot =
                 Some(EglCheckpointSceneCausalSnapshot::new(
-                    harness.renderer.current_size,
-                    &harness.renderer.commands,
-                    &harness.renderer.vertices,
+                    harness.renderer.scene_state.current_size,
+                    &harness.renderer.scene_state.commands,
+                    &harness.renderer.scene_state.vertices,
                     &initial_signatures,
-                    &harness.renderer.presentation_opacities,
+                    &harness.renderer.scene_state.presentation_opacities,
                     &changed_capture_owners,
                 ));
             let owner_change_plan =
@@ -12823,8 +12385,10 @@ mod tests {
             assert!(
                 !owner_change_plan.instances[&EffectInstanceId::new(31).unwrap()].source_unchanged
             );
-            harness.renderer.current_checkpoint_scene_causal_snapshot =
-                Some(original_current_scene);
+            harness
+                .renderer
+                .scene_state
+                .current_checkpoint_scene_causal_snapshot = Some(original_current_scene);
 
             let mut renumbered = graph.clone();
             let pass_id_map = renumbered
@@ -12921,7 +12485,11 @@ mod tests {
             );
 
             promote_current_cache_causal_state(&mut harness.renderer, &unsupported);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             let unsupported_to_supported_plan =
                 effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(
@@ -12960,6 +12528,7 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &initial_signatures);
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             execute_diagnostic_frame_with_origin(
@@ -12991,6 +12560,7 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &current_signatures);
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             let causal_plan =
@@ -13059,11 +12629,13 @@ mod tests {
             assert!(
                 incremental
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_needs_full_refresh(
                         &c_key,
                         incremental
                             .renderer
+                            .effect_runtime
                             .effect_resources
                             .checkpoint_frame_serial(),
                     )
@@ -13096,6 +12668,7 @@ mod tests {
             let reference_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
             uncached_reference
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             execute_diagnostic_frame_with_origin(
@@ -13148,6 +12721,7 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &initial_signatures);
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             execute_diagnostic_frame_with_origin(
@@ -13178,6 +12752,7 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &current_signatures);
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             let causal_plan =
@@ -13238,6 +12813,7 @@ mod tests {
             let reference_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
             uncached_reference
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             execute_diagnostic_frame_with_origin(
@@ -13586,11 +13162,13 @@ mod tests {
             assert!(frame_a.capture_downsample_fusion_elided_capture_pixels > 0);
             let frame_a_serial = incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_frame_serial();
             assert!(
                 incremental
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_needs_full_refresh(
                         &key_a,
@@ -13624,11 +13202,13 @@ mod tests {
             assert!(frame_b.capture_downsample_fusion_elided_capture_pixels > 0);
             let frame_b_serial = incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_frame_serial();
             assert!(
                 incremental
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_needs_full_refresh(
                         &key_b,
@@ -13652,11 +13232,13 @@ mod tests {
             assert!(frame_c.checkpoint_capture_execution_pixels > 0);
             let frame_c_serial = incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_frame_serial();
             assert!(
                 !incremental
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_needs_full_refresh(
                         &key_b,
@@ -13667,6 +13249,7 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &changed_signatures);
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             let frame_d_demand =
@@ -13761,6 +13344,7 @@ mod tests {
             );
             harness
                 .renderer
+                .effect_runtime
                 .effect_shaders
                 .force_uniform_missing_for_test(
                     fused_shader_key,
@@ -13769,7 +13353,11 @@ mod tests {
                 .unwrap();
 
             set_current_snapshot(&mut harness.renderer, &signatures);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
                 &churning_graph,
                 &current_damage,
@@ -13826,10 +13414,15 @@ mod tests {
                 );
             }
 
-            let failed_serial = harness.renderer.effect_resources.checkpoint_frame_serial();
+            let failed_serial = harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .checkpoint_frame_serial();
             assert!(
                 harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_needs_full_refresh(&cache_key, failed_serial)
             );
@@ -13847,10 +13440,15 @@ mod tests {
             assert_eq!(retry.capture_downsample_fusion_executed, 0);
             assert!(retry.checkpoint_capture_execution_pixels > 0);
             assert_eq!(retry.checkpoint_cache_zero_copy_hits, 0);
-            let retry_serial = harness.renderer.effect_resources.checkpoint_frame_serial();
+            let retry_serial = harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .checkpoint_frame_serial();
             assert!(
                 !harness
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .checkpoint_capture_needs_full_refresh(
                         &cache_key,
@@ -13943,6 +13541,7 @@ mod tests {
             set_current_snapshot(&mut incremental.renderer, &render_b_signatures);
             incremental
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .begin_checkpoint_frame();
             let next_plan =
@@ -13974,7 +13573,11 @@ mod tests {
             );
             let surface_signatures = signatures(fixture.scene, None);
             set_current_snapshot(&mut harness.renderer, &surface_signatures);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             promote_current_cache_causal_state(&mut harness.renderer, &graph);
 
             let capture = graph
@@ -13986,7 +13589,11 @@ mod tests {
                         && !pass.checkpoint_dependencies.is_empty()
                 })
                 .expect("checkpoint capture exists");
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             let adjacent = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(adjacent.captures[&capture.id].source_unchanged);
 
@@ -13997,7 +13604,11 @@ mod tests {
             assert!(!discarded.captures[&capture.id].source_unchanged);
 
             promote_current_cache_causal_state(&mut harness.renderer, &graph);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             assert!(
                 effects::checkpoint_causal_stability_plan(&harness.renderer, &graph).captures
                     [&capture.id]
@@ -14005,14 +13616,23 @@ mod tests {
             );
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .clear_checkpoint_capture_cache();
             let cleared = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(!cleared.captures[&capture.id].source_unchanged);
 
             promote_current_cache_causal_state(&mut harness.renderer, &graph);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             let skipped_serial =
                 effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
             assert!(!skipped_serial.captures[&capture.id].source_unchanged);
@@ -14107,6 +13727,7 @@ mod tests {
             assert!(
                 candidate
                     .renderer
+                    .effect_runtime
                     .effect_resources
                     .poison_cached_textures(&candidate.gl, poison)
                     > 0,
@@ -14292,6 +13913,7 @@ mod tests {
                 assert!(
                     candidate
                         .renderer
+                        .effect_runtime
                         .effect_resources
                         .poison_cached_textures(&candidate.gl, poison)
                         > 0,
@@ -14385,6 +14007,7 @@ mod tests {
         assert!(
             candidate
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .poison_cached_textures(&candidate.gl, [1.0, 0.0, 1.0, 1.0])
                 > 0,
@@ -14463,6 +14086,7 @@ mod tests {
         assert!(
             candidate
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .poison_cached_textures(&candidate.gl, [0.0, 1.0, 1.0, 1.0])
                 > 0,
@@ -14628,7 +14252,7 @@ mod tests {
                 }
             }
 
-            let metrics = harness.renderer.effect_resources.metrics();
+            let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
             assert_eq!(metrics.checked_out_texture_count, 0, "step {step}");
             if step == 15 {
                 first_cache_bytes = Some(metrics.current_bytes);
@@ -14650,7 +14274,7 @@ mod tests {
             assert!(metrics.cached_texture_count <= 16);
         }
 
-        let metrics = harness.renderer.effect_resources.metrics();
+        let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
         assert!(
             metrics.reuse_count > 0,
             "moving blur did not reuse pooled textures"
@@ -14819,7 +14443,7 @@ mod tests {
                 }
             }
 
-            let metrics = harness.renderer.effect_resources.metrics();
+            let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
             assert_eq!(metrics.checked_out_texture_count, 0, "step {step}");
             if step == positions.len() - 1 {
                 warm_cache_bytes = Some(metrics.current_bytes);
@@ -14841,7 +14465,7 @@ mod tests {
             assert!(metrics.cached_texture_count <= 32);
         }
 
-        let metrics = harness.renderer.effect_resources.metrics();
+        let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
         assert!(
             metrics.reuse_count > 0,
             "visual-group blur did not reuse pooled textures"
@@ -14904,7 +14528,8 @@ mod tests {
             DecorationResourceKey::Solid(0xff20_4060),
             background_texture,
         );
-        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        harness.renderer.effect_runtime.effect_trace =
+            effects::EffectExecutionTrace::enabled_for_test();
         effects::clear_effect_trace_test_events();
 
         let rect = EffectRect::new(32, 32, 32, 24).expect("visual group blur rectangle");
@@ -15065,7 +14690,8 @@ mod tests {
     #[test]
     fn effect_trace_bounds_checkpoint_scene_advancement() {
         let mut harness = GlesEffectTestHarness::new(256, 192);
-        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        harness.renderer.effect_runtime.effect_trace =
+            effects::EffectExecutionTrace::enabled_for_test();
         effects::clear_effect_trace_test_events();
         for surface_id in [10, 20] {
             let texture = create_uploaded_resource(&harness.gl, 1, 1)
@@ -15081,8 +14707,8 @@ mod tests {
             );
         }
         push_draw_command(
-            &mut harness.renderer.vertices,
-            &mut harness.renderer.commands,
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
             EglDrawLayer::SolidRgba(0xff20_4060),
             EglRect::new(0.0, 0.0, 256.0, 192.0),
             256,
@@ -15091,8 +14717,8 @@ mod tests {
         );
         for (surface_id, y) in [(10, 0.0), (20, 96.0)] {
             push_draw_command(
-                &mut harness.renderer.vertices,
-                &mut harness.renderer.commands,
+                &mut harness.renderer.scene_state.vertices,
+                &mut harness.renderer.scene_state.commands,
                 EglDrawLayer::Surface(surface_id),
                 EglRect::new(0.0, y, 256.0, 96.0),
                 256,
@@ -15100,7 +14726,7 @@ mod tests {
                 OutputFramebufferOrigin::BottomLeft,
             );
         }
-        harness.renderer.scene_geometry_dirty = true;
+        harness.renderer.scene_state.scene_geometry_dirty = true;
 
         let rect = EffectRect::new(32, 32, 64, 48).expect("checkpoint blur rectangle");
         let (scene, registry) = moving_blur_scene(rect);
@@ -15299,12 +14925,12 @@ mod tests {
         harness.install_texture_backed_output();
         let gl = &harness.gl;
         let output_size = (19_u32, 17_u32);
-        let active_output = harness.renderer.active_output_texture.unwrap();
+        let active_output = harness.renderer.scene_state.active_output_texture.unwrap();
         let (quad, _) = harness
             .renderer
             .ensure_effect_quad()
             .expect("fullscreen effect quad is available");
-        let capture_copy = harness.renderer.capture_copy_program;
+        let capture_copy = harness.renderer.effect_runtime.capture_copy_program;
         let downsample_module = oblivion_one::effects::ShaderModuleId::new(
             oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
         )
@@ -15312,6 +14938,7 @@ mod tests {
         let shader_space = oblivion_one::effects::EffectWorkingSpace::LinearSrgb;
         let reference_program = harness
             .renderer
+            .effect_runtime
             .effect_shaders
             .lookup(effects::ShaderProgramKey::new(
                 downsample_module,
@@ -15321,6 +14948,7 @@ mod tests {
             .expect("existing first-downsample shader is prewarmed");
         let fused_program = harness
             .renderer
+            .effect_runtime
             .effect_shaders
             .lookup(effects::ShaderProgramKey::new(
                 downsample_module,
@@ -16896,12 +16524,13 @@ mod tests {
         assert_eq!(stats.missing_required_decoration_resources, 0);
 
         renderer
+            .scene_state
             .repaint_planner
             .commit_presented_transition(OutputDamage::Full);
-        assert_eq!(renderer.repaint_planner.history_depth(), 1);
+        assert_eq!(renderer.scene_state.repaint_planner.history_depth(), 1);
 
         renderer.decoration_resources.clear();
-        renderer.frame_stats = GlesSceneFrameStats::default();
+        renderer.scene_state.frame_stats = GlesSceneFrameStats::default();
         renderer
             .draw_command_batch(true, None)
             .expect("scene draw tolerates a missing decoration resource");
@@ -16913,8 +16542,8 @@ mod tests {
         );
 
         resolved.lifecycle = lamp_test_sample(0.5);
-        renderer.lamp_program = None;
-        renderer.lamp_uniform_locations = None;
+        renderer.scene_state.lamp_program = None;
+        renderer.scene_state.lamp_uniform_locations = None;
         let request = frame_renderer.egl_scene_draw_request(
             320,
             200,
@@ -16933,7 +16562,7 @@ mod tests {
         assert_eq!(fallbacks.failed.len(), 1);
         assert_eq!(fallbacks.failed[0].window_id.get(), 1);
         assert!(renderer.lifecycle_render_evidence.consumed.is_empty());
-        assert_eq!(renderer.repaint_planner.history_depth(), 0);
+        assert_eq!(renderer.scene_state.repaint_planner.history_depth(), 0);
 
         let mut resolved_effect_lifecycle = lamp_test_sample(0.5);
         resolved_effect_lifecycle.samples[0].visual_source = LifecycleVisualSource {
@@ -16957,11 +16586,11 @@ mod tests {
                 oblivion_one::compositor::ResolvedEffectScene::default(),
             ),
         };
-        renderer.lamp_geometry_key = None;
+        renderer.scene_state.lamp_geometry_key = None;
         renderer.rebuild_lamp_commands_if_needed(&resolved_effect_lifecycle, &[], &[], 1.0);
-        assert_eq!(renderer.lamp_commands.len(), 1);
+        assert_eq!(renderer.scene_state.lamp_commands.len(), 1);
         assert!(matches!(
-            renderer.lamp_commands[0].layer,
+            renderer.scene_state.lamp_commands[0].layer,
             EglDrawLayer::LifecycleResolvedVisual(_)
         ));
     }
@@ -17036,7 +16665,7 @@ mod tests {
             cursor_image,
         )
         .expect("GLES renderer creates");
-        renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        renderer.effect_runtime.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
 
         let mut buffer_ids = BufferIdAllocator::default();
         let background = lifecycle_test_surface(603, 0, 0, 320, 200, 0xff24_4567, &mut buffer_ids);
@@ -17092,6 +16721,7 @@ mod tests {
                 ..
             } => {
                 renderer
+                    .scene_state
                     .repaint_planner
                     .commit_presented_transition(OutputDamage::Full);
                 assert_eq!(commit.repaint_plan.repair_damage, OutputDamage::Full);
@@ -17107,7 +16737,7 @@ mod tests {
         assert!(first_evidence.contains(identity, payload_id, 604));
         assert!(renderer.lifecycle_visual_source_is_ready(payload_id));
         assert!(matches!(
-            renderer.lamp_commands.as_slice(),
+            renderer.scene_state.lamp_commands.as_slice(),
             [EglLampDrawCommand {
                 layer: EglDrawLayer::LifecycleResolvedVisual(layer_payload),
                 ..
@@ -17277,6 +16907,10 @@ mod tests {
             AnimationTime::from_nanos(0),
         );
         resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+        resolved.effects = lifecycle_blur_effect_scene(
+            613,
+            oblivion_one::effects::builtin_background_blur_program_id(),
+        );
         resolved.lifecycle_surfaces = vec![retained_window];
         resolved.lifecycle = lifecycle_effect_sample(
             0.45,
@@ -17579,7 +17213,8 @@ mod tests {
     fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() {
         let mut harness = GlesEffectTestHarness::new(320, 200);
         harness.install_texture_backed_output();
-        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        harness.renderer.effect_runtime.effect_trace =
+            effects::EffectExecutionTrace::enabled_for_test();
 
         let mut buffer_ids = BufferIdAllocator::default();
         let background = lifecycle_test_surface_with_row_colors(
@@ -17616,6 +17251,12 @@ mod tests {
             AnimationTime::from_nanos(0),
         );
         resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+        // Keep an ordinary effect graph alive while the retained lifecycle
+        // source runs its own background-blur graph during this frame.
+        resolved.effects = lifecycle_blur_effect_scene(
+            613,
+            oblivion_one::effects::builtin_background_blur_program_id(),
+        );
         resolved.lifecycle_surfaces = vec![retained_window];
         resolved.lifecycle = lifecycle_effect_sample(
             0.45,
@@ -17673,11 +17314,66 @@ mod tests {
                 .lifecycle_visual_source_is_ready(payload_id)
         );
         let trace = effects::take_effect_trace_test_events();
+        let graph_begins = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("event=effect_graph_execute_begin "))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let graph_ends = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("event=effect_graph_execute_end "))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let graph_release_begins = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("event=effect_graph_release_begin "))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let graph_release_ends = trace
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("event=effect_graph_release_end "))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            graph_begins.len(),
+            2,
+            "outer and lifecycle graphs: {trace:?}"
+        );
+        assert_eq!(graph_ends.len(), 2, "outer and lifecycle graphs: {trace:?}");
         assert!(
-            trace
-                .iter()
-                .any(|event| event.starts_with("event=effect_graph_execute_end ")),
-            "TopLeftScanout lifecycle blur must execute its effect graph: {trace:?}"
+            graph_begins[0] < graph_begins[1]
+                && graph_begins[1] < graph_ends[0]
+                && graph_ends[0] < graph_ends[1],
+            "lifecycle graph execution must nest inside the outer graph phase: {trace:?}"
+        );
+        assert_eq!(graph_release_begins.len(), 2, "graph releases: {trace:?}");
+        assert_eq!(graph_release_ends.len(), 2, "graph releases: {trace:?}");
+        assert!(
+            graph_ends[0] < graph_release_begins[0]
+                && graph_release_begins[0] < graph_release_ends[0]
+                && graph_release_ends[0] < graph_ends[1]
+                && graph_ends[1] < graph_release_begins[1]
+                && graph_release_begins[1] < graph_release_ends[1],
+            "the nested graph must release its leases before the outer graph ends, and the outer graph releases afterward: {trace:?}"
+        );
+        let (checkpoint_entries, _) = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .checkpoint_cache_stats();
+        assert_eq!(
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .metrics()
+                .checked_out_texture_count,
+            harness.renderer.lifecycle_visual_resources.len() + checkpoint_entries,
+            "both graphs release every temporary lease; only retained visuals and checkpoint cache entries remain checked out"
         );
 
         let texture = harness
@@ -18054,14 +17750,16 @@ mod tests {
             .renderer
             .rebuild_squash_commands(&lifecycle, &[], &[], 1.0);
 
-        assert_eq!(harness.renderer.squash_vertices.len(), 6);
-        assert_eq!(harness.renderer.squash_commands.len(), 1);
+        assert_eq!(harness.renderer.scene_state.squash_vertices.len(), 6);
+        assert_eq!(harness.renderer.scene_state.squash_commands.len(), 1);
         assert!(matches!(
-            harness.renderer.squash_commands[0].command.layer,
+            harness.renderer.scene_state.squash_commands[0]
+                .command
+                .layer,
             EglDrawLayer::LifecycleResolvedVisual(_)
         ));
-        assert!(harness.renderer.lamp_vertices.is_empty());
-        assert!(harness.renderer.lamp_commands.is_empty());
+        assert!(harness.renderer.scene_state.lamp_vertices.is_empty());
+        assert!(harness.renderer.scene_state.lamp_commands.is_empty());
     }
 
     #[test]
@@ -20705,6 +20403,7 @@ mod tests {
                 .unwrap();
             let texture = harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_capture_texture(&key)
                 .expect("dependency-free Replay cache entry exists");
@@ -20720,6 +20419,7 @@ mod tests {
             let key = effects::checkpoint_capture_cache_key(graph, root_capture(graph)).unwrap();
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .checkpoint_capture_needs_full_refresh(&key, frame_serial)
         }
@@ -20775,14 +20475,16 @@ mod tests {
             renderer: &mut GlesSceneRenderer,
             surface_signatures: &[EglSceneSurfaceSignature],
         ) {
-            renderer.current_checkpoint_scene_causal_snapshot =
+            renderer
+                .scene_state
+                .current_checkpoint_scene_causal_snapshot =
                 Some(EglCheckpointSceneCausalSnapshot::new(
-                    renderer.current_size,
-                    &renderer.commands,
-                    &renderer.vertices,
+                    renderer.scene_state.current_size,
+                    &renderer.scene_state.commands,
+                    &renderer.scene_state.vertices,
                     surface_signatures,
-                    &renderer.presentation_opacities,
-                    &renderer.presentation_visual_group_owners,
+                    &renderer.scene_state.presentation_opacities,
+                    &renderer.scene_state.presentation_visual_group_owners,
                 ));
         }
 
@@ -20795,7 +20497,11 @@ mod tests {
             full: bool,
         ) -> RendererResult<effects::EffectExecutionStats> {
             set_current_snapshot(&mut harness.renderer, surface_signatures);
-            harness.renderer.effect_resources.begin_checkpoint_frame();
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .begin_checkpoint_frame();
             let config = replay_config();
             let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
                 graph, region, full, false,
@@ -20908,7 +20614,11 @@ mod tests {
             )
             .expect("first full Replay refresh succeeds");
 
-            let frame_serial = harness.renderer.effect_resources.checkpoint_frame_serial();
+            let frame_serial = harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .checkpoint_frame_serial();
             assert_eq!(
                 stats.replay_capture_execution_pixels,
                 root_domain_pixels(&graph)
@@ -21039,6 +20749,7 @@ mod tests {
 
             harness
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .invalidate_checkpoint_causal_state();
             let stats = render_root_frame(
@@ -21099,7 +20810,12 @@ mod tests {
                 root_cache_needs_full_refresh(
                     &harness,
                     &changed_graph,
-                    harness.renderer.effect_resources.checkpoint_frame_serial() + 1
+                    harness
+                        .renderer
+                        .effect_runtime
+                        .effect_resources
+                        .checkpoint_frame_serial()
+                        + 1
                 ) == false
             );
         }
@@ -21317,6 +21033,7 @@ mod tests {
                 .expect("reference root capture cache key");
             reference
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .invalidate_checkpoint_capture(&root_key);
             let stats = render_root_frame(
@@ -21401,7 +21118,10 @@ mod tests {
                 fixture.repair,
                 [220, 24, 36, 255],
             );
-            harness.renderer.fail_next_dependency_free_replay_capture = true;
+            harness
+                .renderer
+                .effect_runtime
+                .fail_next_dependency_free_replay_capture = true;
             assert!(
                 render_root_frame(
                     &mut harness,
@@ -21414,7 +21134,11 @@ mod tests {
                 .is_err()
             );
 
-            let failed_frame_serial = harness.renderer.effect_resources.checkpoint_frame_serial();
+            let failed_frame_serial = harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .checkpoint_frame_serial();
             assert!(root_cache_needs_full_refresh(
                 &harness,
                 &graph,
@@ -21479,6 +21203,7 @@ mod tests {
                 .expect("reference root capture cache key");
             reference
                 .renderer
+                .effect_runtime
                 .effect_resources
                 .invalidate_checkpoint_capture(&root_key);
             let full_refresh = render_root_frame(
