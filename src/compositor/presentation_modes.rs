@@ -4,6 +4,8 @@
 //! output.  The latter is a compositor decision and must be frozen into the
 //! output transaction that owns the KMS submission.
 
+use crate::native::presentation_timing::PresentationDomain;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum SurfacePresentationHint {
     #[default]
@@ -348,13 +350,11 @@ impl OutputPresentationMode {
         matches!(self, Self::AdaptiveSync | Self::AdaptiveAsync)
     }
 
-    pub const fn presentation_domain(self) -> crate::native::buffering::PresentationDomain {
+    pub const fn presentation_domain(self) -> PresentationDomain {
         match self {
-            Self::Vsync => crate::native::buffering::PresentationDomain::FixedVsync,
-            Self::AdaptiveSync | Self::AdaptiveAsync => {
-                crate::native::buffering::PresentationDomain::VrrWindow
-            }
-            Self::Async => crate::native::buffering::PresentationDomain::AsyncImmediate,
+            Self::Vsync => PresentationDomain::FixedVsync,
+            Self::AdaptiveSync | Self::AdaptiveAsync => PresentationDomain::VrrWindow,
+            Self::Async => PresentationDomain::AsyncImmediate,
         }
     }
 }
@@ -941,8 +941,6 @@ mod vrr_phase1_regression_tests {
 
     #[test]
     fn presentation_mode_semantics_cover_four_transaction_modes() {
-        use crate::native::buffering::PresentationDomain;
-
         for (mode, is_async, uses_vrr, domain) in [
             (
                 OutputPresentationMode::Vsync,

@@ -10,6 +10,7 @@ pub mod event_loop;
 pub mod explicit_sync;
 pub mod kms;
 pub mod presentation_deadline;
+pub mod presentation_timing;
 pub mod scheduler;
 #[doc(hidden)]
 pub mod sync_file;

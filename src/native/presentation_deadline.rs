@@ -1349,6 +1349,120 @@ mod tests {
     }
 
     #[test]
+    fn fixed_grid_targets_are_stable_at_common_refresh_rates() {
+        const PRESENTED_AT_NS: u64 = 1_000_000_000;
+        const NOW_NS: u64 = PRESENTED_AT_NS + 100_000;
+        const PREDICTED_COST: Duration = Duration::from_nanos(200_000);
+
+        for interval_ns in [16_666_667, 8_333_333, 6_944_444, 6_060_606] {
+            let interval = Duration::from_nanos(interval_ns);
+            let first_target_ns = PRESENTED_AT_NS + interval_ns;
+            let second_target_ns = PRESENTED_AT_NS + 2 * interval_ns;
+
+            let mut normal_planner = PresentationDeadlinePlanner::new(interval);
+            normal_planner.note_presented(MonotonicTimestampNs::new(PRESENTED_AT_NS));
+            let normal = normal_planner
+                .plan_normal(MonotonicTimestampNs::new(NOW_NS), PREDICTED_COST)
+                .unwrap();
+            assert_eq!(normal.sequence(), 2);
+            assert_eq!(normal.presentation_time.get(), first_target_ns);
+            assert_eq!(normal.refresh_interval, interval);
+
+            let mut commit_planner = PresentationDeadlinePlanner::new(interval);
+            commit_planner.note_presented(MonotonicTimestampNs::new(PRESENTED_AT_NS));
+            let commit = commit_planner
+                .plan_not_before(
+                    MonotonicTimestampNs::new(NOW_NS),
+                    MonotonicTimestampNs::new(first_target_ns + 1),
+                    PREDICTED_COST,
+                )
+                .unwrap();
+            assert_eq!(commit.sequence(), 3);
+            assert_eq!(commit.presentation_time.get(), second_target_ns);
+            assert_eq!(commit.refresh_interval, interval);
+            assert_eq!(commit.reason, PresentationTargetReason::CommitTiming);
+
+            let reactive_planner = {
+                let mut planner = PresentationDeadlinePlanner::new(interval);
+                planner.note_presented(MonotonicTimestampNs::new(PRESENTED_AT_NS));
+                planner
+            };
+            let reactive = reactive_planner
+                .reactive_target(MonotonicTimestampNs::new(NOW_NS), PREDICTED_COST)
+                .unwrap();
+            assert_eq!(reactive.sequence(), 2);
+            assert_eq!(reactive.presentation_time.get(), first_target_ns);
+            assert_eq!(reactive.refresh_interval, interval);
+            assert_eq!(reactive.reason, PresentationTargetReason::ReactiveDouble);
+
+            let mut successor_planner = PresentationDeadlinePlanner::new(interval);
+            successor_planner.note_presented(MonotonicTimestampNs::new(PRESENTED_AT_NS));
+            let pending = successor_planner
+                .plan_normal(MonotonicTimestampNs::new(NOW_NS), PREDICTED_COST)
+                .unwrap();
+            let successor = successor_planner
+                .plan_successor_after(
+                    pending,
+                    MonotonicTimestampNs::new(NOW_NS),
+                    PREDICTED_COST,
+                    PresentationTargetReason::Normal,
+                )
+                .unwrap();
+            assert_eq!(successor.sequence(), 3);
+            assert_eq!(successor.presentation_time.get(), second_target_ns);
+            assert_eq!(successor.refresh_interval, interval);
+        }
+    }
+
+    #[test]
+    fn presentation_timing_target_conversions_stay_fixed_vsync() {
+        let interval = Duration::from_nanos(6_944_444);
+        let target = PresentationTarget {
+            sequence: 9,
+            presentation_time: MonotonicTimestampNs::new(1_062_500_000),
+            submit_not_before: MonotonicTimestampNs::new(1_050_000_000),
+            render_start_deadline: MonotonicTimestampNs::new(1_040_000_000),
+            refresh_interval: interval,
+            reason: PresentationTargetReason::Normal,
+            clock_generation: 4,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence: 8,
+                presentation_time: MonotonicTimestampNs::new(1_055_555_556),
+                clock_generation: 4,
+            },
+            selection_evidence: TargetSelectionEvidence::default(),
+        };
+
+        let logical = target.opportunity();
+        assert_eq!(
+            logical.id(),
+            crate::native::buffering::PresentationOpportunityId::new(4, 9)
+        );
+        assert_eq!(
+            logical.timing(),
+            crate::native::presentation_timing::PresentationTiming::FixedVsync {
+                target_time: target.presentation_time,
+                refresh_interval: interval,
+            }
+        );
+
+        let physical = target.physical_opportunity();
+        assert_eq!(
+            physical.id(),
+            crate::native::buffering::PresentationOpportunityId::new(4, 8)
+        );
+        assert_eq!(
+            physical.timing(),
+            crate::native::presentation_timing::PresentationTiming::FixedVsync {
+                target_time: target.physical_claim.presentation_time,
+                refresh_interval: interval,
+            }
+        );
+    }
+
+    #[test]
     fn commit_timing_accounts_for_render_cost_without_presenting_early() {
         let interval = Duration::from_millis(10);
         let mut planner = PresentationDeadlinePlanner::new(interval);

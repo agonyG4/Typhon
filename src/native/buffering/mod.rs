@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use crate::native::presentation_deadline::MonotonicTimestampNs;
+use crate::native::presentation_timing::{PresentationDomain, PresentationTiming};
 use std::time::Duration;
 
 mod credit;
@@ -54,63 +55,62 @@ pub struct O1AdmissionObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresentationDomain {
-    FixedVsync,
-    VrrWindow,
-    AsyncImmediate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentationOpportunity {
     id: PresentationOpportunityId,
-    target_time: MonotonicTimestampNs,
-    refresh_interval: Duration,
-    domain: PresentationDomain,
+    timing: PresentationTiming,
 }
 
 impl PresentationOpportunity {
+    pub const fn new(id: PresentationOpportunityId, timing: PresentationTiming) -> Self {
+        Self { id, timing }
+    }
+
     pub const fn fixed_vsync(
         id: PresentationOpportunityId,
         target_time: MonotonicTimestampNs,
         refresh_interval: Duration,
     ) -> Self {
-        Self {
+        Self::new(
             id,
-            target_time,
-            refresh_interval,
-            domain: PresentationDomain::FixedVsync,
-        }
+            PresentationTiming::FixedVsync {
+                target_time,
+                refresh_interval,
+            },
+        )
     }
 
     pub const fn id(self) -> PresentationOpportunityId {
         self.id
     }
 
-    pub const fn target_time(self) -> MonotonicTimestampNs {
-        self.target_time
-    }
-
-    pub const fn refresh_interval(self) -> Duration {
-        self.refresh_interval
+    pub const fn timing(self) -> PresentationTiming {
+        self.timing
     }
 
     pub const fn domain(self) -> PresentationDomain {
-        self.domain
+        self.timing.domain()
     }
 
-    pub fn successor(self) -> Option<Self> {
-        Some(Self {
-            id: PresentationOpportunityId::new(
-                self.id.clock_generation,
-                self.id.sequence.checked_add(1)?,
-            ),
-            target_time: MonotonicTimestampNs::new(
-                self.target_time
-                    .get()
-                    .checked_add(duration_ns(self.refresh_interval))?,
-            ),
-            ..self
-        })
+    pub fn fixed_vsync_successor(self) -> Option<Self> {
+        let PresentationTiming::FixedVsync {
+            target_time,
+            refresh_interval,
+        } = self.timing
+        else {
+            return None;
+        };
+        let id = PresentationOpportunityId::new(
+            self.id.clock_generation,
+            self.id.sequence.checked_add(1)?,
+        );
+        let target_time = target_time.checked_add(refresh_interval)?;
+        Some(Self::new(
+            id,
+            PresentationTiming::FixedVsync {
+                target_time,
+                refresh_interval,
+            },
+        ))
     }
 }
 
@@ -279,19 +279,16 @@ impl PipelineServiceEstimate {
     }
 }
 
-fn duration_ns(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ElasticFuturePrimaryCredit, OpportunityLease, OpportunityLeaseReason,
-        PipelineServiceEstimate, PresentationDomain, PresentationOpportunity,
-        PresentationOpportunityFrontier, PresentationOpportunityId, SimulatedO1Config, simulate_o1,
+        PipelineServiceEstimate, PresentationOpportunity, PresentationOpportunityFrontier,
+        PresentationOpportunityId, SimulatedO1Config, simulate_o1,
         simulate_o1_with_render_services,
     };
     use crate::native::presentation_deadline::MonotonicTimestampNs;
+    use crate::native::presentation_timing::{PresentationDomain, PresentationTiming};
     use std::time::Duration;
 
     #[test]
@@ -301,7 +298,8 @@ mod tests {
             MonotonicTimestampNs::new(120_000_000),
             Duration::from_millis(10),
         );
-        let lease = OpportunityLease::arm(opportunity, OpportunityLeaseReason::VisualWork);
+        let timing = opportunity.timing();
+        let mut lease = OpportunityLease::arm(opportunity, OpportunityLeaseReason::VisualWork);
 
         assert_eq!(lease.opportunity(), opportunity);
         assert_eq!(
@@ -309,11 +307,20 @@ mod tests {
             PresentationOpportunityId::new(4, 12)
         );
         assert_eq!(
-            lease.opportunity().target_time(),
-            MonotonicTimestampNs::new(120_000_000)
+            lease.opportunity().timing(),
+            PresentationTiming::FixedVsync {
+                target_time: MonotonicTimestampNs::new(120_000_000),
+                refresh_interval: Duration::from_millis(10),
+            }
         );
         assert_eq!(lease.opportunity().domain(), PresentationDomain::FixedVsync);
         assert!(!lease.is_terminal());
+
+        lease.abandon(super::OpportunityLeaseTermination::PresentationDomainChanged);
+
+        assert_eq!(lease.opportunity().id(), opportunity.id());
+        assert_eq!(lease.opportunity().timing(), timing);
+        assert!(lease.is_terminal());
     }
 
     #[test]
