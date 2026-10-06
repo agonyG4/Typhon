@@ -19,13 +19,23 @@ pub(crate) struct NativeInputState {
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
     pub(crate) suppressed_vt_switch_keys: Vec<u16>,
     keyboard_sources: KeyboardSourceLedger,
+    keyboard_repeat: KeyboardRepeatState,
     #[cfg(test)]
     pub(crate) source_removal_modifier_release_routes: Vec<(u16, ModifierMask)>,
     pressed_pointer_buttons: Vec<u32>,
 }
 
 impl NativeInputState {
+    #[cfg(test)]
     pub(crate) fn new(output_width: u32, output_height: u32) -> Self {
+        Self::new_with_repeat_config(output_width, output_height, KeyboardRepeatConfig::default())
+    }
+
+    pub(crate) fn new_with_repeat_config(
+        output_width: u32,
+        output_height: u32,
+        repeat_config: KeyboardRepeatConfig,
+    ) -> Self {
         Self {
             output_width: output_width.max(1),
             output_height: output_height.max(1),
@@ -44,6 +54,7 @@ impl NativeInputState {
             forwarded_deferred_modifier_keys: Vec::new(),
             suppressed_vt_switch_keys: Vec::new(),
             keyboard_sources: KeyboardSourceLedger::default(),
+            keyboard_repeat: KeyboardRepeatState::configured(repeat_config),
             #[cfg(test)]
             source_removal_modifier_release_routes: Vec::new(),
             pressed_pointer_buttons: Vec::new(),
@@ -95,6 +106,8 @@ impl NativeInputState {
 
         let was_inhibited = self.keyboard_shortcuts_inhibited;
         self.keyboard_shortcuts_inhibited = snapshot.effective;
+        self.keyboard_repeat
+            .cancel_if_respected_inhibition(snapshot.effective);
         let mut effect = NativeInputEffect::default();
         if !was_inhibited && snapshot.effective {
             self.binding_manager
@@ -190,19 +203,20 @@ impl NativeInputState {
         }
     }
 
-    pub(crate) fn handle_hardware_input_event(
+    pub(crate) fn handle_hardware_input_event_at(
         &mut self,
         event: NativeHardwareInputEvent,
+        now_ns: u64,
     ) -> NativeInputEffect {
         match event {
             NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
                 device,
                 code,
-                value,
-            }) => self.handle_keyboard_key_event(device, code, value),
+                pressed,
+            }) => self.handle_keyboard_key_event(device, code, pressed, now_ns),
             NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved {
                 device,
-            }) => self.handle_keyboard_source_removed(device),
+            }) => self.handle_keyboard_source_removed(device, now_ns),
             NativeHardwareInputEvent::PointerButton { button, pressed } => {
                 self.handle_pointer_button(button, pressed)
             }
@@ -211,20 +225,21 @@ impl NativeInputState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn handle_hardware_input_event(
+        &mut self,
+        event: NativeHardwareInputEvent,
+    ) -> NativeInputEffect {
+        self.handle_hardware_input_event_at(event, 0)
+    }
+
     fn handle_keyboard_key_event(
         &mut self,
         device: KeyboardDeviceId,
         code: u16,
-        value: i32,
+        pressed: bool,
+        now_ns: u64,
     ) -> NativeInputEffect {
-        let pressed = value != 0;
-        let repeated = value == 2;
-        if repeated {
-            // Raw evdev repeat notifications temporarily retain the legacy binding path.
-            // They never claim or release physical source ownership.
-            return self.route_logical_key_event(code, true, true, false, None);
-        }
-
         let modifiers_before = self.active_modifier_mask();
         let transition = if pressed {
             self.keyboard_sources.press(device, code)
@@ -243,10 +258,14 @@ impl NativeInputState {
             && modifier_family_for_key(code).is_some_and(|family| {
                 modifiers_before.contains(family) && !modifiers_after.contains(family)
             });
-        self.route_logical_key_event(code, pressed, false, modifier_family_released, None)
+        self.route_logical_key_event(code, pressed, modifier_family_released, None, now_ns)
     }
 
-    fn handle_keyboard_source_removed(&mut self, device: KeyboardDeviceId) -> NativeInputEffect {
+    fn handle_keyboard_source_removed(
+        &mut self,
+        device: KeyboardDeviceId,
+        now_ns: u64,
+    ) -> NativeInputEffect {
         let modifiers_before = self.active_modifier_mask();
         let released = self.keyboard_sources.remove_source(device);
         let modifiers_after = self.active_modifier_mask();
@@ -279,9 +298,9 @@ impl NativeInputState {
             effect.append(self.route_logical_key_event(
                 code,
                 false,
-                false,
                 modifier_family_released,
                 Some(modifiers_before),
+                now_ns,
             ));
         }
         effect
@@ -291,123 +310,114 @@ impl NativeInputState {
         &mut self,
         code: u16,
         pressed: bool,
-        repeated: bool,
         modifier_family_released: bool,
         modifiers_for_bindings: Option<ModifierMask>,
+        now_ns: u64,
     ) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
-        let current_state_action = (!repeated).then(|| {
-            effect.record_keyboard_physical_event(NativeKeyboardEvent::new(code, pressed))
-        });
+        let current_state_action =
+            effect.record_keyboard_physical_event(NativeKeyboardEvent::new(code, pressed));
+
+        let modifiers = self.active_modifier_mask();
+        self.keyboard_repeat.cancel_if_modifiers_changed(modifiers);
+        if !is_keyboard_modifier(code) {
+            if pressed
+                || self
+                    .keyboard_repeat
+                    .active()
+                    .is_some_and(|active| active.code == code)
+            {
+                self.keyboard_repeat.cancel();
+            }
+        }
 
         if !pressed && self.release_suppressed_vt_switch_key(code) {
             return effect;
         }
 
         if is_shift_key(code) {
-            if !repeated {
-                if modifier_family_released
-                    && let AstreaBindingMatch::Consumed { action, phase } = self
-                        .binding_manager
-                        .handle_modifier_release(ModifierMask::SHIFT)
-                {
-                    self.apply_binding_action(action, phase, None, &mut effect);
-                }
-                self.forward_client_key(code, pressed, &mut effect, current_state_action);
+            if modifier_family_released
+                && let AstreaBindingMatch::Consumed { action, phase, .. } = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::SHIFT)
+            {
+                self.apply_binding_action(action, phase, None, &mut effect);
             }
+            self.forward_client_key(code, pressed, &mut effect, Some(current_state_action));
             return effect;
         }
 
         if is_alt_key(code) {
-            if !repeated {
-                self.set_deferred_modifier_pressed(code, pressed);
-                let current_state_action = current_state_action
-                    .expect("non-repeat modifier input must have a physical action");
-                let reconciled_release = self.reconcile_forwarded_deferred_modifier_key(
-                    code,
-                    pressed,
-                    current_state_action,
-                    &mut effect,
-                );
-                if modifier_family_released
-                    && let AstreaBindingMatch::Consumed { action, phase } = self
-                        .binding_manager
-                        .handle_modifier_release(ModifierMask::ALT)
-                {
-                    self.apply_binding_action(action, phase, None, &mut effect);
-                    return effect;
-                }
-                if !reconciled_release && self.keyboard_shortcuts_inhibited && pressed {
-                    self.forward_deferred_modifier_key(
-                        code,
-                        &mut effect,
-                        Some(current_state_action),
-                    );
-                }
+            self.set_deferred_modifier_pressed(code, pressed);
+            let reconciled_release = self.reconcile_forwarded_deferred_modifier_key(
+                code,
+                pressed,
+                current_state_action,
+                &mut effect,
+            );
+            if modifier_family_released
+                && let AstreaBindingMatch::Consumed { action, phase, .. } = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::ALT)
+            {
+                self.apply_binding_action(action, phase, None, &mut effect);
+                return effect;
+            }
+            if !reconciled_release && self.keyboard_shortcuts_inhibited && pressed {
+                self.forward_deferred_modifier_key(code, &mut effect, Some(current_state_action));
             }
             return effect;
         }
 
         if is_super_key(code) {
-            if !repeated {
-                self.set_deferred_modifier_pressed(code, pressed);
-                let current_state_action = current_state_action
-                    .expect("non-repeat modifier input must have a physical action");
-                let reconciled_release = self.reconcile_forwarded_deferred_modifier_key(
-                    code,
-                    pressed,
-                    current_state_action,
-                    &mut effect,
-                );
-                if modifier_family_released
-                    && let AstreaBindingMatch::Consumed { action, phase } = self
-                        .binding_manager
-                        .handle_modifier_release(ModifierMask::SUPER)
-                {
-                    self.apply_binding_action(action, phase, None, &mut effect);
-                }
-                if !reconciled_release && self.keyboard_shortcuts_inhibited && pressed {
-                    self.forward_deferred_modifier_key(
-                        code,
-                        &mut effect,
-                        Some(current_state_action),
-                    );
-                }
+            self.set_deferred_modifier_pressed(code, pressed);
+            let reconciled_release = self.reconcile_forwarded_deferred_modifier_key(
+                code,
+                pressed,
+                current_state_action,
+                &mut effect,
+            );
+            if modifier_family_released
+                && let AstreaBindingMatch::Consumed { action, phase, .. } = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::SUPER)
+            {
+                self.apply_binding_action(action, phase, None, &mut effect);
+            }
+            if !reconciled_release && self.keyboard_shortcuts_inhibited && pressed {
+                self.forward_deferred_modifier_key(code, &mut effect, Some(current_state_action));
             }
             return effect;
         }
 
         if is_control_key(code) {
-            if !repeated {
-                if modifier_family_released
-                    && let AstreaBindingMatch::Consumed { action, phase } = self
-                        .binding_manager
-                        .handle_modifier_release(ModifierMask::CTRL)
-                {
-                    self.apply_binding_action(action, phase, None, &mut effect);
-                }
-                if pressed {
-                    if !self.forwarded_control_keys.contains(&code) {
-                        self.forwarded_control_keys.push(code);
-                        effect.forward_keyboard_event(
-                            NativeKeyboardEvent::new(code, true),
-                            current_state_action,
-                        );
-                        effect.request_redraw();
-                    }
-                } else if self.release_forwarded_control_key(code) {
+            if modifier_family_released
+                && let AstreaBindingMatch::Consumed { action, phase, .. } = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::CTRL)
+            {
+                self.apply_binding_action(action, phase, None, &mut effect);
+            }
+            if pressed {
+                if !self.forwarded_control_keys.contains(&code) {
+                    self.forwarded_control_keys.push(code);
                     effect.forward_keyboard_event(
-                        NativeKeyboardEvent::new(code, false),
-                        current_state_action,
+                        NativeKeyboardEvent::new(code, true),
+                        Some(current_state_action),
                     );
                     effect.request_redraw();
                 }
+            } else if self.release_forwarded_control_key(code) {
+                effect.forward_keyboard_event(
+                    NativeKeyboardEvent::new(code, false),
+                    Some(current_state_action),
+                );
+                effect.request_redraw();
             }
             return effect;
         }
 
         if pressed
-            && !repeated
             && self.active_modifier_mask().contains(ModifierMask::CTRL)
             && self.active_modifier_mask().contains(ModifierMask::ALT)
             && let Some(vt) = vt_number_for_function_key(code)
@@ -418,14 +428,24 @@ impl NativeInputState {
             return effect;
         }
 
+        let binding_modifiers = modifiers_for_bindings.unwrap_or(modifiers);
         match self.binding_manager.handle_key(
-            modifiers_for_bindings.unwrap_or_else(|| self.active_modifier_mask()),
+            binding_modifiers,
             code,
             pressed,
-            repeated,
+            false,
             self.keyboard_shortcuts_inhibited,
         ) {
-            AstreaBindingMatch::Consumed { action, phase } => {
+            AstreaBindingMatch::Consumed {
+                action,
+                phase,
+                repeat,
+                inhibition,
+            } => {
+                if pressed && repeat == RepeatPolicy::Enabled {
+                    self.keyboard_repeat
+                        .arm(code, binding_modifiers, inhibition, now_ns);
+                }
                 self.apply_binding_action(action, phase, None, &mut effect);
                 return effect;
             }
@@ -433,26 +453,33 @@ impl NativeInputState {
         }
 
         if self.keyboard_shortcuts_inhibited {
-            if !repeated {
-                self.replay_deferred_modifiers(&mut effect);
-                self.forward_client_key(code, pressed, &mut effect, current_state_action);
-            }
+            self.replay_deferred_modifiers(&mut effect);
+            self.forward_client_key(code, pressed, &mut effect, Some(current_state_action));
             return effect;
         }
 
-        if !repeated {
-            if pressed {
-                self.replay_deferred_modifiers(&mut effect);
-            }
-            self.forward_client_key(code, pressed, &mut effect, current_state_action);
+        if pressed {
+            self.replay_deferred_modifiers(&mut effect);
         }
+        self.forward_client_key(code, pressed, &mut effect, Some(current_state_action));
         effect
     }
 
     #[cfg(test)]
     pub(crate) fn handle_key_event(&mut self, code: u16, value: i32) -> NativeInputEffect {
         let device = KeyboardDeviceId::from_raw(1).expect("test keyboard id is nonzero");
-        self.handle_keyboard_key_event(device, code, value)
+        self.handle_keyboard_key_event(device, code, value != 0, 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key_event_at(
+        &mut self,
+        code: u16,
+        pressed: bool,
+        now_ns: u64,
+    ) -> NativeInputEffect {
+        let device = KeyboardDeviceId::from_raw(1).expect("test keyboard id is nonzero");
+        self.handle_keyboard_key_event(device, code, pressed, now_ns)
     }
 
     #[cfg(test)]
@@ -462,12 +489,103 @@ impl NativeInputState {
         code: u16,
         value: i32,
     ) -> NativeInputEffect {
-        self.handle_keyboard_key_event(device, code, value)
+        self.handle_keyboard_key_event(device, code, value != 0, 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key_event_from_at(
+        &mut self,
+        device: KeyboardDeviceId,
+        code: u16,
+        pressed: bool,
+        now_ns: u64,
+    ) -> NativeInputEffect {
+        self.handle_keyboard_key_event(device, code, pressed, now_ns)
     }
 
     #[cfg(test)]
     pub(crate) fn keyboard_key_is_logically_pressed(&self, code: u16) -> bool {
         self.keyboard_sources.is_logically_pressed(code)
+    }
+
+    pub(crate) fn keyboard_repeat_deadline_ns(&self) -> Option<u64> {
+        self.keyboard_repeat.deadline_ns()
+    }
+
+    pub(crate) fn keyboard_repeat_due(&self, now_ns: u64) -> bool {
+        self.keyboard_repeat.due(now_ns)
+    }
+
+    pub(crate) fn keyboard_repeat_generation(&self) -> u64 {
+        self.keyboard_repeat.generation()
+    }
+
+    pub(crate) fn update_keyboard_repeat_config(
+        &mut self,
+        config: KeyboardRepeatConfig,
+        now_ns: u64,
+    ) {
+        self.keyboard_repeat.update_config(config, now_ns);
+    }
+
+    pub(crate) fn clear_keyboard_repeat(&mut self) {
+        self.keyboard_repeat.cancel();
+    }
+
+    pub(crate) fn service_keyboard_repeat(&mut self, now_ns: u64) -> NativeInputEffect {
+        if !self.keyboard_repeat.due(now_ns) {
+            return NativeInputEffect::default();
+        }
+        let Some(active) = self.keyboard_repeat.active() else {
+            return NativeInputEffect::default();
+        };
+        if active.repeat != RepeatPolicy::Enabled
+            || !self.keyboard_sources.is_logically_pressed(active.code)
+            || self.active_modifier_mask() != active.modifiers
+            || (self.keyboard_shortcuts_inhibited && active.inhibition == InhibitionPolicy::Respect)
+        {
+            self.keyboard_repeat.cancel();
+            return NativeInputEffect::default();
+        }
+
+        let mut effect = NativeInputEffect::default();
+        match self.binding_manager.handle_key(
+            active.modifiers,
+            active.code,
+            true,
+            true,
+            self.keyboard_shortcuts_inhibited,
+        ) {
+            AstreaBindingMatch::Consumed {
+                action,
+                phase,
+                repeat,
+                inhibition,
+            } if repeat == RepeatPolicy::Enabled && inhibition == active.inhibition => {
+                self.apply_binding_action(action, phase, None, &mut effect);
+                self.keyboard_repeat.schedule_after_fire(now_ns);
+            }
+            AstreaBindingMatch::Consumed { .. } | AstreaBindingMatch::Pass => {
+                self.keyboard_repeat.cancel();
+            }
+        }
+        effect
+    }
+
+    pub(crate) fn service_keyboard_repeat_if_unchanged(
+        &mut self,
+        now_ns: u64,
+        generation: u64,
+    ) -> NativeInputEffect {
+        if self.keyboard_repeat_generation() != generation {
+            return NativeInputEffect::default();
+        }
+        self.service_keyboard_repeat(now_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_keyboard_repeat(&self) -> Option<ActiveKeyboardRepeat> {
+        self.keyboard_repeat.active()
     }
 
     pub(crate) fn handle_pointer_button(
@@ -502,7 +620,7 @@ impl NativeInputState {
         });
         let binding_consumed = matches!(binding_match, AstreaBindingMatch::Consumed { .. });
         match binding_match {
-            AstreaBindingMatch::Consumed { action, phase } => {
+            AstreaBindingMatch::Consumed { action, phase, .. } => {
                 self.apply_binding_action(action, phase, Some(button), &mut effect);
             }
             AstreaBindingMatch::Pass => {}
@@ -898,6 +1016,7 @@ impl NativeInputState {
     }
 
     pub(crate) fn clear_pressed_state_for_session_switch(&mut self) {
+        self.clear_keyboard_repeat();
         self.keyboard_sources.clear();
         self.forwarded_control_keys.clear();
         self.forwarded_client_keys.clear();
@@ -923,6 +1042,10 @@ pub(crate) fn is_super_key(code: u16) -> bool {
 
 pub(crate) fn is_control_key(code: u16) -> bool {
     matches!(code, KEY_LEFTCTRL | KEY_RIGHTCTRL)
+}
+
+fn is_keyboard_modifier(code: u16) -> bool {
+    is_shift_key(code) || is_control_key(code) || is_alt_key(code) || is_super_key(code)
 }
 
 fn modifier_family_for_key(code: u16) -> Option<ModifierMask> {

@@ -188,7 +188,7 @@ pub(crate) enum NativeKeyboardInputEvent {
     Key {
         device: KeyboardDeviceId,
         code: u16,
-        value: i32,
+        pressed: bool,
     },
     SourceRemoved {
         device: KeyboardDeviceId,
@@ -250,7 +250,7 @@ impl AstreaShortcutEvent {
 impl NativeHardwareInputEvent {
     pub(crate) fn is_meaningful_user_activity(self) -> bool {
         match self {
-            Self::Keyboard(NativeKeyboardInputEvent::Key { value, .. }) => value != 2,
+            Self::Keyboard(NativeKeyboardInputEvent::Key { .. }) => true,
             Self::Keyboard(NativeKeyboardInputEvent::SourceRemoved { .. }) => false,
             Self::PointerButton { .. } => true,
             Self::PointerMotion(sample) => {
@@ -280,7 +280,7 @@ impl NativeHardwareInputEvent {
         keyboard_device: Option<KeyboardDeviceId>,
     ) -> Option<Self> {
         match event.type_ {
-            EV_KEY if is_pointer_button(event.code) && event.value == 2 => None,
+            EV_KEY if event.value == 2 => None,
             EV_KEY if is_pointer_button(event.code) => Some(Self::PointerButton {
                 button: u32::from(event.code),
                 pressed: event.value != 0,
@@ -288,7 +288,7 @@ impl NativeHardwareInputEvent {
             EV_KEY => Some(Self::Keyboard(NativeKeyboardInputEvent::Key {
                 device: keyboard_device?,
                 code: event.code,
-                value: event.value,
+                pressed: event.value != 0,
             })),
             EV_REL => match event.code {
                 REL_X => Some(Self::PointerMotion(PointerMotionSample::relative(
@@ -501,18 +501,27 @@ mod user_activity_tests {
     use super::*;
 
     #[test]
-    fn native_input_activity_ignores_keyboard_repeat_but_accepts_transitions() {
+    fn normalized_key_transitions_are_activity_and_raw_repeat_is_dropped() {
         let device = KeyboardDeviceId::from_raw(1).unwrap();
-        let key_event = |value| {
+        let key_event = |pressed| {
             NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
                 device,
                 code: 30,
-                value,
+                pressed,
             })
         };
-        assert!(key_event(1).is_meaningful_user_activity());
-        assert!(key_event(0).is_meaningful_user_activity());
-        assert!(!key_event(2).is_meaningful_user_activity());
+        assert!(key_event(true).is_meaningful_user_activity());
+        assert!(key_event(false).is_meaningful_user_activity());
+        let repeat = LinuxInputEvent {
+            _time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_KEY,
+            code: 30,
+            value: 2,
+        };
+        assert!(NativeHardwareInputEvent::from_linux_event(repeat, Some(device)).is_none());
         assert!(
             !NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved { device })
                 .is_meaningful_user_activity()

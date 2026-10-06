@@ -149,6 +149,8 @@ impl NativeRuntime {
             recovery_required: self.pending_session_recovery.is_some(),
             shutdown_requested: cycle.shutdown_requested,
             input_backlog_pending: self.input_epoch.backlog_pending(),
+            keyboard_repeat_due: !cycle.shutdown_requested
+                && self.input_state.keyboard_repeat_due(now_ns),
         }
     }
 
@@ -353,6 +355,8 @@ impl NativeRuntime {
                 self.dispatch_wayland_and_input(
                     &mut cycle,
                     operation_plan.service_input,
+                    operation_plan.service_hardware_input,
+                    operation_plan.service_keyboard_repeat,
                     operation_plan.dispatch_wayland_read_side,
                 )?
             } else {
@@ -779,7 +783,7 @@ impl NativeRuntime {
     ) -> NativeResult<NativeWaylandInputDispatchOutcome> {
         let baseline = cycle.microturn_baseline();
 
-        let outcome = self.dispatch_wayland_and_input(cycle, true, false)?;
+        let outcome = self.dispatch_wayland_and_input(cycle, true, true, false, false)?;
         cycle.merge_input_microturn(baseline);
         Ok(outcome)
     }

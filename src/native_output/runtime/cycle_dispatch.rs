@@ -33,6 +33,11 @@ fn input_requires_full_server_progression(
     may_change_pointer_constraints && !dispatch_wayland
 }
 
+#[inline]
+const fn should_service_keyboard_repeat(service_due: bool, input_backlog_pending: bool) -> bool {
+    service_due && !input_backlog_pending
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativePreReadInputDecision {
     ReadWayland,
@@ -656,16 +661,28 @@ impl NativeRuntime {
             .take()
             .expect("keyboard commit readiness checked above");
         let response = match self.server.commit_keyboard_configuration() {
-            Ok(mutation) => match serde_json::to_value(mutation.snapshot) {
-                Ok(snapshot) => ControlResponse::success(pending.request_id, snapshot),
-                Err(_) => ControlResponse::failure(
-                    pending.request_id,
-                    ControlError::new(
-                        ControlErrorCode::Internal,
-                        "keyboard configuration snapshot serialization failed",
+            Ok(mutation) => {
+                if mutation.repeat_changed {
+                    let configuration = &mutation.snapshot.configuration;
+                    self.input_state.update_keyboard_repeat_config(
+                        KeyboardRepeatConfig::new(
+                            configuration.repeat_rate,
+                            configuration.repeat_delay,
+                        ),
+                        monotonic_now_ns()?,
+                    );
+                }
+                match serde_json::to_value(mutation.snapshot) {
+                    Ok(snapshot) => ControlResponse::success(pending.request_id, snapshot),
+                    Err(_) => ControlResponse::failure(
+                        pending.request_id,
+                        ControlError::new(
+                            ControlErrorCode::Internal,
+                            "keyboard configuration snapshot serialization failed",
+                        ),
                     ),
-                ),
-            },
+                }
+            }
             Err(error) => {
                 self.server.abort_keyboard_configuration();
                 keyboard_configuration_failure(pending.request_id, error)
@@ -1945,9 +1962,13 @@ impl NativeRuntime {
         &mut self,
         cycle: &mut NativeCycleState,
         service_input: bool,
+        service_hardware_input: bool,
+        service_keyboard_repeat: bool,
         dispatch_wayland: bool,
     ) -> NativeResult<NativeWaylandInputDispatchOutcome> {
-        let mut service_input = service_input;
+        let mut service_input = service_input || service_hardware_input || service_keyboard_repeat;
+        let mut service_hardware_input = service_hardware_input;
+        let keyboard_repeat_generation = self.input_state.keyboard_repeat_generation();
         let xwayland_app_environment = self.xwayland.normal_app_environment();
         let perf = self.perf;
         let Self {
@@ -2067,7 +2088,7 @@ impl NativeRuntime {
         if let Some(start_ns) = cursor_sync_start_at_ns {
             pointer_timing.record_cursor_sync(start_ns, monotonic_now_ns()?);
         }
-        let pre_read_probe_performed = dispatch_wayland && !service_input;
+        let pre_read_probe_performed = dispatch_wayland && !service_hardware_input;
         let pre_read_probe_start = if pre_read_probe_performed && timing_enabled {
             Some(capture_timing_point()?)
         } else {
@@ -2077,12 +2098,19 @@ impl NativeRuntime {
         // Query the backend's exact input registrations rather than the
         // bounded global reactor snapshot, which may omit a ready input
         // source under unrelated-fd saturation.
+        let mut pre_read_hardware_input = service_hardware_input;
         let pre_read_input_promoted = matches!(
-            promote_native_input_before_wayland_read(dispatch_wayland, &mut service_input, || {
-                input_devices.ready_nonblocking()
-            },)?,
+            promote_native_input_before_wayland_read(
+                dispatch_wayland,
+                &mut pre_read_hardware_input,
+                || { input_devices.ready_nonblocking() },
+            )?,
             NativePreReadInputDecision::PromoteInputEpoch
         );
+        if pre_read_hardware_input {
+            service_hardware_input = true;
+            service_input = true;
+        }
         let pre_read_probe_end = if pre_read_probe_performed && timing_enabled {
             Some(capture_timing_point()?)
         } else {
@@ -2101,7 +2129,7 @@ impl NativeRuntime {
         // that create or alter input resources cannot reinterpret its events.
         let pending_constraint_requests_before_read =
             server.pointer_constraint_backend_request_count();
-        if dispatch_wayland && !service_input {
+        if dispatch_wayland && !service_hardware_input {
             let wayland_read_start = timing_enabled.then(capture_timing_point).transpose()?;
             let tick_start = Instant::now();
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
@@ -2118,7 +2146,7 @@ impl NativeRuntime {
         }
         let mut pending_constraint_requests_after_read =
             server.pointer_constraint_backend_request_count();
-        if dispatch_wayland && !service_input {
+        if dispatch_wayland && !service_hardware_input {
             native_pointer_debug_log_lazy(|| {
                 format!(
                     "wayland.input_read dispatch after_epoch=false pending={} queued_during_read={}",
@@ -2132,150 +2160,259 @@ impl NativeRuntime {
         let mut completed_input_epoch = None;
         if service_input {
             #[cfg(test)]
-            native_io_recorder.record(NativeIoOperation::RawInputAction);
+            if service_hardware_input {
+                native_io_recorder.record(NativeIoOperation::RawInputAction);
+            }
             if timing_enabled {
                 pointer_timing.record_input_service_start(monotonic_now_ns()?);
             }
             server.begin_native_input_batch();
-            let continuation = input_epoch.backlog_pending();
-            let input_epoch_id = input_epoch.begin(continuation);
-            let constraint = pointer_constraint_backend
-                .active
-                .as_ref()
-                .map(|constraint| (constraint.id, constraint.mode));
-            input_state
-                .set_native_input_epoch_debug(Some(input_epoch_id), constraint.map(|(id, _)| id));
-            native_pointer_debug_log_lazy(|| {
-                format!(
-                    "input.semantic_epoch begin id={} continuation={} constraint={:?} backlog_pending={} wayland_read_deferred={}",
-                    input_epoch_id,
-                    continuation,
-                    constraint,
-                    input_epoch.backlog_pending(),
-                    true,
-                )
-            });
-            let input_drain_start = Instant::now();
-            let libinput_dispatch_start_at_ns = (timing_enabled
-                && !continuation
-                && matches!(
+            if service_hardware_input {
+                let continuation = input_epoch.backlog_pending();
+                let input_epoch_id = input_epoch.begin(continuation);
+                let constraint = pointer_constraint_backend
+                    .active
+                    .as_ref()
+                    .map(|constraint| (constraint.id, constraint.mode));
+                input_state.set_native_input_epoch_debug(
+                    Some(input_epoch_id),
+                    constraint.map(|(id, _)| id),
+                );
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "input.semantic_epoch begin id={} continuation={} constraint={:?} backlog_pending={} wayland_read_deferred={}",
+                        input_epoch_id,
+                        continuation,
+                        constraint,
+                        input_epoch.backlog_pending(),
+                        true,
+                    )
+                });
+                let input_drain_start = Instant::now();
+                let libinput_dispatch_start_at_ns = (timing_enabled
+                    && !continuation
+                    && matches!(
+                        input_devices.kind(),
+                        NativeInputBackendKind::LibseatLibinputUdev
+                            | NativeInputBackendKind::DirectLibinputUdev
+                    ))
+                .then(monotonic_now_ns)
+                .transpose()?;
+                let dispatch_succeeded = continuation || input_devices.begin_semantic_epoch();
+                if let Some(start_ns) = libinput_dispatch_start_at_ns {
+                    pointer_timing.record_libinput_dispatch(start_ns, monotonic_now_ns()?);
+                }
+                let queue_drain_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+                let queue_drain_start = Instant::now();
+                if dispatch_succeeded {
+                    input_devices.drain_epoch_chunk_into(input_batch);
+                } else {
+                    input_batch.raw.clear();
+                    input_batch.coalesced.clear();
+                    input_batch.budget_exhausted = false;
+                }
+                let queue_drain_end_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+                if let Some(start_ns) = queue_drain_start_at_ns {
+                    pointer_timing.record_queue_drain(
+                        start_ns,
+                        queue_drain_end_at_ns.expect("timing end recorded with timing start"),
+                    );
+                    pointer_timing.record_native_batch_materialized(
+                        queue_drain_end_at_ns.expect("timing end recorded with timing start"),
+                    );
+                }
+                input_drain_us = elapsed_micros(input_drain_start);
+                raw_input_events = input_batch.raw.len();
+                // The backend state captured here is authoritative for every event in
+                // this epoch. Protocol progress below may queue a new transition, but
+                // it cannot change the native semantics of this materialized batch.
+                for _ in 0..raw_input_events {
+                    render_telemetry
+                        .resource_efficiency
+                        .record_raw_input_event();
+                }
+                input_event_timestamp_usec = matches!(
                     input_devices.kind(),
                     NativeInputBackendKind::LibseatLibinputUdev
                         | NativeInputBackendKind::DirectLibinputUdev
-                ))
-            .then(monotonic_now_ns)
-            .transpose()?;
-            let dispatch_succeeded = continuation || input_devices.begin_semantic_epoch();
-            if let Some(start_ns) = libinput_dispatch_start_at_ns {
-                pointer_timing.record_libinput_dispatch(start_ns, monotonic_now_ns()?);
-            }
-            let queue_drain_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
-            let queue_drain_start = Instant::now();
-            if dispatch_succeeded {
-                input_devices.drain_epoch_chunk_into(input_batch);
-            } else {
-                input_batch.raw.clear();
-                input_batch.coalesced.clear();
-                input_batch.budget_exhausted = false;
-            }
-            let queue_drain_end_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
-            if let Some(start_ns) = queue_drain_start_at_ns {
-                pointer_timing.record_queue_drain(
-                    start_ns,
-                    queue_drain_end_at_ns.expect("timing end recorded with timing start"),
-                );
-                pointer_timing.record_native_batch_materialized(
-                    queue_drain_end_at_ns.expect("timing end recorded with timing start"),
-                );
-            }
-            input_drain_us = elapsed_micros(input_drain_start);
-            raw_input_events = input_batch.raw.len();
-            // The backend state captured here is authoritative for every event in
-            // this epoch. Protocol progress below may queue a new transition, but
-            // it cannot change the native semantics of this materialized batch.
-            for _ in 0..raw_input_events {
-                render_telemetry
-                    .resource_efficiency
-                    .record_raw_input_event();
-            }
-            input_event_timestamp_usec = matches!(
-                input_devices.kind(),
-                NativeInputBackendKind::LibseatLibinputUdev
-                    | NativeInputBackendKind::DirectLibinputUdev
-            )
-            .then(|| {
-                input_batch
+                )
+                .then(|| {
+                    input_batch
+                        .raw
+                        .iter()
+                        .filter_map(|event| event.timestamp_usec())
+                        .max()
+                })
+                .flatten();
+                let oldest_input_timestamp_usec = input_batch
                     .raw
                     .iter()
                     .filter_map(|event| event.timestamp_usec())
-                    .max()
-            })
-            .flatten();
-            let oldest_input_timestamp_usec = input_batch
-                .raw
-                .iter()
-                .filter_map(|event| event.timestamp_usec())
-                .min();
-            let newest_input_timestamp_usec = input_batch
-                .raw
-                .iter()
-                .filter_map(|event| event.timestamp_usec())
-                .max();
-            input_batch.coalesce_pointer_motion_events();
-            coalesced_input_events = input_batch.coalesced.len();
-            if input_batch
-                .coalesced
-                .iter()
-                .copied()
-                .any(NativeHardwareInputEvent::is_meaningful_user_activity)
-            {
-                server.notify_user_activity();
-            }
-            let timing_batch = NativePointerTimingBatch {
-                raw_events: raw_input_events as u32,
-                coalesced_events: coalesced_input_events as u32,
-                oldest_hardware_timestamp_us: oldest_input_timestamp_usec,
-                newest_hardware_timestamp_us: newest_input_timestamp_usec,
-            };
-            if timing_enabled {
-                pointer_timing.observe_first_batch(timing_batch, monotonic_now_ns()?);
-                if pre_read_input_promoted {
-                    pre_read_observation.batch = Some(timing_batch);
+                    .min();
+                let newest_input_timestamp_usec = input_batch
+                    .raw
+                    .iter()
+                    .filter_map(|event| event.timestamp_usec())
+                    .max();
+                input_batch.coalesce_pointer_motion_events();
+                coalesced_input_events = input_batch.coalesced.len();
+                if input_batch
+                    .coalesced
+                    .iter()
+                    .copied()
+                    .any(NativeHardwareInputEvent::is_meaningful_user_activity)
+                {
+                    server.notify_user_activity();
+                }
+                let timing_batch = NativePointerTimingBatch {
+                    raw_events: raw_input_events as u32,
+                    coalesced_events: coalesced_input_events as u32,
+                    oldest_hardware_timestamp_us: oldest_input_timestamp_usec,
+                    newest_hardware_timestamp_us: newest_input_timestamp_usec,
+                };
+                if timing_enabled {
+                    pointer_timing.observe_first_batch(timing_batch, monotonic_now_ns()?);
+                    if pre_read_input_promoted {
+                        pre_read_observation.batch = Some(timing_batch);
+                    }
+                }
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "input.semantic_epoch batch id={:?} raw={} coalesced={} oldest_ts_us={:?} newest_ts_us={:?} budget_exhausted={} continuation={}",
+                        input_epoch_id,
+                        raw_input_events,
+                        coalesced_input_events,
+                        oldest_input_timestamp_usec,
+                        newest_input_timestamp_usec,
+                        input_batch.budget_exhausted,
+                        input_batch.budget_exhausted,
+                    )
+                });
+                for _ in 0..coalesced_input_events {
+                    render_telemetry
+                        .resource_efficiency
+                        .record_coalesced_input_event();
+                }
+                for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
+                    let may_change_pointer_constraints = event.may_change_pointer_constraints();
+                    let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
+                        server.keyboard_shortcut_inhibition_snapshot(),
+                    );
+                    effect.append(
+                        input_state.handle_hardware_input_event_at(event, monotonic_now_ns()?),
+                    );
+                    if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
+                        render_telemetry.resource_efficiency.record_pointer_sample();
+                    }
+                    let effect_requested_redraw = effect.redraw_requested;
+                    let cursor_visible =
+                        resolve_native_cursor_for_server(server, input_state).visible;
+                    if let Err(error) = apply_cursor_position(
+                        atomic_cursor,
+                        legacy_cursor,
+                        effect.cursor_position,
+                        cursor_visible,
+                        *cursor_preference,
+                        cursor_render_mode,
+                        perf,
+                    ) {
+                        if *cursor_preference == NativeCursorPreference::Hardware {
+                            let shutdown_result = acquire_watches.shutdown(event_loop);
+                            let _ = server.end_native_input_batch();
+                            shutdown_result?;
+                            return Err(error.into());
+                        }
+                        let _ = server.end_native_input_batch();
+                        return Err(error.into());
+                    }
+                    let application = match apply_native_input_effect(
+                        effect,
+                        NativeInputApplyContext {
+                            server,
+                            perf,
+                            resize_perf,
+                            cursor_mode: *cursor_render_mode,
+                            app_gpu_policy: *effective_app_gpu_policy,
+                            process_supervisor,
+                            xwayland: xwayland_app_environment,
+                        },
+                    ) {
+                        Ok(application) => application,
+                        Err(error) => {
+                            let _ = server.end_native_input_batch();
+                            return Err(error);
+                        }
+                    };
+                    vt_switch_requested = vt_switch_requested.or(application.vt_switch_requested);
+                    if application.exit_requested {
+                        cycle.shutdown_requested = true;
+                        break;
+                    }
+                    if let Some(launch) = application.launch {
+                        log_native_app_spawn(perf, &launch);
+                        pending_launches.push_back(launch);
+                    }
+                    if effect_requested_redraw && !application.redraw_requested {
+                        skipped_input_repaints = skipped_input_repaints.saturating_add(1);
+                    }
+                    redraw_requested |= application.redraw_requested;
+                    let interaction_reconciled = reconcile_trigger_liveness(
+                        server,
+                        input_state,
+                        TriggerLivenessPoint::Event(event_index),
+                    );
+                    redraw_requested |= interaction_reconciled;
+                    // A semantic input epoch cannot perform a client read-side
+                    // dispatch. Remember the narrow native-only progression request
+                    // and service it once after the epoch has ended.
+                    if input_requires_full_server_progression(
+                        dispatch_wayland,
+                        may_change_pointer_constraints,
+                    ) {
+                        input_epoch.request_deferred_wayland_progression();
+                        native_pointer_debug_log_lazy(|| {
+                            format!(
+                                "wayland.input_read deferred epoch={:?} reason=protocol_progression",
+                                input_epoch.active_id(),
+                            )
+                        });
+                    }
+                }
+                let interaction_reconciled =
+                    reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
+                redraw_requested |= interaction_reconciled;
+                completed_input_epoch = Some(input_epoch_id);
+                input_epoch.finish(input_batch.budget_exhausted);
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "input.semantic_epoch end id={:?} raw={} coalesced={} budget_exhausted={} backlog_pending={}",
+                        completed_input_epoch,
+                        raw_input_events,
+                        coalesced_input_events,
+                        input_batch.budget_exhausted,
+                        input_epoch.backlog_pending(),
+                    )
+                });
+                if !input_epoch.backlog_pending() {
+                    input_state.set_native_input_epoch_debug(None, None);
                 }
             }
-            native_pointer_debug_log_lazy(|| {
-                format!(
-                    "input.semantic_epoch batch id={:?} raw={} coalesced={} oldest_ts_us={:?} newest_ts_us={:?} budget_exhausted={} continuation={}",
-                    input_epoch_id,
-                    raw_input_events,
-                    coalesced_input_events,
-                    oldest_input_timestamp_usec,
-                    newest_input_timestamp_usec,
-                    input_batch.budget_exhausted,
-                    input_batch.budget_exhausted,
-                )
-            });
-            for _ in 0..coalesced_input_events {
-                render_telemetry
-                    .resource_efficiency
-                    .record_coalesced_input_event();
-            }
-            for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
-                let may_change_pointer_constraints = event.may_change_pointer_constraints();
-                let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
-                    server.keyboard_shortcut_inhibition_snapshot(),
-                );
-                effect.append(input_state.handle_hardware_input_event(event));
-                if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
-                    render_telemetry.resource_efficiency.record_pointer_sample();
-                }
+            if should_service_keyboard_repeat(
+                service_keyboard_repeat,
+                input_epoch.backlog_pending(),
+            ) {
+                let inhibition = server.keyboard_shortcut_inhibition_snapshot();
+                let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(inhibition);
+                effect.append(input_state.service_keyboard_repeat_if_unchanged(
+                    monotonic_now_ns()?,
+                    keyboard_repeat_generation,
+                ));
                 let effect_requested_redraw = effect.redraw_requested;
-                let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
                 if let Err(error) = apply_cursor_position(
                     atomic_cursor,
                     legacy_cursor,
                     effect.cursor_position,
-                    cursor_visible,
+                    resolve_native_cursor_for_server(server, input_state).visible,
                     *cursor_preference,
                     cursor_render_mode,
                     perf,
@@ -2310,7 +2447,6 @@ impl NativeRuntime {
                 vt_switch_requested = vt_switch_requested.or(application.vt_switch_requested);
                 if application.exit_requested {
                     cycle.shutdown_requested = true;
-                    break;
                 }
                 if let Some(launch) = application.launch {
                     log_native_app_spawn(perf, &launch);
@@ -2320,45 +2456,8 @@ impl NativeRuntime {
                     skipped_input_repaints = skipped_input_repaints.saturating_add(1);
                 }
                 redraw_requested |= application.redraw_requested;
-                let interaction_reconciled = reconcile_trigger_liveness(
-                    server,
-                    input_state,
-                    TriggerLivenessPoint::Event(event_index),
-                );
-                redraw_requested |= interaction_reconciled;
-                // A semantic input epoch cannot perform a client read-side
-                // dispatch. Remember the narrow native-only progression request
-                // and service it once after the epoch has ended.
-                if input_requires_full_server_progression(
-                    dispatch_wayland,
-                    may_change_pointer_constraints,
-                ) {
-                    input_epoch.request_deferred_wayland_progression();
-                    native_pointer_debug_log_lazy(|| {
-                        format!(
-                            "wayland.input_read deferred epoch={:?} reason=protocol_progression",
-                            input_epoch.active_id(),
-                        )
-                    });
-                }
-            }
-            let interaction_reconciled =
-                reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
-            redraw_requested |= interaction_reconciled;
-            completed_input_epoch = Some(input_epoch_id);
-            input_epoch.finish(input_batch.budget_exhausted);
-            native_pointer_debug_log_lazy(|| {
-                format!(
-                    "input.semantic_epoch end id={:?} raw={} coalesced={} budget_exhausted={} backlog_pending={}",
-                    completed_input_epoch,
-                    raw_input_events,
-                    coalesced_input_events,
-                    input_batch.budget_exhausted,
-                    input_epoch.backlog_pending(),
-                )
-            });
-            if !input_epoch.backlog_pending() {
-                input_state.set_native_input_epoch_debug(None, None);
+                redraw_requested |=
+                    reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
             }
             let cursor_sync_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
             if let Err(error) = synchronize_cursor_state_for_server(
@@ -2396,8 +2495,8 @@ impl NativeRuntime {
         } else {
             false
         };
-        let input_backlog_continuation = service_input && input_epoch.backlog_pending();
-        let should_dispatch_after_input = service_input
+        let input_backlog_continuation = service_hardware_input && input_epoch.backlog_pending();
+        let should_dispatch_after_input = service_hardware_input
             && !input_backlog_continuation
             && (dispatch_wayland || deferred_wayland_progression);
         if should_dispatch_after_input {
@@ -2574,6 +2673,7 @@ mod tests {
         material_program_parameter_set_failure_response, material_program_selection_response,
         material_program_set_failure_response, material_set_failure_response,
         material_snapshot_response, promote_native_input_before_wayland_read,
+        should_service_keyboard_repeat,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
@@ -3389,6 +3489,13 @@ mod tests {
     fn constraint_sensitive_input_keeps_its_narrow_follow_up() {
         assert!(input_requires_full_server_progression(false, true));
         assert!(!input_requires_full_server_progression(true, true));
+    }
+
+    #[test]
+    fn hardware_backlog_defers_keyboard_repeat_service() {
+        assert!(!should_service_keyboard_repeat(true, true));
+        assert!(should_service_keyboard_repeat(true, false));
+        assert!(!should_service_keyboard_repeat(false, false));
     }
 
     #[test]

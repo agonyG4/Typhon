@@ -35,9 +35,10 @@ pub(crate) enum NativeDeadlineOwner {
     SurfacePacing,
     DmabufRetry,
     OutputConfiguration,
+    KeyboardRepeat,
 }
 
-const DEADLINE_OWNER_COUNT: usize = 10;
+const DEADLINE_OWNER_COUNT: usize = 11;
 
 const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
     match owner {
@@ -51,6 +52,7 @@ const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
         NativeDeadlineOwner::SurfacePacing => 7,
         NativeDeadlineOwner::DmabufRetry => 8,
         NativeDeadlineOwner::OutputConfiguration => 9,
+        NativeDeadlineOwner::KeyboardRepeat => 10,
     }
 }
 
@@ -102,6 +104,7 @@ pub(crate) struct NativeWakePlanInputs {
     pub(crate) surface_pacing_deadline_ns: Option<u64>,
     pub(crate) dmabuf_retry_deadline_ns: Option<u64>,
     pub(crate) output_configuration_deadline_ns: Option<u64>,
+    pub(crate) keyboard_repeat_deadline_ns: Option<u64>,
     pub(crate) input_backlog: bool,
     pub(crate) astrea_publication: bool,
     pub(crate) commit_timing_planning: bool,
@@ -136,6 +139,7 @@ pub(crate) struct NativeWakeAuthorityMetrics {
     pub(crate) deadline_owner_surface_pacing: u64,
     pub(crate) deadline_owner_dmabuf_retry: u64,
     pub(crate) deadline_owner_output_configuration: u64,
+    pub(crate) deadline_owner_keyboard_repeat: u64,
 }
 
 impl NativeWakeAuthorityMetrics {
@@ -242,6 +246,10 @@ impl NativeWakeAuthorityMetrics {
                         self.deadline_owner_output_configuration =
                             self.deadline_owner_output_configuration.saturating_add(1)
                     }
+                    NativeDeadlineOwner::KeyboardRepeat => {
+                        self.deadline_owner_keyboard_repeat =
+                            self.deadline_owner_keyboard_repeat.saturating_add(1)
+                    }
                 }
             }
             None => {
@@ -267,7 +275,7 @@ impl NativeWakeAuthorityMetrics {
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
         format!(
-            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} stale_output_configuration={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} past_output_configuration={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={} deadline_owner_output_configuration={}",
+            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} stale_output_configuration={} stale_keyboard_repeat={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} past_output_configuration={} past_keyboard_repeat={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={} deadline_owner_output_configuration={} deadline_owner_keyboard_repeat={}",
             self.runtime_timer_arms,
             self.runtime_timer_disarms,
             event_loop.continuation_requests(),
@@ -303,6 +311,8 @@ impl NativeWakeAuthorityMetrics {
                 [deadline_owner_index(NativeDeadlineOwner::DmabufRetry)],
             self.stale_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::OutputConfiguration)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat)],
             self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::FrameScheduler)],
             self.past_deadline_arms_by_owner
@@ -323,6 +333,8 @@ impl NativeWakeAuthorityMetrics {
                 [deadline_owner_index(NativeDeadlineOwner::DmabufRetry)],
             self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::OutputConfiguration)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat)],
             self.deadline_owner_frame_scheduler,
             self.deadline_owner_presentation_target,
             self.deadline_owner_atomic_watchdog,
@@ -333,6 +345,7 @@ impl NativeWakeAuthorityMetrics {
             self.deadline_owner_surface_pacing,
             self.deadline_owner_dmabuf_retry,
             self.deadline_owner_output_configuration,
+            self.deadline_owner_keyboard_repeat,
         )
     }
 }
@@ -372,6 +385,15 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
             .atomic_commit_watchdog_deadline_ns
             .map(|at_ns| NativeDeadline {
                 owner: NativeDeadlineOwner::AtomicCommitWatchdog,
+                at_ns,
+            }),
+    );
+    deadline = earliest_deadline(
+        deadline,
+        inputs
+            .keyboard_repeat_deadline_ns
+            .map(|at_ns| NativeDeadline {
+                owner: NativeDeadlineOwner::KeyboardRepeat,
                 at_ns,
             }),
     );
@@ -641,6 +663,90 @@ mod tests {
                 at_ns: 8_000_000_000,
             })
         );
+    }
+
+    #[test]
+    fn keyboard_repeat_deadline_uses_shared_earliest_deadline_arbitration() {
+        let repeat_first = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 0,
+            primary_deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 100,
+            }),
+            keyboard_repeat_deadline_ns: Some(80),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            repeat_first.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::KeyboardRepeat,
+                at_ns: 80,
+            })
+        );
+
+        let presentation_first = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 0,
+            primary_deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 80,
+            }),
+            keyboard_repeat_deadline_ns: Some(100),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            presentation_first.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 80,
+            })
+        );
+
+        let control_first = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 0,
+            control_timeout_deadline_ns: Some(100),
+            keyboard_repeat_deadline_ns: Some(80),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            control_first.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::KeyboardRepeat,
+                at_ns: 80,
+            })
+        );
+
+        let reconsidered_presentation = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 80,
+            primary_deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 100,
+            }),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            reconsidered_presentation.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn keyboard_repeat_deadlines_are_counted_in_wake_authority_metrics() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 80,
+            keyboard_repeat_deadline_ns: Some(80),
+            ..NativeWakePlanInputs::default()
+        });
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        metrics.observe_plan(plan, 80, None, None);
+        let index = deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat);
+
+        assert_eq!(DEADLINE_OWNER_COUNT, 11);
+        assert_eq!(metrics.deadline_owner_keyboard_repeat, 1);
+        assert_eq!(metrics.past_deadline_arms_by_owner[index], 1);
+        assert_eq!(metrics.stale_deadline_arms_by_owner[index], 0);
     }
 
     #[test]

@@ -100,6 +100,8 @@ pub(crate) enum AstreaBindingMatch {
     Consumed {
         action: BindingAction,
         phase: AstreaShortcutPhase,
+        repeat: RepeatPolicy,
+        inhibition: InhibitionPolicy,
     },
     Pass,
 }
@@ -156,6 +158,8 @@ impl AstreaBindingManager {
         };
         let trigger = binding.trigger;
         let action = binding.action.clone();
+        let repeat = binding.repeat;
+        let inhibition = binding.inhibition;
         let phase = shortcut_phase(trigger, repeated);
         if matches!(
             action,
@@ -165,7 +169,12 @@ impl AstreaBindingManager {
         {
             self.active_sequences.alt_tab_active = true;
         }
-        AstreaBindingMatch::Consumed { action, phase }
+        AstreaBindingMatch::Consumed {
+            action,
+            phase,
+            repeat,
+            inhibition,
+        }
     }
 
     pub(crate) fn handle_pointer_button(
@@ -185,6 +194,8 @@ impl AstreaBindingManager {
             .map(|binding| AstreaBindingMatch::Consumed {
                 action: binding.action.clone(),
                 phase: shortcut_phase(binding.trigger, false),
+                repeat: binding.repeat,
+                inhibition: binding.inhibition,
             })
             .unwrap_or(AstreaBindingMatch::Pass)
     }
@@ -203,6 +214,8 @@ impl AstreaBindingManager {
                     name: "alt_tab_commit".to_string(),
                 },
                 phase: AstreaShortcutPhase::Pressed,
+                repeat: RepeatPolicy::Disabled,
+                inhibition: InhibitionPolicy::Respect,
             };
         }
         AstreaBindingMatch::Pass
@@ -507,6 +520,8 @@ mod tests {
             AstreaBindingMatch::Consumed {
                 action: BindingAction::SwitchWorkspace(WorkspaceId::new(10).unwrap()),
                 phase: AstreaShortcutPhase::Pressed,
+                repeat: RepeatPolicy::Disabled,
+                inhibition: InhibitionPolicy::Respect,
             }
         );
         assert_eq!(
@@ -524,6 +539,8 @@ mod tests {
             AstreaBindingMatch::Consumed {
                 action: BindingAction::MoveFocusedWindowToWorkspace(WorkspaceId::new(4).unwrap(),),
                 phase: AstreaShortcutPhase::Pressed,
+                repeat: RepeatPolicy::Disabled,
+                inhibition: InhibitionPolicy::Respect,
             }
         );
     }
@@ -542,6 +559,8 @@ mod tests {
             AstreaBindingMatch::Consumed {
                 action: BindingAction::LaunchSessionCommand(1),
                 phase: AstreaShortcutPhase::Pressed,
+                repeat: RepeatPolicy::Disabled,
+                inhibition: InhibitionPolicy::Bypass,
             }
         );
     }
@@ -554,6 +573,8 @@ mod tests {
             AstreaBindingMatch::Consumed {
                 action: BindingAction::ToggleDefaultSpecialWorkspace,
                 phase: AstreaShortcutPhase::Pressed,
+                repeat: RepeatPolicy::Disabled,
+                inhibition: InhibitionPolicy::Respect,
             }
         );
         assert_eq!(
@@ -571,6 +592,8 @@ mod tests {
             AstreaBindingMatch::Consumed {
                 action: BindingAction::MoveFocusedWindowToOrFromSpecialWorkspace,
                 phase: AstreaShortcutPhase::Pressed,
+                repeat: RepeatPolicy::Disabled,
+                inhibition: InhibitionPolicy::Respect,
             }
         );
         assert_eq!(

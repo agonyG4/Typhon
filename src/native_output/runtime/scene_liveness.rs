@@ -48,6 +48,11 @@ impl NativeRuntime {
             output_configuration_deadline_ns: self.output_configuration_transactions.deadline_ns(),
             surface_pacing_deadline_ns: surface_pacing_deadline,
             dmabuf_retry_deadline_ns: dmabuf_retry_deadline,
+            keyboard_repeat_deadline_ns: self
+                .shutdown
+                .is_running()
+                .then(|| self.input_state.keyboard_repeat_deadline_ns())
+                .flatten(),
             input_backlog: self.input_epoch.backlog_pending(),
             astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning: self.server.has_pending_commit_timing_planning(),
@@ -80,6 +85,7 @@ impl NativeRuntime {
                     NativeDeadlineOwner::SurfacePacing => "deadline:surface_pacing",
                     NativeDeadlineOwner::DmabufRetry => "deadline:dmabuf_retry",
                     NativeDeadlineOwner::OutputConfiguration => "deadline:output_configuration",
+                    NativeDeadlineOwner::KeyboardRepeat => "deadline:keyboard_repeat",
                 }
             } else if plan
                 .continuation

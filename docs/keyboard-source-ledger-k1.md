@@ -84,19 +84,20 @@ existing `input::Device` handle. The reserved source capacity avoids first-key
 allocation for the normal one-to-four-device case; additional source-table
 growth and source-removal release lists may allocate on their infrequent paths.
 
-## Temporary raw-repeat compatibility
+## Repeat compatibility status
 
-Raw evdev `EV_KEY` value `2` remains a temporary compatibility path for the
-existing `RepeatPolicy` binding behavior. It does not mutate source ownership
-or produce an XKB physical transition. Libinput continues to supply only
-press/release transitions. This backend difference remains until K2; K1 adds no
-repeat scheduler.
+K2 resolved the temporary raw-repeat compatibility path. Raw evdev `EV_KEY`
+value `2` is discarded during normalization, and compositor shortcut repeat is
+scheduled from aggregate logical key state. Libinput and raw evdev therefore
+share the same compositor repeat authority. Ordinary Wayland clients continue
+to use their `wl_keyboard.repeat_info` settings.
 
 ## K1 boundary
 
 K1 adds source identity, aggregate key ownership, lifecycle reconciliation, and
-regression coverage only. It does not add media or system actions, a symbolic
-binding engine, compositor repeat scheduling, LED synchronization, virtual
+regression coverage. K2 separately adds compositor shortcut repeat. The
+keyboard milestones do not add media or system actions, a symbolic binding
+engine, LED synchronization, virtual
 keyboards, text-input or input-method support, EIS/libei, keyboard settings, or
 Shell integration.
 

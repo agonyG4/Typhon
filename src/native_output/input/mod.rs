@@ -6,6 +6,7 @@ mod bindings;
 mod epoch;
 mod events;
 mod keyboard;
+mod repeat;
 mod routing;
 mod state;
 
@@ -15,5 +16,6 @@ pub(crate) use bindings::*;
 pub(crate) use epoch::*;
 pub(crate) use events::*;
 pub(crate) use keyboard::*;
+pub(crate) use repeat::*;
 pub(crate) use routing::*;
 pub(crate) use state::*;

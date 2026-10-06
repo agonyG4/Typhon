@@ -900,10 +900,6 @@ fn hardware_input_event_from_libinput(
     match event {
         ::input::Event::Keyboard(KeyboardEvent::Key(event)) => {
             let code = u16::try_from(event.key()).ok()?;
-            let value = match event.key_state() {
-                KeyState::Pressed => 1,
-                KeyState::Released => 0,
-            };
             let device = event.device();
             let device_id = keyboard_devices.get(&device).or_else(|| {
                 device
@@ -915,7 +911,7 @@ fn hardware_input_event_from_libinput(
                 NativeKeyboardInputEvent::Key {
                     device: device_id,
                     code,
-                    value,
+                    pressed: event.key_state() == KeyState::Pressed,
                 },
             ))
         }
@@ -1282,6 +1278,7 @@ impl NativeInputDevices {
                 match read_linux_input_event(&mut self.devices[device_index]) {
                     NativeInputRead::Event(event) => {
                         let keyboard_device = if event.type_ == EV_KEY
+                            && event.value != 2
                             && !is_pointer_button(event.code)
                         {
                             let device = &mut self.devices[device_index];

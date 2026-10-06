@@ -25,11 +25,14 @@ pub(crate) struct NativeRuntimeState {
     pub(super) recovery_required: bool,
     pub(super) shutdown_requested: bool,
     pub(super) input_backlog_pending: bool,
+    pub(super) keyboard_repeat_due: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeWorkDomains {
     pub(super) input: bool,
+    hardware_input: bool,
+    keyboard_repeat: bool,
     pub(super) controller: bool,
     pub(super) wayland_protocol: bool,
     pub(super) astrea_publication: bool,
@@ -51,6 +54,8 @@ pub(crate) struct NativeWorkDomains {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeCycleOperationPlan {
     pub(super) service_input: bool,
+    pub(super) service_hardware_input: bool,
+    pub(super) service_keyboard_repeat: bool,
     pub(super) service_controller: bool,
     pub(super) dispatch_wayland_read_side: bool,
     pub(super) service_screen_capture: bool,
@@ -176,6 +181,8 @@ impl NativeWorkDomains {
     pub(super) const fn operation_plan(self) -> NativeCycleOperationPlan {
         NativeCycleOperationPlan {
             service_input: self.input,
+            service_hardware_input: self.hardware_input,
+            service_keyboard_repeat: self.keyboard_repeat,
             service_controller: self.controller,
             dispatch_wayland_read_side: self.wayland_dispatch,
             service_screen_capture: self.screen_capture,
@@ -195,11 +202,13 @@ impl NativeWorkDomains {
 
     pub(super) fn classify(wakeup: &NativeWakeup, state: &NativeRuntimeState) -> Self {
         let reasons = wakeup.reasons;
-        let input = reasons.input()
+        let hardware_input = reasons.input()
             || state.input_backlog_pending
             || wakeup
                 .continuation
                 .contains(NativeContinuationReason::InputBacklog);
+        let keyboard_repeat = state.keyboard_repeat_due;
+        let input = hardware_input || keyboard_repeat;
         let controller = reasons.controller()
             || wakeup
                 .continuation
@@ -258,6 +267,8 @@ impl NativeWorkDomains {
 
         Self {
             input,
+            hardware_input,
+            keyboard_repeat,
             controller,
             wayland_protocol,
             astrea_publication,
@@ -360,6 +371,43 @@ mod tests {
         let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
 
         assert!(!domains.wayland_dispatch);
+    }
+
+    #[test]
+    fn keyboard_repeat_is_input_work_without_hardware_or_output_work() {
+        let repeat_state = NativeRuntimeState {
+            keyboard_repeat_due: true,
+            ..state()
+        };
+        let domains = NativeWorkDomains::classify(&wakeup(0), &repeat_state);
+        let plan = domains.operation_plan();
+
+        assert!(domains.input);
+        assert_eq!(domains.decision().work_class, NativeWorkClass::NoOutputWork);
+        assert!(plan.service_input);
+        assert!(!plan.service_hardware_input);
+        assert!(plan.service_keyboard_repeat);
+        assert!(!plan.dispatch_wayland_read_side);
+        assert!(!plan.service_acquire_and_prepare);
+        assert!(!plan.presentation_due);
+        assert!(!domains.wayland_dispatch);
+        assert!(!domains.scene);
+        assert!(!domains.cursor);
+        assert!(!domains.presentation);
+        assert!(!domains.explicit_sync);
+    }
+
+    #[test]
+    fn hardware_and_due_repeat_share_input_service_with_hardware_enabled() {
+        let repeat_state = NativeRuntimeState {
+            keyboard_repeat_due: true,
+            ..state()
+        };
+        let plan = NativeWorkDomains::classify(&wakeup(INPUT), &repeat_state).operation_plan();
+
+        assert!(plan.service_input);
+        assert!(plan.service_hardware_input);
+        assert!(plan.service_keyboard_repeat);
     }
 
     #[test]

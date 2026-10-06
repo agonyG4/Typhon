@@ -13,7 +13,7 @@ fn native_input_special_shortcuts_are_consumed_press_only_without_key_leak() {
     );
     assert!(toggle.keyboard_events.is_empty());
 
-    let repeat = input.handle_key_event(KEY_S, 2);
+    let repeat = input.service_keyboard_repeat(1_000_000_000);
     assert!(repeat.window_actions.is_empty());
     assert!(repeat.keyboard_events.is_empty());
 
@@ -36,7 +36,7 @@ fn native_input_layout_toggle_is_super_v_exact_press_only_and_inhibition_aware()
     );
     assert!(toggle.keyboard_events.is_empty());
 
-    let repeat = input.handle_key_event(KEY_V, 2);
+    let repeat = input.service_keyboard_repeat(1_000_000_000);
     assert!(repeat.window_actions.is_empty());
     assert!(repeat.keyboard_events.is_empty());
 

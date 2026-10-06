@@ -67,7 +67,7 @@ mod tests {
         let key = NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
             device,
             code: KEY_Q,
-            value: 1,
+            pressed: true,
         });
         let removed =
             NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved { device });

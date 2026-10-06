@@ -1129,7 +1129,18 @@ impl NativeRuntime {
             ]
         });
         let mut frame_renderer = NativeFrameRenderer::with_cursor_image(cursor_image.clone());
-        let input_state = NativeInputState::new(target.width, target.height);
+        let repeat_configuration = server
+            .keyboard_configuration_snapshot()
+            .map_err(|error| io::Error::other(format!("{error:?}")))?
+            .configuration;
+        let input_state = NativeInputState::new_with_repeat_config(
+            target.width,
+            target.height,
+            KeyboardRepeatConfig::new(
+                repeat_configuration.repeat_rate,
+                repeat_configuration.repeat_delay,
+            ),
+        );
         let initial_cursor_visible =
             resolve_native_cursor_for_server(&server, &input_state).visible;
         let cursor_preference = NativeCursorPreference::from_env();

@@ -250,7 +250,7 @@ fn raw_terminal_keyboard_fd_emits_one_source_removal_after_queued_keys() {
             NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
                 device,
                 code: KEY_Q,
-                value: 1,
+                pressed: true,
             }),
             remove_k1_keyboard(device),
         ]
@@ -504,7 +504,7 @@ fn native_input_screenshot_bindings_are_exact_press_only_reserved_actions() {
         }
 
         let pressed = input.handle_key_event(KEY_SYSRQ, 1);
-        let repeated = input.handle_key_event(KEY_SYSRQ, 2);
+        let repeated = input.service_keyboard_repeat(1_000_000_000);
         let released = input.handle_key_event(KEY_SYSRQ, 0);
 
         assert_eq!(input.active_modifier_mask(), modifiers);
@@ -553,8 +553,15 @@ fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
         reserved: false,
     }]);
 
-    let pressed = input.handle_key_event(KEY_Z, 1);
-    let repeated = input.handle_key_event(KEY_Z, 2);
+    let pressed = input.handle_key_event_at(KEY_Z, true, 1_000_000);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), Some(601_000_000));
+    assert!(
+        input
+            .service_keyboard_repeat(600_999_999)
+            .shortcut_events
+            .is_empty()
+    );
+    let repeated = input.service_keyboard_repeat(601_000_000);
 
     assert_eq!(pressed.shortcut_events.len(), 1);
     assert_eq!(
@@ -566,6 +573,11 @@ fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
         repeated.shortcut_events[0].phase,
         AstreaShortcutPhase::Repeated
     );
+    assert_eq!(input.keyboard_repeat_deadline_ns(), Some(641_000_000));
+    assert!(repeated.keyboard_actions.is_empty());
+    assert!(repeated.keyboard_events.is_empty());
+    input.handle_key_event_at(KEY_Z, false, 602_000_000);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
 }
 
 #[test]
@@ -584,8 +596,8 @@ fn native_input_repeat_disabled_shortcut_suppresses_repeat() {
         reserved: false,
     }]);
 
-    let pressed = input.handle_key_event(KEY_Z, 1);
-    let repeated = input.handle_key_event(KEY_Z, 2);
+    let pressed = input.handle_key_event_at(KEY_Z, true, 1_000_000);
+    let repeated = input.service_keyboard_repeat(1_000_000_000);
 
     assert_eq!(pressed.shortcut_events.len(), 1);
     assert_eq!(
@@ -596,16 +608,409 @@ fn native_input_repeat_disabled_shortcut_suppresses_repeat() {
 }
 
 #[test]
-fn native_input_repeat_is_not_a_keyboard_state_transition() {
+fn repeat_enabled_press_uses_zero_delay_on_a_later_service_call() {
+    let mut input =
+        NativeInputState::new_with_repeat_config(320, 200, KeyboardRepeatConfig::new(25, 0));
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+
+    let press = input.handle_key_event_at(KEY_Z, true, 2_000_000);
+    assert_eq!(press.shortcut_events.len(), 1);
+    assert_eq!(press.shortcut_events[0].phase, AstreaShortcutPhase::Pressed);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), Some(2_000_000));
+    let repeat = input.service_keyboard_repeat(2_000_000);
+    assert_eq!(repeat.shortcut_events.len(), 1);
+    assert_eq!(
+        repeat.shortcut_events[0].phase,
+        AstreaShortcutPhase::Repeated
+    );
+}
+
+#[test]
+fn final_hardware_release_wins_over_a_repeat_due_in_the_same_turn() {
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    let press = input.handle_key_event_at(KEY_Z, true, 0);
+    assert_eq!(press.shortcut_events.len(), 1);
+    assert!(input.keyboard_repeat_due(600_000_000));
+
+    let release = input.handle_key_event_at(KEY_Z, false, 600_000_000);
+    assert_eq!(
+        release.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalOnly(
+            NativeKeyboardEvent::new(KEY_Z, false)
+        )]
+    );
+    assert!(
+        input
+            .service_keyboard_repeat(600_000_000)
+            .shortcut_events
+            .is_empty()
+    );
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+}
+
+#[test]
+fn replacement_target_waits_until_a_later_turn_even_when_old_repeat_was_due() {
+    let mut input =
+        NativeInputState::new_with_repeat_config(320, 200, KeyboardRepeatConfig::new(25, 0));
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_Z, true, 10);
+    let due_generation = input.keyboard_repeat_generation();
+    assert!(input.keyboard_repeat_due(10));
+
+    input.handle_key_event_at(KEY_Z, false, 10);
+    input.handle_key_event_at(KEY_Z, true, 10);
+    assert!(input.keyboard_repeat_generation() != due_generation);
+    assert!(
+        input
+            .service_keyboard_repeat_if_unchanged(10, due_generation)
+            .shortcut_events
+            .is_empty()
+    );
+    let next_turn = input.keyboard_repeat_generation();
+    assert_eq!(
+        input
+            .service_keyboard_repeat_if_unchanged(10, next_turn)
+            .shortcut_events
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn zero_repeat_rate_keeps_initial_binding_press_but_never_arms() {
+    let mut input =
+        NativeInputState::new_with_repeat_config(320, 200, KeyboardRepeatConfig::new(0, 600));
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+
+    let press = input.handle_key_event_at(KEY_Z, true, 10);
+    assert_eq!(press.shortcut_events.len(), 1);
+    assert_eq!(press.shortcut_events[0].phase, AstreaShortcutPhase::Pressed);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn aggregate_key_ownership_keeps_one_repeat_until_the_final_source_releases() {
+    let first = k1_keyboard_id(91);
+    let second = k1_keyboard_id(92);
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+
+    let press = input.handle_key_event_from_at(first, KEY_Z, true, 1_000_000);
+    assert_eq!(press.shortcut_events.len(), 1);
+    let deadline = input.keyboard_repeat_deadline_ns();
+    let second_press = input.handle_key_event_from_at(second, KEY_Z, true, 2_000_000);
+    assert!(second_press.keyboard_actions.is_empty());
+    assert_eq!(input.keyboard_repeat_deadline_ns(), deadline);
+
+    let first_release = input.handle_key_event_from_at(first, KEY_Z, false, 3_000_000);
+    assert!(first_release.keyboard_actions.is_empty());
+    assert!(input.keyboard_key_is_logically_pressed(KEY_Z));
+    assert_eq!(input.keyboard_repeat_deadline_ns(), deadline);
+    assert_eq!(
+        input
+            .service_keyboard_repeat(601_000_000)
+            .shortcut_events
+            .len(),
+        1
+    );
+
+    let final_release = input.handle_key_event_from_at(second, KEY_Z, false, 602_000_000);
+    assert_eq!(
+        final_release.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalOnly(
+            NativeKeyboardEvent::new(KEY_Z, false)
+        )]
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_Z));
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn source_removal_preserves_repeat_for_other_owners_and_cancels_the_last_owner() {
+    let first = k1_keyboard_id(93);
+    let second = k1_keyboard_id(94);
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_from_at(first, KEY_Z, true, 1_000_000);
+    input.handle_key_event_from_at(second, KEY_Z, true, 2_000_000);
+
+    let first_removed = input.handle_hardware_input_event(remove_k1_keyboard(first));
+    assert!(first_removed.keyboard_actions.is_empty());
+    assert!(input.keyboard_key_is_logically_pressed(KEY_Z));
+    assert!(input.active_keyboard_repeat().is_some());
+    assert_eq!(
+        input
+            .service_keyboard_repeat(601_000_000)
+            .shortcut_events
+            .len(),
+        1
+    );
+
+    let last_removed = input.handle_hardware_input_event(remove_k1_keyboard(second));
+    assert_eq!(
+        last_removed.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalOnly(
+            NativeKeyboardEvent::new(KEY_Z, false)
+        )]
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_Z));
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn effective_alt_family_remains_repeat_valid_across_left_right_handoff() {
+    let first = k1_keyboard_id(95);
+    let second = k1_keyboard_id(96);
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::ALT,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_from_at(first, KEY_LEFTALT, true, 10);
+    input.handle_key_event_from_at(first, KEY_Z, true, 20);
+    let deadline = input.keyboard_repeat_deadline_ns();
+    assert!(deadline.is_some());
+
+    input.handle_key_event_from_at(second, KEY_RIGHTALT, true, 30);
+    input.handle_key_event_from_at(first, KEY_LEFTALT, false, 40);
+    assert!(input.active_modifier_mask().contains(ModifierMask::ALT));
+    assert_eq!(input.keyboard_repeat_deadline_ns(), deadline);
+    assert_eq!(
+        input
+            .service_keyboard_repeat(deadline.unwrap())
+            .shortcut_events
+            .len(),
+        1
+    );
+
+    input.handle_key_event_from_at(second, KEY_RIGHTALT, false, 50);
+    assert!(!input.active_modifier_mask().contains(ModifierMask::ALT));
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn effective_modifier_mismatch_cancels_repeat_before_it_fires() {
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::SUPER,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_LEFTMETA, true, 10);
+    input.handle_key_event_at(KEY_Z, true, 20);
+    assert!(input.keyboard_repeat_deadline_ns().is_some());
+
+    input.handle_key_event_at(KEY_LEFTCTRL, true, 30);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn repeat_respects_inhibition_and_bypass_is_rechecked_on_a_repeat_only_turn() {
+    let mut respect = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut respect,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    respect.handle_key_event_at(KEY_Z, true, 1);
+    assert!(respect.keyboard_repeat_deadline_ns().is_some());
+    respect
+        .reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    assert_eq!(respect.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        respect
+            .service_keyboard_repeat(1_000_000_000)
+            .shortcut_events
+            .is_empty()
+    );
+
+    let mut bypass = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut bypass,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Bypass,
+    );
+    bypass.handle_key_event_at(KEY_Z, true, 1);
+    bypass.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    assert!(bypass.keyboard_repeat_deadline_ns().is_some());
+    let repeated = bypass.service_keyboard_repeat(600_000_001);
+    assert_eq!(repeated.shortcut_events.len(), 1);
+    assert_eq!(
+        repeated.shortcut_events[0].phase,
+        AstreaShortcutPhase::Repeated
+    );
+}
+
+#[test]
+fn new_logical_non_modifier_press_replaces_or_cancels_repeat_without_resuming_old_target() {
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_Z, true, 1);
+    assert!(input.keyboard_repeat_deadline_ns().is_some());
+
+    input.handle_key_event_at(KEY_A, true, 2);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    input.handle_key_event_at(KEY_A, false, 3);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_Z, false, 4);
+    input.handle_key_event_at(KEY_Z, true, 5);
+    install_repeat_binding(
+        &mut input,
+        KEY_A,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_A, true, 6);
+    assert_eq!(input.active_keyboard_repeat().unwrap().code, KEY_A);
+    input.handle_key_event_at(KEY_A, false, 7);
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn session_clear_discards_repeat_deadline_and_target() {
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_Z, true, 1);
+    assert!(input.keyboard_repeat_deadline_ns().is_some());
+
+    input.clear_pressed_state_for_session_switch();
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(u64::MAX)
+            .shortcut_events
+            .is_empty()
+    );
+    input.handle_key_event_at(KEY_Z, true, 2);
+    assert!(input.keyboard_repeat_deadline_ns().is_some());
+}
+
+#[test]
+fn scheduled_repeat_is_not_a_keyboard_state_transition() {
     let mut input = NativeInputState::new(320, 200);
 
-    let pressed = input.handle_key_event(KEY_Z, 1);
-    let repeated = input.handle_key_event(KEY_Z, 2);
-    let released = input.handle_key_event(KEY_Z, 0);
+    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::Key(KEY_Z),
+        action: BindingAction::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "test_repeat_state".to_string(),
+        },
+        repeat: RepeatPolicy::Enabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+    let pressed = input.handle_key_event_at(KEY_Z, true, 1_000_000);
+    let repeated = input.service_keyboard_repeat(601_000_000);
+    let released = input.handle_key_event_at(KEY_Z, false, 602_000_000);
 
     assert_eq!(
         pressed.keyboard_actions,
-        vec![NativeKeyboardAction::PhysicalAndClient(
+        vec![NativeKeyboardAction::PhysicalOnly(
             NativeKeyboardEvent::new(KEY_Z, true,)
         )]
     );
@@ -613,17 +1018,28 @@ fn native_input_repeat_is_not_a_keyboard_state_transition() {
     assert!(repeated.keyboard_events.is_empty());
     assert_eq!(
         released.keyboard_actions,
-        vec![NativeKeyboardAction::PhysicalAndClient(
+        vec![NativeKeyboardAction::PhysicalOnly(
             NativeKeyboardEvent::new(KEY_Z, false,)
         )]
     );
 }
 
 #[test]
-fn raw_evdev_repeat_notifications_do_not_create_keyboard_actions() {
+fn raw_evdev_repeat_is_dropped_and_only_scheduled_repeat_fires() {
     let mut input = NativeInputState::new(320, 200);
-    let mut action_counts = Vec::new();
     let device = k1_keyboard_id(1);
+    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::Key(KEY_Z),
+        action: BindingAction::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "raw_repeat_guard".to_string(),
+        },
+        repeat: RepeatPolicy::Enabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
 
     for value in [1, 2, 2, 0] {
         let event = LinuxInputEvent {
@@ -635,17 +1051,68 @@ fn raw_evdev_repeat_notifications_do_not_create_keyboard_actions() {
             code: KEY_Z,
             value,
         };
-        let event = NativeHardwareInputEvent::from_linux_event(event, Some(device)).unwrap();
-        action_counts.push(
-            input
-                .handle_hardware_input_event(event)
-                .keyboard_actions
-                .len(),
-        );
-        assert_eq!(input.keyboard_key_is_logically_pressed(KEY_Z), value != 0);
+        let Some(event) = NativeHardwareInputEvent::from_linux_event(event, Some(device)) else {
+            assert_eq!(value, 2);
+            assert!(input.keyboard_key_is_logically_pressed(KEY_Z));
+            continue;
+        };
+        let effect = input.handle_hardware_input_event(event);
+        if value == 1 {
+            assert_eq!(effect.shortcut_events.len(), 1);
+            assert_eq!(input.keyboard_repeat_deadline_ns(), Some(600_000_000));
+        } else {
+            assert_eq!(value, 0);
+            assert!(effect.shortcut_events.is_empty());
+            assert!(!input.keyboard_key_is_logically_pressed(KEY_Z));
+            assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+        }
     }
 
-    assert_eq!(action_counts, vec![1, 0, 0, 1]);
+    assert!(
+        input
+            .service_keyboard_repeat(1_000_000_000)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
+fn raw_kernel_repeat_does_not_allocate_a_keyboard_source_identity() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut devices = NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("test-event"),
+            keyboard_device_id: None,
+        }],
+        false,
+    );
+    let repeat = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_Z,
+        value: 2,
+    };
+    let written = unsafe {
+        libc::write(
+            write.as_raw_fd(),
+            (&repeat as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+
+    assert!(devices.drain_events().is_empty());
+    assert_eq!(devices.devices[0].keyboard_device_id, None);
 }
 
 #[test]
@@ -663,14 +1130,9 @@ fn raw_repeat_from_another_keyboard_does_not_claim_source_ownership() {
         code: KEY_A,
         value: 2,
     };
-    let repeat = NativeHardwareInputEvent::from_linux_event(repeat, Some(second)).unwrap();
+    let repeat = NativeHardwareInputEvent::from_linux_event(repeat, Some(second));
 
-    assert!(
-        input
-            .handle_hardware_input_event(repeat)
-            .keyboard_actions
-            .is_empty()
-    );
+    assert!(repeat.is_none());
     assert_eq!(
         input
             .handle_key_event_from(first, KEY_A, 0)
@@ -684,6 +1146,27 @@ fn raw_repeat_from_another_keyboard_does_not_claim_source_ownership() {
 
 fn k1_keyboard_id(value: u32) -> KeyboardDeviceId {
     KeyboardDeviceId::from_raw(value).expect("K1 test keyboard ids are nonzero")
+}
+
+fn install_repeat_binding(
+    input: &mut NativeInputState,
+    code: u16,
+    modifiers: ModifierMask,
+    repeat: RepeatPolicy,
+    inhibition: InhibitionPolicy,
+) {
+    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+        modifiers,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::Key(code),
+        action: BindingAction::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "test_repeat".to_string(),
+        },
+        repeat,
+        inhibition,
+        reserved: false,
+    }]);
 }
 
 fn remove_k1_keyboard(device: KeyboardDeviceId) -> NativeHardwareInputEvent {
@@ -1163,7 +1646,7 @@ fn native_input_caps_lock_repeat_does_not_create_an_extra_transition() {
     let mut input = NativeInputState::new(320, 200);
 
     let press = input.handle_key_event(58, 1);
-    let repeat = input.handle_key_event(58, 2);
+    let repeat = input.service_keyboard_repeat(1_000_000_000);
     let release = input.handle_key_event(58, 0);
 
     assert_eq!(press.keyboard_actions.len(), 1);
@@ -1560,7 +2043,7 @@ fn native_input_unbound_ctrl_shift_alt_z_forwards_each_modifier_once() {
     let shift = input.handle_key_event(KEY_RIGHTSHIFT, 1);
     let alt = input.handle_key_event(KEY_RIGHTALT, 1);
     let z = input.handle_key_event(KEY_Z, 1);
-    let repeat = input.handle_key_event(KEY_Z, 2);
+    let repeat = input.service_keyboard_repeat(1_000_000_000);
 
     assert_eq!(
         ctrl.keyboard_events,
