@@ -106,8 +106,7 @@ impl NativeInputState {
 
         let was_inhibited = self.keyboard_shortcuts_inhibited;
         self.keyboard_shortcuts_inhibited = snapshot.effective;
-        self.keyboard_repeat
-            .cancel_if_respected_inhibition(snapshot.effective);
+        self.cancel_keyboard_repeat_if_shortcut_inhibited(snapshot);
         let mut effect = NativeInputEffect::default();
         if !was_inhibited && snapshot.effective {
             self.binding_manager
@@ -115,6 +114,14 @@ impl NativeInputState {
             self.replay_deferred_modifiers(&mut effect);
         }
         effect
+    }
+
+    pub(crate) fn cancel_keyboard_repeat_if_shortcut_inhibited(
+        &mut self,
+        snapshot: KeyboardShortcutInhibitionSnapshot,
+    ) {
+        self.keyboard_repeat
+            .cancel_if_respected_inhibition(snapshot.effective);
     }
 
     pub(crate) fn cursor_position(&self) -> (i32, i32) {

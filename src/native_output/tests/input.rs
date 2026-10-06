@@ -918,6 +918,32 @@ fn repeat_respects_inhibition_and_bypass_is_rechecked_on_a_repeat_only_turn() {
 }
 
 #[test]
+fn wayland_inhibition_snapshot_disarms_respected_repeat_immediately() {
+    let mut input = NativeInputState::new(320, 200);
+    install_repeat_binding(
+        &mut input,
+        KEY_Z,
+        ModifierMask::EMPTY,
+        RepeatPolicy::Enabled,
+        InhibitionPolicy::Respect,
+    );
+    input.handle_key_event_at(KEY_Z, true, 1);
+    assert!(input.keyboard_repeat_deadline_ns().is_some());
+
+    input.cancel_keyboard_repeat_if_shortcut_inhibited(KeyboardShortcutInhibitionSnapshot::new(
+        true, 1,
+    ));
+
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert!(
+        input
+            .service_keyboard_repeat(600_000_001)
+            .shortcut_events
+            .is_empty()
+    );
+}
+
+#[test]
 fn new_logical_non_modifier_press_replaces_or_cancels_repeat_without_resuming_old_target() {
     let mut input = NativeInputState::new(320, 200);
     install_repeat_binding(

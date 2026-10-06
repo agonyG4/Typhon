@@ -2134,6 +2134,9 @@ impl NativeRuntime {
             let tick_start = Instant::now();
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
                 server.dispatch_wayland_with_outcome()?;
+            input_state.cancel_keyboard_repeat_if_shortcut_inhibited(
+                server.keyboard_shortcut_inhibition_snapshot(),
+            );
             if wayland_read_start.is_some() {
                 let wayland_read_end = capture_timing_point()?;
                 pre_read_observation.wayland_read_start = wayland_read_start;
@@ -2505,6 +2508,9 @@ impl NativeRuntime {
             let pending_before_read = server.pointer_constraint_backend_request_count();
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
                 server.dispatch_wayland_with_outcome()?;
+            input_state.cancel_keyboard_repeat_if_shortcut_inhibited(
+                server.keyboard_shortcut_inhibition_snapshot(),
+            );
             if wayland_read_start.is_some() {
                 let wayland_read_end = capture_timing_point()?;
                 pre_read_observation.wayland_read_start = wayland_read_start;
