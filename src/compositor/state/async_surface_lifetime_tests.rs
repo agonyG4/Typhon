@@ -33,8 +33,8 @@ fn terminal_surface_tree_transaction_is_discarded_without_watcher_cancel() {
         .expect("frame callback resource");
     node.frame_callbacks.push(callback.clone());
     state
-        .pending_surface_tree_transactions
-        .push(PendingSurfaceTreeTransaction {
+        .surface_transactions
+        .push_pending_tree(PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(101),
             root_surface_id: surface_id,
             nodes: vec![(surface_id, node)],
@@ -62,7 +62,7 @@ fn terminal_surface_tree_transaction_is_discarded_without_watcher_cancel() {
 
     state.commit_ready_surface_tree_transactions();
 
-    assert!(state.pending_surface_tree_transactions.is_empty());
+    assert!(!state.surface_transactions.has_pending_trees());
     assert!(state.renderable_surface(surface_id).is_none());
     assert!(state.pending_acquire_watch_changes.is_empty());
     assert!(callback.is_alive());
@@ -148,8 +148,8 @@ fn terminal_buffer_surface_tree_transaction_releases_owned_buffer_once() {
     }));
     node.frame_callbacks.push(callback.clone());
     state
-        .pending_surface_tree_transactions
-        .push(PendingSurfaceTreeTransaction {
+        .surface_transactions
+        .push_pending_tree(PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(407),
             root_surface_id: surface_id,
             nodes: vec![(surface_id, node)],
@@ -190,7 +190,7 @@ fn terminal_buffer_surface_tree_transaction_releases_owned_buffer_once() {
     assert!(state.mark_acquire_commit_ready(acquire_commit_id, surface_id, &acquire));
     state.commit_ready_surface_tree_transactions();
 
-    assert!(state.pending_surface_tree_transactions.is_empty());
+    assert!(!state.surface_transactions.has_pending_trees());
     assert!(!state.current_surface_buffers.contains_key(&surface_id));
     assert!(state.renderable_surface(surface_id).is_none());
     assert!(!state.surface_publications.contains_key(&surface_id));
@@ -400,8 +400,8 @@ fn commit_timing_only_surface_tree_is_rejected_after_terminal_owner_before_relea
     commit.attachment = Some(PendingSurfaceAttachment::RemoveContent);
     commit.pacing.commit_timing = Some(future);
     state
-        .pending_surface_tree_transactions
-        .push(PendingSurfaceTreeTransaction {
+        .surface_transactions
+        .push_pending_tree(PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(200),
             root_surface_id: surface_id,
             nodes: vec![(surface_id, commit)],
@@ -418,18 +418,26 @@ fn commit_timing_only_surface_tree_is_rejected_after_terminal_owner_before_relea
             received_at: Instant::now(),
         });
 
-    assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+    assert!(
+        !state.transaction_is_ready(
+            state
+                .surface_transactions
+                .pending_tree_at_for_test(0)
+                .expect("queued transaction")
+        )
+    );
     state.mark_client_terminal(owner_client_id);
     state.commit_ready_surface_tree_transactions();
-    assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(state.surface_transactions.pending_tree_count(), 1);
 
-    state.pending_surface_tree_transactions[0].nodes[0]
-        .1
-        .pacing
-        .commit_timing = Some(due);
+    assert!(
+        state
+            .surface_transactions
+            .set_node_commit_timing_for_test(0, 0, Some(due))
+    );
     state.commit_ready_surface_tree_transactions();
 
-    assert!(state.pending_surface_tree_transactions.is_empty());
+    assert!(!state.surface_transactions.has_pending_trees());
     assert!(state.renderable_surface(surface_id).is_none());
     assert!(!state.surface_publications.contains_key(&surface_id));
 }
@@ -462,8 +470,8 @@ fn fifo_only_surface_tree_is_rejected_after_terminal_owner_before_barrier_releas
     commit.attachment = Some(PendingSurfaceAttachment::RemoveContent);
     commit.pacing.fifo_wait_barrier = true;
     state
-        .pending_surface_tree_transactions
-        .push(PendingSurfaceTreeTransaction {
+        .surface_transactions
+        .push_pending_tree(PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(201),
             root_surface_id: surface_id,
             nodes: vec![(surface_id, commit)],
@@ -481,19 +489,29 @@ fn fifo_only_surface_tree_is_rejected_after_terminal_owner_before_barrier_releas
         });
 
     assert!(
-        state.pending_surface_tree_transactions[0]
+        state
+            .surface_transactions
+            .pending_tree_at_for_test(0)
+            .expect("queued transaction")
             .dependencies
             .is_empty()
     );
-    assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+    assert!(
+        !state.transaction_is_ready(
+            state
+                .surface_transactions
+                .pending_tree_at_for_test(0)
+                .expect("queued transaction")
+        )
+    );
     state.mark_client_terminal(owner_client_id);
     state.commit_ready_surface_tree_transactions();
-    assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(state.surface_transactions.pending_tree_count(), 1);
 
     state.active_fifo_barriers.remove(&surface_id);
     state.commit_ready_surface_tree_transactions();
 
-    assert!(state.pending_surface_tree_transactions.is_empty());
+    assert!(!state.surface_transactions.has_pending_trees());
     assert!(state.renderable_surface(surface_id).is_none());
     assert!(!state.surface_publications.contains_key(&surface_id));
 }
@@ -528,8 +546,8 @@ fn mixed_surface_tree_lifetimes_reject_unrelated_stale_node_when_acquire_is_read
     commit_b.attachment = Some(PendingSurfaceAttachment::RemoveContent);
     let acquire = ExplicitSyncPoint::for_tests_with_signal_script(202, 203, [true]);
     state
-        .pending_surface_tree_transactions
-        .push(PendingSurfaceTreeTransaction {
+        .surface_transactions
+        .push_pending_tree(PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(202),
             root_surface_id: surface_a_id,
             nodes: vec![(surface_a_id, commit_a), (surface_b_id, commit_b)],
@@ -564,7 +582,10 @@ fn mixed_surface_tree_lifetimes_reject_unrelated_stale_node_when_acquire_is_read
         .insert(surface_b_id, 2);
 
     assert_eq!(
-        state.pending_surface_tree_transactions[0]
+        state
+            .surface_transactions
+            .pending_tree_at_for_test(0)
+            .expect("queued transaction")
             .dependencies
             .len(),
         1
@@ -576,7 +597,7 @@ fn mixed_surface_tree_lifetimes_reject_unrelated_stale_node_when_acquire_is_read
     ));
     state.commit_ready_surface_tree_transactions();
 
-    assert!(state.pending_surface_tree_transactions.is_empty());
+    assert!(!state.surface_transactions.has_pending_trees());
     assert!(state.renderable_surface(surface_a_id).is_none());
     assert!(state.renderable_surface(surface_b_id).is_none());
     assert!(!state.surface_publications.contains_key(&surface_a_id));

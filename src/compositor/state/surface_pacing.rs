@@ -421,7 +421,7 @@ impl CompositorState {
 impl CompositorState {
     pub(in crate::compositor) fn has_surface_pacing_work(&self) -> bool {
         !self.active_fifo_barriers.is_empty()
-            || !self.pending_surface_tree_transactions.is_empty()
+            || self.surface_transactions.has_pending_trees()
             || self.has_pending_commit_timing()
     }
 
@@ -484,7 +484,7 @@ impl CompositorState {
                 FifoBarrierClearReason::ForwardProgressFallback,
             );
         }
-        if !expired.is_empty() || !self.pending_surface_tree_transactions.is_empty() {
+        if !expired.is_empty() || self.surface_transactions.has_pending_trees() {
             self.commit_ready_surface_tree_transactions();
         }
         self.surface_pacing_serviced_generation = serviced_generation;
@@ -559,6 +559,13 @@ mod tests {
     use crate::compositor::frame_batch::FrameCallbackPacingState;
     use crate::native::presentation_deadline::MonotonicTimestampNs;
 
+    fn pending_tree(state: &CompositorState, index: usize) -> &PendingSurfaceTreeTransaction {
+        state
+            .surface_transactions
+            .pending_tree_at_for_test(index)
+            .expect("queued transaction")
+    }
+
     #[test]
     fn timestamp_keeps_both_seconds_words_without_truncation() {
         let constraint = CommitTimingConstraint::from_protocol(0x1234_5678_9abc_def0, 7).unwrap();
@@ -593,8 +600,8 @@ mod tests {
         let mut commit = empty_cached_subsurface_commit();
         commit.pacing.commit_timing = Some(requested);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 10,
                 nodes: vec![(10, commit)],
@@ -620,7 +627,7 @@ mod tests {
         };
 
         assert!(state.arm_commit_timing_target(readiness));
-        assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+        assert!(!state.transaction_is_ready(pending_tree(&state, 0)));
         assert_eq!(
             state.next_surface_pacing_deadline_ns(),
             Some(readiness.release_for_render_at.get())
@@ -636,7 +643,7 @@ mod tests {
             release_for_render_at: MonotonicTimestampNs::new(0),
             ..readiness
         });
-        assert!(state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+        assert!(state.transaction_is_ready(pending_tree(&state, 0)));
 
         let pacing = CapturedSurfacePacing {
             commit_timing: Some(requested),
@@ -902,9 +909,13 @@ mod tests {
         first.pacing.commit_timing = Some(requested);
         let mut second = empty_cached_subsurface_commit();
         second.pacing.commit_timing = Some(requested);
-        let first_id = state.allocate_surface_tree_transaction_id();
-        let second_id = state.allocate_surface_tree_transaction_id();
-        state.pending_surface_tree_transactions.extend([
+        let first_id = state
+            .surface_transactions
+            .allocate_surface_tree_transaction_id();
+        let second_id = state
+            .surface_transactions
+            .allocate_surface_tree_transaction_id();
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: first_id,
                 root_surface_id: 1,
@@ -955,8 +966,8 @@ mod tests {
         );
         assert!(
             state
-                .pending_surface_tree_transactions
-                .iter()
+                .surface_transactions
+                .pending_trees()
                 .all(|transaction| { transaction.commit_timing_readiness.is_some() })
         );
         assert!(state.commit_timing_planning_candidates().is_empty());
@@ -972,9 +983,13 @@ mod tests {
         first.pacing.commit_timing = Some(requested);
         let mut second = empty_cached_subsurface_commit();
         second.pacing.commit_timing = Some(requested);
-        let first_id = state.allocate_surface_tree_transaction_id();
-        let second_id = state.allocate_surface_tree_transaction_id();
-        state.pending_surface_tree_transactions.extend([
+        let first_id = state
+            .surface_transactions
+            .allocate_surface_tree_transaction_id();
+        let second_id = state
+            .surface_transactions
+            .allocate_surface_tree_transaction_id();
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: first_id,
                 root_surface_id: 4,
@@ -1010,7 +1025,10 @@ mod tests {
                 .commit_timing_planning_candidate_for_id(second_id)
                 .is_none()
         );
-        state.pending_surface_tree_transactions.remove(0);
+        state
+            .surface_transactions
+            .take_pending_tree_at(0)
+            .expect("queued transaction");
         assert_eq!(
             state
                 .commit_timing_planning_candidates()
@@ -1276,8 +1294,8 @@ mod tests {
             let mut commit = empty_cached_subsurface_commit();
             commit.pacing.commit_timing = Some(requested);
             state
-                .pending_surface_tree_transactions
-                .push(PendingSurfaceTreeTransaction {
+                .surface_transactions
+                .push_pending_tree(PendingSurfaceTreeTransaction {
                     id: SurfaceTreeTransactionId::new(index as u64 + 1),
                     root_surface_id: surface_id,
                     nodes: vec![(surface_id, commit)],
@@ -1295,7 +1313,7 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(state.pending_surface_tree_transactions.len(), 8);
+        assert_eq!(state.surface_transactions.pending_tree_count(), 8);
         assert_eq!(state.take_client_resource_exhaustions().len(), 1);
         assert_eq!(
             state
@@ -1320,8 +1338,8 @@ mod tests {
         state.surface_presentation_generations.insert(surface_id, 1);
         for index in 0..8 {
             state
-                .pending_surface_tree_transactions
-                .push(PendingSurfaceTreeTransaction {
+                .surface_transactions
+                .push_pending_tree(PendingSurfaceTreeTransaction {
                     id: SurfaceTreeTransactionId::new(index as u64 + 1),
                     root_surface_id: surface_id,
                     nodes: vec![(surface_id, empty_cached_subsurface_commit())],
@@ -1346,8 +1364,8 @@ mod tests {
                 });
         }
         let admitted_ids = state
-            .pending_surface_tree_transactions
-            .iter()
+            .surface_transactions
+            .pending_trees()
             .map(|transaction| transaction.id)
             .collect::<Vec<_>>();
 
@@ -1359,8 +1377,8 @@ mod tests {
 
         assert_eq!(
             state
-                .pending_surface_tree_transactions
-                .iter()
+                .surface_transactions
+                .pending_trees()
                 .map(|transaction| transaction.id)
                 .collect::<Vec<_>>(),
             admitted_ids

@@ -825,7 +825,7 @@ impl CompositorState {
             Some(PermanentSurfaceRole::XdgPopup) => SurfaceRole::XdgPopup,
             Some(PermanentSurfaceRole::LayerSurface) => SurfaceRole::LayerSurface,
             Some(PermanentSurfaceRole::Subsurface) => SurfaceRole::Subsurface {
-                parent_id: self.subsurface_transactions.parent(surface_id).unwrap_or(0),
+                parent_id: self.surface_transactions.parent(surface_id).unwrap_or(0),
             },
             Some(PermanentSurfaceRole::Cursor) => SurfaceRole::Cursor,
             Some(PermanentSurfaceRole::DragIcon) => SurfaceRole::DragIcon,
@@ -846,7 +846,7 @@ impl CompositorState {
                 .and_then(|lifecycle| lifecycle.live_instance)
             {
                 Some(LiveRoleInstance::Subsurface { parent_id }) => parent_id,
-                _ => match self.subsurface_transactions.parent(parent_id) {
+                _ => match self.surface_transactions.parent(parent_id) {
                     Some(parent_id) => parent_id,
                     None => return false,
                 },

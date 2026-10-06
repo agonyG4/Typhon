@@ -153,20 +153,27 @@ impl CompositorState {
         if sample.presentation_clock != PresentationClock::Realtime {
             return;
         }
+        let targets = self
+            .surface_transactions
+            .pending_trees()
+            .filter_map(|transaction| {
+                transaction
+                    .commit_timing_readiness
+                    .map(|readiness| (transaction.id, readiness))
+            })
+            .collect::<Vec<_>>();
         let mut backward_jump_replans = 0;
         let mut mappings_revalidated = 0;
         let mut forward_jump_releases = 0;
-        for transaction in &mut self.pending_surface_tree_transactions {
-            let Some(readiness) = transaction.commit_timing_readiness else {
-                continue;
-            };
+        for (transaction_id, readiness) in targets {
             if readiness.clock_mapping.sample.presentation_clock != PresentationClock::Realtime {
                 continue;
             }
             mappings_revalidated += 1;
             match revalidate_commit_timing_readiness(readiness, sample) {
                 CommitTimingRevalidation::Replan => {
-                    transaction.commit_timing_readiness = None;
+                    self.surface_transactions
+                        .set_commit_timing_readiness(transaction_id, None);
                     backward_jump_replans += 1;
                 }
                 CommitTimingRevalidation::AlreadyDue => {
@@ -198,13 +205,7 @@ impl CompositorState {
         let now = client_pacing_now_ns();
         let sample = self.current_commit_timing_clock_sample();
         let mut candidate_deadline = None;
-        for (index, transaction) in self.pending_surface_tree_transactions.iter().enumerate() {
-            if self.pending_surface_tree_transactions[..index]
-                .iter()
-                .any(|previous| previous.root_surface_id == transaction.root_surface_id)
-            {
-                continue;
-            }
+        for transaction in self.surface_transactions.pending_root_heads() {
             let deadline = transaction
                 .commit_timing_readiness
                 .map(|readiness| readiness.release_for_render_at.get())
@@ -227,16 +228,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn next_commit_timing_release_deadline_ns(&self) -> Option<u64> {
-        self.pending_surface_tree_transactions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, transaction)| {
-                if self.pending_surface_tree_transactions[..index]
-                    .iter()
-                    .any(|previous| previous.root_surface_id == transaction.root_surface_id)
-                {
-                    return None;
-                }
+        self.surface_transactions
+            .pending_root_heads()
+            .filter_map(|transaction| {
                 transaction
                     .commit_timing_readiness
                     .map(|readiness| readiness.release_for_render_at.get())
@@ -260,13 +254,7 @@ impl CompositorState {
         }
         let mut candidates = Vec::new();
         let mut already_armed = 0u64;
-        for (index, transaction) in self.pending_surface_tree_transactions.iter().enumerate() {
-            if self.pending_surface_tree_transactions[..index]
-                .iter()
-                .any(|previous| previous.root_surface_id == transaction.root_surface_id)
-            {
-                continue;
-            }
+        for transaction in self.surface_transactions.pending_root_heads() {
             if transaction.commit_timing_readiness.is_some() {
                 already_armed = already_armed.saturating_add(1);
                 continue;
@@ -311,17 +299,12 @@ impl CompositorState {
         transaction_id: SurfaceTreeTransactionId,
         sample: CommitTimingClockSample,
     ) -> Option<CommitTimingPlanningCandidate> {
-        let index = self
-            .pending_surface_tree_transactions
-            .iter()
-            .position(|transaction| transaction.id == transaction_id)?;
-        let transaction = &self.pending_surface_tree_transactions[index];
-        if self.pending_surface_tree_transactions[..index]
-            .iter()
-            .any(|previous| previous.root_surface_id == transaction.root_surface_id)
-        {
+        if !self.surface_transactions.is_root_head(transaction_id) {
             return None;
         }
+        let transaction = self
+            .surface_transactions
+            .transaction_by_id(transaction_id)?;
         let requested_not_before = transaction.commit_timing_request()?;
         let deadline = requested_not_before.scheduler_deadline(sample);
         let clock_mapping = CommitTimingClockMappingMetadata {
@@ -339,8 +322,8 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn has_pending_commit_timing(&self) -> bool {
-        self.pending_surface_tree_transactions
-            .iter()
+        self.surface_transactions
+            .pending_trees()
             .any(|transaction| transaction.commit_timing_request().is_some())
     }
 
@@ -355,10 +338,15 @@ impl CompositorState {
         {
             return false;
         }
-        let Some(transaction_index) = self
-            .pending_surface_tree_transactions
-            .iter()
-            .position(|transaction| transaction.id == readiness.transaction_id)
+        let Some((root_surface_id, request)) = self
+            .surface_transactions
+            .transaction_by_id(readiness.transaction_id)
+            .map(|transaction| {
+                (
+                    transaction.root_surface_id,
+                    transaction.commit_timing_request(),
+                )
+            })
         else {
             self.surface_pacing_metrics.stale_planner_transaction_ids = self
                 .surface_pacing_metrics
@@ -366,11 +354,9 @@ impl CompositorState {
                 .saturating_add(1);
             return false;
         };
-        let root_surface_id =
-            self.pending_surface_tree_transactions[transaction_index].root_surface_id;
-        if self.pending_surface_tree_transactions[..transaction_index]
-            .iter()
-            .any(|previous| previous.root_surface_id == root_surface_id)
+        if !self
+            .surface_transactions
+            .is_root_head(readiness.transaction_id)
         {
             self.surface_pacing_metrics.stale_planner_transaction_ids = self
                 .surface_pacing_metrics
@@ -378,24 +364,22 @@ impl CompositorState {
                 .saturating_add(1);
             return false;
         }
-        if self.pending_surface_tree_transactions[transaction_index].commit_timing_request()
-            != Some(readiness.requested_not_before)
-        {
+        if request != Some(readiness.requested_not_before) {
             self.surface_pacing_metrics.stale_planner_transaction_ids = self
                 .surface_pacing_metrics
                 .stale_planner_transaction_ids
                 .saturating_add(1);
             return false;
         }
-        let has_independent_equal_timestamp = self
-            .pending_surface_tree_transactions
-            .iter()
-            .enumerate()
-            .any(|(index, transaction)| {
-                index != transaction_index
-                    && transaction.root_surface_id != root_surface_id
-                    && transaction.commit_timing_request() == Some(readiness.requested_not_before)
-            });
+        let has_independent_equal_timestamp =
+            self.surface_transactions
+                .pending_trees()
+                .any(|transaction| {
+                    transaction.id != readiness.transaction_id
+                        && transaction.root_surface_id != root_surface_id
+                        && transaction.commit_timing_request()
+                            == Some(readiness.requested_not_before)
+                });
         if has_independent_equal_timestamp {
             self.surface_pacing_metrics
                 .equal_timestamp_independent_plans = self
@@ -409,8 +393,8 @@ impl CompositorState {
                 .realtime_plans_created
                 .saturating_add(1);
         }
-        self.pending_surface_tree_transactions[transaction_index].commit_timing_readiness =
-            Some(readiness);
+        self.surface_transactions
+            .set_commit_timing_readiness(readiness.transaction_id, Some(readiness));
         self.surface_pacing_metrics.commit_timing_candidates_planned = self
             .surface_pacing_metrics
             .commit_timing_candidates_planned
@@ -421,11 +405,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn invalidate_pending_commit_timing_targets(&mut self) {
-        let mut changed = false;
-        for transaction in &mut self.pending_surface_tree_transactions {
-            changed |= transaction.commit_timing_readiness.take().is_some();
+        let transaction_ids = self
+            .surface_transactions
+            .pending_trees()
+            .filter(|transaction| transaction.commit_timing_readiness.is_some())
+            .map(|transaction| transaction.id)
+            .collect::<Vec<_>>();
+        for transaction_id in &transaction_ids {
+            self.surface_transactions
+                .set_commit_timing_readiness(*transaction_id, None);
         }
-        if changed {
+        if !transaction_ids.is_empty() {
             self.invalidate_surface_pacing_deadline_cache();
         }
         self.rebuild_scene_work_index();

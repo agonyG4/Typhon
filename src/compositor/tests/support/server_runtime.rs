@@ -1206,7 +1206,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     |(surface, (origin_x, origin_y))| RenderableSurfaceSnapshot {
                                         relationship_id: server
                                             .state
-                                            .subsurface_transactions
+                                            .surface_transactions
                                             .captured_relationship(surface.surface_id)
                                             .map(|relationship| relationship.relationship_id),
                                         surface_id: surface.surface_id,
@@ -1946,8 +1946,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .count(),
                             pending_surface_tree_transactions: server
                                 .state
-                                .pending_surface_tree_transactions
-                                .iter()
+                                .surface_transactions
+                                .pending_trees()
                                 .filter(|transaction| {
                                     transaction
                                         .nodes
@@ -1982,7 +1982,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .xdg_reassociation_blocked_stale_unpublished_work,
                             subsurface_relationship_phase: server
                                 .state
-                                .subsurface_transactions
+                                .surface_transactions
                                 .relationship_phase(tracked_surface_id),
                             subsurface_parent_is_mapped: server
                                 .state
@@ -1996,8 +1996,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CapturePendingSurfaceTreeTransactions(reply) => {
                         let transactions = server
                             .state
-                            .pending_surface_tree_transactions
-                            .iter()
+                            .surface_transactions
+                            .pending_trees()
                             .map(|transaction| {
                                 (
                                     transaction.id.get(),

@@ -230,14 +230,8 @@ impl CompositorState {
             .iter()
             .any(|commit| commit.surface_id == surface_id)
             || self
-                .pending_surface_tree_transactions
-                .iter()
-                .any(|transaction| {
-                    transaction
-                        .nodes
-                        .iter()
-                        .any(|(node_surface_id, _)| *node_surface_id == surface_id)
-                })
+                .surface_transactions
+                .contains_pending_surface(surface_id)
     }
 
     pub(in crate::compositor) fn retire_unpublished_work_for_xdg_role(
@@ -246,7 +240,7 @@ impl CompositorState {
         reason: AcquireWatchCancelReason,
     ) {
         let pending_commits_before = self.pending_explicit_sync_commits.len();
-        let pending_trees_before = self.pending_surface_tree_transactions.len();
+        let pending_trees_before = self.surface_transactions.pending_tree_count();
         let acquire_changes_before = self.pending_acquire_watch_changes.len();
 
         let callbacks = self.cancel_pending_acquire_commits_for_surface(surface_id, reason);
@@ -256,7 +250,7 @@ impl CompositorState {
         let pending_commits_retired =
             pending_commits_before.saturating_sub(self.pending_explicit_sync_commits.len());
         let pending_trees_retired =
-            pending_trees_before.saturating_sub(self.pending_surface_tree_transactions.len());
+            pending_trees_before.saturating_sub(self.surface_transactions.pending_tree_count());
         let acquire_watches_cancelled = self.pending_acquire_watch_changes
             [acquire_changes_before..]
             .iter()
@@ -599,9 +593,8 @@ mod tests {
     #[test]
     fn reassociation_guard_detects_unpublished_surface_tree_work() {
         let mut state = CompositorState::default();
-        state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+        state.surface_transactions.install_pending_trees_for_test([
+            PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 7,
                 nodes: vec![(7, empty_cached_subsurface_commit())],
@@ -610,7 +603,8 @@ mod tests {
                 external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
-            });
+            },
+        ]);
 
         assert!(state.has_unpublished_surface_work(7));
         assert!(!state.has_unpublished_surface_work(8));
@@ -619,7 +613,7 @@ mod tests {
     #[test]
     fn role_retirement_preserves_unrelated_tree_work_and_is_idempotent() {
         let mut state = CompositorState::default();
-        state.pending_surface_tree_transactions.extend([
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(2),
                 root_surface_id: 7,

@@ -482,9 +482,9 @@ impl CompositorState {
             .surface_content_publishes
             .saturating_add(1);
         if source == SurfacePublicationSource::SurfaceTree {
-            self.subsurface_transaction_metrics
-                .surface_tree_publications = self
-                .subsurface_transaction_metrics
+            self.surface_transactions.metrics.surface_tree_publications = self
+                .surface_transactions
+                .metrics
                 .surface_tree_publications
                 .saturating_add(1);
         }
@@ -548,9 +548,11 @@ impl CompositorState {
             );
         }
         if source == SurfacePublicationSource::SurfaceTree {
-            self.subsurface_transaction_metrics
+            self.surface_transactions
+                .metrics
                 .surface_tree_stale_rejections = self
-                .subsurface_transaction_metrics
+                .surface_transactions
+                .metrics
                 .surface_tree_stale_rejections
                 .saturating_add(1);
         }
@@ -1531,7 +1533,7 @@ impl CompositorState {
             }
         }
         self.deactivate_pointer_constraints_for_surface(surface_id, false);
-        let cached = self.subsurface_transactions.remove_subtree(surface_id);
+        let cached = self.surface_transactions.remove_subtree(surface_id);
         self.update_synchronized_cache_metrics();
         self.release_cached_subsurface_commits(cached);
         self.cleanup_subsurface_stack_state_for_surface(surface_id);

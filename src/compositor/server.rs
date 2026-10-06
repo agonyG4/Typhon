@@ -1931,7 +1931,7 @@ impl OwnCompositorServer {
     }
 
     pub const fn subsurface_transaction_metrics(&self) -> SubsurfaceTransactionMetrics {
-        self.state.subsurface_transaction_metrics
+        self.state.surface_transactions.metrics()
     }
 
     pub const fn surface_pacing_metrics(&self) -> SurfacePacingMetrics {

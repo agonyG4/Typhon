@@ -331,7 +331,7 @@ impl CompositorState {
             surface_id,
             CurrentSurfaceBuffer::Materialized(materialized),
         );
-        for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
+        for child_id in self.surface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
         let window_geometry_changed = xdg_geometry_publication.is_some_and(|(xdg_root, before)| {
@@ -1477,17 +1477,8 @@ impl CompositorState {
                 commit.pending.resize_commit = None;
             }
         }
-        for transaction in &mut self.pending_surface_tree_transactions {
-            for (surface_id, commit) in &mut transaction.nodes {
-                if !surface_ids.contains(surface_id) {
-                    continue;
-                }
-                commit.resize_commit = None;
-                if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment.as_mut() {
-                    buffer.resize_commit = None;
-                }
-            }
-        }
+        self.surface_transactions
+            .clear_resize_state_for_surfaces(surface_ids);
         let before_previews = self.active_toplevel_resizes.len();
         self.active_toplevel_resizes
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
@@ -1714,7 +1705,7 @@ impl CompositorState {
             surface_id,
             CurrentSurfaceBuffer::Unmaterialized(pending),
         );
-        for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
+        for child_id in self.surface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
         self.note_xwayland_buffer_ready(surface_id);
@@ -1862,7 +1853,7 @@ impl CompositorState {
             generation,
             RenderGenerationCause::SurfaceCommit,
         );
-        for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
+        for child_id in self.surface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
         if surface_id == self.root_surface_id_for_surface(surface_id)

@@ -1360,7 +1360,7 @@ fn surface_destroy_with_live_subsurface_tears_down_and_leaves_role_inert() {
     );
     assert!(!server.state.surface_resources.contains_key(&child_id));
     assert!(!server.state.surface_role_lifecycles.contains_key(&child_id));
-    assert_eq!(server.state.subsurface_transactions.parent(child_id), None);
+    assert_eq!(server.state.surface_transactions.parent(child_id), None);
     assert!(!server.state.current_surface_buffers.contains_key(&child_id));
     assert!(!server.state.active_dmabuf_buffers.contains_key(&child_id));
     assert!(

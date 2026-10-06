@@ -131,7 +131,7 @@ impl CompositorState {
                 index.add_unowned_callback(owner);
             }
         }
-        for transaction in &self.pending_surface_tree_transactions {
+        for transaction in self.surface_transactions.pending_trees() {
             let owner = self.scene_work_owner_for_surface(transaction.root_surface_id);
             let locally_signaled_acquire = !self.external_acquire_readiness
                 && transaction
@@ -165,15 +165,11 @@ impl CompositorState {
         }
         let mut commit_timing_planning_signature = EMPTY_COMMIT_TIMING_PLANNING_SIGNATURE;
         let mut commit_timing_planning_pending = false;
-        for (index, transaction) in self.pending_surface_tree_transactions.iter().enumerate() {
+        for transaction in self.surface_transactions.pending_root_heads() {
             let Some(requested) = transaction.commit_timing_request() else {
                 continue;
             };
-            if transaction.commit_timing_readiness.is_some()
-                || self.pending_surface_tree_transactions[..index]
-                    .iter()
-                    .any(|previous| previous.root_surface_id == transaction.root_surface_id)
-            {
+            if transaction.commit_timing_readiness.is_some() {
                 continue;
             }
             commit_timing_planning_pending = true;

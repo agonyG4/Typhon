@@ -7,11 +7,8 @@ impl CompositorState {
         &mut self,
         releases: &mut ShutdownDmabufReleaseSet,
     ) {
-        let mut cached = self.subsurface_transactions.drain_cached_commits();
+        let cached = self.surface_transactions.drain_unpublished_commits();
         self.update_synchronized_cache_metrics();
-        for transaction in self.pending_surface_tree_transactions.drain(..) {
-            cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
-        }
         for commit in cached {
             if commit.explicit_sync.is_some() {
                 self.note_explicit_commit_destroyed(commit.commit_id, "compositor_shutdown");

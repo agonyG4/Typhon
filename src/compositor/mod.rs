@@ -375,6 +375,7 @@ use shm::{
 use state::ActiveSurfacePresentationCommit;
 pub(crate) use state::OverrideRedirectStackSnapshotResult;
 pub use state::PresentationRetainedVisualPayloadId;
+use state::surface_transactions::*;
 pub use state::{
     AstreaShortcutPhase, CommitTimingClockMappingMetadata, CommitTimingClockSample,
     CommitTimingConstraint, CommitTimingPlanningCandidate, CommitTimingReadiness,
@@ -386,7 +387,6 @@ use subsurface::{
     CacheAdmissionFailure, CacheCommitOutcome, CachedSubsurfaceCommit,
     CapturedPointerConstraintSurfaceState, CapturedSurfaceCommitContext,
     PointerConstraintLifecycleCommit, PointerConstraintRegionCommit, SubsurfaceSyncMode,
-    SubsurfaceTransactionState,
 };
 pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
@@ -830,8 +830,7 @@ pub struct CompositorState {
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
     latched_subsurface_stacks: HashMap<u32, Vec<u32>>,
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
-    subsurface_transactions: SubsurfaceTransactionState,
-    subsurface_transaction_metrics: SubsurfaceTransactionMetrics,
+    surface_transactions: SurfaceTransactionState,
     current_surface_buffers: HashMap<u32, CurrentSurfaceBuffer>,
     committed_explicit_xdg_window_geometries: HashMap<u32, CommittedExplicitXdgWindowGeometry>,
     pending_xdg_window_geometry_requests: HashMap<u32, XdgWindowGeometry>,
@@ -874,7 +873,6 @@ pub struct CompositorState {
     window_interaction_release_debug: VecDeque<WindowInteractionReleaseDebugRecord>,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
-    next_surface_tree_transaction_id: u64,
     commit_debug: CommitDebugState,
     resize_flow_metrics: ResizeFlowMetrics,
     xdg_configure_serials: HashMap<u32, XdgConfigureSerialState>,
@@ -897,7 +895,6 @@ pub struct CompositorState {
     shm_buffer_lifetime_metrics: ShmBufferLifetimeMetrics,
     frame_callback_metrics: FrameCallbackMetrics,
     pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
-    pending_surface_tree_transactions: Vec<PendingSurfaceTreeTransaction>,
     acquire_commit_ids: AcquireCommitIdAllocator,
     pending_acquire_watch_changes: Vec<AcquireWatchChange>,
     external_acquire_readiness: bool,

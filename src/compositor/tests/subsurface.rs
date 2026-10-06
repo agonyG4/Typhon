@@ -30,8 +30,8 @@ fn new_subsurface_pending_stack_preserves_existing_restack() {
 #[test]
 fn pending_sibling_is_a_valid_restack_reference_before_application() {
     let mut state = CompositorState::default();
-    assert!(state.subsurface_transactions.register(2, 1));
-    assert!(state.subsurface_transactions.register(3, 1));
+    assert!(state.surface_transactions.register(2, 1));
+    assert!(state.surface_transactions.register(3, 1));
     state.pending_subsurface_stacks.insert(1, vec![1, 3, 2]);
 
     assert!(state.restack_subsurface(2, 1, 3, false));
@@ -43,7 +43,7 @@ fn registering_subsurface_does_not_change_committed_stack() {
     let mut state = CompositorState::default();
     state.committed_subsurface_stacks.insert(1, vec![1, 2, 3]);
 
-    assert!(state.subsurface_transactions.register(4, 1));
+    assert!(state.surface_transactions.register(4, 1));
     state.add_subsurface_to_pending_stack(1, 4);
 
     assert_eq!(state.committed_subsurface_stacks[&1], vec![1, 2, 3]);

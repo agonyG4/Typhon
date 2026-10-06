@@ -262,7 +262,7 @@ fn fifo_wait_is_ordered_and_hidden_surface_forward_progress_is_finite() {
     std::thread::sleep(Duration::from_millis(45));
     let server = stop_test_server(running, server_thread);
     assert!(server.state.active_fifo_barriers.is_empty());
-    assert!(server.state.pending_surface_tree_transactions.is_empty());
+    assert!(!server.state.surface_transactions.has_pending_trees());
     let metrics = server.surface_pacing_metrics();
     assert!(metrics.barriers_captured >= 1);
     assert!(metrics.waits_captured >= 1);
@@ -308,9 +308,13 @@ fn first_future_timed_surface_commit_is_queued_before_publication() {
     connection.roundtrip().unwrap();
 
     let mut server = stop_controllable_test_server(commands, server_thread);
-    assert_eq!(server.state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(server.state.surface_transactions.pending_tree_count(), 1);
     assert_eq!(
-        server.state.pending_surface_tree_transactions[0]
+        server
+            .state
+            .surface_transactions
+            .pending_tree_at(0)
+            .expect("pending timed transaction")
             .commit_timing_request()
             .expect("first timed commit should retain its timing request")
             .seconds(),

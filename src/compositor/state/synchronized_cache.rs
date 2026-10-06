@@ -23,13 +23,15 @@ impl CompositorState {
         {
             buffer.explicit_release = Some(release.clone());
         }
-        self.subsurface_transaction_metrics
+        self.surface_transactions
+            .metrics
             .synchronized_child_commits_cached = self
-            .subsurface_transaction_metrics
+            .surface_transactions
+            .metrics
             .synchronized_child_commits_cached
             .saturating_add(1);
         let already_exhausted = self
-            .subsurface_transactions
+            .surface_transactions
             .client_id(surface_id)
             .is_some_and(|client_id| self.client_resource_exhaustion_pending(client_id));
         if already_exhausted {
@@ -41,19 +43,18 @@ impl CompositorState {
             self.update_synchronized_cache_metrics();
             return;
         }
-        match self
-            .subsurface_transactions
-            .cache_commit(surface_id, commit)
-        {
+        match self.surface_transactions.cache_commit(surface_id, commit) {
             CacheCommitOutcome::Inserted => {
-                self.subsurface_transaction_metrics.cached_commits_appended = self
-                    .subsurface_transaction_metrics
+                self.surface_transactions.metrics.cached_commits_appended = self
+                    .surface_transactions
+                    .metrics
                     .cached_commits_appended
                     .saturating_add(1);
             }
             CacheCommitOutcome::Merged { superseded_buffer } => {
-                self.subsurface_transaction_metrics.cached_commits_merged = self
-                    .subsurface_transaction_metrics
+                self.surface_transactions.metrics.cached_commits_merged = self
+                    .surface_transactions
+                    .metrics
                     .cached_commits_merged
                     .saturating_add(1);
                 if let Some(buffer) = superseded_buffer {
@@ -68,8 +69,8 @@ impl CompositorState {
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: subsurface_tx surface={surface_id} parent={:?} requested_mode={:?} effective_mode=sync decision=cached buffer_id={buffer_id:?}",
-                self.subsurface_transactions.parent(surface_id),
-                self.subsurface_transactions.requested_mode(surface_id),
+                self.surface_transactions.parent(surface_id),
+                self.surface_transactions.requested_mode(surface_id),
             );
         }
     }
@@ -87,31 +88,37 @@ impl CompositorState {
             );
         }
         self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
-        self.subsurface_transaction_metrics.cached_commits_rejected = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.cached_commits_rejected = self
+            .surface_transactions
+            .metrics
             .cached_commits_rejected
             .saturating_add(1);
         match reason {
             CacheAdmissionFailure::PerSurfaceEntryLimit
             | CacheAdmissionFailure::PerSurfaceObligationLimit => {
-                self.subsurface_transaction_metrics
+                self.surface_transactions
+                    .metrics
                     .cache_per_surface_limit_hits = self
-                    .subsurface_transaction_metrics
+                    .surface_transactions
+                    .metrics
                     .cache_per_surface_limit_hits
                     .saturating_add(1);
             }
             CacheAdmissionFailure::PerClientEntryLimit
             | CacheAdmissionFailure::PerClientObligationLimit => {
-                self.subsurface_transaction_metrics
+                self.surface_transactions
+                    .metrics
                     .cache_per_client_limit_hits = self
-                    .subsurface_transaction_metrics
+                    .surface_transactions
+                    .metrics
                     .cache_per_client_limit_hits
                     .saturating_add(1);
             }
             CacheAdmissionFailure::TotalEntryLimit
             | CacheAdmissionFailure::TotalObligationLimit => {
-                self.subsurface_transaction_metrics.cache_global_limit_hits = self
-                    .subsurface_transaction_metrics
+                self.surface_transactions.metrics.cache_global_limit_hits = self
+                    .surface_transactions
+                    .metrics
                     .cache_global_limit_hits
                     .saturating_add(1);
             }
@@ -133,37 +140,43 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn update_synchronized_cache_metrics(&mut self) {
-        self.subsurface_transaction_metrics.current_cached_entries =
-            self.subsurface_transactions.cached_entry_count();
-        self.subsurface_transaction_metrics.maximum_cached_entries =
-            self.subsurface_transactions.maximum_cached_entries();
-        self.subsurface_transaction_metrics
+        self.surface_transactions.metrics.current_cached_entries =
+            self.surface_transactions.cached_entry_count();
+        self.surface_transactions.metrics.maximum_cached_entries =
+            self.surface_transactions.maximum_cached_entries();
+        self.surface_transactions
+            .metrics
             .maximum_cached_entries_per_surface = self
-            .subsurface_transactions
+            .surface_transactions
             .maximum_cached_entries_per_surface();
-        self.subsurface_transaction_metrics
+        self.surface_transactions
+            .metrics
             .maximum_cached_entries_per_client = self
-            .subsurface_transactions
+            .surface_transactions
             .maximum_cached_entries_per_client();
-        self.subsurface_transaction_metrics
-            .current_cached_obligations = self.subsurface_transactions.cached_obligation_count();
-        self.subsurface_transaction_metrics
-            .maximum_cached_obligations = self.subsurface_transactions.maximum_cached_obligations();
-        self.subsurface_transaction_metrics
+        self.surface_transactions.metrics.current_cached_obligations =
+            self.surface_transactions.cached_obligation_count();
+        self.surface_transactions.metrics.maximum_cached_obligations =
+            self.surface_transactions.maximum_cached_obligations();
+        self.surface_transactions
+            .metrics
             .maximum_cached_obligations_per_surface = self
-            .subsurface_transactions
+            .surface_transactions
             .maximum_cached_obligations_per_surface();
-        self.subsurface_transaction_metrics
+        self.surface_transactions
+            .metrics
             .maximum_cached_obligations_per_client = self
-            .subsurface_transactions
+            .surface_transactions
             .maximum_cached_obligations_per_client();
-        self.subsurface_transaction_metrics.maximum_cached_nodes = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.maximum_cached_nodes = self
+            .surface_transactions
+            .metrics
             .maximum_cached_nodes
-            .max(self.subsurface_transactions.cached_node_count());
-        self.subsurface_transaction_metrics.maximum_tree_depth = self
-            .subsurface_transaction_metrics
+            .max(self.surface_transactions.cached_node_count());
+        self.surface_transactions.metrics.maximum_tree_depth = self
+            .surface_transactions
+            .metrics
             .maximum_tree_depth
-            .max(self.subsurface_transactions.maximum_depth());
+            .max(self.surface_transactions.maximum_depth());
     }
 }

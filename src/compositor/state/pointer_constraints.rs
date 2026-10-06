@@ -2240,16 +2240,8 @@ impl CompositorState {
             .get(&surface_id)
             .and_then(captured_hint)
             .or_else(|| {
-                self.pending_surface_tree_transactions
-                    .iter()
-                    .rev()
-                    .flat_map(|transaction| transaction.nodes.iter().rev())
-                    .filter(|(node_surface_id, _)| *node_surface_id == surface_id)
-                    .find_map(|(_, commit)| captured_hint(&commit.pointer_constraint_state))
-            })
-            .or_else(|| {
-                self.subsurface_transactions
-                    .cached_pointer_constraint_hint(surface_id, constraint_id)
+                self.surface_transactions
+                    .pending_pointer_constraint_hint(surface_id, constraint_id)
             });
         Some(PointerConstraintTransitionSnapshot {
             constraint_id,

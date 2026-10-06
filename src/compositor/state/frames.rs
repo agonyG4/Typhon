@@ -77,50 +77,60 @@ impl CompositorState {
         &mut self,
         stats: &SurfaceTreeMergeStats,
     ) {
-        self.subsurface_transaction_metrics
+        self.surface_transactions
+            .metrics
             .bufferless_tree_commits_merged = self
-            .subsurface_transaction_metrics
+            .surface_transactions
+            .metrics
             .bufferless_tree_commits_merged
             .saturating_add((stats.bufferless_nodes == stats.incoming_nodes) as u64);
-        self.subsurface_transaction_metrics
-            .metadata_only_nodes_merged = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.metadata_only_nodes_merged = self
+            .surface_transactions
+            .metrics
             .metadata_only_nodes_merged
             .saturating_add(stats.bufferless_nodes as u64);
-        self.subsurface_transaction_metrics.attachments_replaced = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.attachments_replaced = self
+            .surface_transactions
+            .metrics
             .attachments_replaced
             .saturating_add(stats.attachments_replaced as u64);
-        self.subsurface_transaction_metrics.explicit_detaches = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.explicit_detaches = self
+            .surface_transactions
+            .metrics
             .explicit_detaches
             .saturating_add(stats.explicit_detaches as u64);
-        self.subsurface_transaction_metrics
+        self.surface_transactions
+            .metrics
             .acquire_dependencies_preserved = self
-            .subsurface_transaction_metrics
+            .surface_transactions
+            .metrics
             .acquire_dependencies_preserved
             .saturating_add(stats.dependencies_preserved as u64);
-        self.subsurface_transaction_metrics
+        self.surface_transactions
+            .metrics
             .acquire_dependencies_replaced = self
-            .subsurface_transaction_metrics
+            .surface_transactions
+            .metrics
             .acquire_dependencies_replaced
             .saturating_add(stats.dependencies_replaced as u64);
-        self.subsurface_transaction_metrics.callbacks_merged = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.callbacks_merged = self
+            .surface_transactions
+            .metrics
             .callbacks_merged
             .saturating_add(stats.callbacks_merged as u64);
-        self.subsurface_transaction_metrics.feedbacks_merged = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.feedbacks_merged = self
+            .surface_transactions
+            .metrics
             .feedbacks_merged
             .saturating_add(stats.feedbacks_merged as u64);
-        self.subsurface_transaction_metrics
-            .resize_snapshots_preserved = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.resize_snapshots_preserved = self
+            .surface_transactions
+            .metrics
             .resize_snapshots_preserved
             .saturating_add(stats.resize_snapshots_preserved as u64);
-        self.subsurface_transaction_metrics
-            .resize_snapshots_replaced = self
-            .subsurface_transaction_metrics
+        self.surface_transactions.metrics.resize_snapshots_replaced = self
+            .surface_transactions
+            .metrics
             .resize_snapshots_replaced
             .saturating_add(stats.resize_snapshots_replaced as u64);
     }
@@ -1653,8 +1663,8 @@ impl CompositorState {
             callbacks.extend(self.cancel_pending_acquire_commits_for_surface(surface_id, reason));
         }
         let tree_roots = self
-            .pending_surface_tree_transactions
-            .iter()
+            .surface_transactions
+            .pending_trees()
             .filter(|transaction| {
                 transaction.nodes.iter().any(|(_, commit)| {
                     commit.attachment.as_ref().is_some_and(|attachment| {
@@ -1692,7 +1702,7 @@ impl CompositorState {
                     received_at: Instant::now(),
                 }));
         }
-        for transaction in &self.pending_surface_tree_transactions {
+        for transaction in self.surface_transactions.pending_trees() {
             for dependency in &transaction.dependencies {
                 if dependency.state == PendingAcquireState::Ready {
                     continue;
@@ -1726,10 +1736,8 @@ impl CompositorState {
         {
             return true;
         }
-        self.pending_surface_tree_transactions
-            .iter_mut()
-            .flat_map(|transaction| &mut transaction.dependencies)
-            .find(|dependency| dependency.commit_id == commit_id)
+        self.surface_transactions
+            .acquire_dependency_mut(commit_id)
             .is_some_and(|dependency| dependency.state.mark_eventfd_backed())
     }
 
@@ -1745,10 +1753,8 @@ impl CompositorState {
         {
             return true;
         }
-        self.pending_surface_tree_transactions
-            .iter_mut()
-            .flat_map(|transaction| &mut transaction.dependencies)
-            .find(|dependency| dependency.commit_id == commit_id)
+        self.surface_transactions
+            .acquire_dependency_mut(commit_id)
             .is_some_and(|dependency| dependency.state.mark_fallback_backed())
     }
 
@@ -1764,17 +1770,13 @@ impl CompositorState {
             .find(|commit| commit.commit_id == commit_id)
             .map(|commit| commit.surface_commit_id);
         let surface_commit_id = surface_commit_id.or_else(|| {
-            self.pending_surface_tree_transactions
-                .iter()
-                .flat_map(|transaction| &transaction.dependencies)
-                .find(|dependency| dependency.commit_id == commit_id)
+            self.surface_transactions
+                .acquire_dependency(commit_id)
                 .map(|dependency| dependency.surface_commit_id)
         });
         let tree_dependency_lifetime_is_current = self
-            .pending_surface_tree_transactions
-            .iter()
-            .flat_map(|transaction| &transaction.dependencies)
-            .find(|dependency| dependency.commit_id == commit_id)
+            .surface_transactions
+            .acquire_dependency(commit_id)
             .map(|dependency| {
                 let Some(owner_client_id) = dependency.owner_client_id.as_ref() else {
                     return true;
@@ -1803,13 +1805,10 @@ impl CompositorState {
         {
             true
         } else {
-            self.pending_surface_tree_transactions
-                .iter_mut()
-                .flat_map(|transaction| &mut transaction.dependencies)
-                .find(|dependency| {
-                    dependency.commit_id == commit_id
-                        && dependency.surface_id == surface_id
-                        && dependency.acquire == *acquire
+            self.surface_transactions
+                .acquire_dependency_mut(commit_id)
+                .filter(|dependency| {
+                    dependency.surface_id == surface_id && dependency.acquire == *acquire
                 })
                 .is_some_and(|dependency| dependency.state.mark_ready())
         };

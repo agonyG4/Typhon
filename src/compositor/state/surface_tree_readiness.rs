@@ -3,7 +3,7 @@ use super::*;
 impl CompositorState {
     pub(in crate::compositor) fn commit_ready_surface_tree_transactions(&mut self) {
         self.revalidate_pending_commit_timing_targets();
-        let mut transactions = std::mem::take(&mut self.pending_surface_tree_transactions);
+        let mut transactions = self.surface_transactions.take_pending_trees();
         let mut newly_ready = Vec::new();
         if !self.external_acquire_readiness {
             for transaction in &mut transactions {
@@ -170,14 +170,18 @@ impl CompositorState {
             }
             let wait_ms =
                 u64::try_from(transaction.received_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            self.subsurface_transaction_metrics
+            self.surface_transactions
+                .metrics
                 .maximum_transaction_wait_ms = self
-                .subsurface_transaction_metrics
+                .surface_transactions
+                .metrics
                 .maximum_transaction_wait_ms
                 .max(wait_ms);
-            self.subsurface_transaction_metrics
+            self.surface_transactions
+                .metrics
                 .waiting_transactions_published = self
-                .subsurface_transaction_metrics
+                .surface_transactions
+                .metrics
                 .waiting_transactions_published
                 .saturating_add(1);
             for (surface_id, commit) in &transaction.nodes {
@@ -231,7 +235,8 @@ impl CompositorState {
             }
             self.publish_surface_tree_nodes(transaction);
         }
-        self.pending_surface_tree_transactions = transactions;
+        self.surface_transactions
+            .replace_pending_trees(transactions);
         if pacing_deadline_changed {
             self.invalidate_surface_pacing_deadline_cache();
         }

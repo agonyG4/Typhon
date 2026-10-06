@@ -35,7 +35,7 @@ mod frame_consumption_tests {
         first.pacing.fifo_set_barrier = true;
         let mut second = empty_cached_subsurface_commit();
         second.pacing.fifo_wait_barrier = true;
-        state.pending_surface_tree_transactions.extend([
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 7,
@@ -61,9 +61,13 @@ mod frame_consumption_tests {
         state.commit_ready_surface_tree_transactions();
 
         assert!(state.active_fifo_barriers.contains_key(&7));
-        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+        assert_eq!(state.surface_transactions.pending_tree_count(), 1);
         assert!(
-            state.pending_surface_tree_transactions[0].nodes[0]
+            state
+                .surface_transactions
+                .pending_tree_at_for_test(0)
+                .expect("queued transaction")
+                .nodes[0]
                 .1
                 .pacing
                 .fifo_wait_barrier
@@ -79,7 +83,7 @@ mod frame_consumption_tests {
         timed.pacing.commit_timing = Some(
             CommitTimingConstraint::from_protocol(seconds, (now % 1_000_000_000) as u32).unwrap(),
         );
-        state.pending_surface_tree_transactions.extend([
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(3),
                 root_surface_id: 8,
@@ -104,7 +108,7 @@ mod frame_consumption_tests {
 
         state.commit_ready_surface_tree_transactions();
 
-        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+        assert_eq!(state.surface_transactions.pending_tree_count(), 2);
     }
 
     #[test]
@@ -112,7 +116,7 @@ mod frame_consumption_tests {
         let mut state = CompositorState::default();
         let first_id = SurfaceTreeTransactionId::new(5);
         let second_id = SurfaceTreeTransactionId::new(6);
-        state.pending_surface_tree_transactions.extend([
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: first_id,
                 root_surface_id: 9,
@@ -148,8 +152,8 @@ mod frame_consumption_tests {
 
         assert_eq!(
             state
-                .pending_surface_tree_transactions
-                .iter()
+                .surface_transactions
+                .pending_trees()
                 .map(|transaction| transaction.id)
                 .collect::<Vec<_>>(),
             vec![first_id, second_id]
@@ -161,7 +165,7 @@ mod frame_consumption_tests {
         let mut state = CompositorState::default();
         let blocked_id = SurfaceTreeTransactionId::new(7);
         let ready_id = SurfaceTreeTransactionId::new(8);
-        state.pending_surface_tree_transactions.extend([
+        state.surface_transactions.install_pending_trees_for_test([
             PendingSurfaceTreeTransaction {
                 id: blocked_id,
                 root_surface_id: 10,
@@ -197,8 +201,8 @@ mod frame_consumption_tests {
 
         assert_eq!(
             state
-                .pending_surface_tree_transactions
-                .iter()
+                .surface_transactions
+                .pending_trees()
                 .map(|transaction| transaction.id)
                 .collect::<Vec<_>>(),
             vec![blocked_id]
@@ -299,8 +303,8 @@ mod frame_consumption_tests {
         let mut commit = empty_cached_subsurface_commit();
         commit.pacing.commit_timing = Some(requested);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 8,
                 nodes: vec![(8, commit)],
@@ -327,8 +331,8 @@ mod frame_consumption_tests {
         let mut commit = empty_cached_subsurface_commit();
         commit.pacing.commit_timing = Some(requested);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(11),
                 root_surface_id: 12,
                 nodes: vec![(12, commit)],
@@ -349,8 +353,8 @@ mod frame_consumption_tests {
         let mut commit = empty_cached_subsurface_commit();
         commit.pacing.fifo_set_barrier = true;
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(17),
                 root_surface_id: 18,
                 nodes: vec![(18, commit)],
@@ -371,8 +375,8 @@ mod frame_consumption_tests {
         state.external_acquire_readiness = true;
         let acquire = ExplicitSyncPoint::for_tests(19, 1);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(20),
                 root_surface_id: 21,
                 nodes: vec![(21, empty_cached_subsurface_commit())],
@@ -418,8 +422,8 @@ mod frame_consumption_tests {
         let mut first = empty_cached_subsurface_commit();
         first.pacing.commit_timing = Some(requested);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(26),
                 root_surface_id: 27,
                 nodes: vec![(27, first)],
@@ -436,8 +440,8 @@ mod frame_consumption_tests {
         let mut second = empty_cached_subsurface_commit();
         second.pacing.commit_timing = Some(requested);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(28),
                 root_surface_id: 29,
                 nodes: vec![(29, second)],
@@ -462,8 +466,8 @@ mod frame_consumption_tests {
         let acquire = ExplicitSyncPoint::for_tests(12, 1);
         let commit_id = AcquireCommitId::for_tests(13);
         state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
+            .surface_transactions
+            .push_pending_tree(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(14),
                 root_surface_id: 15,
                 nodes: vec![(15, empty_cached_subsurface_commit())],

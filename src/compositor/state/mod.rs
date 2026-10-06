@@ -66,8 +66,12 @@ mod surface_commit_cursor;
 mod surface_commit_placement;
 mod surface_commits;
 mod surface_focus;
+mod surface_mapping;
 mod surface_pacing;
-mod surface_transactions;
+#[cfg(test)]
+#[path = "surface_transactions/tests/ownership.rs"]
+mod surface_transaction_ownership_tests;
+pub(super) mod surface_transactions;
 mod surface_tree_readiness;
 mod surfaces;
 mod synchronized_cache;
@@ -184,7 +188,8 @@ pub use surface_pacing::{CommitTimingConstraint, SurfacePacingMetrics};
 pub use surface_transactions::SurfaceTreeTransactionId;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::{
-    ActiveSurfacePresentationCommit, BufferlessSurfaceCommitState, PendingSurfaceTreeTransaction,
+    ActiveSurfacePresentationCommit, BufferlessSurfaceCommitState,
+    MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT, PendingSurfaceTreeTransaction,
     ReleasedSurfaceTreeState, SurfacePublicationContext, SurfacePublicationDecision,
     SurfacePublicationSource, SurfacePublicationState, SurfaceTreeAcquireDependency,
     SurfaceTreeMergeStats, SurfaceTreeNodeLifetime, SurfaceTreeNodeLifetimes,

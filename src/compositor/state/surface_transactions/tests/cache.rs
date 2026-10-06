@@ -20,7 +20,7 @@ fn test_client(
 
 #[test]
 fn new_role_defaults_to_synchronized() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert_eq!(
         state.requested_mode(2),
@@ -31,7 +31,7 @@ fn new_role_defaults_to_synchronized() {
 
 #[test]
 fn set_sync_and_set_desync_record_requested_mode() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
     assert_eq!(
@@ -47,7 +47,7 @@ fn set_sync_and_set_desync_record_requested_mode() {
 
 #[test]
 fn desynchronized_descendant_under_synchronized_ancestor_remains_effectively_sync() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.register(3, 2));
     assert!(state.set_mode(3, SubsurfaceSyncMode::Desynchronized));
@@ -58,7 +58,7 @@ fn desynchronized_descendant_under_synchronized_ancestor_remains_effectively_syn
 
 #[test]
 fn role_registration_rejects_reuse_and_cycles() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(!state.register(2, 3));
     assert!(!state.register(1, 2));
@@ -66,7 +66,7 @@ fn role_registration_rejects_reuse_and_cycles() {
 
 #[test]
 fn role_destruction_removes_only_that_role_while_surface_teardown_removes_subtree() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.register(3, 2));
     assert!(state.remove_role(2).is_empty());
@@ -82,7 +82,7 @@ fn role_destruction_removes_only_that_role_while_surface_teardown_removes_subtre
 
 #[test]
 fn pacing_boundaries_are_never_merged_or_reordered() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
 
     let mut first = crate::compositor::state::empty_cached_subsurface_commit();
@@ -111,7 +111,7 @@ fn pacing_boundaries_are_never_merged_or_reordered() {
 
 #[test]
 fn synchronized_cache_does_not_grow_past_the_surface_limit() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
 
     for sequence in 0..8 {
@@ -144,7 +144,7 @@ fn synchronized_cache_does_not_grow_past_the_surface_limit() {
 
 #[test]
 fn ordinary_commits_after_a_boundary_merge_into_the_tail() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
 
     let mut boundary = crate::compositor::state::empty_cached_subsurface_commit();
@@ -182,7 +182,7 @@ fn ordinary_commits_after_a_boundary_merge_into_the_tail() {
 
 #[test]
 fn boundary_stress_remains_bounded_without_retaining_rejected_commits() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
 
     for sequence in 1..=100_000 {
@@ -201,7 +201,7 @@ fn boundary_stress_remains_bounded_without_retaining_rejected_commits() {
 
 #[test]
 fn ordinary_and_boundary_commits_remain_ordered_at_the_tail() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
 
     let mut ordinary = crate::compositor::state::empty_cached_subsurface_commit();
@@ -258,19 +258,19 @@ fn desync_transition_does_not_create_a_synthetic_parent_content_update() {
     for surface_id in [parent_id, child_id, grandchild_id] {
         state.surface_presentation_generations.insert(surface_id, 1);
     }
-    assert!(state.subsurface_transactions.register_with_client(
+    assert!(state.surface_transactions.register_with_client(
         child_id,
         parent_id,
         Some(client.id())
     ));
-    assert!(state.subsurface_transactions.register_with_client(
+    assert!(state.surface_transactions.register_with_client(
         grandchild_id,
         child_id,
         Some(client.id())
     ));
     assert!(
         state
-            .subsurface_transactions
+            .surface_transactions
             .set_mode(grandchild_id, SubsurfaceSyncMode::Desynchronized,)
     );
 
@@ -283,16 +283,19 @@ fn desync_transition_does_not_create_a_synthetic_parent_content_update() {
     );
     assert!(matches!(
         state
-            .subsurface_transactions
+            .surface_transactions
             .cache_commit(grandchild_id, grandchild_commit),
         CacheCommitOutcome::Inserted
     ));
 
     state.set_subsurface_sync_mode(child_id, SubsurfaceSyncMode::Desynchronized);
 
-    assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(state.surface_transactions.pending_tree_count(), 1);
     assert_eq!(
-        state.pending_surface_tree_transactions[0]
+        state
+            .surface_transactions
+            .pending_tree_at_for_test(0)
+            .expect("promoted transaction")
             .nodes
             .iter()
             .map(|(surface_id, _)| *surface_id)
@@ -315,7 +318,7 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
     for surface_id in [parent_id, child_id] {
         state.surface_presentation_generations.insert(surface_id, 1);
     }
-    assert!(state.subsurface_transactions.register_with_client(
+    assert!(state.surface_transactions.register_with_client(
         child_id,
         parent_id,
         Some(client.id())
@@ -326,7 +329,7 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
     first.commit_sequence = SurfaceCommitSequence(11);
     first.pacing.fifo_set_barrier = true;
     assert!(matches!(
-        state.subsurface_transactions.cache_commit(child_id, first),
+        state.surface_transactions.cache_commit(child_id, first),
         CacheCommitOutcome::Inserted
     ));
 
@@ -339,7 +342,7 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
             .expect("future commit timing"),
     );
     assert!(matches!(
-        state.subsurface_transactions.cache_commit(child_id, second),
+        state.surface_transactions.cache_commit(child_id, second),
         CacheCommitOutcome::Inserted
     ));
 
@@ -352,10 +355,22 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
             .and_then(|publication| publication.latest_published),
         Some(SurfaceCommitSequence(11)),
     );
-    assert_eq!(state.pending_surface_tree_transactions.len(), 1);
-    assert_eq!(state.pending_surface_tree_transactions[0].nodes.len(), 1);
+    assert_eq!(state.surface_transactions.pending_tree_count(), 1);
     assert_eq!(
-        state.pending_surface_tree_transactions[0].nodes[0]
+        state
+            .surface_transactions
+            .pending_tree_at_for_test(0)
+            .expect("promoted transaction")
+            .nodes
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .surface_transactions
+            .pending_tree_at_for_test(0)
+            .expect("promoted transaction")
+            .nodes[0]
             .1
             .commit_sequence,
         SurfaceCommitSequence(12),
@@ -364,7 +379,7 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
 
 #[test]
 fn cached_child_content_update_is_not_merged_after_parent_dependency_capture() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.register(3, 2));
 
@@ -483,7 +498,7 @@ fn merging_content_updates_preserves_lineage_and_union_dependencies() {
 
 #[test]
 fn cache_transitions_and_teardown_settle_accounting() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.register(3, 2));
 
@@ -529,7 +544,7 @@ fn cache_transitions_and_teardown_settle_accounting() {
 
 #[test]
 fn global_entry_limit_rejects_without_eviction() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     for surface_id in 2..=513 {
         assert!(state.register(surface_id, 1));
         for sequence in 0..MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE {
@@ -572,7 +587,7 @@ fn global_entry_limit_rejects_without_eviction() {
 
 #[test]
 fn aggregate_entry_high_watermark_tracks_all_cached_surfaces() {
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.register(3, 1));
 
@@ -607,7 +622,7 @@ fn aggregate_obligation_high_watermark_tracks_all_cached_surfaces() {
     let display = Display::<crate::compositor::CompositorState>::new().expect("test display");
     let mut display_handle = display.handle();
     let (client, _peer) = test_client(&mut display_handle);
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register_with_client(2, 1, Some(client.id())));
     assert!(state.register_with_client(3, 1, Some(client.id())));
 
@@ -649,7 +664,7 @@ fn per_client_entry_limit_cannot_be_bypassed_by_many_surfaces() {
     let mut display_handle = display.handle();
     let (client_a, _peer_a) = test_client(&mut display_handle);
     let (client_b, _peer_b) = test_client(&mut display_handle);
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
 
     for surface_id in 2..=33 {
         assert!(state.register_with_client(surface_id, 1, Some(client_a.id())));
@@ -696,7 +711,7 @@ fn merge_path_is_bounded_by_retained_callback_obligations() {
     let display = Display::<crate::compositor::CompositorState>::new().expect("test display");
     let mut display_handle = display.handle();
     let (client, _peer) = test_client(&mut display_handle);
-    let mut state = SubsurfaceTransactionState::default();
+    let mut state = SurfaceTransactionState::default();
     assert!(state.register_with_client(2, 1, Some(client.id())));
 
     for _ in 0..MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_SURFACE {

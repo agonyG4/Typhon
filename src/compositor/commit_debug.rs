@@ -638,11 +638,13 @@ impl super::CompositorState {
             m.callbacks_completed_from_unpublished,
             m.published_commits_without_visual_generation,
             m.visual_generations_from_explicit_sync,
-            self.subsurface_transaction_metrics
+            self.surface_transactions
+                .metrics
                 .explicit_sync_queue_overflow,
-            self.subsurface_transaction_metrics
+            self.surface_transactions
+                .metrics
                 .maximum_explicit_sync_queue_depth,
-            self.subsurface_transaction_metrics.all_ready_queue_pressure,
+            self.surface_transactions.metrics.all_ready_queue_pressure,
             m.unready_commits_superseded,
             self.commit_debug.live.len(),
             self.commit_debug.callbacks.len()
