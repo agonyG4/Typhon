@@ -828,6 +828,160 @@ fn modifier_families_remain_active_until_the_last_left_or_right_key_releases() {
     }
 }
 
+fn physical_keyboard_events(effect: &NativeInputEffect) -> Vec<NativeKeyboardEvent> {
+    effect
+        .keyboard_actions
+        .iter()
+        .filter_map(|action| match action {
+            NativeKeyboardAction::PhysicalOnly(event)
+            | NativeKeyboardAction::PhysicalAndClient(event) => Some(event.clone()),
+            NativeKeyboardAction::ClientOnly(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn removing_one_source_releases_both_modifier_keys_but_each_family_once() {
+    for (left, right, family) in [
+        (KEY_LEFTALT, KEY_RIGHTALT, ModifierMask::ALT),
+        (KEY_LEFTCTRL, KEY_RIGHTCTRL, ModifierMask::CTRL),
+        (KEY_LEFTSHIFT, KEY_RIGHTSHIFT, ModifierMask::SHIFT),
+        (KEY_LEFTMETA, KEY_RIGHTMETA, ModifierMask::SUPER),
+    ] {
+        let mut input = NativeInputState::new(320, 200);
+        let device = k1_keyboard_id(83);
+        input.handle_key_event_from(device, left, 1);
+        input.handle_key_event_from(device, right, 1);
+        let releases_before = input.binding_manager.modifier_release_call_count(family);
+
+        let removed = input.handle_hardware_input_event(remove_k1_keyboard(device));
+
+        assert_eq!(
+            physical_keyboard_events(&removed),
+            vec![
+                NativeKeyboardEvent::new(left, false),
+                NativeKeyboardEvent::new(right, false),
+            ]
+        );
+        assert!(!input.active_modifier_mask().contains(family));
+        assert_eq!(
+            input.binding_manager.modifier_release_call_count(family) - releases_before,
+            1,
+            "{family:?} must transition inactive only once per source removal"
+        );
+        assert_eq!(
+            input.source_removal_modifier_release_routes,
+            vec![(right, family)]
+        );
+    }
+}
+
+#[test]
+fn removing_both_alt_variants_commits_alt_tab_once_after_both_releases() {
+    let mut input = NativeInputState::new(320, 200);
+    let device = k1_keyboard_id(84);
+    input.handle_key_event_from(device, KEY_LEFTALT, 1);
+    input.handle_key_event_from(device, KEY_RIGHTALT, 1);
+    assert_eq!(
+        input
+            .handle_key_event_from(device, KEY_TAB, 1)
+            .shortcut_events,
+        vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
+    );
+    let releases_before = input
+        .binding_manager
+        .modifier_release_call_count(ModifierMask::ALT);
+
+    let removed = input.handle_hardware_input_event(remove_k1_keyboard(device));
+
+    assert_eq!(
+        physical_keyboard_events(&removed),
+        vec![
+            NativeKeyboardEvent::new(KEY_TAB, false),
+            NativeKeyboardEvent::new(KEY_LEFTALT, false),
+            NativeKeyboardEvent::new(KEY_RIGHTALT, false),
+        ]
+    );
+    assert_eq!(
+        removed.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "alt_tab_commit"
+        )]
+    );
+    assert_eq!(
+        input
+            .binding_manager
+            .modifier_release_call_count(ModifierMask::ALT)
+            - releases_before,
+        1
+    );
+    assert_eq!(
+        input.source_removal_modifier_release_routes,
+        vec![(KEY_RIGHTALT, ModifierMask::ALT)]
+    );
+    assert!(!input.active_modifier_mask().contains(ModifierMask::ALT));
+}
+
+#[test]
+fn another_source_keeps_alt_active_until_its_final_release() {
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(85);
+    let second = k1_keyboard_id(86);
+    input.handle_key_event_from(first, KEY_LEFTALT, 1);
+    input.handle_key_event_from(first, KEY_RIGHTALT, 1);
+    input.handle_key_event_from(second, KEY_LEFTALT, 1);
+    input.handle_key_event_from(first, KEY_TAB, 1);
+    let releases_before = input
+        .binding_manager
+        .modifier_release_call_count(ModifierMask::ALT);
+
+    let first_removed = input.handle_hardware_input_event(remove_k1_keyboard(first));
+
+    assert_eq!(
+        physical_keyboard_events(&first_removed),
+        vec![
+            NativeKeyboardEvent::new(KEY_TAB, false),
+            NativeKeyboardEvent::new(KEY_RIGHTALT, false),
+        ]
+    );
+    assert!(input.active_modifier_mask().contains(ModifierMask::ALT));
+    assert!(first_removed.shortcut_events.is_empty());
+    assert_eq!(
+        input
+            .binding_manager
+            .modifier_release_call_count(ModifierMask::ALT),
+        releases_before
+    );
+    assert!(input.source_removal_modifier_release_routes.is_empty());
+
+    let second_removed = input.handle_hardware_input_event(remove_k1_keyboard(second));
+
+    assert_eq!(
+        physical_keyboard_events(&second_removed),
+        vec![NativeKeyboardEvent::new(KEY_LEFTALT, false)]
+    );
+    assert!(!input.active_modifier_mask().contains(ModifierMask::ALT));
+    assert_eq!(
+        second_removed.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "alt_tab_commit"
+        )]
+    );
+    assert_eq!(
+        input
+            .binding_manager
+            .modifier_release_call_count(ModifierMask::ALT)
+            - releases_before,
+        1
+    );
+    assert_eq!(
+        input.source_removal_modifier_release_routes,
+        vec![(KEY_LEFTALT, ModifierMask::ALT)]
+    );
+}
+
 #[test]
 fn the_same_ctrl_key_held_by_two_devices_is_released_once() {
     let mut input = NativeInputState::new(320, 200);

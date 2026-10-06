@@ -19,6 +19,8 @@ pub(crate) struct NativeInputState {
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
     pub(crate) suppressed_vt_switch_keys: Vec<u16>,
     keyboard_sources: KeyboardSourceLedger,
+    #[cfg(test)]
+    pub(crate) source_removal_modifier_release_routes: Vec<(u16, ModifierMask)>,
     pressed_pointer_buttons: Vec<u32>,
 }
 
@@ -42,6 +44,8 @@ impl NativeInputState {
             forwarded_deferred_modifier_keys: Vec::new(),
             suppressed_vt_switch_keys: Vec::new(),
             keyboard_sources: KeyboardSourceLedger::default(),
+            #[cfg(test)]
+            source_removal_modifier_release_routes: Vec::new(),
             pressed_pointer_buttons: Vec::new(),
         }
     }
@@ -247,10 +251,31 @@ impl NativeInputState {
         let released = self.keyboard_sources.remove_source(device);
         let modifiers_after = self.active_modifier_mask();
         let mut effect = NativeInputEffect::default();
+
+        // Removal snapshots both sides of the whole ledger mutation. If this
+        // source owned both left and right keys in a family, attach the one
+        // family transition to the last released key from that family.
+        let mut last_modifier_release_keys = [None; 4];
+        for &code in &released {
+            let Some(family) = modifier_family_for_key(code) else {
+                continue;
+            };
+            if modifiers_before.contains(family) && !modifiers_after.contains(family) {
+                if let Some(index) = modifier_family_index(family) {
+                    last_modifier_release_keys[index] = Some(code);
+                }
+            }
+        }
+
         for code in released {
-            let modifier_family_released = modifier_family_for_key(code).is_some_and(|family| {
-                modifiers_before.contains(family) && !modifiers_after.contains(family)
-            });
+            let modifier_family_released = modifier_family_for_key(code)
+                .and_then(modifier_family_index)
+                .is_some_and(|index| last_modifier_release_keys[index] == Some(code));
+            #[cfg(test)]
+            if modifier_family_released && let Some(family) = modifier_family_for_key(code) {
+                self.source_removal_modifier_release_routes
+                    .push((code, family));
+            }
             effect.append(self.route_logical_key_event(
                 code,
                 false,
@@ -909,6 +934,20 @@ fn modifier_family_for_key(code: u16) -> Option<ModifierMask> {
         Some(ModifierMask::ALT)
     } else if is_super_key(code) {
         Some(ModifierMask::SUPER)
+    } else {
+        None
+    }
+}
+
+fn modifier_family_index(family: ModifierMask) -> Option<usize> {
+    if family == ModifierMask::ALT {
+        Some(0)
+    } else if family == ModifierMask::CTRL {
+        Some(1)
+    } else if family == ModifierMask::SHIFT {
+        Some(2)
+    } else if family == ModifierMask::SUPER {
+        Some(3)
     } else {
         None
     }

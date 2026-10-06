@@ -91,6 +91,8 @@ pub(crate) struct ActiveBindingState {
 pub(crate) struct AstreaBindingManager {
     bindings: Vec<Binding>,
     active_sequences: ActiveBindingState,
+    #[cfg(test)]
+    modifier_release_call_counts: [usize; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,8 @@ impl AstreaBindingManager {
         Self {
             bindings: default_astrea_bindings(),
             active_sequences: ActiveBindingState::default(),
+            #[cfg(test)]
+            modifier_release_call_counts: [0; 4],
         }
     }
 
@@ -121,7 +125,15 @@ impl AstreaBindingManager {
         Self {
             bindings,
             active_sequences: ActiveBindingState::default(),
+            #[cfg(test)]
+            modifier_release_call_counts: [0; 4],
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn modifier_release_call_count(&self, family: ModifierMask) -> usize {
+        self.modifier_release_call_counts
+            [modifier_release_index(family).expect("test query must name one modifier family")]
     }
 
     pub(crate) fn handle_key(
@@ -178,6 +190,11 @@ impl AstreaBindingManager {
     }
 
     pub(crate) fn handle_modifier_release(&mut self, released: ModifierMask) -> AstreaBindingMatch {
+        #[cfg(test)]
+        if let Some(index) = modifier_release_index(released) {
+            self.modifier_release_call_counts[index] += 1;
+        }
+
         if released == ModifierMask::ALT && self.active_sequences.alt_tab_active {
             self.active_sequences.alt_tab_active = false;
             return AstreaBindingMatch::Consumed {
@@ -214,6 +231,21 @@ impl AstreaBindingManager {
                 && (!repeated || binding.repeat == RepeatPolicy::Enabled)
                 && (!inhibited || binding.inhibition == InhibitionPolicy::Bypass)
         })
+    }
+}
+
+#[cfg(test)]
+fn modifier_release_index(family: ModifierMask) -> Option<usize> {
+    if family == ModifierMask::ALT {
+        Some(0)
+    } else if family == ModifierMask::CTRL {
+        Some(1)
+    } else if family == ModifierMask::SHIFT {
+        Some(2)
+    } else if family == ModifierMask::SUPER {
+        Some(3)
+    } else {
+        None
     }
 }
 
