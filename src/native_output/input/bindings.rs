@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn default_workspace_bindings_are_typed_non_repeating_and_not_reserved() {
-        let manager = AstreaBindingManager::default();
+        let mut manager = AstreaBindingManager::default();
         let matched = manager.handle_key(ModifierMask::SUPER, KEY_0, true, false, false);
         assert_eq!(
             action_for_match(&manager, matched),
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn session_switch_bindings_keep_their_reserved_modifier_boundary() {
-        let manager = AstreaBindingManager::default();
+        let mut manager = AstreaBindingManager::default();
         let matched = manager.handle_key(
             ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
             KEY_1,
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn special_workspace_bindings_are_press_only_exact_and_inhibition_aware() {
-        let manager = AstreaBindingManager::default();
+        let mut manager = AstreaBindingManager::default();
         let matched = manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, false);
         assert_eq!(
             action_for_match(&manager, matched),

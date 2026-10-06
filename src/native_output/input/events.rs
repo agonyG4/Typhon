@@ -229,6 +229,7 @@ pub(crate) enum NativeWindowAction {
     MoveFocusedWindowToOrFromSpecialWorkspace,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AstreaShortcutEvent {
     pub(crate) namespace: String,
@@ -236,8 +237,8 @@ pub(crate) struct AstreaShortcutEvent {
     pub(crate) phase: AstreaShortcutPhase,
 }
 
+#[cfg(test)]
 impl AstreaShortcutEvent {
-    #[cfg(test)]
     pub(crate) fn pressed(namespace: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),

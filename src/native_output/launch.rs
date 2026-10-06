@@ -43,6 +43,7 @@ impl AstreaShortcutFallbackKind {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn astrea_shortcut_fallback_kind(
     shortcut: &AstreaShortcutEvent,
     protocol_clients: usize,

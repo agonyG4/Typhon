@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(test)]
 use std::cell::Cell;
 
 #[repr(transparent)]
@@ -35,6 +36,7 @@ pub(crate) struct BindingActionCatalog {
 }
 
 impl BindingActionCatalog {
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             actions: Vec::new(),
@@ -231,6 +233,7 @@ impl CompiledBindingTable {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn binding(&self, id: BindingId) -> Option<&CompiledBinding> {
         self.bindings
             .get(id.index())

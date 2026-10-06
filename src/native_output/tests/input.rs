@@ -95,7 +95,7 @@ fn shortcut_action_manager(
         AstreaShortcutPhase::Repeated => (BindingTrigger::Press, true, true),
         AstreaShortcutPhase::Released => (BindingTrigger::Release, false, false),
     };
-    let manager = AstreaBindingManager::with_specs(vec![BindingSpec {
+    let mut manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger,
         input: BindingInput::PhysicalKey(KEY_Z),
