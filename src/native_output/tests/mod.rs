@@ -49,6 +49,7 @@ mod frame;
 mod fullscreen_cadence;
 mod fullscreen_frame_scene;
 mod input;
+mod input_binding_engine;
 mod input_interaction_liveness;
 mod input_protocol;
 mod input_xwayland_client;
