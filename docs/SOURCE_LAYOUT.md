@@ -25,9 +25,13 @@ native_output
   modules split short-lived frame orchestration, ordinary scene/output/
   checkpoint state, effect execution and resource pooling, retained lifecycle
   visual ownership (including Lamp and Squash), ordinary image resources,
-  damage, dmabuf, geometry, and shader helpers. `frame/` borrows the persistent
-  scene, lifecycle, effect, and ordinary resource owners for one render call;
-  it does not retain frame state.
+  damage, dmabuf, geometry, and shader helpers. `scene/` owns scene identity and
+  shared command construction, `checkpoint.rs` defines the neutral causal data
+  model, and `egl_support/` contains stateless native config/context/presentation
+  helpers. `frame/` borrows the persistent scene, lifecycle, effect, and ordinary
+  resource owners for one render call; it does not retain frame state. The root
+  remains the renderer composition point and native-facing capture/presentation
+  lifecycle boundary.
 - `src/core/geometry.rs` contains reusable geometry types.
 
 Architecture code must use Rust modules, not `include!()`. Disconnected Rust

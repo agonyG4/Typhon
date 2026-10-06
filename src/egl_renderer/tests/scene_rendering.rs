@@ -1009,6 +1009,119 @@ fn scene_cache_key_reuses_geometry_when_content_generation_changes() {
 }
 
 #[test]
+fn scene_cache_hash_preserves_its_exact_surface_field_set() {
+    let signature = EglSceneSurfaceSignature {
+        surface_id: 7,
+        commit_sequence: 1,
+        buffer_id: 11,
+        buffer_width: 800,
+        buffer_height: 600,
+        buffer_scale: 1,
+        buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+        x: 10,
+        y: 20,
+        width: 800,
+        height: 600,
+        render_x: 0,
+        render_y: 0,
+        clip_x: 0,
+        clip_y: 0,
+        clip_width: 0,
+        clip_height: 0,
+        generation: 1,
+    };
+    let key = EglSceneCacheKey::new(
+        1280,
+        800,
+        9,
+        120,
+        &[signature],
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let changed_but_unhashed = EglSceneSurfaceSignature {
+        commit_sequence: 2,
+        buffer_id: 12,
+        generation: 2,
+        ..signature
+    };
+    assert!(key.is_current(
+        1280,
+        800,
+        9,
+        120,
+        &[changed_but_unhashed],
+        OutputFramebufferOrigin::BottomLeft,
+    ));
+
+    let hashed_changes = [
+        EglSceneSurfaceSignature {
+            surface_id: 8,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            buffer_width: 801,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            buffer_height: 601,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            buffer_scale: 2,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Flipped,
+            ..signature
+        },
+        EglSceneSurfaceSignature { x: 11, ..signature },
+        EglSceneSurfaceSignature { y: 21, ..signature },
+        EglSceneSurfaceSignature {
+            width: 801,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            height: 601,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            render_x: 1,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            render_y: 1,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            clip_x: 1,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            clip_y: 1,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            clip_width: 1,
+            ..signature
+        },
+        EglSceneSurfaceSignature {
+            clip_height: 1,
+            ..signature
+        },
+    ];
+    for changed in hashed_changes {
+        assert!(!key.is_current(
+            1280,
+            800,
+            9,
+            120,
+            &[changed],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+    }
+}
+
+#[test]
 fn scene_cache_key_invalidates_when_framebuffer_origin_changes() {
     let signature = EglSceneSurfaceSignature {
         surface_id: 7,

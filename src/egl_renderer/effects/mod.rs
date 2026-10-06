@@ -28,6 +28,8 @@ pub(super) use executor::composition_range;
 pub(crate) use executor::execute_effect_graph_with_debug_config_and_scene_replay_mode;
 #[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
+#[cfg(test)]
+pub(crate) use executor::replay_capture_region_layout;
 pub(crate) use executor::{EffectExecutionSelection, EffectExecutionStats};
 #[cfg(test)]
 pub(crate) use executor::{

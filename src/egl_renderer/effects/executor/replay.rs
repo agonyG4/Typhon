@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::egl_renderer::damage::OutputRect;
+
 pub(super) fn graph_texture(
     graph: &CompiledFrameGraph,
     id: GraphTextureId,
@@ -558,4 +560,43 @@ pub(crate) struct CheckpointCausalStabilityPlan {
     pub(crate) captures: std::collections::HashMap<GraphPassId, CheckpointCaptureCausalStability>,
     pub(crate) instances:
         std::collections::HashMap<EffectInstanceId, EffectInstanceCausalStability>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplayCaptureRegionLayout {
+    pub(crate) materialization_rects: usize,
+    pub(crate) execution_region: EffectRegion,
+    pub(crate) execution_regions: usize,
+    pub(crate) disjoint_overflowed: bool,
+}
+
+pub(crate) fn replay_capture_region_layout(
+    output_rects: &[OutputRect],
+) -> ReplayCaptureRegionLayout {
+    let mut requested = EffectRegion::empty();
+    for output_rect in output_rects {
+        if let Some(rect) = EffectRect::new(
+            output_rect.x,
+            output_rect.y,
+            output_rect.width,
+            output_rect.height,
+        ) {
+            requested.push(rect);
+        }
+    }
+    let disjoint = requested.disjoint_bounded();
+    let execution_region = if disjoint.overflowed {
+        requested
+            .bounding_rect()
+            .map(EffectRegion::from_rect)
+            .unwrap_or_else(EffectRegion::empty)
+    } else {
+        disjoint.region
+    };
+    ReplayCaptureRegionLayout {
+        materialization_rects: output_rects.len(),
+        execution_regions: execution_region.rects().len(),
+        disjoint_overflowed: disjoint.overflowed,
+        execution_region,
+    }
 }

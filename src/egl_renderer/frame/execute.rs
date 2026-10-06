@@ -1,11 +1,16 @@
-use glow::HasContext;
-use oblivion_one::effects::CompiledFrameGraph;
+use std::collections::HashMap;
 
+use glow::HasContext;
+use oblivion_one::effects::{CompiledFrameGraph, RenderPassKind};
+
+use super::super::checkpoint::CheckpointEffectCausalState;
 use super::super::{
-    EffectExecutionContext, EffectFailureReason, LifecycleRenderContext, RendererResult,
+    CheckpointCausalState, EffectExecutionContext, EffectFailureReason, LifecycleRenderContext,
+    RendererResult,
     damage::{OutputRect, RenderExecution, RepaintPlan},
     effects::{
         EffectDebugConfig, EffectExecutionSelection, EffectExecutionStats, SceneReplayWorkMode,
+        composition_range,
     },
     scene_state::{SceneRenderState, SceneTextureSources},
 };
@@ -277,12 +282,12 @@ impl FramePipeline<'_> {
                     self.gl.enable(glow::SCISSOR_TEST);
                 }
                 let mut draw_result = Ok(());
-                for phase in super::super::legacy_scene_scissored_phase_plan(scissors.len()) {
+                for phase in legacy_scene_scissored_phase_plan(scissors.len()) {
                     if draw_result.is_err() {
                         break;
                     }
                     match phase {
-                        super::super::LegacySceneScissoredPhase::BaseRepair(index) => {
+                        LegacySceneScissoredPhase::BaseRepair(index) => {
                             let [x, y, width, height] = scissors[index];
                             unsafe {
                                 self.gl.scissor(x, y, width, height);
@@ -295,18 +300,18 @@ impl FramePipeline<'_> {
                             );
                             draw_result = self.draw_command_batch(true, output_rect);
                         }
-                        super::super::LegacySceneScissoredPhase::PrepareLifecycleSources => {
+                        LegacySceneScissoredPhase::PrepareLifecycleSources => {
                             draw_result =
                                 self.prepare_lifecycle_visual_sources(plan, framebuffer_origin);
                         }
-                        super::super::LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
+                        LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
                             let [x, y, width, height] = scissors[index];
                             unsafe {
                                 self.gl.enable(glow::SCISSOR_TEST);
                                 self.gl.scissor(x, y, width, height);
                             }
                         }
-                        super::super::LegacySceneScissoredPhase::Lamp(index) => {
+                        LegacySceneScissoredPhase::Lamp(index) => {
                             let [x, y, width, height] = scissors[index];
                             let output_rect = super::super::gl_scissor_to_output_rect(
                                 [x, y, width, height],
@@ -315,7 +320,7 @@ impl FramePipeline<'_> {
                             );
                             draw_result = self.draw_lamp_overlay(output_rect);
                         }
-                        super::super::LegacySceneScissoredPhase::Squash(index) => {
+                        LegacySceneScissoredPhase::Squash(index) => {
                             let [x, y, width, height] = scissors[index];
                             let output_rect = super::super::gl_scissor_to_output_rect(
                                 [x, y, width, height],
@@ -324,7 +329,7 @@ impl FramePipeline<'_> {
                             );
                             draw_result = self.draw_squash_overlay(output_rect);
                         }
-                        super::super::LegacySceneScissoredPhase::ExternalOverlays(index) => {
+                        LegacySceneScissoredPhase::ExternalOverlays(index) => {
                             let [x, y, width, height] = scissors[index];
                             let output_rect = super::super::gl_scissor_to_output_rect(
                                 [x, y, width, height],
@@ -443,11 +448,7 @@ pub(in crate::egl_renderer) fn promote_checkpoint_cache_causal_state(
             .current_checkpoint_scene_causal_snapshot
             .clone()
             .map(|scene_snapshot| {
-                super::super::CheckpointCausalState::new(
-                    scene_snapshot,
-                    Some(graph),
-                    &scene.commands,
-                )
+                build_checkpoint_causal_state(scene_snapshot, Some(graph), &scene.commands)
             });
     if let Some(state) = candidate_state {
         effects
@@ -457,5 +458,118 @@ pub(in crate::egl_renderer) fn promote_checkpoint_cache_causal_state(
         effects
             .effect_resources
             .invalidate_checkpoint_causal_state();
+    }
+}
+
+fn build_checkpoint_causal_state(
+    scene: super::super::EglCheckpointSceneCausalSnapshot,
+    graph: Option<&CompiledFrameGraph>,
+    commands: &[super::super::geometry::EglDrawCommand],
+) -> CheckpointCausalState {
+    let mut effects = HashMap::new();
+    if let Some(graph) = graph {
+        let passes_by_id = graph
+            .passes
+            .iter()
+            .map(|pass| (pass.id, pass))
+            .collect::<HashMap<_, _>>();
+        for instance in &graph.instances {
+            let scene_captures = graph
+                .passes
+                .iter()
+                .filter(|pass| {
+                    pass.instance == instance.id && pass.kind == RenderPassKind::SceneCapture
+                })
+                .collect::<Vec<_>>();
+            let has_surface_capture = graph.passes.iter().any(|pass| {
+                pass.instance == instance.id && pass.kind == RenderPassKind::SurfaceCapture
+            });
+            let capture_dependencies = scene_captures
+                .first()
+                .and_then(|pass| {
+                    pass.checkpoint_dependencies
+                        .iter()
+                        .map(|dependency| {
+                            passes_by_id
+                                .get(dependency)
+                                .map(|dependency_pass| dependency_pass.instance)
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .unwrap_or_default();
+            effects.insert(
+                instance.id,
+                CheckpointEffectCausalState {
+                    semantic_signature: instance.semantic_signature,
+                    frame_demand: instance.frame_demand,
+                    causal_backdrop_only: scene_captures.len() == 1 && !has_surface_capture,
+                    capture_owner_root: scene_captures.first().and_then(|pass| {
+                        scene.presentation_owner_for_visual_group(pass.visual_group)
+                    }),
+                    composition_boundary: scene_captures.first().map(|pass| {
+                        let (draw_end, _) = composition_range(
+                            commands,
+                            pass.anchor,
+                            pass.visual_group,
+                            pass.anchor_scope,
+                        );
+                        (draw_end, pass.anchor, pass.visual_group, pass.anchor_scope)
+                    }),
+                    dependencies: capture_dependencies,
+                },
+            );
+        }
+    }
+    CheckpointCausalState { scene, effects }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::egl_renderer) enum LegacySceneScissoredPhase {
+    BaseRepair(usize),
+    PrepareLifecycleSources,
+    RestoreRepairScissor(usize),
+    Lamp(usize),
+    Squash(usize),
+    ExternalOverlays(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::egl_renderer) struct LegacySceneScissoredPhasePlan {
+    repair_count: usize,
+    index: usize,
+}
+
+impl Iterator for LegacySceneScissoredPhasePlan {
+    type Item = LegacySceneScissoredPhase;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let phase = if self.index < self.repair_count {
+            LegacySceneScissoredPhase::BaseRepair(self.index)
+        } else if self.index == self.repair_count {
+            LegacySceneScissoredPhase::PrepareLifecycleSources
+        } else {
+            let offset = self.index - self.repair_count - 1;
+            let repair = offset / 4;
+            if repair >= self.repair_count {
+                return None;
+            }
+            match offset % 4 {
+                0 => LegacySceneScissoredPhase::RestoreRepairScissor(repair),
+                1 => LegacySceneScissoredPhase::Lamp(repair),
+                2 => LegacySceneScissoredPhase::Squash(repair),
+                _ => LegacySceneScissoredPhase::ExternalOverlays(repair),
+            }
+        };
+        self.index = self.index.saturating_add(1);
+        Some(phase)
+    }
+}
+
+pub(in crate::egl_renderer) fn legacy_scene_scissored_phase_plan(
+    repair_count: usize,
+) -> LegacySceneScissoredPhasePlan {
+    LegacySceneScissoredPhasePlan {
+        repair_count,
+        index: 0,
     }
 }

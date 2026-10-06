@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::{
-    compositor,
+    compositor::{self, RenderableSurface},
     effects::{EffectExecutionDemand, FrameExecutionPlan, compile_frame_execution_plan},
 };
 
@@ -711,5 +711,30 @@ impl FramePipeline<'_> {
             &request.surface_resource_sync_states,
             &mut telemetry,
         )
+    }
+}
+
+pub(in crate::egl_renderer) fn split_external_overlay_surfaces(
+    surfaces: &[RenderableSurface],
+    external_overlay_surface_ids: &[u32],
+) -> (Vec<RenderableSurface>, Vec<RenderableSurface>) {
+    if external_overlay_surface_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    surfaces
+        .iter()
+        .cloned()
+        .partition(|surface| !external_overlay_surface_ids.contains(&surface.surface_id))
+}
+
+pub(in crate::egl_renderer) fn resolve_scene_damage_authority(
+    scene_changed: bool,
+    damage_authority_available: bool,
+    output_damage: OutputDamage,
+) -> (OutputDamage, bool) {
+    if scene_changed && !damage_authority_available && output_damage == OutputDamage::Empty {
+        (OutputDamage::Full, true)
+    } else {
+        (output_damage, false)
     }
 }

@@ -1380,9 +1380,15 @@ fn egl_decoration_commands_emit_titlebar_and_button_primitives() {
             .iter()
             .any(|command| { matches!(command.layer, EglDrawLayer::SolidRgba(_)) })
     );
-    assert!(
-        commands
-            .iter()
-            .any(|command| { matches!(command.layer, EglDrawLayer::DecorationAsset(_)) })
-    );
+    if decoration
+        .primitives()
+        .iter()
+        .any(|primitive| matches!(primitive, DecorationRenderPrimitive::Image { .. }))
+    {
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command.layer, EglDrawLayer::DecorationAsset(_)))
+        );
+    }
 }

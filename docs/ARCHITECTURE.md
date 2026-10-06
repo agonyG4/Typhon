@@ -42,7 +42,13 @@ there is no alternate runtime to hide that failure.
   Consumers receive a stack-only `ResourceTextureView` for ordinary texture
   lookup. Lifecycle retained textures remain in `LifecycleVisualStore` and are
   resolved through the effect resource pool; they are composed with ordinary
-  sources only at `SceneTextureSources`. `egl_renderer/frame/` coordinates
+  sources only at `SceneTextureSources`. `egl_renderer/scene/` contains scene
+  cache identity and shared ordinary/Lamp/Squash command construction;
+  `checkpoint.rs` defines the causal snapshot data model while frame execution
+  builds graph-aware causal values. `egl_renderer/egl_support/` contains
+  stateless native config, GLES context, and presentation helpers. The root
+  keeps renderer construction, capture, presentation completion, and explicit
+  teardown as the native-facing façade. `egl_renderer/frame/` coordinates
   begin-frame setup, resource preparation, scene/damage preparation, graph and
   repaint planning, consumer realization, execution, and outcome settlement.
   Its `FramePipeline` is a short-lived borrow over those persistent owners; it

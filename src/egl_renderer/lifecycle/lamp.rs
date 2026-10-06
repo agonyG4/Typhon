@@ -4,6 +4,11 @@ use super::geometry::{
     surface_root_for_lifecycle_surface,
 };
 use super::{frame_state::LifecycleFrameState, visual_store::LifecycleVisualStore};
+use oblivion_one::compositor::{DecorationRenderPrimitive, clipped_decoration_text_geometry};
+
+pub(super) const MAX_LAMP_VERTICES: usize = 65_536;
+pub(super) const LAMP_TARGET_CELL_PIXELS: f32 = 32.0;
+pub(super) const LAMP_MAX_GRID_SUBDIVISIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LampUniformLocations {

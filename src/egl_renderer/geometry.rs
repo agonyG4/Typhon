@@ -1,6 +1,7 @@
+use glow::HasContext;
 use oblivion_one::compositor::ServerFrameColor;
 
-use super::OutputFramebufferOrigin;
+use super::{OutputFramebufferOrigin, OutputRect};
 
 pub(super) const MIN_VERTEX_BUFFER_BYTES: usize = 4096;
 pub(super) const VERTEX_STRIDE: i32 = std::mem::size_of::<EglTexturedVertex>() as i32;
@@ -1235,4 +1236,77 @@ mod tests {
         assert_eq!(legacy[0].uv, scanout[0].uv);
         assert_eq!(legacy[1].uv, scanout[1].uv);
     }
+}
+
+pub(super) fn ensure_vertex_buffer_capacity(
+    gl: &glow::Context,
+    vertex_buffer: glow::Buffer,
+    current_capacity: &mut usize,
+    required_size: usize,
+) {
+    if *current_capacity >= required_size && *current_capacity > 0 {
+        return;
+    }
+    let capacity = required_size
+        .max(MIN_VERTEX_BUFFER_BYTES)
+        .next_power_of_two();
+    unsafe {
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
+        gl.buffer_data_size(glow::ARRAY_BUFFER, capacity as i32, glow::DYNAMIC_DRAW);
+    }
+    *current_capacity = capacity;
+}
+
+pub(super) fn gl_scissor_to_output_rect(
+    [x, y, width, height]: [i32; 4],
+    output_height: u32,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> Option<OutputRect> {
+    let top = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => i32::try_from(output_height)
+            .ok()?
+            .checked_sub(y.checked_add(height)?)?,
+        OutputFramebufferOrigin::TopLeftScanout => y,
+    };
+    (width > 0 && height > 0).then_some(OutputRect::new(x, top, width as u32, height as u32))
+}
+
+pub(super) fn output_rect_for_egl_clip(clip: EglRect) -> Option<OutputRect> {
+    if !clip.x().is_finite()
+        || !clip.y().is_finite()
+        || !clip.width().is_finite()
+        || !clip.height().is_finite()
+        || clip.width() <= 0.0
+        || clip.height() <= 0.0
+    {
+        return None;
+    }
+    let left = f64::from(clip.x()).floor();
+    let top = f64::from(clip.y()).floor();
+    let right = (f64::from(clip.x()) + f64::from(clip.width())).ceil();
+    let bottom = (f64::from(clip.y()) + f64::from(clip.height())).ceil();
+    let left = left.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let top = top.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let right = right.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let bottom = bottom.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let width = (i64::from(right) - i64::from(left)).clamp(0, i64::from(u32::MAX)) as u32;
+    let height = (i64::from(bottom) - i64::from(top)).clamp(0, i64::from(u32::MAX)) as u32;
+    (width > 0 && height > 0).then_some(OutputRect::new(left, top, width, height))
+}
+
+pub(super) fn intersect_output_rect(left: OutputRect, right: OutputRect) -> Option<OutputRect> {
+    let x = i64::from(left.x).max(i64::from(right.x));
+    let y = i64::from(left.y).max(i64::from(right.y));
+    let right_edge = i64::from(left.x)
+        .saturating_add(i64::from(left.width))
+        .min(i64::from(right.x).saturating_add(i64::from(right.width)));
+    let bottom_edge = i64::from(left.y)
+        .saturating_add(i64::from(left.height))
+        .min(i64::from(right.y).saturating_add(i64::from(right.height)));
+    (right_edge > x && bottom_edge > y).then_some(OutputRect::new(
+        x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        (right_edge - x).clamp(0, i64::from(u32::MAX)) as u32,
+        (bottom_edge - y).clamp(0, i64::from(u32::MAX)) as u32,
+    ))
 }

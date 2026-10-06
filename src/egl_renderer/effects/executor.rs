@@ -28,7 +28,6 @@ use super::super::{
     EffectExecutionTargets, EffectFramebufferTarget, EglRect, GlesSceneFrameStats,
     OutputFramebufferOrigin, OutputRect, RendererResult, SceneRenderState, SceneTextureSources,
     VisualGroupId, ensure_vertex_buffer_capacity, intersect_output_rect, output_rect_for_egl_clip,
-    replay_capture_region_layout,
 };
 use super::gpu_timing::{
     CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
@@ -89,6 +88,8 @@ use capture_exec::SceneWorkPreservation;
 use capture_exec::*;
 mod replay;
 pub(crate) use replay::SceneReplayWorkMode;
+#[cfg(test)]
+pub(crate) use replay::replay_capture_region_layout;
 use replay::*;
 mod checkpoint;
 use checkpoint::*;
