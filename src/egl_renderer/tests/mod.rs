@@ -21,11 +21,11 @@ use oblivion_one::render_backend::buffer::{
     DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
 };
 use oblivion_one::window_lifecycle_animation::{
-    LifecycleDirection, LifecycleEffectKind, LifecycleFrameSample, LifecycleSceneSample,
-    LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
+    LifecycleDirection, LifecycleEffectKind, LifecycleSceneSample, LifecycleVisualGroup,
+    LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
 };
 
-fn test_lifecycle_identity(
+pub(super) fn test_lifecycle_identity(
     window_id: oblivion_one::compositor::WindowId,
     started_at: u64,
 ) -> PresentationRetainedVisualIdentity {
@@ -48,20 +48,20 @@ fn egl_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .expect("EGL test lock is not poisoned")
 }
 
-struct GlesEffectTestHarness {
+pub(super) struct GlesEffectTestHarness {
     egl: EglInstance,
     display: egl::Display,
     context: egl::Context,
     surface: egl::Surface,
-    gl: glow::Context,
-    renderer: GlesSceneRenderer,
+    pub(super) gl: glow::Context,
+    pub(super) renderer: GlesSceneRenderer,
     test_output_texture: Option<glow::Texture>,
     test_output_framebuffer: Option<glow::Framebuffer>,
     _egl_test_lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl GlesEffectTestHarness {
-    fn new(width: u32, height: u32) -> Self {
+    pub(super) fn new(width: u32, height: u32) -> Self {
         let egl_test_lock = egl_test_lock();
         const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
         let egl = unsafe { EglInstance::load_required() }
@@ -157,7 +157,7 @@ impl GlesEffectTestHarness {
         }
     }
 
-    fn install_texture_backed_output(&mut self) {
+    pub(super) fn install_texture_backed_output(&mut self) {
         assert!(self.test_output_texture.is_none());
         let width = self.renderer.scene_state.current_size.0;
         let height = self.renderer.scene_state.current_size.1;
@@ -244,6 +244,60 @@ impl Drop for GlesEffectTestHarness {
 mod support;
 use support::*;
 
+pub(super) fn lifecycle_test_lamp_sample(progress: f64) -> LifecycleSceneSample {
+    support::lamp_test_sample(progress)
+}
+
+pub(super) fn lifecycle_test_surface_fixture(
+    surface_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    color: u32,
+    buffer_ids: &mut BufferIdAllocator,
+) -> RenderableSurface {
+    support::lifecycle_test_surface(surface_id, x, y, width, height, color, buffer_ids)
+}
+
+pub(super) fn lifecycle_shm_surface(damage: RenderableSurfaceDamage) -> RenderableSurface {
+    support::test_shm_surface(damage)
+}
+
+pub(super) fn lifecycle_transfer_color(x: u32, logical_y: u32) -> [u8; 4] {
+    support::lifecycle_transfer_test_color(x, logical_y)
+}
+
+pub(super) fn lifecycle_transfer_fill_pattern(
+    harness: &GlesEffectTestHarness,
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
+    support::fill_lifecycle_transfer_test_pattern(harness, framebuffer_origin);
+}
+
+pub(super) fn lifecycle_transfer_texture_key(width: u32, height: u32) -> EffectTextureKey {
+    support::lifecycle_transfer_test_texture_key(width, height)
+}
+
+pub(super) fn lifecycle_transfer_read_pixels(
+    harness: &mut GlesEffectTestHarness,
+    target: &PooledEffectTexture,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    support::read_effect_texture_pixels(harness, target, width, height)
+}
+
+pub(super) fn lifecycle_transfer_assert_pixel(
+    pixels: &[u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    expected: [u8; 4],
+) {
+    support::assert_effect_test_pixel(pixels, width, x, y, expected);
+}
+
 mod checkpoint_causal_gles;
 mod checkpoint_replay;
 mod dependency_free_replay_cache;
@@ -253,13 +307,10 @@ mod effect_passes;
 mod effect_replay;
 mod egl_config;
 mod egl_resources;
-mod lamp;
 mod lifecycle_integration;
 mod scene_rendering;
 mod shm;
-mod squash;
 use egl_resources::{DropProbe, fake_egl_image};
 
 mod effect_session;
-mod lamp_geometry_tests;
 mod presentation_clip;

@@ -1,4 +1,8 @@
 use super::*;
+use crate::egl_renderer::tests::{
+    lifecycle_test_lamp_sample as lamp_test_sample, test_lifecycle_identity,
+};
+use oblivion_one::presentation_animation::PresentationRect;
 
 #[test]
 fn lamp_mesh_identity_ignores_progress() {
@@ -79,43 +83,6 @@ fn lifecycle_source_requires_exact_owner_payload_and_root() {
 }
 
 #[test]
-fn frozen_visual_signature_survives_reversal_but_changes_for_fresh_payload() {
-    let first_sample = lamp_test_sample(0.5);
-    let first_lamp = LifecycleFrameSnapshot::from_sample(&first_sample).samples[0];
-    let first_source = &first_sample.samples[0].visual_source;
-    let next_identity = test_lifecycle_identity(first_lamp.window_id, 2);
-    let mut reversed_lamp = first_lamp;
-    reversed_lamp.presentation_identity = next_identity;
-    let reversed_source = LifecycleVisualSource {
-        presentation_identity: next_identity,
-        ..first_source.clone()
-    };
-    assert_eq!(
-        lifecycle_visual_source_signature(&reversed_source, reversed_lamp, 1.0),
-        lifecycle_visual_source_signature(first_source, first_lamp, 1.0),
-        "owner revisions do not invalidate the same immutable payload"
-    );
-
-    let fresh_payload =
-        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(next_identity);
-    let fresh_lamp = LifecycleFrameSample {
-        presentation_identity: next_identity,
-        payload_id: fresh_payload,
-        ..first_lamp
-    };
-    let fresh_source = LifecycleVisualSource {
-        presentation_identity: next_identity,
-        payload_id: fresh_payload,
-        ..first_source.clone()
-    };
-    assert_ne!(
-        lifecycle_visual_source_signature(&fresh_source, fresh_lamp, 1.0),
-        lifecycle_visual_source_signature(first_source, first_lamp, 1.0),
-        "a new lifecycle payload cannot alias the previous resolved visual"
-    );
-}
-
-#[test]
 fn lamp_draw_commands_are_qualified_by_exact_presentation_identity() {
     let window_id = compositor::WindowId::from_raw(901).expect("test window id");
     let first = test_lifecycle_identity(window_id, 1);
@@ -144,7 +111,11 @@ fn lamp_draw_commands_are_qualified_by_exact_presentation_identity() {
 fn every_visible_lamp_progress_sample_has_lifecycle_damage() {
     for progress in [0.01, 0.5, 0.97] {
         let sample = lamp_test_sample(progress);
-        let damage = lifecycle_damage_for_samples(&sample, 1920, 1080, 1.0);
+        let damage = super::super::frame_state::LifecycleFrameState::damage_for_snapshot(
+            &sample,
+            (1920, 1080),
+            1.0,
+        );
         assert!(
             !matches!(damage, OutputDamage::Empty),
             "progress {progress} must remain eligible for presentation"

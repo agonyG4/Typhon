@@ -21,8 +21,10 @@ native_output
 - `src/compositor/` owns Wayland protocol dispatch and compositor state.
 - `src/compositor/tests/` and `src/native_output/tests/` are connected white-box
   test trees.
-- `src/egl_renderer.rs` and its child modules own the native EGL/GLES scene
-  renderer, damage, dmabuf, geometry, and shader helpers.
+- `src/egl_renderer.rs` is the native EGL/GLES renderer façade. Its child
+  modules split ordinary scene/output/checkpoint state, effect execution and
+  resource pooling, retained lifecycle visual ownership (including Lamp and
+  Squash), damage, dmabuf, geometry, and shader helpers.
 - `src/core/geometry.rs` contains reusable geometry types.
 
 Architecture code must use Rust modules, not `include!()`. Disconnected Rust

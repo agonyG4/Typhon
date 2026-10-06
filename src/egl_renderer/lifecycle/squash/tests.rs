@@ -1,4 +1,10 @@
 use super::*;
+use crate::egl_renderer::tests::{
+    GlesEffectTestHarness, lifecycle_test_lamp_sample as lamp_test_sample,
+    lifecycle_test_surface_fixture as lifecycle_test_surface,
+};
+use oblivion_one::presentation_animation::PresentationRect;
+use oblivion_one::render_backend::buffer::BufferIdAllocator;
 
 #[test]
 fn squash_resolved_source_is_one_quad_and_does_not_use_lamp_mesh() {
@@ -19,20 +25,23 @@ fn squash_resolved_source_is_one_quad_and_does_not_use_lamp_mesh() {
     )
     .expect("valid Squash visual group");
     sample.visual_source.kind = LifecycleVisualSourceKind::ResolvedOwnedEffects;
-    harness
-        .renderer
-        .rebuild_squash_commands(&lifecycle, &[], &[], 1.0);
+    harness.renderer.lifecycle.rebuild_squash_commands(
+        &lifecycle,
+        &[],
+        &[],
+        1.0,
+        (320, 200),
+        OutputFramebufferOrigin::BottomLeft,
+    );
 
-    assert_eq!(harness.renderer.scene_state.squash_vertices.len(), 6);
-    assert_eq!(harness.renderer.scene_state.squash_commands.len(), 1);
+    assert_eq!(harness.renderer.lifecycle.squash.vertices.len(), 6);
+    assert_eq!(harness.renderer.lifecycle.squash.commands.len(), 1);
     assert!(matches!(
-        harness.renderer.scene_state.squash_commands[0]
-            .command
-            .layer,
+        harness.renderer.lifecycle.squash.commands[0].command.layer,
         EglDrawLayer::LifecycleResolvedVisual(_)
     ));
-    assert!(harness.renderer.scene_state.lamp_vertices.is_empty());
-    assert!(harness.renderer.scene_state.lamp_commands.is_empty());
+    assert!(harness.renderer.lifecycle.lamp.vertices.is_empty());
+    assert!(harness.renderer.lifecycle.lamp.commands.is_empty());
 }
 
 #[test]
@@ -62,30 +71,24 @@ fn squash_missing_retained_texture_falls_back_without_render_evidence() {
         0xffee_8844,
         &mut BufferIdAllocator::default(),
     );
-    harness.renderer.lifecycle_samples = LifecycleFrameSnapshot::from_sample(&lifecycle).samples;
-    harness.renderer.rebuild_squash_commands(
+    harness.renderer.lifecycle.begin_frame(&lifecycle);
+    harness.renderer.lifecycle.rebuild_squash_commands(
         &lifecycle,
         std::slice::from_ref(&retained_surface),
         &[],
         1.0,
+        (320, 200),
+        OutputFramebufferOrigin::BottomLeft,
     );
 
     harness
         .renderer
         .draw_squash_overlay(None)
         .expect("missing retained texture is a recoverable lifecycle fallback");
-    assert_eq!(harness.renderer.lifecycle_render_fallbacks.failed.len(), 1);
-    assert_eq!(
-        harness.renderer.lifecycle_render_fallbacks.failed[0].effect,
-        LifecycleEffectKind::Squash
-    );
-    assert!(
-        harness
-            .renderer
-            .lifecycle_render_evidence
-            .consumed
-            .is_empty()
-    );
+    let fallbacks = harness.renderer.lifecycle.fallbacks();
+    assert_eq!(fallbacks.failed.len(), 1);
+    assert_eq!(fallbacks.failed[0].effect, LifecycleEffectKind::Squash);
+    assert!(harness.renderer.lifecycle.evidence().consumed.is_empty());
 }
 
 #[test]

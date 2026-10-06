@@ -215,8 +215,7 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
     );
 
     resolved.lifecycle = lamp_test_sample(0.5);
-    renderer.scene_state.lamp_program = None;
-    renderer.scene_state.lamp_uniform_locations = None;
+    renderer.lifecycle.disable_lamp_for_test();
     let request = frame_renderer.egl_scene_draw_request(
         320,
         200,
@@ -234,7 +233,7 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
     };
     assert_eq!(fallbacks.failed.len(), 1);
     assert_eq!(fallbacks.failed[0].window_id.get(), 1);
-    assert!(renderer.lifecycle_render_evidence.consumed.is_empty());
+    assert!(renderer.lifecycle.evidence().consumed.is_empty());
     assert_eq!(renderer.scene_state.repaint_planner.history_depth(), 0);
 
     let mut resolved_effect_lifecycle = lamp_test_sample(0.5);
@@ -257,11 +256,18 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
         kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
         effect_scene: std::sync::Arc::new(oblivion_one::compositor::ResolvedEffectScene::default()),
     };
-    renderer.scene_state.lamp_geometry_key = None;
-    renderer.rebuild_lamp_commands_if_needed(&resolved_effect_lifecycle, &[], &[], 1.0);
-    assert_eq!(renderer.scene_state.lamp_commands.len(), 1);
+    renderer.lifecycle.invalidate_lamp_geometry_for_test();
+    renderer.lifecycle.rebuild_lamp_commands(
+        &resolved_effect_lifecycle,
+        &[],
+        &[],
+        1.0,
+        (320, 200),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    assert_eq!(renderer.lifecycle.lamp_commands().len(), 1);
     assert!(matches!(
-        renderer.scene_state.lamp_commands[0].layer,
+        renderer.lifecycle.lamp_commands()[0].layer,
         EglDrawLayer::LifecycleResolvedVisual(_)
     ));
 }
@@ -406,9 +412,13 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
         }
     };
     assert!(first_evidence.contains(identity, payload_id, 604));
-    assert!(renderer.lifecycle_visual_source_is_ready(payload_id));
+    assert!(
+        renderer
+            .lifecycle
+            .is_visual_source_ready(payload_id, &renderer.effect_runtime)
+    );
     assert!(matches!(
-        renderer.scene_state.lamp_commands.as_slice(),
+        renderer.lifecycle.lamp_commands(),
         [EglLampDrawCommand {
             layer: EglDrawLayer::LifecycleResolvedVisual(layer_payload),
             ..
@@ -428,10 +438,9 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
     );
 
     let source_signature = renderer
-        .lifecycle_visual_resources
-        .get(&payload_id)
-        .expect("successful blur capture owns a resolved texture")
-        .source_signature;
+        .lifecycle
+        .resolved_visual_source_signature(payload_id)
+        .expect("successful blur capture owns a resolved texture");
     // Canonical effects may change while the retained lifecycle payload
     // and its resolved visual stay frozen through minimize-to-restore.
     resolved.effects = ResolvedEffectScene::new(999, Vec::new());
@@ -467,13 +476,16 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
         }
     };
     assert!(reverse_evidence.contains(identity, payload_id, 604));
-    assert!(renderer.lifecycle_visual_source_is_ready(payload_id));
+    assert!(
+        renderer
+            .lifecycle
+            .is_visual_source_ready(payload_id, &renderer.effect_runtime)
+    );
     assert_eq!(
         renderer
-            .lifecycle_visual_resources
-            .get(&payload_id)
-            .expect("reversal retains the resolved visual")
-            .source_signature,
+            .lifecycle
+            .resolved_visual_source_signature(payload_id)
+            .expect("reversal retains the resolved visual"),
         source_signature
     );
     let reverse_trace = effects::take_effect_trace_test_events();
@@ -520,10 +532,15 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
         fallbacks.failed[0].reason,
         LifecycleRenderFallbackReason::ResolvedSourceCapture
     );
-    assert!(!renderer.lifecycle_visual_source_is_ready(failed_payload));
     assert!(
         !renderer
-            .lifecycle_render_evidence
+            .lifecycle
+            .is_visual_source_ready(failed_payload, &renderer.effect_runtime)
+    );
+    assert!(
+        !renderer
+            .lifecycle
+            .evidence()
             .contains(failed_identity, failed_payload, 604)
     );
     let failure_trace = effects::take_effect_trace_test_events();
@@ -655,10 +672,9 @@ fn assert_lifecycle_resolved_visual_isolation_for_origin(
 
     let texture = harness
         .renderer
-        .lifecycle_visual_resources
-        .get(&payload_id)
+        .lifecycle
+        .resolved_visual_texture(payload_id)
         .expect("resolved lifecycle visual is retained")
-        .texture
         .clone();
     // Supply a deterministic, opaque desktop baseline to the real output
     // before re-running the retained source capture.
@@ -678,16 +694,34 @@ fn assert_lifecycle_resolved_visual_isolation_for_origin(
     assert_eq!(desktop_pixel, [255, 0, 255, 255]);
     let source = harness
         .renderer
-        .lifecycle_visual_sources
-        .values()
+        .lifecycle
+        .visual_sources()
         .next()
         .expect("frozen lifecycle effect source is retained")
         .clone();
-    let lamp = harness.renderer.lifecycle_samples[0];
-    harness
-        .renderer
-        .capture_lifecycle_visual_source(&source, lamp, texture.clone(), framebuffer_origin)
-        .expect("manual resolved-source recapture succeeds");
+    let lamp = harness.renderer.lifecycle.samples()[0];
+    {
+        let renderer = &mut harness.renderer;
+        let mut context = LifecycleRenderContext::new(
+            &harness.gl,
+            &mut renderer.scene_state,
+            &mut renderer.effect_runtime,
+            &renderer.surface_resources,
+            &renderer.frame_resources,
+            &renderer.decoration_resources,
+            renderer.cursor_resource.as_ref(),
+        );
+        renderer
+            .lifecycle
+            .capture_visual_source_for_test(
+                &mut context,
+                &source,
+                lamp,
+                texture.clone(),
+                framebuffer_origin,
+            )
+            .expect("manual resolved-source recapture succeeds");
+    }
     harness.renderer.bind_active_output_framebuffer();
     let output_after = read_effect_test_pixels(&harness.gl, 320, 200);
     assert_eq!(
@@ -853,10 +887,9 @@ fn egl_lifecycle_resolved_visual_preserves_premultiplied_alpha() {
     assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
     let texture = harness
         .renderer
-        .lifecycle_visual_resources
-        .get(&payload_id)
+        .lifecycle
+        .resolved_visual_texture(payload_id)
         .expect("alpha-preserving lifecycle resource is retained")
-        .texture
         .clone();
     let pixels = read_effect_texture_pixels(
         &mut harness,
@@ -982,7 +1015,8 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
     assert!(
         harness
             .renderer
-            .lifecycle_visual_source_is_ready(payload_id)
+            .lifecycle
+            .is_visual_source_ready(payload_id, &harness.renderer.effect_runtime)
     );
     let trace = effects::take_effect_trace_test_events();
     let graph_begins = trace
@@ -1043,23 +1077,21 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
             .effect_resources
             .metrics()
             .checked_out_texture_count,
-        harness.renderer.lifecycle_visual_resources.len() + checkpoint_entries,
+        harness.renderer.lifecycle.resolved_visual_resource_count() + checkpoint_entries,
         "both graphs release every temporary lease; only retained visuals and checkpoint cache entries remain checked out"
     );
 
     let texture = harness
         .renderer
-        .lifecycle_visual_resources
-        .get(&payload_id)
+        .lifecycle
+        .resolved_visual_texture(payload_id)
         .expect("resolved lifecycle visual is retained")
-        .texture
         .clone();
     let source_commands = harness
         .renderer
-        .lifecycle_source_commands
-        .get(&payload_id)
-        .expect("retained lifecycle source commands are prepared")
-        .clone();
+        .lifecycle
+        .source_commands_for_payload(payload_id)
+        .expect("retained lifecycle source commands are prepared");
     assert!(
         source_commands
             .iter()

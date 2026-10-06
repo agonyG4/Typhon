@@ -3,18 +3,11 @@ use super::*;
 #[test]
 fn lamp_renderer_locates_continuous_motion_uniforms() {
     let harness = GlesEffectTestHarness::new(320, 200);
-    let uniforms = harness
-        .renderer
-        .scene_state
-        .lamp_uniform_locations
-        .expect("Lamp shader is available in the GLES test harness");
-    assert!(uniforms.canonical_visual_rect.is_some());
-    assert!(uniforms.source_visual_rect.is_some());
-    assert!(uniforms.sink_rect.is_some());
-    assert!(uniforms.progress.is_some());
-    assert!(uniforms.contraction_progress.is_some());
-    assert!(uniforms.translation_progress.is_some());
-    assert!(uniforms.retreat_progress.is_some());
+    assert_eq!(
+        harness.renderer.lifecycle.lamp_uniforms_present_for_test(),
+        [true; 7],
+        "the lifecycle owner initializes all Lamp uniforms"
+    );
 }
 
 #[test]

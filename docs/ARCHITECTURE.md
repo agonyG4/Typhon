@@ -30,8 +30,11 @@ there is no alternate runtime to hide that failure.
   scheduling primitives.
 - `src/native_output/` owns the native runtime, input adapters, output target,
   cursor, damage, scanout, shell launch, presentation, recovery, and shutdown.
-- `src/egl_renderer.rs` owns the shared native EGL/GLES scene renderer and
-  dmabuf import helpers.
+- `src/egl_renderer.rs` is the shared native EGL/GLES renderer façade and
+  orchestration boundary. `SceneRenderState` owns ordinary scene execution,
+  output, and checkpoint state; `EffectRuntime` owns effect execution and its
+  pooled resources; `egl_renderer/lifecycle/` owns retained lifecycle visual
+  capture plus Lamp and Squash rendering state.
 - `src/session/` describes native seat, input, output, and SDDM prerequisites.
 - `src/core/geometry.rs` contains reusable geometry shared by the window
   manager and native-independent tests.

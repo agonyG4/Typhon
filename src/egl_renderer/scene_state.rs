@@ -23,8 +23,7 @@ pub(in crate::egl_renderer) fn establish_scene_gl_state(
     }
 }
 
-/// Authoritative scene replay, composition, and active output state.
-/// Lifecycle retained payloads and surface resource maps remain renderer-owned.
+/// Ordinary scene replay, composition, output, and checkpoint state.
 pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) program: GlProgram,
     pub(in crate::egl_renderer) presentation_opacity_location: Option<glow::UniformLocation>,
@@ -36,21 +35,6 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) overlay_vertex_buffer: GlBuffer,
     pub(in crate::egl_renderer) overlay_vertex_buffer_capacity: usize,
     pub(in crate::egl_renderer) overlay_geometry_dirty: bool,
-    pub(in crate::egl_renderer) lamp_program: Option<GlProgram>,
-    pub(in crate::egl_renderer) lamp_uniform_locations: Option<LampUniformLocations>,
-    pub(in crate::egl_renderer) lamp_vertex_array: GlVertexArray,
-    pub(in crate::egl_renderer) lamp_vertex_buffer: GlBuffer,
-    pub(in crate::egl_renderer) lamp_vertex_buffer_capacity: usize,
-    pub(in crate::egl_renderer) lamp_geometry_dirty: bool,
-    pub(in crate::egl_renderer) lamp_geometry_key: Option<u64>,
-    pub(in crate::egl_renderer) lamp_vertices: Vec<EglLampVertex>,
-    pub(in crate::egl_renderer) lamp_commands: Vec<EglLampDrawCommand>,
-    pub(in crate::egl_renderer) squash_vertices: Vec<EglTexturedVertex>,
-    pub(in crate::egl_renderer) squash_commands: Vec<EglSquashDrawCommand>,
-    pub(in crate::egl_renderer) squash_vertex_array: GlVertexArray,
-    pub(in crate::egl_renderer) squash_vertex_buffer: GlBuffer,
-    pub(in crate::egl_renderer) squash_vertex_buffer_capacity: usize,
-    pub(in crate::egl_renderer) squash_geometry_dirty: bool,
     pub(in crate::egl_renderer) current_framebuffer_origin: OutputFramebufferOrigin,
     pub(in crate::egl_renderer) current_size: (u32, u32),
     pub(in crate::egl_renderer) vertices: Vec<EglTexturedVertex>,
@@ -112,7 +96,7 @@ impl SceneTextureSources<'_> {
             EglDrawLayer::LifecycleResolvedVisual(payload_id) => self
                 .lifecycle
                 .get(&payload_id)
-                .and_then(|resource| effects.texture(&resource.texture)),
+                .and_then(|resource| effects.texture(resource.pooled_texture())),
             EglDrawLayer::Cursor => self.cursor.map(|resource| resource.texture),
         }
     }
@@ -360,17 +344,10 @@ impl SceneRenderState {
 impl SceneRenderState {
     pub(in crate::egl_renderer) fn destroy_gl_resources(&mut self, gl: &glow::Context) {
         unsafe {
-            if let Some(lamp_program) = self.lamp_program.take() {
-                gl.delete_program(lamp_program);
-            }
-            gl.delete_buffer(self.lamp_vertex_buffer);
-            gl.delete_vertex_array(self.lamp_vertex_array);
             gl.delete_buffer(self.scene_vertex_buffer);
             gl.delete_vertex_array(self.scene_vertex_array);
             gl.delete_buffer(self.overlay_vertex_buffer);
             gl.delete_vertex_array(self.overlay_vertex_array);
-            gl.delete_buffer(self.squash_vertex_buffer);
-            gl.delete_vertex_array(self.squash_vertex_array);
             gl.delete_program(self.program);
         }
     }

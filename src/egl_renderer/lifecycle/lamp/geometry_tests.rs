@@ -1,5 +1,10 @@
 use super::*;
+use crate::egl_renderer::tests::{
+    lifecycle_shm_surface as test_shm_surface, lifecycle_test_lamp_sample as lamp_test_sample,
+};
+use oblivion_one::compositor::RenderableSurfaceDamage;
 use oblivion_one::compositor::ViewportSourceRect;
+use oblivion_one::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 
 #[test]
 fn lamp_geometry_cache_tracks_live_viewport_mapping_without_changing_bounds() {
