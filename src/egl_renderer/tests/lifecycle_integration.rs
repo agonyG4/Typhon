@@ -153,8 +153,9 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
     let outcome = renderer
         .draw_scene(&egl, display, egl_surface, request)
         .expect("frame with canonical decoration and empty lifecycle renders");
-    let stats = match outcome {
-        EglFrameOutcome::Rendered { stats, .. } | EglFrameOutcome::Skipped { stats, .. } => stats,
+    let (stats, commit) = match outcome {
+        EglFrameOutcome::Rendered { commit, stats, .. } => (stats, Some(commit)),
+        EglFrameOutcome::Skipped { stats, .. } => (stats, None),
         EglFrameOutcome::LifecycleFallback { .. } => {
             panic!("decoration-only regression frame unexpectedly requested lifecycle fallback")
         }
@@ -172,10 +173,10 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
     }));
     assert_eq!(stats.missing_required_decoration_resources, 0);
 
-    renderer
-        .scene_state
-        .repaint_planner
-        .commit_presented_transition(OutputDamage::Full);
+    renderer.commit_presented(
+        commit.expect("the initial full-damage frame renders"),
+        OutputDamage::Full,
+    );
     assert_eq!(renderer.scene_state.repaint_planner.history_depth(), 1);
 
     renderer
@@ -199,6 +200,79 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
         }
         _ => unreachable!("required decoration layers stay in the decoration domain"),
     }));
+
+    renderer.effect_runtime.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+    effects::clear_effect_trace_test_events();
+    let no_damage_request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Empty),
+    );
+    let no_damage_outcome = renderer
+        .draw_scene(&egl, display, egl_surface, no_damage_request)
+        .expect("no-damage frame still performs pre-skip resource preparation");
+    let EglFrameOutcome::Skipped { reason, stats } = no_damage_outcome else {
+        panic!("unchanged scene with authoritative empty damage is skipped");
+    };
+    assert_eq!(reason, FrameSkipReason::NoLogicalDamage);
+    assert_eq!(stats.surface_resource_candidates, resolved.surfaces.len());
+    assert_eq!(stats.surface_resource_consumers, 0);
+    assert_eq!(stats.surface_resource_deferred, resolved.surfaces.len());
+    assert_eq!(stats.missing_required_decoration_resources, 0);
+    assert!(required_layers.iter().all(|layer| {
+        match layer {
+            EglDrawLayer::SolidRgba(color) => renderer
+                .resources
+                .texture_view()
+                .texture_for_solid_decoration(*color)
+                .is_some(),
+            EglDrawLayer::DecorationAsset(asset_id) => renderer
+                .resources
+                .texture_view()
+                .texture_for_decoration_asset(*asset_id)
+                .is_some(),
+            _ => unreachable!("required decoration layers stay in the decoration domain"),
+        }
+    }));
+    let no_damage_trace = effects::take_effect_trace_test_events();
+    let phase_events = no_damage_trace
+        .iter()
+        .filter(|event| {
+            [
+                "event=effect_scene_resolve_",
+                "event=effect_graph_compile_",
+                "event=effect_demand_plan_",
+                "event=renderer_draw_complete_",
+            ]
+            .iter()
+            .any(|prefix| event.starts_with(prefix))
+        })
+        .map(|event| {
+            event
+                .split_whitespace()
+                .next()
+                .expect("frame phase event has a name")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phase_events,
+        [
+            "event=effect_scene_resolve_begin",
+            "event=effect_scene_resolve_end",
+            "event=effect_graph_compile_begin",
+            "event=effect_graph_compile_end",
+        ],
+        "no-damage skip occurs after scene resolve and graph selection, before demand and draw: {no_damage_trace:?}"
+    );
+
+    renderer
+        .resources
+        .ensure_decoration_resources(&renderer.gl, &egl, display, std::iter::empty())
+        .expect("unused decoration textures are retired again before draw accounting");
     renderer.scene_state.frame_stats = GlesSceneFrameStats::default();
     renderer
         .draw_command_batch(true, None)
@@ -426,6 +500,39 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
             .iter()
             .any(|event| event.starts_with("event=effect_graph_execute_end ")),
         "successful lifecycle blur execution must leave positive trace evidence: {first_trace:?}"
+    );
+    let phase_events = first_trace
+        .iter()
+        .filter(|event| {
+            [
+                "event=effect_scene_resolve_",
+                "event=effect_graph_compile_",
+                "event=effect_demand_plan_",
+                "event=renderer_draw_complete_",
+            ]
+            .iter()
+            .any(|prefix| event.starts_with(prefix))
+        })
+        .map(|event| {
+            event
+                .split_whitespace()
+                .next()
+                .expect("frame phase event has a name")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phase_events,
+        [
+            "event=effect_scene_resolve_begin",
+            "event=effect_scene_resolve_end",
+            "event=effect_graph_compile_begin",
+            "event=effect_graph_compile_end",
+            "event=effect_demand_plan_begin",
+            "event=effect_demand_plan_end",
+            "event=renderer_draw_complete_begin",
+            "event=renderer_draw_complete_end",
+        ],
+        "normal effect frames preserve top-level phase boundary ordering: {first_trace:?}"
     );
     assert!(
         !first_trace

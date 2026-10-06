@@ -318,11 +318,11 @@ fn ordinary_egl_presentation_opacity_resolves_owner_values() {
             None,
         );
         assert_eq!(
-            GlesSceneRenderer::presentation_opacity_for_root(&[entry], 701),
+            SceneRenderState::presentation_opacity_for_root(&[entry], 701),
             value as f32
         );
         assert_eq!(
-            GlesSceneRenderer::presentation_opacity_for_root(&[entry], 999),
+            SceneRenderState::presentation_opacity_for_root(&[entry], 999),
             1.0
         );
     }
@@ -345,7 +345,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         None,
     );
 
-    harness.renderer.rebuild_scene_commands(
+    harness.renderer.scene_state.rebuild_scene_commands(
         320,
         200,
         &surfaces,
@@ -381,7 +381,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         PresentationOpacity::new(1.0).expect("presentation opacity"),
         None,
     );
-    harness.renderer.rebuild_scene_commands(
+    harness.renderer.scene_state.rebuild_scene_commands(
         320,
         200,
         &surfaces,
@@ -417,7 +417,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         PresentationOpacity::new(0.0).expect("presentation opacity"),
         None,
     );
-    harness.renderer.rebuild_scene_commands(
+    harness.renderer.scene_state.rebuild_scene_commands(
         320,
         200,
         &surfaces,

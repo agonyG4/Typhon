@@ -332,6 +332,304 @@ impl SceneRenderState {
 }
 
 impl SceneRenderState {
+    pub(in crate::egl_renderer) fn presentation_opacity_for_root(
+        presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
+        owner_root: u32,
+    ) -> f32 {
+        presentation_opacities
+            .iter()
+            .find(|entry| entry.root_surface_id == owner_root)
+            .map_or(1.0, |entry| entry.opacity.get() as f32)
+            .clamp(0.0, 1.0)
+    }
+
+    pub(in crate::egl_renderer) fn scene_cache_is_current(
+        &self,
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        external_overlay_surface_ids: &[u32],
+        decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> bool {
+        self.scene_cache_key.is_some_and(|key| {
+            key.is_current_with_decorations_and_external_overlay_ids(
+                width,
+                height,
+                content_generation,
+                output_scale_key,
+                surface_signatures,
+                external_overlay_surface_ids,
+                decoration_instances,
+                popup_surface_ids,
+                presentation_geometry_signature,
+                framebuffer_origin,
+            )
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hot EGL command rebuild path passes borrowed frame state directly to avoid transient config allocation"
+    )]
+    pub(in crate::egl_renderer) fn rebuild_scene_commands(
+        &mut self,
+        width: u32,
+        height: u32,
+        surfaces: &[RenderableSurface],
+        decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
+        content_generation: u64,
+        output_scale: f64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        external_overlay_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
+        presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
+        presentation_clips: &[oblivion_one::presentation_animation::PresentationGroupClip],
+        presentation_owner_roots_by_surface: &HashMap<u32, u32>,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) {
+        self.frame_stats.orphan_decoration_count =
+            compositor::WindowVisualGroup::orphan_decoration_count(surfaces, decoration_instances);
+        self.vertices.clear();
+        self.commands.clear();
+        self.presentation_opacities.clear();
+        self.presentation_visual_group_opacities.clear();
+        self.presentation_visual_group_clips.clear();
+        self.presentation_visual_group_owners.clear();
+        self.scene_geometry_dirty = true;
+        self.vertices.reserve((1 + surfaces.len()) * 6);
+        self.commands.reserve(1 + surfaces.len());
+
+        push_output_background_command(
+            &mut self.vertices,
+            &mut self.commands,
+            width,
+            height,
+            framebuffer_origin,
+        );
+
+        let render_assignments =
+            compositor::surface_render_space_assignments(surfaces, output_scale);
+        for (group_index, group) in compositor::WindowVisualGroup::stack_order_with_popups(
+            surfaces,
+            decoration_instances,
+            popup_surface_ids,
+        )
+        .into_iter()
+        .enumerate()
+        {
+            let command_start = self.commands.len();
+            let visual_group = VisualGroupId::new(
+                u32::try_from(group_index)
+                    .unwrap_or(u32::MAX.saturating_sub(1))
+                    .saturating_add(1),
+            );
+            for &surface_index in group.surface_indices() {
+                let Some((surface, render_assignment)) = surfaces
+                    .get(surface_index)
+                    .zip(render_assignments.get(surface_index).cloned())
+                else {
+                    continue;
+                };
+                push_egl_surface_commands(
+                    &mut self.vertices,
+                    &mut self.commands,
+                    width,
+                    height,
+                    surface,
+                    render_assignment,
+                    framebuffer_origin,
+                    visual_group,
+                );
+            }
+            if let Some(decoration_index) = group.decoration_index()
+                && let Some(instance) = decoration_instances.get(decoration_index)
+            {
+                push_egl_decoration_instance(
+                    &mut self.vertices,
+                    &mut self.commands,
+                    width,
+                    height,
+                    instance,
+                    output_scale,
+                    framebuffer_origin,
+                    visual_group,
+                );
+            }
+            let group_root = group.root_surface_id();
+            let owner_root = presentation_owner_roots_by_surface
+                .get(&group_root)
+                .copied()
+                .unwrap_or(group_root);
+            let opacity = Self::presentation_opacity_for_root(presentation_opacities, owner_root);
+            if let Some(visual_group) = visual_group {
+                self.presentation_visual_group_owners
+                    .insert(visual_group, owner_root);
+                self.presentation_visual_group_opacities
+                    .insert(visual_group, opacity);
+                if let Some(clip) = presentation_clips
+                    .iter()
+                    .find(|clip| clip.root_surface_id == owner_root)
+                    .and_then(|clip| clip.presented_clip)
+                {
+                    let scale = output_scale.max(0.01);
+                    self.presentation_visual_group_clips.insert(
+                        visual_group,
+                        EglRect::new(
+                            (clip.x() * scale) as f32,
+                            (clip.y() * scale) as f32,
+                            (clip.width() * scale) as f32,
+                            (clip.height() * scale) as f32,
+                        ),
+                    );
+                }
+            }
+            for _ in command_start..self.commands.len() {
+                self.presentation_opacities.push(opacity);
+            }
+            let presentation_clip = visual_group
+                .and_then(|visual_group| self.presentation_visual_group_clips.get(&visual_group))
+                .copied();
+            for command in &mut self.commands[command_start..] {
+                command.presentation_clip = presentation_clip;
+            }
+            if opacity < 1.0 {
+                for command in &mut self.commands[command_start..] {
+                    command.opaque_regions.clear();
+                }
+            }
+        }
+
+        self.scene_cache_key = Some(
+            EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
+                width,
+                height,
+                content_generation,
+                output_scale_key,
+                surface_signatures,
+                presentation_geometry_signature,
+                external_overlay_surface_ids,
+                decoration_instances,
+                popup_surface_ids,
+                framebuffer_origin,
+            ),
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "overlay command emission keeps target, overlay, cursor, scale, and origin state explicit"
+    )]
+    pub(in crate::egl_renderer) fn rebuild_overlay_commands(
+        &mut self,
+        width: u32,
+        height: u32,
+        visual_state: DesktopVisualState,
+        overlay_surfaces: &[RenderableSurface],
+        client_cursor: Option<compositor::ClientCursorRenderState<'_>>,
+        output_scale: f64,
+        framebuffer_origin: OutputFramebufferOrigin,
+        cursor_image: &CompositorCursorImage,
+        cursor_size: Option<(u32, u32)>,
+    ) {
+        self.cursor_vertices.clear();
+        self.cursor_commands.clear();
+        self.cursor_presentation_opacities.clear();
+        self.overlay_geometry_dirty = true;
+
+        let render_assignments =
+            compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
+        for (surface, render_assignment) in overlay_surfaces.iter().zip(render_assignments) {
+            let command_start = self.cursor_commands.len();
+            push_egl_surface_commands(
+                &mut self.cursor_vertices,
+                &mut self.cursor_commands,
+                width,
+                height,
+                surface,
+                render_assignment,
+                framebuffer_origin,
+                None,
+            );
+            self.cursor_presentation_opacities
+                .extend(std::iter::repeat_n(
+                    1.0,
+                    self.cursor_commands.len().saturating_sub(command_start),
+                ));
+        }
+
+        if let Some((cursor_x, cursor_y)) = visual_state.cursor
+            && let Some(cursor_size) = cursor_size
+        {
+            let (top_left_x, top_left_y) = cursor_image.top_left(cursor_x, cursor_y);
+            push_draw_command(
+                &mut self.cursor_vertices,
+                &mut self.cursor_commands,
+                EglDrawLayer::Cursor,
+                EglRect::new(
+                    top_left_x as f32,
+                    top_left_y as f32,
+                    cursor_size.0 as f32,
+                    cursor_size.1 as f32,
+                ),
+                width,
+                height,
+                framebuffer_origin,
+            );
+            self.cursor_presentation_opacities.push(1.0);
+        }
+
+        if let Some(cursor) = client_cursor {
+            let visual_target = compositor::SurfaceTargetRect::new(
+                compositor::scale_logical_coordinate(
+                    cursor.logical_x.saturating_add(cursor.surface.x),
+                    output_scale,
+                ),
+                compositor::scale_logical_coordinate(
+                    cursor.logical_y.saturating_add(cursor.surface.y),
+                    output_scale,
+                ),
+                compositor::scale_logical_extent(cursor.surface.width, output_scale),
+                compositor::scale_logical_extent(cursor.surface.height, output_scale),
+            );
+            let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
+            let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
+            push_draw_command_with_uv(
+                &mut self.cursor_vertices,
+                &mut self.cursor_commands,
+                EglDrawLayer::Surface(cursor.surface.surface_id),
+                EglRect::new(
+                    render_plan.content_target.x() as f32,
+                    render_plan.content_target.y() as f32,
+                    render_plan.content_target.width() as f32,
+                    render_plan.content_target.height() as f32,
+                ),
+                uv,
+                surface_sampling_for_plan(
+                    cursor.surface.buffer_size().width,
+                    cursor.surface.buffer_size().height,
+                    render_plan.content_target.x(),
+                    render_plan.content_target.y(),
+                    render_plan.content_target.width(),
+                    render_plan.content_target.height(),
+                    uv,
+                ),
+                width,
+                height,
+                framebuffer_origin,
+            );
+            self.cursor_presentation_opacities.push(1.0);
+        }
+    }
+}
+
+impl SceneRenderState {
     pub(in crate::egl_renderer) fn destroy_gl_resources(&mut self, gl: &glow::Context) {
         unsafe {
             gl.delete_buffer(self.scene_vertex_buffer);

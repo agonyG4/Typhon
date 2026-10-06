@@ -158,7 +158,7 @@ fn popup_visual_group_inherits_window_group_clip_from_its_presentation_owner() {
         None,
     );
 
-    harness.renderer.rebuild_scene_commands(
+    harness.renderer.scene_state.rebuild_scene_commands(
         16,
         16,
         &surfaces,

@@ -18,7 +18,7 @@ use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
         DesktopVisualState, RenderableSurface, SurfaceOpaqueRect, SurfaceOpaqueRegion,
-        SurfaceResourceSyncState, VisualGroupId, clipped_decoration_text_geometry,
+        VisualGroupId, clipped_decoration_text_geometry,
     },
     cursor_theme::CompositorCursorImage,
     window_lifecycle_animation::{
@@ -33,6 +33,7 @@ use oblivion_one::{
 mod damage;
 pub(crate) mod dmabuf;
 mod effects;
+mod frame;
 mod geometry;
 mod lifecycle;
 pub(crate) mod native_fence;
@@ -40,42 +41,39 @@ mod program;
 mod resources;
 mod scene_state;
 
+pub(crate) use frame::{
+    EglFrameOutcome, EglOutputRenderTarget, EglSceneDrawRequest, EglSceneFrameCommit,
+    FrameSkipReason, GlesSceneFrameStats,
+};
 pub(crate) use resources::EglImageGuard;
 
 pub(crate) use damage::{
     BufferAge, EglPartialRepaintCapabilities, FullRepaintReason, OutputDamage, OutputRect,
-    PartialRepaintComplexityAction, PartialRepaintComplexityPolicy, PartialRepaintPlanner,
-    RepaintMode, render_target_buffer_age,
+    PartialRepaintPlanner, RepaintMode, render_target_buffer_age,
 };
-use damage::{
-    ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
-    RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
-    resolve_effect_execution_for_repaint_plan_with_diagnostics,
-};
+use damage::{EglOutputDamage, EglOutputDamageTracker, RenderExecution, RepaintPlan};
+#[cfg(test)]
+pub(crate) use damage::{PartialRepaintComplexityAction, PartialRepaintComplexityPolicy};
 #[cfg(test)]
 use effects::ShaderProgramCache;
 use effects::{
     DamageTraceSnapshot, EffectExecutionContext, EffectExecutionTrace, EffectFailureReason,
-    EffectGlResourceCache, EffectGraphMetrics, EffectRepaintProvenanceSnapshot, EffectRuntime,
-    EffectRuntimeCaptureSnapshot, FrameTraceSummary, RepaintPlanTraceSnapshot, graph_metrics,
+    EffectGlResourceCache, EffectRepaintProvenanceSnapshot, EffectRuntime,
+    EffectRuntimeCaptureSnapshot, FrameTraceSummary, RepaintPlanTraceSnapshot,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglLampDrawCommand, EglLampVertex, EglRect, EglTexturedVertex,
     EglUvRect, EglVisibilityDecision, MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan,
-    SurfaceSampling, VERTEX_STRIDE, add_surface_consumers_for_command_range,
-    plan_surface_consumers, push_draw_command, push_draw_command_with_uv,
-    surface_sampling_for_plan,
+    SurfaceSampling, VERTEX_STRIDE, plan_surface_consumers, push_draw_command,
+    push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use lifecycle::{
     LifecycleCaptureSnapshot, LifecycleRenderContext, LifecycleRenderState,
     LifecycleResolvedVisualResource,
 };
 use program::create_texture_program;
-use resources::surface::SurfaceResourceInputs;
-use resources::{
-    RendererResourceCaptureSnapshot, RendererResourceState, ResourceTelemetry, ResourceTextureView,
-};
+use resources::{RendererResourceCaptureSnapshot, RendererResourceState, ResourceTextureView};
 use scene_state::{SceneCaptureSnapshot, SceneRenderState, SceneTextureSources};
 
 pub(crate) type RendererResult<T> = Result<T, Box<dyn Error>>;
@@ -107,131 +105,6 @@ pub(crate) struct NativeEglConfigCandidate {
     pub green_size: egl::Int,
     pub blue_size: egl::Int,
     pub alpha_size: egl::Int,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GlesSceneFrameStats {
-    pub scene_rebuilt: bool,
-    pub surface_resource_candidates: usize,
-    pub surface_resource_consumers: usize,
-    pub surface_resource_deferred: usize,
-    pub shm_upload_bytes: usize,
-    pub dmabuf_imports: usize,
-    pub dmabuf_reuses: usize,
-    pub dmabuf_import_failures: usize,
-    pub dmabuf_cache_entries: usize,
-    pub dmabuf_cache_peak_entries: usize,
-    pub dmabuf_cache_evictions: usize,
-    pub dmabuf_current_resource_reuses: usize,
-    pub dmabuf_cache_hits: usize,
-    pub dmabuf_cache_misses: usize,
-    pub dmabuf_cache_insertions: usize,
-    pub dmabuf_cache_evictions_dead: usize,
-    pub dmabuf_cache_evictions_surface_bound: usize,
-    pub dmabuf_cache_evictions_surface_destroyed: usize,
-    pub dmabuf_cache_max_entries_for_one_surface: usize,
-    pub shm_full_resyncs: usize,
-    pub repaint_mode: RepaintMode,
-    pub partial_repaint_complexity_policy: PartialRepaintComplexityPolicy,
-    pub partial_repaint_complexity_action: PartialRepaintComplexityAction,
-    pub buffer_age: Option<u32>,
-    pub current_damage_rects: usize,
-    pub current_damage_pixels: u64,
-    pub repair_damage_rects: usize,
-    pub repair_damage_pixels: u64,
-    pub scissor_passes: usize,
-    pub planner_passes: usize,
-    pub planner_commands_visited: usize,
-    pub commands_drawable: usize,
-    pub draw_command_replays: usize,
-    pub commands_considered: usize,
-    pub commands_executed: usize,
-    pub missing_required_decoration_resources: usize,
-    pub commands_rejected_outside_damage: usize,
-    pub commands_rejected_outside_remaining: usize,
-    pub commands_rejected_occluded: usize,
-    pub opaque_rectangles_subtracted: usize,
-    pub planner_early_terminations: usize,
-    pub effect_fallbacks: usize,
-    pub region_fragmentation_overflow_fallbacks: usize,
-    pub scene_replay_work_overflow_fallbacks: usize,
-    pub peak_region_piece_count: usize,
-    pub texture_binds: usize,
-    pub draw_calls: usize,
-    pub scene_vbo_uploads: usize,
-    pub scene_vbo_upload_bytes: usize,
-    pub overlay_vbo_uploads: usize,
-    pub overlay_vbo_upload_bytes: usize,
-    pub history_depth: usize,
-    pub fallback_reason: Option<FullRepaintReason>,
-    pub partial_repaint_enabled: bool,
-    pub contradictory_empty_damage: bool,
-    pub orphan_decoration_count: u32,
-    pub effect_instances_visible: usize,
-    pub effect_instances_pruned: usize,
-    pub effect_instances_executed: usize,
-    pub effect_instances_failed: usize,
-    pub render_graph_passes: usize,
-    pub effect_passes_executed: usize,
-    pub render_graph_peak_live_textures: usize,
-    pub effect_graph_peak_live_bytes: u64,
-    pub effect_capture_pixels: u64,
-    pub effect_capture_pixels_executed: u64,
-    pub effect_output_pixels: u64,
-    pub blur_downsample_passes: usize,
-    pub blur_upsample_passes: usize,
-    pub effect_resource_allocations: usize,
-    pub effect_resource_acquisitions: usize,
-    pub effect_resource_reuses: usize,
-    pub effect_resource_evictions: usize,
-    pub effect_gpu_cache_bytes: u64,
-    pub effect_gpu_cache_peak_bytes: u64,
-    pub effect_gpu_budget_bytes: u64,
-    pub effect_gpu_cached_keys: usize,
-    pub effect_gpu_cached_textures: usize,
-    pub effect_gpu_checked_out_textures: usize,
-    pub effect_resource_allocations_total: usize,
-    pub effect_resource_reuses_total: usize,
-    pub effect_resource_evictions_total: usize,
-    pub shader_cache_capacity: usize,
-    pub shader_cache_entries: usize,
-    pub shader_cache_peak_entries: usize,
-    pub shader_cache_evictions_total: usize,
-    pub effect_failure_reason: Option<EffectFailureReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrameSkipReason {
-    NoLogicalDamage,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EglFrameOutcome {
-    Skipped {
-        reason: FrameSkipReason,
-        stats: GlesSceneFrameStats,
-    },
-    Rendered {
-        commit: EglSceneFrameCommit,
-        stats: GlesSceneFrameStats,
-        lifecycle_evidence: LifecycleRenderEvidence,
-    },
-    LifecycleFallback {
-        stats: GlesSceneFrameStats,
-        fallbacks: LifecycleRenderFallbacks,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // The explicit Atomic runtime consumes this after bootstrap reordering.
-pub(crate) struct EglOutputRenderTarget {
-    pub(crate) framebuffer: glow::Framebuffer,
-    pub(crate) sampleable_texture: Option<glow::Texture>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) buffer_age: BufferAge,
-    pub(crate) framebuffer_origin: OutputFramebufferOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,75 +141,6 @@ impl EffectExecutionTargets {
     pub(crate) fn uses_separate_targets(self) -> bool {
         self.baseline_read.framebuffer != self.composition_draw.framebuffer
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EglSceneFrameCommit {
-    repaint_plan: RepaintPlan,
-    damage_state: EglPresentedDamageState,
-    scene_key: EglSceneCacheKey,
-}
-
-impl EglSceneFrameCommit {
-    pub(crate) const fn repaint_plan(&self) -> &RepaintPlan {
-        &self.repaint_plan
-    }
-
-    #[cfg(test)]
-    pub(crate) fn empty_for_test() -> Self {
-        Self {
-            repaint_plan: RepaintPlan {
-                render_damage: OutputDamage::Empty,
-                repair_damage: OutputDamage::Empty,
-                buffer_age: None,
-                mode: RepaintMode::Skip,
-                fallback_reason: None,
-                ..RepaintPlan::default()
-            },
-            damage_state: EglPresentedDamageState::empty_for_test(),
-            scene_key: EglSceneCacheKey {
-                width: 1,
-                height: 1,
-                content_generation: 0,
-                output_scale_key: 0,
-                surface_signature_hash: 0,
-                decoration_signature_hash: 0,
-                popup_surface_signature_hash: 0,
-                external_overlay_surface_signature_hash: 0,
-                presentation_geometry_signature: 0,
-                framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
-            },
-        }
-    }
-}
-
-pub struct EglSceneDrawRequest<'a> {
-    pub width: u32,
-    pub height: u32,
-    pub surfaces: &'a [RenderableSurface],
-    pub external_overlay_surface_ids: &'a [u32],
-    pub popup_surface_ids: &'a [u32],
-    pub content_generation: u64,
-    pub(crate) frame_id: Option<u64>,
-    pub(crate) render_generation: Option<u64>,
-    pub(crate) scene_generation: u64,
-    pub(crate) scene_signature: u64,
-    pub visual_state: DesktopVisualState,
-    pub output_scale: f64,
-    pub decoration_instances: &'a [DecorationRenderInstance],
-    pub effects: &'a compositor::ResolvedEffectScene,
-    /// Compatibility-shaped cache input carrying the complete visual signature.
-    pub presentation_visual_signature: u64,
-    pub presentation_opacities:
-        &'a [oblivion_one::presentation_animation::PresentationGroupOpacity],
-    pub presentation_clips: &'a [oblivion_one::presentation_animation::PresentationGroupClip],
-    pub presentation_owner_root_surface_ids: &'a [u32],
-    pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
-    pub(crate) current_damage: Option<OutputDamage>,
-    pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
-    pub lifecycle: &'a LifecycleSceneSample,
-    pub lifecycle_surfaces: &'a [RenderableSurface],
-    pub lifecycle_decorations: &'a [DecorationRenderInstance],
 }
 
 pub(crate) struct GlesSceneRenderer {
@@ -646,6 +450,7 @@ impl GlesSceneRenderer {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::egl_renderer) fn effect_execution_context(
         &mut self,
     ) -> EffectExecutionContext<'_> {
@@ -661,25 +466,25 @@ impl GlesSceneRenderer {
         EffectExecutionContext::new(gl, scene_state, effect_runtime, texture_sources)
     }
 
-    fn execute_effect_graph_with_overlays(
+    #[cfg(test)]
+    pub(crate) fn draw_squash_overlay(
         &mut self,
-        graph: &oblivion_one::effects::CompiledFrameGraph,
-        framebuffer_origin: OutputFramebufferOrigin,
-        repaint_plan: &RepaintPlan,
-        demand: &oblivion_one::effects::EffectExecutionDemand,
-        selection: &effects::EffectExecutionSelection,
-    ) -> RendererResult<effects::EffectExecutionStats> {
-        self.execute_effect_graph_with_overlays_config(
-            graph,
-            framebuffer_origin,
-            repaint_plan,
-            demand,
-            selection,
-            *effects::effect_debug_config(),
-            None,
-        )
+        scissor: Option<OutputRect>,
+    ) -> RendererResult<()> {
+        let Self {
+            gl,
+            scene_state,
+            effect_runtime,
+            lifecycle,
+            resources,
+            ..
+        } = self;
+        let mut context =
+            LifecycleRenderContext::new(gl, scene_state, effect_runtime, resources.texture_view());
+        lifecycle.draw_squash_overlay(&mut context, scissor)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::egl_renderer) fn execute_effect_graph_with_overlays_config(
         &mut self,
@@ -691,54 +496,31 @@ impl GlesSceneRenderer {
         debug_config: effects::EffectDebugConfig,
         scene_replay_work_mode_override: Option<effects::SceneReplayWorkMode>,
     ) -> RendererResult<effects::EffectExecutionStats> {
-        let mut prepared = {
-            let mut context = self.effect_execution_context();
-            effects::prepare_effect_graph_execution(
-                &mut context,
-                graph,
-                framebuffer_origin,
-                repaint_plan,
-                demand,
-                selection,
-                debug_config,
-                scene_replay_work_mode_override,
-            )?
-        };
-        let promotes_checkpoint_cache = prepared.promotes_checkpoint_cache();
-        let composition_target = prepared.composition_target();
-        let mut result = {
-            let mut context = self.effect_execution_context();
-            effects::execute_prepared_effect_graph_core(&mut context, &mut prepared)
-        };
-        if result.is_ok() {
-            let overlay_result = (|| {
-                if self.effect_runtime.effect_trace.enabled() {
-                    self.effect_runtime.effect_trace.overlay_boundary("begin");
-                }
-                self.draw_lifecycle_overlays(
-                    prepared.overlay_rects(),
-                    framebuffer_origin,
-                    repaint_plan,
-                )?;
-                self.draw_effect_overlays(prepared.overlay_rects(), framebuffer_origin)?;
-                if self.effect_runtime.effect_trace.enabled() {
-                    self.effect_runtime.effect_trace.overlay_boundary("end");
-                }
-                self.establish_effect_composition_state(composition_target);
-                Ok(())
-            })();
-            if let Err(error) = overlay_result {
-                result = Err(error);
-            }
-        }
-        let result = {
-            let mut context = self.effect_execution_context();
-            effects::finish_prepared_effect_graph_execution(&mut context, prepared, result)
-        };
-        if result.is_ok() && promotes_checkpoint_cache {
-            self.promote_checkpoint_cache_causal_state(graph);
-        }
-        result
+        let Self {
+            gl,
+            cursor_image,
+            scene_state,
+            lifecycle,
+            effect_runtime,
+            resources,
+        } = self;
+        frame::FramePipeline::new(
+            gl,
+            cursor_image,
+            scene_state,
+            lifecycle,
+            effect_runtime,
+            resources,
+        )
+        .execute_effect_graph_with_overlays_config(
+            graph,
+            framebuffer_origin,
+            repaint_plan,
+            demand,
+            selection,
+            debug_config,
+            scene_replay_work_mode_override,
+        )
     }
 
     pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
@@ -772,12 +554,9 @@ impl GlesSceneRenderer {
 
     /// Restore the complete state expected by ordinary scene drawing after an
     /// effect or other offscreen pass has changed GL state.
+    #[cfg(test)]
     pub(crate) fn establish_ordinary_scene_state(&self) {
         self.establish_scene_state_for_framebuffer(self.scene_state.active_output_framebuffer);
-    }
-
-    pub(crate) fn establish_effect_composition_state(&self, target: EffectFramebufferTarget) {
-        self.establish_scene_state_for_framebuffer(target.framebuffer);
     }
 
     #[cfg(test)]
@@ -818,20 +597,10 @@ impl GlesSceneRenderer {
             .begin_effect_repaint(&self.gl, plan, framebuffer_origin)
     }
 
+    #[cfg(test)]
     fn establish_scene_state_for_framebuffer(&self, framebuffer: Option<glow::Framebuffer>) {
         self.scene_state
             .establish_scene_state_for_framebuffer(&self.gl, framebuffer);
-    }
-
-    fn presentation_opacity_for_root(
-        presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
-        owner_root: u32,
-    ) -> f32 {
-        presentation_opacities
-            .iter()
-            .find(|entry| entry.root_surface_id == owner_root)
-            .map_or(1.0, |entry| entry.opacity.get() as f32)
-            .clamp(0.0, 1.0)
     }
 
     pub(crate) fn renderer_info(&self) -> GlesRendererInfo {
@@ -1106,654 +875,23 @@ impl GlesSceneRenderer {
         buffer_age: BufferAge,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<EglFrameOutcome> {
-        self.effect_runtime
-            .effect_resources
-            .begin_checkpoint_frame();
-        let EglSceneDrawRequest {
-            width,
-            height,
-            surfaces,
-            external_overlay_surface_ids,
-            content_generation,
-            frame_id,
-            render_generation,
-            scene_generation,
-            scene_signature,
-            visual_state,
-            output_scale,
-            decoration_instances,
-            effects,
-            presentation_visual_signature,
-            presentation_opacities,
-            presentation_clips,
-            presentation_owner_root_surface_ids,
-            popup_surface_ids,
-            client_cursor,
-            current_damage,
-            surface_resource_sync_states,
+        let Self {
+            gl,
+            cursor_image,
+            scene_state,
             lifecycle,
-            lifecycle_surfaces,
-            lifecycle_decorations,
-        } = request;
-        self.effect_runtime.effect_trace = self.effect_runtime.effect_trace.with_frame_context(
-            frame_id,
-            render_generation,
-            Some(scene_generation),
-            Some(scene_signature),
-        );
-        if !self.effect_runtime.capture_in_progress {
-            self.effect_runtime
-                .effect_gpu_profiler
-                .collect(&self.gl, &self.effect_runtime.effect_trace);
-        }
-        self.effect_runtime.effect_trace.frame_boundary(
-            "effect_scene_resolve",
-            "begin",
-            FrameTraceSummary::default(),
-        );
-        let width = width.max(1);
-        let height = height.max(1);
-        let input_damage_trace = if self.effect_runtime.effect_trace.enabled() {
-            Some(DamageTraceSnapshot::from_optional(
-                current_damage.as_ref(),
-                width,
-                height,
-            ))
-        } else {
-            None
-        };
-        self.scene_state.current_framebuffer_origin = framebuffer_origin;
-        self.lifecycle.begin_frame(lifecycle);
-        let output_scale_key = compositor::output_scale_key(output_scale);
-        let mut scaled_visual_state =
-            compositor::scale_desktop_visual_state(visual_state, output_scale);
-        if client_cursor.is_some() {
-            scaled_visual_state.cursor = None;
-        }
-        self.scene_state.frame_stats = GlesSceneFrameStats::default();
-        let effect_time = self.effect_runtime.effect_clock_elapsed_seconds();
-        self.effect_runtime.effect_delta_seconds = if self.effect_runtime.effect_time_seconds == 0.0
-        {
-            0.0
-        } else {
-            (effect_time - self.effect_runtime.effect_time_seconds).clamp(0.0, 0.25)
-        };
-        self.effect_runtime.effect_time_seconds = effect_time;
-        self.effect_runtime.effect_output_scale = output_scale.max(0.0) as f32;
-        self.ensure_output_size(width, height)?;
-        self.lifecycle
-            .release_stale_visual_resources(&mut self.effect_runtime);
-        self.scene_state.frame_stats.effect_instances_visible = effects
-            .instances
-            .iter()
-            .filter(|instance| !instance.region.is_empty())
-            .count();
-        self.effect_runtime.effect_trace.frame_boundary(
-            "effect_scene_resolve",
-            "end",
-            FrameTraceSummary {
-                scene_generation: Some(scene_generation),
-                scene_signature: Some(scene_signature),
-                visible_effect_count: Some(self.scene_state.frame_stats.effect_instances_visible),
-                ..FrameTraceSummary::default()
-            },
-        );
-        self.resources.ensure_frame_resources(&self.gl)?;
-        self.resources.ensure_decoration_resources(
-            &self.gl,
-            egl,
-            egl_display,
-            decoration_instances
-                .iter()
-                .chain(lifecycle_decorations.iter()),
-        )?;
-        if scaled_visual_state.cursor.is_some() {
-            self.resources.ensure_cursor_resource(
-                &self.gl,
-                egl,
-                egl_display,
-                &self.cursor_image,
-            )?;
-        }
-        {
-            let mut telemetry = ResourceTelemetry::new(&mut self.scene_state.frame_stats);
-            self.resources.reconcile_surface_resource_lifetimes(
-                &self.gl,
-                egl,
-                egl_display,
-                surfaces,
-                lifecycle_surfaces,
-                client_cursor.map(|cursor| cursor.surface),
-                &mut telemetry,
-            )?;
-        }
-        // The software client cursor remains eager: it is a small, separately
-        // owned overlay path and is not part of ordinary scene realization.
-        if let Some(cursor) = client_cursor.map(|cursor| cursor.surface) {
-            let mut cursor_consumers = SurfaceConsumerPlan::default();
-            cursor_consumers.add_surface(cursor.surface_id);
-            cursor_consumers.finish();
-            let mut telemetry = ResourceTelemetry::new(&mut self.scene_state.frame_stats);
-            self.resources.realize_surface_resources_for_consumers(
-                &self.gl,
-                egl,
-                egl_display,
-                SurfaceResourceInputs {
-                    canonical: surfaces,
-                    lifecycle: lifecycle_surfaces,
-                    client_cursor: Some(cursor),
-                },
-                &cursor_consumers,
-                &surface_resource_sync_states,
-                &mut telemetry,
-            )?;
-        }
-
-        let (base_surfaces, overlay_surfaces) =
-            split_external_overlay_surfaces(surfaces, external_overlay_surface_ids);
-        let presentation_owner_roots_by_surface = surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .zip(presentation_owner_root_surface_ids.iter().copied())
-            .collect::<HashMap<_, _>>();
-        let scene_surfaces = if external_overlay_surface_ids.is_empty() {
-            surfaces
-        } else {
-            base_surfaces.as_slice()
-        };
-        let surface_signatures = egl_scene_surface_signatures(surfaces);
-        let candidate_scene_key = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
-            width,
-            height,
-            content_generation,
-            output_scale_key,
-            &surface_signatures,
-            presentation_visual_signature,
-            external_overlay_surface_ids,
-            decoration_instances,
-            popup_surface_ids,
-            framebuffer_origin,
-        );
-        let scene_changed = self.scene_state.presented_scene_key != Some(candidate_scene_key);
-        let commands_changed = !self.scene_cache_is_current(
-            width,
-            height,
-            content_generation,
-            output_scale_key,
-            &surface_signatures,
-            external_overlay_surface_ids,
-            decoration_instances,
-            popup_surface_ids,
-            presentation_visual_signature,
-            framebuffer_origin,
-        );
-        let client_cursor_damage = client_cursor.map(|cursor| {
-            ClientCursorDamageState::new(
-                compositor::scale_logical_coordinate(
-                    cursor.logical_x.saturating_add(cursor.surface.x),
-                    output_scale,
-                ),
-                compositor::scale_logical_coordinate(
-                    cursor.logical_y.saturating_add(cursor.surface.y),
-                    output_scale,
-                ),
-                compositor::scale_logical_extent(cursor.surface.width, output_scale),
-                compositor::scale_logical_extent(cursor.surface.height, output_scale),
-                cursor.surface.generation,
-                width,
-                height,
-            )
-        });
-        let damage_authority_available = current_damage.is_some();
-        let output_damage = self.scene_state.damage_tracker.damage_for_frame(
-            width,
-            height,
-            scene_changed,
-            current_damage,
-            scaled_visual_state,
-            client_cursor_damage,
-        );
-        let output_damage = output_damage.union(
-            self.lifecycle
-                .damage_for_snapshot(lifecycle, (width, height), output_scale),
-            width,
-            height,
-        );
-        let (output_damage, contradictory_empty_damage) = resolve_scene_damage_authority(
-            scene_changed,
-            damage_authority_available,
-            output_damage,
-        );
-        let scene_damage_trace = if self.effect_runtime.effect_trace.enabled() {
-            Some(DamageTraceSnapshot::from_damage(
-                &output_damage,
-                width,
-                height,
-            ))
-        } else {
-            None
-        };
-        self.scene_state.frame_stats.contradictory_empty_damage = contradictory_empty_damage;
-        let damage_state = EglOutputDamageTracker::candidate_state(
-            width,
-            height,
-            scaled_visual_state,
-            client_cursor_damage,
-            &self.cursor_image,
-        );
-
-        if commands_changed {
-            self.scene_state.frame_stats.scene_rebuilt = true;
-            self.rebuild_scene_commands(
-                width,
-                height,
-                scene_surfaces,
-                decoration_instances,
-                popup_surface_ids,
-                content_generation,
-                output_scale,
-                output_scale_key,
-                &surface_signatures,
-                external_overlay_surface_ids,
-                presentation_visual_signature,
-                presentation_opacities,
-                presentation_clips,
-                &presentation_owner_roots_by_surface,
-                framebuffer_origin,
-            );
-        }
-        self.rebuild_overlay_commands(
-            width,
-            height,
-            scaled_visual_state,
-            &overlay_surfaces,
-            client_cursor,
-            output_scale,
-            framebuffer_origin,
-        );
-        self.scene_state.current_checkpoint_scene_causal_snapshot =
-            Some(EglCheckpointSceneCausalSnapshot::new(
-                (width, height),
-                &self.scene_state.commands,
-                &self.scene_state.vertices,
-                &surface_signatures,
-                &self.scene_state.presentation_opacities,
-                &self.scene_state.presentation_visual_group_owners,
-            ));
-        self.lifecycle.rebuild_lamp_commands(
+            effect_runtime,
+            resources,
+        } = self;
+        frame::FramePipeline::new(
+            gl,
+            cursor_image,
+            scene_state,
             lifecycle,
-            lifecycle_surfaces,
-            lifecycle_decorations,
-            output_scale,
-            self.scene_state.current_size,
-            framebuffer_origin,
-        );
-        self.lifecycle.rebuild_squash_commands(
-            lifecycle,
-            lifecycle_surfaces,
-            lifecycle_decorations,
-            output_scale,
-            self.scene_state.current_size,
-            framebuffer_origin,
-        );
-        let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
-        let output_bounds = EffectRect::new(0, 0, width, height)
-            .expect("non-zero renderer dimensions must form valid effect bounds");
-        self.effect_runtime.effect_trace.frame_boundary(
-            "effect_graph_compile",
-            "begin",
-            self.effect_trace_summary(effects, None, None, None),
-        );
-        let execution_plan = if self.effect_runtime.failed_effect_generation
-            == Some(self.effect_runtime.effect_registry_generation)
-            && self.scene_state.frame_stats.effect_instances_visible != 0
-        {
-            self.scene_state.frame_stats.effect_fallbacks = self
-                .scene_state
-                .frame_stats
-                .effect_fallbacks
-                .saturating_add(1);
-            self.scene_state.frame_stats.effect_instances_failed =
-                self.scene_state.frame_stats.effect_instances_visible;
-            self.scene_state.frame_stats.effect_failure_reason =
-                Some(EffectFailureReason::GraphCompile);
-            FrameExecutionPlan::LegacyScene
-        } else {
-            match compile_frame_execution_plan(
-                effects,
-                &effect_source_damage,
-                output_bounds,
-                &self.effect_runtime.effect_registry,
-            ) {
-                Ok(FrameExecutionPlan::LegacyScene) => FrameExecutionPlan::LegacyScene,
-                Ok(FrameExecutionPlan::EffectGraph(graph)) => {
-                    self.record_effect_graph_metrics(graph_metrics(&graph));
-                    FrameExecutionPlan::EffectGraph(graph)
-                }
-                Err(_) => {
-                    self.scene_state.frame_stats.effect_fallbacks = self
-                        .scene_state
-                        .frame_stats
-                        .effect_fallbacks
-                        .saturating_add(1);
-                    self.scene_state.frame_stats.effect_instances_failed =
-                        self.scene_state.frame_stats.effect_instances_visible;
-                    self.scene_state.frame_stats.effect_failure_reason =
-                        Some(EffectFailureReason::GraphCompile);
-                    self.effect_runtime.failed_effect_generation =
-                        Some(self.effect_runtime.effect_registry_generation);
-                    FrameExecutionPlan::LegacyScene
-                }
-            }
-        };
-        if matches!(&execution_plan, FrameExecutionPlan::LegacyScene) {
-            self.effect_runtime
-                .effect_resources
-                .clear_checkpoint_capture_cache();
-        }
-        let compiled_graph = match &execution_plan {
-            FrameExecutionPlan::EffectGraph(graph) => Some(graph),
-            FrameExecutionPlan::LegacyScene => None,
-        };
-        self.effect_runtime.effect_trace.frame_boundary(
-            "effect_graph_compile",
-            "end",
-            self.effect_trace_summary(effects, None, compiled_graph, None),
-        );
-        let output_damage = match &execution_plan {
-            FrameExecutionPlan::LegacyScene => output_damage,
-            FrameExecutionPlan::EffectGraph(graph) => {
-                merge_effect_damage(output_damage, &graph.final_damage, width, height)
-            }
-        };
-        let merged_damage_trace = if self.effect_runtime.effect_trace.enabled() {
-            Some(DamageTraceSnapshot::from_damage(
-                &output_damage,
-                width,
-                height,
-            ))
-        } else {
-            None
-        };
-        let (mut plan, damage_complexity_shadow_trace) =
-            if self.effect_runtime.effect_trace.enabled() {
-                let (plan, shadow) = self
-                    .scene_state
-                    .repaint_planner
-                    .plan_with_damage_complexity_shadow(output_damage, buffer_age);
-                (plan, Some(shadow))
-            } else {
-                (
-                    self.scene_state
-                        .repaint_planner
-                        .plan(output_damage, buffer_age),
-                    None,
-                )
-            };
-        if plan.mode == RepaintMode::Skip {
-            self.scene_state.frame_stats.surface_resource_candidates = surfaces.len();
-            self.scene_state.frame_stats.surface_resource_deferred = surfaces.len();
-            self.record_effect_resource_metrics();
-            self.record_repaint_stats(&plan);
-            return Ok(EglFrameOutcome::Skipped {
-                reason: FrameSkipReason::NoLogicalDamage,
-                stats: self.scene_state.frame_stats,
-            });
-        }
-        let initial_repaint_trace = if self.effect_runtime.effect_trace.enabled() {
-            Some(RepaintPlanTraceSnapshot::from_plan(&plan, width, height))
-        } else {
-            None
-        };
-        let demand_trace_seed = if self.effect_runtime.effect_trace.enabled() {
-            compiled_graph.map(|graph| oblivion_one::effects::EffectDemandPlanStats {
-                repair_rect_count: plan.repair_damage.rect_count(),
-                dependency_edge_count: graph.instances.iter().fold(0, |count, instance| {
-                    count.saturating_add(instance.dependencies.len())
-                }),
-                dependency_propagations: 0,
-                max_instance_region_rect_count: 0,
-                conservative_full: plan.mode == RepaintMode::Full,
-                ..oblivion_one::effects::EffectDemandPlanStats::default()
-            })
-        } else {
-            None
-        };
-        let mut demand_trace_begin_summary =
-            self.effect_trace_summary(effects, Some(&plan), compiled_graph, None);
-        demand_trace_begin_summary.demand_plan = demand_trace_seed;
-        self.effect_runtime.effect_trace.frame_boundary(
-            "effect_demand_plan",
-            "begin",
-            demand_trace_begin_summary,
-        );
-        let effect_execution_demand = match &execution_plan {
-            FrameExecutionPlan::LegacyScene => None,
-            FrameExecutionPlan::EffectGraph(graph) => {
-                Some(if self.effect_runtime.effect_trace.enabled() {
-                    let (demand, snapshot) =
-                        resolve_effect_execution_for_repaint_plan_with_diagnostics(
-                            &self.scene_state.repaint_planner,
-                            graph,
-                            &mut plan,
-                            width,
-                            height,
-                        );
-                    self.effect_runtime
-                        .effect_trace
-                        .effect_execution_resolution(|| snapshot);
-                    demand
-                } else {
-                    resolve_effect_execution_for_repaint_plan(
-                        &self.scene_state.repaint_planner,
-                        graph,
-                        &mut plan,
-                        width,
-                        height,
-                    )
-                })
-            }
-        };
-        let selected_effect_count = effect_execution_demand
-            .as_ref()
-            .map(|demand| demand.instances.len());
-        let demand_trace_stats = if self.effect_runtime.effect_trace.enabled() {
-            effect_execution_demand
-                .as_ref()
-                .map(|demand| demand.plan_stats())
-        } else {
-            None
-        };
-        let mut demand_trace_end_summary =
-            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count);
-        demand_trace_end_summary.demand_plan = demand_trace_stats;
-        self.effect_runtime.effect_trace.frame_boundary(
-            "effect_demand_plan",
-            "end",
-            demand_trace_end_summary,
-        );
-        self.effect_runtime
-            .effect_trace
-            .effect_repaint_provenance(|| {
-                EffectRepaintProvenanceSnapshot::new(
-                    input_damage_trace.expect("enabled effect trace must capture input damage"),
-                    scene_damage_trace.expect("enabled effect trace must capture scene damage"),
-                    merged_damage_trace.expect("enabled effect trace must capture merged damage"),
-                    initial_repaint_trace
-                        .expect("enabled effect trace must capture initial repaint"),
-                    RepaintPlanTraceSnapshot::from_plan(&plan, width, height),
-                    damage_complexity_shadow_trace
-                        .expect("enabled effect trace must capture damage complexity shadow"),
-                )
-            });
-        if let Some(demand) = &effect_execution_demand {
-            self.scene_state.frame_stats.effect_instances_pruned = self
-                .scene_state
-                .frame_stats
-                .effect_instances_visible
-                .saturating_sub(demand.instances.len());
-        }
-        let repair_rects = repaint_plan_output_rects(&plan, width, height);
-        let mut consumer_plan = plan_surface_consumers(&self.scene_state.commands, &repair_rects);
-        self.lifecycle
-            .extend_surface_consumers(&mut consumer_plan, &repair_rects);
-        add_surface_consumers_for_command_range(
-            &mut consumer_plan,
-            &self.scene_state.cursor_commands,
-            0,
-            self.scene_state.cursor_commands.len(),
-            &repair_rects,
-        );
-        let effect_selection = match (&execution_plan, &effect_execution_demand) {
-            (FrameExecutionPlan::EffectGraph(graph), Some(demand)) => {
-                let selection = effects::select_effect_execution(graph, demand);
-                consumer_plan.extend(&effects::plan_effect_surface_consumers(
-                    graph,
-                    demand,
-                    &selection,
-                    &self.scene_state.commands,
-                    &repair_rects,
-                    (width, height),
-                ));
-                Some(selection)
-            }
-            _ => None,
-        };
-        consumer_plan.finish();
-        self.scene_state.frame_stats.surface_resource_candidates = surfaces.len();
-        self.scene_state.frame_stats.surface_resource_consumers = consumer_plan
-            .surface_ids()
-            .iter()
-            .filter(|surface_id| {
-                surfaces
-                    .iter()
-                    .any(|surface| surface.surface_id == **surface_id)
-            })
-            .count();
-        self.scene_state.frame_stats.surface_resource_deferred = self
-            .scene_state
-            .frame_stats
-            .surface_resource_candidates
-            .saturating_sub(self.scene_state.frame_stats.surface_resource_consumers);
-        let mut telemetry = ResourceTelemetry::new(&mut self.scene_state.frame_stats);
-        self.resources.realize_surface_resources_for_consumers(
-            &self.gl,
-            egl,
-            egl_display,
-            SurfaceResourceInputs {
-                canonical: surfaces,
-                lifecycle: lifecycle_surfaces,
-                client_cursor: client_cursor.map(|cursor| cursor.surface),
-            },
-            &consumer_plan,
-            &surface_resource_sync_states,
-            &mut telemetry,
-        )?;
-        self.effect_runtime.effect_trace.frame_boundary(
-            "renderer_draw_complete",
-            "begin",
-            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
-        );
-        let draw_result = match &execution_plan {
-            FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
-            FrameExecutionPlan::EffectGraph(graph) => {
-                let demand = effect_execution_demand
-                    .as_ref()
-                    .expect("effect graph execution must have an execution demand");
-                let selection = effect_selection
-                    .as_ref()
-                    .expect("effect graph execution must have an execution selection");
-                match self.execute_effect_graph_with_overlays(
-                    graph,
-                    framebuffer_origin,
-                    &plan,
-                    demand,
-                    selection,
-                ) {
-                    Ok(execution_stats) => {
-                        self.scene_state.frame_stats.effect_instances_executed =
-                            execution_stats.instances;
-                        self.scene_state.frame_stats.effect_passes_executed =
-                            execution_stats.passes;
-                        self.scene_state
-                            .frame_stats
-                            .scene_replay_work_overflow_fallbacks =
-                            execution_stats.scene_replay_work_overflow_fallbacks;
-                        self.scene_state.frame_stats.blur_downsample_passes =
-                            execution_stats.blur_downsamples;
-                        self.scene_state.frame_stats.blur_upsample_passes =
-                            execution_stats.blur_upsamples;
-                        self.scene_state.frame_stats.effect_capture_pixels_executed =
-                            execution_stats.capture_execution_pixels;
-                        self.scene_state.frame_stats.effect_resource_acquisitions =
-                            execution_stats.resource_acquisitions;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        self.effect_runtime
-                            .effect_resources
-                            .invalidate_checkpoint_capture_contents();
-                        self.scene_state.frame_stats.effect_fallbacks = self
-                            .scene_state
-                            .frame_stats
-                            .effect_fallbacks
-                            .saturating_add(1);
-                        self.scene_state.frame_stats.effect_instances_failed =
-                            self.scene_state.frame_stats.effect_instances_visible;
-                        self.scene_state.frame_stats.effect_failure_reason =
-                            Some(EffectFailureReason::from_error(error.as_ref()));
-                        if self.scene_state.frame_stats.effect_failure_reason
-                            == Some(EffectFailureReason::ShaderUnavailable)
-                        {
-                            self.effect_runtime.failed_effect_generation =
-                                Some(self.effect_runtime.effect_registry_generation);
-                        }
-                        self.draw_textured_layers(&plan, framebuffer_origin)
-                    }
-                }
-            }
-        };
-        if let Err(error) = draw_result {
-            self.effect_runtime.effect_trace.frame_boundary(
-                "renderer_draw_complete",
-                "end",
-                self.effect_trace_summary(
-                    effects,
-                    Some(&plan),
-                    compiled_graph,
-                    selected_effect_count,
-                ),
-            );
-            self.scene_state.repaint_planner.invalidate();
-            return Err(error);
-        }
-        self.effect_runtime.effect_trace.frame_boundary(
-            "renderer_draw_complete",
-            "end",
-            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
-        );
-        self.lifecycle.record_missing_evidence_fallbacks(
-            f64::from(self.effect_runtime.effect_output_scale),
-            self.scene_state.current_size,
-        );
-        if self.lifecycle.has_fallbacks() {
-            self.scene_state.repaint_planner.invalidate();
-            return Ok(EglFrameOutcome::LifecycleFallback {
-                stats: self.scene_state.frame_stats,
-                fallbacks: self.lifecycle.fallbacks(),
-            });
-        }
-        self.record_effect_resource_metrics();
-        self.record_repaint_stats(&plan);
-        Ok(EglFrameOutcome::Rendered {
-            commit: EglSceneFrameCommit {
-                repaint_plan: plan,
-                damage_state,
-                scene_key: candidate_scene_key,
-            },
-            stats: self.scene_state.frame_stats,
-            lifecycle_evidence: self.lifecycle.evidence(),
-        })
+            effect_runtime,
+            resources,
+        )
+        .render(egl, egl_display, request, buffer_age, framebuffer_origin)
     }
 
     pub(crate) fn commit_presented(
@@ -1772,33 +910,17 @@ impl GlesSceneRenderer {
             self.scene_state.repaint_planner.history_depth();
     }
 
+    #[cfg(test)]
     pub(crate) fn promote_checkpoint_cache_causal_state(
         &mut self,
         graph: &oblivion_one::effects::CompiledFrameGraph,
     ) {
-        let frame_serial = self
-            .effect_runtime
-            .effect_resources
-            .checkpoint_frame_serial();
-        if let Some(state) = self.checkpoint_causal_candidate_state(Some(graph)) {
-            self.effect_runtime
-                .effect_resources
-                .promote_checkpoint_causal_state(frame_serial, state);
-        } else {
-            self.effect_runtime
-                .effect_resources
-                .invalidate_checkpoint_causal_state();
-        }
-    }
-
-    fn checkpoint_causal_candidate_state(
-        &self,
-        graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
-    ) -> Option<CheckpointCausalState> {
-        self.scene_state
-            .current_checkpoint_scene_causal_snapshot
-            .clone()
-            .map(|scene| CheckpointCausalState::new(scene, graph, &self.scene_state.commands))
+        let Self {
+            scene_state,
+            effect_runtime,
+            ..
+        } = self;
+        frame::promote_checkpoint_cache_causal_state(scene_state, effect_runtime, graph);
     }
 
     pub(crate) fn discard_rendered(&mut self, frame: EglSceneFrameCommit) {
@@ -1815,571 +937,7 @@ impl GlesSceneRenderer {
         self.scene_state.frame_stats.history_depth = 0;
     }
 
-    fn record_repaint_stats(&mut self, plan: &RepaintPlan) {
-        let (width, height) = self.scene_state.current_size;
-        self.scene_state.frame_stats.repaint_mode = plan.mode;
-        self.scene_state
-            .frame_stats
-            .partial_repaint_complexity_policy = plan.complexity_policy;
-        self.scene_state
-            .frame_stats
-            .partial_repaint_complexity_action = plan.complexity_action;
-        self.scene_state.frame_stats.buffer_age = plan.buffer_age;
-        self.scene_state.frame_stats.current_damage_rects = plan.render_damage.rect_count();
-        self.scene_state.frame_stats.current_damage_pixels =
-            plan.render_damage.pixels(width, height).unwrap_or(u64::MAX);
-        self.scene_state.frame_stats.repair_damage_rects = plan.repair_damage.rect_count();
-        self.scene_state.frame_stats.repair_damage_pixels =
-            plan.repair_damage.pixels(width, height).unwrap_or(u64::MAX);
-        self.scene_state.frame_stats.fallback_reason = plan.fallback_reason;
-        self.scene_state.frame_stats.partial_repaint_enabled =
-            self.scene_state.repaint_planner.partial_enabled();
-        self.scene_state.frame_stats.history_depth =
-            self.scene_state.repaint_planner.history_depth();
-    }
-
-    fn record_effect_graph_metrics(&mut self, metrics: EffectGraphMetrics) {
-        self.scene_state.frame_stats.effect_instances_visible = metrics.instances;
-        self.scene_state.frame_stats.render_graph_passes = metrics.passes;
-        self.scene_state.frame_stats.render_graph_peak_live_textures = metrics.peak_live_textures;
-        self.scene_state.frame_stats.effect_graph_peak_live_bytes = metrics.peak_live_bytes;
-        self.scene_state.frame_stats.effect_capture_pixels = metrics.capture_pixels;
-        self.scene_state.frame_stats.effect_output_pixels = metrics.output_pixels;
-    }
-
-    fn effect_trace_summary(
-        &self,
-        effects: &compositor::ResolvedEffectScene,
-        repaint_plan: Option<&RepaintPlan>,
-        graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
-        selected_effect_count: Option<usize>,
-    ) -> FrameTraceSummary {
-        FrameTraceSummary {
-            scene_generation: Some(effects.generation),
-            repaint_mode: repaint_plan.map(|plan| plan.mode.as_str()),
-            render_damage_signature: repaint_plan
-                .map(|plan| plan.render_damage.identity_signature()),
-            repair_damage_signature: repaint_plan
-                .map(|plan| plan.repair_damage.identity_signature()),
-            visible_effect_count: Some(self.scene_state.frame_stats.effect_instances_visible),
-            selected_effect_count,
-            graph_pass_count: graph.map(|graph| graph.stats.passes),
-            graph_texture_count: graph.map(|graph| graph.stats.textures),
-            peak_live_intermediate_count: graph.map(|graph| graph.stats.peak_live_intermediates),
-            ..FrameTraceSummary::default()
-        }
-    }
-
-    fn record_effect_resource_metrics(&mut self) {
-        let metrics = self.effect_runtime.effect_resources.metrics();
-        self.scene_state.frame_stats.effect_resource_allocations = metrics.allocation_count;
-        self.scene_state.frame_stats.effect_resource_reuses = metrics.reuse_count;
-        self.scene_state.frame_stats.effect_resource_evictions = metrics.eviction_count;
-        self.scene_state
-            .frame_stats
-            .effect_resource_allocations_total = metrics.allocation_count;
-        self.scene_state.frame_stats.effect_resource_reuses_total = metrics.reuse_count;
-        self.scene_state.frame_stats.effect_resource_evictions_total = metrics.eviction_count;
-        self.scene_state.frame_stats.effect_gpu_cache_bytes = metrics.current_bytes;
-        self.scene_state.frame_stats.effect_gpu_cache_peak_bytes = metrics.peak_bytes;
-        self.scene_state.frame_stats.effect_gpu_budget_bytes = metrics.budget_bytes;
-        self.scene_state.frame_stats.effect_gpu_cached_keys = metrics.cached_key_count;
-        self.scene_state.frame_stats.effect_gpu_cached_textures = metrics.cached_texture_count;
-        self.scene_state.frame_stats.effect_gpu_checked_out_textures =
-            metrics.checked_out_texture_count;
-        let shader_metrics = self.effect_runtime.effect_shaders.metrics();
-        self.scene_state.frame_stats.shader_cache_capacity = shader_metrics.capacity;
-        self.scene_state.frame_stats.shader_cache_entries = shader_metrics.resident_entries;
-        self.scene_state.frame_stats.shader_cache_peak_entries = shader_metrics.peak_entries;
-        self.scene_state.frame_stats.shader_cache_evictions_total = shader_metrics.eviction_count;
-    }
-
-    fn ensure_output_size(&mut self, width: u32, height: u32) -> RendererResult<()> {
-        if self.scene_state.current_size == (width, height) {
-            return Ok(());
-        }
-
-        self.lifecycle
-            .release_all_visual_resources(&mut self.effect_runtime);
-        self.scene_state.current_size = (width, height);
-        self.scene_state.repaint_planner.resize((width, height));
-        self.scene_state.scene_cache_key = None;
-        self.effect_runtime
-            .effect_resources
-            .cleanup_size_history(&self.gl);
-        unsafe {
-            self.gl.viewport(0, 0, width as i32, height as i32);
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "scene-cache validation compares each render-state component explicitly"
-    )]
-    fn scene_cache_is_current(
-        &self,
-        width: u32,
-        height: u32,
-        content_generation: u64,
-        output_scale_key: u32,
-        surface_signatures: &[EglSceneSurfaceSignature],
-        external_overlay_surface_ids: &[u32],
-        decoration_instances: &[DecorationRenderInstance],
-        popup_surface_ids: &[u32],
-        presentation_geometry_signature: u64,
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) -> bool {
-        self.scene_state.scene_cache_key.is_some_and(|key| {
-            key.is_current_with_decorations_and_external_overlay_ids(
-                width,
-                height,
-                content_generation,
-                output_scale_key,
-                surface_signatures,
-                external_overlay_surface_ids,
-                decoration_instances,
-                popup_surface_ids,
-                presentation_geometry_signature,
-                framebuffer_origin,
-            )
-        })
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "hot EGL command rebuild path passes borrowed frame state directly to avoid transient config allocation"
-    )]
-    fn rebuild_scene_commands(
-        &mut self,
-        width: u32,
-        height: u32,
-        surfaces: &[RenderableSurface],
-        decoration_instances: &[DecorationRenderInstance],
-        popup_surface_ids: &[u32],
-        content_generation: u64,
-        output_scale: f64,
-        output_scale_key: u32,
-        surface_signatures: &[EglSceneSurfaceSignature],
-        external_overlay_surface_ids: &[u32],
-        presentation_geometry_signature: u64,
-        presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
-        presentation_clips: &[oblivion_one::presentation_animation::PresentationGroupClip],
-        presentation_owner_roots_by_surface: &HashMap<u32, u32>,
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) {
-        self.scene_state.frame_stats.orphan_decoration_count =
-            compositor::WindowVisualGroup::orphan_decoration_count(surfaces, decoration_instances);
-        self.scene_state.vertices.clear();
-        self.scene_state.commands.clear();
-        self.scene_state.presentation_opacities.clear();
-        self.scene_state.presentation_visual_group_opacities.clear();
-        self.scene_state.presentation_visual_group_clips.clear();
-        self.scene_state.presentation_visual_group_owners.clear();
-        self.scene_state.scene_geometry_dirty = true;
-        self.scene_state.vertices.reserve((1 + surfaces.len()) * 6);
-        self.scene_state.commands.reserve(1 + surfaces.len());
-
-        push_output_background_command(
-            &mut self.scene_state.vertices,
-            &mut self.scene_state.commands,
-            width,
-            height,
-            framebuffer_origin,
-        );
-
-        let render_assignments =
-            compositor::surface_render_space_assignments(surfaces, output_scale);
-        for (group_index, group) in compositor::WindowVisualGroup::stack_order_with_popups(
-            surfaces,
-            decoration_instances,
-            popup_surface_ids,
-        )
-        .into_iter()
-        .enumerate()
-        {
-            let command_start = self.scene_state.commands.len();
-            let visual_group = VisualGroupId::new(
-                u32::try_from(group_index)
-                    .unwrap_or(u32::MAX.saturating_sub(1))
-                    .saturating_add(1),
-            );
-            for &surface_index in group.surface_indices() {
-                let Some((surface, render_assignment)) = surfaces
-                    .get(surface_index)
-                    .zip(render_assignments.get(surface_index).cloned())
-                else {
-                    continue;
-                };
-                push_egl_surface_commands(
-                    &mut self.scene_state.vertices,
-                    &mut self.scene_state.commands,
-                    width,
-                    height,
-                    surface,
-                    render_assignment,
-                    framebuffer_origin,
-                    visual_group,
-                );
-            }
-            if let Some(decoration_index) = group.decoration_index()
-                && let Some(instance) = decoration_instances.get(decoration_index)
-            {
-                push_egl_decoration_instance(
-                    &mut self.scene_state.vertices,
-                    &mut self.scene_state.commands,
-                    width,
-                    height,
-                    instance,
-                    output_scale,
-                    framebuffer_origin,
-                    visual_group,
-                );
-            }
-            let group_root = group.root_surface_id();
-            let owner_root = presentation_owner_roots_by_surface
-                .get(&group_root)
-                .copied()
-                .unwrap_or(group_root);
-            let opacity = Self::presentation_opacity_for_root(presentation_opacities, owner_root);
-            if let Some(visual_group) = visual_group {
-                self.scene_state
-                    .presentation_visual_group_owners
-                    .insert(visual_group, owner_root);
-                self.scene_state
-                    .presentation_visual_group_opacities
-                    .insert(visual_group, opacity);
-                if let Some(clip) = presentation_clips
-                    .iter()
-                    .find(|clip| clip.root_surface_id == owner_root)
-                    .and_then(|clip| clip.presented_clip)
-                {
-                    let scale = output_scale.max(0.01);
-                    self.scene_state.presentation_visual_group_clips.insert(
-                        visual_group,
-                        EglRect::new(
-                            (clip.x() * scale) as f32,
-                            (clip.y() * scale) as f32,
-                            (clip.width() * scale) as f32,
-                            (clip.height() * scale) as f32,
-                        ),
-                    );
-                }
-            }
-            for _ in command_start..self.scene_state.commands.len() {
-                self.scene_state.presentation_opacities.push(opacity);
-            }
-            let presentation_clip = visual_group
-                .and_then(|visual_group| {
-                    self.scene_state
-                        .presentation_visual_group_clips
-                        .get(&visual_group)
-                })
-                .copied();
-            for command in &mut self.scene_state.commands[command_start..] {
-                command.presentation_clip = presentation_clip;
-            }
-            if opacity < 1.0 {
-                for command in &mut self.scene_state.commands[command_start..] {
-                    command.opaque_regions.clear();
-                }
-            }
-        }
-
-        self.scene_state.scene_cache_key = Some(
-            EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
-                width,
-                height,
-                content_generation,
-                output_scale_key,
-                surface_signatures,
-                presentation_geometry_signature,
-                external_overlay_surface_ids,
-                decoration_instances,
-                popup_surface_ids,
-                framebuffer_origin,
-            ),
-        );
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "overlay command emission keeps target, overlay, cursor, scale, and origin state explicit"
-    )]
-    fn rebuild_overlay_commands(
-        &mut self,
-        width: u32,
-        height: u32,
-        visual_state: DesktopVisualState,
-        overlay_surfaces: &[RenderableSurface],
-        client_cursor: Option<compositor::ClientCursorRenderState<'_>>,
-        output_scale: f64,
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) {
-        self.scene_state.cursor_vertices.clear();
-        self.scene_state.cursor_commands.clear();
-        self.scene_state.cursor_presentation_opacities.clear();
-        self.scene_state.overlay_geometry_dirty = true;
-
-        let render_assignments =
-            compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
-        for (surface, render_assignment) in overlay_surfaces.iter().zip(render_assignments) {
-            let command_start = self.scene_state.cursor_commands.len();
-            push_egl_surface_commands(
-                &mut self.scene_state.cursor_vertices,
-                &mut self.scene_state.cursor_commands,
-                width,
-                height,
-                surface,
-                render_assignment,
-                framebuffer_origin,
-                None,
-            );
-            self.scene_state
-                .cursor_presentation_opacities
-                .extend(std::iter::repeat_n(
-                    1.0,
-                    self.scene_state
-                        .cursor_commands
-                        .len()
-                        .saturating_sub(command_start),
-                ));
-        }
-
-        if let Some((cursor_x, cursor_y)) = visual_state.cursor
-            && let Some(cursor_size) = self.resources.texture_view().cursor_size()
-        {
-            let (top_left_x, top_left_y) = self.cursor_image.top_left(cursor_x, cursor_y);
-            push_draw_command(
-                &mut self.scene_state.cursor_vertices,
-                &mut self.scene_state.cursor_commands,
-                EglDrawLayer::Cursor,
-                EglRect::new(
-                    top_left_x as f32,
-                    top_left_y as f32,
-                    cursor_size.0 as f32,
-                    cursor_size.1 as f32,
-                ),
-                width,
-                height,
-                framebuffer_origin,
-            );
-            self.scene_state.cursor_presentation_opacities.push(1.0);
-        }
-
-        if let Some(cursor) = client_cursor {
-            let visual_target = compositor::SurfaceTargetRect::new(
-                compositor::scale_logical_coordinate(
-                    cursor.logical_x.saturating_add(cursor.surface.x),
-                    output_scale,
-                ),
-                compositor::scale_logical_coordinate(
-                    cursor.logical_y.saturating_add(cursor.surface.y),
-                    output_scale,
-                ),
-                compositor::scale_logical_extent(cursor.surface.width, output_scale),
-                compositor::scale_logical_extent(cursor.surface.height, output_scale),
-            );
-            let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
-            let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
-            push_draw_command_with_uv(
-                &mut self.scene_state.cursor_vertices,
-                &mut self.scene_state.cursor_commands,
-                EglDrawLayer::Surface(cursor.surface.surface_id),
-                EglRect::new(
-                    render_plan.content_target.x() as f32,
-                    render_plan.content_target.y() as f32,
-                    render_plan.content_target.width() as f32,
-                    render_plan.content_target.height() as f32,
-                ),
-                uv,
-                surface_sampling_for_plan(
-                    cursor.surface.buffer_size().width,
-                    cursor.surface.buffer_size().height,
-                    render_plan.content_target.x(),
-                    render_plan.content_target.y(),
-                    render_plan.content_target.width(),
-                    render_plan.content_target.height(),
-                    uv,
-                ),
-                width,
-                height,
-                framebuffer_origin,
-            );
-            self.scene_state.cursor_presentation_opacities.push(1.0);
-        }
-    }
-
-    fn draw_textured_layers(
-        &mut self,
-        plan: &RepaintPlan,
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) -> RendererResult<()> {
-        self.establish_ordinary_scene_state();
-        unsafe { self.gl.clear_color(0.0, 0.0, 0.0, 1.0) };
-
-        let execution = plan
-            .render_execution(
-                self.scene_state.current_size.0,
-                self.scene_state.current_size.1,
-                framebuffer_origin,
-            )
-            .ok_or_else(|| io::Error::other("repaint execution conversion failed"))?;
-        match execution {
-            RenderExecution::Full => {
-                unsafe {
-                    self.gl.disable(glow::SCISSOR_TEST);
-                    self.gl.clear(glow::COLOR_BUFFER_BIT);
-                }
-                self.draw_command_batch(true, None)?;
-                self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
-                self.draw_lamp_overlay(None)?;
-                self.draw_squash_overlay(None)?;
-                self.draw_command_batch(false, None)?;
-            }
-            RenderExecution::Scissored {
-                scissors,
-                disable_scissor_after,
-            } => {
-                unsafe {
-                    self.gl.enable(glow::SCISSOR_TEST);
-                }
-                let mut draw_result = Ok(());
-                for phase in legacy_scene_scissored_phase_plan(scissors.len()) {
-                    if draw_result.is_err() {
-                        break;
-                    }
-                    match phase {
-                        LegacySceneScissoredPhase::BaseRepair(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            unsafe {
-                                self.gl.scissor(x, y, width, height);
-                                self.gl.clear(glow::COLOR_BUFFER_BIT);
-                            }
-                            let output_rect = gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene_state.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_command_batch(true, output_rect);
-                        }
-                        LegacySceneScissoredPhase::PrepareLifecycleSources => {
-                            draw_result =
-                                self.prepare_lifecycle_visual_sources(plan, framebuffer_origin);
-                        }
-                        LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            unsafe {
-                                self.gl.enable(glow::SCISSOR_TEST);
-                                self.gl.scissor(x, y, width, height);
-                            }
-                        }
-                        LegacySceneScissoredPhase::Lamp(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            let output_rect = gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene_state.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_lamp_overlay(output_rect);
-                        }
-                        LegacySceneScissoredPhase::Squash(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            let output_rect = gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene_state.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_squash_overlay(output_rect);
-                        }
-                        LegacySceneScissoredPhase::ExternalOverlays(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            let output_rect = gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene_state.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_command_batch(false, output_rect);
-                        }
-                    }
-                }
-                if disable_scissor_after {
-                    unsafe {
-                        self.gl.disable(glow::SCISSOR_TEST);
-                    }
-                }
-                draw_result?;
-                self.scene_state.frame_stats.scissor_passes = scissors.len();
-            }
-        }
-
-        unsafe {
-            self.gl.disable(glow::SCISSOR_TEST);
-            self.gl.bind_texture(glow::TEXTURE_2D, None);
-        }
-        Ok(())
-    }
-
-    fn prepare_lifecycle_visual_sources(
-        &mut self,
-        plan: &RepaintPlan,
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) -> RendererResult<()> {
-        let mut context = LifecycleRenderContext::new(
-            &self.gl,
-            &mut self.scene_state,
-            &mut self.effect_runtime,
-            self.resources.texture_view(),
-        );
-        self.lifecycle
-            .prepare_visual_sources(&mut context, plan, framebuffer_origin)
-    }
-
-    fn draw_lamp_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
-        let mut context = LifecycleRenderContext::new(
-            &self.gl,
-            &mut self.scene_state,
-            &mut self.effect_runtime,
-            self.resources.texture_view(),
-        );
-        self.lifecycle.draw_lamp_overlay(&mut context, scissor)
-    }
-
-    fn draw_squash_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
-        let mut context = LifecycleRenderContext::new(
-            &self.gl,
-            &mut self.scene_state,
-            &mut self.effect_runtime,
-            self.resources.texture_view(),
-        );
-        self.lifecycle.draw_squash_overlay(&mut context, scissor)
-    }
-
-    pub(crate) fn draw_lifecycle_overlays(
-        &mut self,
-        rects: &[OutputRect],
-        framebuffer_origin: OutputFramebufferOrigin,
-        plan: &RepaintPlan,
-    ) -> RendererResult<()> {
-        let mut context = LifecycleRenderContext::new(
-            &self.gl,
-            &mut self.scene_state,
-            &mut self.effect_runtime,
-            self.resources.texture_view(),
-        );
-        self.lifecycle
-            .draw_overlays(&mut context, rects, framebuffer_origin, plan)
-    }
-
-    fn draw_effect_overlays(
-        &mut self,
-        rects: &[OutputRect],
-        framebuffer_origin: OutputFramebufferOrigin,
-    ) -> RendererResult<()> {
-        self.effect_execution_context()
-            .draw_effect_overlays(rects, framebuffer_origin)
-    }
-
+    #[cfg(test)]
     fn draw_command_batch(
         &mut self,
         scene: bool,
@@ -2389,6 +947,7 @@ impl GlesSceneRenderer {
             .draw_command_batch(scene, scissor)
     }
 
+    #[cfg(test)]
     #[cfg(test)]
     fn draw_command_batch_with_visibility(
         &mut self,
@@ -2400,6 +959,7 @@ impl GlesSceneRenderer {
             .draw_command_batch_with_visibility(scene, scissor, plan_scene_visibility)
     }
 
+    #[cfg(test)]
     #[cfg(test)]
     fn draw_command_batch_with_visibility_and_range(
         &mut self,

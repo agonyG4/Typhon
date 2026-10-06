@@ -22,9 +22,12 @@ native_output
 - `src/compositor/tests/` and `src/native_output/tests/` are connected white-box
   test trees.
 - `src/egl_renderer.rs` is the native EGL/GLES renderer façade. Its child
-  modules split ordinary scene/output/checkpoint state, effect execution and
-  resource pooling, retained lifecycle visual ownership (including Lamp and
-  Squash), damage, dmabuf, geometry, and shader helpers.
+  modules split short-lived frame orchestration, ordinary scene/output/
+  checkpoint state, effect execution and resource pooling, retained lifecycle
+  visual ownership (including Lamp and Squash), ordinary image resources,
+  damage, dmabuf, geometry, and shader helpers. `frame/` borrows the persistent
+  scene, lifecycle, effect, and ordinary resource owners for one render call;
+  it does not retain frame state.
 - `src/core/geometry.rs` contains reusable geometry types.
 
 Architecture code must use Rust modules, not `include!()`. Disconnected Rust

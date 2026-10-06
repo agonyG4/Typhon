@@ -42,7 +42,11 @@ there is no alternate runtime to hide that failure.
   Consumers receive a stack-only `ResourceTextureView` for ordinary texture
   lookup. Lifecycle retained textures remain in `LifecycleVisualStore` and are
   resolved through the effect resource pool; they are composed with ordinary
-  sources only at `SceneTextureSources`.
+  sources only at `SceneTextureSources`. `egl_renderer/frame/` coordinates
+  begin-frame setup, resource preparation, scene/damage preparation, graph and
+  repaint planning, consumer realization, execution, and outcome settlement.
+  Its `FramePipeline` is a short-lived borrow over those persistent owners; it
+  owns no renderer state between frames.
 - `src/session/` describes native seat, input, output, and SDDM prerequisites.
 - `src/core/geometry.rs` contains reusable geometry shared by the window
   manager and native-independent tests.
