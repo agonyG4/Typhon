@@ -233,7 +233,6 @@ impl CompiledBindingTable {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn binding(&self, id: BindingId) -> Option<&CompiledBinding> {
         self.bindings
             .get(id.index())
@@ -320,6 +319,7 @@ impl AstreaBindingManager {
         self.table.action_catalog()
     }
 
+    #[cfg(test)]
     pub(crate) fn binding(&self, id: BindingId) -> Option<&CompiledBinding> {
         self.table.binding(id)
     }
