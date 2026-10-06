@@ -1,5 +1,5 @@
 use super::{
-    ControllerDeviceId,
+    ControllerButton, ControllerDeviceId,
     device::ControllerBatchStats,
     device::{
         ControllerIdAllocator, InputDeviceMetadata, classify_controller_capabilities,
@@ -16,7 +16,7 @@ use super::{
     },
     policy::{ControllerPolicy, parse_controller_policy},
     semantic::{
-        ControllerActionMask, ControllerButton, ControllerSemanticAction, ControllerSemanticFrame,
+        ControllerActionMask, ControllerSemanticAction, ControllerSemanticFrame,
         ControllerSemanticMapper, ControllerSemanticMapping,
     },
 };

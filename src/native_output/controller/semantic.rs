@@ -1,4 +1,4 @@
-use super::frame::ControllerFrame;
+use super::frame::{ControllerButton, ControllerFrame};
 
 const NAVIGATION_ENTER: f32 = 0.55;
 const NAVIGATION_EXIT: f32 = 0.40;
@@ -14,29 +14,6 @@ pub(crate) enum ControllerSemanticAction {
     Cancel,
     Menu,
     System,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[allow(dead_code)] // The full standard physical vocabulary is for internal consumers.
-pub(crate) enum ControllerButton {
-    South,
-    East,
-    West,
-    North,
-    LeftShoulder,
-    RightShoulder,
-    LeftTriggerButton,
-    RightTriggerButton,
-    Select,
-    Start,
-    Guide,
-    LeftStick,
-    RightStick,
-    DpadUp,
-    DpadDown,
-    DpadLeft,
-    DpadRight,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

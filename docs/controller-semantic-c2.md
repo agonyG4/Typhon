@@ -56,6 +56,16 @@ built the logical frame. The native runtime currently supplies a no-op sink;
 semantic telemetry is counted independently. This callback is an internal
 attachment point for a future consumer, not a queue or a consumer API.
 
+A real consumer must not interrupt exhaustion of an evdev synchronized
+iterator. Consumer integration must preserve C1.1's full-batch invariant. The
+no-op production sink currently leaves synchronized batch draining
+uninterrupted.
+
+Controller removal, session suspension, or runtime-generation replacement
+invalidates all semantic held state for that `ControllerDeviceId`. Future
+consumers must treat device lifetime as an ownership boundary; a disappearing
+device does not require synthesized `Released` events.
+
 C2 has no repeat engine. A stationary held control produces no new evdev
 events, so correct repeat behavior would require time-based scheduling and a
 real consumer requirement. The held mask preserves state for that future work.

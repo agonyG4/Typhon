@@ -1,5 +1,3 @@
-use super::semantic::ControllerButton;
-
 pub(crate) const ABS_AXIS_COUNT: usize = 64;
 pub(crate) const KEY_CODE_COUNT: usize = 0x300;
 const KEY_WORDS: usize = KEY_CODE_COUNT.div_ceil(u64::BITS as usize);
@@ -81,6 +79,29 @@ pub(crate) enum ControllerInputEvent {
     Absolute { code: u16, value: i32 },
     SynReport,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(dead_code)] // The full standard physical vocabulary is for internal consumers.
+pub(crate) enum ControllerButton {
+    South,
+    East,
+    West,
+    North,
+    LeftShoulder,
+    RightShoulder,
+    LeftTriggerButton,
+    RightTriggerButton,
+    Select,
+    Start,
+    Guide,
+    LeftStick,
+    RightStick,
+    DpadUp,
+    DpadDown,
+    DpadLeft,
+    DpadRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

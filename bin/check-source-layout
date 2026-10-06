@@ -55,6 +55,23 @@ roots = [
 ]
 mod_re = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;", re.MULTILINE)
 
+for physical_path in (
+    Path("src/native_output/controller/frame.rs"),
+    Path("src/native_output/controller/physical.rs"),
+):
+    if not physical_path.exists():
+        continue
+    physical_source = physical_path.read_text()
+    if re.search(
+        r"(?ms)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+[^;]*\bsemantic\s*::",
+        physical_source,
+    ):
+        print(
+            f"source-layout: physical controller module imports semantic layer: {physical_path}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
 def visit(path: Path, seen: set[Path]) -> None:
     path = path.resolve()
     if path in seen or not path.exists():
