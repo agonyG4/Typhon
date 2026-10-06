@@ -646,23 +646,22 @@ fn moving_blur_domain_reuses_real_gles_resources() {
 fn moving_visual_group_blur_replays_only_background_below_target() {
     let mut harness = GlesEffectTestHarness::new(256, 192);
     const BACKGROUND_COLOR: u32 = 0xff20_4060;
-    let target_texture =
-        create_uploaded_resource(&harness.gl, 32, 24).expect("target scene texture creates");
-    harness.renderer.surface_resources.insert(
-        42,
-        EglSurfaceResource {
-            image: target_texture,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
-    let background_texture =
-        create_uploaded_resource(&harness.gl, 1, 1).expect("background scene texture creates");
-    harness.renderer.decoration_resources.insert(
-        DecorationResourceKey::Solid(BACKGROUND_COLOR),
-        background_texture,
-    );
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, 42, 32, 24, None)
+        .expect("target scene texture creates");
+    harness
+        .renderer
+        .resources
+        .test_create_decoration_texture(
+            &harness.gl,
+            EglDrawLayer::SolidRgba(BACKGROUND_COLOR),
+            1,
+            1,
+            None,
+        )
+        .expect("background scene texture creates");
 
     let output_bounds = EffectRect::new(0, 0, 256, 192).expect("output bounds");
     let full_damage = EffectRegion::from_rect(output_bounds);
@@ -836,23 +835,22 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
 #[test]
 fn effect_trace_bounds_visual_group_scene_and_final_replay() {
     let mut harness = GlesEffectTestHarness::new(256, 192);
-    let target_texture =
-        create_uploaded_resource(&harness.gl, 32, 24).expect("target scene texture creates");
-    harness.renderer.surface_resources.insert(
-        42,
-        EglSurfaceResource {
-            image: target_texture,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
-    let background_texture =
-        create_uploaded_resource(&harness.gl, 1, 1).expect("background scene texture creates");
-    harness.renderer.decoration_resources.insert(
-        DecorationResourceKey::Solid(0xff20_4060),
-        background_texture,
-    );
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, 42, 32, 24, None)
+        .expect("target scene texture creates");
+    harness
+        .renderer
+        .resources
+        .test_create_decoration_texture(
+            &harness.gl,
+            EglDrawLayer::SolidRgba(0xff20_4060),
+            1,
+            1,
+            None,
+        )
+        .expect("background scene texture creates");
     harness.renderer.effect_runtime.effect_trace =
         effects::EffectExecutionTrace::enabled_for_test();
     effects::clear_effect_trace_test_events();
@@ -1014,17 +1012,11 @@ fn effect_trace_bounds_checkpoint_scene_advancement() {
         effects::EffectExecutionTrace::enabled_for_test();
     effects::clear_effect_trace_test_events();
     for surface_id in [10, 20] {
-        let texture =
-            create_uploaded_resource(&harness.gl, 1, 1).expect("checkpoint scene texture creates");
-        harness.renderer.surface_resources.insert(
-            surface_id,
-            EglSurfaceResource {
-                image: texture,
-                dmabuf_key: None,
-                buffer_lifetime: None,
-                shm_synced_commit: None,
-            },
-        );
+        harness
+            .renderer
+            .resources
+            .test_create_surface_texture(&harness.gl, surface_id, 1, 1, None)
+            .expect("checkpoint scene texture creates");
     }
     push_draw_command(
         &mut harness.renderer.scene_state.vertices,

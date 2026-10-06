@@ -316,43 +316,19 @@ pub(in crate::egl_renderer::tests) fn install_diagnostic_scene(
             ]);
         }
     }
-    let background_image = create_uploaded_resource(&harness.gl, width, height)
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, 7, width, height, Some(&background))
         .expect("diagnostic background texture creates");
-    write_rgba_bytes_to_resource(
-        &harness.gl,
-        &background_image,
-        SurfaceDamageRect::full(width, height),
-        &background,
-    );
-    harness.renderer.surface_resources.insert(
-        7,
-        EglSurfaceResource {
-            image: background_image,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
     let translucent_surface = [
         112_u8, 18, 12, 128, 18, 112, 12, 160, 18, 12, 112, 96, 112, 112, 12, 192,
     ];
-    let target_image = create_uploaded_resource(&harness.gl, 2, 2)
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, 42, 2, 2, Some(&translucent_surface))
         .expect("diagnostic translucent surface texture creates");
-    write_rgba_bytes_to_resource(
-        &harness.gl,
-        &target_image,
-        SurfaceDamageRect::full(2, 2),
-        &translucent_surface,
-    );
-    harness.renderer.surface_resources.insert(
-        42,
-        EglSurfaceResource {
-            image: target_image,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
     harness.renderer.scene_state.vertices.clear();
     harness.renderer.scene_state.commands.clear();
     push_draw_command(
@@ -401,23 +377,11 @@ pub(in crate::egl_renderer::tests) fn insert_native_test_surface(
     height: u32,
     pixels: &[u8],
 ) {
-    let image = create_uploaded_resource(&harness.gl, width, height)
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, surface_id, width, height, Some(pixels))
         .expect("native diagnostic surface texture creates");
-    write_rgba_bytes_to_resource(
-        &harness.gl,
-        &image,
-        SurfaceDamageRect::full(width, height),
-        pixels,
-    );
-    harness.renderer.surface_resources.insert(
-        surface_id,
-        EglSurfaceResource {
-            image,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
 }
 
 pub(in crate::egl_renderer::tests) fn install_native_stacked_diagnostic_scene(
@@ -437,65 +401,35 @@ pub(in crate::egl_renderer::tests) fn install_native_stacked_diagnostic_scene(
             ]);
         }
     }
-    let background_image = create_uploaded_resource(&harness.gl, width, height)
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(
+            &harness.gl,
+            spec.background_surface,
+            width,
+            height,
+            Some(&background),
+        )
         .expect("native diagnostic background texture creates");
-    write_rgba_bytes_to_resource(
-        &harness.gl,
-        &background_image,
-        SurfaceDamageRect::full(width, height),
-        &background,
-    );
-    harness.renderer.surface_resources.insert(
-        spec.background_surface,
-        EglSurfaceResource {
-            image: background_image,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
 
     let a_surface = [
         112_u8, 18, 12, 128, 18, 112, 12, 160, 18, 12, 112, 96, 112, 112, 12, 192,
     ];
-    let a_image =
-        create_uploaded_resource(&harness.gl, 2, 2).expect("native diagnostic A texture creates");
-    write_rgba_bytes_to_resource(
-        &harness.gl,
-        &a_image,
-        SurfaceDamageRect::full(2, 2),
-        &a_surface,
-    );
-    harness.renderer.surface_resources.insert(
-        spec.a_surface,
-        EglSurfaceResource {
-            image: a_image,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, spec.a_surface, 2, 2, Some(&a_surface))
+        .expect("native diagnostic A texture creates");
 
     let b_surface = [
         12_u8, 18, 112, 144, 112, 18, 12, 176, 12, 112, 18, 112, 88, 88, 112, 192,
     ];
-    let b_image =
-        create_uploaded_resource(&harness.gl, 2, 2).expect("native diagnostic B texture creates");
-    write_rgba_bytes_to_resource(
-        &harness.gl,
-        &b_image,
-        SurfaceDamageRect::full(2, 2),
-        &b_surface,
-    );
-    harness.renderer.surface_resources.insert(
-        spec.b_surface,
-        EglSurfaceResource {
-            image: b_image,
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, spec.b_surface, 2, 2, Some(&b_surface))
+        .expect("native diagnostic B texture creates");
 
     harness.renderer.scene_state.vertices.clear();
     harness.renderer.scene_state.commands.clear();
@@ -969,19 +903,13 @@ pub(in crate::egl_renderer::tests) fn update_diagnostic_background_for_surface(
     repair: OutputRect,
     color: [u8; 4],
 ) {
-    let resource = &harness
-        .renderer
-        .surface_resources
-        .get(&surface_id)
-        .expect("diagnostic background resource")
-        .image;
     let pixels = vec![color; repair.width as usize * repair.height as usize]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    write_rgba_bytes_to_resource(
+    harness.renderer.resources.test_write_surface_rgba(
         &harness.gl,
-        resource,
+        surface_id,
         SurfaceDamageRect {
             x: repair.x as u32,
             y: repair.y as u32,

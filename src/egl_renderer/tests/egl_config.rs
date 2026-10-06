@@ -343,7 +343,7 @@ fn trusted_custom_wrapper_compiles_and_links_in_real_gles_context() {
                 ];
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(destination_texture));
-                configure_texture(&gl);
+                RendererResourceState::test_configure_texture(&gl);
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -357,7 +357,7 @@ fn trusted_custom_wrapper_compiles_and_links_in_real_gles_context() {
                 );
                 gl.active_texture(glow::TEXTURE1);
                 gl.bind_texture(glow::TEXTURE_2D, Some(source_texture));
-                configure_texture(&gl);
+                RendererResourceState::test_configure_texture(&gl);
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -457,7 +457,7 @@ fn trusted_custom_wrapper_compiles_and_links_in_real_gles_context() {
         .expect("normalize regression quad creates");
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(input_texture));
-        configure_texture(&gl);
+        RendererResourceState::test_configure_texture(&gl);
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
@@ -578,7 +578,7 @@ fn trusted_custom_wrapper_compiles_and_links_in_real_gles_context() {
     }
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(mask_texture));
-        configure_texture(&gl);
+        RendererResourceState::test_configure_texture(&gl);
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,

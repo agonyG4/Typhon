@@ -72,17 +72,11 @@ impl LifecycleRenderState {
 
     pub(super) fn texture_sources<'a>(
         &'a self,
-        surfaces: &'a HashMap<u32, EglSurfaceResource>,
-        frames: &'a HashMap<compositor::ServerFrameColor, EglImageResource>,
-        decorations: &'a HashMap<DecorationResourceKey, EglImageResource>,
-        cursor: Option<&'a EglImageResource>,
+        ordinary: ResourceTextureView<'a>,
     ) -> SceneTextureSources<'a> {
         SceneTextureSources {
-            surfaces,
-            frames,
-            decorations,
+            ordinary,
             lifecycle: &self.visual_store.resolved_visual_resources,
-            cursor,
         }
     }
 
@@ -360,10 +354,7 @@ pub(super) struct LifecycleRenderContext<'a> {
     pub(super) gl: &'a glow::Context,
     pub(super) scene_state: &'a mut SceneRenderState,
     pub(super) effect_runtime: &'a mut EffectRuntime,
-    pub(super) surface_resources: &'a HashMap<u32, EglSurfaceResource>,
-    pub(super) frame_resources: &'a HashMap<compositor::ServerFrameColor, EglImageResource>,
-    pub(super) decoration_resources: &'a HashMap<DecorationResourceKey, EglImageResource>,
-    pub(super) cursor_resource: Option<&'a EglImageResource>,
+    pub(super) resources: ResourceTextureView<'a>,
 }
 
 impl<'a> LifecycleRenderContext<'a> {
@@ -371,19 +362,13 @@ impl<'a> LifecycleRenderContext<'a> {
         gl: &'a glow::Context,
         scene_state: &'a mut SceneRenderState,
         effect_runtime: &'a mut EffectRuntime,
-        surface_resources: &'a HashMap<u32, EglSurfaceResource>,
-        frame_resources: &'a HashMap<compositor::ServerFrameColor, EglImageResource>,
-        decoration_resources: &'a HashMap<DecorationResourceKey, EglImageResource>,
-        cursor_resource: Option<&'a EglImageResource>,
+        resources: ResourceTextureView<'a>,
     ) -> Self {
         Self {
             gl,
             scene_state,
             effect_runtime,
-            surface_resources,
-            frame_resources,
-            decoration_resources,
-            cursor_resource,
+            resources,
         }
     }
 
@@ -399,11 +384,8 @@ impl<'a> LifecycleRenderContext<'a> {
             self.scene_state,
             self.effect_runtime,
             SceneTextureSources {
-                surfaces: self.surface_resources,
-                frames: self.frame_resources,
-                decorations: self.decoration_resources,
+                ordinary: self.resources,
                 lifecycle: lifecycle_resources,
-                cursor: self.cursor_resource,
             },
         )
     }
@@ -417,11 +399,8 @@ impl<'a> LifecycleRenderContext<'a> {
         >,
     ) -> Option<GlTexture> {
         SceneTextureSources {
-            surfaces: self.surface_resources,
-            frames: self.frame_resources,
-            decorations: self.decoration_resources,
+            ordinary: self.resources,
             lifecycle: lifecycle_resources,
-            cursor: self.cursor_resource,
         }
         .texture_for_layer(layer, &self.effect_runtime.effect_resources)
     }

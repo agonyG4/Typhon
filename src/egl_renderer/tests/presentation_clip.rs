@@ -13,16 +13,10 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
     let mut harness = GlesEffectTestHarness::new(4, 1);
     let pixel = rgba_to_pixel([255, 0, 0, 255]);
     let texture = create_effect_test_texture(&harness.gl, 1, 1, &[255, 0, 0, 255]);
-    let resource = EglImageResource {
-        texture,
-        size: (1, 1),
-        generation: 0,
-        egl_image: None,
-    };
     harness
         .renderer
-        .decoration_resources
-        .insert(DecorationResourceKey::Solid(pixel), resource);
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(pixel), texture);
 
     let group = oblivion_one::compositor::VisualGroupId::new(1).expect("visual group");
     harness.renderer.scene_state.vertices.clear();
@@ -102,16 +96,10 @@ fn real_gles_clip_intersects_frame_damage_scissor() {
     let mut harness = GlesEffectTestHarness::new(4, 1);
     let pixel = rgba_to_pixel([0, 255, 0, 255]);
     let texture = create_effect_test_texture(&harness.gl, 1, 1, &[0, 255, 0, 255]);
-    let resource = EglImageResource {
-        texture,
-        size: (1, 1),
-        generation: 0,
-        egl_image: None,
-    };
     harness
         .renderer
-        .decoration_resources
-        .insert(DecorationResourceKey::Solid(pixel), resource);
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(pixel), texture);
     let group = oblivion_one::compositor::VisualGroupId::new(1).expect("visual group");
     harness.renderer.scene_state.vertices.clear();
     harness.renderer.scene_state.commands.clear();
@@ -217,31 +205,16 @@ fn real_gles_blur_effects_keep_kernel_source_and_clip_final_contribution() {
     let clip = EglRect::new(24.0, 16.0, 8.0, 16.0);
     let clip_pixel = rgba_to_pixel([32, 64, 96, 255]);
     let background = create_effect_test_texture(&harness.gl, 1, 1, &[32, 64, 96, 255]);
-    harness.renderer.decoration_resources.insert(
-        DecorationResourceKey::Solid(clip_pixel),
-        EglImageResource {
-            texture: background,
-            size: (1, 1),
-            generation: 0,
-            egl_image: None,
-        },
-    );
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(clip_pixel), background);
     let surface_pixels = [255, 0, 0, 255].repeat(16 * 16);
     let surface = create_effect_test_texture(&harness.gl, 16, 16, &surface_pixels);
-    harness.renderer.surface_resources.insert(
-        owner_root,
-        EglSurfaceResource {
-            image: EglImageResource {
-                texture: surface,
-                size: (16, 16),
-                generation: 0,
-                egl_image: None,
-            },
-            dmabuf_key: None,
-            buffer_lifetime: None,
-            shm_synced_commit: None,
-        },
-    );
+    harness
+        .renderer
+        .resources
+        .test_install_surface_texture(owner_root, surface);
     install_visual_group_scene_commands(&mut harness.renderer, rect, visual_group);
     let target_command = harness
         .renderer

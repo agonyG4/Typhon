@@ -17,15 +17,10 @@ use oblivion_one::effects::{
 use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
-        DesktopVisualState, RenderableSurface, SurfaceCommitCounter, SurfaceDamageRect,
-        SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfaceResourceSyncState, VisualGroupId,
-        clipped_decoration_text_geometry,
+        DesktopVisualState, RenderableSurface, SurfaceOpaqueRect, SurfaceOpaqueRegion,
+        SurfaceResourceSyncState, VisualGroupId, clipped_decoration_text_geometry,
     },
     cursor_theme::CompositorCursorImage,
-    render_backend::{
-        buffer::{DmabufImageKey, DrmModifier, WeakBufferIdentity},
-        egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
-    },
     window_lifecycle_animation::{
         LifecycleEffectKind, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleRenderEvidence,
         LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
@@ -42,7 +37,10 @@ mod geometry;
 mod lifecycle;
 pub(crate) mod native_fence;
 mod program;
+mod resources;
 mod scene_state;
+
+pub(crate) use resources::EglImageGuard;
 
 pub(crate) use damage::{
     BufferAge, EglPartialRepaintCapabilities, FullRepaintReason, OutputDamage, OutputRect,
@@ -74,6 +72,10 @@ use lifecycle::{
     LifecycleResolvedVisualResource,
 };
 use program::create_texture_program;
+use resources::surface::SurfaceResourceInputs;
+use resources::{
+    RendererResourceCaptureSnapshot, RendererResourceState, ResourceTelemetry, ResourceTextureView,
+};
 use scene_state::{SceneCaptureSnapshot, SceneRenderState, SceneTextureSources};
 
 pub(crate) type RendererResult<T> = Result<T, Box<dyn Error>>;
@@ -90,265 +92,10 @@ pub(crate) type EglSwapBuffersWithDamage = unsafe extern "system" fn(
     egl::Int,
 ) -> egl::Boolean;
 
-struct SurfaceResourceInputs<'a> {
-    canonical: &'a [RenderableSurface],
-    lifecycle: &'a [RenderableSurface],
-    client_cursor: Option<&'a RenderableSurface>,
-}
-
-const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
 const EGL_BUFFER_AGE_EXT: egl::Int = 0x313d;
 const MAX_LAMP_VERTICES: usize = 65_536;
 const LAMP_TARGET_CELL_PIXELS: f32 = 32.0;
 const LAMP_MAX_GRID_SUBDIVISIONS: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmabufImportGlStage {
-    TextureCreation,
-    Bind,
-    TextureConfiguration,
-    ImageTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmabufImportFailureClass {
-    BufferIncompatible,
-    RendererFatal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmabufImportPath {
-    Initial,
-    Replacement,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmabufImportCacheState {
-    NotChecked,
-    Miss,
-    Hit,
-}
-
-#[derive(Debug)]
-enum DmabufTextureImportError {
-    InvalidAttributes(EglGlesImportError),
-    EglImageCreation(egl::Error),
-    TextureCreation(String),
-    Gl {
-        stage: DmabufImportGlStage,
-        error: u32,
-    },
-}
-
-impl DmabufTextureImportError {
-    fn classification(&self) -> DmabufImportFailureClass {
-        match self {
-            Self::InvalidAttributes(_) => DmabufImportFailureClass::BufferIncompatible,
-            Self::EglImageCreation(
-                egl::Error::BadAttribute
-                | egl::Error::BadMatch
-                | egl::Error::BadNativePixmap
-                | egl::Error::BadParameter,
-            ) => DmabufImportFailureClass::BufferIncompatible,
-            Self::Gl {
-                stage: DmabufImportGlStage::ImageTarget,
-                error: glow::INVALID_OPERATION,
-            } => DmabufImportFailureClass::BufferIncompatible,
-            _ => DmabufImportFailureClass::RendererFatal,
-        }
-    }
-
-    fn stage_name(&self) -> &'static str {
-        match self {
-            Self::InvalidAttributes(_) => "attributes",
-            Self::EglImageCreation(_) => "egl_create_image",
-            Self::TextureCreation(_) => "texture_creation",
-            Self::Gl { stage, .. } => match stage {
-                DmabufImportGlStage::TextureCreation => "texture_creation",
-                DmabufImportGlStage::Bind => "bind",
-                DmabufImportGlStage::TextureConfiguration => "texture_configuration",
-                DmabufImportGlStage::ImageTarget => "image_target",
-            },
-        }
-    }
-
-    fn error_code(&self) -> Option<u32> {
-        match self {
-            Self::EglImageCreation(error) => Some(error.native() as u32),
-            Self::Gl { error, .. } => Some(*error),
-            Self::InvalidAttributes(_) | Self::TextureCreation(_) => None,
-        }
-    }
-
-    fn egl_image_created(&self) -> bool {
-        matches!(self, Self::TextureCreation(_) | Self::Gl { .. })
-    }
-}
-
-impl std::fmt::Display for DmabufTextureImportError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidAttributes(error) => {
-                write!(formatter, "invalid DMA-BUF import attributes: {error:?}")
-            }
-            Self::EglImageCreation(error) => write!(formatter, "eglCreateImage failed: {error}"),
-            Self::TextureCreation(error) => write!(formatter, "texture creation failed: {error}"),
-            Self::Gl { stage, error } => {
-                write!(formatter, "GL {:?} failed with error 0x{error:04x}", stage)
-            }
-        }
-    }
-}
-
-impl Error for DmabufTextureImportError {}
-
-fn drain_gl_errors(gl: &glow::Context) -> Option<u32> {
-    first_drained_gl_error(|| unsafe { gl.get_error() })
-}
-
-fn first_drained_gl_error(mut next_error: impl FnMut() -> u32) -> Option<u32> {
-    let mut first_error = None;
-    loop {
-        let error = next_error();
-        if error == glow::NO_ERROR {
-            return first_error;
-        }
-        first_error.get_or_insert(error);
-    }
-}
-
-fn check_dmabuf_gl_stage(
-    gl: &glow::Context,
-    stage: DmabufImportGlStage,
-) -> Result<(), DmabufTextureImportError> {
-    drain_gl_errors(gl).map_or(Ok(()), |error| {
-        Err(DmabufTextureImportError::Gl { stage, error })
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DmabufImportDiagnosticContext {
-    surface_id: u32,
-    generation: u64,
-    buffer_id: u64,
-    width: u32,
-    height: u32,
-    fourcc: u32,
-    modifier: u64,
-    planes: usize,
-    path: DmabufImportPath,
-    cache: DmabufImportCacheState,
-}
-
-impl DmabufImportDiagnosticContext {
-    fn from_surface(
-        surface: &RenderableSurface,
-        path: DmabufImportPath,
-        cache: DmabufImportCacheState,
-    ) -> Option<Self> {
-        let handle = surface.dmabuf_handle()?;
-        let modifier = handle
-            .planes()
-            .first()
-            .map(|plane| plane.descriptor().modifier.0)?;
-        let size = handle.size();
-        Some(Self {
-            surface_id: surface.surface_id,
-            generation: surface.generation,
-            buffer_id: surface.buffer_id().get(),
-            width: size.width,
-            height: size.height,
-            fourcc: handle.format().as_fourcc(),
-            modifier,
-            planes: handle.planes().len(),
-            path,
-            cache,
-        })
-    }
-}
-
-fn log_dmabuf_import_context(
-    context: DmabufImportDiagnosticContext,
-    event: &'static str,
-    stage: &'static str,
-    egl_image_created: bool,
-    error_code: Option<u32>,
-    classification: &'static str,
-) {
-    let error_code = error_code.map_or_else(|| "none".to_owned(), |code| format!("0x{code:04x}"));
-    eprintln!(
-        "oblivion-one compositor: dmabuf {event}: surface={} generation={} buffer_id={} size={}x{} fourcc=0x{:08x} modifier=0x{:016x} implicit={} planes={} path={:?} cache={:?} egl_image={} stage={} gl_or_egl_error={} classification={classification}",
-        context.surface_id,
-        context.generation,
-        context.buffer_id,
-        context.width,
-        context.height,
-        context.fourcc,
-        context.modifier,
-        context.modifier == DrmModifier::INVALID.0,
-        context.planes,
-        context.path,
-        context.cache,
-        egl_image_created,
-        stage,
-        error_code,
-    );
-}
-
-fn settle_dmabuf_import_result<T>(
-    result: RendererResult<T>,
-    context: DmabufImportDiagnosticContext,
-    frame_stats: &mut GlesSceneFrameStats,
-    failed_surface_generations: &mut HashMap<u32, u64>,
-) -> RendererResult<Option<T>> {
-    match result {
-        Ok(resource) => {
-            failed_surface_generations.remove(&context.surface_id);
-            if native_egl_debug_enabled() {
-                log_dmabuf_import_context(
-                    context,
-                    "import_accepted",
-                    "complete",
-                    true,
-                    None,
-                    "success",
-                );
-            }
-            Ok(Some(resource))
-        }
-        Err(error) => {
-            let Some(import_error) = error.downcast_ref::<DmabufTextureImportError>() else {
-                return Err(error);
-            };
-            let classification = import_error.classification();
-            let should_log = failed_surface_generations
-                .get(&context.surface_id)
-                .is_none_or(|generation| *generation != context.generation);
-            if should_log || classification == DmabufImportFailureClass::RendererFatal {
-                log_dmabuf_import_context(
-                    context,
-                    "import_rejected",
-                    import_error.stage_name(),
-                    import_error.egl_image_created(),
-                    import_error.error_code(),
-                    match classification {
-                        DmabufImportFailureClass::BufferIncompatible => "buffer_incompatible",
-                        DmabufImportFailureClass::RendererFatal => "renderer_fatal",
-                    },
-                );
-            }
-            if classification == DmabufImportFailureClass::RendererFatal {
-                return Err(error);
-            }
-            frame_stats.dmabuf_import_failures =
-                frame_stats.dmabuf_import_failures.saturating_add(1);
-            if should_log {
-                failed_surface_generations.insert(context.surface_id, context.generation);
-            }
-            Ok(None)
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeEglConfigCandidate {
@@ -598,25 +345,14 @@ pub(crate) struct GlesSceneRenderer {
     effect_runtime: EffectRuntime,
     scene_state: SceneRenderState,
     lifecycle: LifecycleRenderState,
-    texture_upload_rgba: Vec<u8>,
-    cursor_resource: Option<EglImageResource>,
-    cursor_resource_stale: bool,
-    surface_resources: HashMap<u32, EglSurfaceResource>,
-    dmabuf_resource_cache: HashMap<DmabufImageKey, CachedDmabufResource<EglImageResource>>,
-    dmabuf_cache_peak_entries: usize,
-    dmabuf_cache_max_entries_for_one_surface: usize,
-    active_surface_ids: Vec<u32>,
-    failed_surface_generations: HashMap<u32, u64>,
-    frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
-    decoration_resources: HashMap<DecorationResourceKey, EglImageResource>,
-    egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
+    resources: RendererResourceState,
 }
 
 struct CaptureRendererState {
     scene: SceneCaptureSnapshot,
     effect_runtime: EffectRuntimeCaptureSnapshot,
     lifecycle: LifecycleCaptureSnapshot,
-    failed_surface_generations: HashMap<u32, u64>,
+    resources: RendererResourceCaptureSnapshot,
 }
 
 impl CaptureRendererState {
@@ -625,7 +361,7 @@ impl CaptureRendererState {
             scene: SceneCaptureSnapshot::take(&renderer.scene_state),
             effect_runtime: EffectRuntimeCaptureSnapshot::take(&renderer.effect_runtime),
             lifecycle: renderer.lifecycle.capture_snapshot(),
-            failed_surface_generations: renderer.failed_surface_generations.clone(),
+            resources: renderer.resources.capture_snapshot(),
         }
     }
 
@@ -633,7 +369,7 @@ impl CaptureRendererState {
         self.scene.restore(&mut renderer.scene_state);
         self.effect_runtime.restore(&mut renderer.effect_runtime);
         renderer.lifecycle.restore_capture_snapshot(self.lifecycle);
-        renderer.failed_surface_generations = self.failed_surface_generations;
+        renderer.resources.restore_capture_snapshot(self.resources);
     }
 }
 
@@ -906,18 +642,7 @@ impl GlesSceneRenderer {
             },
             lifecycle,
             cursor_image,
-            texture_upload_rgba: Vec::new(),
-            cursor_resource: None,
-            cursor_resource_stale: false,
-            surface_resources: HashMap::new(),
-            dmabuf_resource_cache: HashMap::new(),
-            dmabuf_cache_peak_entries: 0,
-            dmabuf_cache_max_entries_for_one_surface: 0,
-            active_surface_ids: Vec::new(),
-            failed_surface_generations: HashMap::new(),
-            frame_resources: HashMap::new(),
-            decoration_resources: HashMap::new(),
-            egl_image_target_texture_2d,
+            resources: RendererResourceState::new(egl_image_target_texture_2d),
         })
     }
 
@@ -929,18 +654,10 @@ impl GlesSceneRenderer {
             scene_state,
             effect_runtime,
             lifecycle,
-            surface_resources,
-            frame_resources,
-            decoration_resources,
-            cursor_resource,
+            resources,
             ..
         } = self;
-        let texture_sources = lifecycle.texture_sources(
-            surface_resources,
-            frame_resources,
-            decoration_resources,
-            cursor_resource.as_ref(),
-        );
+        let texture_sources = lifecycle.texture_sources(resources.texture_view());
         EffectExecutionContext::new(gl, scene_state, effect_runtime, texture_sources)
     }
 
@@ -1049,7 +766,7 @@ impl GlesSceneRenderer {
         self.scene_state
             .damage_tracker
             .set_cursor_image(cursor_image);
-        self.cursor_resource_stale = true;
+        self.resources.mark_cursor_stale();
         self.scene_state.repaint_planner.invalidate();
     }
 
@@ -1481,8 +1198,9 @@ impl GlesSceneRenderer {
                 ..FrameTraceSummary::default()
             },
         );
-        self.ensure_frame_resources()?;
-        self.ensure_decoration_resources(
+        self.resources.ensure_frame_resources(&self.gl)?;
+        self.resources.ensure_decoration_resources(
+            &self.gl,
             egl,
             egl_display,
             decoration_instances
@@ -1490,22 +1208,34 @@ impl GlesSceneRenderer {
                 .chain(lifecycle_decorations.iter()),
         )?;
         if scaled_visual_state.cursor.is_some() {
-            self.ensure_cursor_resource(egl, egl_display)?;
+            self.resources.ensure_cursor_resource(
+                &self.gl,
+                egl,
+                egl_display,
+                &self.cursor_image,
+            )?;
         }
-        self.reconcile_surface_resource_lifetimes(
-            egl,
-            egl_display,
-            surfaces,
-            lifecycle_surfaces,
-            client_cursor.map(|cursor| cursor.surface),
-        )?;
+        {
+            let mut telemetry = ResourceTelemetry::new(&mut self.scene_state.frame_stats);
+            self.resources.reconcile_surface_resource_lifetimes(
+                &self.gl,
+                egl,
+                egl_display,
+                surfaces,
+                lifecycle_surfaces,
+                client_cursor.map(|cursor| cursor.surface),
+                &mut telemetry,
+            )?;
+        }
         // The software client cursor remains eager: it is a small, separately
         // owned overlay path and is not part of ordinary scene realization.
         if let Some(cursor) = client_cursor.map(|cursor| cursor.surface) {
             let mut cursor_consumers = SurfaceConsumerPlan::default();
             cursor_consumers.add_surface(cursor.surface_id);
             cursor_consumers.finish();
-            self.realize_surface_resources_for_consumers(
+            let mut telemetry = ResourceTelemetry::new(&mut self.scene_state.frame_stats);
+            self.resources.realize_surface_resources_for_consumers(
+                &self.gl,
                 egl,
                 egl_display,
                 SurfaceResourceInputs {
@@ -1515,6 +1245,7 @@ impl GlesSceneRenderer {
                 },
                 &cursor_consumers,
                 &surface_resource_sync_states,
+                &mut telemetry,
             )?;
         }
 
@@ -1904,7 +1635,9 @@ impl GlesSceneRenderer {
             .frame_stats
             .surface_resource_candidates
             .saturating_sub(self.scene_state.frame_stats.surface_resource_consumers);
-        self.realize_surface_resources_for_consumers(
+        let mut telemetry = ResourceTelemetry::new(&mut self.scene_state.frame_stats);
+        self.resources.realize_surface_resources_for_consumers(
+            &self.gl,
             egl,
             egl_display,
             SurfaceResourceInputs {
@@ -1914,6 +1647,7 @@ impl GlesSceneRenderer {
             },
             &consumer_plan,
             &surface_resource_sync_states,
+            &mut telemetry,
         )?;
         self.effect_runtime.effect_trace.frame_boundary(
             "renderer_draw_complete",
@@ -2179,668 +1913,6 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
-    fn ensure_cursor_resource(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-    ) -> RendererResult<()> {
-        let width = self.cursor_image.width;
-        let height = self.cursor_image.height;
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
-        if self
-            .cursor_resource
-            .as_ref()
-            .is_some_and(|resource| resource.size == (width, height) && !self.cursor_resource_stale)
-        {
-            return Ok(());
-        }
-
-        let mut resource = create_uploaded_resource(&self.gl, width, height)?;
-        write_argb_pixels_to_resource(
-            &self.gl,
-            &resource,
-            SurfaceDamageRect::full(width, height),
-            &self.cursor_image.pixels_argb8888,
-            &mut self.texture_upload_rgba,
-        );
-        if let Some(old) = self.cursor_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, old);
-        }
-        resource.generation = 1;
-        self.cursor_resource = Some(resource);
-        self.cursor_resource_stale = false;
-        Ok(())
-    }
-
-    fn ensure_frame_resources(&mut self) -> RendererResult<()> {
-        for color in compositor::ServerFrameColor::ALL {
-            if self.frame_resources.contains_key(&color) {
-                continue;
-            }
-
-            let mut resource = create_uploaded_resource(&self.gl, 1, 1)?;
-            write_argb_pixels_to_resource(
-                &self.gl,
-                &resource,
-                SurfaceDamageRect::full(1, 1),
-                &[color.pixel()],
-                &mut self.texture_upload_rgba,
-            );
-            resource.generation = 1;
-            self.frame_resources.insert(color, resource);
-        }
-        Ok(())
-    }
-
-    fn ensure_decoration_resources<'a, I>(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        instances: I,
-    ) -> RendererResult<()>
-    where
-        I: IntoIterator<Item = &'a DecorationRenderInstance>,
-    {
-        let DecorationResourceRequirements {
-            required,
-            required_assets,
-        } = decoration_resource_requirements(
-            instances
-                .into_iter()
-                .map(DecorationRenderInstance::primitives),
-        );
-
-        let stale = self
-            .decoration_resources
-            .keys()
-            .copied()
-            .filter(|key| !required.contains(key))
-            .collect::<Vec<_>>();
-        for key in stale {
-            if let Some(resource) = self.decoration_resources.remove(&key) {
-                destroy_image_resource(&self.gl, egl, egl_display, resource);
-            }
-        }
-
-        for key in required {
-            if self.decoration_resources.contains_key(&key) {
-                continue;
-            }
-            let mut resource = match key {
-                DecorationResourceKey::Solid(color) => {
-                    let resource = create_uploaded_resource(&self.gl, 1, 1)?;
-                    write_argb_pixels_to_resource(
-                        &self.gl,
-                        &resource,
-                        SurfaceDamageRect::full(1, 1),
-                        &[color],
-                        &mut self.texture_upload_rgba,
-                    );
-                    resource
-                }
-                DecorationResourceKey::Asset(asset_id) => {
-                    let asset = required_assets
-                        .get(&asset_id)
-                        .expect("required decoration asset was collected");
-                    let resource =
-                        create_uploaded_resource(&self.gl, asset.width(), asset.height())?;
-                    write_rgba_bytes_to_resource(
-                        &self.gl,
-                        &resource,
-                        SurfaceDamageRect::full(asset.width(), asset.height()),
-                        asset.rgba_premultiplied(),
-                    );
-                    resource
-                }
-            };
-            resource.generation = 1;
-            self.decoration_resources.insert(key, resource);
-        }
-        Ok(())
-    }
-
-    fn reconcile_surface_resource_lifetimes(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surfaces: &[RenderableSurface],
-        lifecycle_surfaces: &[RenderableSurface],
-        client_cursor: Option<&RenderableSurface>,
-    ) -> RendererResult<()> {
-        self.evict_dead_cached_dmabufs(egl, egl_display);
-        self.active_surface_ids.clear();
-        self.active_surface_ids
-            .extend(surfaces.iter().map(|surface| surface.surface_id));
-        self.active_surface_ids
-            .extend(lifecycle_surfaces.iter().map(|surface| surface.surface_id));
-        self.active_surface_ids
-            .extend(client_cursor.map(|surface| surface.surface_id));
-        self.active_surface_ids.sort_unstable();
-        self.active_surface_ids.dedup();
-
-        for surface in surfaces
-            .iter()
-            .chain(lifecycle_surfaces)
-            .chain(client_cursor)
-        {
-            let Some((action, resource)) =
-                reconcile_surface_resource_backing(&mut self.surface_resources, surface)
-            else {
-                continue;
-            };
-            match action {
-                SurfaceResourceLifetimeAction::DemoteDmabuf => {
-                    self.cache_or_destroy_dmabuf_resource(
-                        egl,
-                        egl_display,
-                        surface.surface_id,
-                        resource,
-                    );
-                }
-                SurfaceResourceLifetimeAction::Destroy => {
-                    destroy_surface_resource(&self.gl, egl, egl_display, resource);
-                }
-                SurfaceResourceLifetimeAction::Keep => {
-                    unreachable!("current surface resource reconciliation never removes Keep")
-                }
-            }
-        }
-
-        let stale_ids = self
-            .surface_resources
-            .keys()
-            .copied()
-            .filter(|id| self.active_surface_ids.binary_search(id).is_err())
-            .collect::<Vec<_>>();
-        for surface_id in stale_ids {
-            if let Some(resource) = self.surface_resources.remove(&surface_id) {
-                destroy_surface_resource(&self.gl, egl, egl_display, resource);
-            }
-            self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface_id);
-            self.failed_surface_generations.remove(&surface_id);
-        }
-
-        self.scene_state.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
-        self.scene_state.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
-        self.scene_state
-            .frame_stats
-            .dmabuf_cache_max_entries_for_one_surface =
-            self.dmabuf_cache_max_entries_for_one_surface;
-        Ok(())
-    }
-
-    fn realize_surface_resources_for_consumers(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        inputs: SurfaceResourceInputs<'_>,
-        consumers: &SurfaceConsumerPlan,
-        sync_states: &[SurfaceResourceSyncState],
-    ) -> RendererResult<()> {
-        for surface in inputs
-            .canonical
-            .iter()
-            .chain(inputs.lifecycle)
-            .chain(inputs.client_cursor)
-        {
-            if consumers
-                .surface_ids()
-                .binary_search(&surface.surface_id)
-                .is_err()
-            {
-                continue;
-            }
-            let sync_state = sync_states
-                .iter()
-                .find(|state| state.surface_id == surface.surface_id)
-                .copied()
-                .unwrap_or(SurfaceResourceSyncState {
-                    surface_id: surface.surface_id,
-                    complete_since: None,
-                    current_commit: SurfaceCommitCounter::default(),
-                    authoritative: false,
-                });
-            self.realize_surface_resource(egl, egl_display, surface, sync_state)?;
-        }
-        self.scene_state.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
-        self.scene_state.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
-        self.scene_state
-            .frame_stats
-            .dmabuf_cache_max_entries_for_one_surface =
-            self.dmabuf_cache_max_entries_for_one_surface;
-        Ok(())
-    }
-
-    fn realize_surface_resource(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surface: &RenderableSurface,
-        sync_state: SurfaceResourceSyncState,
-    ) -> RendererResult<()> {
-        let update = self
-            .surface_resources
-            .get(&surface.surface_id)
-            .map_or(EglSurfaceResourceUpdate::Recreate, |resource| {
-                resource.update_for(surface, sync_state)
-            });
-        match update {
-            EglSurfaceResourceUpdate::Reuse => return Ok(()),
-            EglSurfaceResourceUpdate::ReuseShm => {
-                if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                    resource.advance_shm_sync_baseline(sync_state.current_commit);
-                }
-                return Ok(());
-            }
-            EglSurfaceResourceUpdate::ReuseDmabuf => {
-                if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                    resource.image.generation = surface.generation;
-                }
-                self.scene_state.frame_stats.dmabuf_current_resource_reuses = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_current_resource_reuses
-                    .saturating_add(1);
-                self.scene_state.frame_stats.dmabuf_reuses =
-                    self.scene_state.frame_stats.dmabuf_reuses.saturating_add(1);
-                return Ok(());
-            }
-            EglSurfaceResourceUpdate::UploadDamage | EglSurfaceResourceUpdate::FullShmResync => {
-                if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                    let force_full = update == EglSurfaceResourceUpdate::FullShmResync;
-                    self.scene_state.frame_stats.shm_upload_bytes = self
-                        .scene_state
-                        .frame_stats
-                        .shm_upload_bytes
-                        .saturating_add(resource.write_shm_damage(
-                            &self.gl,
-                            surface,
-                            force_full,
-                            sync_state.current_commit,
-                            &mut self.texture_upload_rgba,
-                        ));
-                    if force_full {
-                        self.scene_state.frame_stats.shm_full_resyncs = self
-                            .scene_state
-                            .frame_stats
-                            .shm_full_resyncs
-                            .saturating_add(1);
-                    }
-                }
-                return Ok(());
-            }
-            EglSurfaceResourceUpdate::Recreate if surface.dmabuf_handle().is_some() => {
-                self.switch_dmabuf_surface_resource(egl, egl_display, surface)?;
-                return Ok(());
-            }
-            EglSurfaceResourceUpdate::Recreate => {}
-            EglSurfaceResourceUpdate::UnsupportedBuffer => {
-                if let Some(resource) = self.surface_resources.remove(&surface.surface_id) {
-                    destroy_surface_resource(&self.gl, egl, egl_display, resource);
-                }
-                self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
-                return Ok(());
-            }
-        }
-
-        if let Some(old) = self.surface_resources.remove(&surface.surface_id) {
-            destroy_surface_resource(&self.gl, egl, egl_display, old);
-        }
-        if surface.dmabuf_handle().is_none() {
-            self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
-        }
-
-        let result = create_surface_resource(
-            &self.gl,
-            egl,
-            egl_display,
-            self.egl_image_target_texture_2d,
-            surface,
-            (surface.cpu_pixels().is_some() && sync_state.authoritative)
-                .then_some(sync_state.current_commit),
-            &mut self.texture_upload_rgba,
-        );
-        if let Some(context) = DmabufImportDiagnosticContext::from_surface(
-            surface,
-            DmabufImportPath::Initial,
-            DmabufImportCacheState::NotChecked,
-        ) {
-            if let Some(resource) = settle_dmabuf_import_result(
-                result,
-                context,
-                &mut self.scene_state.frame_stats,
-                &mut self.failed_surface_generations,
-            )? {
-                self.scene_state.frame_stats.dmabuf_imports = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_imports
-                    .saturating_add(1);
-                self.surface_resources.insert(surface.surface_id, resource);
-            }
-        } else {
-            match result {
-                Ok(resource) => {
-                    self.scene_state.frame_stats.shm_upload_bytes = self
-                        .scene_state
-                        .frame_stats
-                        .shm_upload_bytes
-                        .saturating_add(surface_upload_byte_len(surface));
-                    self.failed_surface_generations.remove(&surface.surface_id);
-                    self.surface_resources.insert(surface.surface_id, resource);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "oblivion-one compositor: failed to realize surface {} on EGL/GLES: {error}",
-                        surface.surface_id
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn switch_dmabuf_surface_resource(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surface: &RenderableSurface,
-    ) -> RendererResult<()> {
-        let Some(handle) = surface.dmabuf_handle() else {
-            return Ok(());
-        };
-        let key = DmabufImageKey::from_handle(surface.buffer_id(), handle);
-
-        if let Some(mut cached) = self.dmabuf_resource_cache.remove(&key) {
-            if native_egl_debug_enabled() {
-                eprintln!(
-                    "oblivion-one compositor: dmabuf cache=hit surface={} key={key:?} texture={:?} egl_image={:?}",
-                    surface.surface_id,
-                    cached.image.texture,
-                    cached.image.egl_image.map(|image| image.as_ptr()),
-                );
-                if let Some(context) = DmabufImportDiagnosticContext::from_surface(
-                    surface,
-                    DmabufImportPath::Replacement,
-                    DmabufImportCacheState::Hit,
-                ) {
-                    log_dmabuf_import_context(
-                        context,
-                        "resource_selected",
-                        "cache",
-                        cached.image.egl_image.is_some(),
-                        None,
-                        "success",
-                    );
-                }
-            }
-            cached.image.generation = surface.generation;
-            self.scene_state.frame_stats.dmabuf_cache_hits = self
-                .scene_state
-                .frame_stats
-                .dmabuf_cache_hits
-                .saturating_add(1);
-            self.scene_state.frame_stats.dmabuf_reuses =
-                self.scene_state.frame_stats.dmabuf_reuses.saturating_add(1);
-            if let Some(old) = self.surface_resources.insert(
-                surface.surface_id,
-                EglSurfaceResource {
-                    image: cached.image,
-                    dmabuf_key: Some(key),
-                    buffer_lifetime: Some(surface.buffer_identity().downgrade()),
-                    shm_synced_commit: None,
-                },
-            ) {
-                self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
-            }
-            return Ok(());
-        }
-
-        if native_egl_debug_enabled() {
-            eprintln!(
-                "oblivion-one compositor: dmabuf cache=miss surface={} key={key:?} layout={:?}",
-                surface.surface_id,
-                surface.dmabuf_handle(),
-            );
-        }
-        self.scene_state.frame_stats.dmabuf_cache_misses = self
-            .scene_state
-            .frame_stats
-            .dmabuf_cache_misses
-            .saturating_add(1);
-
-        let Some(old) = self.surface_resources.remove(&surface.surface_id) else {
-            let result = create_surface_resource(
-                &self.gl,
-                egl,
-                egl_display,
-                self.egl_image_target_texture_2d,
-                surface,
-                None,
-                &mut self.texture_upload_rgba,
-            );
-            let context = DmabufImportDiagnosticContext::from_surface(
-                surface,
-                DmabufImportPath::Initial,
-                DmabufImportCacheState::Miss,
-            )
-            .expect("switching a DMA-BUF resource requires a DMA-BUF surface");
-            if let Some(resource) = settle_dmabuf_import_result(
-                result,
-                context,
-                &mut self.scene_state.frame_stats,
-                &mut self.failed_surface_generations,
-            )? {
-                self.scene_state.frame_stats.dmabuf_imports = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_imports
-                    .saturating_add(1);
-                self.surface_resources.insert(surface.surface_id, resource);
-            }
-            return Ok(());
-        };
-        self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
-
-        let result = create_surface_resource(
-            &self.gl,
-            egl,
-            egl_display,
-            self.egl_image_target_texture_2d,
-            surface,
-            None,
-            &mut self.texture_upload_rgba,
-        );
-        let context = DmabufImportDiagnosticContext::from_surface(
-            surface,
-            DmabufImportPath::Replacement,
-            DmabufImportCacheState::Miss,
-        )
-        .expect("switching a DMA-BUF resource requires a DMA-BUF surface");
-        if let Some(resource) = settle_dmabuf_import_result(
-            result,
-            context,
-            &mut self.scene_state.frame_stats,
-            &mut self.failed_surface_generations,
-        )? {
-            self.scene_state.frame_stats.dmabuf_imports = self
-                .scene_state
-                .frame_stats
-                .dmabuf_imports
-                .saturating_add(1);
-            self.surface_resources.insert(surface.surface_id, resource);
-        }
-        Ok(())
-    }
-
-    fn cache_or_destroy_dmabuf_resource(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surface_id: u32,
-        resource: EglSurfaceResource,
-    ) {
-        let Some(key) = resource.dmabuf_key else {
-            destroy_surface_resource(&self.gl, egl, egl_display, resource);
-            return;
-        };
-        let Some(buffer_lifetime) = resource.buffer_lifetime else {
-            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-            return;
-        };
-        if !buffer_lifetime.is_alive() {
-            if native_egl_debug_enabled() {
-                eprintln!(
-                    "oblivion-one compositor: dmabuf cache=evict reason=dead-before-cache key={key:?}"
-                );
-            }
-            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-            self.scene_state.frame_stats.dmabuf_cache_evictions = self
-                .scene_state
-                .frame_stats
-                .dmabuf_cache_evictions
-                .saturating_add(1);
-            self.scene_state.frame_stats.dmabuf_cache_evictions_dead = self
-                .scene_state
-                .frame_stats
-                .dmabuf_cache_evictions_dead
-                .saturating_add(1);
-            return;
-        }
-
-        self.prune_cached_dmabufs_for_surface(egl, egl_display, surface_id);
-        if let Some(replaced) = self.dmabuf_resource_cache.insert(
-            key,
-            CachedDmabufResource {
-                image: resource.image,
-                buffer_lifetime,
-                surface_id,
-            },
-        ) {
-            destroy_image_resource(&self.gl, egl, egl_display, replaced.image);
-        }
-        self.scene_state.frame_stats.dmabuf_cache_insertions = self
-            .scene_state
-            .frame_stats
-            .dmabuf_cache_insertions
-            .saturating_add(1);
-        let surface_entries = self
-            .dmabuf_resource_cache
-            .values()
-            .filter(|cached| cached.surface_id == surface_id)
-            .count();
-        self.dmabuf_cache_max_entries_for_one_surface = self
-            .dmabuf_cache_max_entries_for_one_surface
-            .max(surface_entries);
-        self.dmabuf_cache_peak_entries = self
-            .dmabuf_cache_peak_entries
-            .max(self.dmabuf_resource_cache.len());
-    }
-
-    fn prune_cached_dmabufs_for_surface(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surface_id: u32,
-    ) {
-        let cached = self
-            .dmabuf_resource_cache
-            .values()
-            .filter(|cached| cached.surface_id == surface_id)
-            .count();
-        if cached < MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE {
-            return;
-        }
-        let Some(key) = self
-            .dmabuf_resource_cache
-            .iter()
-            .find_map(|(key, cached)| (cached.surface_id == surface_id).then_some(key.clone()))
-        else {
-            return;
-        };
-        if let Some(resource) = self.dmabuf_resource_cache.remove(&key) {
-            if native_egl_debug_enabled() {
-                eprintln!(
-                    "oblivion-one compositor: dmabuf cache=evict reason=surface-bound key={key:?}"
-                );
-            }
-            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-            self.scene_state.frame_stats.dmabuf_cache_evictions = self
-                .scene_state
-                .frame_stats
-                .dmabuf_cache_evictions
-                .saturating_add(1);
-            self.scene_state
-                .frame_stats
-                .dmabuf_cache_evictions_surface_bound = self
-                .scene_state
-                .frame_stats
-                .dmabuf_cache_evictions_surface_bound
-                .saturating_add(1);
-        }
-    }
-
-    fn destroy_cached_dmabufs_for_surface(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surface_id: u32,
-    ) {
-        let keys = self
-            .dmabuf_resource_cache
-            .iter()
-            .filter_map(|(key, cached)| (cached.surface_id == surface_id).then_some(key.clone()))
-            .collect::<Vec<_>>();
-        for key in keys {
-            if let Some(resource) = self.dmabuf_resource_cache.remove(&key) {
-                if native_egl_debug_enabled() {
-                    eprintln!(
-                        "oblivion-one compositor: dmabuf cache=evict reason=surface-destroyed key={key:?}"
-                    );
-                }
-                destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-                self.scene_state.frame_stats.dmabuf_cache_evictions = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_cache_evictions
-                    .saturating_add(1);
-                self.scene_state
-                    .frame_stats
-                    .dmabuf_cache_evictions_surface_destroyed = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_cache_evictions_surface_destroyed
-                    .saturating_add(1);
-            }
-        }
-    }
-
-    fn evict_dead_cached_dmabufs(&mut self, egl: &EglInstance, egl_display: egl::Display) {
-        let dead = dead_cached_dmabuf_keys(&self.dmabuf_resource_cache);
-        for key in dead {
-            if let Some(cached) = self.dmabuf_resource_cache.remove(&key) {
-                if native_egl_debug_enabled() {
-                    eprintln!(
-                        "oblivion-one compositor: dmabuf cache=evict reason=buffer-dead key={key:?}"
-                    );
-                }
-                destroy_image_resource(&self.gl, egl, egl_display, cached.image);
-                self.scene_state.frame_stats.dmabuf_cache_evictions = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_cache_evictions
-                    .saturating_add(1);
-                self.scene_state.frame_stats.dmabuf_cache_evictions_dead = self
-                    .scene_state
-                    .frame_stats
-                    .dmabuf_cache_evictions_dead
-                    .saturating_add(1);
-            }
-        }
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "scene-cache validation compares each render-state component explicitly"
@@ -3075,7 +2147,7 @@ impl GlesSceneRenderer {
         }
 
         if let Some((cursor_x, cursor_y)) = visual_state.cursor
-            && let Some(cursor) = self.cursor_resource.as_ref()
+            && let Some(cursor_size) = self.resources.texture_view().cursor_size()
         {
             let (top_left_x, top_left_y) = self.cursor_image.top_left(cursor_x, cursor_y);
             push_draw_command(
@@ -3085,8 +2157,8 @@ impl GlesSceneRenderer {
                 EglRect::new(
                     top_left_x as f32,
                     top_left_y as f32,
-                    cursor.size.0 as f32,
-                    cursor.size.1 as f32,
+                    cursor_size.0 as f32,
+                    cursor_size.1 as f32,
                 ),
                 width,
                 height,
@@ -3257,10 +2329,7 @@ impl GlesSceneRenderer {
             &self.gl,
             &mut self.scene_state,
             &mut self.effect_runtime,
-            &self.surface_resources,
-            &self.frame_resources,
-            &self.decoration_resources,
-            self.cursor_resource.as_ref(),
+            self.resources.texture_view(),
         );
         self.lifecycle
             .prepare_visual_sources(&mut context, plan, framebuffer_origin)
@@ -3271,10 +2340,7 @@ impl GlesSceneRenderer {
             &self.gl,
             &mut self.scene_state,
             &mut self.effect_runtime,
-            &self.surface_resources,
-            &self.frame_resources,
-            &self.decoration_resources,
-            self.cursor_resource.as_ref(),
+            self.resources.texture_view(),
         );
         self.lifecycle.draw_lamp_overlay(&mut context, scissor)
     }
@@ -3284,10 +2350,7 @@ impl GlesSceneRenderer {
             &self.gl,
             &mut self.scene_state,
             &mut self.effect_runtime,
-            &self.surface_resources,
-            &self.frame_resources,
-            &self.decoration_resources,
-            self.cursor_resource.as_ref(),
+            self.resources.texture_view(),
         );
         self.lifecycle.draw_squash_overlay(&mut context, scissor)
     }
@@ -3302,10 +2365,7 @@ impl GlesSceneRenderer {
             &self.gl,
             &mut self.scene_state,
             &mut self.effect_runtime,
-            &self.surface_resources,
-            &self.frame_resources,
-            &self.decoration_resources,
-            self.cursor_resource.as_ref(),
+            self.resources.texture_view(),
         );
         self.lifecycle
             .draw_overlays(&mut context, rects, framebuffer_origin, plan)
@@ -3360,21 +2420,7 @@ impl GlesSceneRenderer {
     }
 
     pub(crate) fn destroy(&mut self, egl: &EglInstance, egl_display: egl::Display) {
-        if let Some(resource) = self.cursor_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
-        for (_, resource) in self.frame_resources.drain() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
-        for (_, resource) in self.decoration_resources.drain() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
-        for (_, resource) in self.surface_resources.drain() {
-            destroy_surface_resource(&self.gl, egl, egl_display, resource);
-        }
-        for (_, resource) in self.dmabuf_resource_cache.drain() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
-        }
+        self.resources.destroy(&self.gl, egl, egl_display);
         self.lifecycle
             .release_all_visual_resources(&mut self.effect_runtime);
         self.effect_runtime.destroy_persistent_resources(&self.gl);
@@ -3528,260 +2574,6 @@ fn rgba_to_pixel(color: [u8; 4]) -> u32 {
         | (u32::from(color[0]) << 16)
         | (u32::from(color[1]) << 8)
         | u32::from(color[2])
-}
-
-struct DecorationResourceRequirements<'a> {
-    required: HashSet<DecorationResourceKey>,
-    required_assets: HashMap<u64, &'a oblivion_one::compositor::DecorationRasterAsset>,
-}
-
-fn decoration_resource_requirements<'a, I>(primitive_sets: I) -> DecorationResourceRequirements<'a>
-where
-    I: IntoIterator<Item = &'a [DecorationRenderPrimitive]>,
-{
-    let mut required = HashSet::new();
-    let mut required_assets = HashMap::new();
-    for primitives in primitive_sets {
-        for primitive in primitives {
-            match primitive {
-                DecorationRenderPrimitive::SolidRect { color, .. } => {
-                    required.insert(DecorationResourceKey::Solid(rgba_to_pixel(*color)));
-                }
-                DecorationRenderPrimitive::Image { asset, .. } => {
-                    required.insert(DecorationResourceKey::Asset(asset.asset_id()));
-                    required_assets.insert(asset.asset_id(), asset);
-                }
-                DecorationRenderPrimitive::Text { color, asset, .. } => {
-                    required.insert(DecorationResourceKey::Solid(rgba_to_pixel(*color)));
-                    required.insert(DecorationResourceKey::Asset(asset.asset_id()));
-                    required_assets.insert(asset.asset_id(), asset);
-                }
-            }
-        }
-    }
-    DecorationResourceRequirements {
-        required,
-        required_assets,
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn decoration_resource_keys_for_primitive_sets<'a, I>(
-    primitive_sets: I,
-) -> HashSet<DecorationResourceKey>
-where
-    I: IntoIterator<Item = &'a [DecorationRenderPrimitive]>,
-{
-    decoration_resource_requirements(primitive_sets).required
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum DecorationResourceKey {
-    Solid(u32),
-    Asset(u64),
-}
-
-struct EglImageResource {
-    texture: GlTexture,
-    size: (u32, u32),
-    generation: u64,
-    egl_image: Option<egl::Image>,
-}
-
-pub(crate) struct EglImageGuard<F>
-where
-    F: FnMut(egl::Image),
-{
-    image: Option<egl::Image>,
-    destroy: F,
-}
-
-impl<F> EglImageGuard<F>
-where
-    F: FnMut(egl::Image),
-{
-    pub(crate) fn new(image: egl::Image, destroy: F) -> Self {
-        Self {
-            image: Some(image),
-            destroy,
-        }
-    }
-
-    pub(crate) fn image(&self) -> egl::Image {
-        self.image.expect("EGL image guard must own an image")
-    }
-
-    pub(crate) fn disarm(mut self) -> egl::Image {
-        self.image
-            .take()
-            .expect("EGL image guard must own an image")
-    }
-}
-
-impl<F> Drop for EglImageGuard<F>
-where
-    F: FnMut(egl::Image),
-{
-    fn drop(&mut self) {
-        if let Some(image) = self.image.take() {
-            (self.destroy)(image);
-        }
-    }
-}
-
-struct EglSurfaceResource {
-    image: EglImageResource,
-    dmabuf_key: Option<DmabufImageKey>,
-    buffer_lifetime: Option<WeakBufferIdentity>,
-    shm_synced_commit: Option<SurfaceCommitCounter>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SurfaceResourceLifetimeAction {
-    Keep,
-    DemoteDmabuf,
-    Destroy,
-}
-
-struct CachedDmabufResource<R> {
-    image: R,
-    buffer_lifetime: WeakBufferIdentity,
-    surface_id: u32,
-}
-
-fn dead_cached_dmabuf_keys<R>(
-    cache: &HashMap<DmabufImageKey, CachedDmabufResource<R>>,
-) -> Vec<DmabufImageKey> {
-    cache
-        .iter()
-        .filter_map(|(key, cached)| (!cached.buffer_lifetime.is_alive()).then_some(key.clone()))
-        .collect()
-}
-
-fn classify_surface_resource_lifetime(
-    resource: &EglSurfaceResource,
-    surface: &RenderableSurface,
-) -> SurfaceResourceLifetimeAction {
-    if let Some(installed_key) = resource.dmabuf_key.as_ref() {
-        let current_key = surface
-            .dmabuf_handle()
-            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle));
-        return if current_key.as_ref() == Some(installed_key) {
-            SurfaceResourceLifetimeAction::Keep
-        } else {
-            SurfaceResourceLifetimeAction::DemoteDmabuf
-        };
-    }
-
-    let size = surface.buffer_size();
-    if surface.cpu_pixels().is_some() && resource.image.size == (size.width, size.height) {
-        SurfaceResourceLifetimeAction::Keep
-    } else {
-        SurfaceResourceLifetimeAction::Destroy
-    }
-}
-
-fn reconcile_surface_resource_backing(
-    surface_resources: &mut HashMap<u32, EglSurfaceResource>,
-    surface: &RenderableSurface,
-) -> Option<(SurfaceResourceLifetimeAction, EglSurfaceResource)> {
-    let action = surface_resources
-        .get(&surface.surface_id)
-        .map(|resource| classify_surface_resource_lifetime(resource, surface))?;
-    if action == SurfaceResourceLifetimeAction::Keep {
-        return None;
-    }
-    surface_resources
-        .remove(&surface.surface_id)
-        .map(|resource| (action, resource))
-}
-
-impl EglSurfaceResource {
-    fn advance_shm_sync_baseline(&mut self, synced_commit: SurfaceCommitCounter) {
-        self.shm_synced_commit = Some(synced_commit);
-    }
-
-    fn update_for(
-        &self,
-        surface: &RenderableSurface,
-        sync_state: SurfaceResourceSyncState,
-    ) -> EglSurfaceResourceUpdate {
-        let buffer_size = surface.buffer_size();
-        if self.image.size != (buffer_size.width, buffer_size.height) {
-            return EglSurfaceResourceUpdate::Recreate;
-        }
-        if surface.cpu_pixels().is_some() {
-            if self.image.egl_image.is_some() {
-                return EglSurfaceResourceUpdate::Recreate;
-            }
-            if !sync_state.authoritative {
-                return EglSurfaceResourceUpdate::FullShmResync;
-            }
-            if self.shm_synced_commit == Some(sync_state.current_commit) {
-                return EglSurfaceResourceUpdate::Reuse;
-            }
-            if surface.damage.is_history_lost() {
-                return EglSurfaceResourceUpdate::FullShmResync;
-            }
-            if sync_state.complete_since.is_some_and(|complete_since| {
-                self.shm_synced_commit
-                    .is_some_and(|synced| synced >= complete_since)
-            }) {
-                return if surface.damage.is_empty() {
-                    EglSurfaceResourceUpdate::ReuseShm
-                } else {
-                    EglSurfaceResourceUpdate::UploadDamage
-                };
-            }
-            return EglSurfaceResourceUpdate::FullShmResync;
-        }
-        if self.image.generation == surface.generation {
-            return EglSurfaceResourceUpdate::Reuse;
-        }
-        if surface
-            .dmabuf_handle()
-            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle))
-            .is_some_and(|key| self.dmabuf_key.as_ref() == Some(&key))
-        {
-            return EglSurfaceResourceUpdate::ReuseDmabuf;
-        }
-        if surface.dmabuf_handle().is_some() {
-            return EglSurfaceResourceUpdate::Recreate;
-        }
-        EglSurfaceResourceUpdate::UnsupportedBuffer
-    }
-
-    fn write_shm_damage(
-        &mut self,
-        gl: &glow::Context,
-        surface: &RenderableSurface,
-        force_full_upload: bool,
-        synced_commit: SurfaceCommitCounter,
-        upload_rgba: &mut Vec<u8>,
-    ) -> usize {
-        let upload_bytes = write_surface_pixels_to_resource(
-            gl,
-            &self.image,
-            surface,
-            force_full_upload,
-            upload_rgba,
-        );
-        self.image.generation = surface.generation;
-        self.shm_synced_commit = Some(synced_commit);
-        upload_bytes
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EglSurfaceResourceUpdate {
-    Reuse,
-    ReuseShm,
-    ReuseDmabuf,
-    UploadDamage,
-    FullShmResync,
-    Recreate,
-    UnsupportedBuffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4567,350 +3359,6 @@ fn egl_decoration_snapshot_signature_hash(snapshots: &[DecorationSceneSnapshot])
 
 const fn fnv1a_u64(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
-}
-
-fn surface_upload_byte_len(surface: &RenderableSurface) -> usize {
-    let size = surface.buffer_size();
-    (size.width as usize)
-        .saturating_mul(size.height as usize)
-        .saturating_mul(4)
-}
-
-fn create_surface_resource(
-    gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-    egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
-    surface: &RenderableSurface,
-    shm_synced_commit: Option<SurfaceCommitCounter>,
-    upload_rgba: &mut Vec<u8>,
-) -> RendererResult<EglSurfaceResource> {
-    let image = if surface.cpu_pixels().is_some() {
-        let buffer_size = surface.buffer_size();
-        let mut resource = create_uploaded_resource(gl, buffer_size.width, buffer_size.height)?;
-        write_surface_pixels_to_resource(gl, &resource, surface, true, upload_rgba);
-        resource.generation = surface.generation;
-        resource
-    } else if let Some(handle) = surface.dmabuf_handle() {
-        create_dmabuf_resource(
-            gl,
-            egl,
-            egl_display,
-            egl_image_target_texture_2d,
-            handle,
-            surface.generation,
-        )?
-    } else {
-        return Err(io::Error::other("surface has no importable buffer").into());
-    };
-
-    if native_egl_debug_enabled() && surface.dmabuf_handle().is_some() {
-        eprintln!(
-            "oblivion-one compositor: dmabuf cache=create surface={} buffer_id={} texture={:?} egl_image={:?}",
-            surface.surface_id,
-            surface.buffer_id().get(),
-            image.texture,
-            image.egl_image.map(|egl_image| egl_image.as_ptr()),
-        );
-    }
-
-    Ok(EglSurfaceResource {
-        image,
-        dmabuf_key: surface
-            .dmabuf_handle()
-            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle)),
-        buffer_lifetime: surface
-            .dmabuf_handle()
-            .map(|_| surface.buffer_identity().downgrade()),
-        shm_synced_commit,
-    })
-}
-
-fn create_uploaded_resource(
-    gl: &glow::Context,
-    width: u32,
-    height: u32,
-) -> RendererResult<EglImageResource> {
-    let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
-    unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        configure_texture(gl);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RGBA as i32,
-            width as i32,
-            height as i32,
-            0,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(None),
-        );
-    }
-    Ok(EglImageResource {
-        texture,
-        size: (width, height),
-        generation: 0,
-        egl_image: None,
-    })
-}
-
-fn create_dmabuf_resource(
-    gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-    egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
-    handle: &oblivion_one::render_backend::buffer::DmabufBufferHandle,
-    generation: u64,
-) -> RendererResult<EglImageResource> {
-    let preexisting_gl_error = drain_gl_errors(gl);
-    if native_egl_debug_enabled()
-        && let Some(error) = preexisting_gl_error
-    {
-        eprintln!(
-            "oblivion-one compositor: dmabuf import cleared preexisting GL error 0x{error:04x}"
-        );
-    }
-    let Some(egl_image_target_texture_2d) = egl_image_target_texture_2d else {
-        return Err(io::Error::other("GL_OES_EGL_image is unavailable").into());
-    };
-    let attributes = EglGlesDmabufImportAttributes::from_handle(handle)
-        .map_err(DmabufTextureImportError::InvalidAttributes)?;
-    let no_context = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
-    let null_client_buffer = unsafe { egl::ClientBuffer::from_ptr(ptr::null_mut()) };
-    let image = egl
-        .create_image(
-            egl_display,
-            no_context,
-            EGL_LINUX_DMA_BUF_EXT,
-            null_client_buffer,
-            attributes.as_slice(),
-        )
-        .map_err(DmabufTextureImportError::EglImageCreation)?;
-    let image_guard = EglImageGuard::new(image, |image| {
-        let _ = egl.destroy_image(egl_display, image);
-    });
-    let texture = unsafe {
-        gl.create_texture()
-            .map_err(|error| DmabufTextureImportError::TextureCreation(error.to_owned()))?
-    };
-    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::TextureCreation) {
-        unsafe { gl.delete_texture(texture) };
-        return Err(error.into());
-    }
-    unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    }
-    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::Bind) {
-        unsafe { gl.delete_texture(texture) };
-        return Err(error.into());
-    }
-    configure_texture(gl);
-    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::TextureConfiguration) {
-        unsafe { gl.delete_texture(texture) };
-        return Err(error.into());
-    }
-    unsafe {
-        egl_image_target_texture_2d(glow::TEXTURE_2D, image_guard.image().as_ptr());
-    }
-    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::ImageTarget) {
-        unsafe { gl.delete_texture(texture) };
-        return Err(error.into());
-    }
-
-    let size = handle.size();
-    Ok(EglImageResource {
-        texture,
-        size: (size.width, size.height),
-        generation,
-        egl_image: Some(image_guard.disarm()),
-    })
-}
-
-fn write_surface_pixels_to_resource(
-    gl: &glow::Context,
-    resource: &EglImageResource,
-    surface: &RenderableSurface,
-    force_full_upload: bool,
-    upload_rgba: &mut Vec<u8>,
-) -> usize {
-    if force_full_upload
-        || surface.damage.is_full()
-        || surface
-            .damage
-            .covers_surface(surface.buffer_size().width, surface.buffer_size().height)
-    {
-        let Some(pixels) = surface.cpu_pixels() else {
-            return 0;
-        };
-        let buffer_size = surface.buffer_size();
-        return write_argb_pixels_to_resource(
-            gl,
-            resource,
-            SurfaceDamageRect::full(buffer_size.width, buffer_size.height),
-            pixels,
-            upload_rgba,
-        );
-    }
-
-    let buffer_size = surface.buffer_size();
-    let mut uploaded_bytes = 0usize;
-    for rect in surface
-        .damage
-        .clipped_rects(buffer_size.width, buffer_size.height)
-    {
-        if rect.width == 0 || rect.height == 0 {
-            continue;
-        }
-        if !pack_surface_rect_rgba(surface, rect, upload_rgba) {
-            continue;
-        }
-        uploaded_bytes = uploaded_bytes.saturating_add(write_rgba_bytes_to_resource(
-            gl,
-            resource,
-            rect,
-            upload_rgba,
-        ));
-    }
-    uploaded_bytes
-}
-
-fn write_argb_pixels_to_resource(
-    gl: &glow::Context,
-    resource: &EglImageResource,
-    rect: SurfaceDamageRect,
-    pixels: &[u32],
-    upload_rgba: &mut Vec<u8>,
-) -> usize {
-    pack_argb_pixels_rgba(pixels, upload_rgba);
-    write_rgba_bytes_to_resource(gl, resource, rect, upload_rgba)
-}
-
-fn write_rgba_bytes_to_resource(
-    gl: &glow::Context,
-    resource: &EglImageResource,
-    rect: SurfaceDamageRect,
-    rgba: &[u8],
-) -> usize {
-    unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(resource.texture));
-        gl.tex_sub_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            rect.x as i32,
-            rect.y as i32,
-            rect.width as i32,
-            rect.height as i32,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(rgba)),
-        );
-    }
-    (rect.width as usize)
-        .saturating_mul(rect.height as usize)
-        .saturating_mul(4)
-}
-
-fn pack_argb_pixels_rgba(pixels: &[u32], output: &mut Vec<u8>) {
-    output.resize(pixels.len().saturating_mul(4), 0);
-    for (index, &pixel) in pixels.iter().enumerate() {
-        let base = index * 4;
-        output[base] = ((pixel >> 16) & 0xff) as u8;
-        output[base + 1] = ((pixel >> 8) & 0xff) as u8;
-        output[base + 2] = (pixel & 0xff) as u8;
-        output[base + 3] = ((pixel >> 24) & 0xff) as u8;
-    }
-}
-
-fn pack_surface_rect_rgba(
-    surface: &RenderableSurface,
-    rect: SurfaceDamageRect,
-    output: &mut Vec<u8>,
-) -> bool {
-    let Some(surface_pixels) = surface.cpu_pixels() else {
-        return false;
-    };
-    let surface_width = surface.buffer_size().width as usize;
-    let rect_x = rect.x as usize;
-    let rect_y = rect.y as usize;
-    let rect_width = rect.width as usize;
-    let rect_height = rect.height as usize;
-
-    output.resize(rect_width.saturating_mul(rect_height).saturating_mul(4), 0);
-    let mut output_index = 0;
-    for row_index in 0..rect_height {
-        let Some(start) = (rect_y + row_index)
-            .checked_mul(surface_width)
-            .and_then(|row_start| row_start.checked_add(rect_x))
-        else {
-            output.clear();
-            return false;
-        };
-        let Some(end) = start.checked_add(rect_width) else {
-            output.clear();
-            return false;
-        };
-        let Some(row) = surface_pixels.get(start..end) else {
-            output.clear();
-            return false;
-        };
-        for &pixel in row {
-            output[output_index] = ((pixel >> 16) & 0xff) as u8;
-            output[output_index + 1] = ((pixel >> 8) & 0xff) as u8;
-            output[output_index + 2] = (pixel & 0xff) as u8;
-            output[output_index + 3] = ((pixel >> 24) & 0xff) as u8;
-            output_index += 4;
-        }
-    }
-    true
-}
-
-fn configure_texture(gl: &glow::Context) {
-    unsafe {
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-    }
-}
-
-fn destroy_surface_resource(
-    gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-    resource: EglSurfaceResource,
-) {
-    destroy_image_resource(gl, egl, egl_display, resource.image);
-}
-
-fn destroy_image_resource(
-    gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-    resource: EglImageResource,
-) {
-    unsafe {
-        gl.delete_texture(resource.texture);
-    }
-    if let Some(image) = resource.egl_image {
-        let _ = egl.destroy_image(egl_display, image);
-    }
 }
 
 fn ensure_vertex_buffer_capacity(

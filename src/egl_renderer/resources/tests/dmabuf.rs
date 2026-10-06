@@ -1,5 +1,17 @@
 use super::*;
 
+use std::io;
+
+fn settle_dmabuf_import_result<T>(
+    result: Result<T, Box<dyn std::error::Error>>,
+    context: DmabufImportDiagnosticContext,
+    frame_stats: &mut GlesSceneFrameStats,
+    failed_surface_generations: &mut HashMap<u32, u64>,
+) -> Result<Option<T>, Box<dyn std::error::Error>> {
+    let mut telemetry = ResourceTelemetry::new(frame_stats);
+    super::settle_dmabuf_import_result(result, context, &mut telemetry, failed_surface_generations)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 
 struct DmabufRingQualification {

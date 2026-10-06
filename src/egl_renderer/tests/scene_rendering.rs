@@ -779,15 +779,6 @@ fn output_damage_tracker_repeats_candidate_damage_until_presented() {
 }
 
 #[test]
-fn argb_pixels_pack_to_rgba_without_changing_channel_order() {
-    let mut packed = Vec::new();
-
-    pack_argb_pixels_rgba(&[0x1122_3344, 0xaa55_6677], &mut packed);
-
-    assert_eq!(packed, vec![0x22, 0x33, 0x44, 0x11, 0x55, 0x66, 0x77, 0xaa]);
-}
-
-#[test]
 fn scene_cache_key_invalidates_when_surface_geometry_changes() {
     let initial_signature = EglSceneSurfaceSignature {
         surface_id: 7,

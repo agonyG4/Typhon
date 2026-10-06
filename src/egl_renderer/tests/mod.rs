@@ -1,7 +1,7 @@
 use super::*;
 use oblivion_one::compositor::{
-    RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitCounter, SurfaceCommitSequence,
-    SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
+    RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitSequence, SurfaceDamageRect,
+    SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend,
 };
 use oblivion_one::core::SceneNodeId;
 use oblivion_one::effects::{
@@ -17,8 +17,8 @@ use oblivion_one::presentation_animation::{
     PresentationRect, PresentationRetainedVisualIdentity, PresentationRetainedVisualKind,
 };
 use oblivion_one::render_backend::buffer::{
-    BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
-    DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+    BufferIdAllocator, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DmabufImageKey,
+    DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
 };
 use oblivion_one::window_lifecycle_animation::{
     LifecycleDirection, LifecycleEffectKind, LifecycleSceneSample, LifecycleVisualGroup,
@@ -43,9 +43,10 @@ const AR24: u32 = u32::from_le_bytes(*b"AR24");
 
 fn egl_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    // The lock protects serialization only; a failed test cannot corrupt shared lock state.
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .expect("EGL test lock is not poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub(super) struct GlesEffectTestHarness {
@@ -301,7 +302,6 @@ pub(super) fn lifecycle_transfer_assert_pixel(
 mod checkpoint_causal_gles;
 mod checkpoint_replay;
 mod dependency_free_replay_cache;
-mod dmabuf;
 mod effect_capture;
 mod effect_passes;
 mod effect_replay;
@@ -309,8 +309,6 @@ mod egl_config;
 mod egl_resources;
 mod lifecycle_integration;
 mod scene_rendering;
-mod shm;
-use egl_resources::{DropProbe, fake_egl_image};
 
 mod effect_session;
 mod presentation_clip;

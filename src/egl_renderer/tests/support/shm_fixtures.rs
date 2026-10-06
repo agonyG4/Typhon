@@ -32,19 +32,3 @@ pub(in crate::egl_renderer::tests) fn test_shm_surface(
         damage,
     }
 }
-
-pub(in crate::egl_renderer::tests) fn test_shm_resource(
-    synced_commit: Option<SurfaceCommitCounter>,
-) -> EglSurfaceResource {
-    EglSurfaceResource {
-        image: EglImageResource {
-            texture: glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
-            size: (2, 2),
-            generation: 1,
-            egl_image: None,
-        },
-        dmabuf_key: None,
-        buffer_lifetime: None,
-        shm_synced_commit: synced_commit,
-    }
-}

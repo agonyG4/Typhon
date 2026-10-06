@@ -18,10 +18,7 @@ fn clear_test_target(harness: &mut GlesEffectTestHarness, target: &PooledEffectT
         &harness.gl,
         &mut renderer.scene_state,
         &mut renderer.effect_runtime,
-        &renderer.surface_resources,
-        &renderer.frame_resources,
-        &renderer.decoration_resources,
-        renderer.cursor_resource.as_ref(),
+        renderer.resources.texture_view(),
     );
     clear_effect_texture(&mut context, target).expect("lifecycle capture texture clears");
 }
@@ -38,10 +35,7 @@ fn copy_test_output_region(
         &harness.gl,
         &mut renderer.scene_state,
         &mut renderer.effect_runtime,
-        &renderer.surface_resources,
-        &renderer.frame_resources,
-        &renderer.decoration_resources,
-        renderer.cursor_resource.as_ref(),
+        renderer.resources.texture_view(),
     );
     copy_framebuffer_region_to_texture(
         &mut context,

@@ -63,14 +63,11 @@ pub(crate) struct SceneRenderState {
 /// Read-only scene texture lookup view. Resource ownership stays with the
 /// renderer; retained effect textures are resolved against the runtime pool.
 pub(in crate::egl_renderer) struct SceneTextureSources<'a> {
-    pub(in crate::egl_renderer) surfaces: &'a HashMap<u32, EglSurfaceResource>,
-    pub(in crate::egl_renderer) frames: &'a HashMap<compositor::ServerFrameColor, EglImageResource>,
-    pub(in crate::egl_renderer) decorations: &'a HashMap<DecorationResourceKey, EglImageResource>,
+    pub(in crate::egl_renderer) ordinary: ResourceTextureView<'a>,
     pub(in crate::egl_renderer) lifecycle: &'a HashMap<
         compositor::PresentationRetainedVisualPayloadId,
         LifecycleResolvedVisualResource,
     >,
-    pub(in crate::egl_renderer) cursor: Option<&'a EglImageResource>,
 }
 
 impl SceneTextureSources<'_> {
@@ -80,24 +77,17 @@ impl SceneTextureSources<'_> {
         effects: &EffectGlResourceCache,
     ) -> Option<glow::Texture> {
         match layer {
-            EglDrawLayer::Solid(color) => self.frames.get(&color).map(|resource| resource.texture),
-            EglDrawLayer::SolidRgba(color) => self
-                .decorations
-                .get(&DecorationResourceKey::Solid(color))
-                .map(|resource| resource.texture),
-            EglDrawLayer::DecorationAsset(asset_id) => self
-                .decorations
-                .get(&DecorationResourceKey::Asset(asset_id))
-                .map(|resource| resource.texture),
-            EglDrawLayer::Surface(surface_id) => self
-                .surfaces
-                .get(&surface_id)
-                .map(|resource| resource.image.texture),
+            EglDrawLayer::Solid(color) => self.ordinary.texture_for_frame(color),
+            EglDrawLayer::SolidRgba(color) => self.ordinary.texture_for_solid_decoration(color),
+            EglDrawLayer::DecorationAsset(asset_id) => {
+                self.ordinary.texture_for_decoration_asset(asset_id)
+            }
+            EglDrawLayer::Surface(surface_id) => self.ordinary.texture_for_surface(surface_id),
             EglDrawLayer::LifecycleResolvedVisual(payload_id) => self
                 .lifecycle
                 .get(&payload_id)
                 .and_then(|resource| effects.texture(resource.pooled_texture())),
-            EglDrawLayer::Cursor => self.cursor.map(|resource| resource.texture),
+            EglDrawLayer::Cursor => self.ordinary.cursor_texture(),
         }
     }
 }

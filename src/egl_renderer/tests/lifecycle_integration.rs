@@ -1,46 +1,6 @@
 use super::*;
 
 #[test]
-fn decoration_resource_requirements_include_canonical_and_lifecycle_instances() {
-    let canonical = vec![DecorationRenderPrimitive::SolidRect {
-        rect: oblivion_one::compositor::DecorationRect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 26,
-        },
-        color: [51, 51, 51, 255],
-    }];
-    let lifecycle = vec![DecorationRenderPrimitive::SolidRect {
-        rect: oblivion_one::compositor::DecorationRect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 26,
-        },
-        color: [17, 34, 51, 255],
-    }];
-
-    let requirements =
-        decoration_resource_requirements([canonical.as_slice(), lifecycle.as_slice()]);
-
-    assert!(
-        requirements
-            .required
-            .contains(&DecorationResourceKey::Solid(rgba_to_pixel([
-                51, 51, 51, 255,
-            ])))
-    );
-    assert!(
-        requirements
-            .required
-            .contains(&DecorationResourceKey::Solid(rgba_to_pixel([
-                17, 34, 51, 255,
-            ])))
-    );
-}
-
-#[test]
 fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_together() {
     let _egl_test_lock = egl_test_lock();
     const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
@@ -159,11 +119,24 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
     );
     assert_eq!(resolved.decorations.len(), 1);
     assert!(resolved.lifecycle_decorations.is_empty());
-    let required = decoration_resource_requirements(
-        resolved
-            .decorations
+    let required_layers = resolved
+        .decorations
+        .iter()
+        .flat_map(DecorationRenderInstance::primitives)
+        .filter_map(|primitive| match primitive {
+            DecorationRenderPrimitive::SolidRect { color, .. } => {
+                Some(EglDrawLayer::SolidRgba(rgba_to_pixel(*color)))
+            }
+            DecorationRenderPrimitive::Image { asset, .. } => {
+                Some(EglDrawLayer::DecorationAsset(asset.asset_id()))
+            }
+            DecorationRenderPrimitive::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        required_layers
             .iter()
-            .map(DecorationRenderInstance::primitives),
+            .any(|layer| matches!(layer, EglDrawLayer::SolidRgba(_)))
     );
 
     let input_state = crate::native_output::NativeInputState::new(320, 200);
@@ -187,13 +160,16 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
         }
     };
 
-    assert_eq!(renderer.decoration_resources.len(), required.required.len());
-    assert!(
-        required
-            .required
-            .iter()
-            .all(|key| renderer.decoration_resources.contains_key(key))
-    );
+    let resources = renderer.resources.texture_view();
+    assert!(required_layers.iter().all(|layer| match layer {
+        EglDrawLayer::SolidRgba(color) => {
+            resources.texture_for_solid_decoration(*color).is_some()
+        }
+        EglDrawLayer::DecorationAsset(asset_id) => {
+            resources.texture_for_decoration_asset(*asset_id).is_some()
+        }
+        _ => unreachable!("required decoration layers stay in the decoration domain"),
+    }));
     assert_eq!(stats.missing_required_decoration_resources, 0);
 
     renderer
@@ -202,7 +178,27 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
         .commit_presented_transition(OutputDamage::Full);
     assert_eq!(renderer.scene_state.repaint_planner.history_depth(), 1);
 
-    renderer.decoration_resources.clear();
+    renderer
+        .resources
+        .ensure_decoration_resources(&renderer.gl, &egl, display, std::iter::empty())
+        .expect("unused decoration textures are retired");
+    assert!(required_layers.iter().all(|layer| match layer {
+        EglDrawLayer::SolidRgba(color) => {
+            renderer
+                .resources
+                .texture_view()
+                .texture_for_solid_decoration(*color)
+                .is_none()
+        }
+        EglDrawLayer::DecorationAsset(asset_id) => {
+            renderer
+                .resources
+                .texture_view()
+                .texture_for_decoration_asset(*asset_id)
+                .is_none()
+        }
+        _ => unreachable!("required decoration layers stay in the decoration domain"),
+    }));
     renderer.scene_state.frame_stats = GlesSceneFrameStats::default();
     renderer
         .draw_command_batch(true, None)
@@ -706,10 +702,7 @@ fn assert_lifecycle_resolved_visual_isolation_for_origin(
             &harness.gl,
             &mut renderer.scene_state,
             &mut renderer.effect_runtime,
-            &renderer.surface_resources,
-            &renderer.frame_resources,
-            &renderer.decoration_resources,
-            renderer.cursor_resource.as_ref(),
+            renderer.resources.texture_view(),
         );
         renderer
             .lifecycle
@@ -1108,11 +1101,10 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
     );
     let surface_texture = harness
         .renderer
-        .surface_resources
-        .get(&614)
-        .expect("retained surface texture is realized")
-        .image
-        .texture;
+        .resources
+        .texture_view()
+        .texture_for_surface(614)
+        .expect("retained surface texture is realized");
     let surface_framebuffer = unsafe {
         harness
             .gl

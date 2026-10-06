@@ -34,7 +34,15 @@ there is no alternate runtime to hide that failure.
   orchestration boundary. `SceneRenderState` owns ordinary scene execution,
   output, and checkpoint state; `EffectRuntime` owns effect execution and its
   pooled resources; `egl_renderer/lifecycle/` owns retained lifecycle visual
-  capture plus Lamp and Squash rendering state.
+  capture plus Lamp and Squash rendering state; `egl_renderer/resources/`
+  owns ordinary surface, DMA-BUF, and UI image resources.
+
+  `RendererResourceState` composes `SurfaceResourceStore`,
+  `DmabufResourceState`, `UiResourceStore`, and reusable upload scratch.
+  Consumers receive a stack-only `ResourceTextureView` for ordinary texture
+  lookup. Lifecycle retained textures remain in `LifecycleVisualStore` and are
+  resolved through the effect resource pool; they are composed with ordinary
+  sources only at `SceneTextureSources`.
 - `src/session/` describes native seat, input, output, and SDDM prerequisites.
 - `src/core/geometry.rs` contains reusable geometry shared by the window
   manager and native-independent tests.
