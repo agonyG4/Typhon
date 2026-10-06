@@ -60,4 +60,33 @@ mod tests {
         assert_eq!(batch.raw.capacity(), raw_capacity);
         assert_eq!(batch.coalesced.capacity(), coalesced_capacity);
     }
+
+    #[test]
+    fn keyboard_source_events_flush_pointer_motion_without_coalescing() {
+        let device = KeyboardDeviceId::from_raw(1).unwrap();
+        let key = NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Q,
+            value: 1,
+        });
+        let removed =
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved { device });
+        let motion = |timestamp_usec, dx| {
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                timestamp_usec,
+                RelativeMotion::accelerated_only(dx, 0.0),
+            ))
+        };
+        let mut batch = NativeInputBatch {
+            raw: vec![motion(1, 1.0), key, motion(2, 2.0), removed, motion(3, 3.0)],
+            ..NativeInputBatch::default()
+        };
+
+        batch.coalesce_pointer_motion_events();
+
+        assert_eq!(
+            batch.coalesced,
+            vec![motion(1, 1.0), key, motion(2, 2.0), removed, motion(3, 3.0)]
+        );
+    }
 }

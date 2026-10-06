@@ -14,6 +14,10 @@ impl ModifierMask {
     pub(crate) const fn matches(self, active: Self) -> bool {
         self.0 == active.0
     }
+
+    pub(crate) const fn contains(self, family: Self) -> bool {
+        self.0 & family.0 == family.0
+    }
 }
 
 impl std::ops::BitOr for ModifierMask {

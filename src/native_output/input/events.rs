@@ -16,6 +16,8 @@ pub(crate) const KEY_9: u16 = 10;
 pub(crate) const KEY_0: u16 = 11;
 pub(crate) const KEY_TAB: u16 = 15;
 pub(crate) const KEY_Q: u16 = 16;
+#[cfg(test)]
+pub(crate) const KEY_A: u16 = 30;
 pub(crate) const KEY_P: u16 = 25;
 pub(crate) const KEY_S: u16 = 31;
 pub(crate) const KEY_LEFTCTRL: u16 = 29;
@@ -181,9 +183,21 @@ impl PointerMotionSample {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeKeyboardInputEvent {
+    Key {
+        device: KeyboardDeviceId,
+        code: u16,
+        value: i32,
+    },
+    SourceRemoved {
+        device: KeyboardDeviceId,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum NativeHardwareInputEvent {
-    Key { code: u16, value: i32 },
+    Keyboard(NativeKeyboardInputEvent),
     PointerButton { button: u32, pressed: bool },
     PointerMotion(PointerMotionSample),
     PointerAxis(PointerAxisFrame),
@@ -236,7 +250,8 @@ impl AstreaShortcutEvent {
 impl NativeHardwareInputEvent {
     pub(crate) fn is_meaningful_user_activity(self) -> bool {
         match self {
-            Self::Key { value, .. } => value != 2,
+            Self::Keyboard(NativeKeyboardInputEvent::Key { value, .. }) => value != 2,
+            Self::Keyboard(NativeKeyboardInputEvent::SourceRemoved { .. }) => false,
             Self::PointerButton { .. } => true,
             Self::PointerMotion(sample) => {
                 sample.absolute.is_some() || sample.relative.is_some_and(|motion| !motion.is_zero())
@@ -249,29 +264,32 @@ impl NativeHardwareInputEvent {
     }
 
     pub(crate) const fn may_change_pointer_constraints(self) -> bool {
-        matches!(self, Self::Key { .. } | Self::PointerButton { .. })
+        matches!(self, Self::Keyboard(_) | Self::PointerButton { .. })
     }
 
     pub(crate) const fn timestamp_usec(self) -> Option<u64> {
         match self {
             Self::PointerMotion(sample) => Some(sample.timestamp_usec),
-            Self::Key { .. } | Self::PointerButton { .. } => None,
+            Self::Keyboard(_) | Self::PointerButton { .. } => None,
             Self::PointerAxis(frame) => Some(frame.timestamp_usec),
         }
     }
 
-    pub(crate) fn from_linux_event(event: LinuxInputEvent) -> Option<Self> {
+    pub(crate) fn from_linux_event(
+        event: LinuxInputEvent,
+        keyboard_device: Option<KeyboardDeviceId>,
+    ) -> Option<Self> {
         match event.type_ {
-            EV_KEY if is_pointer_button(event.code) && event.value != 2 => {
-                Some(Self::PointerButton {
-                    button: u32::from(event.code),
-                    pressed: event.value != 0,
-                })
-            }
-            EV_KEY => Some(Self::Key {
+            EV_KEY if is_pointer_button(event.code) && event.value == 2 => None,
+            EV_KEY if is_pointer_button(event.code) => Some(Self::PointerButton {
+                button: u32::from(event.code),
+                pressed: event.value != 0,
+            }),
+            EV_KEY => Some(Self::Keyboard(NativeKeyboardInputEvent::Key {
+                device: keyboard_device?,
                 code: event.code,
                 value: event.value,
-            }),
+            })),
             EV_REL => match event.code {
                 REL_X => Some(Self::PointerMotion(PointerMotionSample::relative(
                     linux_input_event_time_usec(event),
@@ -484,10 +502,20 @@ mod user_activity_tests {
 
     #[test]
     fn native_input_activity_ignores_keyboard_repeat_but_accepts_transitions() {
-        assert!(NativeHardwareInputEvent::Key { code: 30, value: 1 }.is_meaningful_user_activity());
-        assert!(NativeHardwareInputEvent::Key { code: 30, value: 0 }.is_meaningful_user_activity());
+        let device = KeyboardDeviceId::from_raw(1).unwrap();
+        let key_event = |value| {
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+                device,
+                code: 30,
+                value,
+            })
+        };
+        assert!(key_event(1).is_meaningful_user_activity());
+        assert!(key_event(0).is_meaningful_user_activity());
+        assert!(!key_event(2).is_meaningful_user_activity());
         assert!(
-            !NativeHardwareInputEvent::Key { code: 30, value: 2 }.is_meaningful_user_activity()
+            !NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved { device })
+                .is_meaningful_user_activity()
         );
     }
 

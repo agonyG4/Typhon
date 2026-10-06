@@ -14,6 +14,24 @@ fn libinput_event_type_is_pending(event_type: ::input::ffi::libinput_event_type)
     event_type != ::input::ffi::libinput_event_type_LIBINPUT_EVENT_NONE
 }
 
+#[cfg(test)]
+mod keyboard_registry_tests {
+    use super::*;
+
+    #[test]
+    fn removed_backend_identity_gets_a_fresh_runtime_keyboard_id() {
+        let mut allocator = KeyboardDeviceIdAllocator::default();
+        let mut registry = KeyboardDeviceRegistry::<u32>::default();
+        let first = registry.register(7, &mut allocator).unwrap();
+        assert_eq!(registry.register(7, &mut allocator), Some(first));
+        assert_eq!(registry.remove(&7), Some(first));
+
+        let replacement = registry.register(7, &mut allocator).unwrap();
+        assert_ne!(replacement, first);
+        assert_ne!(replacement.get(), 0);
+    }
+}
+
 fn libinput_queue_has_event(input: &::input::Libinput) -> bool {
     // `Libinput::next` consumes the internal queue, while dispatch only
     // populates it.  Check the queue directly at the bounded-drain boundary
@@ -28,6 +46,17 @@ pub(crate) enum NativeInputEventFds<'a> {
 }
 
 fn poll_native_input_fds(poll_fds: &mut [libc::pollfd]) -> io::Result<bool> {
+    poll_input_fds(poll_fds, false)
+}
+
+fn poll_raw_input_fds(poll_fds: &mut [libc::pollfd]) -> io::Result<bool> {
+    poll_input_fds(poll_fds, true)
+}
+
+fn poll_input_fds(
+    poll_fds: &mut [libc::pollfd],
+    service_terminal_readiness: bool,
+) -> io::Result<bool> {
     if poll_fds.is_empty() {
         return Ok(false);
     }
@@ -51,9 +80,13 @@ fn poll_native_input_fds(poll_fds: &mut [libc::pollfd]) -> io::Result<bool> {
     let terminal_events =
         (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL | libc::POLLRDHUP) as libc::c_short;
     let readable = libc::POLLIN as libc::c_short;
-    Ok(poll_fds
-        .iter()
-        .any(|poll_fd| poll_fd.revents & terminal_events == 0 && poll_fd.revents & readable != 0))
+    Ok(poll_fds.iter().any(|poll_fd| {
+        if service_terminal_readiness {
+            poll_fd.revents & (terminal_events | readable) != 0
+        } else {
+            poll_fd.revents & terminal_events == 0 && poll_fd.revents & readable != 0
+        }
+    }))
 }
 
 fn libinput_poll_fd(input: &::input::Libinput) -> libc::pollfd {
@@ -242,6 +275,8 @@ pub(crate) struct LibinputInputBackend {
     pub(crate) device_count: usize,
     pub(crate) suspended: bool,
     pub(crate) scroll_v120_remainders: HashMap<String, ScrollV120Remainder>,
+    keyboard_devices: KeyboardDeviceRegistry<::input::Device>,
+    keyboard_id_allocator: KeyboardDeviceIdAllocator,
 }
 
 /// Fractional wheel motion is kept per libinput device and per axis until it
@@ -292,7 +327,13 @@ impl LibinputInputBackend {
             io::Error::other(format!("failed to assign libinput seat {assigned_seat}"))
         })?;
         input.dispatch()?;
-        let device_count = drain_initial_libinput_device_events(&mut input);
+        let mut keyboard_devices = KeyboardDeviceRegistry::default();
+        let mut keyboard_id_allocator = KeyboardDeviceIdAllocator::default();
+        let device_count = drain_initial_libinput_device_events(
+            &mut input,
+            &mut keyboard_devices,
+            &mut keyboard_id_allocator,
+        );
         println!(
             "native input: libseat/libinput assigned {assigned_seat}, {device_count} device(s)"
         );
@@ -306,6 +347,8 @@ impl LibinputInputBackend {
             device_count,
             suspended: false,
             scroll_v120_remainders: HashMap::new(),
+            keyboard_devices,
+            keyboard_id_allocator,
         })
     }
 
@@ -319,7 +362,13 @@ impl LibinputInputBackend {
             io::Error::other(format!("failed to assign libinput seat {seat_name}"))
         })?;
         input.dispatch()?;
-        let device_count = drain_initial_libinput_device_events(&mut input);
+        let mut keyboard_devices = KeyboardDeviceRegistry::default();
+        let mut keyboard_id_allocator = KeyboardDeviceIdAllocator::default();
+        let device_count = drain_initial_libinput_device_events(
+            &mut input,
+            &mut keyboard_devices,
+            &mut keyboard_id_allocator,
+        );
         println!("native input: libinput assigned {seat_name}, {device_count} device(s)");
         let input_poll_fd = libinput_poll_fd(&input);
         Ok(Self {
@@ -331,6 +380,8 @@ impl LibinputInputBackend {
             device_count,
             suspended: false,
             scroll_v120_remainders: HashMap::new(),
+            keyboard_devices,
+            keyboard_id_allocator,
         })
     }
 
@@ -367,6 +418,8 @@ impl LibinputInputBackend {
                 self.output_width,
                 self.output_height,
                 &mut self.scroll_v120_remainders,
+                &mut self.keyboard_devices,
+                &mut self.keyboard_id_allocator,
             ) {
                 events.push(event);
                 if events.len() >= NATIVE_INPUT_DRAIN_BUDGET {
@@ -396,8 +449,10 @@ impl LibinputInputBackend {
 
     fn suspend_for_session(&mut self) {
         self.suspended = true;
+        self.keyboard_devices.clear();
         self.input.suspend();
         self.discard_events_unconditionally();
+        self.keyboard_devices.clear();
     }
 
     fn resume_after_session(&mut self) -> io::Result<()> {
@@ -740,17 +795,96 @@ impl ::input::LibinputInterface for DirectLibinputInterface {
     }
 }
 
-pub(crate) fn drain_initial_libinput_device_events(input: &mut ::input::Libinput) -> usize {
-    input
-        .filter(|event| matches!(event, ::input::Event::Device(_)))
-        .count()
+#[derive(Debug)]
+struct KeyboardDeviceRegistry<Device> {
+    ids: HashMap<Device, KeyboardDeviceId>,
 }
 
-pub(crate) fn hardware_input_event_from_libinput(
+impl<Device> Default for KeyboardDeviceRegistry<Device> {
+    fn default() -> Self {
+        Self {
+            ids: HashMap::new(),
+        }
+    }
+}
+
+impl<Device: Eq + std::hash::Hash> KeyboardDeviceRegistry<Device> {
+    fn get(&self, device: &Device) -> Option<KeyboardDeviceId> {
+        self.ids.get(device).copied()
+    }
+
+    fn register(
+        &mut self,
+        device: Device,
+        allocator: &mut KeyboardDeviceIdAllocator,
+    ) -> Option<KeyboardDeviceId> {
+        if let Some(id) = self.ids.get(&device) {
+            return Some(*id);
+        }
+        let id = allocator.allocate()?;
+        self.ids.insert(device, id);
+        Some(id)
+    }
+
+    fn remove(&mut self, device: &Device) -> Option<KeyboardDeviceId> {
+        self.ids.remove(device)
+    }
+
+    fn clear(&mut self) {
+        self.ids.clear();
+    }
+}
+
+fn drain_initial_libinput_device_events(
+    input: &mut ::input::Libinput,
+    keyboard_devices: &mut KeyboardDeviceRegistry<::input::Device>,
+    keyboard_id_allocator: &mut KeyboardDeviceIdAllocator,
+) -> usize {
+    let mut device_event_count = 0;
+    for event in input {
+        if matches!(&event, ::input::Event::Device(_)) {
+            device_event_count += 1;
+            let _ =
+                update_libinput_device_registry(&event, keyboard_devices, keyboard_id_allocator);
+        }
+    }
+    device_event_count
+}
+
+fn update_libinput_device_registry(
+    event: &::input::Event,
+    keyboard_devices: &mut KeyboardDeviceRegistry<::input::Device>,
+    keyboard_id_allocator: &mut KeyboardDeviceIdAllocator,
+) -> Option<NativeHardwareInputEvent> {
+    use ::input::event::EventTrait;
+
+    match event {
+        ::input::Event::Device(::input::event::DeviceEvent::Added(_)) => {
+            let device = event.device();
+            if device.has_capability(::input::DeviceCapability::Keyboard) {
+                let _ = keyboard_devices.register(device, keyboard_id_allocator);
+            }
+            None
+        }
+        ::input::Event::Device(::input::event::DeviceEvent::Removed(_)) => {
+            let device = event.device();
+            keyboard_devices.remove(&device).map(|device| {
+                NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved {
+                    device,
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+fn hardware_input_event_from_libinput(
     event: ::input::Event,
     output_width: u32,
     output_height: u32,
     scroll_v120_remainders: &mut HashMap<String, ScrollV120Remainder>,
+    keyboard_devices: &mut KeyboardDeviceRegistry<::input::Device>,
+    keyboard_id_allocator: &mut KeyboardDeviceIdAllocator,
 ) -> Option<NativeHardwareInputEvent> {
     use ::input::event::EventTrait;
     use ::input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
@@ -759,6 +893,10 @@ pub(crate) fn hardware_input_event_from_libinput(
         Axis, ButtonState, PointerEvent, PointerEventTrait, PointerScrollEvent,
     };
 
+    if matches!(&event, ::input::Event::Device(_)) {
+        return update_libinput_device_registry(&event, keyboard_devices, keyboard_id_allocator);
+    }
+
     match event {
         ::input::Event::Keyboard(KeyboardEvent::Key(event)) => {
             let code = u16::try_from(event.key()).ok()?;
@@ -766,7 +904,20 @@ pub(crate) fn hardware_input_event_from_libinput(
                 KeyState::Pressed => 1,
                 KeyState::Released => 0,
             };
-            Some(NativeHardwareInputEvent::Key { code, value })
+            let device = event.device();
+            let device_id = keyboard_devices.get(&device).or_else(|| {
+                device
+                    .has_capability(::input::DeviceCapability::Keyboard)
+                    .then(|| keyboard_devices.register(device, keyboard_id_allocator))
+                    .flatten()
+            })?;
+            Some(NativeHardwareInputEvent::Keyboard(
+                NativeKeyboardInputEvent::Key {
+                    device: device_id,
+                    code,
+                    value,
+                },
+            ))
         }
         ::input::Event::Pointer(PointerEvent::Motion(event)) => Some(
             NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
@@ -1020,6 +1171,7 @@ pub(crate) fn flush_pending_pointer_motion(
 pub(crate) struct NativeInputDevice {
     pub(crate) file: fs::File,
     pub(crate) path: PathBuf,
+    pub(crate) keyboard_device_id: Option<KeyboardDeviceId>,
 }
 
 #[derive(Debug, Default)]
@@ -1027,6 +1179,7 @@ pub(crate) struct NativeInputDevices {
     pub(crate) devices: Vec<NativeInputDevice>,
     pub(crate) suspended: bool,
     input_poll_fds: Vec<libc::pollfd>,
+    keyboard_id_allocator: KeyboardDeviceIdAllocator,
 }
 
 impl NativeInputDevices {
@@ -1043,6 +1196,7 @@ impl NativeInputDevices {
             devices,
             suspended,
             input_poll_fds,
+            keyboard_id_allocator: KeyboardDeviceIdAllocator::default(),
         }
     }
 
@@ -1055,7 +1209,11 @@ impl NativeInputDevices {
                 .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&path)
             {
-                Ok(file) => devices.push(NativeInputDevice { file, path }),
+                Ok(file) => devices.push(NativeInputDevice {
+                    file,
+                    path,
+                    keyboard_device_id: None,
+                }),
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     denied_paths.push(path);
                 }
@@ -1095,7 +1253,7 @@ impl NativeInputDevices {
         if self.suspended {
             return Ok(false);
         }
-        poll_native_input_fds(&mut self.input_poll_fds)
+        poll_raw_input_fds(&mut self.input_poll_fds)
     }
 
     pub(crate) fn drain_epoch_chunk_into(
@@ -1118,10 +1276,43 @@ impl NativeInputDevices {
 
     fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         events.clear();
-        for device in &mut self.devices {
-            while let Some(event) = read_linux_input_event(device) {
-                if let Some(event) = NativeHardwareInputEvent::from_linux_event(event) {
-                    events.push(event);
+        let mut device_index = 0;
+        while device_index < self.devices.len() {
+            loop {
+                match read_linux_input_event(&mut self.devices[device_index]) {
+                    NativeInputRead::Event(event) => {
+                        let keyboard_device = if event.type_ == EV_KEY
+                            && !is_pointer_button(event.code)
+                        {
+                            let device = &mut self.devices[device_index];
+                            if device.keyboard_device_id.is_none() {
+                                device.keyboard_device_id = self.keyboard_id_allocator.allocate();
+                            }
+                            device.keyboard_device_id
+                        } else {
+                            None
+                        };
+                        if let Some(event) =
+                            NativeHardwareInputEvent::from_linux_event(event, keyboard_device)
+                        {
+                            events.push(event);
+                        }
+                    }
+                    NativeInputRead::WouldBlock
+                        if self.input_poll_fds[device_index].revents & terminal_poll_events()
+                            != 0 =>
+                    {
+                        self.retire_device(device_index, events);
+                        break;
+                    }
+                    NativeInputRead::WouldBlock => {
+                        device_index += 1;
+                        break;
+                    }
+                    NativeInputRead::DeviceGone => {
+                        self.retire_device(device_index, events);
+                        break;
+                    }
                 }
                 if events.len() >= NATIVE_INPUT_DRAIN_BUDGET {
                     return true;
@@ -1129,6 +1320,16 @@ impl NativeInputDevices {
             }
         }
         false
+    }
+
+    fn retire_device(&mut self, device_index: usize, events: &mut Vec<NativeHardwareInputEvent>) {
+        if let Some(device) = self.devices[device_index].keyboard_device_id.take() {
+            events.push(NativeHardwareInputEvent::Keyboard(
+                NativeKeyboardInputEvent::SourceRemoved { device },
+            ));
+        }
+        self.devices.remove(device_index);
+        self.input_poll_fds.remove(device_index);
     }
 
     fn discard_events_unconditionally(&mut self) {
@@ -1143,10 +1344,16 @@ impl NativeInputDevices {
     pub(crate) fn suspend_for_session(&mut self) {
         self.suspended = true;
         self.discard_events_unconditionally();
+        for device in &mut self.devices {
+            device.keyboard_device_id = None;
+        }
     }
 
     pub(crate) fn resume_after_session(&mut self) {
         self.discard_events_unconditionally();
+        for device in &mut self.devices {
+            device.keyboard_device_id = None;
+        }
         self.suspended = false;
         self.discard_events_unconditionally();
     }
@@ -1199,7 +1406,18 @@ pub(crate) fn input_event_number(path: &Path) -> Option<u32> {
         .ok()
 }
 
-pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> Option<LinuxInputEvent> {
+const fn terminal_poll_events() -> libc::c_short {
+    (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL | libc::POLLRDHUP) as libc::c_short
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NativeInputRead {
+    Event(LinuxInputEvent),
+    WouldBlock,
+    DeviceGone,
+}
+
+pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> NativeInputRead {
     let mut event = mem::MaybeUninit::<LinuxInputEvent>::uninit();
     let read = unsafe {
         libc::read(
@@ -1209,18 +1427,33 @@ pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> Option<L
         )
     };
     if read == mem::size_of::<LinuxInputEvent>() as isize {
-        return Some(unsafe { event.assume_init() });
+        return NativeInputRead::Event(unsafe { event.assume_init() });
+    }
+    if read == 0 {
+        return NativeInputRead::DeviceGone;
     }
     if read < 0 {
         let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock {
-            eprintln!(
-                "native input: failed reading {}: {error}",
-                device.path.display()
-            );
+        if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::Interrupted {
+            return NativeInputRead::WouldBlock;
         }
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENODEV) | Some(libc::ENXIO) | Some(libc::EBADF)
+        ) {
+            return NativeInputRead::DeviceGone;
+        }
+        eprintln!(
+            "native input: failed reading {}: {error}",
+            device.path.display()
+        );
+        return NativeInputRead::WouldBlock;
     }
-    None
+    eprintln!(
+        "native input: short read from {}: {read} byte(s)",
+        device.path.display()
+    );
+    NativeInputRead::DeviceGone
 }
 
 #[cfg(test)]

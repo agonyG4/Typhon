@@ -49,7 +49,7 @@ fn native_input_layout_toggle_is_super_v_exact_press_only_and_inhibition_aware()
 
     let mut inhibited = NativeInputState::new(320, 200);
     inhibited.keyboard_shortcuts_inhibited = true;
-    inhibited.super_pressed = true;
+    inhibited.handle_key_event(KEY_LEFTMETA, 1);
     let pass = inhibited.handle_key_event(KEY_V, 1);
     assert!(pass.window_actions.is_empty());
 }

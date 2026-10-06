@@ -5,6 +5,7 @@ mod batch;
 mod bindings;
 mod epoch;
 mod events;
+mod keyboard;
 mod routing;
 mod state;
 
@@ -13,5 +14,6 @@ pub(crate) use batch::*;
 pub(crate) use bindings::*;
 pub(crate) use epoch::*;
 pub(crate) use events::*;
+pub(crate) use keyboard::*;
 pub(crate) use routing::*;
 pub(crate) use state::*;

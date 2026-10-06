@@ -6,10 +6,6 @@ pub(crate) struct NativeInputState {
     pub(crate) output_height: u32,
     pub(crate) cursor_x: f64,
     pub(crate) cursor_y: f64,
-    pub(crate) alt_pressed: bool,
-    pub(crate) ctrl_pressed: bool,
-    pub(crate) super_pressed: bool,
-    pub(crate) shift_pressed: bool,
     pub(crate) keyboard_shortcuts_inhibited: bool,
     keyboard_shortcut_inhibition_generation: u64,
     pub(crate) pointer_constraint: NativePointerConstraintState,
@@ -22,7 +18,7 @@ pub(crate) struct NativeInputState {
     pub(crate) pressed_deferred_modifier_keys: Vec<u16>,
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
     pub(crate) suppressed_vt_switch_keys: Vec<u16>,
-    physically_pressed_keys: Vec<u16>,
+    keyboard_sources: KeyboardSourceLedger,
     pressed_pointer_buttons: Vec<u32>,
 }
 
@@ -33,10 +29,6 @@ impl NativeInputState {
             output_height: output_height.max(1),
             cursor_x: f64::from(output_width.max(1)) / 2.0,
             cursor_y: f64::from(output_height.max(1)) / 2.0,
-            alt_pressed: false,
-            ctrl_pressed: false,
-            super_pressed: false,
-            shift_pressed: false,
             keyboard_shortcuts_inhibited: false,
             keyboard_shortcut_inhibition_generation: 0,
             pointer_constraint: NativePointerConstraintState::None,
@@ -49,7 +41,7 @@ impl NativeInputState {
             pressed_deferred_modifier_keys: Vec::new(),
             forwarded_deferred_modifier_keys: Vec::new(),
             suppressed_vt_switch_keys: Vec::new(),
-            physically_pressed_keys: Vec::new(),
+            keyboard_sources: KeyboardSourceLedger::default(),
             pressed_pointer_buttons: Vec::new(),
         }
     }
@@ -199,7 +191,14 @@ impl NativeInputState {
         event: NativeHardwareInputEvent,
     ) -> NativeInputEffect {
         match event {
-            NativeHardwareInputEvent::Key { code, value } => self.handle_key_event(code, value),
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+                device,
+                code,
+                value,
+            }) => self.handle_keyboard_key_event(device, code, value),
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved {
+                device,
+            }) => self.handle_keyboard_source_removed(device),
             NativeHardwareInputEvent::PointerButton { button, pressed } => {
                 self.handle_pointer_button(button, pressed)
             }
@@ -208,12 +207,71 @@ impl NativeInputState {
         }
     }
 
-    pub(crate) fn handle_key_event(&mut self, code: u16, value: i32) -> NativeInputEffect {
+    fn handle_keyboard_key_event(
+        &mut self,
+        device: KeyboardDeviceId,
+        code: u16,
+        value: i32,
+    ) -> NativeInputEffect {
         let pressed = value != 0;
         let repeated = value == 2;
+        if repeated {
+            // Raw evdev repeat notifications temporarily retain the legacy binding path.
+            // They never claim or release physical source ownership.
+            return self.route_logical_key_event(code, true, true, false, None);
+        }
+
+        let modifiers_before = self.active_modifier_mask();
+        let transition = if pressed {
+            self.keyboard_sources.press(device, code)
+        } else {
+            self.keyboard_sources.release(device, code)
+        };
+        if transition == KeyboardAggregateTransition::None {
+            if !pressed {
+                self.release_suppressed_vt_switch_key(code);
+            }
+            return NativeInputEffect::default();
+        }
+
+        let modifiers_after = self.active_modifier_mask();
+        let modifier_family_released = !pressed
+            && modifier_family_for_key(code).is_some_and(|family| {
+                modifiers_before.contains(family) && !modifiers_after.contains(family)
+            });
+        self.route_logical_key_event(code, pressed, false, modifier_family_released, None)
+    }
+
+    fn handle_keyboard_source_removed(&mut self, device: KeyboardDeviceId) -> NativeInputEffect {
+        let modifiers_before = self.active_modifier_mask();
+        let released = self.keyboard_sources.remove_source(device);
+        let modifiers_after = self.active_modifier_mask();
+        let mut effect = NativeInputEffect::default();
+        for code in released {
+            let modifier_family_released = modifier_family_for_key(code).is_some_and(|family| {
+                modifiers_before.contains(family) && !modifiers_after.contains(family)
+            });
+            effect.append(self.route_logical_key_event(
+                code,
+                false,
+                false,
+                modifier_family_released,
+                Some(modifiers_before),
+            ));
+        }
+        effect
+    }
+
+    fn route_logical_key_event(
+        &mut self,
+        code: u16,
+        pressed: bool,
+        repeated: bool,
+        modifier_family_released: bool,
+        modifiers_for_bindings: Option<ModifierMask>,
+    ) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
         let current_state_action = (!repeated).then(|| {
-            self.track_physical_key(code, pressed);
             effect.record_keyboard_physical_event(NativeKeyboardEvent::new(code, pressed))
         });
 
@@ -223,8 +281,7 @@ impl NativeInputState {
 
         if is_shift_key(code) {
             if !repeated {
-                self.shift_pressed = pressed;
-                if !pressed
+                if modifier_family_released
                     && let AstreaBindingMatch::Consumed { action, phase } = self
                         .binding_manager
                         .handle_modifier_release(ModifierMask::SHIFT)
@@ -238,7 +295,6 @@ impl NativeInputState {
 
         if is_alt_key(code) {
             if !repeated {
-                self.alt_pressed = pressed;
                 self.set_deferred_modifier_pressed(code, pressed);
                 let current_state_action = current_state_action
                     .expect("non-repeat modifier input must have a physical action");
@@ -248,7 +304,7 @@ impl NativeInputState {
                     current_state_action,
                     &mut effect,
                 );
-                if !pressed
+                if modifier_family_released
                     && let AstreaBindingMatch::Consumed { action, phase } = self
                         .binding_manager
                         .handle_modifier_release(ModifierMask::ALT)
@@ -269,7 +325,6 @@ impl NativeInputState {
 
         if is_super_key(code) {
             if !repeated {
-                self.super_pressed = pressed;
                 self.set_deferred_modifier_pressed(code, pressed);
                 let current_state_action = current_state_action
                     .expect("non-repeat modifier input must have a physical action");
@@ -279,7 +334,7 @@ impl NativeInputState {
                     current_state_action,
                     &mut effect,
                 );
-                if !pressed
+                if modifier_family_released
                     && let AstreaBindingMatch::Consumed { action, phase } = self
                         .binding_manager
                         .handle_modifier_release(ModifierMask::SUPER)
@@ -299,8 +354,7 @@ impl NativeInputState {
 
         if is_control_key(code) {
             if !repeated {
-                self.ctrl_pressed = pressed;
-                if !pressed
+                if modifier_family_released
                     && let AstreaBindingMatch::Consumed { action, phase } = self
                         .binding_manager
                         .handle_modifier_release(ModifierMask::CTRL)
@@ -329,8 +383,8 @@ impl NativeInputState {
 
         if pressed
             && !repeated
-            && self.ctrl_pressed
-            && self.alt_pressed
+            && self.active_modifier_mask().contains(ModifierMask::CTRL)
+            && self.active_modifier_mask().contains(ModifierMask::ALT)
             && let Some(vt) = vt_number_for_function_key(code)
         {
             effect.vt_switch = Some(vt);
@@ -340,7 +394,7 @@ impl NativeInputState {
         }
 
         match self.binding_manager.handle_key(
-            self.active_modifier_mask(),
+            modifiers_for_bindings.unwrap_or_else(|| self.active_modifier_mask()),
             code,
             pressed,
             repeated,
@@ -368,6 +422,27 @@ impl NativeInputState {
             self.forward_client_key(code, pressed, &mut effect, current_state_action);
         }
         effect
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key_event(&mut self, code: u16, value: i32) -> NativeInputEffect {
+        let device = KeyboardDeviceId::from_raw(1).expect("test keyboard id is nonzero");
+        self.handle_keyboard_key_event(device, code, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key_event_from(
+        &mut self,
+        device: KeyboardDeviceId,
+        code: u16,
+        value: i32,
+    ) -> NativeInputEffect {
+        self.handle_keyboard_key_event(device, code, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keyboard_key_is_logically_pressed(&self, code: u16) -> bool {
+        self.keyboard_sources.is_logically_pressed(code)
     }
 
     pub(crate) fn handle_pointer_button(
@@ -549,20 +624,6 @@ impl NativeInputState {
         true
     }
 
-    fn track_physical_key(&mut self, code: u16, pressed: bool) {
-        if pressed {
-            if !self.physically_pressed_keys.contains(&code) {
-                self.physically_pressed_keys.push(code);
-            }
-        } else if let Some(index) = self
-            .physically_pressed_keys
-            .iter()
-            .position(|pressed_code| *pressed_code == code)
-        {
-            self.physically_pressed_keys.swap_remove(index);
-        }
-    }
-
     fn forward_deferred_modifier_key(
         &mut self,
         code: u16,
@@ -682,16 +743,24 @@ impl NativeInputState {
 
     pub(crate) fn active_modifier_mask(&self) -> ModifierMask {
         let mut mask = ModifierMask::EMPTY;
-        if self.alt_pressed {
+        if self.keyboard_sources.is_logically_pressed(KEY_LEFTALT)
+            || self.keyboard_sources.is_logically_pressed(KEY_RIGHTALT)
+        {
             mask = mask | ModifierMask::ALT;
         }
-        if self.shift_pressed {
+        if self.keyboard_sources.is_logically_pressed(KEY_LEFTSHIFT)
+            || self.keyboard_sources.is_logically_pressed(KEY_RIGHTSHIFT)
+        {
             mask = mask | ModifierMask::SHIFT;
         }
-        if self.super_pressed {
+        if self.keyboard_sources.is_logically_pressed(KEY_LEFTMETA)
+            || self.keyboard_sources.is_logically_pressed(KEY_RIGHTMETA)
+        {
             mask = mask | ModifierMask::SUPER;
         }
-        if self.ctrl_pressed {
+        if self.keyboard_sources.is_logically_pressed(KEY_LEFTCTRL)
+            || self.keyboard_sources.is_logically_pressed(KEY_RIGHTCTRL)
+        {
             mask = mask | ModifierMask::CTRL;
         }
         mask
@@ -797,18 +866,14 @@ impl NativeInputState {
         &mut self,
         effect: &mut NativeInputEffect,
     ) {
-        for code in self.physically_pressed_keys.drain(..) {
+        for code in self.keyboard_sources.logical_pressed_keys() {
             let _ = effect.record_keyboard_physical_event(NativeKeyboardEvent::new(code, false));
         }
         self.clear_pressed_state_for_session_switch();
     }
 
     pub(crate) fn clear_pressed_state_for_session_switch(&mut self) {
-        self.physically_pressed_keys.clear();
-        self.alt_pressed = false;
-        self.ctrl_pressed = false;
-        self.super_pressed = false;
-        self.shift_pressed = false;
+        self.keyboard_sources.clear();
         self.forwarded_control_keys.clear();
         self.forwarded_client_keys.clear();
         self.pressed_deferred_modifier_keys.clear();
@@ -833,6 +898,20 @@ pub(crate) fn is_super_key(code: u16) -> bool {
 
 pub(crate) fn is_control_key(code: u16) -> bool {
     matches!(code, KEY_LEFTCTRL | KEY_RIGHTCTRL)
+}
+
+fn modifier_family_for_key(code: u16) -> Option<ModifierMask> {
+    if is_shift_key(code) {
+        Some(ModifierMask::SHIFT)
+    } else if is_control_key(code) {
+        Some(ModifierMask::CTRL)
+    } else if is_alt_key(code) {
+        Some(ModifierMask::ALT)
+    } else if is_super_key(code) {
+        Some(ModifierMask::SUPER)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn is_pointer_button(code: u16) -> bool {

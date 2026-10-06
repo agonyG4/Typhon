@@ -55,6 +55,7 @@ fn raw_evdev_events_discarded_during_suspend_do_not_replay() {
         vec![NativeInputDevice {
             file: fs::File::from(read),
             path: PathBuf::from("test-event"),
+            keyboard_device_id: None,
         }],
         false,
     );
@@ -94,6 +95,7 @@ fn raw_evdev_events_arriving_after_suspend_are_not_delivered() {
         vec![NativeInputDevice {
             file: fs::File::from(read),
             path: PathBuf::from("test-event"),
+            keyboard_device_id: None,
         }],
         false,
     ));
@@ -142,10 +144,12 @@ fn raw_backend_targeted_readiness_is_complete_and_nonconsuming() {
             NativeInputDevice {
                 file: fs::File::from(first_read),
                 path: PathBuf::from("first-event"),
+                keyboard_device_id: None,
             },
             NativeInputDevice {
                 file: fs::File::from(second_read),
                 path: PathBuf::from("second-event"),
+                keyboard_device_id: None,
             },
         ],
         false,
@@ -175,6 +179,8 @@ fn raw_backend_targeted_readiness_is_complete_and_nonconsuming() {
     assert_eq!(backend.drain_events().len(), 1);
 
     drop(first_write);
+    assert!(backend.ready_nonblocking().unwrap());
+    assert!(backend.drain_events().is_empty());
     assert!(!backend.ready_nonblocking().unwrap());
 
     let event = LinuxInputEvent {
@@ -201,6 +207,185 @@ fn raw_backend_targeted_readiness_is_complete_and_nonconsuming() {
 }
 
 #[test]
+fn raw_terminal_keyboard_fd_emits_one_source_removal_after_queued_keys() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let device = k1_keyboard_id(70);
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("keyboard-event"),
+            keyboard_device_id: Some(device),
+        }],
+        false,
+    ));
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_Q,
+        value: 1,
+    };
+    let written = unsafe {
+        libc::write(
+            write.as_raw_fd(),
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+    drop(write);
+
+    assert!(backend.ready_nonblocking().unwrap());
+    assert_eq!(
+        backend.drain_events(),
+        vec![
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+                device,
+                code: KEY_Q,
+                value: 1,
+            }),
+            remove_k1_keyboard(device),
+        ]
+    );
+    assert!(!backend.ready_nonblocking().unwrap());
+    let NativeInputBackend::RawEvdev(devices) = backend else {
+        unreachable!();
+    };
+    assert!(devices.devices.is_empty());
+}
+
+#[test]
+fn raw_terminal_device_without_keyboard_identity_retires_without_fake_event() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut devices = NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("pointer-event"),
+            keyboard_device_id: None,
+        }],
+        false,
+    );
+    drop(write);
+
+    assert!(devices.ready_nonblocking().unwrap());
+    assert!(devices.drain_events().is_empty());
+    assert!(!devices.ready_nonblocking().unwrap());
+    assert!(devices.devices.is_empty());
+}
+
+#[test]
+fn raw_pointer_button_never_allocates_keyboard_source_identity() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut devices = NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("pointer-event"),
+            keyboard_device_id: None,
+        }],
+        false,
+    );
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: BTN_LEFT,
+        value: 1,
+    };
+    let written = unsafe {
+        libc::write(
+            write.as_raw_fd(),
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+
+    assert_eq!(
+        devices.drain_events(),
+        vec![NativeHardwareInputEvent::PointerButton {
+            button: u32::from(BTN_LEFT),
+            pressed: true,
+        }]
+    );
+    assert!(devices.devices[0].keyboard_device_id.is_none());
+}
+
+#[test]
+fn raw_keyboard_source_identity_is_fresh_after_session_resume() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let write_fd = write.as_raw_fd();
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("keyboard-event"),
+            keyboard_device_id: None,
+        }],
+        false,
+    ));
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_Q,
+        value: 1,
+    };
+    let write_key = || unsafe {
+        libc::write(
+            write_fd,
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(write_key() as usize, std::mem::size_of::<LinuxInputEvent>());
+    let before_suspend = backend.drain_events();
+    let old_id = match before_suspend[0] {
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key { device, .. }) => device,
+        _ => unreachable!(),
+    };
+
+    backend.suspend_for_session();
+    backend.resume_after_session().unwrap();
+    assert_eq!(write_key() as usize, std::mem::size_of::<LinuxInputEvent>());
+    let after_resume = backend.drain_events();
+    let new_id = match after_resume[0] {
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key { device, .. }) => device,
+        _ => unreachable!(),
+    };
+
+    assert_ne!(old_id, new_id);
+}
+
+#[test]
 fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
     let mut pipe = [0; 2];
     assert_eq!(
@@ -213,6 +398,7 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
         vec![NativeInputDevice {
             file: fs::File::from(read),
             path: PathBuf::from("test-event"),
+            keyboard_device_id: None,
         }],
         false,
     ));
@@ -236,7 +422,6 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
         )
     };
     write.write_all(bytes).unwrap();
-    drop(write);
 
     let mut batch = NativeInputBatch::default();
     assert!(backend.begin_semantic_epoch());
@@ -247,6 +432,7 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
     backend.drain_epoch_chunk_into(&mut batch);
     assert_eq!(batch.raw.len(), 1);
     assert!(!batch.budget_exhausted);
+    drop(write);
 }
 
 #[test]
@@ -437,6 +623,7 @@ fn native_input_repeat_is_not_a_keyboard_state_transition() {
 fn raw_evdev_repeat_notifications_do_not_create_keyboard_actions() {
     let mut input = NativeInputState::new(320, 200);
     let mut action_counts = Vec::new();
+    let device = k1_keyboard_id(1);
 
     for value in [1, 2, 2, 0] {
         let event = LinuxInputEvent {
@@ -448,16 +635,373 @@ fn raw_evdev_repeat_notifications_do_not_create_keyboard_actions() {
             code: KEY_Z,
             value,
         };
-        let event = NativeHardwareInputEvent::from_linux_event(event).unwrap();
+        let event = NativeHardwareInputEvent::from_linux_event(event, Some(device)).unwrap();
         action_counts.push(
             input
                 .handle_hardware_input_event(event)
                 .keyboard_actions
                 .len(),
         );
+        assert_eq!(input.keyboard_key_is_logically_pressed(KEY_Z), value != 0);
     }
 
     assert_eq!(action_counts, vec![1, 0, 0, 1]);
+}
+
+#[test]
+fn raw_repeat_from_another_keyboard_does_not_claim_source_ownership() {
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(81);
+    let second = k1_keyboard_id(82);
+    input.handle_key_event_from(first, KEY_A, 1);
+    let repeat = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_A,
+        value: 2,
+    };
+    let repeat = NativeHardwareInputEvent::from_linux_event(repeat, Some(second)).unwrap();
+
+    assert!(
+        input
+            .handle_hardware_input_event(repeat)
+            .keyboard_actions
+            .is_empty()
+    );
+    assert_eq!(
+        input
+            .handle_key_event_from(first, KEY_A, 0)
+            .keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_A, false)
+        )]
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_A));
+}
+
+fn k1_keyboard_id(value: u32) -> KeyboardDeviceId {
+    KeyboardDeviceId::from_raw(value).expect("K1 test keyboard ids are nonzero")
+}
+
+fn remove_k1_keyboard(device: KeyboardDeviceId) -> NativeHardwareInputEvent {
+    NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved { device })
+}
+
+fn apply_k1_keyboard_effect(
+    server: &mut OwnCompositorServer,
+    effect: NativeInputEffect,
+    resize_perf: &mut NativeResizePerfState,
+    process_supervisor: &mut ChildSupervisor,
+) {
+    apply_native_input_effect(
+        effect,
+        NativeInputApplyContext {
+            server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn native_input_aggregates_key_ownership_before_the_authoritative_xkb_state() {
+    let socket_name = format!("typhon-k1-key-ledger-{}", std::process::id());
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(1);
+    let second = k1_keyboard_id(2);
+    let mut resize_perf = NativeResizePerfState::default();
+    let mut process_supervisor = ChildSupervisor::new();
+
+    server.update_keyboard_state_without_publication(u32::from(KEY_A), false);
+    assert!(server.keyboard_reconfiguration_is_quiescent());
+
+    let press = input.handle_key_event_from(first, KEY_A, 1);
+    assert_eq!(
+        press.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_A, true)
+        )]
+    );
+    apply_k1_keyboard_effect(
+        &mut server,
+        press,
+        &mut resize_perf,
+        &mut process_supervisor,
+    );
+    assert!(!server.keyboard_reconfiguration_is_quiescent());
+
+    let second_press = input.handle_key_event_from(second, KEY_A, 1);
+    assert!(second_press.keyboard_actions.is_empty());
+    let first_release = input.handle_key_event_from(first, KEY_A, 0);
+    assert!(first_release.keyboard_actions.is_empty());
+    assert!(input.keyboard_key_is_logically_pressed(KEY_A));
+    assert!(!server.keyboard_reconfiguration_is_quiescent());
+
+    let final_release = input.handle_key_event_from(second, KEY_A, 0);
+    assert_eq!(
+        final_release.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_A, false)
+        )]
+    );
+    apply_k1_keyboard_effect(
+        &mut server,
+        final_release,
+        &mut resize_perf,
+        &mut process_supervisor,
+    );
+    assert!(server.keyboard_reconfiguration_is_quiescent());
+}
+
+#[test]
+fn removing_a_keyboard_releases_only_its_unshared_keys() {
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(11);
+    let second = k1_keyboard_id(12);
+    input.handle_key_event_from(first, KEY_Q, 1);
+    input.handle_key_event_from(second, KEY_Q, 1);
+
+    let first_removed = input.handle_hardware_input_event(remove_k1_keyboard(first));
+    assert!(first_removed.keyboard_actions.is_empty());
+    assert!(input.keyboard_key_is_logically_pressed(KEY_Q));
+    assert_eq!(
+        input
+            .handle_key_event_from(second, KEY_Q, 0)
+            .keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_Q, false)
+        )]
+    );
+
+    let third = k1_keyboard_id(13);
+    input.handle_key_event_from(third, KEY_Q, 1);
+    assert_eq!(
+        input
+            .handle_hardware_input_event(remove_k1_keyboard(third))
+            .keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_Q, false)
+        )]
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_Q));
+}
+
+#[test]
+fn modifier_families_remain_active_until_the_last_left_or_right_key_releases() {
+    for (left, right, family) in [
+        (KEY_LEFTALT, KEY_RIGHTALT, ModifierMask::ALT),
+        (KEY_LEFTCTRL, KEY_RIGHTCTRL, ModifierMask::CTRL),
+        (KEY_LEFTSHIFT, KEY_RIGHTSHIFT, ModifierMask::SHIFT),
+        (KEY_LEFTMETA, KEY_RIGHTMETA, ModifierMask::SUPER),
+    ] {
+        let mut input = NativeInputState::new(320, 200);
+        input.handle_key_event(left, 1);
+        input.handle_key_event(right, 1);
+
+        let left_release = input.handle_key_event(left, 0);
+
+        assert!(input.active_modifier_mask().contains(family));
+        if family == ModifierMask::ALT {
+            input.handle_key_event(KEY_TAB, 1);
+            assert!(left_release.shortcut_events.is_empty());
+            let final_release = input.handle_key_event(right, 0);
+            assert_eq!(
+                final_release.shortcut_events,
+                vec![AstreaShortcutEvent::pressed(
+                    "astrea-shell",
+                    "alt_tab_commit"
+                )]
+            );
+        } else {
+            input.handle_key_event(right, 0);
+            assert!(!input.active_modifier_mask().contains(family));
+        }
+    }
+}
+
+#[test]
+fn the_same_ctrl_key_held_by_two_devices_is_released_once() {
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(15);
+    let second = k1_keyboard_id(16);
+    let press = input.handle_key_event_from(first, KEY_LEFTCTRL, 1);
+    assert_eq!(
+        press.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_LEFTCTRL, true)
+        )]
+    );
+    assert!(
+        input
+            .handle_key_event_from(second, KEY_LEFTCTRL, 1)
+            .keyboard_actions
+            .is_empty()
+    );
+
+    let first_release = input.handle_key_event_from(first, KEY_LEFTCTRL, 0);
+    assert!(first_release.keyboard_actions.is_empty());
+    assert!(input.active_modifier_mask().contains(ModifierMask::CTRL));
+
+    let final_release = input.handle_key_event_from(second, KEY_LEFTCTRL, 0);
+    assert_eq!(
+        final_release.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_LEFTCTRL, false)
+        )]
+    );
+    assert!(!input.active_modifier_mask().contains(ModifierMask::CTRL));
+}
+
+#[test]
+fn removing_a_source_releases_shortcut_triggers_before_modifiers() {
+    let mut input = NativeInputState::new(320, 200);
+    let device = k1_keyboard_id(21);
+    input.handle_key_event_from(device, KEY_LEFTALT, 1);
+    let tab_press = input.handle_key_event_from(device, KEY_TAB, 1);
+    assert_eq!(
+        tab_press.shortcut_events,
+        vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
+    );
+
+    let removed = input.handle_hardware_input_event(remove_k1_keyboard(device));
+
+    assert_eq!(
+        removed.keyboard_actions,
+        vec![
+            NativeKeyboardAction::PhysicalOnly(NativeKeyboardEvent::new(KEY_TAB, false)),
+            NativeKeyboardAction::PhysicalOnly(NativeKeyboardEvent::new(KEY_LEFTALT, false)),
+        ]
+    );
+    assert!(removed.keyboard_events.is_empty());
+    assert_eq!(
+        removed.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "alt_tab_commit"
+        )]
+    );
+    assert!(input.active_modifier_mask().matches(ModifierMask::EMPTY));
+}
+
+#[test]
+fn source_removal_balances_forwarded_keys_under_shortcut_inhibition() {
+    let mut input = NativeInputState::new(320, 200);
+    input.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    let first = k1_keyboard_id(31);
+    let second = k1_keyboard_id(32);
+    let press = input.handle_key_event_from(first, KEY_A, 1);
+    assert_eq!(
+        press.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_A, true)]
+    );
+    input.handle_key_event_from(second, KEY_A, 1);
+
+    let shared_removal = input.handle_hardware_input_event(remove_k1_keyboard(first));
+    assert!(shared_removal.keyboard_events.is_empty());
+    assert!(input.forwarded_client_keys.contains(&KEY_A));
+
+    let final_removal = input.handle_hardware_input_event(remove_k1_keyboard(second));
+    assert_eq!(
+        final_removal.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_A, false)
+        )]
+    );
+    assert!(!input.forwarded_client_keys.contains(&KEY_A));
+}
+
+#[test]
+fn removing_a_compositor_consumed_shortcut_never_sends_a_client_release() {
+    let mut input = NativeInputState::new(320, 200);
+    let device = k1_keyboard_id(41);
+    input.handle_key_event_from(device, KEY_LEFTALT, 1);
+    let consumed = input.handle_key_event_from(device, KEY_TAB, 1);
+    assert!(consumed.keyboard_events.is_empty());
+
+    let removed = input.handle_hardware_input_event(remove_k1_keyboard(device));
+
+    assert!(removed.keyboard_events.is_empty());
+    assert!(
+        removed
+            .keyboard_actions
+            .iter()
+            .all(|action| matches!(action, NativeKeyboardAction::PhysicalOnly(_)))
+    );
+    assert_eq!(
+        removed.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "alt_tab_commit"
+        )]
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_TAB));
+}
+
+#[test]
+fn session_clear_discards_keyboard_ownership_without_id_aliasing() {
+    let mut allocator = KeyboardDeviceIdAllocator::default();
+    let old_device = allocator.allocate().unwrap();
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event_from(old_device, KEY_A, 1);
+    input.clear_pressed_state_for_session_switch();
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_A));
+
+    let fresh_device = allocator.allocate().unwrap();
+    assert_ne!(old_device, fresh_device);
+    assert!(
+        input
+            .handle_key_event_from(old_device, KEY_A, 0)
+            .keyboard_actions
+            .is_empty()
+    );
+    assert_eq!(
+        input
+            .handle_key_event_from(fresh_device, KEY_A, 1)
+            .keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_A, true)
+        )]
+    );
+}
+
+#[test]
+fn vt_switch_clear_releases_shared_physical_keys_once() {
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(51);
+    let second = k1_keyboard_id(52);
+    input.handle_key_event_from(first, KEY_Q, 1);
+    input.handle_key_event_from(second, KEY_Q, 1);
+    input.handle_key_event_from(first, KEY_LEFTCTRL, 1);
+    input.handle_key_event_from(first, KEY_LEFTALT, 1);
+
+    let switch = input.handle_key_event_from(first, KEY_F3, 1);
+    let q_releases = switch
+        .keyboard_actions
+        .iter()
+        .filter(|action| {
+            **action == NativeKeyboardAction::PhysicalOnly(NativeKeyboardEvent::new(KEY_Q, false))
+        })
+        .count();
+
+    assert_eq!(switch.vt_switch, Some(3));
+    assert_eq!(q_releases, 1);
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_Q));
+}
+
+#[test]
+fn source_removal_is_not_activity_but_can_require_constraint_reconciliation() {
+    let removal = remove_k1_keyboard(k1_keyboard_id(61));
+    assert!(!removal.is_meaningful_user_activity());
+    assert!(removal.may_change_pointer_constraints());
 }
 
 #[test]
@@ -489,6 +1033,7 @@ fn native_input_release_trigger_shortcut_emits_released_phase() {
         reserved: false,
     }]);
 
+    input.handle_key_event(KEY_Z, 1);
     let release = input.handle_key_event(KEY_Z, 0);
 
     assert_eq!(release.shortcut_events.len(), 1);
