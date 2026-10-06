@@ -344,7 +344,7 @@ pub(crate) struct NativeInputEffect {
     pub(crate) pointer_buttons: Vec<NativePointerButtonEvent>,
     pub(crate) pointer_axis: Option<PointerAxisFrame>,
     pub(crate) window_actions: Vec<NativeWindowAction>,
-    pub(crate) shortcut_events: Vec<AstreaShortcutEvent>,
+    pub(crate) binding_action_invocations: Vec<BindingActionInvocation>,
     pub(crate) launch_command: Option<Vec<String>>,
     pub(crate) launch_source: Option<NativeLaunchSource>,
     pub(crate) vt_switch: Option<u8>,
@@ -426,7 +426,8 @@ impl NativeInputEffect {
             self.pointer_axis = other.pointer_axis;
         }
         self.window_actions.append(&mut other.window_actions);
-        self.shortcut_events.append(&mut other.shortcut_events);
+        self.binding_action_invocations
+            .append(&mut other.binding_action_invocations);
         if other.launch_command.is_some() {
             self.launch_command = other.launch_command;
             self.launch_source = other.launch_source;

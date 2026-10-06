@@ -1,4 +1,4 @@
-use super::{InhibitionPolicy, ModifierMask, RepeatPolicy};
+use super::{BindingId, InhibitionPolicy, ModifierMask, RepeatPolicy};
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -45,6 +45,7 @@ pub(crate) enum KeyboardRepeatPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ActiveKeyboardRepeat {
+    pub(crate) binding: BindingId,
     pub(crate) code: u16,
     pub(crate) modifiers: ModifierMask,
     pub(crate) inhibition: InhibitionPolicy,
@@ -90,6 +91,7 @@ impl KeyboardRepeatState {
 
     pub(crate) fn arm(
         &mut self,
+        binding: BindingId,
         code: u16,
         modifiers: ModifierMask,
         inhibition: InhibitionPolicy,
@@ -105,6 +107,7 @@ impl KeyboardRepeatState {
         }
         self.generation = self.generation.saturating_add(1);
         self.active = Some(ActiveKeyboardRepeat {
+            binding,
             code,
             modifiers,
             inhibition,
@@ -195,6 +198,7 @@ mod tests {
     fn target() -> KeyboardRepeatState {
         let mut state = KeyboardRepeatState::with_config(KeyboardRepeatConfig::new(25, 600));
         state.arm(
+            BindingId::from_index(0).expect("test binding ID"),
             44,
             ModifierMask::EMPTY,
             InhibitionPolicy::Respect,
@@ -214,7 +218,13 @@ mod tests {
     #[test]
     fn late_service_schedules_one_interval_from_actual_service_time() {
         let mut state = KeyboardRepeatState::with_config(KeyboardRepeatConfig::new(25, 100));
-        state.arm(44, ModifierMask::EMPTY, InhibitionPolicy::Respect, 0);
+        state.arm(
+            BindingId::from_index(0).expect("test binding ID"),
+            44,
+            ModifierMask::EMPTY,
+            InhibitionPolicy::Respect,
+            0,
+        );
         assert!(state.due(100_000_000));
         state.schedule_after_fire(260_000_000);
         assert_eq!(state.deadline_ns(), Some(300_000_000));
@@ -224,11 +234,23 @@ mod tests {
     #[test]
     fn zero_rate_never_arms_and_zero_delay_is_due_without_inline_service() {
         let mut disabled = KeyboardRepeatState::with_config(KeyboardRepeatConfig::new(0, 0));
-        disabled.arm(44, ModifierMask::EMPTY, InhibitionPolicy::Respect, 10);
+        disabled.arm(
+            BindingId::from_index(0).expect("test binding ID"),
+            44,
+            ModifierMask::EMPTY,
+            InhibitionPolicy::Respect,
+            10,
+        );
         assert_eq!(disabled.deadline_ns(), None);
 
         let mut immediate = KeyboardRepeatState::with_config(KeyboardRepeatConfig::new(25, 0));
-        immediate.arm(44, ModifierMask::EMPTY, InhibitionPolicy::Respect, 10);
+        immediate.arm(
+            BindingId::from_index(0).expect("test binding ID"),
+            44,
+            ModifierMask::EMPTY,
+            InhibitionPolicy::Respect,
+            10,
+        );
         assert_eq!(immediate.deadline_ns(), Some(10));
         assert!(immediate.active().is_some());
     }

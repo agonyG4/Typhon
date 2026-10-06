@@ -444,14 +444,18 @@ impl NativeInputState {
             self.keyboard_shortcuts_inhibited,
         ) {
             AstreaBindingMatch::Consumed {
+                binding,
                 action,
                 phase,
                 repeat,
                 inhibition,
             } => {
-                if pressed && repeat == RepeatPolicy::Enabled {
+                if pressed
+                    && repeat == RepeatPolicy::Enabled
+                    && let Some(binding) = binding
+                {
                     self.keyboard_repeat
-                        .arm(code, binding_modifiers, inhibition, now_ns);
+                        .arm(binding, code, binding_modifiers, inhibition, now_ns);
                 }
                 self.apply_binding_action(action, phase, None, &mut effect);
                 return effect;
@@ -556,23 +560,26 @@ impl NativeInputState {
         }
 
         let mut effect = NativeInputEffect::default();
-        match self.binding_manager.handle_key(
-            active.modifiers,
+        match self.binding_manager.match_repeat_binding(
+            active.binding,
             active.code,
-            true,
-            true,
+            active.modifiers,
             self.keyboard_shortcuts_inhibited,
         ) {
-            AstreaBindingMatch::Consumed {
+            Some(AstreaBindingMatch::Consumed {
+                binding: Some(binding),
                 action,
                 phase,
                 repeat,
                 inhibition,
-            } if repeat == RepeatPolicy::Enabled && inhibition == active.inhibition => {
+            }) if binding == active.binding
+                && repeat == RepeatPolicy::Enabled
+                && inhibition == active.inhibition =>
+            {
                 self.apply_binding_action(action, phase, None, &mut effect);
                 self.keyboard_repeat.schedule_after_fire(now_ns);
             }
-            AstreaBindingMatch::Consumed { .. } | AstreaBindingMatch::Pass => {
+            Some(AstreaBindingMatch::Consumed { .. }) | Some(AstreaBindingMatch::Pass) | None => {
                 self.keyboard_repeat.cancel();
             }
         }
@@ -925,68 +932,72 @@ impl NativeInputState {
 
     fn apply_binding_action(
         &mut self,
-        action: BindingAction,
+        action: BindingActionId,
         phase: AstreaShortcutPhase,
         trigger_button: Option<u32>,
         effect: &mut NativeInputEffect,
     ) {
+        let action_id = action;
+        let Some(action) = self.binding_manager.action_catalog().action(action_id) else {
+            return;
+        };
         match action {
-            BindingAction::ExitCompositor => {
+            BindingActionDefinition::ExitCompositor => {
                 effect.exit_requested = true;
             }
-            BindingAction::CloseActiveWindow => {
+            BindingActionDefinition::CloseActiveWindow => {
                 effect
                     .window_actions
                     .push(NativeWindowAction::CloseActiveWindow);
                 effect.request_visual_redraw();
             }
-            BindingAction::ToggleFullscreen => {
+            BindingActionDefinition::ToggleFullscreen => {
                 effect
                     .window_actions
                     .push(NativeWindowAction::ToggleFullscreen);
                 effect.request_visual_redraw();
             }
-            BindingAction::ToggleFocusedWindowLayout => {
+            BindingActionDefinition::ToggleFocusedWindowLayout => {
                 effect
                     .window_actions
                     .push(NativeWindowAction::ToggleFocusedWindowLayout);
                 effect.request_visual_redraw();
             }
-            BindingAction::SwitchWorkspace(workspace) => {
+            BindingActionDefinition::SwitchWorkspace(workspace) => {
                 effect
                     .window_actions
-                    .push(NativeWindowAction::SwitchWorkspace(workspace));
+                    .push(NativeWindowAction::SwitchWorkspace(*workspace));
                 effect.request_visual_redraw();
             }
-            BindingAction::MoveFocusedWindowToWorkspace(workspace) => {
+            BindingActionDefinition::MoveFocusedWindowToWorkspace(workspace) => {
                 effect
                     .window_actions
-                    .push(NativeWindowAction::MoveFocusedWindowToWorkspace(workspace));
+                    .push(NativeWindowAction::MoveFocusedWindowToWorkspace(*workspace));
                 effect.request_visual_redraw();
             }
-            BindingAction::ToggleDefaultSpecialWorkspace => {
+            BindingActionDefinition::ToggleDefaultSpecialWorkspace => {
                 effect
                     .window_actions
                     .push(NativeWindowAction::ToggleDefaultSpecialWorkspace);
                 effect.request_visual_redraw();
             }
-            BindingAction::MoveFocusedWindowToOrFromSpecialWorkspace => {
+            BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace => {
                 effect
                     .window_actions
                     .push(NativeWindowAction::MoveFocusedWindowToOrFromSpecialWorkspace);
                 effect.request_visual_redraw();
             }
-            BindingAction::LaunchCommand(command) => {
-                effect.launch_command = Some(command);
-                effect.launch_source = Some(NativeLaunchSource::BindingApplication);
+            BindingActionDefinition::LaunchCommand(_)
+            | BindingActionDefinition::LaunchSessionCommand { .. }
+            | BindingActionDefinition::EmitShortcut { .. } => {
+                effect
+                    .binding_action_invocations
+                    .push(BindingActionInvocation {
+                        action: action_id,
+                        phase,
+                    });
             }
-            BindingAction::LaunchSessionCommand(index) => {
-                if let Some(command) = external_session_switch_command(index) {
-                    effect.launch_command = Some(command);
-                    effect.launch_source = Some(NativeLaunchSource::BindingSessionCommand);
-                }
-            }
-            BindingAction::BeginMove => {
+            BindingActionDefinition::BeginMove => {
                 effect.window_actions.push(NativeWindowAction::BeginMove {
                     x: self.cursor_x,
                     y: self.cursor_y,
@@ -994,20 +1005,13 @@ impl NativeInputState {
                 });
                 effect.request_visual_redraw();
             }
-            BindingAction::BeginResize => {
+            BindingActionDefinition::BeginResize => {
                 effect.window_actions.push(NativeWindowAction::BeginResize {
                     x: self.cursor_x,
                     y: self.cursor_y,
                     trigger_button,
                 });
                 effect.request_visual_redraw();
-            }
-            BindingAction::EmitShortcut { namespace, name } => {
-                effect.shortcut_events.push(AstreaShortcutEvent {
-                    namespace,
-                    name,
-                    phase,
-                });
             }
         }
     }

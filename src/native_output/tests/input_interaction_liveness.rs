@@ -84,11 +84,11 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
     ));
 
     let mut input = NativeInputState::new(320, 200);
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::PointerRelease,
         input: BindingInput::PointerButton(button),
-        action: BindingAction::EmitShortcut {
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "test".to_string(),
             name: "consumed_release".to_string(),
         },
@@ -107,6 +107,7 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
     apply_native_input_effect(
         release,
         NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -170,6 +171,7 @@ fn client_owned_xdg_move_release_uses_production_native_routing() {
                 ..NativeInputEffect::default()
             },
             NativeInputApplyContext {
+                binding_action_catalog: &BindingActionCatalog::empty(),
                 server: &mut server,
                 perf: NativePerfLogger::from_env(),
                 resize_perf: &mut resize_perf,
@@ -297,6 +299,7 @@ fn client_owned_x11_release_uses_production_native_routing() {
                 ..NativeInputEffect::default()
             },
             NativeInputApplyContext {
+                binding_action_catalog: &BindingActionCatalog::empty(),
                 server: &mut server,
                 perf: NativePerfLogger::from_env(),
                 resize_perf: &mut resize_perf,
@@ -380,6 +383,7 @@ fn compositor_owned_native_binding_release_is_consumed_by_production_routing() {
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,

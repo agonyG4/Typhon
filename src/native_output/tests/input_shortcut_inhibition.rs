@@ -44,7 +44,7 @@ fn native_input_shortcut_inhibition_reconciles_deferred_alt_and_cancels_alt_tab(
     );
     let alt_tab = input.handle_key_event(KEY_TAB, 1);
     assert_eq!(
-        alt_tab.shortcut_events,
+        resolved_shortcut_events(&input, &alt_tab),
         vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
     );
 
@@ -54,14 +54,14 @@ fn native_input_shortcut_inhibition_reconciles_deferred_alt_and_cancels_alt_tab(
         transition.keyboard_events,
         vec![NativeKeyboardEvent::new(KEY_LEFTALT, true)]
     );
-    assert!(transition.shortcut_events.is_empty());
+    assert!(transition.binding_action_invocations.is_empty());
 
     let release = input.handle_key_event(KEY_LEFTALT, 0);
     assert_eq!(
         release.keyboard_events,
         vec![NativeKeyboardEvent::new(KEY_LEFTALT, false)]
     );
-    assert!(release.shortcut_events.is_empty());
+    assert!(release.binding_action_invocations.is_empty());
 }
 
 #[test]

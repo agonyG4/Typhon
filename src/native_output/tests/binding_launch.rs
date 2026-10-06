@@ -36,6 +36,7 @@ fn binding_application_launch_receives_current_xwayland_environment() {
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,

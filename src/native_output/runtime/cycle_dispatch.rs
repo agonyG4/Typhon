@@ -2332,6 +2332,7 @@ impl NativeRuntime {
                         effect,
                         NativeInputApplyContext {
                             server,
+                            binding_action_catalog: input_state.binding_manager.action_catalog(),
                             perf,
                             resize_perf,
                             cursor_mode: *cursor_render_mode,
@@ -2433,6 +2434,7 @@ impl NativeRuntime {
                     effect,
                     NativeInputApplyContext {
                         server,
+                        binding_action_catalog: input_state.binding_manager.action_catalog(),
                         perf,
                         resize_perf,
                         cursor_mode: *cursor_render_mode,

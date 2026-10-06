@@ -8,9 +8,10 @@ input entering Typhon contains only logical key press and release transitions.
 ## Repeat target and source ownership
 
 `NativeInputState` owns a fixed-size `KeyboardRepeatState` with at most one
-active target. A target records the logical key code, the exact aggregate
-modifier mask that matched the binding, its inhibition policy, its initial or
-repeating phase, and one absolute deadline. It stores no `KeyboardDeviceId`.
+active target. A target records the `BindingId` selected by its initial press,
+the logical key code, the exact aggregate modifier mask, its inhibition policy,
+its initial or repeating phase, and one absolute deadline. It stores no
+`KeyboardDeviceId`.
 
 K1's `KeyboardSourceLedger` remains the source of truth. A second keyboard
 pressing a key already held does not create a new logical transition or change
@@ -56,9 +57,11 @@ batch leaves input backlog, repeat service waits until the backlog clears.
 
 Each native cycle emits at most one repeat action. A late service does not
 catch up missed intervals; the next deadline is scheduled from the actual
-service time. Before each action Typhon validates that the aggregate trigger
-key is still held, the effective modifier mask still matches, the current
-binding is still repeat-enabled, and shortcut inhibition still permits it.
+service time. Before each action Typhon validates the exact compiled `BindingId`
+selected by the initial press, that its aggregate trigger key is still held,
+its modifier mask and repeat policy still match, and shortcut inhibition still
+permits it. Repeat does not rematch the binding table or switch to another
+candidate.
 Respect-policy targets cancel when shortcut inhibition becomes effective;
 Bypass-policy targets may continue.
 
@@ -75,8 +78,8 @@ and deadline. A fresh physical press is required after resume.
 
 Repeat tracking uses a fixed-size target and one deadline. The normal repeat
 path adds no scheduler heap allocation, lock, thread, channel, async task, or
-filesystem work. Binding action cloning remains part of the existing binding
-manager and is outside K2.
+filesystem work. The compiled action catalog resolves the repeat's stored
+binding ID without re-matching or cloning its payload.
 
 K2 adds deterministic compositor shortcut repeat only. It does not add media
 or system actions, a symbolic or compiled binding engine, LED synchronization,

@@ -39,6 +39,85 @@ use wayland_protocols::xwayland::shell::v1::client::{
 };
 use xkbcommon::xkb;
 
+fn resolved_shortcut_events(
+    input: &NativeInputState,
+    effect: &NativeInputEffect,
+) -> Vec<AstreaShortcutEvent> {
+    effect
+        .binding_action_invocations
+        .iter()
+        .filter_map(|invocation| {
+            match input
+                .binding_manager
+                .action_catalog()
+                .action(invocation.action)?
+            {
+                BindingActionDefinition::EmitShortcut { namespace, name } => {
+                    Some(AstreaShortcutEvent {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                        phase: invocation.phase,
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn resolved_binding_command(
+    input: &NativeInputState,
+    effect: &NativeInputEffect,
+) -> Option<Vec<String>> {
+    effect
+        .binding_action_invocations
+        .iter()
+        .filter_map(|invocation| {
+            match input
+                .binding_manager
+                .action_catalog()
+                .action(invocation.action)?
+            {
+                BindingActionDefinition::LaunchCommand(command) => Some(command.clone()),
+                BindingActionDefinition::LaunchSessionCommand { command, .. } => command.clone(),
+                _ => None,
+            }
+        })
+        .last()
+}
+
+fn shortcut_action_manager(
+    name: &str,
+    phase: AstreaShortcutPhase,
+) -> (AstreaBindingManager, BindingActionInvocation) {
+    let (trigger, pressed, repeated) = match phase {
+        AstreaShortcutPhase::Pressed => (BindingTrigger::Press, true, false),
+        AstreaShortcutPhase::Repeated => (BindingTrigger::Press, true, true),
+        AstreaShortcutPhase::Released => (BindingTrigger::Release, false, false),
+    };
+    let manager = AstreaBindingManager::with_specs(vec![BindingSpec {
+        modifiers: ModifierMask::EMPTY,
+        trigger,
+        input: BindingInput::PhysicalKey(KEY_Z),
+        action: BindingActionDefinition::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: name.to_string(),
+        },
+        repeat: if repeated {
+            RepeatPolicy::Enabled
+        } else {
+            RepeatPolicy::Disabled
+        },
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+    let matched = manager.handle_key(ModifierMask::EMPTY, KEY_Z, pressed, repeated, false);
+    let AstreaBindingMatch::Consumed { action, phase, .. } = matched else {
+        panic!("test shortcut binding must match");
+    };
+    (manager, BindingActionInvocation { action, phase })
+}
+
 #[path = "input_shortcut_inhibition.rs"]
 mod input_shortcut_inhibition;
 
@@ -466,7 +545,7 @@ fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
     assert_eq!(space.launch_command, None);
     assert_eq!(space.launch_source, None);
     assert_eq!(
-        space.shortcut_events,
+        resolved_shortcut_events(&input, &space),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "spotlight_toggle"
@@ -509,11 +588,11 @@ fn native_input_screenshot_bindings_are_exact_press_only_reserved_actions() {
 
         assert_eq!(input.active_modifier_mask(), modifiers);
         assert_eq!(
-            pressed.shortcut_events,
+            resolved_shortcut_events(&input, &pressed),
             vec![AstreaShortcutEvent::pressed("astrea-shell", name)]
         );
-        assert!(repeated.shortcut_events.is_empty());
-        assert!(released.shortcut_events.is_empty());
+        assert!(repeated.binding_action_invocations.is_empty());
+        assert!(released.binding_action_invocations.is_empty());
     }
 }
 
@@ -531,7 +610,7 @@ fn native_input_screenshot_bindings_reject_extra_modifiers() {
         assert!(
             input
                 .handle_key_event(KEY_SYSRQ, 1)
-                .shortcut_events
+                .binding_action_invocations
                 .is_empty()
         );
     }
@@ -540,11 +619,11 @@ fn native_input_screenshot_bindings_reject_extra_modifiers() {
 #[test]
 fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
     let mut input = NativeInputState::new(320, 200);
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::Press,
-        input: BindingInput::Key(KEY_Z),
-        action: BindingAction::EmitShortcut {
+        input: BindingInput::PhysicalKey(KEY_Z),
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "astrea-shell".to_string(),
             name: "test_repeat".to_string(),
         },
@@ -558,19 +637,19 @@ fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
     assert!(
         input
             .service_keyboard_repeat(600_999_999)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
     let repeated = input.service_keyboard_repeat(601_000_000);
 
-    assert_eq!(pressed.shortcut_events.len(), 1);
+    assert_eq!(pressed.binding_action_invocations.len(), 1);
     assert_eq!(
-        pressed.shortcut_events[0].phase,
+        pressed.binding_action_invocations[0].phase,
         AstreaShortcutPhase::Pressed
     );
-    assert_eq!(repeated.shortcut_events.len(), 1);
+    assert_eq!(repeated.binding_action_invocations.len(), 1);
     assert_eq!(
-        repeated.shortcut_events[0].phase,
+        repeated.binding_action_invocations[0].phase,
         AstreaShortcutPhase::Repeated
     );
     assert_eq!(input.keyboard_repeat_deadline_ns(), Some(641_000_000));
@@ -581,13 +660,172 @@ fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
 }
 
 #[test]
+fn native_input_repeat_reuses_the_press_binding_id_without_generic_lookup() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_Z),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "repeat-earlier".to_string(),
+            },
+            repeat: RepeatPolicy::Enabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_Z),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "repeat-selected".to_string(),
+            },
+            repeat: RepeatPolicy::Enabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+    ]);
+
+    let press = input.handle_key_event_at(KEY_Z, true, 1_000_000);
+    let active = input.active_keyboard_repeat().unwrap();
+    let binding_id = active.binding;
+    let action_id = press.binding_action_invocations[0].action;
+    assert_eq!(
+        input.binding_manager.binding(binding_id).unwrap().action,
+        action_id
+    );
+    let lookup_count = input.binding_manager.generic_lookup_count_for_tests();
+    assert_eq!(lookup_count, 1);
+
+    let repeated = input.service_keyboard_repeat(601_000_000);
+
+    assert_eq!(input.active_keyboard_repeat().unwrap().binding, binding_id);
+    assert_eq!(repeated.binding_action_invocations[0].action, action_id);
+    assert_eq!(
+        input.binding_manager.generic_lookup_count_for_tests(),
+        lookup_count
+    );
+}
+
+#[test]
+fn native_input_repeat_cancels_the_selected_respect_binding_without_fallback() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_Z),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "repeat-bypass-earlier".to_string(),
+            },
+            repeat: RepeatPolicy::Enabled,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: false,
+        },
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_Z),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "repeat-respect-selected".to_string(),
+            },
+            repeat: RepeatPolicy::Enabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+    ]);
+    let press = input.handle_key_event_at(KEY_Z, true, 1_000_000);
+    let selected_action = press.binding_action_invocations[0].action;
+    assert!(input.active_keyboard_repeat().is_some());
+
+    input.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    let lookup_count = input.binding_manager.generic_lookup_count_for_tests();
+    let repeated = input.service_keyboard_repeat(601_000_000);
+
+    assert!(input.active_keyboard_repeat().is_none());
+    assert!(repeated.binding_action_invocations.is_empty());
+    assert_eq!(
+        input.binding_manager.generic_lookup_count_for_tests(),
+        lookup_count
+    );
+    assert_eq!(
+        input
+            .binding_manager
+            .action_catalog()
+            .action(selected_action),
+        Some(&BindingActionDefinition::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "repeat-respect-selected".to_string(),
+        })
+    );
+}
+
+#[test]
+fn native_input_repeat_modifier_mismatch_does_not_retarget_to_another_candidate() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![
+        BindingSpec {
+            modifiers: ModifierMask::SHIFT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_Z),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "shift-repeat-candidate".to_string(),
+            },
+            repeat: RepeatPolicy::Enabled,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: false,
+        },
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_Z),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "initial-repeat-binding".to_string(),
+            },
+            repeat: RepeatPolicy::Enabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+    ]);
+
+    let press = input.handle_key_event_at(KEY_Z, true, 1_000_000);
+    let selected_action = press.binding_action_invocations[0].action;
+    let selected_binding = input.active_keyboard_repeat().unwrap().binding;
+    input.handle_key_event_at(KEY_LEFTSHIFT, true, 2_000_000);
+    let lookup_count = input.binding_manager.generic_lookup_count_for_tests();
+    let repeated = input.service_keyboard_repeat(601_000_000);
+
+    assert!(input.active_keyboard_repeat().is_none());
+    assert!(repeated.binding_action_invocations.is_empty());
+    assert_eq!(
+        input.binding_manager.generic_lookup_count_for_tests(),
+        lookup_count
+    );
+    assert_eq!(
+        input
+            .binding_manager
+            .binding(selected_binding)
+            .unwrap()
+            .action,
+        selected_action
+    );
+}
+
+#[test]
 fn native_input_repeat_disabled_shortcut_suppresses_repeat() {
     let mut input = NativeInputState::new(320, 200);
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::Press,
-        input: BindingInput::Key(KEY_Z),
-        action: BindingAction::EmitShortcut {
+        input: BindingInput::PhysicalKey(KEY_Z),
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "astrea-shell".to_string(),
             name: "test_no_repeat".to_string(),
         },
@@ -599,12 +837,12 @@ fn native_input_repeat_disabled_shortcut_suppresses_repeat() {
     let pressed = input.handle_key_event_at(KEY_Z, true, 1_000_000);
     let repeated = input.service_keyboard_repeat(1_000_000_000);
 
-    assert_eq!(pressed.shortcut_events.len(), 1);
+    assert_eq!(pressed.binding_action_invocations.len(), 1);
     assert_eq!(
-        pressed.shortcut_events[0].phase,
+        pressed.binding_action_invocations[0].phase,
         AstreaShortcutPhase::Pressed
     );
-    assert!(repeated.shortcut_events.is_empty());
+    assert!(repeated.binding_action_invocations.is_empty());
 }
 
 #[test]
@@ -620,13 +858,16 @@ fn repeat_enabled_press_uses_zero_delay_on_a_later_service_call() {
     );
 
     let press = input.handle_key_event_at(KEY_Z, true, 2_000_000);
-    assert_eq!(press.shortcut_events.len(), 1);
-    assert_eq!(press.shortcut_events[0].phase, AstreaShortcutPhase::Pressed);
+    assert_eq!(press.binding_action_invocations.len(), 1);
+    assert_eq!(
+        press.binding_action_invocations[0].phase,
+        AstreaShortcutPhase::Pressed
+    );
     assert_eq!(input.keyboard_repeat_deadline_ns(), Some(2_000_000));
     let repeat = input.service_keyboard_repeat(2_000_000);
-    assert_eq!(repeat.shortcut_events.len(), 1);
+    assert_eq!(repeat.binding_action_invocations.len(), 1);
     assert_eq!(
-        repeat.shortcut_events[0].phase,
+        repeat.binding_action_invocations[0].phase,
         AstreaShortcutPhase::Repeated
     );
 }
@@ -642,7 +883,7 @@ fn final_hardware_release_wins_over_a_repeat_due_in_the_same_turn() {
         InhibitionPolicy::Respect,
     );
     let press = input.handle_key_event_at(KEY_Z, true, 0);
-    assert_eq!(press.shortcut_events.len(), 1);
+    assert_eq!(press.binding_action_invocations.len(), 1);
     assert!(input.keyboard_repeat_due(600_000_000));
 
     let release = input.handle_key_event_at(KEY_Z, false, 600_000_000);
@@ -655,7 +896,7 @@ fn final_hardware_release_wins_over_a_repeat_due_in_the_same_turn() {
     assert!(
         input
             .service_keyboard_repeat(600_000_000)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
     assert_eq!(input.keyboard_repeat_deadline_ns(), None);
@@ -682,14 +923,14 @@ fn replacement_target_waits_until_a_later_turn_even_when_old_repeat_was_due() {
     assert!(
         input
             .service_keyboard_repeat_if_unchanged(10, due_generation)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
     let next_turn = input.keyboard_repeat_generation();
     assert_eq!(
         input
             .service_keyboard_repeat_if_unchanged(10, next_turn)
-            .shortcut_events
+            .binding_action_invocations
             .len(),
         1
     );
@@ -708,13 +949,16 @@ fn zero_repeat_rate_keeps_initial_binding_press_but_never_arms() {
     );
 
     let press = input.handle_key_event_at(KEY_Z, true, 10);
-    assert_eq!(press.shortcut_events.len(), 1);
-    assert_eq!(press.shortcut_events[0].phase, AstreaShortcutPhase::Pressed);
+    assert_eq!(press.binding_action_invocations.len(), 1);
+    assert_eq!(
+        press.binding_action_invocations[0].phase,
+        AstreaShortcutPhase::Pressed
+    );
     assert_eq!(input.keyboard_repeat_deadline_ns(), None);
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -733,7 +977,7 @@ fn aggregate_key_ownership_keeps_one_repeat_until_the_final_source_releases() {
     );
 
     let press = input.handle_key_event_from_at(first, KEY_Z, true, 1_000_000);
-    assert_eq!(press.shortcut_events.len(), 1);
+    assert_eq!(press.binding_action_invocations.len(), 1);
     let deadline = input.keyboard_repeat_deadline_ns();
     let second_press = input.handle_key_event_from_at(second, KEY_Z, true, 2_000_000);
     assert!(second_press.keyboard_actions.is_empty());
@@ -746,7 +990,7 @@ fn aggregate_key_ownership_keeps_one_repeat_until_the_final_source_releases() {
     assert_eq!(
         input
             .service_keyboard_repeat(601_000_000)
-            .shortcut_events
+            .binding_action_invocations
             .len(),
         1
     );
@@ -763,7 +1007,7 @@ fn aggregate_key_ownership_keeps_one_repeat_until_the_final_source_releases() {
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -790,7 +1034,7 @@ fn source_removal_preserves_repeat_for_other_owners_and_cancels_the_last_owner()
     assert_eq!(
         input
             .service_keyboard_repeat(601_000_000)
-            .shortcut_events
+            .binding_action_invocations
             .len(),
         1
     );
@@ -807,7 +1051,7 @@ fn source_removal_preserves_repeat_for_other_owners_and_cancels_the_last_owner()
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -836,7 +1080,7 @@ fn effective_alt_family_remains_repeat_valid_across_left_right_handoff() {
     assert_eq!(
         input
             .service_keyboard_repeat(deadline.unwrap())
-            .shortcut_events
+            .binding_action_invocations
             .len(),
         1
     );
@@ -847,7 +1091,7 @@ fn effective_alt_family_remains_repeat_valid_across_left_right_handoff() {
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -871,7 +1115,7 @@ fn effective_modifier_mismatch_cancels_repeat_before_it_fires() {
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -894,7 +1138,7 @@ fn repeat_respects_inhibition_and_bypass_is_rechecked_on_a_repeat_only_turn() {
     assert!(
         respect
             .service_keyboard_repeat(1_000_000_000)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 
@@ -910,9 +1154,9 @@ fn repeat_respects_inhibition_and_bypass_is_rechecked_on_a_repeat_only_turn() {
     bypass.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
     assert!(bypass.keyboard_repeat_deadline_ns().is_some());
     let repeated = bypass.service_keyboard_repeat(600_000_001);
-    assert_eq!(repeated.shortcut_events.len(), 1);
+    assert_eq!(repeated.binding_action_invocations.len(), 1);
     assert_eq!(
-        repeated.shortcut_events[0].phase,
+        repeated.binding_action_invocations[0].phase,
         AstreaShortcutPhase::Repeated
     );
 }
@@ -938,7 +1182,7 @@ fn wayland_inhibition_snapshot_disarms_respected_repeat_immediately() {
     assert!(
         input
             .service_keyboard_repeat(600_000_001)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -984,7 +1228,7 @@ fn new_logical_non_modifier_press_replaces_or_cancels_repeat_without_resuming_ol
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -1007,7 +1251,7 @@ fn session_clear_discards_repeat_deadline_and_target() {
     assert!(
         input
             .service_keyboard_repeat(u64::MAX)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
     input.handle_key_event_at(KEY_Z, true, 2);
@@ -1018,11 +1262,11 @@ fn session_clear_discards_repeat_deadline_and_target() {
 fn scheduled_repeat_is_not_a_keyboard_state_transition() {
     let mut input = NativeInputState::new(320, 200);
 
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::Press,
-        input: BindingInput::Key(KEY_Z),
-        action: BindingAction::EmitShortcut {
+        input: BindingInput::PhysicalKey(KEY_Z),
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "astrea-shell".to_string(),
             name: "test_repeat_state".to_string(),
         },
@@ -1054,11 +1298,11 @@ fn scheduled_repeat_is_not_a_keyboard_state_transition() {
 fn raw_evdev_repeat_is_dropped_and_only_scheduled_repeat_fires() {
     let mut input = NativeInputState::new(320, 200);
     let device = k1_keyboard_id(1);
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::Press,
-        input: BindingInput::Key(KEY_Z),
-        action: BindingAction::EmitShortcut {
+        input: BindingInput::PhysicalKey(KEY_Z),
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "astrea-shell".to_string(),
             name: "raw_repeat_guard".to_string(),
         },
@@ -1084,11 +1328,11 @@ fn raw_evdev_repeat_is_dropped_and_only_scheduled_repeat_fires() {
         };
         let effect = input.handle_hardware_input_event(event);
         if value == 1 {
-            assert_eq!(effect.shortcut_events.len(), 1);
+            assert_eq!(effect.binding_action_invocations.len(), 1);
             assert_eq!(input.keyboard_repeat_deadline_ns(), Some(600_000_000));
         } else {
             assert_eq!(value, 0);
-            assert!(effect.shortcut_events.is_empty());
+            assert!(effect.binding_action_invocations.is_empty());
             assert!(!input.keyboard_key_is_logically_pressed(KEY_Z));
             assert_eq!(input.keyboard_repeat_deadline_ns(), None);
         }
@@ -1097,7 +1341,7 @@ fn raw_evdev_repeat_is_dropped_and_only_scheduled_repeat_fires() {
     assert!(
         input
             .service_keyboard_repeat(1_000_000_000)
-            .shortcut_events
+            .binding_action_invocations
             .is_empty()
     );
 }
@@ -1181,11 +1425,11 @@ fn install_repeat_binding(
     repeat: RepeatPolicy,
     inhibition: InhibitionPolicy,
 ) {
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers,
         trigger: BindingTrigger::Press,
-        input: BindingInput::Key(code),
-        action: BindingAction::EmitShortcut {
+        input: BindingInput::PhysicalKey(code),
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "astrea-shell".to_string(),
             name: "test_repeat".to_string(),
         },
@@ -1208,6 +1452,7 @@ fn apply_k1_keyboard_effect(
     apply_native_input_effect(
         effect,
         NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
             server,
             perf: NativePerfLogger::from_env(),
             resize_perf,
@@ -1321,10 +1566,10 @@ fn modifier_families_remain_active_until_the_last_left_or_right_key_releases() {
         assert!(input.active_modifier_mask().contains(family));
         if family == ModifierMask::ALT {
             input.handle_key_event(KEY_TAB, 1);
-            assert!(left_release.shortcut_events.is_empty());
+            assert!(left_release.binding_action_invocations.is_empty());
             let final_release = input.handle_key_event(right, 0);
             assert_eq!(
-                final_release.shortcut_events,
+                resolved_shortcut_events(&input, &final_release),
                 vec![AstreaShortcutEvent::pressed(
                     "astrea-shell",
                     "alt_tab_commit"
@@ -1391,10 +1636,9 @@ fn removing_both_alt_variants_commits_alt_tab_once_after_both_releases() {
     let device = k1_keyboard_id(84);
     input.handle_key_event_from(device, KEY_LEFTALT, 1);
     input.handle_key_event_from(device, KEY_RIGHTALT, 1);
+    let tab_press = input.handle_key_event_from(device, KEY_TAB, 1);
     assert_eq!(
-        input
-            .handle_key_event_from(device, KEY_TAB, 1)
-            .shortcut_events,
+        resolved_shortcut_events(&input, &tab_press),
         vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
     );
     let releases_before = input
@@ -1412,7 +1656,7 @@ fn removing_both_alt_variants_commits_alt_tab_once_after_both_releases() {
         ]
     );
     assert_eq!(
-        removed.shortcut_events,
+        resolved_shortcut_events(&input, &removed),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "alt_tab_commit"
@@ -1455,7 +1699,7 @@ fn another_source_keeps_alt_active_until_its_final_release() {
         ]
     );
     assert!(input.active_modifier_mask().contains(ModifierMask::ALT));
-    assert!(first_removed.shortcut_events.is_empty());
+    assert!(first_removed.binding_action_invocations.is_empty());
     assert_eq!(
         input
             .binding_manager
@@ -1472,7 +1716,7 @@ fn another_source_keeps_alt_active_until_its_final_release() {
     );
     assert!(!input.active_modifier_mask().contains(ModifierMask::ALT));
     assert_eq!(
-        second_removed.shortcut_events,
+        resolved_shortcut_events(&input, &second_removed),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "alt_tab_commit"
@@ -1531,7 +1775,7 @@ fn removing_a_source_releases_shortcut_triggers_before_modifiers() {
     input.handle_key_event_from(device, KEY_LEFTALT, 1);
     let tab_press = input.handle_key_event_from(device, KEY_TAB, 1);
     assert_eq!(
-        tab_press.shortcut_events,
+        resolved_shortcut_events(&input, &tab_press),
         vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
     );
 
@@ -1546,7 +1790,7 @@ fn removing_a_source_releases_shortcut_triggers_before_modifiers() {
     );
     assert!(removed.keyboard_events.is_empty());
     assert_eq!(
-        removed.shortcut_events,
+        resolved_shortcut_events(&input, &removed),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "alt_tab_commit"
@@ -1600,7 +1844,7 @@ fn removing_a_compositor_consumed_shortcut_never_sends_a_client_release() {
             .all(|action| matches!(action, NativeKeyboardAction::PhysicalOnly(_)))
     );
     assert_eq!(
-        removed.shortcut_events,
+        resolved_shortcut_events(&input, &removed),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "alt_tab_commit"
@@ -1683,11 +1927,11 @@ fn native_input_caps_lock_repeat_does_not_create_an_extra_transition() {
 #[test]
 fn native_input_release_trigger_shortcut_emits_released_phase() {
     let mut input = NativeInputState::new(320, 200);
-    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::Release,
-        input: BindingInput::Key(KEY_Z),
-        action: BindingAction::EmitShortcut {
+        input: BindingInput::PhysicalKey(KEY_Z),
+        action: BindingActionDefinition::EmitShortcut {
             namespace: "astrea-shell".to_string(),
             name: "test_release".to_string(),
         },
@@ -1699,9 +1943,9 @@ fn native_input_release_trigger_shortcut_emits_released_phase() {
     input.handle_key_event(KEY_Z, 1);
     let release = input.handle_key_event(KEY_Z, 0);
 
-    assert_eq!(release.shortcut_events.len(), 1);
+    assert_eq!(release.binding_action_invocations.len(), 1);
     assert_eq!(
-        release.shortcut_events[0].phase,
+        release.binding_action_invocations[0].phase,
         AstreaShortcutPhase::Released
     );
 }
@@ -1715,18 +1959,17 @@ fn native_input_zero_owner_spotlight_press_launches_one_fallback() {
     let mut server =
         OwnCompositorServer::bind(format!("typhon-shortcut-fallback-{}", std::process::id()))
             .unwrap();
+    let (action_manager, invocation) =
+        shortcut_action_manager("spotlight_toggle", AstreaShortcutPhase::Pressed);
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            shortcut_events: vec![AstreaShortcutEvent {
-                namespace: "astrea-shell".to_string(),
-                name: "spotlight_toggle".to_string(),
-                phase: AstreaShortcutPhase::Pressed,
-            }],
+            binding_action_invocations: vec![invocation],
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: action_manager.action_catalog(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -1757,18 +2000,17 @@ fn native_input_zero_owner_alt_tab_next_launches_one_fallback() {
     let mut server =
         OwnCompositorServer::bind(format!("typhon-alt-tab-fallback-{}", std::process::id()))
             .unwrap();
+    let (action_manager, invocation) =
+        shortcut_action_manager("alt_tab_next", AstreaShortcutPhase::Pressed);
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            shortcut_events: vec![AstreaShortcutEvent {
-                namespace: "astrea-shell".to_string(),
-                name: "alt_tab_next".to_string(),
-                phase: AstreaShortcutPhase::Pressed,
-            }],
+            binding_action_invocations: vec![invocation],
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: action_manager.action_catalog(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -1815,17 +2057,17 @@ fn native_input_spotlight_fallback_spawn_failure_is_non_fatal_and_recorded() {
         std::process::id()
     ))
     .unwrap();
+    let (action_manager, invocation) =
+        shortcut_action_manager("spotlight_toggle", AstreaShortcutPhase::Pressed);
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            shortcut_events: vec![AstreaShortcutEvent::pressed(
-                "astrea-shell",
-                "spotlight_toggle",
-            )],
+            binding_action_invocations: vec![invocation],
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: action_manager.action_catalog(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -1869,14 +2111,17 @@ fn native_input_alt_tab_fallback_spawn_failure_is_non_fatal_and_recorded() {
         std::process::id()
     ))
     .unwrap();
+    let (action_manager, invocation) =
+        shortcut_action_manager("alt_tab_next", AstreaShortcutPhase::Pressed);
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            shortcut_events: vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")],
+            binding_action_invocations: vec![invocation],
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: action_manager.action_catalog(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -1934,18 +2179,16 @@ fn native_input_zero_owner_repeat_and_alt_tab_non_next_do_not_launch_fallback() 
             name
         ))
         .unwrap();
+        let (action_manager, invocation) = shortcut_action_manager(name, phase);
         let mut process_supervisor = ChildSupervisor::new();
         let mut resize_perf = NativeResizePerfState::default();
         let application = apply_native_input_effect(
             NativeInputEffect {
-                shortcut_events: vec![AstreaShortcutEvent {
-                    namespace: "astrea-shell".to_string(),
-                    name: name.to_string(),
-                    phase,
-                }],
+                binding_action_invocations: vec![invocation],
                 ..NativeInputEffect::default()
             },
             NativeInputApplyContext {
+                binding_action_catalog: action_manager.action_catalog(),
                 server: &mut server,
                 perf: NativePerfLogger::from_env(),
                 resize_perf: &mut resize_perf,
@@ -2108,12 +2351,12 @@ fn native_input_alt_tab_sequence_emits_astrea_shortcuts() {
     let commit = input.handle_key_event(KEY_LEFTALT, 0);
 
     assert_eq!(
-        next.shortcut_events,
+        resolved_shortcut_events(&input, &next),
         vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
     );
     assert!(next.keyboard_events.is_empty());
     assert_eq!(
-        commit.shortcut_events,
+        resolved_shortcut_events(&input, &commit),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "alt_tab_commit"
@@ -2136,7 +2379,7 @@ fn native_input_alt_shift_tab_sequence_emits_previous() {
     let previous = input.handle_key_event(KEY_TAB, 1);
 
     assert_eq!(
-        previous.shortcut_events,
+        resolved_shortcut_events(&input, &previous),
         vec![AstreaShortcutEvent::pressed(
             "astrea-shell",
             "alt_tab_previous"
@@ -2148,12 +2391,31 @@ fn native_input_alt_shift_tab_sequence_emits_previous() {
 #[test]
 fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
     let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous = [
+        (
+            "OBLIVION_ONE_SESSION_1_COMMAND",
+            std::env::var_os("OBLIVION_ONE_SESSION_1_COMMAND"),
+        ),
+        (
+            "OBLIVION_ONE_SESSION_2_COMMAND",
+            std::env::var_os("OBLIVION_ONE_SESSION_2_COMMAND"),
+        ),
+        (
+            "OBLIVION_ONE_SESSION_3_COMMAND",
+            std::env::var_os("OBLIVION_ONE_SESSION_3_COMMAND"),
+        ),
+    ];
     unsafe {
         std::env::set_var("OBLIVION_ONE_SESSION_1_COMMAND", "switch-one");
         std::env::set_var("OBLIVION_ONE_SESSION_2_COMMAND", "switch-two");
         std::env::set_var("OBLIVION_ONE_SESSION_3_COMMAND", "switch-three");
     }
     let mut input = NativeInputState::new(320, 200);
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SESSION_1_COMMAND", "changed-after-build");
+        std::env::set_var("OBLIVION_ONE_SESSION_2_COMMAND", "changed-after-build");
+        std::env::set_var("OBLIVION_ONE_SESSION_3_COMMAND", "changed-after-build");
+    }
     input.handle_key_event(KEY_LEFTCTRL, 1);
     input.handle_key_event(KEY_LEFTSHIFT, 1);
     input.handle_key_event(KEY_LEFTALT, 1);
@@ -2163,7 +2425,7 @@ fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
     let three = input.handle_key_event(KEY_3, 1);
 
     assert_eq!(
-        one.launch_command,
+        resolved_binding_command(&input, &one),
         Some(vec![
             "sh".to_string(),
             "-lc".to_string(),
@@ -2171,7 +2433,7 @@ fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
         ])
     );
     assert_eq!(
-        two.launch_command,
+        resolved_binding_command(&input, &two),
         Some(vec![
             "sh".to_string(),
             "-lc".to_string(),
@@ -2179,7 +2441,7 @@ fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
         ])
     );
     assert_eq!(
-        three.launch_command,
+        resolved_binding_command(&input, &three),
         Some(vec![
             "sh".to_string(),
             "-lc".to_string(),
@@ -2188,9 +2450,52 @@ fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
     );
 
     unsafe {
+        for (name, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+}
+
+#[test]
+fn unavailable_session_command_stays_consumed_and_uses_construction_snapshot() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("OBLIVION_ONE_SESSION_1_COMMAND");
+    unsafe {
         std::env::remove_var("OBLIVION_ONE_SESSION_1_COMMAND");
-        std::env::remove_var("OBLIVION_ONE_SESSION_2_COMMAND");
-        std::env::remove_var("OBLIVION_ONE_SESSION_3_COMMAND");
+    }
+    let mut input = NativeInputState::new(320, 200);
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SESSION_1_COMMAND", "added-after-build");
+    }
+    input.handle_key_event(KEY_LEFTCTRL, 1);
+    input.handle_key_event(KEY_LEFTSHIFT, 1);
+    input.handle_key_event(KEY_LEFTALT, 1);
+
+    let effect = input.handle_key_event(KEY_1, 1);
+    assert!(effect.keyboard_events.is_empty());
+    assert!(effect.launch_command.is_none());
+    assert_eq!(effect.binding_action_invocations.len(), 1);
+    assert!(matches!(
+        input
+            .binding_manager
+            .action_catalog()
+            .action(effect.binding_action_invocations[0].action),
+        Some(BindingActionDefinition::LaunchSessionCommand {
+            index: 1,
+            command: None
+        })
+    ));
+
+    unsafe {
+        if let Some(previous) = previous {
+            std::env::set_var("OBLIVION_ONE_SESSION_1_COMMAND", previous);
+        } else {
+            std::env::remove_var("OBLIVION_ONE_SESSION_1_COMMAND");
+        }
     }
 }
 
@@ -2921,7 +3226,10 @@ fn native_input_astrea_keyboard_shortcuts_map_to_actions_and_events() {
     let close = input.handle_key_event(KEY_C, 1);
     let fullscreen = input.handle_key_event(KEY_F, 1);
 
-    assert_eq!(launch.launch_command, Some(vec!["kitty".to_string()]));
+    assert_eq!(
+        resolved_binding_command(&input, &launch),
+        Some(vec!["kitty".to_string()])
+    );
     assert!(launch.keyboard_events.is_empty());
     assert_eq!(
         close.window_actions,
@@ -3097,6 +3405,7 @@ fn apply_native_keyboard_events(
         apply_native_input_effect(
             input.handle_key_event(code, value),
             NativeInputApplyContext {
+                binding_action_catalog: input.binding_manager.action_catalog(),
                 server,
                 perf: NativePerfLogger::from_env(),
                 resize_perf: &mut resize_perf,
@@ -3753,6 +4062,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -3804,6 +4114,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,
@@ -3838,6 +4149,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
             server: &mut server,
             perf: NativePerfLogger::from_env(),
             resize_perf: &mut resize_perf,

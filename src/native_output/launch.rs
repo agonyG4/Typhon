@@ -47,10 +47,24 @@ pub(crate) fn astrea_shortcut_fallback_kind(
     shortcut: &AstreaShortcutEvent,
     protocol_clients: usize,
 ) -> Option<AstreaShortcutFallbackKind> {
-    if protocol_clients > 0 || shortcut.phase != AstreaShortcutPhase::Pressed {
+    astrea_shortcut_fallback_kind_parts(
+        &shortcut.namespace,
+        &shortcut.name,
+        shortcut.phase,
+        protocol_clients,
+    )
+}
+
+pub(crate) fn astrea_shortcut_fallback_kind_parts(
+    namespace: &str,
+    name: &str,
+    phase: AstreaShortcutPhase,
+    protocol_clients: usize,
+) -> Option<AstreaShortcutFallbackKind> {
+    if protocol_clients > 0 || phase != AstreaShortcutPhase::Pressed {
         return None;
     }
-    match (shortcut.namespace.as_str(), shortcut.name.as_str()) {
+    match (namespace, name) {
         ("astrea-shell", "spotlight_toggle") => Some(AstreaShortcutFallbackKind::Spotlight),
         ("astrea-shell", "alt_tab_next") => Some(AstreaShortcutFallbackKind::AltTab),
         _ => None,

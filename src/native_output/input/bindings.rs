@@ -1,7 +1,7 @@
 use super::*;
 use oblivion_one::wm::WorkspaceId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ModifierMask(u8);
 
 impl ModifierMask {
@@ -28,7 +28,7 @@ impl std::ops::BitOr for ModifierMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BindingTrigger {
     Press,
     Release,
@@ -36,14 +36,14 @@ pub(crate) enum BindingTrigger {
     PointerRelease,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BindingInput {
-    Key(u16),
+    PhysicalKey(u16),
     PointerButton(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BindingAction {
+pub(crate) enum BindingActionDefinition {
     ExitCompositor,
     CloseActiveWindow,
     ToggleFullscreen,
@@ -53,10 +53,16 @@ pub(crate) enum BindingAction {
     ToggleDefaultSpecialWorkspace,
     MoveFocusedWindowToOrFromSpecialWorkspace,
     LaunchCommand(Vec<String>),
-    LaunchSessionCommand(u8),
+    LaunchSessionCommand {
+        index: u8,
+        command: Option<Vec<String>>,
+    },
     BeginMove,
     BeginResize,
-    EmitShortcut { namespace: String, name: String },
+    EmitShortcut {
+        namespace: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,12 +77,13 @@ pub(crate) enum InhibitionPolicy {
     Bypass,
 }
 
+/// Cold definition input. Compiled bindings retain only their action ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Binding {
+pub(crate) struct BindingSpec {
     pub(crate) modifiers: ModifierMask,
     pub(crate) trigger: BindingTrigger,
     pub(crate) input: BindingInput,
-    pub(crate) action: BindingAction,
+    pub(crate) action: BindingActionDefinition,
     pub(crate) repeat: RepeatPolicy,
     pub(crate) inhibition: InhibitionPolicy,
     pub(crate) reserved: bool,
@@ -87,168 +94,8 @@ pub(crate) struct ActiveBindingState {
     pub(crate) alt_tab_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AstreaBindingManager {
-    bindings: Vec<Binding>,
-    active_sequences: ActiveBindingState,
-    #[cfg(test)]
-    modifier_release_call_counts: [usize; 4],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AstreaBindingMatch {
-    Consumed {
-        action: BindingAction,
-        phase: AstreaShortcutPhase,
-        repeat: RepeatPolicy,
-        inhibition: InhibitionPolicy,
-    },
-    Pass,
-}
-
-impl Default for AstreaBindingManager {
-    fn default() -> Self {
-        Self::with_default_bindings()
-    }
-}
-
-impl AstreaBindingManager {
-    pub(crate) fn with_default_bindings() -> Self {
-        Self {
-            bindings: default_astrea_bindings(),
-            active_sequences: ActiveBindingState::default(),
-            #[cfg(test)]
-            modifier_release_call_counts: [0; 4],
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_bindings(bindings: Vec<Binding>) -> Self {
-        Self {
-            bindings,
-            active_sequences: ActiveBindingState::default(),
-            #[cfg(test)]
-            modifier_release_call_counts: [0; 4],
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn modifier_release_call_count(&self, family: ModifierMask) -> usize {
-        self.modifier_release_call_counts
-            [modifier_release_index(family).expect("test query must name one modifier family")]
-    }
-
-    pub(crate) fn handle_key(
-        &mut self,
-        modifiers: ModifierMask,
-        code: u16,
-        pressed: bool,
-        repeated: bool,
-        inhibited: bool,
-    ) -> AstreaBindingMatch {
-        let trigger = if pressed {
-            BindingTrigger::Press
-        } else {
-            BindingTrigger::Release
-        };
-        let input = BindingInput::Key(code);
-        let Some(binding) = self.match_binding(modifiers, trigger, input, repeated, inhibited)
-        else {
-            return AstreaBindingMatch::Pass;
-        };
-        let trigger = binding.trigger;
-        let action = binding.action.clone();
-        let repeat = binding.repeat;
-        let inhibition = binding.inhibition;
-        let phase = shortcut_phase(trigger, repeated);
-        if matches!(
-            action,
-            BindingAction::EmitShortcut { ref namespace, ref name }
-                if namespace == "astrea-shell" && name.starts_with("alt_tab_")
-        ) && name_is_alt_tab_step(&action)
-        {
-            self.active_sequences.alt_tab_active = true;
-        }
-        AstreaBindingMatch::Consumed {
-            action,
-            phase,
-            repeat,
-            inhibition,
-        }
-    }
-
-    pub(crate) fn handle_pointer_button(
-        &mut self,
-        modifiers: ModifierMask,
-        button: u32,
-        pressed: bool,
-        inhibited: bool,
-    ) -> AstreaBindingMatch {
-        let trigger = if pressed {
-            BindingTrigger::PointerPress
-        } else {
-            BindingTrigger::PointerRelease
-        };
-        let input = BindingInput::PointerButton(button);
-        self.match_binding(modifiers, trigger, input, false, inhibited)
-            .map(|binding| AstreaBindingMatch::Consumed {
-                action: binding.action.clone(),
-                phase: shortcut_phase(binding.trigger, false),
-                repeat: binding.repeat,
-                inhibition: binding.inhibition,
-            })
-            .unwrap_or(AstreaBindingMatch::Pass)
-    }
-
-    pub(crate) fn handle_modifier_release(&mut self, released: ModifierMask) -> AstreaBindingMatch {
-        #[cfg(test)]
-        if let Some(index) = modifier_release_index(released) {
-            self.modifier_release_call_counts[index] += 1;
-        }
-
-        if released == ModifierMask::ALT && self.active_sequences.alt_tab_active {
-            self.active_sequences.alt_tab_active = false;
-            return AstreaBindingMatch::Consumed {
-                action: BindingAction::EmitShortcut {
-                    namespace: "astrea-shell".to_string(),
-                    name: "alt_tab_commit".to_string(),
-                },
-                phase: AstreaShortcutPhase::Pressed,
-                repeat: RepeatPolicy::Disabled,
-                inhibition: InhibitionPolicy::Respect,
-            };
-        }
-        AstreaBindingMatch::Pass
-    }
-
-    pub(crate) fn cancel_shortcut_sequences_for_inhibition(&mut self) {
-        // Inhibition transfers ownership of subsequent keyboard input to the
-        // focused client.  Cancel stateful compositor sequences without
-        // emitting their completion action; physical modifier truth remains
-        // owned by NativeInputState.
-        self.active_sequences.alt_tab_active = false;
-    }
-
-    fn match_binding(
-        &self,
-        modifiers: ModifierMask,
-        trigger: BindingTrigger,
-        input: BindingInput,
-        repeated: bool,
-        inhibited: bool,
-    ) -> Option<&Binding> {
-        self.bindings.iter().rev().find(|binding| {
-            binding.trigger == trigger
-                && binding.input == input
-                && binding.modifiers.matches(modifiers)
-                && (!repeated || binding.repeat == RepeatPolicy::Enabled)
-                && (!inhibited || binding.inhibition == InhibitionPolicy::Bypass)
-        })
-    }
-}
-
 #[cfg(test)]
-fn modifier_release_index(family: ModifierMask) -> Option<usize> {
+pub(super) fn modifier_release_index(family: ModifierMask) -> Option<usize> {
     if family == ModifierMask::ALT {
         Some(0)
     } else if family == ModifierMask::CTRL {
@@ -262,7 +109,7 @@ fn modifier_release_index(family: ModifierMask) -> Option<usize> {
     }
 }
 
-const fn shortcut_phase(trigger: BindingTrigger, repeated: bool) -> AstreaShortcutPhase {
+pub(super) const fn shortcut_phase(trigger: BindingTrigger, repeated: bool) -> AstreaShortcutPhase {
     match trigger {
         BindingTrigger::Press | BindingTrigger::PointerPress => {
             if repeated {
@@ -275,76 +122,67 @@ const fn shortcut_phase(trigger: BindingTrigger, repeated: bool) -> AstreaShortc
     }
 }
 
-fn name_is_alt_tab_step(action: &BindingAction) -> bool {
-    matches!(
-        action,
-        BindingAction::EmitShortcut { namespace, name }
-            if namespace == "astrea-shell"
-                && matches!(name.as_str(), "alt_tab_next" | "alt_tab_previous")
-    )
-}
-
-pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
-    let mut bindings = vec![
-        Binding {
+pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
+    let mut specs = vec![
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_Q),
-            action: BindingAction::LaunchCommand(vec!["kitty".to_string()]),
+            input: BindingInput::PhysicalKey(KEY_Q),
+            action: BindingActionDefinition::LaunchCommand(vec!["kitty".to_string()]),
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_S),
-            action: BindingAction::ToggleDefaultSpecialWorkspace,
+            input: BindingInput::PhysicalKey(KEY_S),
+            action: BindingActionDefinition::ToggleDefaultSpecialWorkspace,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_S),
-            action: BindingAction::MoveFocusedWindowToOrFromSpecialWorkspace,
+            input: BindingInput::PhysicalKey(KEY_S),
+            action: BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_C),
-            action: BindingAction::CloseActiveWindow,
+            input: BindingInput::PhysicalKey(KEY_C),
+            action: BindingActionDefinition::CloseActiveWindow,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_F),
-            action: BindingAction::ToggleFullscreen,
+            input: BindingInput::PhysicalKey(KEY_F),
+            action: BindingActionDefinition::ToggleFullscreen,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_V),
-            action: BindingAction::ToggleFocusedWindowLayout,
+            input: BindingInput::PhysicalKey(KEY_V),
+            action: BindingActionDefinition::ToggleFocusedWindowLayout,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_SPACE),
-            action: BindingAction::EmitShortcut {
+            input: BindingInput::PhysicalKey(KEY_SPACE),
+            action: BindingActionDefinition::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
                 name: "spotlight_toggle".to_string(),
             },
@@ -352,11 +190,11 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::EMPTY,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_SYSRQ),
-            action: BindingAction::EmitShortcut {
+            input: BindingInput::PhysicalKey(KEY_SYSRQ),
+            action: BindingActionDefinition::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
                 name: "screenshot_quick".to_string(),
             },
@@ -364,11 +202,11 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_SYSRQ),
-            action: BindingAction::EmitShortcut {
+            input: BindingInput::PhysicalKey(KEY_SYSRQ),
+            action: BindingActionDefinition::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
                 name: "screenshot_region_frozen".to_string(),
             },
@@ -376,11 +214,11 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_SYSRQ),
-            action: BindingAction::EmitShortcut {
+            input: BindingInput::PhysicalKey(KEY_SYSRQ),
+            action: BindingActionDefinition::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
                 name: "screenshot_region_live".to_string(),
             },
@@ -388,29 +226,29 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::PointerPress,
             input: BindingInput::PointerButton(u32::from(BTN_LEFT)),
-            action: BindingAction::BeginMove,
+            action: BindingActionDefinition::BeginMove,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::PointerPress,
             input: BindingInput::PointerButton(u32::from(BTN_RIGHT)),
-            action: BindingAction::BeginResize,
+            action: BindingActionDefinition::BeginResize,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::ALT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_TAB),
-            action: BindingAction::EmitShortcut {
+            input: BindingInput::PhysicalKey(KEY_TAB),
+            action: BindingActionDefinition::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
                 name: "alt_tab_next".to_string(),
             },
@@ -418,11 +256,11 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::ALT | ModifierMask::SHIFT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_TAB),
-            action: BindingAction::EmitShortcut {
+            input: BindingInput::PhysicalKey(KEY_TAB),
+            action: BindingActionDefinition::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
                 name: "alt_tab_previous".to_string(),
             },
@@ -430,66 +268,75 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::ALT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_P),
-            action: BindingAction::ExitCompositor,
+            input: BindingInput::PhysicalKey(KEY_P),
+            action: BindingActionDefinition::ExitCompositor,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_1),
-            action: BindingAction::LaunchSessionCommand(1),
+            input: BindingInput::PhysicalKey(KEY_1),
+            action: BindingActionDefinition::LaunchSessionCommand {
+                index: 1,
+                command: None,
+            },
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_2),
-            action: BindingAction::LaunchSessionCommand(2),
+            input: BindingInput::PhysicalKey(KEY_2),
+            action: BindingActionDefinition::LaunchSessionCommand {
+                index: 2,
+                command: None,
+            },
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-        Binding {
+        BindingSpec {
             modifiers: ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(KEY_3),
-            action: BindingAction::LaunchSessionCommand(3),
+            input: BindingInput::PhysicalKey(KEY_3),
+            action: BindingActionDefinition::LaunchSessionCommand {
+                index: 3,
+                command: None,
+            },
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
     ];
-    for workspace in 1..=10 {
-        let workspace = WorkspaceId::new(workspace).expect("workspace binding id");
+    for workspace_number in 1..=10 {
+        let workspace = WorkspaceId::new(workspace_number).expect("workspace binding id");
         let key = workspace_key(workspace);
-        bindings.push(Binding {
+        specs.push(BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(key),
-            action: BindingAction::SwitchWorkspace(workspace),
+            input: BindingInput::PhysicalKey(key),
+            action: BindingActionDefinition::SwitchWorkspace(workspace),
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         });
-        bindings.push(Binding {
+        specs.push(BindingSpec {
             modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
             trigger: BindingTrigger::Press,
-            input: BindingInput::Key(key),
-            action: BindingAction::MoveFocusedWindowToWorkspace(workspace),
+            input: BindingInput::PhysicalKey(key),
+            action: BindingActionDefinition::MoveFocusedWindowToWorkspace(workspace),
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
         });
     }
-    bindings
+    specs
 }
 
 const fn workspace_key(workspace: WorkspaceId) -> u16 {
@@ -512,89 +359,101 @@ const fn workspace_key(workspace: WorkspaceId) -> u16 {
 mod tests {
     use super::*;
 
+    fn action_for_match<'a>(
+        manager: &'a AstreaBindingManager,
+        matched: AstreaBindingMatch,
+    ) -> Option<&'a BindingActionDefinition> {
+        match matched {
+            AstreaBindingMatch::Consumed { action, .. } => manager.action_catalog().action(action),
+            AstreaBindingMatch::Pass => None,
+        }
+    }
+
     #[test]
     fn default_workspace_bindings_are_typed_non_repeating_and_not_reserved() {
-        let mut manager = AstreaBindingManager::default();
+        let manager = AstreaBindingManager::default();
+        let matched = manager.handle_key(ModifierMask::SUPER, KEY_0, true, false, false);
         assert_eq!(
-            manager.handle_key(ModifierMask::SUPER, KEY_0, true, false, false),
-            AstreaBindingMatch::Consumed {
-                action: BindingAction::SwitchWorkspace(WorkspaceId::new(10).unwrap()),
-                phase: AstreaShortcutPhase::Pressed,
-                repeat: RepeatPolicy::Disabled,
-                inhibition: InhibitionPolicy::Respect,
-            }
+            action_for_match(&manager, matched),
+            Some(&BindingActionDefinition::SwitchWorkspace(
+                WorkspaceId::new(10).unwrap()
+            ))
         );
         assert_eq!(
             manager.handle_key(ModifierMask::SUPER, KEY_0, true, true, false),
             AstreaBindingMatch::Pass
         );
-        assert_eq!(
-            manager.handle_key(
-                ModifierMask::SUPER | ModifierMask::SHIFT,
-                KEY_4,
-                true,
-                false,
-                false,
-            ),
-            AstreaBindingMatch::Consumed {
-                action: BindingAction::MoveFocusedWindowToWorkspace(WorkspaceId::new(4).unwrap(),),
-                phase: AstreaShortcutPhase::Pressed,
-                repeat: RepeatPolicy::Disabled,
-                inhibition: InhibitionPolicy::Respect,
-            }
+        let matched = manager.handle_key(
+            ModifierMask::SUPER | ModifierMask::SHIFT,
+            KEY_4,
+            true,
+            false,
+            false,
         );
+        assert_eq!(
+            action_for_match(&manager, matched),
+            Some(&BindingActionDefinition::MoveFocusedWindowToWorkspace(
+                WorkspaceId::new(4).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn default_pointer_bindings_keep_move_resize_and_inhibition_policy() {
+        let mut manager = AstreaBindingManager::default();
+
+        for (button, expected) in [
+            (BTN_LEFT, BindingActionDefinition::BeginMove),
+            (BTN_RIGHT, BindingActionDefinition::BeginResize),
+        ] {
+            let matched =
+                manager.handle_pointer_button(ModifierMask::SUPER, u32::from(button), true, false);
+            assert_eq!(action_for_match(&manager, matched), Some(&expected));
+            assert_eq!(
+                manager.handle_pointer_button(ModifierMask::SUPER, u32::from(button), true, true,),
+                AstreaBindingMatch::Pass
+            );
+        }
     }
 
     #[test]
     fn session_switch_bindings_keep_their_reserved_modifier_boundary() {
-        let mut manager = AstreaBindingManager::default();
-        assert_eq!(
-            manager.handle_key(
-                ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
-                KEY_1,
-                true,
-                false,
-                true,
-            ),
-            AstreaBindingMatch::Consumed {
-                action: BindingAction::LaunchSessionCommand(1),
-                phase: AstreaShortcutPhase::Pressed,
-                repeat: RepeatPolicy::Disabled,
-                inhibition: InhibitionPolicy::Bypass,
-            }
+        let manager = AstreaBindingManager::default();
+        let matched = manager.handle_key(
+            ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
+            KEY_1,
+            true,
+            false,
+            true,
         );
+        assert!(matches!(
+            action_for_match(&manager, matched),
+            Some(BindingActionDefinition::LaunchSessionCommand { index: 1, .. })
+        ));
     }
 
     #[test]
     fn special_workspace_bindings_are_press_only_exact_and_inhibition_aware() {
-        let mut manager = AstreaBindingManager::default();
+        let manager = AstreaBindingManager::default();
+        let matched = manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, false);
         assert_eq!(
-            manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, false),
-            AstreaBindingMatch::Consumed {
-                action: BindingAction::ToggleDefaultSpecialWorkspace,
-                phase: AstreaShortcutPhase::Pressed,
-                repeat: RepeatPolicy::Disabled,
-                inhibition: InhibitionPolicy::Respect,
-            }
+            action_for_match(&manager, matched),
+            Some(&BindingActionDefinition::ToggleDefaultSpecialWorkspace)
         );
         assert_eq!(
             manager.handle_key(ModifierMask::SUPER, KEY_S, true, true, false),
             AstreaBindingMatch::Pass
         );
+        let matched = manager.handle_key(
+            ModifierMask::SUPER | ModifierMask::SHIFT,
+            KEY_S,
+            true,
+            false,
+            false,
+        );
         assert_eq!(
-            manager.handle_key(
-                ModifierMask::SUPER | ModifierMask::SHIFT,
-                KEY_S,
-                true,
-                false,
-                false
-            ),
-            AstreaBindingMatch::Consumed {
-                action: BindingAction::MoveFocusedWindowToOrFromSpecialWorkspace,
-                phase: AstreaShortcutPhase::Pressed,
-                repeat: RepeatPolicy::Disabled,
-                inhibition: InhibitionPolicy::Respect,
-            }
+            action_for_match(&manager, matched),
+            Some(&BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace)
         );
         assert_eq!(
             manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, true),

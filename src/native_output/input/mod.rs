@@ -2,6 +2,7 @@ use super::*;
 
 mod backend;
 mod batch;
+mod binding_table;
 mod bindings;
 mod epoch;
 mod events;
@@ -12,6 +13,7 @@ mod state;
 
 pub(crate) use backend::*;
 pub(crate) use batch::*;
+pub(crate) use binding_table::*;
 pub(crate) use bindings::*;
 pub(crate) use epoch::*;
 pub(crate) use events::*;
