@@ -120,11 +120,15 @@ impl NativeRuntime {
         if cycle.wakeup.controller_monitor_ready {
             manager.service_monitor();
         }
-        let outcome = manager.drain_ready(readiness, |id, token| {
-            token_map
-                .get(&id)
-                .is_some_and(|registered| *registered == token)
-        });
+        let outcome = manager.drain_ready(
+            readiness,
+            |id, token| {
+                token_map
+                    .get(&id)
+                    .is_some_and(|registered| *registered == token)
+            },
+            |_, _| {},
+        );
         if backlog_requested {
             manager.record_backlog_continuation();
         }
@@ -150,6 +154,8 @@ impl NativeRuntime {
             raw_events: telemetry.raw_events,
             logical_frames: telemetry.logical_frames,
             activity_transitions: telemetry.activity_transitions,
+            semantic_frames: telemetry.semantic_frames,
+            semantic_transitions: telemetry.semantic_transitions,
             drain_budget_exhaustions: telemetry.drain_budget_exhaustions,
             backlog_continuations: telemetry.backlog_continuations,
             // evdev's synchronized fetch path repairs SYN_DROPPED internally

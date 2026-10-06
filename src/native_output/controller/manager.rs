@@ -16,6 +16,7 @@ use super::{
         TransportFingerprint,
     },
     policy::ControllerPolicy,
+    semantic::{ControllerActionMask, ControllerSemanticFrame},
 };
 
 /// Target admission budget. An admitted synchronized batch is indivisible and may exceed it.
@@ -41,10 +42,29 @@ pub(crate) struct ControllerTelemetry {
     pub(crate) raw_events: u64,
     pub(crate) logical_frames: u64,
     pub(crate) activity_transitions: u64,
+    pub(crate) semantic_frames: u64,
+    pub(crate) semantic_transitions: u64,
     pub(crate) drain_budget_exhaustions: u64,
     pub(crate) backlog_continuations: u64,
     pub(crate) read_failures: u64,
     pub(crate) hotplug_failures: u64,
+}
+
+impl ControllerTelemetry {
+    pub(super) fn record_batch(&mut self, batch: ControllerBatchStats) {
+        self.logical_frames = self
+            .logical_frames
+            .saturating_add(batch.logical_frames as u64);
+        self.activity_transitions = self
+            .activity_transitions
+            .saturating_add(batch.activity_transitions as u64);
+        self.semantic_frames = self
+            .semantic_frames
+            .saturating_add(batch.semantic_frames as u64);
+        self.semantic_transitions = self
+            .semantic_transitions
+            .saturating_add(batch.semantic_transitions as u64);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -188,6 +208,14 @@ impl ControllerManager {
             .map(ControllerDevice::raw_fd)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn semantic_state(&self, id: ControllerDeviceId) -> Option<ControllerActionMask> {
+        self.devices
+            .iter()
+            .find(|device| device.id() == id)
+            .map(ControllerDevice::semantic_state)
+    }
+
     pub(crate) fn service_monitor(&mut self) {
         if self.policy != ControllerPolicy::Observe || self.suspended {
             return;
@@ -232,6 +260,7 @@ impl ControllerManager {
         &mut self,
         readiness: &[ControllerDeviceReadyEvent],
         mut readiness_is_current: impl FnMut(ControllerDeviceId, ReactorToken) -> bool,
+        mut semantic_sink: impl FnMut(ControllerDeviceId, ControllerSemanticFrame),
     ) -> ControllerDrainOutcome {
         if self.suspended || self.policy != ControllerPolicy::Observe {
             return ControllerDrainOutcome::default();
@@ -272,7 +301,7 @@ impl ControllerManager {
                 continue;
             };
             match drain_admitted_batch(&mut budget, || {
-                self.devices[device_index].drain_synchronized_batch()
+                self.devices[device_index].drain_synchronized_batch(&mut semantic_sink)
             }) {
                 Ok(Some((batch, exhausted))) => {
                     self.record_batch(batch, &mut outcome);
@@ -450,14 +479,7 @@ impl ControllerManager {
     }
 
     fn record_batch(&mut self, batch: ControllerBatchStats, outcome: &mut ControllerDrainOutcome) {
-        self.telemetry.logical_frames = self
-            .telemetry
-            .logical_frames
-            .saturating_add(batch.logical_frames as u64);
-        self.telemetry.activity_transitions = self
-            .telemetry
-            .activity_transitions
-            .saturating_add(batch.activity_transitions as u64);
+        self.telemetry.record_batch(batch);
         outcome.meaningful_activity |= batch.activity_transitions > 0;
     }
 

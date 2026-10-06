@@ -73,9 +73,10 @@ recovery counter, so that telemetry field is reported as unavailable.
 
 ## Future boundaries
 
-C2 may add Astrea Shell semantic controller navigation through the existing
-authenticated shortcut/control path, including external-use suppression.
-C3 may design source-aware aggregate keyboard/pointer ownership, compound
-controller grouping, richer external ownership evidence, optional hidraw
-correlation, leases, and a standardized protocol or portal. None of those
-behaviors is implemented by C1.
+C2 adds only a typed semantic foundation over C1's normalized per-device
+controller frames. It has no consumer. A future Shell or Eclipse adapter is
+separate work and should be built only when that consumer is stable. C3 may
+design source-aware aggregate keyboard/pointer ownership, compound controller
+grouping, richer external ownership evidence, optional hidraw correlation,
+leases, and a standardized protocol or portal. None of those behaviors is
+implemented by C1 or C2.

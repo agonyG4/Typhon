@@ -8,8 +8,12 @@ use std::{
 use evdev::{Device, EventSummary, InputEvent, SynchronizationCode};
 
 use super::frame::{
-    ABS_AXIS_COUNT, AxisRange, ControllerFrame, ControllerFrameBuilder, ControllerInputEvent,
-    KEY_CODE_COUNT, is_controller_button,
+    ABS_AXIS_COUNT, AxisRange, ControllerFrameBuilder, ControllerInputEvent, KEY_CODE_COUNT,
+    is_controller_button,
+};
+use super::semantic::{
+    ControllerActionMask, ControllerSemanticFrame, ControllerSemanticMapper,
+    ControllerSemanticMapping,
 };
 
 const KEY_WORDS: usize = KEY_CODE_COUNT.div_ceil(u64::BITS as usize);
@@ -229,6 +233,7 @@ pub(crate) struct ControllerDevice {
     identity: ControllerIdentity,
     evdev: Device,
     frame_builder: ControllerFrameBuilder,
+    semantic_mapper: ControllerSemanticMapper,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -236,6 +241,8 @@ pub(super) struct ControllerBatchStats {
     pub(super) raw_events: usize,
     pub(super) logical_frames: usize,
     pub(super) activity_transitions: usize,
+    pub(super) semantic_frames: usize,
+    pub(super) semantic_transitions: usize,
 }
 
 impl ControllerDevice {
@@ -282,6 +289,10 @@ impl ControllerDevice {
                 frame_builder.seed_pressed_key(code);
             }
         }
+        let semantic_mapper = ControllerSemanticMapper::seeded(
+            ControllerSemanticMapping::default(),
+            &frame_builder.state_snapshot(),
+        );
 
         let Some(id) = ids.allocate() else {
             return Err(io::Error::other("controller device IDs exhausted"));
@@ -294,6 +305,7 @@ impl ControllerDevice {
             identity,
             evdev,
             frame_builder,
+            semantic_mapper,
         }))
     }
 
@@ -320,21 +332,35 @@ impl ControllerDevice {
     }
 
     /// Drains one evdev synchronized batch atomically before exposing its statistics.
-    pub(crate) fn drain_synchronized_batch(&mut self) -> io::Result<ControllerBatchStats> {
+    /// The infallible sink has no return path into synchronized iterator traversal.
+    pub(crate) fn drain_synchronized_batch(
+        &mut self,
+        sink: &mut impl FnMut(ControllerDeviceId, ControllerSemanticFrame),
+    ) -> io::Result<ControllerBatchStats> {
         let Self {
+            id,
             evdev,
             frame_builder,
+            semantic_mapper,
             ..
         } = self;
         let events = evdev.fetch_events()?;
         Ok(process_synchronized_events(
             events.map(controller_input_event),
             frame_builder,
+            semantic_mapper,
+            *id,
+            sink,
         ))
     }
 
     pub(crate) fn clear_session_state(&mut self) {
         self.frame_builder.clear_session_state();
+        self.semantic_mapper.clear();
+    }
+
+    pub(crate) fn semantic_state(&self) -> ControllerActionMask {
+        self.semantic_mapper.held()
     }
 }
 
@@ -358,20 +384,28 @@ fn controller_input_event(event: InputEvent) -> ControllerInputEvent {
 pub(super) fn process_synchronized_events(
     events: impl IntoIterator<Item = ControllerInputEvent>,
     frame_builder: &mut ControllerFrameBuilder,
+    semantic_mapper: &mut ControllerSemanticMapper,
+    device_id: ControllerDeviceId,
+    sink: &mut impl FnMut(ControllerDeviceId, ControllerSemanticFrame),
 ) -> ControllerBatchStats {
     let mut stats = ControllerBatchStats::default();
     // FetchEventsSynced drops complete SYN_REPORT blocks through its consumed_to marker, so this
-    // traversal must exhaust the iterator before returning.
+    // traversal must exhaust the iterator before returning. The sink has no result or break
+    // channel into this loop.
     for event in events {
         stats.raw_events = stats.raw_events.saturating_add(1);
-        if let Some(ControllerFrame {
-            activity_transition,
-            ..
-        }) = frame_builder.process(event)
-        {
+        if let Some(frame) = frame_builder.process(event) {
             stats.logical_frames = stats.logical_frames.saturating_add(1);
-            if activity_transition {
+            if frame.activity_transition {
                 stats.activity_transitions = stats.activity_transitions.saturating_add(1);
+            }
+            if let Some(semantic_frame) = semantic_mapper.map_frame(&frame) {
+                stats.semantic_frames = stats.semantic_frames.saturating_add(1);
+                stats.semantic_transitions = stats
+                    .semantic_transitions
+                    .saturating_add(semantic_frame.pressed.count() as usize)
+                    .saturating_add(semantic_frame.released.count() as usize);
+                sink(device_id, semantic_frame);
             }
         }
     }

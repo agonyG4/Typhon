@@ -2,6 +2,7 @@ mod device;
 mod frame;
 mod manager;
 mod policy;
+pub(crate) mod semantic;
 
 pub(crate) use device::ControllerDeviceId;
 pub(crate) use manager::{ControllerManager, MAX_CONTROLLER_DEVICES};

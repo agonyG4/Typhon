@@ -1,3 +1,5 @@
+use super::semantic::ControllerButton;
+
 pub(crate) const ABS_AXIS_COUNT: usize = 64;
 pub(crate) const KEY_CODE_COUNT: usize = 0x300;
 const KEY_WORDS: usize = KEY_CODE_COUNT.div_ceil(u64::BITS as usize);
@@ -16,6 +18,8 @@ pub(crate) const ABS_RY: u16 = 0x04;
 pub(crate) const ABS_RZ: u16 = 0x05;
 #[cfg(test)]
 pub(crate) const ABS_HAT0X: u16 = HAT0_X;
+#[cfg(test)]
+pub(crate) const ABS_HAT0Y: u16 = HAT0_Y;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AxisRange {
@@ -91,6 +95,43 @@ pub(crate) struct ControllerFrame {
     pub(crate) button_transition: bool,
     pub(crate) dpad_transition: bool,
     pub(crate) activity_transition: bool,
+}
+
+impl ControllerFrame {
+    /// Returns the current physical state of a standard location-based button.
+    /// D-pad buttons merge Linux BTN_DPAD codes with ABS_HAT0 state.
+    pub(crate) fn standard_button_pressed(&self, button: ControllerButton) -> bool {
+        let code = match button {
+            ControllerButton::South => 0x130,
+            ControllerButton::East => 0x131,
+            ControllerButton::West => 0x134,
+            ControllerButton::North => 0x133,
+            ControllerButton::LeftShoulder => 0x136,
+            ControllerButton::RightShoulder => 0x137,
+            ControllerButton::LeftTriggerButton => 0x138,
+            ControllerButton::RightTriggerButton => 0x139,
+            ControllerButton::Select => 0x13a,
+            ControllerButton::Start => 0x13b,
+            ControllerButton::Guide => 0x13c,
+            ControllerButton::LeftStick => 0x13d,
+            ControllerButton::RightStick => 0x13e,
+            ControllerButton::DpadUp => BTN_DPAD_UP,
+            ControllerButton::DpadDown => 0x221,
+            ControllerButton::DpadLeft => 0x222,
+            ControllerButton::DpadRight => BTN_DPAD_RIGHT,
+        };
+        let index = usize::from(code);
+        let key_pressed =
+            self.buttons[index / u64::BITS as usize] & (1u64 << (index % u64::BITS as usize)) != 0;
+        key_pressed
+            || match button {
+                ControllerButton::DpadUp => self.dpad_y < 0,
+                ControllerButton::DpadDown => self.dpad_y > 0,
+                ControllerButton::DpadLeft => self.dpad_x < 0,
+                ControllerButton::DpadRight => self.dpad_x > 0,
+                _ => false,
+            }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +215,22 @@ impl ControllerFrameBuilder {
         self.pending_button_transition = false;
         self.pending_dpad_transition = false;
         self.pending_changes = false;
+    }
+
+    /// Captures current physical state without consuming pending transitions.
+    pub(crate) fn state_snapshot(&self) -> ControllerFrame {
+        ControllerFrame {
+            buttons: self.buttons,
+            changed_buttons: [0; KEY_WORDS],
+            dpad_x: self.axes[usize::from(HAT0_X)].clamp(-1, 1) as i8,
+            dpad_y: self.axes[usize::from(HAT0_Y)].clamp(-1, 1) as i8,
+            left_stick: [self.signed_axis(ABS_X), self.signed_axis(ABS_Y)],
+            right_stick: [self.signed_axis(ABS_RX), self.signed_axis(ABS_RY)],
+            triggers: [self.trigger_axis(ABS_Z), self.trigger_axis(ABS_RZ)],
+            button_transition: false,
+            dpad_transition: false,
+            activity_transition: false,
+        }
     }
 
     fn process_key(&mut self, code: u16, value: i32) {

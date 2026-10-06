@@ -219,6 +219,8 @@ pub struct ControllerObserverSnapshot {
     pub raw_events: u64,
     pub logical_frames: u64,
     pub activity_transitions: u64,
+    pub semantic_frames: u64,
+    pub semantic_transitions: u64,
     pub drain_budget_exhaustions: u64,
     pub backlog_continuations: u64,
     #[serde(default)]
@@ -237,12 +239,39 @@ impl Default for ControllerObserverSnapshot {
             raw_events: 0,
             logical_frames: 0,
             activity_transitions: 0,
+            semantic_frames: 0,
+            semantic_transitions: 0,
             drain_budget_exhaustions: 0,
             backlog_continuations: 0,
             synchronization_recoveries: None,
             read_failures: 0,
             hotplug_failures: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod controller_observer_snapshot_tests {
+    use super::ControllerObserverSnapshot;
+
+    #[test]
+    fn semantic_telemetry_is_serialized_and_defaults_to_zero() {
+        let default = ControllerObserverSnapshot::default();
+        assert_eq!(default.semantic_frames, 0);
+        assert_eq!(default.semantic_transitions, 0);
+        let snapshot = ControllerObserverSnapshot {
+            semantic_frames: 4,
+            semantic_transitions: 7,
+            ..ControllerObserverSnapshot::default()
+        };
+
+        let encoded = serde_json::to_value(&snapshot).expect("serialize controller telemetry");
+        assert_eq!(encoded["semanticFrames"], 4);
+        assert_eq!(encoded["semanticTransitions"], 7);
+        let decoded: ControllerObserverSnapshot =
+            serde_json::from_value(encoded).expect("deserialize controller telemetry");
+        assert_eq!(decoded.semantic_frames, 4);
+        assert_eq!(decoded.semantic_transitions, 7);
     }
 }
 
