@@ -385,6 +385,7 @@ impl NativeRuntime {
                 NativePerfField::str("startup", kms_commit_worker_startup.as_str()),
             ]
         });
+        let refresh_interval_ns = output_refresh_rate.interval_ns();
         let acquire_notifier = DrmAcquirePointNotifier;
         let acquire_watches =
             ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
@@ -481,7 +482,6 @@ impl NativeRuntime {
             event_loop.register(fd, NativeEventSource::ChildSignal)?;
         }
         let scheduler_anchor_ns = monotonic_now_ns()?;
-        let refresh_interval_ns = output_refresh_rate.interval_ns();
         let refresh_hz = output_refresh_rate.rounded_hz();
         let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
             refresh_interval_ns,

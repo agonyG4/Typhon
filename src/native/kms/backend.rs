@@ -1895,6 +1895,27 @@ impl KmsBackendSelection {
             .commit_runtime_modeset_candidate(candidate)
     }
 
+    /// Finalizes state after this selection accepted a real Atomic modeset.
+    ///
+    /// A successful `commit_runtime_modeset_candidate` is only possible when
+    /// this selection is `Atomic`; the selection is owned by the runtime and
+    /// cannot change between that commit and this synchronous finalization.
+    /// Keep this post-commit operation infallible so callers cannot recover
+    /// with kernel state advanced but runtime state still on the old mode.
+    pub fn adopt_committed_runtime_modeset_candidate(
+        &mut self,
+        candidate: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) {
+        match &mut self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.adopt_committed_runtime_modeset_candidate(candidate);
+            }
+            KmsDisplayBackend::Legacy(_) => {
+                unreachable!("successful runtime Atomic commit requires the Atomic backend")
+            }
+        }
+    }
+
     pub fn adopt_runtime_modeset_candidate(
         &mut self,
         candidate: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,

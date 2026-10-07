@@ -6,12 +6,12 @@ use std::sync::{
     mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 
+use crate::native_output::KmsModeTiming;
 use oblivion_one::native::kms::{
     AtomicCursorVisualState, DrmModeBlobIo, FramebufferId, PreparedAtomicRuntimeModeset,
 };
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use oblivion_one::native::scheduler::NativeFrameScheduler;
-use oblivion_one::native_output::presentation::kms_timing::KmsModeTiming;
 use oblivion_one::private_config::{PrivateConfigError, PrivateConfigFile};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 

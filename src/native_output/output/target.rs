@@ -389,11 +389,7 @@ pub(crate) fn output_refresh_rate_for_mode(mode: &drm_sys::drm_mode_modeinfo) ->
         refresh_millihz
     };
     let fallback_interval_ns = 1_000_000_000_000u64 / u64::from(refresh_millihz);
-    let interval_ns =
-        oblivion_one::native_output::presentation::kms_timing::KmsModeTiming::from_mode(
-            mode,
-            fallback_interval_ns,
-        )
+    let interval_ns = crate::native_output::KmsModeTiming::from_mode(mode, fallback_interval_ns)
         .refresh_interval_ns();
     OutputRefreshRate::from_native_timing(refresh_millihz, interval_ns)
 }

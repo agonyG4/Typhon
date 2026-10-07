@@ -28,6 +28,7 @@ use oblivion_one::window_lifecycle_animation::{
 };
 use std::borrow::Cow;
 use std::process;
+use wayland_server::Resource;
 use wayland_server::protocol::wl_output;
 
 fn test_surface(
