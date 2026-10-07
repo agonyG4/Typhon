@@ -103,6 +103,25 @@ physical capture pixels. Its first downsample keeps the ordinary
 `DualKawaseDownsample` timing, including the additional direct-output sampling
 work.
 
+`TYPHON_EFFECT_GPU_STALL_DIAGNOSTICS=1` adds opt-in host submission timings and
+one optional GPU-memory sample per Effects graph. It is active only when
+`TYPHON_EFFECT_GPU_TIMING=1` is also set. `effect_graph_host_cpu_ns` measures
+host wall time across graph submission and timer-query submission;
+`total_ns` remains the GPU timestamp interval. Pass host timings are attached
+to the same asynchronous pass spans as their GPU timestamps and separate
+query-submission time from `execute_pass` time. Diagnostics do not wait for GPU
+completion.
+
+When `GL_NVX_gpu_memory_info` is available, the profiler reports approximate
+available video memory and eviction counters; memory quantities are in KiB.
+Eviction counters are running values and may already be non-zero at the first
+sample, which has no eviction delta. These values are telemetry only and do not
+control Effects resource budgets or rendering decisions. An eviction caused
+during a frame may first appear in the following graph's sample, so native spike
+analysis should inspect the spike frame and its immediate neighbors. The
+sampling host duration is reported separately as
+`gpu_memory_sample_host_cpu_ns`.
+
 `TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH=blit` forces the diagnostic
 framebuffer-blit path. Setting it to `shader-copy` explicitly requests the
 preferred shader-copy path while retaining the no-sampleable-output fallback.

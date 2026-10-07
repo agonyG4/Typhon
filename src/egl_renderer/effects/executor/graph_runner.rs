@@ -565,6 +565,9 @@ pub(super) fn execute_graph_passes_inner(
                     capture_metadata,
                 )
             });
+            let execute_host_start = pass_timing
+                .filter(|span| span.host_timing_enabled())
+                .map(|_| Instant::now());
             let execute_result = execute_pass(
                 renderer,
                 graph,
@@ -585,6 +588,7 @@ pub(super) fn execute_graph_passes_inner(
                     .copied(),
                 &mut stats,
             );
+            let execute_host_ns = monotonic_elapsed_ns(execute_host_start);
             let replay_execution = execute_result.as_ref().ok().copied().flatten();
             finalize_pass_timing_and_replay_detail(
                 || {
@@ -592,6 +596,7 @@ pub(super) fn execute_graph_passes_inner(
                         renderer.gl,
                         pass_timing,
                         replay_execution,
+                        execute_host_ns,
                     );
                 },
                 replay_execution,

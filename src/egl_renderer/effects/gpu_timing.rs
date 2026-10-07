@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     ffi::{OsStr, c_void},
+    time::Instant,
 };
 
 use glow::HasContext;
@@ -9,8 +10,12 @@ use oblivion_one::effects::{MAX_EFFECT_INSTANCES_PER_OUTPUT, MAX_GRAPH_PASSES, R
 use super::resources::CheckpointCacheAdmissionStats;
 use super::trace::EffectExecutionTrace;
 
-const MAX_COLLECTION_PER_CALL: usize = 64;
 const GPU_TIMING_ENV: &str = "TYPHON_EFFECT_GPU_TIMING";
+const GPU_STALL_DIAGNOSTICS_ENV: &str = "TYPHON_EFFECT_GPU_STALL_DIAGNOSTICS";
+const GPU_MEMORY_INFO_EXTENSION: &str = "GL_NVX_gpu_memory_info";
+const GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX: u32 = 0x9049;
+const GPU_MEMORY_INFO_EVICTION_COUNT_NVX: u32 = 0x904a;
+const GPU_MEMORY_INFO_EVICTED_MEMORY_NVX: u32 = 0x904b;
 const GPU_DISJOINT_EXT: u32 = 0x8fbb;
 const EXPECTED_IN_FLIGHT_GRAPH_SCOPES: usize = 2;
 const CURRENT_BUILTIN_BLUR_PASSES: usize = 2;
@@ -29,6 +34,37 @@ const _: () = assert!(TIMING_SPAN_POOL_CAPACITY <= MAX_GRAPH_PASSES);
 
 fn gpu_timing_requested(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProfilerConfig {
+    gpu_timing_enabled: bool,
+    stall_diagnostics_enabled: bool,
+}
+
+impl ProfilerConfig {
+    fn from_environment() -> Self {
+        let gpu_timing_enabled = gpu_timing_requested(std::env::var_os(GPU_TIMING_ENV).as_deref());
+        let stall_diagnostics_enabled = gpu_timing_enabled
+            && gpu_timing_requested(std::env::var_os(GPU_STALL_DIAGNOSTICS_ENV).as_deref());
+        Self {
+            gpu_timing_enabled,
+            stall_diagnostics_enabled,
+        }
+    }
+}
+
+fn discover_gpu_memory_info_support(
+    diagnostics_enabled: bool,
+    supported_extensions: impl FnOnce() -> bool,
+) -> bool {
+    diagnostics_enabled && supported_extensions()
+}
+
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| {
+        start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+    })
 }
 
 fn composite_scene_replay_summary_is_complete(
@@ -65,6 +101,7 @@ pub(crate) struct GraphTimingScope {
     scope_id: u64,
     total: SpanToken,
     frame_id: Option<u64>,
+    host_start: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,6 +257,84 @@ pub(crate) struct PassTimingWork {
     pub(crate) target_height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EffectPassHostTiming {
+    total_host_ns: u64,
+    execute_host_ns: u64,
+    begin_query_submit_host_ns: u64,
+    end_query_submit_host_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GpuMemoryInfoSample {
+    gpu_memory_info_available: bool,
+    gpu_memory_current_available_kib: u64,
+    gpu_memory_eviction_count: u64,
+    gpu_memory_evicted_kib: u64,
+    gpu_memory_eviction_delta_known: bool,
+    gpu_memory_eviction_count_delta: u64,
+    gpu_memory_evicted_kib_delta: u64,
+    gpu_memory_sample_host_cpu_ns: u64,
+}
+
+#[derive(Default)]
+struct GpuMemoryInfoTracker {
+    previous_evictions: Option<(u64, u64)>,
+}
+
+impl GpuMemoryInfoTracker {
+    fn sample(
+        &mut self,
+        available: bool,
+        mut query: impl FnMut(u32) -> i32,
+    ) -> GpuMemoryInfoSample {
+        if !available {
+            return GpuMemoryInfoSample::default();
+        }
+
+        let sample_start = Instant::now();
+        let current_available_kib =
+            query(GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX).max(0) as u64;
+        let eviction_count = query(GPU_MEMORY_INFO_EVICTION_COUNT_NVX).max(0) as u64;
+        let evicted_kib = query(GPU_MEMORY_INFO_EVICTED_MEMORY_NVX).max(0) as u64;
+        let gpu_memory_sample_host_cpu_ns = elapsed_ns(Some(sample_start));
+        let (delta_known, eviction_count_delta, evicted_kib_delta) = self
+            .previous_evictions
+            .map_or((false, 0, 0), |(previous_count, previous_kib)| {
+                if eviction_count >= previous_count && evicted_kib >= previous_kib {
+                    (
+                        true,
+                        eviction_count - previous_count,
+                        evicted_kib - previous_kib,
+                    )
+                } else {
+                    (false, 0, 0)
+                }
+            });
+        self.previous_evictions = Some((eviction_count, evicted_kib));
+
+        GpuMemoryInfoSample {
+            gpu_memory_info_available: true,
+            gpu_memory_current_available_kib: current_available_kib,
+            gpu_memory_eviction_count: eviction_count,
+            gpu_memory_evicted_kib: evicted_kib,
+            gpu_memory_eviction_delta_known: delta_known,
+            gpu_memory_eviction_count_delta: eviction_count_delta,
+            gpu_memory_evicted_kib_delta: evicted_kib_delta,
+            gpu_memory_sample_host_cpu_ns,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GpuTimingDiagnosticsRecord {
+    enabled: bool,
+    effect_graph_host_cpu_ns: u64,
+    effect_pass_host_cpu_ns: u64,
+    gpu_memory: GpuMemoryInfoSample,
+    max_host_effect_pass: Option<MaxHostEffectPassTiming>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TimingSpanMetadata {
     scope_id: u64,
@@ -231,6 +346,7 @@ struct TimingSpanMetadata {
     work: PassTimingWork,
     capture: Option<CaptureTimingMetadata>,
     replay_execution: Option<ReplayCaptureExecutionDetail>,
+    host_timing: Option<EffectPassHostTiming>,
     composite_scene_replay_work: Option<CompositeSceneReplayWork>,
     composite_scene_replay_execution: Option<CompositeSceneReplayExecutionDetail>,
 }
@@ -245,6 +361,13 @@ enum PollOutcome {
         record: Option<GpuTimingRecord>,
     },
     Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryResolution {
+    Unavailable,
+    Disjoint,
+    Ready((u64, u64)),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +440,19 @@ struct MaxEffectPassTiming {
     target_width: u32,
     target_height: u32,
     capture_mode: Option<CaptureTimingMode>,
+    host_timing: Option<EffectPassHostTiming>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxHostEffectPassTiming {
+    total_host_ns: u64,
+    pass_id: u64,
+    instance_id: u64,
+    kind: RenderPassKind,
+    gpu_duration_ns: u64,
+    execute_host_ns: u64,
+    begin_query_submit_host_ns: u64,
+    end_query_submit_host_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -512,6 +648,7 @@ struct GpuTimingRecord {
     max_capture_pass: Option<MaxCapturePassTiming>,
     max_effect_pass: Option<MaxEffectPassTiming>,
     max_composite_scene_replay: Option<MaxCompositeSceneReplayTiming>,
+    diagnostics: GpuTimingDiagnosticsRecord,
     graph_gap_attribution_available: bool,
     max_graph_gap: GraphGapTiming,
 }
@@ -589,6 +726,7 @@ struct GraphAggregate {
     composite_scene_replay_draw_calls: usize,
     composite_scene_replay_texture_binds: usize,
     max_composite_scene_replay: Option<MaxCompositeSceneReplayTiming>,
+    diagnostics: GpuTimingDiagnosticsRecord,
     graph_gap_timeline_valid: bool,
     first_pass_start: Option<TimedPassEndpoint>,
     last_pass_end: Option<TimedPassEndpoint>,
@@ -753,6 +891,7 @@ impl TimingState {
             work: PassTimingWork::default(),
             capture: None,
             replay_execution: None,
+            host_timing: None,
             composite_scene_replay_work: None,
             composite_scene_replay_execution: None,
         });
@@ -798,6 +937,7 @@ impl TimingState {
             composite_scene_replay_draw_calls: 0,
             composite_scene_replay_texture_binds: 0,
             max_composite_scene_replay: None,
+            diagnostics: GpuTimingDiagnosticsRecord::default(),
             graph_gap_timeline_valid: true,
             first_pass_start: None,
             last_pass_end: None,
@@ -807,6 +947,7 @@ impl TimingState {
             scope_id,
             total: token,
             frame_id,
+            host_start: None,
         })
     }
 
@@ -869,6 +1010,7 @@ impl TimingState {
             work: PassTimingWork::default(),
             capture: None,
             replay_execution: None,
+            host_timing: None,
             composite_scene_replay_work: Some(work),
             composite_scene_replay_execution: None,
         });
@@ -915,6 +1057,12 @@ impl TimingState {
         true
     }
 
+    fn is_open(&self, token: SpanToken) -> bool {
+        self.slots.get(token.slot).is_some_and(|state| {
+            state.phase == SlotPhase::Open && state.generation == token.generation
+        })
+    }
+
     fn has_scope(&self, scope_id: u64) -> bool {
         self.aggregates
             .iter()
@@ -945,6 +1093,46 @@ impl TimingState {
         false
     }
 
+    fn set_stall_diagnostics_enabled(&mut self, scope: GraphTimingScope, enabled: bool) -> bool {
+        let Some(aggregate) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
+        else {
+            return false;
+        };
+        aggregate.diagnostics.enabled = enabled;
+        true
+    }
+
+    fn attach_graph_host_cpu_ns(&mut self, scope: GraphTimingScope, duration_ns: u64) -> bool {
+        let Some(aggregate) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
+        else {
+            return false;
+        };
+        aggregate.diagnostics.effect_graph_host_cpu_ns = duration_ns;
+        true
+    }
+
+    fn attach_gpu_memory_sample(
+        &mut self,
+        scope: GraphTimingScope,
+        sample: GpuMemoryInfoSample,
+    ) -> bool {
+        let Some(aggregate) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
+        else {
+            return false;
+        };
+        aggregate.diagnostics.gpu_memory = sample;
+        true
+    }
+
     fn attach_replay_execution_detail(
         &mut self,
         token: SpanToken,
@@ -957,6 +1145,16 @@ impl TimingState {
             pending.token == token && pending.metadata.purpose == TimingSpanPurpose::Pass
         }) {
             pending.metadata.replay_execution = Some(detail);
+            return true;
+        }
+        false
+    }
+
+    fn attach_pass_host_timing(&mut self, token: SpanToken, detail: EffectPassHostTiming) -> bool {
+        if let Some(pending) = self.pending.iter_mut().find(|pending| {
+            pending.token == token && pending.metadata.purpose == TimingSpanPurpose::Pass
+        }) {
+            pending.metadata.host_timing = Some(detail);
             return true;
         }
         false
@@ -1014,11 +1212,42 @@ impl TimingState {
         self.disjoint_invalidated_spans
     }
 
-    fn pending_query_slots(&self) -> Option<(usize, usize)> {
-        self.pending.front().map(|pending| {
-            let slot = pending.token.slot;
-            (slot, slot)
-        })
+    fn collect_ready_with(
+        &mut self,
+        max_entries: usize,
+        mut resolve_front: impl FnMut(PendingSpan) -> QueryResolution,
+        mut on_record: impl FnMut(&GpuTimingRecord),
+    ) -> (usize, bool) {
+        let mut collected = 0;
+        let mut stopped_for_disjoint = false;
+        let bound = max_entries.min(self.slots.len());
+        while collected < bound {
+            let Some(pending) = self.pending.front().copied() else {
+                break;
+            };
+            match resolve_front(pending) {
+                QueryResolution::Unavailable => break,
+                QueryResolution::Disjoint => {
+                    stopped_for_disjoint = true;
+                    break;
+                }
+                QueryResolution::Ready(timestamps) => {
+                    match self.poll_front(true, Some(timestamps)) {
+                        PollOutcome::Ready {
+                            record: Some(record),
+                            ..
+                        } => on_record(&record),
+                        PollOutcome::Ready { .. } | PollOutcome::Invalid => {}
+                        PollOutcome::Empty | PollOutcome::NotReady => {
+                            debug_assert!(false, "front span disappeared during collection");
+                            break;
+                        }
+                    }
+                    collected += 1;
+                }
+            }
+        }
+        (collected, stopped_for_disjoint)
     }
 
     #[cfg(test)]
@@ -1212,6 +1441,12 @@ impl TimingState {
         aggregate.pixels[index] =
             aggregate.pixels[index].saturating_add(metadata.work.effect_pixels);
         aggregate.timed_passes = aggregate.timed_passes.saturating_add(1);
+        if let Some(host_timing) = metadata.host_timing {
+            aggregate.diagnostics.effect_pass_host_cpu_ns = aggregate
+                .diagnostics
+                .effect_pass_host_cpu_ns
+                .saturating_add(host_timing.total_host_ns);
+        }
 
         let is_capture = matches!(
             kind,
@@ -1233,12 +1468,32 @@ impl TimingState {
                 } else {
                     None
                 },
+                host_timing: metadata.host_timing,
             };
             if aggregate
                 .max_effect_pass
                 .is_none_or(|current| candidate.duration_ns > current.duration_ns)
             {
                 aggregate.max_effect_pass = Some(candidate);
+            }
+            if let Some(host_timing) = metadata.host_timing {
+                let candidate = MaxHostEffectPassTiming {
+                    total_host_ns: host_timing.total_host_ns,
+                    pass_id,
+                    instance_id,
+                    kind,
+                    gpu_duration_ns: duration_ns,
+                    execute_host_ns: host_timing.execute_host_ns,
+                    begin_query_submit_host_ns: host_timing.begin_query_submit_host_ns,
+                    end_query_submit_host_ns: host_timing.end_query_submit_host_ns,
+                };
+                if aggregate
+                    .diagnostics
+                    .max_host_effect_pass
+                    .is_none_or(|current| candidate.total_host_ns > current.total_host_ns)
+                {
+                    aggregate.diagnostics.max_host_effect_pass = Some(candidate);
+                }
             }
         }
         let Some(capture) = metadata.capture.filter(|_| is_capture) else {
@@ -1572,24 +1827,10 @@ impl TimingState {
             max_capture_pass: aggregate.max_capture_pass,
             max_effect_pass: aggregate.max_effect_pass,
             max_composite_scene_replay: aggregate.max_composite_scene_replay,
+            diagnostics: aggregate.diagnostics,
             graph_gap_attribution_available,
             max_graph_gap,
         })
-    }
-
-    #[cfg(test)]
-    fn collect_ready_for_test(&mut self, available_count: usize) -> usize {
-        let mut collected = 0;
-        while collected < available_count && collected < MAX_COLLECTION_PER_CALL {
-            if !matches!(
-                self.poll_front(true, Some((100, 140))),
-                PollOutcome::Ready { .. } | PollOutcome::Invalid
-            ) {
-                break;
-            }
-            collected += 1;
-        }
-        collected
     }
 
     #[cfg(test)]
@@ -1618,6 +1859,7 @@ impl TimingState {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CollectionAction {
     StopUnavailable,
@@ -1625,6 +1867,7 @@ enum CollectionAction {
     ReadResults,
 }
 
+#[cfg(test)]
 fn collection_action(available: bool, disjoint: bool, uses_disjoint: bool) -> CollectionAction {
     if !available {
         CollectionAction::StopUnavailable
@@ -1777,11 +2020,22 @@ struct ActiveProfiler {
     path: TimestampPath,
     queries: Vec<QueryPair>,
     timing: TimingState,
+    stall_diagnostics_enabled: bool,
+    gpu_memory_info_available: bool,
+    gpu_memory_info: GpuMemoryInfoTracker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PassTimingSpan {
     token: SpanToken,
+    host_start: Option<Instant>,
+    begin_query_submit_host_ns: u64,
+}
+
+impl PassTimingSpan {
+    pub(crate) const fn host_timing_enabled(self) -> bool {
+        self.host_start.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2147,6 +2401,39 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         max_capture_visibility_cpu_ns,
         max_capture_draw_submit_cpu_ns,
     );
+    let max_gpu_host = record
+        .max_effect_pass
+        .and_then(|pass| pass.host_timing)
+        .unwrap_or_default();
+    let max_host_pass = record.diagnostics.max_host_effect_pass;
+    let memory = record.diagnostics.gpu_memory;
+    let line = format!(
+        "{line} effect_graph_host_cpu_ns={} effect_pass_host_cpu_ns={} max_effect_pass_host_cpu_ns={} max_effect_pass_execute_host_cpu_ns={} max_effect_pass_begin_query_host_cpu_ns={} max_effect_pass_end_query_host_cpu_ns={} max_host_effect_pass_cpu_ns={} max_host_effect_pass_id={} max_host_effect_instance_id={} max_host_effect_kind={} max_host_effect_pass_kind={} max_host_effect_pass_gpu_ns={} max_host_effect_pass_execute_cpu_ns={} max_host_effect_pass_begin_query_cpu_ns={} max_host_effect_pass_end_query_cpu_ns={} gpu_stall_diagnostics_enabled={} gpu_memory_info_available={} gpu_memory_current_available_kib={} gpu_memory_eviction_count={} gpu_memory_evicted_kib={} gpu_memory_eviction_delta_known={} gpu_memory_eviction_count_delta={} gpu_memory_evicted_kib_delta={} gpu_memory_sample_host_cpu_ns={}",
+        record.diagnostics.effect_graph_host_cpu_ns,
+        record.diagnostics.effect_pass_host_cpu_ns,
+        max_gpu_host.total_host_ns,
+        max_gpu_host.execute_host_ns,
+        max_gpu_host.begin_query_submit_host_ns,
+        max_gpu_host.end_query_submit_host_ns,
+        max_host_pass.map_or(0, |pass| pass.total_host_ns),
+        max_host_pass.map_or(0, |pass| pass.pass_id),
+        max_host_pass.map_or(0, |pass| pass.instance_id),
+        max_host_pass.map_or("none", |pass| render_pass_kind_name(pass.kind)),
+        max_host_pass.map_or("none", |pass| render_pass_kind_name(pass.kind)),
+        max_host_pass.map_or(0, |pass| pass.gpu_duration_ns),
+        max_host_pass.map_or(0, |pass| pass.execute_host_ns),
+        max_host_pass.map_or(0, |pass| pass.begin_query_submit_host_ns),
+        max_host_pass.map_or(0, |pass| pass.end_query_submit_host_ns),
+        usize::from(record.diagnostics.enabled),
+        usize::from(memory.gpu_memory_info_available),
+        memory.gpu_memory_current_available_kib,
+        memory.gpu_memory_eviction_count,
+        memory.gpu_memory_evicted_kib,
+        usize::from(memory.gpu_memory_eviction_delta_known),
+        memory.gpu_memory_eviction_count_delta,
+        memory.gpu_memory_evicted_kib_delta,
+        memory.gpu_memory_sample_host_cpu_ns,
+    );
     format!(
         "{line} max_capture_replay_detail_available={} pass_timed_ns={} graph_unattributed_ns={} max_effect_pass_ns={} max_effect_pass_id={} max_effect_instance_id={} max_effect_kind={} max_effect_capture_mode={} max_effect_pixels={} max_effect_damage_rects={} max_effect_damage_bbox_pixels={} max_effect_target_width={} max_effect_target_height={} graph_gap_attribution_available={} max_graph_gap_ns={} max_graph_gap_position={} max_graph_gap_after_pass_id={} max_graph_gap_after_instance_id={} max_graph_gap_after_kind={} max_graph_gap_after_capture_mode={} max_graph_gap_after_checkpoint_count={} max_graph_gap_before_pass_id={} max_graph_gap_before_instance_id={} max_graph_gap_before_kind={} max_graph_gap_before_capture_mode={} max_graph_gap_before_checkpoint_count={} composite_scene_replay_timing_available={} composite_scene_replay_expected_spans={} composite_scene_replay_resolved_spans={} composite_scene_replay_gpu_ns={} composite_scene_replay_host_cpu_ns={} composite_scene_replay_scene_scan_pairs={} composite_scene_replay_commands_executed={} composite_scene_replay_draw_calls={} composite_scene_replay_texture_binds={} max_composite_scene_replay_gpu_ns={} max_composite_scene_replay_pass_id={} max_composite_scene_replay_instance_id={} max_composite_scene_replay_command_start={} max_composite_scene_replay_command_end={} max_composite_scene_replay_command_count={} max_composite_scene_replay_scene_commands={} max_composite_scene_replay_active_work_rects={} max_composite_scene_replay_active_work_pixels={} max_composite_scene_replay_command_region_pairs={} max_composite_scene_replay_scene_scan_pairs={} max_composite_scene_replay_pending_checkpoints={} max_composite_scene_replay_host_cpu_ns={} max_composite_scene_replay_commands_considered={} max_composite_scene_replay_commands_executed={} max_composite_scene_replay_draw_calls={} max_composite_scene_replay_texture_binds={} max_composite_scene_replay_scene_vbo_uploads={} max_composite_scene_replay_scene_vbo_upload_bytes={} checkpoint_cache_candidates={} checkpoint_cache_candidates_considered={} checkpoint_cache_resident_candidates={} checkpoint_cache_new_admissions={} checkpoint_cache_skipped_entry_limit={} checkpoint_cache_skipped_graph_peak_unknown={} checkpoint_cache_skipped_graph_pressure={} checkpoint_cache_skipped_budget={} checkpoint_cache_skipped_size={} checkpoint_cache_skipped_allocation={} checkpoint_cache_skipped_budget_bytes={} checkpoint_cache_graph_peak_known={} checkpoint_cache_graph_peak_bytes={} checkpoint_cache_base_checked_out_bytes={} checkpoint_cache_budget_bytes={} checkpoint_cache_additional_budget_needed_bytes={} checkpoint_cache_additional_budget_needed_known={} checkpoint_cache_cleared_for_graph_pressure={} effect_resource_hard_budget_bytes={} checkpoint_cache_soft_budget_bytes={} checkpoint_cache_bytes_at_admission={} checkpoint_cache_skipped_hard_budget={} checkpoint_cache_skipped_hard_budget_bytes={} checkpoint_cache_skipped_soft_budget={} checkpoint_cache_skipped_soft_budget_bytes={} checkpoint_cache_additional_checkpoint_budget_needed_for_all_candidates_bytes={} checkpoint_cache_additional_checkpoint_budget_needed_known={}",
         usize::from(max_capture_replay_detail_available(record)),
@@ -2242,7 +2529,8 @@ impl EffectGpuProfiler {
         gl: &glow::Context,
         load_with: impl FnMut(&str) -> Option<*const c_void>,
     ) -> Self {
-        if !gpu_timing_requested(std::env::var_os(GPU_TIMING_ENV).as_deref()) {
+        let config = ProfilerConfig::from_environment();
+        if !config.gpu_timing_enabled {
             return Self {
                 state: ProfilerState::Disabled,
             };
@@ -2257,6 +2545,11 @@ impl EffectGpuProfiler {
                 };
             }
         };
+        let gpu_memory_info_available =
+            discover_gpu_memory_info_support(config.stall_diagnostics_enabled, || {
+                gl.supported_extensions()
+                    .contains(GPU_MEMORY_INFO_EXTENSION)
+            });
         let queries = match create_query_pairs(gl) {
             Ok(queries) => queries,
             Err(()) => {
@@ -2273,6 +2566,9 @@ impl EffectGpuProfiler {
                 path,
                 queries,
                 timing: TimingState::active(TIMING_SPAN_POOL_CAPACITY),
+                stall_diagnostics_enabled: config.stall_diagnostics_enabled,
+                gpu_memory_info_available,
+                gpu_memory_info: GpuMemoryInfoTracker::default(),
             }),
         }
     }
@@ -2290,46 +2586,43 @@ impl EffectGpuProfiler {
         let ProfilerState::Active(active) = &mut self.state else {
             return;
         };
-        for _ in 0..MAX_COLLECTION_PER_CALL {
-            let Some((_, end_slot)) = active.timing.pending_query_slots() else {
-                break;
-            };
-            let pair = active.queries[end_slot];
-            let available =
-                unsafe { gl.get_query_parameter_u32(pair.end, glow::QUERY_RESULT_AVAILABLE) } != 0;
-            if !available {
-                break;
-            }
-            let disjoint = active.path.uses_disjoint() && gpu_disjoint(gl);
-            match collection_action(true, disjoint, active.path.uses_disjoint()) {
-                CollectionAction::InvalidateDisjoint => {
-                    observe_disjoint(&mut active.timing, true);
-                    return;
+        let queries = &active.queries;
+        let uses_disjoint = active.path.uses_disjoint();
+        let (_, stopped_for_disjoint) = active.timing.collect_ready_with(
+            TIMING_SPAN_POOL_CAPACITY,
+            |pending| {
+                let pair = queries[pending.token.slot];
+                let available =
+                    unsafe { gl.get_query_parameter_u32(pair.end, glow::QUERY_RESULT_AVAILABLE) }
+                        != 0;
+                if !available {
+                    return QueryResolution::Unavailable;
                 }
-                CollectionAction::ReadResults => {}
-                CollectionAction::StopUnavailable => unreachable!("availability was checked"),
-            }
-            let start_ns = unsafe { gl.get_query_parameter_u64(pair.start, glow::QUERY_RESULT) };
-            let end_ns = unsafe { gl.get_query_parameter_u64(pair.end, glow::QUERY_RESULT) };
-            if let PollOutcome::Ready {
-                record: Some(record),
-                ..
-            } = active.timing.poll_front(true, Some((start_ns, end_ns)))
-            {
-                eprintln!("typhon effect: {}", format_gpu_timing_line(&record));
-            }
-            for event in active.timing.drain_capture_gpu_timing_events() {
-                trace.capture_gpu_timing(
-                    event.frame_id,
-                    event.pass_id,
-                    event.instance_id,
-                    event.kind,
-                    event.mode.as_str(),
-                    event.checkpoint_count,
-                    event.pixels,
-                    event.duration_ns,
-                );
-            }
+                if uses_disjoint && gpu_disjoint(gl) {
+                    return QueryResolution::Disjoint;
+                }
+                let start_ns =
+                    unsafe { gl.get_query_parameter_u64(pair.start, glow::QUERY_RESULT) };
+                let end_ns = unsafe { gl.get_query_parameter_u64(pair.end, glow::QUERY_RESULT) };
+                QueryResolution::Ready((start_ns, end_ns))
+            },
+            |record| eprintln!("typhon effect: {}", format_gpu_timing_line(record)),
+        );
+        if stopped_for_disjoint {
+            observe_disjoint(&mut active.timing, true);
+            return;
+        }
+        for event in active.timing.drain_capture_gpu_timing_events() {
+            trace.capture_gpu_timing(
+                event.frame_id,
+                event.pass_id,
+                event.instance_id,
+                event.kind,
+                event.mode.as_str(),
+                event.checkpoint_count,
+                event.pixels,
+                event.duration_ns,
+            );
         }
     }
 
@@ -2344,8 +2637,22 @@ impl EffectGpuProfiler {
         if active.path.uses_disjoint() && observe_disjoint(&mut active.timing, gpu_disjoint(gl)) {
             return None;
         }
-        let scope = active.timing.begin_scope(frame_id)?;
+        let mut scope = active.timing.begin_scope(frame_id)?;
+        active
+            .timing
+            .set_stall_diagnostics_enabled(scope, active.stall_diagnostics_enabled);
+        if active.stall_diagnostics_enabled {
+            let sample = active
+                .gpu_memory_info
+                .sample(active.gpu_memory_info_available, |pname| unsafe {
+                    gl.get_parameter_i32(pname)
+                });
+            active.timing.attach_gpu_memory_sample(scope, sample);
+        }
         let query = active.queries[scope.total.slot].start;
+        if active.stall_diagnostics_enabled {
+            scope.host_start = Some(Instant::now());
+        }
         unsafe { gl.query_counter(query, glow::TIMESTAMP) };
         Some(scope)
     }
@@ -2366,6 +2673,9 @@ impl EffectGpuProfiler {
         }
         let query = active.queries[scope.total.slot].end;
         unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+        active
+            .timing
+            .attach_graph_host_cpu_ns(scope, elapsed_ns(scope.host_start));
         true
     }
 
@@ -2409,13 +2719,19 @@ impl EffectGpuProfiler {
             work,
             capture,
             replay_execution: None,
+            host_timing: None,
             composite_scene_replay_work: None,
             composite_scene_replay_execution: None,
         };
         let token = active.timing.begin_pass(scope, metadata)?;
         let query = active.queries[token.slot].start;
+        let host_start = active.stall_diagnostics_enabled.then(Instant::now);
         unsafe { gl.query_counter(query, glow::TIMESTAMP) };
-        Some(PassTimingSpan { token })
+        Some(PassTimingSpan {
+            token,
+            host_start,
+            begin_query_submit_host_ns: elapsed_ns(host_start),
+        })
     }
 
     pub(crate) fn end_pass(
@@ -2423,6 +2739,7 @@ impl EffectGpuProfiler {
         gl: &glow::Context,
         span: Option<PassTimingSpan>,
         replay_execution: Option<ReplayCaptureExecutionDetail>,
+        execute_host_ns: u64,
     ) {
         let Some(span) = span else {
             return;
@@ -2430,9 +2747,26 @@ impl EffectGpuProfiler {
         let ProfilerState::Active(active) = &mut self.state else {
             return;
         };
+        if !active.timing.is_open(span.token) {
+            return;
+        }
+        let query = active.queries[span.token.slot].end;
+        let end_query_start = span.host_start.map(|_| Instant::now());
+        unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+        let end_query_submit_host_ns = elapsed_ns(end_query_start);
+        let total_host_ns = elapsed_ns(span.host_start);
         if active.timing.finish(span.token) {
-            let query = active.queries[span.token.slot].end;
-            unsafe { gl.query_counter(query, glow::TIMESTAMP) };
+            if span.host_start.is_some() {
+                active.timing.attach_pass_host_timing(
+                    span.token,
+                    EffectPassHostTiming {
+                        total_host_ns,
+                        execute_host_ns,
+                        begin_query_submit_host_ns: span.begin_query_submit_host_ns,
+                        end_query_submit_host_ns,
+                    },
+                );
+            }
             active
                 .timing
                 .attach_replay_execution_detail(span.token, replay_execution);
@@ -2510,6 +2844,9 @@ impl EffectGpuProfiler {
                 }),
                 queries: Vec::new(),
                 timing: TimingState::active_for_test(capacity),
+                stall_diagnostics_enabled: false,
+                gpu_memory_info_available: false,
+                gpu_memory_info: GpuMemoryInfoTracker::default(),
             }),
         }
     }
@@ -2555,7 +2892,7 @@ impl EffectGpuProfiler {
 mod tests {
     use std::collections::HashSet;
     use std::sync::{
-        Mutex,
+        Mutex, MutexGuard,
         atomic::{AtomicI32, AtomicUsize, Ordering},
     };
 
@@ -2568,7 +2905,89 @@ mod tests {
     static EXT_QUERYIV_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXT_QUERYIV_TARGET: AtomicI32 = AtomicI32::new(0);
     static EXT_QUERYIV_PNAME: AtomicI32 = AtomicI32::new(0);
+    static TEST_GL_QUERY_NAME: AtomicUsize = AtomicUsize::new(0);
     static QUERYIV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static PROFILER_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ProfilerEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        timing: Option<std::ffi::OsString>,
+        diagnostics: Option<std::ffi::OsString>,
+    }
+
+    impl ProfilerEnvGuard {
+        fn new() -> Self {
+            let lock = PROFILER_ENV_TEST_LOCK.lock().unwrap();
+            Self {
+                _lock: lock,
+                timing: std::env::var_os(GPU_TIMING_ENV),
+                diagnostics: std::env::var_os(GPU_STALL_DIAGNOSTICS_ENV),
+            }
+        }
+
+        fn set(&self, timing: Option<&str>, diagnostics: Option<&str>) {
+            // SAFETY: profiler environment tests serialize mutations with PROFILER_ENV_TEST_LOCK.
+            unsafe {
+                match timing {
+                    Some(value) => std::env::set_var(GPU_TIMING_ENV, value),
+                    None => std::env::remove_var(GPU_TIMING_ENV),
+                }
+                match diagnostics {
+                    Some(value) => std::env::set_var(GPU_STALL_DIAGNOSTICS_ENV, value),
+                    None => std::env::remove_var(GPU_STALL_DIAGNOSTICS_ENV),
+                }
+            }
+        }
+    }
+
+    impl Drop for ProfilerEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: profiler environment tests serialize mutations with PROFILER_ENV_TEST_LOCK.
+            unsafe {
+                match &self.timing {
+                    Some(value) => std::env::set_var(GPU_TIMING_ENV, value),
+                    None => std::env::remove_var(GPU_TIMING_ENV),
+                }
+                match &self.diagnostics {
+                    Some(value) => std::env::set_var(GPU_STALL_DIAGNOSTICS_ENV, value),
+                    None => std::env::remove_var(GPU_STALL_DIAGNOSTICS_ENV),
+                }
+            }
+        }
+    }
+
+    unsafe extern "system" fn test_gl_get_string(name: u32) -> *const u8 {
+        match name {
+            glow::VERSION => c"2.1".as_ptr().cast(),
+            glow::EXTENSIONS => c"GL_ARB_timer_query".as_ptr().cast(),
+            _ => c"".as_ptr().cast(),
+        }
+    }
+
+    unsafe extern "system" fn test_gl_gen_queries(count: i32, query_ids: *mut u32) {
+        for offset in 0..count.max(0) as usize {
+            let name = TEST_GL_QUERY_NAME
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1) as u32;
+            unsafe { *query_ids.add(offset) = name };
+        }
+    }
+
+    fn test_gl_context() -> glow::Context {
+        // SAFETY: this minimal loader supplies the version-2.1 string queries and query-name
+        // allocation used by profiler tests; no other function is called by these test paths.
+        unsafe {
+            glow::Context::from_loader_function(|name| {
+                if name == "glGetString" {
+                    test_gl_get_string as *const () as *const std::ffi::c_void
+                } else if name == "glGenQueries" {
+                    test_gl_gen_queries as *const () as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                }
+            })
+        }
+    }
 
     unsafe extern "system" fn fake_core_get_queryiv(target: u32, pname: u32, params: *mut i32) {
         CORE_QUERYIV_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2641,6 +3060,7 @@ mod tests {
             },
             capture,
             replay_execution: None,
+            host_timing: None,
             composite_scene_replay_work: None,
             composite_scene_replay_execution: None,
         }
@@ -3321,6 +3741,7 @@ mod tests {
                 generation: 1,
             },
             frame_id: Some(120),
+            host_start: None,
         };
 
         assert!(
@@ -3804,14 +4225,139 @@ mod tests {
     }
 
     #[test]
-    fn collection_bound_stops_before_a_large_ready_backlog() {
-        let mut state = TimingState::active_for_test(65);
-        for frame_id in 0..65 {
+    fn collector_drains_more_than_64_contiguously_ready_spans() {
+        let mut state = TimingState::active_for_test(128);
+        for frame_id in 0..128 {
             let scope = state.begin_scope(Some(frame_id)).expect("scope slot");
             assert!(state.finish(scope.total));
         }
-        assert_eq!(state.collect_ready_for_test(65), 64);
-        assert_eq!(state.pending_span_count(), 1);
+
+        let mut resolved = 0;
+        let capacity = state.query_slots();
+        let (collected, stopped_for_disjoint) = state.collect_ready_with(
+            capacity,
+            |pending| {
+                resolved += 1;
+                QueryResolution::Ready((100, 140 + pending.metadata.frame_id.unwrap()))
+            },
+            |_| {},
+        );
+
+        assert_eq!(collected, 128);
+        assert_eq!(resolved, 128);
+        assert!(!stopped_for_disjoint);
+        assert_eq!(state.pending_span_count(), 0);
+    }
+
+    #[test]
+    fn collector_drains_the_entire_timing_span_pool_capacity() {
+        let capacity = TIMING_SPAN_POOL_CAPACITY;
+        let mut state = TimingState::active_for_test(capacity);
+        for frame_id in 0..capacity {
+            let scope = state
+                .begin_scope(Some(frame_id as u64))
+                .expect("scope slot");
+            assert!(state.finish(scope.total));
+        }
+
+        let mut resolved = 0;
+        let (collected, stopped_for_disjoint) = state.collect_ready_with(
+            capacity,
+            |_| {
+                resolved += 1;
+                QueryResolution::Ready((100, 140))
+            },
+            |_| {},
+        );
+
+        assert_eq!(collected, capacity);
+        assert_eq!(resolved, capacity);
+        assert!(!stopped_for_disjoint);
+        assert_eq!(state.pending_span_count(), 0);
+        assert_eq!(state.free_slot_count(), capacity);
+        assert_eq!(state.dropped_spans(), 0);
+    }
+
+    #[test]
+    fn collector_stops_at_the_oldest_unavailable_span_without_scanning_ahead() {
+        let mut state = TimingState::active_for_test(4);
+        for frame_id in 0..4 {
+            let scope = state.begin_scope(Some(frame_id)).expect("scope slot");
+            assert!(state.finish(scope.total));
+        }
+
+        let availability = [true, true, false, true];
+        let mut inspected = 0;
+        let mut result_reads = 0;
+        let capacity = state.query_slots();
+        let (collected, stopped_for_disjoint) = state.collect_ready_with(
+            capacity,
+            |_| {
+                let available = availability[inspected];
+                inspected += 1;
+                if available {
+                    result_reads += 1;
+                    QueryResolution::Ready((100, 140))
+                } else {
+                    QueryResolution::Unavailable
+                }
+            },
+            |_| {},
+        );
+
+        assert_eq!(collected, 2);
+        assert_eq!(inspected, 3);
+        assert_eq!(result_reads, 2);
+        assert!(!stopped_for_disjoint);
+        assert_eq!(state.pending_span_count(), 2);
+    }
+
+    #[test]
+    fn sustained_79_span_frames_recover_after_a_two_frame_availability_delay() {
+        const SPANS_PER_FRAME: usize = 79;
+        const AVAILABILITY_DELAY_FRAMES: usize = 2;
+        const FRAMES: usize = 40;
+
+        let mut state = TimingState::active_for_test(TIMING_SPAN_POOL_CAPACITY);
+        let mut frame_backlogs = Vec::with_capacity(FRAMES);
+        for frame in 0..FRAMES {
+            let (collected, stopped_for_disjoint) = state.collect_ready_with(
+                TIMING_SPAN_POOL_CAPACITY,
+                |pending| {
+                    let produced_frame = pending.metadata.frame_id.unwrap() as usize;
+                    if frame.saturating_sub(produced_frame) >= AVAILABILITY_DELAY_FRAMES {
+                        QueryResolution::Ready((100, 140))
+                    } else {
+                        QueryResolution::Unavailable
+                    }
+                },
+                |_| {},
+            );
+            assert!(!stopped_for_disjoint);
+            if frame >= AVAILABILITY_DELAY_FRAMES {
+                assert_eq!(collected, SPANS_PER_FRAME);
+            }
+
+            for _ in 0..SPANS_PER_FRAME {
+                let scope = state
+                    .begin_scope(Some(frame as u64))
+                    .expect("span pool remains available");
+                assert!(state.finish(scope.total));
+            }
+            frame_backlogs.push(state.pending_span_count());
+        }
+
+        assert!(
+            frame_backlogs[30..]
+                .iter()
+                .all(|backlog| *backlog == 2 * SPANS_PER_FRAME)
+        );
+        assert!(state.high_water <= AVAILABILITY_DELAY_FRAMES * SPANS_PER_FRAME);
+        assert_eq!(state.dropped_spans(), 0);
+        assert_eq!(
+            state.free_slot_count(),
+            TIMING_SPAN_POOL_CAPACITY - 2 * SPANS_PER_FRAME
+        );
     }
 
     #[test]
@@ -4224,6 +4770,243 @@ mod tests {
         assert!(line.contains("max_effect_target_width=480"));
         assert!(line.contains("max_effect_target_height=270"));
         assert!(line.contains("max_capture_pass_ns=40"));
+    }
+
+    #[test]
+    fn gpu_and_host_slowest_pass_attribution_stays_on_its_own_span() {
+        let mut state = TimingState::active_for_test(3);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        state.set_stall_diagnostics_enabled(scope, true);
+        state.attach_graph_host_cpu_ns(scope, 900_000);
+
+        for (pass_id, instance_id, kind, gpu_ns, host) in [
+            (
+                44,
+                99,
+                RenderPassKind::DualKawaseUpsample,
+                18_000_000,
+                EffectPassHostTiming {
+                    total_host_ns: 110_000,
+                    execute_host_ns: 90_000,
+                    begin_query_submit_host_ns: 10_000,
+                    end_query_submit_host_ns: 10_000,
+                },
+            ),
+            (
+                52,
+                101,
+                RenderPassKind::Fragment,
+                300_000,
+                EffectPassHostTiming {
+                    total_host_ns: 5_000_000,
+                    execute_host_ns: 4_600_000,
+                    begin_query_submit_host_ns: 200_000,
+                    end_query_submit_host_ns: 200_000,
+                },
+            ),
+        ] {
+            let mut metadata = pass_metadata(pass_id, kind, 64, None);
+            metadata.instance_id = Some(instance_id);
+            let pass = state.begin_pass(scope, metadata).expect("pass slot");
+            assert!(state.finish(pass));
+            assert!(state.attach_pass_host_timing(pass, host));
+            assert!(matches!(
+                state.poll_front(true, Some((100, 100 + gpu_ns))),
+                PollOutcome::Ready {
+                    duration_ns: Some(_),
+                    record: None,
+                }
+            ));
+        }
+
+        let record = resolve_test_total(&mut state, scope, 50, 20_000_000);
+        let gpu_max = record.max_effect_pass.expect("GPU-slowest pass");
+        let host_max = record
+            .diagnostics
+            .max_host_effect_pass
+            .expect("host-slowest pass");
+
+        assert_eq!(gpu_max.pass_id, 44);
+        assert_eq!(gpu_max.instance_id, 99);
+        assert_eq!(gpu_max.duration_ns, 18_000_000);
+        assert_eq!(
+            gpu_max.host_timing,
+            Some(EffectPassHostTiming {
+                total_host_ns: 110_000,
+                execute_host_ns: 90_000,
+                begin_query_submit_host_ns: 10_000,
+                end_query_submit_host_ns: 10_000,
+            })
+        );
+        assert_eq!(host_max.pass_id, 52);
+        assert_eq!(host_max.instance_id, 101);
+        assert_eq!(host_max.kind, RenderPassKind::Fragment);
+        assert_eq!(host_max.total_host_ns, 5_000_000);
+        assert_eq!(host_max.gpu_duration_ns, 300_000);
+        assert_eq!(record.diagnostics.effect_pass_host_cpu_ns, 5_110_000);
+        assert_eq!(record.diagnostics.effect_graph_host_cpu_ns, 900_000);
+
+        let line = format_gpu_timing_line(&record);
+        assert!(line.contains("max_effect_pass_host_cpu_ns=110000"));
+        assert!(line.contains("max_effect_pass_execute_host_cpu_ns=90000"));
+        assert!(line.contains("max_host_effect_pass_id=52"));
+        assert!(line.contains("max_host_effect_instance_id=101"));
+        assert!(line.contains("max_host_effect_kind=fragment"));
+        assert!(line.contains("max_host_effect_pass_kind=fragment"));
+        assert!(line.contains("max_host_effect_pass_gpu_ns=300000"));
+    }
+
+    #[test]
+    fn stall_diagnostics_require_both_exact_environment_switches() {
+        let env = ProfilerEnvGuard::new();
+        env.set(Some("1"), None);
+        let timing_only = ProfilerConfig::from_environment();
+        assert!(timing_only.gpu_timing_enabled);
+        assert!(!timing_only.stall_diagnostics_enabled);
+        assert!(
+            pass_metadata(1, RenderPassKind::Composite, 1, None)
+                .host_timing
+                .is_none()
+        );
+        assert!(!GpuTimingDiagnosticsRecord::default().enabled);
+
+        let _queryiv_lock = QUERYIV_TEST_LOCK.lock().unwrap();
+        reset_queryiv_calls();
+        let gl = test_gl_context();
+        let mut query_symbol_loads = 0;
+        let profiler = EffectGpuProfiler::new(&gl, |name| {
+            query_symbol_loads += 1;
+            (name == "glGetQueryiv").then_some(fake_core_get_queryiv as *const c_void)
+        });
+        assert_eq!(profiler.state_kind(), ProfilerStateKind::Active);
+        assert_eq!(
+            profiler.allocated_query_count_for_test(),
+            TIMING_QUERY_OBJECT_CAPACITY
+        );
+        assert_eq!(query_symbol_loads, 2);
+        assert_eq!(CORE_QUERYIV_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(EXT_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+        let ProfilerState::Active(active) = &profiler.state else {
+            unreachable!("timing-only configuration stays active")
+        };
+        assert!(!active.stall_diagnostics_enabled);
+        assert!(!active.gpu_memory_info_available);
+
+        let mut extension_probes = 0;
+        assert!(!discover_gpu_memory_info_support(
+            timing_only.stall_diagnostics_enabled,
+            || {
+                extension_probes += 1;
+                true
+            },
+        ));
+        assert_eq!(extension_probes, 0);
+        let mut memory_queries = 0;
+        GpuMemoryInfoTracker::default().sample(false, |_| {
+            memory_queries += 1;
+            0
+        });
+        assert_eq!(memory_queries, 0);
+
+        env.set(None, Some("1"));
+        let diagnostics_without_timing = ProfilerConfig::from_environment();
+        assert!(!diagnostics_without_timing.gpu_timing_enabled);
+        assert!(!diagnostics_without_timing.stall_diagnostics_enabled);
+        let gl = test_gl_context();
+        let mut timing_functions_loaded = 0;
+        let profiler = EffectGpuProfiler::new(&gl, |_| {
+            timing_functions_loaded += 1;
+            None
+        });
+        assert_eq!(profiler.state_kind(), ProfilerStateKind::Disabled);
+        assert_eq!(profiler.allocated_query_count_for_test(), 0);
+        assert_eq!(timing_functions_loaded, 0);
+
+        env.set(Some("1"), Some("true"));
+        assert!(!ProfilerConfig::from_environment().stall_diagnostics_enabled);
+
+        env.set(Some("1"), Some("1"));
+        let both_enabled = ProfilerConfig::from_environment();
+        assert!(both_enabled.gpu_timing_enabled);
+        assert!(both_enabled.stall_diagnostics_enabled);
+    }
+
+    #[test]
+    fn nvx_extension_discovery_and_unsupported_sampling_issue_no_queries() {
+        let mut extension_probes = 0;
+        assert!(!discover_gpu_memory_info_support(false, || {
+            extension_probes += 1;
+            true
+        }));
+        assert_eq!(extension_probes, 0);
+
+        let unsupported_extensions = HashSet::<String>::new();
+        assert!(!discover_gpu_memory_info_support(true, || {
+            unsupported_extensions.contains(GPU_MEMORY_INFO_EXTENSION)
+        }));
+        let supported_extensions = HashSet::from([GPU_MEMORY_INFO_EXTENSION.to_owned()]);
+        assert!(discover_gpu_memory_info_support(true, || {
+            supported_extensions.contains(GPU_MEMORY_INFO_EXTENSION)
+        }));
+
+        let mut tracker = GpuMemoryInfoTracker::default();
+        let mut query_calls = 0;
+        let sample = tracker.sample(false, |_| {
+            query_calls += 1;
+            123
+        });
+        assert_eq!(query_calls, 0);
+        assert!(!sample.gpu_memory_info_available);
+        assert!(!sample.gpu_memory_eviction_delta_known);
+        assert_eq!(sample.gpu_memory_current_available_kib, 0);
+    }
+
+    #[test]
+    fn nvx_memory_samples_query_exact_tokens_and_report_monotonic_deltas() {
+        let mut tracker = GpuMemoryInfoTracker::default();
+        let mut queried = Vec::new();
+        let first = tracker.sample(true, |pname| {
+            queried.push(pname);
+            match pname {
+                GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX => 8192,
+                GPU_MEMORY_INFO_EVICTION_COUNT_NVX => 7,
+                GPU_MEMORY_INFO_EVICTED_MEMORY_NVX => 128,
+                _ => panic!("unexpected NVX token: {pname:#x}"),
+            }
+        });
+        assert_eq!(
+            queried,
+            [
+                GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX,
+                GPU_MEMORY_INFO_EVICTION_COUNT_NVX,
+                GPU_MEMORY_INFO_EVICTED_MEMORY_NVX,
+            ]
+        );
+        assert!(first.gpu_memory_info_available);
+        assert_eq!(first.gpu_memory_current_available_kib, 8192);
+        assert_eq!(first.gpu_memory_eviction_count, 7);
+        assert_eq!(first.gpu_memory_evicted_kib, 128);
+        assert!(!first.gpu_memory_eviction_delta_known);
+
+        let second = tracker.sample(true, |pname| match pname {
+            GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX => 6144,
+            GPU_MEMORY_INFO_EVICTION_COUNT_NVX => 9,
+            GPU_MEMORY_INFO_EVICTED_MEMORY_NVX => 256,
+            _ => panic!("unexpected NVX token: {pname:#x}"),
+        });
+        assert!(second.gpu_memory_eviction_delta_known);
+        assert_eq!(second.gpu_memory_eviction_count_delta, 2);
+        assert_eq!(second.gpu_memory_evicted_kib_delta, 128);
+
+        let unchanged = tracker.sample(true, |pname| match pname {
+            GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX => 6144,
+            GPU_MEMORY_INFO_EVICTION_COUNT_NVX => 9,
+            GPU_MEMORY_INFO_EVICTED_MEMORY_NVX => 256,
+            _ => panic!("unexpected NVX token: {pname:#x}"),
+        });
+        assert!(unchanged.gpu_memory_eviction_delta_known);
+        assert_eq!(unchanged.gpu_memory_eviction_count_delta, 0);
+        assert_eq!(unchanged.gpu_memory_evicted_kib_delta, 0);
     }
 
     #[test]
@@ -5012,6 +5795,7 @@ mod tests {
             max_capture_pass: None,
             max_effect_pass: None,
             max_composite_scene_replay: None,
+            diagnostics: GpuTimingDiagnosticsRecord::default(),
             graph_gap_attribution_available: false,
             max_graph_gap: GraphGapTiming::unavailable(),
         };
@@ -5034,6 +5818,30 @@ mod tests {
             "max_effect_damage_bbox_pixels",
             "max_effect_target_width",
             "max_effect_target_height",
+            "effect_graph_host_cpu_ns",
+            "effect_pass_host_cpu_ns",
+            "max_effect_pass_host_cpu_ns",
+            "max_effect_pass_execute_host_cpu_ns",
+            "max_effect_pass_begin_query_host_cpu_ns",
+            "max_effect_pass_end_query_host_cpu_ns",
+            "max_host_effect_pass_cpu_ns",
+            "max_host_effect_pass_id",
+            "max_host_effect_instance_id",
+            "max_host_effect_kind",
+            "max_host_effect_pass_kind",
+            "max_host_effect_pass_gpu_ns",
+            "max_host_effect_pass_execute_cpu_ns",
+            "max_host_effect_pass_begin_query_cpu_ns",
+            "max_host_effect_pass_end_query_cpu_ns",
+            "gpu_stall_diagnostics_enabled",
+            "gpu_memory_info_available",
+            "gpu_memory_current_available_kib",
+            "gpu_memory_eviction_count",
+            "gpu_memory_evicted_kib",
+            "gpu_memory_eviction_delta_known",
+            "gpu_memory_eviction_count_delta",
+            "gpu_memory_evicted_kib_delta",
+            "gpu_memory_sample_host_cpu_ns",
             "graph_gap_attribution_available",
             "max_graph_gap_ns",
             "max_graph_gap_position",
@@ -5120,6 +5928,12 @@ mod tests {
         assert!(line.contains("pass_timed_ns=281400"));
         assert!(line.contains("graph_unattributed_ns=0"));
         assert!(line.contains("max_effect_pass_ns=0"));
+        assert!(line.contains("effect_graph_host_cpu_ns=0"));
+        assert!(line.contains("effect_pass_host_cpu_ns=0"));
+        assert!(line.contains("gpu_stall_diagnostics_enabled=0"));
+        assert!(line.contains("gpu_memory_info_available=0"));
+        assert!(line.contains("gpu_memory_eviction_delta_known=0"));
+        assert!(line.contains("max_host_effect_pass_kind=none"));
         assert!(line.contains("max_effect_pass_id=0"));
         assert!(line.contains("max_effect_instance_id=0"));
         assert!(line.contains("max_effect_kind=none"));
@@ -5162,6 +5976,14 @@ mod tests {
             " capture_downsample_fusion_candidates=3 capture_downsample_fusion_executed=2 capture_downsample_fusion_elided_capture_pixels=345 capture_downsample_fusion_output_pixels=78 capture_downsample_fusion_ineligible=1",
             "",
         );
+        let (legacy_prefix, diagnostics_and_suffix) = legacy_line
+            .split_once(" effect_graph_host_cpu_ns=")
+            .expect("diagnostics fields follow legacy timing fields");
+        let (_, legacy_suffix) = diagnostics_and_suffix
+            .split_once(" max_capture_replay_detail_available=")
+            .expect("legacy appended fields follow diagnostics fields");
+        let legacy_line =
+            format!("{legacy_prefix} max_capture_replay_detail_available={legacy_suffix}");
         assert_eq!(
             legacy_line
                 .split(" checkpoint_cache_candidates=")
