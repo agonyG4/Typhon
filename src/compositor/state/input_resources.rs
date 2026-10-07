@@ -1090,7 +1090,9 @@ impl CompositorState {
                 .pointer_surface
                 .as_ref()
                 .map(compositor_surface_id)
-                .filter(|surface_id| self.pointer_constraint.filters_absolute_motion(*surface_id));
+                .filter(|surface_id| {
+                    self.effective_locked_pointer_surface_for_absolute_motion() == Some(*surface_id)
+                });
             if self.wayland_pointer_dnd_routing_active() || locked_surface_id.is_none() {
                 self.send_pointer_motion(position.x, position.y);
             } else if let Some(surface_id) = locked_surface_id {

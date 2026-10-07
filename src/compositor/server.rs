@@ -1835,7 +1835,7 @@ impl OwnCompositorServer {
 
     pub fn cursor_reveal_authority(&self) -> Option<CursorRevealAuthority> {
         crate::pointer_debug::cursor_presentation_trace_enabled()
-            .then_some(self.state.last_cursor_reveal_authority)
+            .then_some(self.state.pointer_constraint_reveal_authority())
             .flatten()
     }
 
@@ -1843,9 +1843,8 @@ impl OwnCompositorServer {
         if !crate::pointer_debug::cursor_presentation_trace_enabled() {
             return;
         }
-        if self.state.last_cursor_reveal_authority == Some(completed) {
-            self.state.last_cursor_reveal_authority = None;
-        }
+        self.state
+            .complete_pointer_constraint_reveal_trace_if(completed);
     }
 
     pub fn last_pointer_position(&self) -> (f64, f64) {

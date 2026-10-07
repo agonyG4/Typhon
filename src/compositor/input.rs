@@ -320,46 +320,6 @@ impl PointerConstraintBackendRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct PointerConstraintState {
-    mode: PointerConstraintMode,
-    surface_id: Option<u32>,
-}
-
-impl Default for PointerConstraintState {
-    fn default() -> Self {
-        Self {
-            mode: PointerConstraintMode::None,
-            surface_id: None,
-        }
-    }
-}
-
-impl PointerConstraintState {
-    #[allow(dead_code)]
-    pub fn activate(&mut self, mode: PointerConstraintMode, surface_id: u32) {
-        self.mode = mode;
-        self.surface_id = Some(surface_id);
-    }
-
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.mode = PointerConstraintMode::None;
-        self.surface_id = None;
-    }
-
-    #[allow(dead_code)]
-    pub const fn mode(self) -> PointerConstraintMode {
-        self.mode
-    }
-
-    #[allow(dead_code)]
-    pub fn filters_absolute_motion(self, surface_id: u32) -> bool {
-        self.surface_id == Some(surface_id) && matches!(self.mode, PointerConstraintMode::Locked)
-    }
-}
-
 pub(super) fn send_pointer_frame_if_supported(pointer: &wl_pointer::WlPointer) {
     if pointer.version() >= WL_POINTER_FRAME_SINCE {
         let _ = pointer.send_event(wl_pointer::Event::Frame);
@@ -465,19 +425,5 @@ mod tests {
             }
             .is_zero()
         );
-    }
-
-    #[test]
-    fn pointer_constraint_locked_surface_filters_absolute_motion() {
-        let mut state = PointerConstraintState::default();
-
-        state.activate(PointerConstraintMode::Confined, 42);
-        assert!(!state.filters_absolute_motion(42));
-        state.activate(PointerConstraintMode::Locked, 42);
-
-        assert!(state.filters_absolute_motion(42));
-        assert!(!state.filters_absolute_motion(7));
-        state.clear();
-        assert_eq!(state.mode(), PointerConstraintMode::None);
     }
 }

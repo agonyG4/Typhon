@@ -1587,7 +1587,7 @@ impl CompositorState {
             .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
         {
             self.pointer_surface = None;
-            self.clear_pointer_constraint();
+            self.invalidate_locked_relative_recipient_cache();
             self.cursor_visibility.client_hidden_pointer = None;
             self.cursor_visibility.client_cursor_pointer = None;
             self.sync_cursor_visibility_request();

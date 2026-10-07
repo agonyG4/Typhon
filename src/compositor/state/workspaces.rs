@@ -402,7 +402,7 @@ impl CompositorState {
             let surface_id = compositor_surface_id(surface);
             root_surface_ids.contains(&self.root_surface_id_for_surface(surface_id))
         }) {
-            self.clear_pointer_constraint();
+            self.invalidate_locked_relative_recipient_cache();
         }
         if self.implicit_pointer_grab.as_ref().is_some_and(|grab| {
             root_surface_ids.contains(&grab.root_surface_id)

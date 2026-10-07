@@ -1381,12 +1381,7 @@ impl CompositorState {
             self.send_pointer_enter_to_resource(&pointer, target);
         }
         let surface_id = compositor_surface_id(&target.surface);
-        let constraint_ids = self
-            .pointer_constraints
-            .values()
-            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
-            .map(|constraint| constraint.id)
-            .collect::<Vec<_>>();
+        let constraint_ids = self.pointer_constraint_ids_for_surface(surface_id);
         for constraint_id in constraint_ids {
             self.maybe_request_pointer_constraint_activation(constraint_id);
         }
@@ -1426,12 +1421,7 @@ impl CompositorState {
             push_pointer_frame_once(frame_pointers, pointer);
         }
         let surface_id = compositor_surface_id(&target.surface);
-        let constraint_ids = self
-            .pointer_constraints
-            .values()
-            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
-            .map(|constraint| constraint.id)
-            .collect::<Vec<_>>();
+        let constraint_ids = self.pointer_constraint_ids_for_surface(surface_id);
         for constraint_id in constraint_ids {
             self.maybe_request_pointer_constraint_activation(constraint_id);
         }

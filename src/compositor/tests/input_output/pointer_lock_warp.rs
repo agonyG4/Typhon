@@ -63,7 +63,7 @@ fn locked_pointer_warp_is_ignored_while_active() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    activate_backend_locked_pointer(&commands, &mut state, &mut queue).unwrap();
+    let backend_id = activate_backend_locked_pointer(&commands, &mut state, &mut queue).unwrap();
     let _ = capture_pointer_constraint_backend_requests(&commands);
 
     state.pointer_motion = false;
@@ -142,6 +142,29 @@ fn locked_pointer_warp_is_ignored_while_active() {
         .unwrap();
     let position_after_unlock = receiver.recv().unwrap();
 
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 78,
+            absolute: Some(OutputPosition {
+                x: anchor.0 + 4.0,
+                y: anchor.1 + 3.0,
+            }),
+            relative: None,
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
@@ -162,4 +185,5 @@ fn locked_pointer_warp_is_ignored_while_active() {
     assert_eq!(state.locked_count, 1);
     assert_eq!(state.unlocked_count, 0);
     assert_eq!(state.relative_motion_count, 1);
+    assert!(state.pointer_motion);
 }

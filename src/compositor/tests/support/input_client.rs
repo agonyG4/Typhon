@@ -277,58 +277,6 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_relative
     Ok(state)
 }
 
-pub(in crate::compositor::tests) fn create_locked_focused_toplevel_and_receive_pointer_motion_sample(
-    socket_path: &PathBuf,
-    commands: &Sender<ServerCommand>,
-    sample: PointerMotionSample,
-) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
-    let stream = UnixStream::connect(socket_path)?;
-    let connection = Connection::from_socket(stream)?;
-    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
-    let qh = queue.handle();
-
-    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
-    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
-    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
-    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
-    let pointer = seat.get_pointer(&qh, ());
-    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
-        globals.bind(&qh, 1..=1, ())?;
-    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
-
-    let surface = compositor.create_surface(&qh, ());
-    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    let _toplevel = xdg_surface.get_toplevel(&qh, ());
-    surface.commit();
-    connection.flush()?;
-
-    let mut state = RegistryTestState::default();
-    queue.roundtrip(&mut state)?;
-    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
-    connection.flush()?;
-    wait_for_server_commands(commands);
-    queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion {
-        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
-        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
-    })?;
-    wait_for_server_commands(commands);
-    queue.roundtrip(&mut state)?;
-
-    commands.send(ServerCommand::ActivatePointerConstraint(
-        PointerConstraintMode::Locked,
-    ))?;
-    wait_for_server_commands(commands);
-    state.pointer_motion = false;
-    state.pointer_surface_x = None;
-    state.pointer_surface_y = None;
-
-    commands.send(ServerCommand::PointerMotionSample(sample))?;
-    wait_for_server_commands(commands);
-    queue.roundtrip(&mut state)?;
-    Ok(state)
-}
-
 pub(in crate::compositor::tests) fn capture_pointer_constraint_backend_requests(
     commands: &Sender<ServerCommand>,
 ) -> Vec<PointerConstraintBackendRequest> {

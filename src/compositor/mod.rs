@@ -251,9 +251,9 @@ pub use input::{
     CursorRevealAuthority, OutputPosition, OutputRect, OutputRegion, PointerAxisComponent,
     PointerAxisFrame, PointerAxisSource, PointerConstraintBackendId,
     PointerConstraintBackendRequest, PointerConstraintMode,
-    PointerConstraintRegionResolutionTiming, PointerConstraintState,
-    PointerConstraintTransitionSnapshot, PointerMotionSample, PointerRestoreDecision,
-    PointerWarpOrigin, RelativePointerMotion, ResolvedPointerConstraintBackendRequest,
+    PointerConstraintRegionResolutionTiming, PointerConstraintTransitionSnapshot,
+    PointerMotionSample, PointerRestoreDecision, PointerWarpOrigin, RelativePointerMotion,
+    ResolvedPointerConstraintBackendRequest,
 };
 use input::{
     InputSerial, InputSerialKind, PointerConstraintLifetime, send_pointer_frame_if_supported,
@@ -790,19 +790,8 @@ pub struct CompositorState {
     keyboard_configuration_persistence: crate::control_snapshots::KeyboardConfigurationPersistence,
     keyboard_environment_override_active: bool,
     pointer_surface: Option<wl_surface::WlSurface>,
-    pointer_constraint: PointerConstraintState,
-    pointer_constraints: HashMap<u64, PointerConstraint>,
-    pending_pointer_constraint_surface_states: HashMap<u32, CapturedPointerConstraintSurfaceState>,
-    next_internal_pointer_constraint_id: u64,
-    next_pointer_constraint_generation: u64,
-    active_locked_pointer_routing: Option<ActiveLockedPointerRouting>,
-    active_confined_pointer_routing: Option<ActiveConfinedPointerRouting>,
+    pointer_constraint_runtime: PointerConstraintRuntimeState,
     relative_motion_debug: RelativeMotionDebugState,
-    dispatch_epoch: u64,
-    active_backend_constraint: Option<PointerConstraintBackendId>,
-    pending_backend_constraint: Option<PointerConstraintBackendId>,
-    pending_locked_pointer_reveal: Option<PendingLockedPointerReveal>,
-    last_cursor_reveal_authority: Option<CursorRevealAuthority>,
     pending_pointer_constraint_backend_requests: Vec<PointerConstraintBackendRequest>,
     cursor_visibility: CursorVisibilityState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
@@ -1125,35 +1114,6 @@ struct AstreaShortcutRegistration {
     namespace: String,
     name: String,
 }
-#[derive(Debug, Clone)]
-pub(in crate::compositor) struct ActiveLockedPointerRouting {
-    constraint_id: u64,
-    generation: u64,
-    pointer: wl_pointer::WlPointer,
-    surface: wl_surface::WlSurface,
-    surface_x: f64,
-    surface_y: f64,
-    activation_anchor: OutputPosition,
-}
-#[derive(Debug, Clone)]
-pub(in crate::compositor) struct ActiveConfinedPointerRouting {
-    constraint_id: u64,
-    generation: u64,
-    pointer: wl_pointer::WlPointer,
-    surface: wl_surface::WlSurface,
-    region: OutputRegion,
-}
-#[derive(Debug, Clone)]
-struct PendingLockedPointerReveal {
-    backend_id: PointerConstraintBackendId,
-    pointer: wl_pointer::WlPointer,
-    surface: wl_surface::WlSurface,
-    fallback_position: Option<OutputPosition>,
-    fallback_origin: Option<PointerWarpOrigin>,
-    backend_restore_settled: bool,
-    backend_settled_dispatch_epoch: Option<u64>,
-    client_warp_position: Option<OutputPosition>,
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImplicitPointerRouting {
     Normal,
@@ -1206,47 +1166,6 @@ impl LockedRelativeRecipientCache {
         self.key = None;
     }
 }
-#[derive(Debug, Clone)]
-struct PointerConstraint {
-    id: u64,
-    generation: u64,
-    mode: PointerConstraintMode,
-    lifetime: PointerConstraintLifetime,
-    surface: wl_surface::WlSurface,
-    pointer: wl_pointer::WlPointer,
-    locked_resource: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
-    confined_resource: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
-    active: bool,
-    backend_pending: bool,
-    canceled_backend_activation: bool,
-    protocol_resource_alive: bool,
-    surface_constraint_pending: bool,
-    lifecycle_removal_pending: bool,
-    defunct: bool,
-    committed: bool,
-    committed_region: SurfaceInputRegion,
-    committed_cursor_position_hint: Option<(f64, f64)>,
-}
-#[derive(Debug, Clone)]
-pub(in crate::compositor) struct PointerConstraintRegistration {
-    id: u64,
-    mode: PointerConstraintMode,
-    lifetime: PointerConstraintLifetime,
-    surface: wl_surface::WlSurface,
-    pointer: wl_pointer::WlPointer,
-    locked_resource: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
-    confined_resource: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
-    region: SurfaceInputRegion,
-}
-impl PointerConstraint {
-    fn backend_id(&self) -> PointerConstraintBackendId {
-        PointerConstraintBackendId {
-            constraint_id: self.id,
-            generation: self.generation,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DataOfferData {
     target_client_id: ClientId,

@@ -110,7 +110,6 @@ pub(in crate::compositor::tests) enum ServerCommand {
         y: f64,
     },
     PointerMotionSample(PointerMotionSample),
-    ActivatePointerConstraint(PointerConstraintMode),
     PointerButton {
         button: u32,
         pressed: bool,
@@ -655,11 +654,6 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::PointerMotionSample(sample) => {
                         server.send_pointer_motion_sample(sample);
-                    }
-                    ServerCommand::ActivatePointerConstraint(mode) => {
-                        server
-                            .state
-                            .activate_pointer_constraint_for_focused_surface(mode);
                     }
                     ServerCommand::PointerButton { button, pressed } => {
                         server.send_pointer_button(button, pressed);
@@ -2131,7 +2125,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let _ = reply.send((pending, requests));
                     }
                     ServerCommand::CapturePointerConstraintIds(reply) => {
-                        let ids = server.state.pointer_constraints.keys().copied().collect();
+                        let ids = server.state.pointer_constraint_ids_for_test();
                         let _ = reply.send(ids);
                     }
                     ServerCommand::CaptureTerminalClientCount(reply) => {
@@ -2141,17 +2135,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         constraint_id,
                         reply,
                     } => {
-                        let snapshot = server.state.pointer_constraints.get(&constraint_id).map(
-                            |constraint| PointerConstraintSurfaceSnapshot {
-                                committed: constraint.committed,
-                                active: constraint.active,
-                                protocol_resource_alive: constraint.protocol_resource_alive,
-                                backend_pending: constraint.backend_pending,
-                                surface_constraint_pending: constraint.surface_constraint_pending,
-                                lifecycle_removal_pending: constraint.lifecycle_removal_pending,
-                                defunct: constraint.defunct,
-                                committed_region: constraint.committed_region.clone(),
-                                committed_cursor_position_hint: constraint
+                        let snapshot = server
+                            .state
+                            .pointer_constraint_surface_snapshot_for_test(constraint_id)
+                            .map(|snapshot| PointerConstraintSurfaceSnapshot {
+                                committed: snapshot.committed,
+                                active: snapshot.active,
+                                protocol_resource_alive: snapshot.protocol_resource_alive,
+                                backend_pending: snapshot.backend_pending,
+                                surface_constraint_pending: snapshot.surface_constraint_pending,
+                                lifecycle_removal_pending: snapshot.lifecycle_removal_pending,
+                                defunct: snapshot.defunct,
+                                committed_region: snapshot.committed_region,
+                                committed_cursor_position_hint: snapshot
                                     .committed_cursor_position_hint,
                             },
                         );
@@ -2171,14 +2167,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         );
                     }
                     ServerCommand::CaptureActiveLockedPointerAnchor(reply) => {
-                        let anchor =
-                            server
-                                .state
-                                .active_locked_pointer_routing
-                                .as_ref()
-                                .map(|routing| {
-                                    (routing.activation_anchor.x, routing.activation_anchor.y)
-                                });
+                        let anchor = server.state.active_locked_pointer_anchor_for_test();
                         let _ = reply.send(anchor);
                     }
                     ServerCommand::CaptureFocusedSurfaceId(reply) => {

@@ -60,6 +60,32 @@ there is no alternate runtime to hide that failure.
 The source-layout check requires every retained Rust file to be connected to
 the module tree and keeps production modules below the configured size limits.
 
+## Pointer constraint runtime authority
+
+`PointerConstraintRuntimeState` is the single persistent owner of protocol
+constraint records, pre-commit surface mutations, active lock/confine routing,
+backend constraint identities, generation counters, and lock-release reveal
+tracking. Surface-commit mutations transfer into `SurfaceTransactionState` as
+captured transaction data and return to the runtime owner when publication
+makes them effective:
+
+```text
+pointer constraint protocol request
+        ↓
+PointerConstraintRuntimeState pending mutation
+        ↓ wl_surface.commit capture
+SurfaceTransactionState captured mutation
+        ↓ transaction publication
+PointerConstraintRuntimeState committed constraint state
+        ↓
+CompositorState focus / topology / region / cursor / backend orchestration
+```
+
+The runtime owner does not own pointer focus, spatial caches, cursor
+visibility, or the native request transport queue. Absolute-motion filtering
+uses the matching active backend identity and generation from the runtime
+owner; relative-pointer routing remains in input dispatch.
+
 ## Effective XDG window geometry
 
 The compositor has one logical authority for native XDG window geometry.

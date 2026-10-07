@@ -104,48 +104,6 @@ fn focused_relative_pointer_receives_raw_delta_before_lock() {
 }
 
 #[test]
-fn locked_pointer_constraint_suppresses_absolute_motion_but_keeps_relative_motion() {
-    let socket_name = unique_socket_name();
-    let capabilities = InputProtocolCapabilities {
-        relative_pointer: true,
-        ..InputProtocolCapabilities::desktop_baseline()
-    };
-    let server =
-        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
-    let socket_path = runtime_socket_path(&socket_name);
-    let (commands, server_thread) = spawn_controllable_test_server(server);
-    let relative = RelativePointerMotion {
-        dx: 9.0,
-        dy: -8.0,
-        dx_unaccelerated: 11.0,
-        dy_unaccelerated: -10.0,
-    };
-
-    let state = create_locked_focused_toplevel_and_receive_pointer_motion_sample(
-        &socket_path,
-        &commands,
-        PointerMotionSample {
-            timestamp_usec: 77,
-            absolute: Some(OutputPosition { x: 160.0, y: 90.0 }),
-            relative: Some(relative),
-        },
-    )
-    .unwrap();
-    commands.send(ServerCommand::Stop).unwrap();
-    server_thread.join().unwrap();
-
-    assert_eq!(state.relative_motion_count, 1);
-    assert_eq!(state.relative_motion_dx, Some(relative.dx));
-    assert_eq!(
-        state.relative_motion_dx_unaccel,
-        Some(relative.dx_unaccelerated)
-    );
-    assert!(!state.pointer_motion);
-    assert_eq!(state.pointer_surface_x, None);
-    assert_eq!(state.pointer_surface_y, None);
-}
-
-#[test]
 fn locked_relative_motion_is_followed_by_source_pointer_frame() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
