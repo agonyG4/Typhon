@@ -4,6 +4,7 @@ use super::*;
 impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
         self.fail_pending_screen_captures("session_inactive");
+        self.quiesce_system_action_transport();
         self.input_state.clear_keyboard_repeat();
         let now_ns = monotonic_now_ns()?;
         let first_request = self.shutdown.is_running();
@@ -101,6 +102,7 @@ impl NativeRuntime {
                 dmabuf_gpu_release_tokens: Vec::new(),
                 xwayland_events: Vec::new(),
                 control_events: Vec::new(),
+                system_action_events: Default::default(),
                 cursor_io_events: Vec::new(),
                 keyboard_persistence_events: Vec::new(),
                 controller_monitor_ready: false,

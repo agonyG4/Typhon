@@ -2,6 +2,7 @@ use super::*;
 use crate::native_output::controller::{
     ControllerDeviceId, ControllerManager, ControllerPolicy, MAX_CONTROLLER_DEVICES,
 };
+use crate::system_action_transport::NativeSystemActionTransport;
 use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
 use oblivion_one::core::OutputId;
 
@@ -166,6 +167,7 @@ mod session_io;
 mod shutdown;
 mod shutdown_cycle;
 mod slow_cycle;
+mod system_action_io;
 mod wake_plan;
 mod window_exit_frame;
 mod work_domains;
@@ -416,6 +418,7 @@ mod microturn_tests {
                 dmabuf_gpu_release_tokens: Vec::new(),
                 xwayland_events: Vec::new(),
                 control_events: Vec::new(),
+                system_action_events: Default::default(),
                 cursor_io_events: Vec::new(),
                 keyboard_persistence_events: Vec::new(),
                 controller_monitor_ready: false,
@@ -702,6 +705,7 @@ pub(crate) struct NativeRuntime {
     dmem_foreground: oblivion_one::native::dmem_foreground::DmemForeground,
     dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry,
     control_server: NativeControlServer,
+    system_action_transport: NativeSystemActionTransport,
     started_at: Instant,
     vrr_policy: VrrPolicy,
     xwayland: XwaylandService,
@@ -946,6 +950,7 @@ impl Drop for NativeRuntime {
         let _ = self
             .dmabuf_gpu_release_registry
             .cancel_all(&mut self.event_loop, &mut self.server);
+        self.quiesce_system_action_transport();
         let _ = self.control_server.shutdown(&mut self.event_loop);
         if let Some(token) = self.cursor_io_worker_reactor_token.take() {
             let _ = self.event_loop.unregister(token);

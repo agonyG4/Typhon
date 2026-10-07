@@ -2032,6 +2032,7 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: _,
             event_loop,
+            system_action_transport,
             drm_reactor_token: _,
             cursor_output_arbitration,
             frame_scheduler,
@@ -2395,6 +2396,13 @@ impl NativeRuntime {
                             return Err(error);
                         }
                     };
+                    super::system_action_io::submit_input_application_system_actions(
+                        system_action_transport,
+                        event_loop,
+                        input_state,
+                        &application,
+                        perf,
+                    );
                     vt_switch_requested = vt_switch_requested.or(application.vt_switch_requested);
                     if application.exit_requested {
                         cycle.shutdown_requested = true;
@@ -2513,6 +2521,13 @@ impl NativeRuntime {
                         return Err(error);
                     }
                 };
+                super::system_action_io::submit_input_application_system_actions(
+                    system_action_transport,
+                    event_loop,
+                    input_state,
+                    &application,
+                    perf,
+                );
                 vt_switch_requested = vt_switch_requested.or(application.vt_switch_requested);
                 if application.exit_requested {
                     cycle.shutdown_requested = true;

@@ -129,8 +129,18 @@ impl ControlRuntimePaths {
         &self.socket_path
     }
 
+    pub(crate) fn system_action_socket_path(&self) -> PathBuf {
+        self.socket_dir.join("system-actions.sock")
+    }
+
     pub fn lock_path(&self) -> PathBuf {
         self.socket_dir.join("control.lock")
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_system_action_endpoint(&self) -> Result<PathBuf, ControlServerError> {
+        self.prepare_directories(effective_uid())?;
+        Ok(self.system_action_socket_path())
     }
 
     #[cfg(test)]
@@ -138,7 +148,7 @@ impl ControlRuntimePaths {
         &self.socket_dir
     }
 
-    fn prepare_directories(&self, owner_uid: u32) -> Result<(), ControlServerError> {
+    pub(crate) fn prepare_directories(&self, owner_uid: u32) -> Result<(), ControlServerError> {
         ensure_owned_directory(&self.runtime_dir.join("astrea"), owner_uid)?;
         ensure_owned_directory(&self.runtime_dir.join("astrea").join("typhon"), owner_uid)?;
         ensure_owned_directory(&self.socket_dir, owner_uid)?;

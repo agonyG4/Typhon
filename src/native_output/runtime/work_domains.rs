@@ -46,6 +46,7 @@ pub(crate) struct NativeWorkDomains {
     pub(super) surface_pacing: bool,
     pub(super) xwayland: bool,
     pub(super) control: bool,
+    pub(super) system_action_transport: bool,
     pub(super) children: bool,
     pub(super) session: bool,
     pub(super) shutdown: bool,
@@ -134,6 +135,9 @@ impl NativeWorkDomains {
         if self.controller {
             bits |= 1 << 16;
         }
+        if self.system_action_transport {
+            bits |= 1 << 17;
+        }
         bits
     }
 
@@ -152,6 +156,28 @@ impl NativeWorkDomains {
             && !self.surface_pacing
             && !self.xwayland
             && !self.control
+            && !self.system_action_transport
+            && !self.children
+            && !self.session
+            && !self.shutdown
+    }
+
+    pub(super) const fn only_system_action_transport_work(self) -> bool {
+        self.system_action_transport
+            && !self.input
+            && !self.wayland_protocol
+            && !self.astrea_publication
+            && !self.commit_timing_planning
+            && !self.wayland_dispatch
+            && !self.scene
+            && !self.cursor
+            && !self.screen_capture
+            && !self.presentation
+            && !self.explicit_sync
+            && !self.surface_pacing
+            && !self.xwayland
+            && !self.control
+            && !self.controller
             && !self.children
             && !self.session
             && !self.shutdown
@@ -218,6 +244,8 @@ impl NativeWorkDomains {
             || wakeup
                 .continuation
                 .contains(NativeContinuationReason::ControlTimeout);
+        let system_action_transport =
+            reasons.system_action_transport() || !wakeup.system_action_events.is_empty();
         let children = reasons.child_signal();
         let session = reasons.seat();
         let xwayland = reasons.xwayland_listen()
@@ -282,6 +310,7 @@ impl NativeWorkDomains {
             surface_pacing,
             xwayland,
             control,
+            system_action_transport,
             children,
             session,
             shutdown: state.shutdown_requested,
@@ -330,6 +359,7 @@ mod tests {
     const CONTROL: u32 = 1 << 14;
     const DMABUF_GPU_RELEASE: u32 = 1 << 16;
     const CONTROLLER: u32 = 1 << 20;
+    const SYSTEM_ACTION: u32 = 1 << 21;
 
     fn wakeup(bits: u32) -> NativeWakeup {
         NativeWakeup {
@@ -342,6 +372,7 @@ mod tests {
             dmabuf_gpu_release_tokens: Vec::new(),
             xwayland_events: Vec::new(),
             control_events: Vec::new(),
+            system_action_events: Default::default(),
             cursor_io_events: Vec::new(),
             keyboard_persistence_events: Vec::new(),
             controller_monitor_ready: false,
@@ -395,6 +426,28 @@ mod tests {
         assert!(!domains.cursor);
         assert!(!domains.presentation);
         assert!(!domains.explicit_sync);
+    }
+
+    #[test]
+    fn system_action_transport_isolated_from_wayland_and_visual_work() {
+        let domains = NativeWorkDomains::classify(&wakeup(SYSTEM_ACTION), &state());
+        assert!(domains.system_action_transport);
+        assert!(domains.only_system_action_transport_work());
+        assert!(!domains.wayland_dispatch);
+        assert!(!domains.scene);
+        assert!(!domains.cursor);
+        assert!(!domains.presentation);
+        assert_eq!(domains.diagnostic_bits() & (1 << 17), 1 << 17);
+    }
+
+    #[test]
+    fn system_action_handshake_deadline_timer_is_transport_only_work() {
+        let mut wakeup = wakeup(TIMER);
+        wakeup.reasons.mark_system_action_transport();
+        let domains = NativeWorkDomains::classify(&wakeup, &state());
+
+        assert!(domains.system_action_transport);
+        assert!(domains.only_system_action_transport_work());
     }
 
     #[test]

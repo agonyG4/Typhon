@@ -73,6 +73,12 @@ stored `BindingId` against its raw or translated identity. A layout or lock-stat
 change that makes that binding stop matching cancels the repeat. Physical
 repeat targets do not request an XKB translation.
 
+For a K4A system-action binding, the exact repeat target also requires the
+current advertised capability. K4B1 applies capability changes before repeat
+service; withdrawing the action cancels that target and removes its deadline.
+An unrelated capability update leaves the selected binding and repeat
+ownership unchanged.
+
 Repeat only reapplies the consumed compositor binding action with
 `AstreaShortcutPhase::Repeated`. It is not physical user activity and does not
 change keyboard source ownership, compositor or client XKB state, or client key

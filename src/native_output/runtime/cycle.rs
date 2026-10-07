@@ -195,6 +195,17 @@ impl NativeRuntime {
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
         let now_ns = monotonic_now_ns()?;
+        if self
+            .system_action_transport
+            .next_deadline_ns()
+            .is_some_and(|deadline| deadline <= now_ns)
+        {
+            cycle.wakeup.reasons.mark_system_action_transport();
+        }
+        self.service_system_action_transport(&cycle, now_ns);
+        if cycle.wakeup.reasons.system_action_transport() {
+            self.arm_runtime_deadline()?;
+        }
         let slow_cycle_enabled = self.slow_cycle_trace.enabled();
         let mut render_attempted = false;
         if self.pointer_timing.enabled() {
@@ -233,6 +244,11 @@ impl NativeRuntime {
             if self.session.permits_output() && self.shutdown.is_running() {
                 self.service_controller_work(&cycle)?;
             }
+            self.finish_slow_cycle(&cycle, render_attempted)?;
+            return Ok(());
+        }
+        if work_domains.only_system_action_transport_work() {
+            self.arm_runtime_deadline()?;
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
@@ -931,6 +947,7 @@ impl NativeRuntime {
     fn arm_suspended_deadline(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
         let control_timeout_deadline = self.control_server.next_deadline_ns();
+        let system_action_transport_deadline = self.system_action_transport.next_deadline_ns();
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
             primary_deadline: self.shutdown.suspended_reactor_deadline_ns().map(|at_ns| {
@@ -940,6 +957,8 @@ impl NativeRuntime {
                 }
             }),
             control_timeout_deadline_ns: control_timeout_deadline
+                .filter(|deadline| *deadline > now_ns),
+            system_action_transport_deadline_ns: system_action_transport_deadline
                 .filter(|deadline| *deadline > now_ns),
             output_configuration_deadline_ns: self
                 .output_configuration_transactions

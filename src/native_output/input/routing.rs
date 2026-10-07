@@ -4,6 +4,7 @@ use crate::native_output::runtime::{
     NativePointerConstraintBackendAction, NativePointerTimingPoint, NativePointerTransitionContext,
     capture_timing_point,
 };
+use crate::system_action::AstreaSystemActionBatch;
 use ::input::AsRaw;
 use oblivion_one::compositor::{
     InteractionUpdateOutcome, PointerRestoreDecision, PointerWarpOrigin,
@@ -1482,6 +1483,8 @@ pub(crate) fn apply_native_input_effect(
         fallback_attempts: 0,
         fallback_spawn_failed: None,
         vt_switch_requested: effect.vt_switch,
+        system_actions: AstreaSystemActionBatch::default(),
+        system_action_overflow: false,
     };
     application.redraw_requested |= apply_compositor_only_pointer_position(&effect, |x, y| {
         if context.server.window_interaction_active() {
@@ -1731,6 +1734,11 @@ pub(crate) fn apply_native_input_effect(
                     fallback_attempt = Some((invocation, kind));
                 }
             }
+            BindingActionDefinition::SystemAction(action) => {
+                if !application.system_actions.push(*action) {
+                    application.system_action_overflow = true;
+                }
+            }
             BindingActionDefinition::ExitCompositor
             | BindingActionDefinition::CloseActiveWindow
             | BindingActionDefinition::ToggleFullscreen
@@ -1740,8 +1748,7 @@ pub(crate) fn apply_native_input_effect(
             | BindingActionDefinition::ToggleDefaultSpecialWorkspace
             | BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace
             | BindingActionDefinition::BeginMove
-            | BindingActionDefinition::BeginResize
-            | BindingActionDefinition::SystemAction(_) => {}
+            | BindingActionDefinition::BeginResize => {}
         }
     }
     if let Some(command) = effect.launch_command {
@@ -2233,6 +2240,8 @@ pub(crate) struct NativeInputApplication {
     pub(crate) fallback_attempts: usize,
     pub(crate) fallback_spawn_failed: Option<AstreaShortcutFallbackKind>,
     pub(crate) vt_switch_requested: Option<u8>,
+    pub(crate) system_actions: AstreaSystemActionBatch,
+    pub(crate) system_action_overflow: bool,
 }
 
 pub(crate) fn apply_native_window_action(

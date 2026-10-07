@@ -1351,3 +1351,141 @@ fn xf86_raw_translated_duplicate_is_one_binding_and_one_repeat_target() {
         active.binding
     );
 }
+
+fn system_action_binding_with_trigger(
+    action: AstreaSystemAction,
+    trigger: BindingTrigger,
+    repeat: RepeatPolicy,
+) -> BindingSpec {
+    BindingSpec {
+        modifiers: ModifierMask::EMPTY,
+        trigger,
+        input: BindingInput::KeySym(BindingKeySym::new(
+            xkbcommon::xkb::keysyms::KEY_XF86AudioRaiseVolume,
+        )),
+        action: BindingActionDefinition::SystemAction(action),
+        repeat,
+        inhibition: InhibitionPolicy::Bypass,
+        reserved: true,
+    }
+}
+
+#[test]
+fn capability_changes_preserve_client_press_release_ownership() {
+    let volume = AstreaSystemActionCapabilities::for_action(AstreaSystemAction::OutputVolumeUp);
+    let snapshot = symbolic_snapshot(
+        Some((
+            xkbcommon::xkb::keysyms::KEY_XF86AudioRaiseVolume,
+            ModifierMask::EMPTY,
+        )),
+        Some((
+            xkbcommon::xkb::keysyms::KEY_XF86AudioRaiseVolume,
+            ModifierMask::EMPTY,
+        )),
+    );
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+
+    let mut client_owned = NativeInputState::new(320, 200);
+    client_owned.binding_manager = AstreaBindingManager::with_specs_and_system_capabilities(
+        vec![system_action_binding_with_trigger(
+            AstreaSystemAction::OutputVolumeUp,
+            BindingTrigger::Press,
+            RepeatPolicy::Enabled,
+        )],
+        AstreaSystemActionCapabilities::EMPTY,
+    );
+    let press = press_with_snapshot(&mut client_owned, device, KEY_Z, Some(snapshot));
+    assert!(press.keyboard_actions.iter().any(|action| matches!(
+        action,
+        NativeKeyboardAction::PhysicalAndClient(event) if event.pressed
+    )));
+    assert!(client_owned.set_system_action_capabilities(volume));
+    let release = client_owned.handle_hardware_input_event_at_with_symbolic(
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Z,
+            pressed: false,
+        }),
+        None,
+        2,
+    );
+    assert!(release.keyboard_actions.iter().any(|action| matches!(
+        action,
+        NativeKeyboardAction::PhysicalAndClient(event) if !event.pressed
+    )));
+
+    let mut system_owned = NativeInputState::new(320, 200);
+    system_owned.binding_manager = AstreaBindingManager::with_specs_and_system_capabilities(
+        vec![system_action_binding_with_trigger(
+            AstreaSystemAction::OutputVolumeUp,
+            BindingTrigger::Press,
+            RepeatPolicy::Enabled,
+        )],
+        volume,
+    );
+    let press = press_with_snapshot(&mut system_owned, device, KEY_Z, Some(snapshot));
+    assert_eq!(press.binding_action_invocations.len(), 1);
+    assert!(!press.keyboard_actions.iter().any(|action| matches!(
+        action,
+        NativeKeyboardAction::PhysicalAndClient(_) | NativeKeyboardAction::ClientOnly(_)
+    )));
+    assert!(system_owned.set_system_action_capabilities(AstreaSystemActionCapabilities::EMPTY));
+    let release = system_owned.handle_hardware_input_event_at_with_symbolic(
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Z,
+            pressed: false,
+        }),
+        None,
+        3,
+    );
+    assert!(!release.keyboard_actions.iter().any(|action| matches!(
+        action,
+        NativeKeyboardAction::PhysicalAndClient(_) | NativeKeyboardAction::ClientOnly(_)
+    )));
+}
+
+#[test]
+fn removing_active_system_repeat_capability_cancels_only_that_exact_repeat() {
+    let volume = AstreaSystemActionCapabilities::for_action(AstreaSystemAction::OutputVolumeUp);
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager =
+        AstreaBindingManager::with_default_bindings_and_system_capabilities(volume);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let snapshot = symbolic_snapshot(
+        Some((
+            xkbcommon::xkb::keysyms::KEY_XF86AudioRaiseVolume,
+            ModifierMask::EMPTY,
+        )),
+        None,
+    );
+    let press = press_with_snapshot(&mut input, device, KEY_Z, Some(snapshot));
+    assert_eq!(press.binding_action_invocations.len(), 1);
+    assert!(input.active_keyboard_repeat().is_some());
+    let generation = input.keyboard_repeat_generation();
+
+    assert!(input.set_system_action_capabilities(AstreaSystemActionCapabilities::EMPTY));
+    assert!(input.active_keyboard_repeat().is_none());
+    assert_eq!(input.keyboard_repeat_deadline_ns(), None);
+    assert_ne!(input.keyboard_repeat_generation(), generation);
+    assert!(
+        input
+            .service_keyboard_repeat_if_unchanged_with_symbolic(
+                2_000_000_000,
+                generation,
+                Some(snapshot),
+            )
+            .binding_action_invocations
+            .is_empty()
+    );
+
+    let unrelated = AstreaSystemActionCapabilities::for_action(AstreaSystemAction::MediaNext);
+    let mut still_supported = NativeInputState::new(320, 200);
+    still_supported.binding_manager =
+        AstreaBindingManager::with_default_bindings_and_system_capabilities(volume);
+    let _ = press_with_snapshot(&mut still_supported, device, KEY_Z, Some(snapshot));
+    let generation = still_supported.keyboard_repeat_generation();
+    assert!(still_supported.set_system_action_capabilities(volume.union(unrelated)));
+    assert!(still_supported.active_keyboard_repeat().is_some());
+    assert_eq!(still_supported.keyboard_repeat_generation(), generation);
+}

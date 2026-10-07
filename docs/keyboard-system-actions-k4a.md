@@ -19,7 +19,7 @@ The vocabulary intentionally excludes power and session lifecycle actions, scree
 
 `AstreaSystemActionCapabilities` is a fixed-width bit mask. Each action has a distinct bit, and a compile-time width assertion plus unit tests protect the representation. A capability says that a live executor understands an action; it does not promise that the operation will succeed on the current hardware or that a media player is active.
 
-K4A production constructors use `EMPTY`. Thus the compiled XF86 defaults are ineligible in the production configuration. A candidate is eligible only when its normal trigger, repeat, and inhibition rules pass and, for a system action, the manager's capability mask contains that action. The manager's capability mask is fixed for its lifetime in K4A.
+K4A production constructors use `EMPTY`. Thus the compiled XF86 defaults are ineligible until K4B1 connects a validated session-service peer and completes the capability handshake. A candidate is eligible only when its normal trigger, repeat, and inhibition rules pass and, for a system action, the manager's current capability mask contains that action. K4B1 replaces this mask on service capability updates and clears it on disconnect; it does not rebuild the compiled binding table.
 
 Capability is an eligibility filter, not a shadow. If a later system-action binding is unsupported, matching continues to an earlier eligible physical or symbolic binding. If nothing else matches, the event takes the normal K1/K3B client-forwarding path. The unsupported action is not consumed as a no-op.
 
@@ -57,9 +57,9 @@ XF86 keys use K3B's authoritative pre-update XKB snapshot and the same raw/trans
 
 K2 retains the exact `BindingId` selected at press time. Repeat validation checks that exact binding's capability, physical held-key/modifier ownership, inhibition policy, and fresh symbolic identity when the trigger is a `KeySym`; it does not rematch or retarget. Physical repeat retains its physical modifier snapshot.
 
-## No executor in K4A
+## No executor in K4A/K4B1
 
-The system-action invocation uses the existing compact binding-action machinery, but K4A does not dispatch it. It does not make DBus calls, spawn commands, send Shell shortcuts, publish Wayland events, flush clients, or request rendering. Production capabilities are empty, so no default system action can reach this unexecuted invocation path.
+K4A defined the typed invocation without dispatching it. K4B1 now carries an eligible invocation to the session service over a nonblocking local socket, but it still does not execute the action. Before a validated peer completes Welcome, capabilities are empty and the XF86 defaults fall through normally. Afterward, only advertised actions are eligible and are sent as typed intents. Typhon makes no D-Bus call, spawns no command, sends no Shell shortcut, publishes no action over Wayland, and requests no rendering because of the system action.
 
 Unsupported actions do not fall back to `wpctl`, `pactl`, `playerctl`, `brightnessctl`, or another command. They remain ineligible and normal binding/client fallback continues. K4A also adds no PipeWire, PulseAudio, WirePlumber, MPRIS, brightness writes, touchpad mutation, power actions, OSD, keyboard LEDs, virtual keyboard, IME, or Shell integration.
 
@@ -67,4 +67,4 @@ The hot path adds one compact availability check and, for a system action, one b
 
 ## K4B boundary
 
-K4B may add a nonblocking session-service transport carrying typed `AstreaSystemAction` values to `astrea-sessiond`. That service can own audio backends, MPRIS, display and keyboard brightness, and input-device policy. K4B will define capability negotiation, dynamic updates, disconnect behavior, repeat invalidation, dispatch, and executor telemetry. K4A commits to no transport and provides no executor.
+K4B1 adds the nonblocking transport and dynamic capability lifecycle for typed `AstreaSystemAction` values. It does not execute them. K4B2 may add the `astrea-sessiond` executors for audio backends, MPRIS, display and keyboard brightness, and input-device policy. Typhon continues to own shortcut intent only; it does not perform those operations.

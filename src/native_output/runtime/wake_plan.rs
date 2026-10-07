@@ -32,13 +32,14 @@ pub(crate) enum NativeDeadlineOwner {
     XwaylandTimeout,
     CursorResponse,
     ControlTimeout,
+    SystemActionTransport,
     SurfacePacing,
     DmabufRetry,
     OutputConfiguration,
     KeyboardRepeat,
 }
 
-const DEADLINE_OWNER_COUNT: usize = 11;
+const DEADLINE_OWNER_COUNT: usize = 12;
 
 const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
     match owner {
@@ -53,6 +54,7 @@ const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
         NativeDeadlineOwner::DmabufRetry => 8,
         NativeDeadlineOwner::OutputConfiguration => 9,
         NativeDeadlineOwner::KeyboardRepeat => 10,
+        NativeDeadlineOwner::SystemActionTransport => 11,
     }
 }
 
@@ -101,6 +103,7 @@ pub(crate) struct NativeWakePlanInputs {
     pub(crate) xwayland_timeout_deadline_ns: Option<u64>,
     pub(crate) cursor_response_deadline_ns: Option<u64>,
     pub(crate) control_timeout_deadline_ns: Option<u64>,
+    pub(crate) system_action_transport_deadline_ns: Option<u64>,
     pub(crate) surface_pacing_deadline_ns: Option<u64>,
     pub(crate) dmabuf_retry_deadline_ns: Option<u64>,
     pub(crate) output_configuration_deadline_ns: Option<u64>,
@@ -234,6 +237,7 @@ impl NativeWakeAuthorityMetrics {
                     NativeDeadlineOwner::ControlTimeout => {
                         self.deadline_owner_control = self.deadline_owner_control.saturating_add(1)
                     }
+                    NativeDeadlineOwner::SystemActionTransport => {}
                     NativeDeadlineOwner::SurfacePacing => {
                         self.deadline_owner_surface_pacing =
                             self.deadline_owner_surface_pacing.saturating_add(1)
@@ -430,6 +434,15 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
             .control_timeout_deadline_ns
             .map(|at_ns| NativeDeadline {
                 owner: NativeDeadlineOwner::ControlTimeout,
+                at_ns,
+            }),
+    );
+    deadline = earliest_deadline(
+        deadline,
+        inputs
+            .system_action_transport_deadline_ns
+            .map(|at_ns| NativeDeadline {
+                owner: NativeDeadlineOwner::SystemActionTransport,
                 at_ns,
             }),
     );
@@ -743,7 +756,7 @@ mod tests {
         metrics.observe_plan(plan, 80, None, None);
         let index = deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat);
 
-        assert_eq!(DEADLINE_OWNER_COUNT, 11);
+        assert_eq!(DEADLINE_OWNER_COUNT, 12);
         assert_eq!(metrics.deadline_owner_keyboard_repeat, 1);
         assert_eq!(metrics.past_deadline_arms_by_owner[index], 1);
         assert_eq!(metrics.stale_deadline_arms_by_owner[index], 0);

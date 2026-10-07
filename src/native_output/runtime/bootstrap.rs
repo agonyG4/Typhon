@@ -394,6 +394,23 @@ impl NativeRuntime {
         let controller_manager = (controller_policy == ControllerPolicy::Observe)
             .then(|| ControllerManager::new(controller_policy));
         let control_server = create_native_control_server(&mut event_loop, &server)?;
+        let system_action_transport = match oblivion_one::xdg_runtime_dir() {
+            Ok(runtime_dir) => match NativeSystemActionTransport::bind(
+                &mut event_loop,
+                &runtime_dir,
+                server.socket_name(),
+            ) {
+                Ok(transport) => transport,
+                Err(error) => {
+                    eprintln!("native system-action transport unavailable: {error}");
+                    NativeSystemActionTransport::unavailable()
+                }
+            },
+            Err(error) => {
+                eprintln!("native system-action transport unavailable: {error}");
+                NativeSystemActionTransport::unavailable()
+            }
+        };
         let dmem_foreground = DmemForeground::start(
             DmemForegroundPolicy::from_env(),
             DmemPaths::production(),
@@ -679,6 +696,7 @@ impl NativeRuntime {
             dmem_foreground,
             dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
+            system_action_transport,
             started_at: Instant::now(),
             vrr_policy,
             xwayland,

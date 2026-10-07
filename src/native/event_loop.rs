@@ -31,6 +31,8 @@ pub enum NativeEventSource {
     XwaylandStderr,
     ControlListener,
     ControlClient,
+    SystemActionListener,
+    SystemActionPeer,
     RuntimeContinuation,
 }
 
@@ -99,6 +101,7 @@ impl WakeReasons {
     const XWAYLAND_XWM: u32 = 1 << 11;
     const XWAYLAND_STDERR: u32 = 1 << 12;
     const CONTROL: u32 = 1 << 14;
+    const SYSTEM_ACTION: u32 = 1 << 21;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -180,6 +183,15 @@ impl WakeReasons {
         self.0 & Self::CONTROL != 0
     }
 
+    pub const fn system_action_transport(self) -> bool {
+        self.0 & Self::SYSTEM_ACTION != 0
+    }
+
+    #[doc(hidden)]
+    pub fn mark_system_action_transport(&mut self) {
+        self.0 |= Self::SYSTEM_ACTION;
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -210,6 +222,9 @@ impl WakeReasons {
             NativeEventSource::XwaylandXwm => Self::XWAYLAND_XWM,
             NativeEventSource::XwaylandStderr => Self::XWAYLAND_STDERR,
             NativeEventSource::ControlListener | NativeEventSource::ControlClient => Self::CONTROL,
+            NativeEventSource::SystemActionListener | NativeEventSource::SystemActionPeer => {
+                Self::SYSTEM_ACTION
+            }
             NativeEventSource::RuntimeContinuation => Self::RUNTIME_CONTINUATION,
         };
     }
@@ -229,6 +244,36 @@ pub struct XwaylandReadyEvent {
 pub struct ControlReadyEvent {
     pub token: ReactorToken,
     pub flags: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemActionReadyEvent {
+    pub token: ReactorToken,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemActionReadyEvents {
+    events: [Option<SystemActionReadyEvent>; 2],
+    len: u8,
+}
+
+impl SystemActionReadyEvents {
+    fn push(&mut self, event: SystemActionReadyEvent) {
+        let index = usize::from(self.len);
+        if index < self.events.len() {
+            self.events[index] = Some(event);
+            self.len += 1;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SystemActionReadyEvent> {
+        self.events[..usize::from(self.len)].iter().flatten()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +299,7 @@ pub struct NativeWakeup {
     pub dmabuf_gpu_release_tokens: Vec<ReactorToken>,
     pub xwayland_events: Vec<XwaylandReadyEvent>,
     pub control_events: Vec<ControlReadyEvent>,
+    pub system_action_events: SystemActionReadyEvents,
     pub cursor_io_events: Vec<CursorIoReadyEvent>,
     pub keyboard_persistence_events: Vec<KeyboardPersistenceReadyEvent>,
     pub controller_monitor_ready: bool,
@@ -649,6 +695,7 @@ impl NativeEventLoop {
         let mut dmabuf_gpu_release_tokens = Vec::new();
         let mut xwayland_events = Vec::new();
         let mut control_events = Vec::new();
+        let mut system_action_events = SystemActionReadyEvents::default();
         let mut cursor_io_events = Vec::new();
         let mut keyboard_persistence_events = Vec::new();
         let mut controller_monitor_ready = false;
@@ -692,6 +739,7 @@ impl NativeEventLoop {
                 }
                 if is_xwayland_source(registration_source)
                     || is_control_source(registration_source)
+                    || is_system_action_source(registration_source)
                     || registration_source == NativeEventSource::CursorIoWorker
                     || registration_source == NativeEventSource::KeyboardPersistenceWorker
                     || registration_source
@@ -721,6 +769,11 @@ impl NativeEventLoop {
                         // and is serviced from the dedicated wake reason.
                     } else if registration_source == NativeEventSource::DmabufGpuRelease {
                         dmabuf_gpu_release_tokens.push(token);
+                    } else if is_system_action_source(registration_source) {
+                        system_action_events.push(SystemActionReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
                     } else {
                         control_events.push(ControlReadyEvent {
                             token,
@@ -763,6 +816,13 @@ impl NativeEventLoop {
                     }
                     NativeEventSource::ControlListener | NativeEventSource::ControlClient => {
                         control_events.push(ControlReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    }
+                    NativeEventSource::SystemActionListener
+                    | NativeEventSource::SystemActionPeer => {
+                        system_action_events.push(SystemActionReadyEvent {
                             token,
                             flags: event_flags,
                         });
@@ -812,6 +872,7 @@ impl NativeEventLoop {
             dmabuf_gpu_release_tokens,
             xwayland_events,
             control_events,
+            system_action_events,
             cursor_io_events,
             keyboard_persistence_events,
             controller_monitor_ready,
@@ -1026,6 +1087,13 @@ fn is_control_source(source: NativeEventSource) -> bool {
     matches!(
         source,
         NativeEventSource::ControlListener | NativeEventSource::ControlClient
+    )
+}
+
+fn is_system_action_source(source: NativeEventSource) -> bool {
+    matches!(
+        source,
+        NativeEventSource::SystemActionListener | NativeEventSource::SystemActionPeer
     )
 }
 

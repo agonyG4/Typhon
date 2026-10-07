@@ -7,6 +7,9 @@ mod egl_renderer;
 mod native_output;
 mod pointer_debug;
 mod system_action;
+mod system_action_protocol;
+#[path = "native/system_action_transport.rs"]
+mod system_action_transport;
 
 use oblivion_one::{
     CompositorAppGpuPreference,

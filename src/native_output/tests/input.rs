@@ -1806,7 +1806,7 @@ fn native_input_zero_owner_spotlight_press_launches_one_fallback() {
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            binding_action_invocations: vec![invocation],
+            binding_action_invocations: BindingActionInvocations::one(invocation),
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
@@ -1847,7 +1847,7 @@ fn native_input_zero_owner_alt_tab_next_launches_one_fallback() {
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            binding_action_invocations: vec![invocation],
+            binding_action_invocations: BindingActionInvocations::one(invocation),
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
@@ -1904,7 +1904,7 @@ fn native_input_spotlight_fallback_spawn_failure_is_non_fatal_and_recorded() {
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            binding_action_invocations: vec![invocation],
+            binding_action_invocations: BindingActionInvocations::one(invocation),
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
@@ -1958,7 +1958,7 @@ fn native_input_alt_tab_fallback_spawn_failure_is_non_fatal_and_recorded() {
     let mut resize_perf = NativeResizePerfState::default();
     let application = apply_native_input_effect(
         NativeInputEffect {
-            binding_action_invocations: vec![invocation],
+            binding_action_invocations: BindingActionInvocations::one(invocation),
             ..NativeInputEffect::default()
         },
         NativeInputApplyContext {
@@ -2025,7 +2025,7 @@ fn native_input_zero_owner_repeat_and_alt_tab_non_next_do_not_launch_fallback() 
         let mut resize_perf = NativeResizePerfState::default();
         let application = apply_native_input_effect(
             NativeInputEffect {
-                binding_action_invocations: vec![invocation],
+                binding_action_invocations: BindingActionInvocations::one(invocation),
                 ..NativeInputEffect::default()
             },
             NativeInputApplyContext {

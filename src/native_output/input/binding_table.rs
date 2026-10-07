@@ -55,6 +55,116 @@ pub(crate) struct BindingActionInvocation {
     pub(crate) phase: AstreaShortcutPhase,
 }
 
+const BINDING_ACTION_INVOCATION_CAPACITY: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BindingActionInvocations {
+    entries: [Option<BindingActionInvocation>; BINDING_ACTION_INVOCATION_CAPACITY],
+    inline_len: u8,
+    overflow: Vec<BindingActionInvocation>,
+}
+
+impl Default for BindingActionInvocations {
+    fn default() -> Self {
+        Self {
+            entries: [None; BINDING_ACTION_INVOCATION_CAPACITY],
+            inline_len: 0,
+            overflow: Vec::new(),
+        }
+    }
+}
+
+impl BindingActionInvocations {
+    #[cfg(test)]
+    pub(crate) fn one(invocation: BindingActionInvocation) -> Self {
+        let mut result = Self::default();
+        result.push(invocation);
+        result
+    }
+
+    pub(crate) fn push(&mut self, invocation: BindingActionInvocation) -> bool {
+        let inline_len = usize::from(self.inline_len);
+        if inline_len < self.entries.len() {
+            self.entries[inline_len] = Some(invocation);
+            self.inline_len += 1;
+        } else {
+            // Source removal can reconcile many logical releases in one
+            // effect. Preserve that unbounded existing behavior while keeping
+            // ordinary single-key transitions allocation-free.
+            self.overflow.push(invocation);
+        }
+        true
+    }
+
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        for invocation in other.iter().copied() {
+            self.push(invocation);
+        }
+        *other = Self::default();
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &BindingActionInvocation> {
+        self.entries[..usize::from(self.inline_len)]
+            .iter()
+            .flatten()
+            .chain(self.overflow.iter())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first(&self) -> Option<&BindingActionInvocation> {
+        self.iter().next()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.inline_len == 0 && self.overflow.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        usize::from(self.inline_len) + self.overflow.len()
+    }
+}
+
+#[cfg(test)]
+mod binding_action_invocation_tests {
+    use super::{
+        AstreaShortcutPhase, BINDING_ACTION_INVOCATION_CAPACITY, BindingActionId,
+        BindingActionInvocation, BindingActionInvocations,
+    };
+
+    #[test]
+    fn large_reconciliation_keeps_invocations_after_inline_capacity() {
+        let invocation = BindingActionInvocation {
+            action: BindingActionId::from_index(0).unwrap(),
+            phase: AstreaShortcutPhase::Pressed,
+        };
+        let mut invocations = BindingActionInvocations::default();
+        for _ in 0..(BINDING_ACTION_INVOCATION_CAPACITY + 7) {
+            assert!(invocations.push(invocation));
+        }
+
+        assert_eq!(invocations.len(), BINDING_ACTION_INVOCATION_CAPACITY + 7);
+        assert!(invocations.iter().all(|entry| *entry == invocation));
+        assert_eq!(invocations[BINDING_ACTION_INVOCATION_CAPACITY], invocation);
+    }
+}
+
+impl std::ops::Index<usize> for BindingActionInvocations {
+    type Output = BindingActionInvocation;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let inline_len = usize::from(self.inline_len);
+        if index < inline_len {
+            self.entries[index]
+                .as_ref()
+                .expect("index below inline invocation length")
+        } else {
+            &self.overflow[index - inline_len]
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BindingSequenceEffect {
     None,
@@ -371,6 +481,27 @@ impl AstreaBindingManager {
 
     pub(crate) fn action_catalog(&self) -> &BindingActionCatalog {
         self.table.action_catalog()
+    }
+
+    pub(crate) fn set_system_capabilities(
+        &mut self,
+        capabilities: AstreaSystemActionCapabilities,
+    ) -> bool {
+        if self.system_capabilities == capabilities {
+            return false;
+        }
+        self.system_capabilities = capabilities;
+        true
+    }
+
+    pub(crate) const fn system_capability_count(&self) -> u32 {
+        self.system_capabilities.count()
+    }
+
+    pub(crate) fn repeat_binding_available(&self, id: BindingId) -> bool {
+        self.table
+            .binding(id)
+            .is_some_and(|binding| binding.availability.is_available(self.system_capabilities))
     }
 
     #[cfg(test)]

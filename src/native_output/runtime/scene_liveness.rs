@@ -17,6 +17,7 @@ impl NativeRuntime {
             .then(|| self.server.next_surface_pacing_deadline_ns())
             .flatten();
         let control_timeout_deadline = self.control_server.next_deadline_ns();
+        let system_action_transport_deadline = self.system_action_transport.next_deadline_ns();
         let scheduler_wake_requirement = self.current_scheduler_wake_requirement(now_ns)?;
         let scheduler_wake_requirement = gate_scheduler_for_output_configuration(
             self.pending_output_configuration.is_some(),
@@ -44,6 +45,8 @@ impl NativeRuntime {
             xwayland_timeout_deadline_ns: self.xwayland.next_deadline_ns(),
             cursor_response_deadline_ns: self.cursor_output_arbitration.wake_deadline_ns(now_ns),
             control_timeout_deadline_ns: control_timeout_deadline
+                .filter(|deadline| *deadline > now_ns),
+            system_action_transport_deadline_ns: system_action_transport_deadline
                 .filter(|deadline| *deadline > now_ns),
             output_configuration_deadline_ns: match (
                 self.output_configuration_transactions.deadline_ns(),
@@ -88,6 +91,9 @@ impl NativeRuntime {
                     NativeDeadlineOwner::XwaylandTimeout => "deadline:xwayland_timeout",
                     NativeDeadlineOwner::CursorResponse => "deadline:cursor_response",
                     NativeDeadlineOwner::ControlTimeout => "deadline:control_timeout",
+                    NativeDeadlineOwner::SystemActionTransport => {
+                        "deadline:system_action_transport"
+                    }
                     NativeDeadlineOwner::SurfacePacing => "deadline:surface_pacing",
                     NativeDeadlineOwner::DmabufRetry => "deadline:dmabuf_retry",
                     NativeDeadlineOwner::OutputConfiguration => "deadline:output_configuration",

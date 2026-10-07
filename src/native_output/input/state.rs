@@ -562,6 +562,27 @@ impl NativeInputState {
         self.keyboard_repeat.generation()
     }
 
+    pub(crate) fn set_system_action_capabilities(
+        &mut self,
+        capabilities: crate::system_action::AstreaSystemActionCapabilities,
+    ) -> bool {
+        let changed = self.binding_manager.set_system_capabilities(capabilities);
+        if changed
+            && self.keyboard_repeat.active().is_some_and(|active| {
+                !self
+                    .binding_manager
+                    .repeat_binding_available(active.binding)
+            })
+        {
+            self.keyboard_repeat.cancel();
+        }
+        changed
+    }
+
+    pub(crate) const fn system_action_capability_count(&self) -> u32 {
+        self.binding_manager.system_capability_count()
+    }
+
     pub(crate) fn update_keyboard_repeat_config(
         &mut self,
         config: KeyboardRepeatConfig,

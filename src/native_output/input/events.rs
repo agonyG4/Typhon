@@ -345,7 +345,7 @@ pub(crate) struct NativeInputEffect {
     pub(crate) pointer_buttons: Vec<NativePointerButtonEvent>,
     pub(crate) pointer_axis: Option<PointerAxisFrame>,
     pub(crate) window_actions: Vec<NativeWindowAction>,
-    pub(crate) binding_action_invocations: Vec<BindingActionInvocation>,
+    pub(crate) binding_action_invocations: BindingActionInvocations,
     pub(crate) launch_command: Option<Vec<String>>,
     pub(crate) launch_source: Option<NativeLaunchSource>,
     pub(crate) vt_switch: Option<u8>,
