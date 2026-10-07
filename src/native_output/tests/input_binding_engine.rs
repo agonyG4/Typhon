@@ -1,4 +1,5 @@
 use super::*;
+use crate::system_action::{AstreaSystemAction, AstreaSystemActionCapabilities};
 
 const KEY_EQUAL: u16 = 13;
 
@@ -938,4 +939,415 @@ fn unavailable_session_command_stays_consumed_and_uses_construction_snapshot() {
             std::env::remove_var("OBLIVION_ONE_SESSION_1_COMMAND");
         }
     }
+}
+
+fn system_action_binding(
+    keysym: u32,
+    action: AstreaSystemAction,
+    repeat: RepeatPolicy,
+) -> BindingSpec {
+    BindingSpec {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::KeySym(BindingKeySym::new(keysym)),
+        action: BindingActionDefinition::SystemAction(action),
+        repeat,
+        inhibition: InhibitionPolicy::Bypass,
+        reserved: true,
+    }
+}
+
+fn system_symbol_snapshot(keysym: u32) -> KeyboardSymbolicSnapshot {
+    symbolic_snapshot(
+        Some((keysym, ModifierMask::EMPTY)),
+        Some((keysym, ModifierMask::EMPTY)),
+    )
+}
+
+#[test]
+fn default_xf86_system_bindings_have_typed_actions_and_expected_policies() {
+    use xkbcommon::xkb::keysyms as keysym;
+
+    let expected = [
+        (
+            keysym::KEY_XF86AudioRaiseVolume,
+            AstreaSystemAction::OutputVolumeUp,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysym::KEY_XF86AudioLowerVolume,
+            AstreaSystemAction::OutputVolumeDown,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysym::KEY_XF86AudioMute,
+            AstreaSystemAction::ToggleOutputMute,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioMicMute,
+            AstreaSystemAction::ToggleMicrophoneMute,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioPlay,
+            AstreaSystemAction::MediaPlayPause,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioPause,
+            AstreaSystemAction::MediaPause,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioStop,
+            AstreaSystemAction::MediaStop,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioNext,
+            AstreaSystemAction::MediaNext,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioPrev,
+            AstreaSystemAction::MediaPrevious,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioRewind,
+            AstreaSystemAction::MediaRewind,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86AudioForward,
+            AstreaSystemAction::MediaFastForward,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86MonBrightnessUp,
+            AstreaSystemAction::DisplayBrightnessUp,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysym::KEY_XF86MonBrightnessDown,
+            AstreaSystemAction::DisplayBrightnessDown,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysym::KEY_XF86KbdBrightnessUp,
+            AstreaSystemAction::KeyboardBrightnessUp,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysym::KEY_XF86KbdBrightnessDown,
+            AstreaSystemAction::KeyboardBrightnessDown,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysym::KEY_XF86KbdLightOnOff,
+            AstreaSystemAction::ToggleKeyboardBacklight,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysym::KEY_XF86TouchpadToggle,
+            AstreaSystemAction::ToggleTouchpad,
+            RepeatPolicy::Disabled,
+        ),
+    ];
+    let specs = default_astrea_binding_specs();
+    let system_specs: Vec<_> = specs
+        .iter()
+        .filter(|spec| matches!(&spec.action, BindingActionDefinition::SystemAction(_)))
+        .collect();
+
+    assert_eq!(system_specs.len(), expected.len());
+    for (keysym, action, repeat) in expected {
+        let binding = system_specs
+            .iter()
+            .find(|spec| spec.input == BindingInput::KeySym(BindingKeySym::new(keysym)))
+            .expect("expected XF86 system binding");
+        assert_eq!(binding.modifiers, ModifierMask::EMPTY);
+        assert_eq!(binding.trigger, BindingTrigger::Press);
+        assert_eq!(
+            binding.action,
+            BindingActionDefinition::SystemAction(action)
+        );
+        assert_eq!(binding.repeat, repeat);
+        assert_eq!(binding.inhibition, InhibitionPolicy::Bypass);
+        assert!(binding.reserved);
+    }
+
+    let existing_specs: Vec<_> = specs
+        .iter()
+        .filter(|spec| !matches!(&spec.action, BindingActionDefinition::SystemAction(_)))
+        .collect();
+    assert_eq!(existing_specs.len(), 38);
+    assert!(existing_specs.iter().all(|spec| {
+        matches!(
+            spec.input,
+            BindingInput::PhysicalKey(_) | BindingInput::PointerButton(_)
+        )
+    }));
+}
+
+#[test]
+fn empty_production_capabilities_leave_xf86_press_on_client_forwarding_path() {
+    use xkbcommon::xkb::keysyms;
+
+    let mut input = NativeInputState::new(320, 200);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let effect = press_with_snapshot(
+        &mut input,
+        device,
+        KEY_Z,
+        Some(system_symbol_snapshot(keysyms::KEY_XF86AudioRaiseVolume)),
+    );
+
+    assert!(effect.binding_action_invocations.is_empty());
+    assert_eq!(
+        effect.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_Z, true)
+        )]
+    );
+    assert!(input.active_keyboard_repeat().is_none());
+}
+
+#[test]
+fn system_capabilities_enable_only_the_advertised_xf86_actions() {
+    use xkbcommon::xkb::keysyms;
+
+    let volume_up = AstreaSystemActionCapabilities::for_action(AstreaSystemAction::OutputVolumeUp);
+    let mut manager =
+        AstreaBindingManager::with_default_bindings_and_system_capabilities(volume_up);
+    let raise = manager.handle_keyboard_key(
+        ModifierMask::EMPTY,
+        KEY_Z,
+        Some(system_symbol_snapshot(keysyms::KEY_XF86AudioRaiseVolume)),
+        true,
+        false,
+        false,
+    );
+    let AstreaBindingMatch::Consumed {
+        binding: Some(binding),
+        action,
+        repeat,
+        inhibition,
+        ..
+    } = raise
+    else {
+        panic!("advertised volume-up capability should match");
+    };
+    assert_eq!(
+        manager.action_catalog().action(action),
+        Some(&BindingActionDefinition::SystemAction(
+            AstreaSystemAction::OutputVolumeUp
+        ))
+    );
+    assert_eq!(repeat, RepeatPolicy::Enabled);
+    assert_eq!(inhibition, InhibitionPolicy::Bypass);
+
+    let lower = manager.handle_keyboard_key(
+        ModifierMask::EMPTY,
+        KEY_Z,
+        Some(system_symbol_snapshot(keysyms::KEY_XF86AudioLowerVolume)),
+        true,
+        false,
+        false,
+    );
+    assert_eq!(lower, AstreaBindingMatch::Pass);
+
+    let mut inhibited_manager =
+        AstreaBindingManager::with_default_bindings_and_system_capabilities(volume_up);
+    assert!(matches!(
+        inhibited_manager.handle_keyboard_key(
+            ModifierMask::EMPTY,
+            KEY_Z,
+            Some(system_symbol_snapshot(keysyms::KEY_XF86AudioRaiseVolume)),
+            true,
+            false,
+            true,
+        ),
+        AstreaBindingMatch::Consumed { .. }
+    ));
+
+    let mut unsupported_manager =
+        AstreaBindingManager::with_default_bindings_and_system_capabilities(
+            AstreaSystemActionCapabilities::EMPTY,
+        );
+    assert_eq!(
+        unsupported_manager.handle_keyboard_key(
+            ModifierMask::EMPTY,
+            KEY_Z,
+            Some(system_symbol_snapshot(keysyms::KEY_XF86AudioRaiseVolume)),
+            true,
+            false,
+            true,
+        ),
+        AstreaBindingMatch::Pass
+    );
+    assert!(
+        unsupported_manager
+            .match_repeat_binding(
+                binding,
+                KEY_Z,
+                ModifierMask::EMPTY,
+                Some(system_symbol_snapshot(keysyms::KEY_XF86AudioRaiseVolume)),
+                false,
+            )
+            .is_none()
+    );
+    assert!(manager.binding(binding).is_some());
+}
+
+#[test]
+fn unavailable_later_system_action_falls_back_and_available_one_keeps_global_order() {
+    use xkbcommon::xkb::keysyms as keysym;
+
+    let system = system_action_binding(
+        keysym::KEY_XF86AudioRaiseVolume,
+        AstreaSystemAction::OutputVolumeUp,
+        RepeatPolicy::Enabled,
+    );
+    let ordinary = shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(keysym::KEY_XF86AudioRaiseVolume)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "earlier-ordinary",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    );
+    let snapshot = Some(system_symbol_snapshot(keysym::KEY_XF86AudioRaiseVolume));
+
+    let mut unsupported = AstreaBindingManager::with_specs_and_system_capabilities(
+        vec![ordinary.clone(), system.clone()],
+        AstreaSystemActionCapabilities::EMPTY,
+    );
+    let AstreaBindingMatch::Consumed { action, .. } =
+        unsupported.handle_keyboard_key(ModifierMask::EMPTY, KEY_Z, snapshot, true, false, false)
+    else {
+        panic!("earlier ordinary binding should be eligible");
+    };
+    assert_eq!(
+        unsupported.action_catalog().action(action),
+        Some(&ordinary.action)
+    );
+
+    let capable = AstreaSystemActionCapabilities::for_action(AstreaSystemAction::OutputVolumeUp);
+    let mut supported =
+        AstreaBindingManager::with_specs_and_system_capabilities(vec![ordinary, system], capable);
+    let AstreaBindingMatch::Consumed { action, .. } =
+        supported.handle_keyboard_key(ModifierMask::EMPTY, KEY_Z, snapshot, true, false, false)
+    else {
+        panic!("available system binding should match");
+    };
+    assert_eq!(
+        supported.action_catalog().action(action),
+        Some(&BindingActionDefinition::SystemAction(
+            AstreaSystemAction::OutputVolumeUp
+        ))
+    );
+}
+
+#[test]
+fn physical_and_xf86_system_candidates_keep_one_definition_order() {
+    use xkbcommon::xkb::keysyms as keysym;
+
+    let physical = shortcut_binding(
+        BindingInput::PhysicalKey(KEY_Z),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "physical",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    );
+    let system = system_action_binding(
+        keysym::KEY_XF86AudioMute,
+        AstreaSystemAction::ToggleOutputMute,
+        RepeatPolicy::Disabled,
+    );
+    let capabilities =
+        AstreaSystemActionCapabilities::for_action(AstreaSystemAction::ToggleOutputMute);
+    let snapshot = Some(system_symbol_snapshot(keysym::KEY_XF86AudioMute));
+
+    let mut physical_later = AstreaBindingManager::with_specs_and_system_capabilities(
+        vec![system.clone(), physical.clone()],
+        capabilities,
+    );
+    let AstreaBindingMatch::Consumed { action, .. } = physical_later.handle_keyboard_key(
+        ModifierMask::EMPTY,
+        KEY_Z,
+        snapshot,
+        true,
+        false,
+        false,
+    ) else {
+        panic!("one candidate should match");
+    };
+    assert_eq!(
+        physical_later.action_catalog().action(action),
+        Some(&physical.action)
+    );
+
+    let mut system_later = AstreaBindingManager::with_specs_and_system_capabilities(
+        vec![physical, system],
+        capabilities,
+    );
+    let AstreaBindingMatch::Consumed { action, .. } =
+        system_later.handle_keyboard_key(ModifierMask::EMPTY, KEY_Z, snapshot, true, false, false)
+    else {
+        panic!("one candidate should match");
+    };
+    assert_eq!(
+        system_later.action_catalog().action(action),
+        Some(&BindingActionDefinition::SystemAction(
+            AstreaSystemAction::ToggleOutputMute
+        ))
+    );
+}
+
+#[test]
+fn xf86_raw_translated_duplicate_is_one_binding_and_one_repeat_target() {
+    use xkbcommon::xkb::keysyms as keysym;
+
+    let capabilities =
+        AstreaSystemActionCapabilities::for_action(AstreaSystemAction::OutputVolumeUp);
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager =
+        AstreaBindingManager::with_default_bindings_and_system_capabilities(capabilities);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let snapshot = system_symbol_snapshot(keysym::KEY_XF86AudioRaiseVolume);
+    let press = press_with_snapshot(&mut input, device, KEY_Z, Some(snapshot));
+    let active = input.active_keyboard_repeat().expect("volume step repeats");
+
+    assert_eq!(press.binding_action_invocations.len(), 1);
+    assert_eq!(
+        input
+            .binding_manager
+            .action_catalog()
+            .action(press.binding_action_invocations[0].action),
+        Some(&BindingActionDefinition::SystemAction(
+            AstreaSystemAction::OutputVolumeUp
+        ))
+    );
+    assert!(!press.redraw_requested);
+    assert!(press.launch_command.is_none());
+    assert!(press.keyboard_events.is_empty());
+
+    let generation = input.keyboard_repeat_generation();
+    let repeat = input.service_keyboard_repeat_if_unchanged_with_symbolic(
+        601_000_000,
+        generation,
+        Some(snapshot),
+    );
+    assert_eq!(repeat.binding_action_invocations.len(), 1);
+    assert_eq!(
+        repeat.binding_action_invocations[0].action,
+        press.binding_action_invocations[0].action
+    );
+    assert_eq!(
+        input.active_keyboard_repeat().unwrap().binding,
+        active.binding
+    );
 }

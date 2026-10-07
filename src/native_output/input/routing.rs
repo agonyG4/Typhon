@@ -1740,7 +1740,8 @@ pub(crate) fn apply_native_input_effect(
             | BindingActionDefinition::ToggleDefaultSpecialWorkspace
             | BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace
             | BindingActionDefinition::BeginMove
-            | BindingActionDefinition::BeginResize => {}
+            | BindingActionDefinition::BeginResize
+            | BindingActionDefinition::SystemAction(_) => {}
         }
     }
     if let Some(command) = effect.launch_command {

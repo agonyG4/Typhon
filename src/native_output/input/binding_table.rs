@@ -1,4 +1,5 @@
 use super::*;
+use crate::system_action::{AstreaSystemAction, AstreaSystemActionCapabilities};
 #[cfg(test)]
 use std::cell::Cell;
 
@@ -93,6 +94,28 @@ impl Ord for BindingLookupKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingAvailability {
+    Always,
+    SystemAction(AstreaSystemAction),
+}
+
+impl BindingAvailability {
+    const fn from_action(action: &BindingActionDefinition) -> Self {
+        match action {
+            BindingActionDefinition::SystemAction(action) => Self::SystemAction(*action),
+            _ => Self::Always,
+        }
+    }
+
+    const fn is_available(self, capabilities: AstreaSystemActionCapabilities) -> bool {
+        match self {
+            Self::Always => true,
+            Self::SystemAction(action) => capabilities.contains(action),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompiledBinding {
     pub(crate) id: BindingId,
@@ -100,6 +123,7 @@ pub(crate) struct CompiledBinding {
     pub(crate) input: BindingInput,
     pub(crate) modifiers: ModifierMask,
     pub(crate) action: BindingActionId,
+    availability: BindingAvailability,
     pub(crate) repeat: RepeatPolicy,
     pub(crate) inhibition: InhibitionPolicy,
     pub(crate) reserved: bool,
@@ -171,6 +195,7 @@ impl CompiledBindingTable {
                 BindingId::from_index(index).ok_or(BindingTableCompileError::TooManyBindings)?;
             let action = BindingActionId::from_index(actions.len())
                 .ok_or(BindingTableCompileError::TooManyActions)?;
+            let availability = BindingAvailability::from_action(&spec.action);
             let sequence_effect = classify_sequence_effect(&spec.action);
             let action_definition = resolve_action_definition(spec.action);
             let definition_order =
@@ -182,6 +207,7 @@ impl CompiledBindingTable {
                 input: spec.input,
                 modifiers: spec.modifiers,
                 action,
+                availability,
                 repeat: spec.repeat,
                 inhibition: spec.inhibition,
                 reserved: spec.reserved,
@@ -250,6 +276,7 @@ impl CompiledBindingTable {
         input: BindingInput,
         repeated: bool,
         inhibited: bool,
+        system_capabilities: AstreaSystemActionCapabilities,
     ) -> Option<CompiledBindingMatch> {
         let key = BindingLookupKey::of(trigger, input, modifiers);
         let bucket_index = self
@@ -263,6 +290,7 @@ impl CompiledBindingTable {
             let binding = self.binding(*id)?;
             if (repeated && binding.repeat != RepeatPolicy::Enabled)
                 || (inhibited && binding.inhibition != InhibitionPolicy::Bypass)
+                || !binding.availability.is_available(system_capabilities)
             {
                 return None;
             }
@@ -280,6 +308,7 @@ impl CompiledBindingTable {
 #[derive(Debug, Clone)]
 pub(crate) struct AstreaBindingManager {
     table: CompiledBindingTable,
+    system_capabilities: AstreaSystemActionCapabilities,
     active_sequences: ActiveBindingState,
     #[cfg(test)]
     modifier_release_call_counts: [usize; 4],
@@ -299,9 +328,25 @@ impl AstreaBindingManager {
             .expect("built-in binding table must compile")
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_default_bindings_and_system_capabilities(
+        capabilities: AstreaSystemActionCapabilities,
+    ) -> Self {
+        Self::from_specs_with_system_capabilities(default_astrea_binding_specs(), capabilities)
+            .expect("built-in binding table must compile")
+    }
+
     pub(crate) fn from_specs(specs: Vec<BindingSpec>) -> Result<Self, BindingTableCompileError> {
+        Self::from_specs_with_system_capabilities(specs, AstreaSystemActionCapabilities::EMPTY)
+    }
+
+    fn from_specs_with_system_capabilities(
+        specs: Vec<BindingSpec>,
+        system_capabilities: AstreaSystemActionCapabilities,
+    ) -> Result<Self, BindingTableCompileError> {
         Ok(Self {
             table: CompiledBindingTable::compile(specs)?,
+            system_capabilities,
             active_sequences: ActiveBindingState::default(),
             #[cfg(test)]
             modifier_release_call_counts: [0; 4],
@@ -313,6 +358,15 @@ impl AstreaBindingManager {
     #[cfg(test)]
     pub(crate) fn with_specs(specs: Vec<BindingSpec>) -> Self {
         Self::from_specs(specs).expect("test binding table must compile")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_specs_and_system_capabilities(
+        specs: Vec<BindingSpec>,
+        capabilities: AstreaSystemActionCapabilities,
+    ) -> Self {
+        Self::from_specs_with_system_capabilities(specs, capabilities)
+            .expect("test binding table must compile")
     }
 
     pub(crate) fn action_catalog(&self) -> &BindingActionCatalog {
@@ -455,6 +509,7 @@ impl AstreaBindingManager {
             || !trigger_matches
             || binding.repeat != RepeatPolicy::Enabled
             || (inhibited && binding.inhibition != InhibitionPolicy::Bypass)
+            || !binding.availability.is_available(self.system_capabilities)
         {
             return None;
         }
@@ -478,8 +533,14 @@ impl AstreaBindingManager {
         #[cfg(test)]
         self.generic_lookup_count
             .set(self.generic_lookup_count.get().saturating_add(1));
-        self.table
-            .match_binding(modifiers, trigger, input, repeated, inhibited)
+        self.table.match_binding(
+            modifiers,
+            trigger,
+            input,
+            repeated,
+            inhibited,
+            self.system_capabilities,
+        )
     }
 
     fn match_keyboard_binding(
@@ -684,7 +745,14 @@ mod tests {
                         let expected =
                             reference_match(&specs, modifiers, trigger, input, repeated, inhibited);
                         let actual = table
-                            .match_binding(modifiers, trigger, input, repeated, inhibited)
+                            .match_binding(
+                                modifiers,
+                                trigger,
+                                input,
+                                repeated,
+                                inhibited,
+                                AstreaSystemActionCapabilities::EMPTY,
+                            )
                             .map(|matched| {
                                 table
                                     .binding(matched.binding)
@@ -726,6 +794,7 @@ mod tests {
                     BindingInput::PhysicalKey(KEY_Z),
                     repeated,
                     inhibited,
+                    AstreaSystemActionCapabilities::EMPTY,
                 )
                 .expect("one candidate remains eligible");
             table.binding(matched.binding).unwrap().definition_order
@@ -774,6 +843,7 @@ mod tests {
                 BindingInput::PhysicalKey(KEY_Z),
                 false,
                 false,
+                AstreaSystemActionCapabilities::EMPTY,
             )
             .unwrap();
         let pointer_match = table
@@ -783,6 +853,7 @@ mod tests {
                 BindingInput::PointerButton(u32::from(BTN_LEFT)),
                 false,
                 false,
+                AstreaSystemActionCapabilities::EMPTY,
             )
             .unwrap();
 
@@ -836,6 +907,7 @@ mod tests {
                 BindingInput::PhysicalKey(KEY_TAB),
                 false,
                 false,
+                AstreaSystemActionCapabilities::EMPTY,
             )
             .unwrap();
 

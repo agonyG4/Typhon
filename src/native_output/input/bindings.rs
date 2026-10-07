@@ -1,4 +1,5 @@
 use super::*;
+use crate::system_action::AstreaSystemAction;
 use oblivion_one::wm::WorkspaceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +69,7 @@ pub(crate) enum BindingActionDefinition {
         index: u8,
         command: Option<Vec<String>>,
     },
+    SystemAction(AstreaSystemAction),
     BeginMove,
     BeginResize,
     EmitShortcut {
@@ -347,6 +349,106 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
             reserved: false,
         });
     }
+
+    use xkbcommon::xkb::keysyms;
+    for (keysym, action, repeat) in [
+        (
+            keysyms::KEY_XF86AudioRaiseVolume,
+            AstreaSystemAction::OutputVolumeUp,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioLowerVolume,
+            AstreaSystemAction::OutputVolumeDown,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioMute,
+            AstreaSystemAction::ToggleOutputMute,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioMicMute,
+            AstreaSystemAction::ToggleMicrophoneMute,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioPlay,
+            AstreaSystemAction::MediaPlayPause,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioPause,
+            AstreaSystemAction::MediaPause,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioStop,
+            AstreaSystemAction::MediaStop,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioNext,
+            AstreaSystemAction::MediaNext,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioPrev,
+            AstreaSystemAction::MediaPrevious,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioRewind,
+            AstreaSystemAction::MediaRewind,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86AudioForward,
+            AstreaSystemAction::MediaFastForward,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86MonBrightnessUp,
+            AstreaSystemAction::DisplayBrightnessUp,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysyms::KEY_XF86MonBrightnessDown,
+            AstreaSystemAction::DisplayBrightnessDown,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysyms::KEY_XF86KbdBrightnessUp,
+            AstreaSystemAction::KeyboardBrightnessUp,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysyms::KEY_XF86KbdBrightnessDown,
+            AstreaSystemAction::KeyboardBrightnessDown,
+            RepeatPolicy::Enabled,
+        ),
+        (
+            keysyms::KEY_XF86KbdLightOnOff,
+            AstreaSystemAction::ToggleKeyboardBacklight,
+            RepeatPolicy::Disabled,
+        ),
+        (
+            keysyms::KEY_XF86TouchpadToggle,
+            AstreaSystemAction::ToggleTouchpad,
+            RepeatPolicy::Disabled,
+        ),
+    ] {
+        specs.push(BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::KeySym(BindingKeySym::new(keysym)),
+            action: BindingActionDefinition::SystemAction(action),
+            repeat,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: true,
+        });
+    }
+
     specs
 }
 

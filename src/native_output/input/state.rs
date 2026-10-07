@@ -1050,7 +1050,8 @@ impl NativeInputState {
             }
             BindingActionDefinition::LaunchCommand(_)
             | BindingActionDefinition::LaunchSessionCommand { .. }
-            | BindingActionDefinition::EmitShortcut { .. } => {
+            | BindingActionDefinition::EmitShortcut { .. }
+            | BindingActionDefinition::SystemAction(_) => {
                 effect
                     .binding_action_invocations
                     .push(BindingActionInvocation {
