@@ -14,6 +14,7 @@ pub mod presentation_timing;
 pub mod scheduler;
 #[doc(hidden)]
 pub mod sync_file;
+pub mod vrr_window;
 
 #[cfg(test)]
 mod control_tests;
