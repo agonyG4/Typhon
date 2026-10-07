@@ -4,7 +4,8 @@ use super::*;
 use oblivion_one::compositor::MaterialSetError;
 use oblivion_one::compositor::{
     DirectScanoutEffectDoctorDetails, DirectScanoutFeedbackCapabilities,
-    DirectScanoutSceneAnalysis, SurfaceRenderBackend,
+    DirectScanoutSceneAnalysis, KeyboardBindingModifierMask, KeyboardBindingSymbol,
+    KeyboardBindingTranslation, SurfaceRenderBackend,
 };
 use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
@@ -36,6 +37,42 @@ fn input_requires_full_server_progression(
 #[inline]
 const fn should_service_keyboard_repeat(service_due: bool, input_backlog_pending: bool) -> bool {
     service_due && !input_backlog_pending
+}
+
+fn native_keyboard_symbolic_snapshot(
+    translation: KeyboardBindingTranslation,
+) -> crate::native_output::input::KeyboardSymbolicSnapshot {
+    fn identity(
+        symbol: KeyboardBindingSymbol,
+    ) -> crate::native_output::input::KeyboardSymbolicIdentity {
+        use crate::native_output::input::{BindingKeySym, ModifierMask};
+
+        let mut modifiers = ModifierMask::EMPTY;
+        if symbol
+            .modifiers
+            .contains(KeyboardBindingModifierMask::SHIFT)
+        {
+            modifiers = modifiers | ModifierMask::SHIFT;
+        }
+        if symbol.modifiers.contains(KeyboardBindingModifierMask::CTRL) {
+            modifiers = modifiers | ModifierMask::CTRL;
+        }
+        if symbol.modifiers.contains(KeyboardBindingModifierMask::ALT) {
+            modifiers = modifiers | ModifierMask::ALT;
+        }
+        if symbol.modifiers.contains(KeyboardBindingModifierMask::LOGO) {
+            modifiers = modifiers | ModifierMask::SUPER;
+        }
+        crate::native_output::input::KeyboardSymbolicIdentity {
+            keysym: BindingKeySym::new(symbol.keysym),
+            modifiers,
+        }
+    }
+
+    crate::native_output::input::KeyboardSymbolicSnapshot {
+        raw: translation.raw.map(identity),
+        translated: translation.translated.map(identity),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2298,12 +2335,24 @@ impl NativeRuntime {
                 }
                 for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
                     let may_change_pointer_constraints = event.may_change_pointer_constraints();
+                    let symbolic = match event {
+                        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+                            code,
+                            pressed: true,
+                            ..
+                        }) => Some(native_keyboard_symbolic_snapshot(
+                            server.keyboard_binding_translation(u32::from(code)),
+                        )),
+                        _ => None,
+                    };
                     let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
                         server.keyboard_shortcut_inhibition_snapshot(),
                     );
-                    effect.append(
-                        input_state.handle_hardware_input_event_at(event, monotonic_now_ns()?),
-                    );
+                    effect.append(input_state.handle_hardware_input_event_at_with_symbolic(
+                        event,
+                        symbolic,
+                        monotonic_now_ns()?,
+                    ));
                     if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
                         render_telemetry.resource_efficiency.record_pointer_sample();
                     }
@@ -2407,10 +2456,26 @@ impl NativeRuntime {
             ) {
                 let inhibition = server.keyboard_shortcut_inhibition_snapshot();
                 let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(inhibition);
-                effect.append(input_state.service_keyboard_repeat_if_unchanged(
-                    monotonic_now_ns()?,
-                    keyboard_repeat_generation,
-                ));
+                let repeat_now_ns = monotonic_now_ns()?;
+                let symbolic_repeat = if input_state.keyboard_repeat_generation()
+                    == keyboard_repeat_generation
+                    && input_state.keyboard_repeat_due(repeat_now_ns)
+                {
+                    input_state.keyboard_repeat_symbolic_keycode().map(|code| {
+                        native_keyboard_symbolic_snapshot(
+                            server.keyboard_binding_translation(u32::from(code)),
+                        )
+                    })
+                } else {
+                    None
+                };
+                effect.append(
+                    input_state.service_keyboard_repeat_if_unchanged_with_symbolic(
+                        repeat_now_ns,
+                        keyboard_repeat_generation,
+                        symbolic_repeat,
+                    ),
+                );
                 let effect_requested_redraw = effect.redraw_requested;
                 if let Err(error) = apply_cursor_position(
                     atomic_cursor,

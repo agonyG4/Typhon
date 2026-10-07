@@ -273,7 +273,10 @@ pub use interaction::{
     WindowInteractionKind, WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
     WindowInteractionReleaseMetrics,
 };
-pub use keyboard::{KeyboardConfig, KeyboardConfigurationPreparation};
+pub use keyboard::{
+    KeyboardBindingModifierMask, KeyboardBindingSymbol, KeyboardBindingTranslation, KeyboardConfig,
+    KeyboardConfigurationPreparation,
+};
 use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
 pub use presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,

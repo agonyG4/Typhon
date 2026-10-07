@@ -47,7 +47,7 @@ pub(crate) enum KeyboardRepeatPhase {
 pub(crate) struct ActiveKeyboardRepeat {
     pub(crate) binding: BindingId,
     pub(crate) code: u16,
-    pub(crate) modifiers: ModifierMask,
+    pub(crate) physical_modifiers: ModifierMask,
     pub(crate) inhibition: InhibitionPolicy,
     pub(crate) repeat: RepeatPolicy,
     phase: KeyboardRepeatPhase,
@@ -93,7 +93,7 @@ impl KeyboardRepeatState {
         &mut self,
         binding: BindingId,
         code: u16,
-        modifiers: ModifierMask,
+        physical_modifiers: ModifierMask,
         inhibition: InhibitionPolicy,
         now_ns: u64,
     ) {
@@ -109,7 +109,7 @@ impl KeyboardRepeatState {
         self.active = Some(ActiveKeyboardRepeat {
             binding,
             code,
-            modifiers,
+            physical_modifiers,
             inhibition,
             repeat: RepeatPolicy::Enabled,
             phase: KeyboardRepeatPhase::InitialDelay,
@@ -133,7 +133,7 @@ impl KeyboardRepeatState {
     pub(crate) fn cancel_if_modifiers_changed(&mut self, modifiers: ModifierMask) -> bool {
         if self
             .active
-            .is_some_and(|active| active.modifiers != modifiers)
+            .is_some_and(|active| active.physical_modifiers != modifiers)
         {
             self.cancel()
         } else {

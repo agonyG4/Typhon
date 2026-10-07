@@ -54,6 +54,13 @@ fn map_keyboard_configuration_error(error: String) -> KeyboardConfigurationContr
 }
 
 impl CompositorState {
+    pub(crate) fn keyboard_binding_translation(
+        &self,
+        evdev_key: u32,
+    ) -> crate::compositor::keyboard::KeyboardBindingTranslation {
+        self.keyboard_state.binding_translation(evdev_key)
+    }
+
     pub(in crate::compositor) fn wayland_pointer_dnd_routing_active(&self) -> bool {
         self.implicit_pointer_grab
             .as_ref()

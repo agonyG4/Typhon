@@ -1,10 +1,10 @@
 # Typhon Keyboard K3A
 
-K3A compiles Typhon's physical keyboard and pointer binding definitions into an immutable, ID-based table. It removes action-payload cloning and full binding scans from the event and repeat paths while preserving the current shortcut behavior.
+K3A compiles Typhon's physical keyboard and pointer binding definitions into an immutable, ID-based table. It removes action-payload cloning and full binding scans from the event and repeat paths while preserving the current shortcut behavior. K3B now extends this same compiled table with layout-aware `KeySym` candidates.
 
 ## Scope and boundary
 
-Bindings continue to match Linux physical evdev key codes and pointer button codes. K3A adds no symbolic `KeySym` matching, consumed-modifier handling, or layout-sensitive user bindings. The compositor's keyboard module remains the authority for XKB state, keymaps, layouts, variants, options, and lock state. K3B can translate symbolic candidates from that existing compositor state without adding a second `xkb::State` to native input.
+K3A itself matches Linux physical evdev key codes and pointer button codes. K3B adds symbolic `KeySym` matching and consumed-modifier handling through read-only snapshots from the compositor's existing XKB state. The compositor's keyboard module remains the authority for XKB state, keymaps, layouts, variants, options, and lock state; native input owns no second `xkb::State`.
 
 ## Definitions and compiled table
 
@@ -20,7 +20,7 @@ Session-command environment variables are read and validated while the manager i
 
 ## Lookup and precedence
 
-The table sorts exact lookup keys made from trigger, physical key or pointer button, and modifier mask. Each key maps to a compact candidate range ordered by descending definition ordinal. Matching binary-searches the key and checks only that range.
+The table sorts exact lookup keys made from trigger, physical key, `KeySym`, or pointer button and modifier mask. Each key maps to a compact candidate range ordered by descending definition ordinal. Matching binary-searches each eligible representation's key and checks only those ranges.
 
 This preserves reverse-definition precedence. The first eligible candidate wins, but an ineligible later candidate does not shadow an earlier eligible one. Inhibition and repeat policy remain candidate eligibility rules; duplicate keys remain valid.
 

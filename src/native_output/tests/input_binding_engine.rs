@@ -1,5 +1,747 @@
 use super::*;
 
+const KEY_EQUAL: u16 = 13;
+
+#[test]
+fn logical_keyboard_press_matches_its_raw_symbolic_binding_once() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
+        modifiers: ModifierMask::SHIFT,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+        action: BindingActionDefinition::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "raw-q".to_string(),
+        },
+        repeat: RepeatPolicy::Disabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let q = KeyboardSymbolicIdentity {
+        keysym: BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q),
+        modifiers: ModifierMask::SHIFT,
+    };
+    let snapshot = KeyboardSymbolicSnapshot {
+        raw: Some(q),
+        translated: Some(q),
+    };
+
+    let effect = input.handle_hardware_input_event_at_with_symbolic(
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Q,
+            pressed: true,
+        }),
+        Some(snapshot),
+        1,
+    );
+
+    assert_eq!(effect.binding_action_invocations.len(), 1);
+    assert_eq!(shortcut_name(&input, &effect), Some("raw-q"));
+    assert_eq!(input.binding_manager.generic_lookup_count_for_tests(), 3);
+}
+
+#[test]
+fn physical_and_symbolic_candidates_share_definition_order_and_inhibition_fallback() {
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        None,
+    );
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+
+    let mut symbolic_then_physical = NativeInputState::new(320, 200);
+    symbolic_then_physical.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "earlier-symbolic",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            BindingInput::PhysicalKey(KEY_Q),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "later-physical",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let effect = press_with_snapshot(&mut symbolic_then_physical, device, KEY_Q, Some(q));
+    assert_eq!(
+        shortcut_name(&symbolic_then_physical, &effect),
+        Some("later-physical")
+    );
+
+    let mut physical_then_symbolic = NativeInputState::new(320, 200);
+    physical_then_symbolic.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            BindingInput::PhysicalKey(KEY_Q),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "earlier-physical",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "later-symbolic",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let effect = press_with_snapshot(&mut physical_then_symbolic, device, KEY_Q, Some(q));
+    assert_eq!(
+        shortcut_name(&physical_then_symbolic, &effect),
+        Some("later-symbolic")
+    );
+
+    let mut symbolic_respect = NativeInputState::new(320, 200);
+    symbolic_respect.keyboard_shortcuts_inhibited = true;
+    symbolic_respect.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            BindingInput::PhysicalKey(KEY_Q),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "physical-bypass-fallback",
+            InhibitionPolicy::Bypass,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "later-symbolic-respect",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let effect = press_with_snapshot(&mut symbolic_respect, device, KEY_Q, Some(q));
+    assert_eq!(
+        shortcut_name(&symbolic_respect, &effect),
+        Some("physical-bypass-fallback")
+    );
+
+    let mut physical_respect = NativeInputState::new(320, 200);
+    physical_respect.keyboard_shortcuts_inhibited = true;
+    physical_respect.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "symbolic-bypass-fallback",
+            InhibitionPolicy::Bypass,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            BindingInput::PhysicalKey(KEY_Q),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "later-physical-respect",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let effect = press_with_snapshot(&mut physical_respect, device, KEY_Q, Some(q));
+    assert_eq!(
+        shortcut_name(&physical_respect, &effect),
+        Some("symbolic-bypass-fallback")
+    );
+}
+
+#[test]
+fn raw_and_translated_candidates_also_share_definition_order() {
+    let snapshot = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_equal, ModifierMask::SHIFT)),
+        Some((xkbcommon::xkb::keysyms::KEY_plus, ModifierMask::EMPTY)),
+    );
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let raw = BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_equal));
+    let translated = BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_plus));
+
+    let mut translated_then_raw = NativeInputState::new(320, 200);
+    translated_then_raw.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            translated,
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "earlier-translated",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            raw,
+            ModifierMask::SHIFT,
+            BindingTrigger::Press,
+            "later-raw",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let effect = press_with_snapshot(&mut translated_then_raw, device, KEY_EQUAL, Some(snapshot));
+    assert_eq!(
+        shortcut_name(&translated_then_raw, &effect),
+        Some("later-raw")
+    );
+
+    let mut raw_then_translated = NativeInputState::new(320, 200);
+    raw_then_translated.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            raw,
+            ModifierMask::SHIFT,
+            BindingTrigger::Press,
+            "earlier-raw",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            translated,
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "later-translated",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let effect = press_with_snapshot(&mut raw_then_translated, device, KEY_EQUAL, Some(snapshot));
+    assert_eq!(
+        shortcut_name(&raw_then_translated, &effect),
+        Some("later-translated")
+    );
+}
+
+#[test]
+fn translated_symbol_uses_consumed_modifiers_without_changing_physical_matching() {
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let shift_consumed = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_equal, ModifierMask::SHIFT)),
+        Some((xkbcommon::xkb::keysyms::KEY_plus, ModifierMask::EMPTY)),
+    );
+
+    let mut translated = NativeInputState::new(320, 200);
+    translated.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_plus)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "translated-plus",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    )]);
+    translated.handle_key_event_at(KEY_LEFTSHIFT, true, 1);
+    let effect = press_with_snapshot(&mut translated, device, KEY_EQUAL, Some(shift_consumed));
+    assert_eq!(shortcut_name(&translated, &effect), Some("translated-plus"));
+    assert_eq!(translated.active_modifier_mask(), ModifierMask::SHIFT);
+
+    let mut physical = NativeInputState::new(320, 200);
+    physical.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::PhysicalKey(KEY_2),
+        ModifierMask::SHIFT,
+        BindingTrigger::Press,
+        "physical-shift-two",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    )]);
+    physical.handle_key_event_at(KEY_LEFTSHIFT, true, 1);
+    let effect = press_with_snapshot(&mut physical, device, KEY_2, Some(shift_consumed));
+    assert_eq!(
+        shortcut_name(&physical, &effect),
+        Some("physical-shift-two")
+    );
+}
+
+#[test]
+fn missing_symbolic_translation_does_not_block_physical_binding() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::PhysicalKey(KEY_Q),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "physical-q-without-symbol",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    )]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+
+    let effect = press_with_snapshot(
+        &mut input,
+        device,
+        KEY_Q,
+        Some(KeyboardSymbolicSnapshot::default()),
+    );
+
+    assert_eq!(
+        shortcut_name(&input, &effect),
+        Some("physical-q-without-symbol")
+    );
+}
+
+#[test]
+fn final_release_uses_the_press_time_symbol_after_a_layout_change() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Release,
+            "q-release",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_a)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Release,
+            "a-release",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let layout_a = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let layout_b = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_a, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_a, ModifierMask::EMPTY)),
+    );
+
+    let _ = press_with_snapshot(&mut input, device, KEY_Q, Some(layout_a));
+    let release = input.handle_hardware_input_event_at_with_symbolic(
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Q,
+            pressed: false,
+        }),
+        Some(layout_b),
+        2,
+    );
+
+    assert_eq!(shortcut_name(&input, &release), Some("q-release"));
+}
+
+#[test]
+fn multi_source_key_keeps_the_first_symbol_until_final_release() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Release,
+        "original-q-release",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    )]);
+    let first = KeyboardDeviceId::from_raw(1).unwrap();
+    let second = KeyboardDeviceId::from_raw(2).unwrap();
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let z = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+    );
+
+    let _ = press_with_snapshot(&mut input, first, KEY_Q, Some(q));
+    let duplicate_logical_press = press_with_snapshot(&mut input, second, KEY_Q, Some(z));
+    assert!(
+        duplicate_logical_press
+            .binding_action_invocations
+            .is_empty()
+    );
+
+    let non_final_release = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::Key {
+            device: first,
+            code: KEY_Q,
+            pressed: false,
+        },
+    ));
+    assert!(non_final_release.binding_action_invocations.is_empty());
+    assert!(input.keyboard_key_is_logically_pressed(KEY_Q));
+
+    let final_release = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::Key {
+            device: second,
+            code: KEY_Q,
+            pressed: false,
+        },
+    ));
+    assert_eq!(
+        shortcut_name(&input, &final_release),
+        Some("original-q-release")
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_Q));
+}
+
+#[test]
+fn duplicate_press_and_spurious_other_source_release_do_not_replace_cached_symbol() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Release,
+        "original-q-release",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    )]);
+    let owner = KeyboardDeviceId::from_raw(1).unwrap();
+    let stranger = KeyboardDeviceId::from_raw(2).unwrap();
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let z = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+    );
+
+    let _ = press_with_snapshot(&mut input, owner, KEY_Q, Some(q));
+    let duplicate = press_with_snapshot(&mut input, owner, KEY_Q, Some(z));
+    assert!(duplicate.binding_action_invocations.is_empty());
+    let spurious_release = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::Key {
+            device: stranger,
+            code: KEY_Q,
+            pressed: false,
+        },
+    ));
+    assert!(spurious_release.binding_action_invocations.is_empty());
+
+    let release = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::Key {
+            device: owner,
+            code: KEY_Q,
+            pressed: false,
+        },
+    ));
+    assert_eq!(shortcut_name(&input, &release), Some("original-q-release"));
+}
+
+#[test]
+fn source_removal_keeps_identity_for_other_owner_and_uses_it_for_final_owner() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Release,
+        "source-removed-q-release",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Disabled,
+    )]);
+    let first = KeyboardDeviceId::from_raw(1).unwrap();
+    let second = KeyboardDeviceId::from_raw(2).unwrap();
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let z = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+    );
+
+    let _ = press_with_snapshot(&mut input, first, KEY_Q, Some(q));
+    let _ = press_with_snapshot(&mut input, second, KEY_Q, Some(z));
+    let removed_non_final = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::SourceRemoved { device: first },
+    ));
+    assert!(removed_non_final.binding_action_invocations.is_empty());
+    assert!(input.keyboard_key_is_logically_pressed(KEY_Q));
+
+    let removed_final = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::SourceRemoved { device: second },
+    ));
+    assert_eq!(
+        shortcut_name(&input, &removed_final),
+        Some("source-removed-q-release")
+    );
+    assert!(!input.keyboard_key_is_logically_pressed(KEY_Q));
+}
+
+#[test]
+fn symbolic_repeat_keeps_exact_binding_and_cancels_after_translation_changes() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "repeat-q",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Enabled,
+    )]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let z = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+    );
+
+    let press = press_with_snapshot(&mut input, device, KEY_Q, Some(q));
+    let binding = input.active_keyboard_repeat().unwrap().binding;
+    assert_eq!(input.keyboard_repeat_symbolic_keycode(), Some(KEY_Q));
+    let lookups_after_press = input.binding_manager.generic_lookup_count_for_tests();
+    let generation = input.keyboard_repeat_generation();
+    let repeated =
+        input.service_keyboard_repeat_if_unchanged_with_symbolic(601_000_000, generation, Some(q));
+    assert_eq!(shortcut_name(&input, &press), Some("repeat-q"));
+    assert_eq!(shortcut_name(&input, &repeated), Some("repeat-q"));
+    assert_eq!(input.active_keyboard_repeat().unwrap().binding, binding);
+    assert_eq!(
+        input.binding_manager.generic_lookup_count_for_tests(),
+        lookups_after_press
+    );
+
+    let next_generation = input.keyboard_repeat_generation();
+    let next_deadline = input.keyboard_repeat_deadline_ns().unwrap();
+    let stale = input.service_keyboard_repeat_if_unchanged_with_symbolic(
+        next_deadline,
+        next_generation,
+        Some(z),
+    );
+    assert!(stale.binding_action_invocations.is_empty());
+    assert!(input.active_keyboard_repeat().is_none());
+}
+
+#[test]
+fn symbolic_repeat_survives_non_final_source_removal_and_stops_at_final_removal() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "source-owned-repeat-q",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Enabled,
+    )]);
+    let first = KeyboardDeviceId::from_raw(1).unwrap();
+    let second = KeyboardDeviceId::from_raw(2).unwrap();
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let z = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+    );
+
+    let _ = press_with_snapshot(&mut input, first, KEY_Q, Some(q));
+    let _ = press_with_snapshot(&mut input, second, KEY_Q, Some(z));
+    let non_final = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::SourceRemoved { device: first },
+    ));
+    assert!(non_final.binding_action_invocations.is_empty());
+    assert!(input.active_keyboard_repeat().is_some());
+
+    let repeated = input.service_keyboard_repeat_if_unchanged_with_symbolic(
+        601_000_000,
+        input.keyboard_repeat_generation(),
+        Some(q),
+    );
+    assert_eq!(
+        shortcut_name(&input, &repeated),
+        Some("source-owned-repeat-q")
+    );
+
+    let final_removal = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::SourceRemoved { device: second },
+    ));
+    assert!(final_removal.binding_action_invocations.is_empty());
+    assert!(input.active_keyboard_repeat().is_none());
+    assert!(
+        input
+            .service_keyboard_repeat_if_unchanged_with_symbolic(
+                u64::MAX,
+                input.keyboard_repeat_generation(),
+                Some(q),
+            )
+            .binding_action_invocations
+            .is_empty()
+    );
+}
+
+#[test]
+fn translated_symbolic_repeat_retains_physical_shift_ownership() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_plus)),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "repeat-plus",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Enabled,
+    )]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let _ = input.handle_key_event_at(KEY_LEFTSHIFT, true, 1);
+    let translation = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_equal, ModifierMask::SHIFT)),
+        Some((xkbcommon::xkb::keysyms::KEY_plus, ModifierMask::EMPTY)),
+    );
+    let press = press_with_snapshot(&mut input, device, KEY_EQUAL, Some(translation));
+    let active = input.active_keyboard_repeat().unwrap();
+    assert_eq!(active.physical_modifiers, ModifierMask::SHIFT);
+    assert_eq!(input.keyboard_repeat_symbolic_keycode(), Some(KEY_EQUAL));
+
+    let repeated = input.service_keyboard_repeat_if_unchanged_with_symbolic(
+        601_000_000,
+        input.keyboard_repeat_generation(),
+        Some(translation),
+    );
+    assert_eq!(shortcut_name(&input, &press), Some("repeat-plus"));
+    assert_eq!(shortcut_name(&input, &repeated), Some("repeat-plus"));
+}
+
+#[test]
+fn physical_repeat_target_does_not_request_symbolic_translation() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![shortcut_binding(
+        BindingInput::PhysicalKey(KEY_Q),
+        ModifierMask::EMPTY,
+        BindingTrigger::Press,
+        "repeat-physical-q",
+        InhibitionPolicy::Respect,
+        RepeatPolicy::Enabled,
+    )]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let _ = press_with_snapshot(&mut input, device, KEY_Q, None);
+
+    assert_eq!(input.keyboard_repeat_symbolic_keycode(), None);
+}
+
+#[test]
+fn session_clear_discards_symbolic_press_identity_and_repeat_target() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Press,
+            "q-repeat",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Enabled,
+        ),
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_q)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Release,
+            "q-release",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+        shortcut_binding(
+            BindingInput::KeySym(BindingKeySym::new(xkbcommon::xkb::keysyms::KEY_z)),
+            ModifierMask::EMPTY,
+            BindingTrigger::Release,
+            "z-release",
+            InhibitionPolicy::Respect,
+            RepeatPolicy::Disabled,
+        ),
+    ]);
+    let device = KeyboardDeviceId::from_raw(1).unwrap();
+    let q = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_q, ModifierMask::EMPTY)),
+    );
+    let z = symbolic_snapshot(
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+        Some((xkbcommon::xkb::keysyms::KEY_z, ModifierMask::EMPTY)),
+    );
+
+    let _ = press_with_snapshot(&mut input, device, KEY_Q, Some(q));
+    assert_eq!(input.keyboard_repeat_symbolic_keycode(), Some(KEY_Q));
+    input.clear_pressed_state_for_session_switch();
+    assert_eq!(input.keyboard_repeat_symbolic_keycode(), None);
+    let stale_release = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Q,
+            pressed: false,
+        },
+    ));
+    assert!(stale_release.binding_action_invocations.is_empty());
+
+    let _ = press_with_snapshot(&mut input, device, KEY_Q, Some(z));
+    let fresh_release = input.handle_hardware_input_event(NativeHardwareInputEvent::Keyboard(
+        NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_Q,
+            pressed: false,
+        },
+    ));
+    assert_eq!(shortcut_name(&input, &fresh_release), Some("z-release"));
+}
+
+fn symbolic_snapshot(
+    raw: Option<(u32, ModifierMask)>,
+    translated: Option<(u32, ModifierMask)>,
+) -> KeyboardSymbolicSnapshot {
+    let identity = |(keysym, modifiers)| KeyboardSymbolicIdentity {
+        keysym: BindingKeySym::new(keysym),
+        modifiers,
+    };
+    KeyboardSymbolicSnapshot {
+        raw: raw.map(identity),
+        translated: translated.map(identity),
+    }
+}
+
+fn shortcut_binding(
+    input: BindingInput,
+    modifiers: ModifierMask,
+    trigger: BindingTrigger,
+    name: &str,
+    inhibition: InhibitionPolicy,
+    repeat: RepeatPolicy,
+) -> BindingSpec {
+    BindingSpec {
+        modifiers,
+        trigger,
+        input,
+        action: BindingActionDefinition::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: name.to_string(),
+        },
+        repeat,
+        inhibition,
+        reserved: false,
+    }
+}
+
+fn press_with_snapshot(
+    input: &mut NativeInputState,
+    device: KeyboardDeviceId,
+    code: u16,
+    symbolic: Option<KeyboardSymbolicSnapshot>,
+) -> NativeInputEffect {
+    input.handle_hardware_input_event_at_with_symbolic(
+        NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code,
+            pressed: true,
+        }),
+        symbolic,
+        1,
+    )
+}
+
+fn shortcut_name<'a>(input: &'a NativeInputState, effect: &NativeInputEffect) -> Option<&'a str> {
+    let invocation = effect.binding_action_invocations.first()?;
+    match input
+        .binding_manager
+        .action_catalog()
+        .action(invocation.action)?
+    {
+        BindingActionDefinition::EmitShortcut { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
 #[test]
 fn native_input_repeat_reuses_the_press_binding_id_without_generic_lookup() {
     let mut input = NativeInputState::new(320, 200);

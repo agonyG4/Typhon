@@ -36,9 +36,20 @@ pub(crate) enum BindingTrigger {
     PointerRelease,
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct BindingKeySym(u32);
+
+impl BindingKeySym {
+    pub(crate) const fn new(keysym: u32) -> Self {
+        Self(keysym)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BindingInput {
     PhysicalKey(u16),
+    KeySym(BindingKeySym),
     PointerButton(u32),
 }
 

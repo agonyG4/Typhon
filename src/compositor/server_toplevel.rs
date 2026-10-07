@@ -154,6 +154,14 @@ impl OwnCompositorServer {
         self.state.update_keyboard_physical_state(key, pressed)
     }
 
+    #[doc(hidden)]
+    pub fn keyboard_binding_translation(
+        &self,
+        key: u32,
+    ) -> crate::compositor::keyboard::KeyboardBindingTranslation {
+        self.state.keyboard_binding_translation(key)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_keyboard_state_for_test(&mut self) {
         self.state.fail_keyboard_state_for_test();

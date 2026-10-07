@@ -10,6 +10,7 @@ mod keyboard;
 mod repeat;
 mod routing;
 mod state;
+mod symbolic;
 
 pub(crate) use backend::*;
 pub(crate) use batch::*;
@@ -21,3 +22,4 @@ pub(crate) use keyboard::*;
 pub(crate) use repeat::*;
 pub(crate) use routing::*;
 pub(crate) use state::*;
+pub(crate) use symbolic::*;

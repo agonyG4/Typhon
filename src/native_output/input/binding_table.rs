@@ -324,10 +324,11 @@ impl AstreaBindingManager {
         self.table.binding(id)
     }
 
-    pub(crate) fn handle_key(
+    pub(crate) fn handle_keyboard_key(
         &mut self,
-        modifiers: ModifierMask,
+        physical_modifiers: ModifierMask,
         code: u16,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
         pressed: bool,
         repeated: bool,
         inhibited: bool,
@@ -337,10 +338,11 @@ impl AstreaBindingManager {
         } else {
             BindingTrigger::Release
         };
-        let Some(matched) = self.match_binding(
-            modifiers,
+        let Some(matched) = self.match_keyboard_binding(
+            physical_modifiers,
             trigger,
-            BindingInput::PhysicalKey(code),
+            code,
+            symbolic,
             repeated,
             inhibited,
         ) else {
@@ -360,6 +362,18 @@ impl AstreaBindingManager {
             repeat: matched.repeat,
             inhibition: matched.inhibition,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key(
+        &mut self,
+        modifiers: ModifierMask,
+        code: u16,
+        pressed: bool,
+        repeated: bool,
+        inhibited: bool,
+    ) -> AstreaBindingMatch {
+        self.handle_keyboard_key(modifiers, code, None, pressed, repeated, inhibited)
     }
 
     pub(crate) fn handle_pointer_button(
@@ -418,14 +432,28 @@ impl AstreaBindingManager {
         &self,
         id: BindingId,
         code: u16,
-        modifiers: ModifierMask,
+        physical_modifiers: ModifierMask,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
         inhibited: bool,
     ) -> Option<AstreaBindingMatch> {
         let binding = self.table.binding(id)?;
+        let trigger_matches = match binding.input {
+            BindingInput::PhysicalKey(binding_code) => {
+                binding_code == code && binding.modifiers.matches(physical_modifiers)
+            }
+            BindingInput::KeySym(expected) => symbolic.is_some_and(|snapshot| {
+                [snapshot.raw, snapshot.translated]
+                    .into_iter()
+                    .flatten()
+                    .any(|identity| {
+                        identity.keysym == expected && binding.modifiers.matches(identity.modifiers)
+                    })
+            }),
+            BindingInput::PointerButton(_) => false,
+        };
         if binding.trigger != BindingTrigger::Press
-            || binding.input != BindingInput::PhysicalKey(code)
+            || !trigger_matches
             || binding.repeat != RepeatPolicy::Enabled
-            || !binding.modifiers.matches(modifiers)
             || (inhibited && binding.inhibition != InhibitionPolicy::Bypass)
         {
             return None;
@@ -452,6 +480,67 @@ impl AstreaBindingManager {
             .set(self.generic_lookup_count.get().saturating_add(1));
         self.table
             .match_binding(modifiers, trigger, input, repeated, inhibited)
+    }
+
+    fn match_keyboard_binding(
+        &self,
+        physical_modifiers: ModifierMask,
+        trigger: BindingTrigger,
+        code: u16,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
+        repeated: bool,
+        inhibited: bool,
+    ) -> Option<CompiledBindingMatch> {
+        let physical = self.match_binding(
+            physical_modifiers,
+            trigger,
+            BindingInput::PhysicalKey(code),
+            repeated,
+            inhibited,
+        );
+        let raw = symbolic
+            .and_then(|snapshot| snapshot.raw)
+            .and_then(|identity| {
+                self.match_binding(
+                    identity.modifiers,
+                    trigger,
+                    BindingInput::KeySym(identity.keysym),
+                    repeated,
+                    inhibited,
+                )
+            });
+        let translated = symbolic
+            .and_then(|snapshot| snapshot.translated)
+            .and_then(|identity| {
+                self.match_binding(
+                    identity.modifiers,
+                    trigger,
+                    BindingInput::KeySym(identity.keysym),
+                    repeated,
+                    inhibited,
+                )
+            });
+
+        let mut winner = None;
+        for candidate in [physical, raw, translated].into_iter().flatten() {
+            let candidate_order = self
+                .table
+                .binding(candidate.binding)
+                .map_or(0, |binding| binding.definition_order);
+            let winner_order = winner
+                .and_then(|matched: CompiledBindingMatch| self.table.binding(matched.binding))
+                .map_or(0, |binding| binding.definition_order);
+            if winner.is_none() || candidate_order > winner_order {
+                winner = Some(candidate);
+            }
+        }
+        winner
+    }
+
+    pub(crate) fn repeat_binding_requires_symbolic_translation(&self, id: BindingId) -> bool {
+        self.table
+            .binding(id)
+            .is_some_and(|binding| matches!(binding.input, BindingInput::KeySym(_)))
     }
 
     #[cfg(test)]

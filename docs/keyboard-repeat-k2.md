@@ -65,6 +65,14 @@ candidate.
 Respect-policy targets cancel when shortcut inhibition becomes effective;
 Bypass-policy targets may continue.
 
+For a K3B `KeySym` target, the retained modifier snapshot remains the aggregate
+physical `ModifierMask`; it is not replaced by XKB's consumed symbolic
+modifiers. When a symbolic repeat is due, the runtime obtains a fresh read-only
+translation from the authoritative compositor XKB state and validates the exact
+stored `BindingId` against its raw or translated identity. A layout or lock-state
+change that makes that binding stop matching cancels the repeat. Physical
+repeat targets do not request an XKB translation.
+
 Repeat only reapplies the consumed compositor binding action with
 `AstreaShortcutPhase::Repeated`. It is not physical user activity and does not
 change keyboard source ownership, compositor or client XKB state, or client key

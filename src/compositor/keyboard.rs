@@ -290,11 +290,80 @@ pub(super) enum KeyboardLayoutError {
 pub(super) struct XkbKeyboardState {
     keymap: xkb::Keymap,
     physical_state: xkb::State,
+    shortcut_modifier_indices: KeyboardShortcutModifierIndices,
     physical_pressed_keys: HashSet<u32>,
     config: KeyboardConfig,
     serialized_keymap_v1: Vec<u8>,
     pending_configuration: Option<PendingKeyboardConfiguration>,
     configuration_generation: u64,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyboardBindingModifierMask(u8);
+
+impl KeyboardBindingModifierMask {
+    pub const EMPTY: Self = Self(0);
+    pub const SHIFT: Self = Self(1 << 0);
+    pub const CTRL: Self = Self(1 << 1);
+    pub const ALT: Self = Self(1 << 2);
+    pub const LOGO: Self = Self(1 << 3);
+
+    pub const fn contains(self, modifier: Self) -> bool {
+        self.0 & modifier.0 == modifier.0
+    }
+
+    const fn without(self, modifier: Self) -> Self {
+        Self(self.0 & !modifier.0)
+    }
+}
+
+impl std::ops::BitOr for KeyboardBindingModifierMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardBindingSymbol {
+    pub keysym: u32,
+    pub modifiers: KeyboardBindingModifierMask,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyboardBindingTranslation {
+    pub raw: Option<KeyboardBindingSymbol>,
+    pub translated: Option<KeyboardBindingSymbol>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct KeyboardShortcutModifierIndices {
+    shift: Option<xkb::ModIndex>,
+    ctrl: Option<xkb::ModIndex>,
+    alt: Option<xkb::ModIndex>,
+    logo: Option<xkb::ModIndex>,
+}
+
+impl KeyboardShortcutModifierIndices {
+    fn from_keymap(keymap: &xkb::Keymap) -> Self {
+        fn find(keymap: &xkb::Keymap, names: &[&str]) -> Option<xkb::ModIndex> {
+            names.iter().find_map(|name| {
+                let index = keymap.mod_get_index(name);
+                (index != xkb::MOD_INVALID).then_some(index)
+            })
+        }
+
+        Self {
+            shift: find(keymap, &["Shift"]),
+            ctrl: find(keymap, &["Control"]),
+            alt: find(keymap, &["Alt", "Mod1"]),
+            logo: find(keymap, &["Super", "Logo", "Mod4"]),
+        }
+    }
 }
 
 pub(super) struct PreparedKeyboardConfiguration {
@@ -413,6 +482,7 @@ impl XkbKeyboardState {
         }
 
         let physical_state = xkb::State::new(&keymap);
+        let shortcut_modifier_indices = KeyboardShortcutModifierIndices::from_keymap(&keymap);
         let default_layout = i32::try_from(config.default_layout_index)
             .map_err(|_| "default layout index is not representable".to_string())?;
         if xkb_compat::update_latched_locked(&physical_state, 0, 0, default_layout).is_none() {
@@ -421,6 +491,7 @@ impl XkbKeyboardState {
         Ok(Self {
             keymap,
             physical_state,
+            shortcut_modifier_indices,
             physical_pressed_keys: HashSet::new(),
             config: config.clone(),
             serialized_keymap_v1,
@@ -621,8 +692,11 @@ impl XkbKeyboardState {
             {
                 return Err("replacement keyboard state update failed".to_string());
             }
+            let shortcut_modifier_indices =
+                KeyboardShortcutModifierIndices::from_keymap(&candidate.keymap);
             self.keymap = candidate.keymap;
             self.physical_state = new_state;
+            self.shortcut_modifier_indices = shortcut_modifier_indices;
             self.serialized_keymap_v1 = candidate.serialized_keymap_v1;
         } else if config.default_layout_index != self.config.default_layout_index {
             let layout = i32::try_from(config.default_layout_index)
@@ -774,6 +848,92 @@ impl XkbKeyboardState {
             self.physical_pressed_keys.remove(&evdev_key);
         }
         self.wayland_serialized_state() != before
+    }
+
+    pub(super) fn binding_translation(&self, evdev_key: u32) -> KeyboardBindingTranslation {
+        let Some(keycode) = self.keycode_for_evdev(evdev_key) else {
+            return KeyboardBindingTranslation::default();
+        };
+
+        let active_modifiers = self.effective_shortcut_modifiers();
+        let mut translation = KeyboardBindingTranslation::default();
+        let layout = self.physical_state.key_get_layout(keycode);
+        if layout != xkb::LAYOUT_INVALID {
+            let symbols = self.keymap.key_get_syms_by_level(keycode, layout, 0);
+            if let [keysym] = symbols
+                && keysym.raw() != xkb::keysyms::KEY_NoSymbol
+            {
+                translation.raw = Some(KeyboardBindingSymbol {
+                    keysym: keysym.raw(),
+                    modifiers: active_modifiers,
+                });
+            }
+        }
+
+        let keysym = self.physical_state.key_get_one_sym(keycode);
+        if keysym.raw() != xkb::keysyms::KEY_NoSymbol {
+            let mut modifiers = active_modifiers;
+            for (index, modifier) in [
+                (
+                    self.shortcut_modifier_indices.shift,
+                    KeyboardBindingModifierMask::SHIFT,
+                ),
+                (
+                    self.shortcut_modifier_indices.ctrl,
+                    KeyboardBindingModifierMask::CTRL,
+                ),
+                (
+                    self.shortcut_modifier_indices.alt,
+                    KeyboardBindingModifierMask::ALT,
+                ),
+                (
+                    self.shortcut_modifier_indices.logo,
+                    KeyboardBindingModifierMask::LOGO,
+                ),
+            ] {
+                if index
+                    .is_some_and(|index| self.physical_state.mod_index_is_consumed(keycode, index))
+                {
+                    modifiers = modifiers.without(modifier);
+                }
+            }
+            translation.translated = Some(KeyboardBindingSymbol {
+                keysym: keysym.raw(),
+                modifiers,
+            });
+        }
+
+        translation
+    }
+
+    fn effective_shortcut_modifiers(&self) -> KeyboardBindingModifierMask {
+        let mut modifiers = KeyboardBindingModifierMask::EMPTY;
+        for (index, modifier) in [
+            (
+                self.shortcut_modifier_indices.shift,
+                KeyboardBindingModifierMask::SHIFT,
+            ),
+            (
+                self.shortcut_modifier_indices.ctrl,
+                KeyboardBindingModifierMask::CTRL,
+            ),
+            (
+                self.shortcut_modifier_indices.alt,
+                KeyboardBindingModifierMask::ALT,
+            ),
+            (
+                self.shortcut_modifier_indices.logo,
+                KeyboardBindingModifierMask::LOGO,
+            ),
+        ] {
+            if index.is_some_and(|index| {
+                self.physical_state
+                    .mod_index_is_active(index, xkb::STATE_MODS_EFFECTIVE)
+            }) {
+                modifiers.0 |= modifier.0;
+            }
+        }
+        modifiers
     }
 
     pub(super) fn wayland_serialized_state(&self) -> KeyboardSerializedState {
@@ -996,6 +1156,20 @@ impl KeyboardStateHandle {
                 .borrow()
                 .get(&id)
                 .map(XkbKeyboardState::wayland_serialized_state)
+        })
+    }
+
+    pub(super) fn binding_translation(&self, evdev_key: u32) -> KeyboardBindingTranslation {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return KeyboardBindingTranslation::default();
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .map_or_else(KeyboardBindingTranslation::default, |state| {
+                    state.binding_translation(evdev_key)
+                })
         })
     }
 
@@ -1345,6 +1519,14 @@ fn describe_config(config: &KeyboardConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn us_keyboard_config() -> KeyboardConfig {
+        KeyboardConfig {
+            layout: "us".to_string(),
+            variant: None,
+            ..KeyboardConfig::default()
+        }
+    }
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1358,6 +1540,207 @@ mod tests {
         assert_eq!(config.repeat_rate, 25);
         assert_eq!(config.repeat_delay, 600);
         assert_eq!(config.default_layout_index, 0);
+    }
+
+    #[test]
+    fn binding_translation_reads_pre_update_symbols_without_mutating_authoritative_state() {
+        let config = us_keyboard_config();
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        assert!(state.update_physical_key(42, true));
+
+        let pressed_before = state.physical_pressed_keys.clone();
+        let serialized_before = state.wayland_serialized_state();
+        let layout_before = state.layout_snapshot().unwrap();
+        let translation = state.binding_translation(17);
+
+        assert_eq!(
+            translation.raw,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_w,
+                modifiers: KeyboardBindingModifierMask::SHIFT,
+            })
+        );
+        assert_eq!(
+            translation.translated,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_W,
+                modifiers: KeyboardBindingModifierMask::EMPTY,
+            })
+        );
+        assert_eq!(state.physical_pressed_keys, pressed_before);
+        assert_eq!(state.wayland_serialized_state(), serialized_before);
+        assert_eq!(state.layout_snapshot().unwrap(), layout_before);
+
+        let _ = state.update_physical_key(17, true);
+        assert!(state.physical_pressed_keys.contains(&17));
+    }
+
+    #[test]
+    fn raw_and_translated_symbols_separate_shifted_symbol_from_shortcut_modifiers() {
+        let config = us_keyboard_config();
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        assert!(state.update_physical_key(42, true));
+
+        let translation = state.binding_translation(13);
+
+        assert_eq!(
+            translation.raw,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_equal,
+                modifiers: KeyboardBindingModifierMask::SHIFT,
+            })
+        );
+        assert_eq!(
+            translation.translated,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_plus,
+                modifiers: KeyboardBindingModifierMask::EMPTY,
+            })
+        );
+    }
+
+    #[test]
+    fn consumed_shift_preserves_alt_and_raw_identity_keeps_both_modifiers() {
+        let config = us_keyboard_config();
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        assert!(state.update_physical_key(42, true));
+        assert!(state.update_physical_key(56, true));
+
+        let translation = state.binding_translation(13);
+
+        assert_eq!(
+            translation.raw,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_equal,
+                modifiers: KeyboardBindingModifierMask::SHIFT | KeyboardBindingModifierMask::ALT,
+            })
+        );
+        assert_eq!(
+            translation.translated,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_plus,
+                modifiers: KeyboardBindingModifierMask::ALT,
+            })
+        );
+    }
+
+    #[test]
+    fn raw_identity_tracks_control_and_logo_modifier_families() {
+        let config = us_keyboard_config();
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        assert!(state.update_physical_key(29, true));
+        assert!(state.update_physical_key(125, true));
+
+        let translation = state.binding_translation(16);
+
+        assert_eq!(
+            translation.raw,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_q,
+                modifiers: KeyboardBindingModifierMask::CTRL | KeyboardBindingModifierMask::LOGO,
+            })
+        );
+    }
+
+    #[test]
+    fn caps_lock_changes_translation_without_becoming_a_binding_modifier() {
+        let config = us_keyboard_config();
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        let _ = state.update_physical_key(58, true);
+
+        let translation = state.binding_translation(30);
+
+        assert_eq!(
+            translation.raw,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_a,
+                modifiers: KeyboardBindingModifierMask::EMPTY,
+            })
+        );
+        assert_eq!(
+            translation.translated,
+            Some(KeyboardBindingSymbol {
+                keysym: xkb::keysyms::KEY_A,
+                modifiers: KeyboardBindingModifierMask::EMPTY,
+            })
+        );
+    }
+
+    #[test]
+    fn num_lock_changes_keypad_translation_without_becoming_a_binding_modifier() {
+        let config = us_keyboard_config();
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        let _ = state.update_physical_key(69, true);
+
+        let translation = state.binding_translation(79);
+
+        assert!(translation.raw.is_some());
+        assert!(translation.translated.is_some());
+        assert_eq!(
+            translation.raw.unwrap().modifiers,
+            KeyboardBindingModifierMask::EMPTY
+        );
+        assert_eq!(
+            translation.translated.unwrap().modifiers,
+            KeyboardBindingModifierMask::EMPTY
+        );
+    }
+
+    #[test]
+    fn keymap_replacement_recomputes_cached_shortcut_modifier_indices() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::minimal_us()).unwrap();
+        let replacement = KeyboardConfig {
+            layout: "fr".to_string(),
+            ..KeyboardConfig::minimal_us()
+        };
+
+        state.prepare_configuration(replacement).unwrap();
+        state.mark_pending_configuration_persisted().unwrap();
+        state.commit_prepared_configuration().unwrap();
+
+        assert_eq!(
+            state.shortcut_modifier_indices,
+            KeyboardShortcutModifierIndices::from_keymap(&state.keymap)
+        );
+    }
+
+    #[test]
+    fn same_evdev_key_changes_raw_symbol_when_locked_layout_changes() {
+        let config = KeyboardConfig {
+            layout: "us,fr".to_string(),
+            variant: None,
+            ..KeyboardConfig::default()
+        };
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        let _ = state.update_physical_key(16, true);
+        let us = state.binding_translation(16);
+        assert_eq!(
+            us.raw.map(|symbol| symbol.keysym),
+            Some(xkb::keysyms::KEY_q)
+        );
+
+        state.set_locked_layout(1).unwrap();
+        let fr = state.binding_translation(16);
+
+        assert_eq!(
+            fr.raw.map(|symbol| symbol.keysym),
+            Some(xkb::keysyms::KEY_a)
+        );
+        assert!(state.physical_pressed_keys.contains(&16));
+    }
+
+    #[test]
+    fn unavailable_or_nosymbol_keycodes_return_empty_translation() {
+        let state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+
+        assert_eq!(
+            state.binding_translation(0),
+            KeyboardBindingTranslation::default()
+        );
+        assert_eq!(
+            state.binding_translation(0x2ff),
+            KeyboardBindingTranslation::default()
+        );
     }
 
     #[test]
@@ -1695,6 +2078,17 @@ mod tests {
         let mut handle = KeyboardStateHandle::default();
         assert!(handle.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default())));
         assert!(handle.wayland_serialized_state().is_some());
+    }
+
+    #[test]
+    fn uninitialized_keyboard_translation_fails_closed_without_initializing_xkb() {
+        let handle = KeyboardStateHandle::default();
+
+        assert_eq!(
+            handle.binding_translation(16),
+            KeyboardBindingTranslation::default()
+        );
+        assert!(matches!(handle.status, KeyboardStateStatus::Uninitialized));
     }
 
     #[test]

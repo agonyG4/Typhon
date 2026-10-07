@@ -19,6 +19,7 @@ pub(crate) struct NativeInputState {
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
     pub(crate) suppressed_vt_switch_keys: Vec<u16>,
     keyboard_sources: KeyboardSourceLedger,
+    keyboard_symbolic_presses: KeyboardSymbolicPressLedger,
     keyboard_repeat: KeyboardRepeatState,
     #[cfg(test)]
     pub(crate) source_removal_modifier_release_routes: Vec<(u16, ModifierMask)>,
@@ -54,6 +55,7 @@ impl NativeInputState {
             forwarded_deferred_modifier_keys: Vec::new(),
             suppressed_vt_switch_keys: Vec::new(),
             keyboard_sources: KeyboardSourceLedger::default(),
+            keyboard_symbolic_presses: KeyboardSymbolicPressLedger::default(),
             keyboard_repeat: KeyboardRepeatState::configured(repeat_config),
             #[cfg(test)]
             source_removal_modifier_release_routes: Vec::new(),
@@ -210,9 +212,19 @@ impl NativeInputState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_hardware_input_event_at(
         &mut self,
         event: NativeHardwareInputEvent,
+        now_ns: u64,
+    ) -> NativeInputEffect {
+        self.handle_hardware_input_event_at_with_symbolic(event, None, now_ns)
+    }
+
+    pub(crate) fn handle_hardware_input_event_at_with_symbolic(
+        &mut self,
+        event: NativeHardwareInputEvent,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
         now_ns: u64,
     ) -> NativeInputEffect {
         match event {
@@ -220,7 +232,7 @@ impl NativeInputState {
                 device,
                 code,
                 pressed,
-            }) => self.handle_keyboard_key_event(device, code, pressed, now_ns),
+            }) => self.handle_keyboard_key_event(device, code, pressed, symbolic, now_ns),
             NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved {
                 device,
             }) => self.handle_keyboard_source_removed(device, now_ns),
@@ -245,6 +257,7 @@ impl NativeInputState {
         device: KeyboardDeviceId,
         code: u16,
         pressed: bool,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
         now_ns: u64,
     ) -> NativeInputEffect {
         let modifiers_before = self.active_modifier_mask();
@@ -265,7 +278,21 @@ impl NativeInputState {
             && modifier_family_for_key(code).is_some_and(|family| {
                 modifiers_before.contains(family) && !modifiers_after.contains(family)
             });
-        self.route_logical_key_event(code, pressed, modifier_family_released, None, now_ns)
+        let symbolic = if pressed {
+            self.keyboard_symbolic_presses
+                .capture(code, symbolic.unwrap_or_default());
+            symbolic
+        } else {
+            self.keyboard_symbolic_presses.take(code)
+        };
+        self.route_logical_key_event(
+            code,
+            pressed,
+            modifier_family_released,
+            None,
+            symbolic,
+            now_ns,
+        )
     }
 
     fn handle_keyboard_source_removed(
@@ -302,11 +329,13 @@ impl NativeInputState {
                 self.source_removal_modifier_release_routes
                     .push((code, family));
             }
+            let symbolic = self.keyboard_symbolic_presses.take(code);
             effect.append(self.route_logical_key_event(
                 code,
                 false,
                 modifier_family_released,
                 Some(modifiers_before),
+                symbolic,
                 now_ns,
             ));
         }
@@ -319,6 +348,7 @@ impl NativeInputState {
         pressed: bool,
         modifier_family_released: bool,
         modifiers_for_bindings: Option<ModifierMask>,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
         now_ns: u64,
     ) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
@@ -436,9 +466,10 @@ impl NativeInputState {
         }
 
         let binding_modifiers = modifiers_for_bindings.unwrap_or(modifiers);
-        match self.binding_manager.handle_key(
+        match self.binding_manager.handle_keyboard_key(
             binding_modifiers,
             code,
+            symbolic,
             pressed,
             false,
             self.keyboard_shortcuts_inhibited,
@@ -455,7 +486,7 @@ impl NativeInputState {
                     && let Some(binding) = binding
                 {
                     self.keyboard_repeat
-                        .arm(binding, code, binding_modifiers, inhibition, now_ns);
+                        .arm(binding, code, modifiers, inhibition, now_ns);
                 }
                 self.apply_binding_action(action, phase, None, &mut effect);
                 return effect;
@@ -479,7 +510,7 @@ impl NativeInputState {
     #[cfg(test)]
     pub(crate) fn handle_key_event(&mut self, code: u16, value: i32) -> NativeInputEffect {
         let device = KeyboardDeviceId::from_raw(1).expect("test keyboard id is nonzero");
-        self.handle_keyboard_key_event(device, code, value != 0, 0)
+        self.handle_keyboard_key_event(device, code, value != 0, None, 0)
     }
 
     #[cfg(test)]
@@ -490,7 +521,7 @@ impl NativeInputState {
         now_ns: u64,
     ) -> NativeInputEffect {
         let device = KeyboardDeviceId::from_raw(1).expect("test keyboard id is nonzero");
-        self.handle_keyboard_key_event(device, code, pressed, now_ns)
+        self.handle_keyboard_key_event(device, code, pressed, None, now_ns)
     }
 
     #[cfg(test)]
@@ -500,7 +531,7 @@ impl NativeInputState {
         code: u16,
         value: i32,
     ) -> NativeInputEffect {
-        self.handle_keyboard_key_event(device, code, value != 0, 0)
+        self.handle_keyboard_key_event(device, code, value != 0, None, 0)
     }
 
     #[cfg(test)]
@@ -511,7 +542,7 @@ impl NativeInputState {
         pressed: bool,
         now_ns: u64,
     ) -> NativeInputEffect {
-        self.handle_keyboard_key_event(device, code, pressed, now_ns)
+        self.handle_keyboard_key_event(device, code, pressed, None, now_ns)
     }
 
     #[cfg(test)]
@@ -543,7 +574,23 @@ impl NativeInputState {
         self.keyboard_repeat.cancel();
     }
 
+    pub(crate) fn keyboard_repeat_symbolic_keycode(&self) -> Option<u16> {
+        let active = self.keyboard_repeat.active()?;
+        self.binding_manager
+            .repeat_binding_requires_symbolic_translation(active.binding)
+            .then_some(active.code)
+    }
+
+    #[cfg(test)]
     pub(crate) fn service_keyboard_repeat(&mut self, now_ns: u64) -> NativeInputEffect {
+        self.service_keyboard_repeat_with_symbolic(now_ns, None)
+    }
+
+    fn service_keyboard_repeat_with_symbolic(
+        &mut self,
+        now_ns: u64,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
+    ) -> NativeInputEffect {
         if !self.keyboard_repeat.due(now_ns) {
             return NativeInputEffect::default();
         }
@@ -552,7 +599,7 @@ impl NativeInputState {
         };
         if active.repeat != RepeatPolicy::Enabled
             || !self.keyboard_sources.is_logically_pressed(active.code)
-            || self.active_modifier_mask() != active.modifiers
+            || self.active_modifier_mask() != active.physical_modifiers
             || (self.keyboard_shortcuts_inhibited && active.inhibition == InhibitionPolicy::Respect)
         {
             self.keyboard_repeat.cancel();
@@ -563,7 +610,8 @@ impl NativeInputState {
         match self.binding_manager.match_repeat_binding(
             active.binding,
             active.code,
-            active.modifiers,
+            active.physical_modifiers,
+            symbolic,
             self.keyboard_shortcuts_inhibited,
         ) {
             Some(AstreaBindingMatch::Consumed {
@@ -586,6 +634,7 @@ impl NativeInputState {
         effect
     }
 
+    #[cfg(test)]
     pub(crate) fn service_keyboard_repeat_if_unchanged(
         &mut self,
         now_ns: u64,
@@ -594,7 +643,19 @@ impl NativeInputState {
         if self.keyboard_repeat_generation() != generation {
             return NativeInputEffect::default();
         }
-        self.service_keyboard_repeat(now_ns)
+        self.service_keyboard_repeat_with_symbolic(now_ns, None)
+    }
+
+    pub(crate) fn service_keyboard_repeat_if_unchanged_with_symbolic(
+        &mut self,
+        now_ns: u64,
+        generation: u64,
+        symbolic: Option<KeyboardSymbolicSnapshot>,
+    ) -> NativeInputEffect {
+        if self.keyboard_repeat_generation() != generation {
+            return NativeInputEffect::default();
+        }
+        self.service_keyboard_repeat_with_symbolic(now_ns, symbolic)
     }
 
     #[cfg(test)]
@@ -1029,6 +1090,7 @@ impl NativeInputState {
     pub(crate) fn clear_pressed_state_for_session_switch(&mut self) {
         self.clear_keyboard_repeat();
         self.keyboard_sources.clear();
+        self.keyboard_symbolic_presses.clear();
         self.forwarded_control_keys.clear();
         self.forwarded_client_keys.clear();
         self.pressed_deferred_modifier_keys.clear();

@@ -1,6 +1,6 @@
 use super::*;
 
-const LINUX_KEY_CODE_COUNT: usize = 0x300;
+pub(crate) const LINUX_KEY_CODE_COUNT: usize = 0x300;
 const KEY_WORD_COUNT: usize = LINUX_KEY_CODE_COUNT.div_ceil(u64::BITS as usize);
 const INITIAL_KEYBOARD_SOURCE_CAPACITY: usize = 4;
 
