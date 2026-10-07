@@ -657,7 +657,6 @@ impl NativeRuntime {
             cursor_scheduling_policy,
             cursor_output_arbitration,
             direct_scanout_preference,
-            direct_scanout_qualification: DirectScanoutQualificationState::default(),
             cursor_render_mode,
             presented_planes: initial_presented(atomic_cursor.as_ref()),
             atomic_cursor,

@@ -2,12 +2,22 @@
 
 Direct Scanout has completed project hardware qualification and is qualified
 for production automatic use; `OBLIVION_ONE_DIRECT_SCANOUT=auto` is the default.
-Runtime qualification is separate: a new compositor starts without a proven
-current content/KMS candidate, and every candidate must still pass the exact
-scene, device, plane,
-format/modifier, generation, synchronization, cursor, presentation-state, and
-KMS `TEST_ONLY` checks before it can be submitted. A failed proof falls back to
-composition.
+That project-level qualification does not qualify any candidate at runtime.
+Each candidate remains untrusted until semantic analysis and the authoritative
+backend path accept its exact `DirectPlaneValidationKey`, required KMS
+`TEST_ONLY`, real submission, and pageflip ownership conditions. The validation
+cache can reuse evidence only for an identical key; there is no global sticky
+"current candidate qualified" flag. Candidate blockers, validation-cache
+counters, TEST_ONLY/submission counters, and pending/active/runtime state are
+the current diagnostics. A failed proof falls back to composition.
+
+The current production attempt also requires effective KMS worker transport
+and a present worker handle, plus the explicit Atomic EGL/GBM scanout path. The
+runtime feature state additionally requires a healthy worker and an active
+native output session. With worker `off`, Legacy KMS, or `auto` degraded to
+synchronous KMS, normal composition continues safely and Direct Scanout remains
+configured but is not attempted. The KMS worker doctor entry reports worker
+startup degradation.
 
 This procedure is for regression and hardware requalification of that
 production default. The canonical matrix values are `off` and `auto`.

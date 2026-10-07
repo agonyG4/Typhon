@@ -199,8 +199,8 @@ main
 | Wayland compositor semantic state | `CompositorState` | resource IDs + typed internal IDs | process lifetime | semantic publication/commit | protocol error, bounded rejection, client cleanup |
 | Logical output | `CompositorState` / native runtime share one allocated `OutputId` | `OutputId` | compositor lifetime | identity remains stable | allocation failure is explicit; current product still one physical output |
 | `wl_surface` pending state | `SurfaceData` | `SurfaceId` + Wayland resource | resource lifetime | `wl_surface.commit` capture | protocol error / resource destruction |
-| Surface-tree semantic transaction | `SurfaceTransactionState` | `SurfaceTreeTransactionId` + commit lineage | cached -> queued -> ready -> publish/terminal | readiness predicates + atomic publication | reject stale lifetime, bounded admission, supersession/coalescing only when legal |
-| Synchronized subsurface cache | `SurfaceTransactionState` | surface/client + relationship identity + commit lineage | synchronized commits until parent publication | materialized into the same owner's tree queue | hard per-surface/client/global bounds; offending client rejected |
+| Surface-tree semantic transaction | compositor pending transaction queue | `SurfaceTreeTransactionId` + commit lineage | queued -> ready -> publish/terminal | readiness predicates + atomic publication | reject stale lifetime, bounded admission, supersession/coalescing only when legal |
+| Synchronized subsurface cache | `SubsurfaceTransactionState` | surface/client + commit lineage | synchronized commits until parent publication | folded into owning tree transaction | hard per-surface/client/global bounds; offending client rejected |
 | Window semantic state | `CompositorState` desktop/window registries | window/group/surface identity | map -> mutate -> unmap/destroy | canonical state update | protocol-specific repair/cleanup |
 | Workspace state | `WorkspaceManager` inside compositor | `WorkspaceId`, special workspace ID | compositor lifetime | canonical activation/move | invalid target rejected; invisible tiled reflow deferred |
 | Tiling layout | compositor tiled-layout state + Dwindle solver | window/group IDs, layout tree nodes | insert/remove/reflow | atomic canonical geometry application | typed layout error, preserve/fallback geometry |
@@ -322,12 +322,8 @@ client protocol mutation
 ### Source anchors
 
 - `src/compositor/state_data.rs` — `SurfaceData`.
-- `src/compositor/subsurface.rs` — `CachedSubsurfaceCommit` and captured commit/relationship models.
-- `src/compositor/state/surface_transactions/state.rs` — unified persistent transaction state.
-- `src/compositor/state/surface_transactions/model.rs` — `PendingSurfaceTreeTransaction` and transaction models.
-- `src/compositor/state/surface_transactions/lineage.rs` — Content Update coverage and lineage operations.
-- `src/compositor/state/surface_transactions/queue.rs` — queue structure, admission, coalescing and compositor orchestration.
-- `src/compositor/state/surface_transactions/publication.rs` — lifetime rejection and cached-commit application helpers.
+- `src/compositor/subsurface.rs` — `CachedSubsurfaceCommit`, `SubsurfaceTransactionState`.
+- `src/compositor/state/surface_transactions.rs` — `PendingSurfaceTreeTransaction`.
 - `src/compositor/state/surface_tree_readiness.rs` — `commit_ready_surface_tree_transactions`.
 - `src/compositor/state/subsurfaces.rs` — `merge_or_queue_surface_tree_transaction`, `publish_surface_tree`.
 - `src/compositor/state/direct_scanout.rs` — `direct_scanout_scene_analysis`.
@@ -433,7 +429,7 @@ Wayland surface state is double-buffered, and synchronized subsurfaces require m
 
 ### 6.3 Synchronized cache authority
 
-`SurfaceTransactionState` owns live subsurface relationship identity, synchronized cached commits and their accounting, the materialized pending surface-tree queue, transaction ID allocation and `SubsurfaceTransactionMetrics`. It imposes explicit cache limits:
+`SubsurfaceTransactionState` owns synchronized cached commits and associated accounting. It imposes explicit limits:
 
 - 8 cached commits per surface;
 - 256 per client;
@@ -444,27 +440,11 @@ This is architectural, not only defensive programming: a client cannot turn sync
 
 ### 6.4 Tree transaction authority
 
-`SurfaceTransactionState` remains the sole owner as a synchronized cached Content Update becomes a materialized `PendingSurfaceTreeTransaction`. It holds the root, exact nodes and cached commits, captured publication lifetimes, acquire dependencies, external content dependencies, Commit Timing readiness and transaction timing. `SurfaceTreeTransactionId` provides stable semantic identity.
+`PendingSurfaceTreeTransaction` contains the root, exact nodes and cached commits, captured publication lifetimes, acquire dependencies, external content dependencies, Commit Timing readiness and transaction timing. `SurfaceTreeTransactionId` provides stable semantic identity.
 
 `merge_or_queue_surface_tree_transaction` coalesces only when commit lineage and obligation constraints permit it. A pacing-protected transaction cannot be silently replaced simply because a newer visual state exists. Dependencies are preserved in transaction order.
 
-`commit_ready_surface_tree_transactions` is compositor-wide readiness orchestration over the owner's queue. It checks captured lifetimes, acquire readiness, Content Update dependencies, FIFO barriers and Commit Timing before publishing or settling queued work. Accepted intent is applied to canonical compositor state through `publish_surface_tree` and `apply_cached_subsurface_commit`.
-
-The transaction owner does not duplicate the publication ledger, explicit-sync allocator/watch registry, pacing clock/FIFO barriers, surface-tree publication batch state, mapping state or scene topology. The publication ledger remains canonical across immediate, explicit-sync and surface-tree commits. Standalone explicit-sync and tree dependencies share one acquire authority. Pacing and scene publication remain compositor-wide authorities.
-
-```text
-CompositorState
-├── SurfaceTransactionState
-│   ├── live subsurface relationships
-│   ├── synchronized cached Content Updates and accounting
-│   ├── pending surface-tree transactions and IDs
-│   └── transaction-domain metrics
-├── canonical surface/publication state
-├── shared explicit-sync readiness
-├── surface pacing and presentation clock
-├── scene/topology state
-└── remaining compositor domains
-```
+`commit_ready_surface_tree_transactions` is the readiness arbiter. It verifies that captured lifetimes and generations are still valid and that all dependent readiness conditions have reached a legal terminal/ready state. Publication uses `publish_surface_tree`, retaining one semantic transaction authority.
 
 ### 6.5 Supersession and destruction
 
@@ -477,14 +457,9 @@ Supersession is allowed only where newer state can legally replace older state w
 ### Source anchors
 
 - `src/compositor/state_data.rs` — `SurfaceData`.
-- `src/compositor/subsurface.rs` — captured commit/relationship models and `CachedSubsurfaceCommit`.
-- `src/compositor/state/surface_transactions/state.rs` — `SurfaceTransactionState` and cached accounting.
-- `src/compositor/state/surface_transactions/model.rs` — `SurfaceTreeTransactionId`, `PendingSurfaceTreeTransaction`.
-- `src/compositor/state/surface_transactions/lineage.rs` — Content Update identity coverage.
-- `src/compositor/state/surface_transactions/queue.rs` — queue admission/coalescing orchestration.
-- `src/compositor/state/surface_transactions/publication.rs` — async lifetime rejection and accepted commit application.
-- `src/compositor/state/surface_mapping.rs` — canonical surface mapping projection, outside the transaction owner.
-- `src/compositor/state/subsurfaces.rs` — relationship/topology integration and `publish_surface_tree`.
+- `src/compositor/subsurface.rs` — `SubsurfaceTransactionState`, cached-commit limits and `CachedSubsurfaceCommit`.
+- `src/compositor/state/surface_transactions.rs` — `SurfaceTreeTransactionId`, `PendingSurfaceTreeTransaction`.
+- `src/compositor/state/subsurfaces.rs` — transaction extraction, coalescing and `publish_surface_tree`.
 - `src/compositor/state/surface_tree_readiness.rs` — readiness/publish loop.
 - `src/compositor/state/surface_commits.rs` — canonical buffer commit/update paths.
 
@@ -2042,7 +2017,7 @@ The following diagrams are high value. The descriptions are intentionally precis
 ### D-03 — Synchronized subsurface transaction graph
 
 **Nodes:** root + child/grandchild commits; lineage edges; acquire dependencies; external-content dependency; FIFO/Commit Timing.  
-**Ownership boundary:** one `SurfaceTransactionState` owns both cached and materialized pending phases.
+**Ownership boundary:** `SubsurfaceTransactionState` cache versus pending tree transaction.
 **Teach:** why coalescing needs contiguous lineage and protected obligations.
 
 ### D-04 — Semantic -> presentation -> rendered -> physical

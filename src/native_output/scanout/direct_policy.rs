@@ -84,6 +84,36 @@ pub(crate) fn direct_blocker(reason: &str) -> (&'static str, u64) {
     }
 }
 
+/// Describes whether the runtime path can attempt direct presentation, not
+/// whether any particular candidate has passed exact KMS validation.
+pub(crate) fn direct_scanout_feature_state(
+    policy_enabled: bool,
+    scanout_destroyed: bool,
+    direct_active: bool,
+    explicit_atomic_scanout_available: bool,
+    worker_transport_effective: bool,
+    worker_exists: bool,
+    worker_healthy: bool,
+    session_active: bool,
+) -> oblivion_one::control_snapshots::FeatureState {
+    use oblivion_one::control_snapshots::FeatureState;
+
+    if !policy_enabled || scanout_destroyed {
+        FeatureState::Unavailable
+    } else if direct_active {
+        FeatureState::Active
+    } else if explicit_atomic_scanout_available
+        && worker_transport_effective
+        && worker_exists
+        && worker_healthy
+        && session_active
+    {
+        FeatureState::Available
+    } else {
+        FeatureState::Configured
+    }
+}
+
 pub(crate) fn direct_scanout_doctor_severity(
     enabled: bool,
     state: oblivion_one::control_snapshots::FeatureState,
@@ -153,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_treats_unproven_auto_candidates_as_healthy() {
+    fn doctor_treats_auto_runtime_states_as_healthy() {
         use oblivion_one::control_snapshots::{DoctorSeverity, FeatureState};
 
         assert_eq!(
@@ -176,6 +206,82 @@ mod tests {
                 DoctorSeverity::Warning
             );
         }
+    }
+
+    #[test]
+    fn direct_scanout_feature_state_reports_operational_readiness() {
+        use oblivion_one::control_snapshots::FeatureState;
+
+        let state = |policy_enabled,
+                     scanout_destroyed,
+                     direct_active,
+                     explicit_atomic_scanout_available,
+                     worker_transport_effective,
+                     worker_exists,
+                     worker_healthy,
+                     session_active| {
+            direct_scanout_feature_state(
+                policy_enabled,
+                scanout_destroyed,
+                direct_active,
+                explicit_atomic_scanout_available,
+                worker_transport_effective,
+                worker_exists,
+                worker_healthy,
+                session_active,
+            )
+        };
+
+        assert_eq!(
+            state(false, false, false, true, true, true, true, true),
+            FeatureState::Unavailable,
+        );
+        assert_eq!(
+            state(true, true, false, true, true, true, true, true),
+            FeatureState::Unavailable,
+        );
+        assert_eq!(
+            state(true, false, true, false, false, false, false, false),
+            FeatureState::Active,
+        );
+        assert_eq!(
+            state(true, false, false, true, true, true, true, true),
+            FeatureState::Available,
+        );
+        // Synchronous submission (including an auto startup fallback) is a
+        // healthy composition fallback, but cannot attempt Direct Scanout.
+        assert_eq!(
+            state(true, false, false, true, false, false, false, true),
+            FeatureState::Configured,
+        );
+        // A missing worker cannot make the path available.
+        assert_eq!(
+            state(true, false, false, true, true, false, false, true),
+            FeatureState::Configured,
+        );
+        // A present but fatally failed worker has the same safe fallback state.
+        assert_eq!(
+            state(true, false, false, true, true, true, false, true),
+            FeatureState::Configured,
+        );
+        assert_eq!(
+            state(true, false, false, false, true, true, true, true),
+            FeatureState::Configured,
+        );
+        assert_eq!(
+            state(true, false, false, true, true, true, true, false),
+            FeatureState::Configured,
+        );
+    }
+
+    #[test]
+    fn direct_scanout_path_is_available_without_a_visible_candidate() {
+        use oblivion_one::control_snapshots::FeatureState;
+
+        assert_eq!(
+            direct_scanout_feature_state(true, false, false, true, true, true, true, true),
+            FeatureState::Available,
+        );
     }
 
     #[test]

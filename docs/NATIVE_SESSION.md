@@ -51,7 +51,7 @@ bounded by discovered capabilities and transaction validation.
 | `OBLIVION_ONE_SCANOUT_BACKEND` | `auto`; Atomic aliases `gpu`, `native`, `native-gpu`, `native-egl-gbm`, `egl-gbm`, `gles-gbm`, `egl-gles-gbm`; rollback `native-egl-gbm-opaque`; CPU GBM aliases `gbm-cpu-write`, `gbm-cpu-write-pageflip`, `cpu-gbm-write`, `cpu-gbm-pageflip`, `cpu`, `cpu-gbm`, `gbm`, `egl`, `pageflip`, `gbm-egl`, `gbm-egl-pageflip`; dumb aliases `dumb`, `framebuffer`, `legacy` | `auto` | Auto chooses explicit Atomic EGL/GBM, then CPU GBM, then dumb when those capabilities are available. Explicit backend choices do not walk that fallback list. Unknown values warn and use `auto`. The opaque path is rollback-only and is never selected automatically. |
 | `OBLIVION_ONE_KMS_COMMIT_WORKER` | `off`, `auto`, `force` | `auto` | Auto uses the worker on Atomic KMS; worker startup failure warns and continues synchronously. Legacy KMS remains synchronous. `force` fails on Legacy KMS or Atomic worker startup failure; `off` is intentionally synchronous. Invalid explicit values are configuration errors. |
 | `OBLIVION_ONE_TRIPLE_BUFFERING` | `auto`, `off`, `force` | `auto` | Auto selects triple buffering only with proven capabilities and useful overlap; otherwise it stays double-buffered. `force` does not bypass capability blockers and falls back to double buffering with a doctor warning. Invalid values are configuration errors. |
-| `OBLIVION_ONE_DIRECT_SCANOUT` | `auto`, `off`; deprecated alias `experimental-auto` | `auto` | Direct Scanout is project-qualified for production automatic use. Auto attempts eligible candidates opportunistically; exact scene, device, format/modifier, plane, generation, sync, cursor, presentation-state, and KMS `TEST_ONLY` proof still apply. A candidate that cannot be proven falls back to composition. Unknown values, including `force`, warn and resolve to `off`. Runtime candidate qualification starts unproven and is separate from project-level feature qualification. |
+| `OBLIVION_ONE_DIRECT_SCANOUT` | `auto`, `off`; deprecated alias `experimental-auto` | `auto` | Direct Scanout is project-qualified for production automatic use. Auto attempts eligible candidates on the explicit Atomic EGL/GBM path when the effective KMS worker is healthy and the session permits output. Each candidate still needs exact scene, device, format/modifier, plane, generation, synchronization, cursor, presentation-state, and KMS validation. A candidate that cannot be proven falls back to composition. Unknown values, including `force`, warn and resolve to `off`. |
 | `OBLIVION_ONE_VRR` | `off`, `auto`, `on`; aliases `0`/`false`/`no`/`disable`/`disabled` and `1`/`true`/`yes`/`enable`/`enabled` | `auto` | Phase 1 is implemented. Auto requests Adaptive Sync only for eligible solitary-fullscreen candidates; Atomic connector/CRTC capability and exact request validation still govern. Unknown values warn and resolve to `auto`. Further scheduler and final target-hardware qualification work is intentionally deferred; see [Presentation Modes v1](wayland/PRESENTATION_MODES_V1.md#phase-1-qualification-boundary). |
 | `OBLIVION_ONE_TEARING` | `off`, `auto` | `off` | Auto may request async page-flip only when its surface hint, fullscreen, cursor/plane, sync, timing, format, and exact KMS checks allow it. Missing or unrecognized values resolve to `off`. |
 | `OBLIVION_ONE_CURSOR` | `auto`, `hardware` (`hw`, `drm`), `software` (`sw`, `cpu`) | `auto` | Auto uses an available safe hardware cursor and falls back to software. Explicit `hardware` fails startup if its requested hardware path cannot be established. Unknown values warn and use `auto`. |
@@ -60,8 +60,20 @@ bounded by discovered capabilities and transaction validation.
 
 `experimental-auto` is accepted temporarily for existing launch scripts and emits
 a deprecation warning; `auto` is the canonical Direct Scanout policy. The
-runtime's `not_qualified` telemetry describes current candidate proof, not the
-production maturity of the feature.
+project-level hardware qualification is complete, but it does not qualify an
+individual buffer. Each candidate remains untrusted until semantic analysis
+and the exact `DirectPlaneValidationKey` validation path accepts it, including
+required `TEST_ONLY` and real-submit conditions. There is no global sticky
+candidate-qualified flag. Runtime state, exact blockers, validation-cache
+counters, and `TEST_ONLY`/submission/presentation counters describe current
+behavior.
+
+The current Direct Scanout attempt requires effective KMS worker transport and
+a present worker handle. With worker `off`, Legacy KMS, or `auto` startup
+degraded to synchronous KMS, ordinary composition continues and Direct Scanout
+remains configured but is not attempted. This is a current path limitation,
+not a fatal session condition; the KMS worker doctor entry reports worker
+startup degradation.
 
 With Atomic KMS, `OBLIVION_ONE_CURSOR=auto` selects the discovered universal
 cursor plane when its ARGB8888 storage can be allocated safely. This applies to

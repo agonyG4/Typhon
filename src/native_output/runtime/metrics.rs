@@ -1021,19 +1021,15 @@ impl NativeRuntime {
                         && self.cursor_render_mode == NativeCursorRenderMode::Hardware,
                 ),
                 NativePerfField::str("direct_scanout_policy", direct_scanout_policy),
+                NativePerfField::str(
+                    "direct_scanout_runtime_state",
+                    self.direct_scanout_state().as_str(),
+                ),
                 NativePerfField::bool(
                     "direct_scanout_active",
                     self.presented_planes
                         .primary
                         .is_some_and(|assignment| assignment.is_direct()),
-                ),
-                NativePerfField::bool(
-                    "direct_scanout_qualified",
-                    self.direct_scanout_qualification.is_qualified(),
-                ),
-                NativePerfField::str(
-                    "direct_scanout_qualification",
-                    self.direct_scanout_qualification.status_str(),
                 ),
                 NativePerfField::bool("direct_scanout_pending", direct_pending),
                 NativePerfField::bool(

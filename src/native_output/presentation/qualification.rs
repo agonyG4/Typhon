@@ -1,11 +1,4 @@
-use super::transaction::OutputContentKey;
 use std::os::fd::OwnedFd;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DirectScanoutQualification {
-    NotQualified,
-    Qualified,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectReleaseMode {
@@ -59,59 +52,5 @@ impl DirectSyncReadiness {
                 DirectReleaseMode::Pageflip
             },
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DirectScanoutQualificationState {
-    status: DirectScanoutQualification,
-    last_qualified_content: Option<OutputContentKey>,
-}
-
-impl Default for DirectScanoutQualificationState {
-    fn default() -> Self {
-        Self {
-            status: DirectScanoutQualification::NotQualified,
-            last_qualified_content: None,
-        }
-    }
-}
-
-impl DirectScanoutQualificationState {
-    pub(crate) const fn status_str(self) -> &'static str {
-        match self.status {
-            DirectScanoutQualification::NotQualified => "not_qualified",
-            DirectScanoutQualification::Qualified => "qualified",
-        }
-    }
-
-    pub(crate) const fn is_qualified(self) -> bool {
-        matches!(self.status, DirectScanoutQualification::Qualified)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn qualify(&mut self, content: OutputContentKey) {
-        self.status = DirectScanoutQualification::Qualified;
-        self.last_qualified_content = Some(content);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn invalidate(&mut self) {
-        self.status = DirectScanoutQualification::NotQualified;
-        self.last_qualified_content = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_direct_scanout_qualification_starts_without_a_proven_candidate() {
-        let state = DirectScanoutQualificationState::default();
-
-        assert!(!state.is_qualified());
-        assert_eq!(state.status_str(), "not_qualified");
-        assert_eq!(state.last_qualified_content, None);
     }
 }

@@ -4434,20 +4434,25 @@ impl NativeRuntime {
         None
     }
 
-    fn direct_scanout_state(&self) -> FeatureState {
-        if !self.direct_scanout_preference.enabled() || self.scanout_destroyed {
-            FeatureState::Unavailable
-        } else if self
-            .presented_planes
-            .primary
-            .is_some_and(PresentedPrimaryAssignment::is_direct)
-        {
-            FeatureState::Active
-        } else if self.direct_scanout_qualification.is_qualified() {
-            FeatureState::Available
-        } else {
-            FeatureState::Configured
-        }
+    pub(super) fn direct_scanout_state(&self) -> FeatureState {
+        crate::native_output::scanout::direct_scanout_feature_state(
+            self.direct_scanout_preference.enabled(),
+            self.scanout_destroyed,
+            self.presented_planes
+                .primary
+                .is_some_and(PresentedPrimaryAssignment::is_direct),
+            matches!(
+                &*self.scanout,
+                crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(_)
+            ),
+            self.kms_commit_worker_transport
+                == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
+            self.kms_commit_worker.is_some(),
+            self.kms_commit_worker
+                .as_ref()
+                .is_some_and(|worker| worker.fatal_reason().is_none()),
+            self.session.permits_output(),
+        )
     }
 
     fn control_output_snapshot(&self) -> OutputSnapshot {

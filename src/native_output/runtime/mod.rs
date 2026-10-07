@@ -680,7 +680,6 @@ pub(crate) struct NativeRuntime {
     cursor_scheduling_policy: NativeCursorSchedulingPolicy,
     cursor_output_arbitration: NativeCursorOutputArbitration,
     direct_scanout_preference: NativeDirectScanoutPreference,
-    direct_scanout_qualification: DirectScanoutQualificationState,
     cursor_render_mode: NativeCursorRenderMode,
     atomic_cursor: Option<NativeAtomicCursor>,
     legacy_cursor: Option<NativeLegacyHardwareCursor>,

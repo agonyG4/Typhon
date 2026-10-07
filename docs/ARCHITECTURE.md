@@ -211,9 +211,32 @@ frame behind a queued primary. Predictive Triple may prepare or worker-queue
 one later primary, but never creates a third future primary or grows the
 three-slot pool.
 
-Direct Scanout remains available only to the explicit EGL/GBM scanout. Legacy
-cursor ioctls are a Legacy-KMS-only implementation detail; compatibility
-scanouts never combine an Atomic primary with a legacy cursor owner.
+Direct Scanout is project-qualified for production automatic use and defaults
+to `OBLIVION_ONE_DIRECT_SCANOUT=auto`. The current candidate attempt is limited
+to the explicit Atomic EGL/GBM scanout with effective KMS worker transport, a
+present healthy worker, and a session that permits output. If worker transport
+is off, Legacy KMS is selected, or worker `auto` falls back to synchronous
+submission, ordinary composition continues safely and Direct Scanout remains
+configured without an attempt. The KMS worker doctor entry owns worker startup
+degradation reporting.
+
+Runtime `FeatureState` describes feature-path readiness: `Available` means the
+runtime path can attempt a candidate, even when no direct candidate is visible;
+`Active` means a Direct Scanout primary is currently presented. Neither state
+qualifies a candidate. Each candidate is validated independently through
+semantic analysis, its exact `DirectPlaneValidationKey`, the matching
+validation-cache entry or required KMS `TEST_ONLY`, real submission, and
+pageflip-owned framebuffer lifetime. Failed or ineligible candidates return to
+composition. Legacy cursor ioctls are a Legacy-KMS-only implementation detail;
+compatibility scanouts never combine an Atomic primary with a legacy cursor
+owner.
+
+Current source anchors for this boundary are
+`src/native_output/scanout/direct_policy.rs`,
+`src/native_output/scanout/direct_validation.rs`,
+`src/native_output/runtime/cycle_dispatch.rs`,
+`src/native_output/runtime/presentation_cycle.rs`, and
+`src/native_output/scanout/atomic_egl_gbm/direct.rs`.
 
 The effective KMS cursor state is centralized: software fallback, a latched
 cursor-plane failure, and an unsupported client cursor keep the Atomic cursor
@@ -299,10 +322,11 @@ Only a zero-owner `spotlight_toggle` or `alt_tab_next` press may resolve an
 optional external fallback. If that fallback cannot spawn, Typhon records and
 logs `fallback_spawn_failed`, consumes the binding, and continues running.
 
-Client launch policy removes host activation/display routes, sets Typhon's
-Wayland socket, and keeps X11 disabled unless a Typhon-owned XWayland bridge is
-explicitly implemented. This policy affects child environments only; it never
-chooses the compositor runtime.
+Client launch policy removes host activation/display routes and sets Typhon's
+Wayland socket. The opt-in managed XWayland service supplies its own private
+display environment; clients do not inherit a host X11 display. XWayland stays
+off by default through `TYPHON_XWAYLAND=off`. This policy affects child
+environments only; it never chooses the compositor runtime.
 
 ## Session boundary
 

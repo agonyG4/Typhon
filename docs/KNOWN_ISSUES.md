@@ -27,10 +27,18 @@ formats and modifiers. Presentation mode and content type are part of the
 Direct Scanout validation identity, so VRR and tearing are not blanket
 exclusions: each still depends on its own eligibility and exact KMS validation.
 
-Startup runtime qualification may correctly remain unproven until a current
-candidate passes scene, device, plane, format/modifier, synchronization,
-cursor, generation, presentation-mode, and `TEST_ONLY` checks. Those runtime
-blockers and counters remain useful diagnostics.
+The current candidate attempt is available only on the explicit Atomic
+EGL/GBM path when effective KMS worker transport is active and a worker handle
+is present. The runtime feature state also requires a healthy worker and a
+native session that permits output. With worker `off`, Legacy KMS,
+or `auto` falling back to synchronous submission, ordinary composition
+continues safely and Direct Scanout stays configured without being attempted.
+This path limitation is not a compositor failure. Each attempted candidate
+still needs exact scene, device, plane, format/modifier, synchronization,
+cursor, generation, presentation-state, `DirectPlaneValidationKey`, and KMS
+validation evidence; rejection returns to composition. Runtime state, exact
+blockers, validation-cache counters, and TEST_ONLY/submission counters report
+that evidence without a global sticky candidate-qualified state.
 
 ## Native SDDM and TTY validation is incomplete
 
@@ -47,11 +55,17 @@ diagnostics but do not provide the same performance envelope as the normal
 GPU path. Hardware cursor policy can similarly fall back to software unless
 hardware cursor use was explicitly required.
 
-## X11 compatibility is not enabled
+## XWayland is opt-in and not broadly real-application-qualified
 
-Clients launched by Typhon receive the Typhon Wayland environment. An X11-only
-client fails instead of opening on an inherited host display. A Typhon-owned
-XWayland bridge remains an architectural boundary, not an enabled fallback.
+The managed XWayland/XWM path is implemented but defaults off;
+`TYPHON_XWAYLAND=off` is the default, with managed lazy and eager modes
+available by opt-in. The managed XWM lifecycle, bidirectional CLIPBOARD and
+PRIMARY transfer, and XDND in both directions are implemented. Runtime RandR
+output publication and X11 cursor ownership integration remain incomplete,
+and broad real-application interoperability qualification is still pending.
+See [XWayland](XWAYLAND.md) and
+[XWayland interoperability qualification](XWAYLAND_INTEROP_QUALIFICATION.md)
+for the implemented scope and qualification boundary.
 
 ## Application-specific graphics warnings
 
