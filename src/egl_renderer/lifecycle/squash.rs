@@ -64,8 +64,12 @@ fn transform_squash_geometry(
     output_size: (u32, u32),
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> bool {
-    let source_client =
-        scaled_presentation_rect(visual_group.presented_source_client_rect, output_scale);
+    // Raw retained surfaces and frozen SSD are captured in canonical space.
+    // The current rectangle still starts from the physically presented source
+    // so the first Squash frame maps canonical primitives into the geometry
+    // that was visible immediately before minimization. Resolved owned-effect
+    // textures are handled separately in their already-presented visual space.
+    let source_client = scaled_presentation_rect(visual_group.canonical_client_rect, output_scale);
     let Some(current_client) =
         oblivion_one::window_lifecycle_animation::squash_client_rect_at_progress(
             visual_group.presented_source_client_rect,
@@ -85,6 +89,10 @@ fn transform_squash_geometry(
     {
         return false;
     }
+    let scale_x = current_client.width() / source_client.width();
+    let scale_y = current_client.height() / source_client.height();
+    let changes_texture_scale =
+        (scale_x - 1.0).abs() > f64::EPSILON * 8.0 || (scale_y - 1.0).abs() > f64::EPSILON * 8.0;
     let map_point = |point: [f64; 2]| {
         [
             current_client.x()
@@ -121,6 +129,17 @@ fn transform_squash_geometry(
             return false;
         };
         command.bounds = bounds;
+        // Surface sampling is chosen before lifecycle geometry is applied.
+        // Switch only textured Squash primitives whose affine size changes;
+        // exact pixel-aligned 1:1 endpoints retain nearest-neighbor sampling.
+        if changes_texture_scale
+            && matches!(
+                command.layer,
+                EglDrawLayer::Surface(_) | EglDrawLayer::DecorationAsset(_)
+            )
+        {
+            command.sampling = SurfaceSampling::ScaledLinear;
+        }
         command.presentation_clip = match command.presentation_clip {
             Some(clip) => match map_rect(clip) {
                 Some(clip) => Some(clip),
