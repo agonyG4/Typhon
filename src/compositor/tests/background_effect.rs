@@ -1,4 +1,5 @@
 use super::*;
+use crate::astrea_background_effect_coverage::client::astrea_background_effect_coverage_manager_v1 as client_coverage_manager;
 use crate::effects::{
     EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode, EffectNodeId,
     EffectOutsets, EffectParameterId, EffectParameterImpact, EffectParameterSpec,
@@ -596,11 +597,15 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
     server.state.set_background_effect_enabled(true);
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
+    commands
+        .send(ServerCommand::AuthorizeAstreaShellPid(std::process::id()))
+        .unwrap();
+    wait_for_server_commands(&commands);
 
     let mut blur_policy = crate::blur_policy::BlurPolicyConfig::default();
     blur_policy.enabled = true;
     blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::Auto;
-    replace_blur_policy_config(&commands, blur_policy);
+    replace_blur_policy_config(&commands, blur_policy.clone());
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
@@ -609,10 +614,15 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
         let background_manager: client_ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1 =
             globals.bind(&qh, 1..=1, ())?;
+        let coverage_manager: client_coverage_manager::AstreaBackgroundEffectCoverageManagerV1 =
+            globals.bind(&qh, 1..=1, ())?;
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
         let (surface, xdg_surface, _toplevel) =
             create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 100)?;
+        let coverage = coverage_manager.get_coverage(&surface, &qh, ());
+        coverage.set_rounded_rect(0.5, 0.25, 72.0, 34.0, 17.0);
+        coverage.set_triangle(35.0, 40.5, 47.0, 40.5, 41.0, 48.0);
         xdg_surface.set_window_geometry(10, 12, 100, 70);
         surface.commit();
         connection.flush()?;
@@ -635,6 +645,10 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         assert_eq!(
             auto_scene.instances[0].target_bounds,
             expected_window_bounds
+        );
+        assert_eq!(
+            auto_scene.instances[0].coverage, None,
+            "automatic blur does not consume private client coverage"
         );
 
         let public_effect = background_manager.get_background_effect(&surface, &qh, ());
@@ -659,6 +673,96 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
             &[expected_client_bounds],
             "a client region remains rooted at the raw wl_surface origin"
         );
+        assert_eq!(
+            client_scene.instances[0].target_bounds, expected_client_bounds,
+            "analytic coverage must not broaden the public coarse work bounds"
+        );
+        let client_coverage = client_scene.instances[0]
+            .coverage
+            .as_ref()
+            .expect("committed client coverage refines the public client blur");
+        let rounded_rect = client_coverage.rounded_rect.unwrap();
+        assert_eq!(rounded_rect.x, f64::from(expected_client_bounds.x) + 0.5);
+        assert_eq!(rounded_rect.y, f64::from(expected_client_bounds.y) + 0.25);
+        assert_eq!(rounded_rect.width, 72.0);
+        assert_eq!(rounded_rect.height, 34.0);
+        assert!(client_coverage.triangle.is_some());
+
+        coverage.set_rounded_rect(0.5, 0.25, 72.0, 34.0, 17.0);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let identical_coverage_scene = capture_effect_scene(&commands);
+        assert_eq!(identical_coverage_scene.signature, client_scene.signature);
+        assert_eq!(identical_coverage_scene.generation, client_scene.generation);
+
+        let client_signature = identical_coverage_scene.instances[0].signature;
+        coverage.set_rounded_rect(0.5, 0.25, 72.0, 34.0, 16.0);
+        let pending_coverage_scene = capture_effect_scene(&commands);
+        assert_eq!(
+            pending_coverage_scene.instances[0].coverage,
+            identical_coverage_scene.instances[0].coverage,
+            "a private coverage request remains pending until wl_surface.commit"
+        );
+        assert_eq!(
+            pending_coverage_scene.instances[0].signature,
+            client_signature
+        );
+
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let committed_radius_scene = capture_effect_scene(&commands);
+        assert_eq!(
+            committed_radius_scene.instances[0]
+                .coverage
+                .as_ref()
+                .unwrap()
+                .rounded_rect
+                .unwrap()
+                .radius,
+            16.0
+        );
+        assert_ne!(
+            committed_radius_scene.instances[0].signature,
+            client_signature
+        );
+        assert_ne!(committed_radius_scene.generation, client_scene.generation);
+
+        coverage.clear();
+        let pending_clear_scene = capture_effect_scene(&commands);
+        assert!(pending_clear_scene.instances[0].coverage.is_some());
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let cleared_scene = capture_effect_scene(&commands);
+        assert_eq!(cleared_scene.instances[0].coverage, None);
+
+        coverage.set_rounded_rect(-2.5, -1.25, 72.0, 34.0, 17.0);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let negative_local_scene = capture_effect_scene(&commands);
+        assert_eq!(
+            negative_local_scene.instances[0]
+                .coverage
+                .as_ref()
+                .unwrap()
+                .rounded_rect
+                .unwrap()
+                .x,
+            f64::from(expected_client_bounds.x) - 2.5
+        );
+        assert_eq!(
+            negative_local_scene.instances[0].target_bounds,
+            expected_client_bounds
+        );
+        coverage.destroy();
+        assert!(negative_local_scene.instances[0].coverage.is_some());
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        assert_eq!(capture_effect_scene(&commands).instances[0].coverage, None);
 
         public_effect.set_blur_region(None);
         xdg_surface.set_window_geometry(0, -24, 944, 526);
@@ -678,6 +782,141 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         assert_ne!(
             negative_offset_scene.instances[0].signature, auto_scene.instances[0].signature,
             "a committed XDG geometry change must alter the resolved effect signature"
+        );
+        assert_eq!(
+            negative_offset_scene.instances[0].coverage, None,
+            "the automatic/rule assignment remains unrefined even while client coverage is stored"
+        );
+        blur_policy.enabled = false;
+        replace_blur_policy_config(&commands, blur_policy);
+        assert!(
+            capture_effect_scene(&commands).is_empty(),
+            "private coverage without a committed public blur must not create an effect"
+        );
+        Ok(())
+    })();
+
+    stop_controllable_test_server(commands, server_thread);
+    result.unwrap();
+}
+
+#[test]
+fn synchronized_child_coverage_is_cached_merged_and_published_with_parent() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.state.set_background_effect_enabled(true);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    commands
+        .send(ServerCommand::AuthorizeAstreaShellPid(std::process::id()))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let subcompositor: client_wl_subcompositor::WlSubcompositor =
+            globals.bind(&qh, 1..=1, ())?;
+        let background_manager: client_ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1 =
+            globals.bind(&qh, 1..=1, ())?;
+        let coverage_manager: client_coverage_manager::AstreaBackgroundEffectCoverageManagerV1 =
+            globals.bind(&qh, 1..=1, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let (parent, _xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 80)?;
+        let child = compositor.create_surface(&qh, ());
+        let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+        subsurface.set_position(4, 6);
+        let public_effect = background_manager.get_background_effect(&child, &qh, ());
+        let region = compositor.create_region(&qh, ());
+        region.add(0, 0, 64, 48);
+        public_effect.set_blur_region(Some(&region));
+        region.destroy();
+        let coverage = coverage_manager.get_coverage(&child, &qh, ());
+        coverage.set_rounded_rect(0.25, 0.5, 52.0, 32.0, 12.0);
+
+        commit_test_buffered_surface(&child, &shm, &qh, 64, 48)?;
+        parent.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let initial_scene = capture_effect_scene(&commands);
+        let initial = initial_scene
+            .instances
+            .iter()
+            .find(|instance| instance.coverage.is_some())
+            .expect("parent publication makes synchronized child coverage visible");
+        assert_eq!(
+            initial
+                .coverage
+                .as_ref()
+                .unwrap()
+                .rounded_rect
+                .unwrap()
+                .radius,
+            12.0
+        );
+
+        coverage.set_rounded_rect(0.25, 0.5, 52.0, 32.0, 16.0);
+        child.commit();
+        coverage.set_rounded_rect(0.25, 0.5, 52.0, 32.0, 14.0);
+        child.commit();
+        child.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let cached_scene = capture_effect_scene(&commands);
+        assert_eq!(cached_scene.signature, initial_scene.signature);
+        let cached = cached_scene
+            .instances
+            .iter()
+            .find(|instance| instance.coverage.is_some())
+            .expect("cached child coverage remains in the scene");
+        assert_eq!(
+            cached.coverage.as_ref(),
+            initial.coverage.as_ref(),
+            "synchronized child changes remain cached until parent publication"
+        );
+
+        parent.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let published_scene = capture_effect_scene(&commands);
+        let published = published_scene
+            .instances
+            .iter()
+            .find(|instance| instance.coverage.is_some())
+            .expect("published child blur retains its coverage");
+        assert_eq!(
+            published
+                .coverage
+                .as_ref()
+                .unwrap()
+                .rounded_rect
+                .unwrap()
+                .radius,
+            14.0
+        );
+        assert_ne!(published_scene.signature, initial_scene.signature);
+
+        coverage.destroy();
+        child.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        assert_eq!(
+            capture_effect_scene(&commands).signature,
+            published_scene.signature
+        );
+        parent.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        let destroyed_scene = capture_effect_scene(&commands);
+        assert!(
+            destroyed_scene
+                .instances
+                .iter()
+                .all(|instance| instance.coverage.is_none())
         );
         Ok(())
     })();

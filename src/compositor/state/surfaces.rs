@@ -1452,6 +1452,8 @@ impl CompositorState {
         self.release_protocol_surface_effects_for_surface(surface_id);
         self.internal_surface_effects.remove(&surface_id);
         self.background_effect_resources.remove(&surface_id);
+        self.background_effect_coverage_resources
+            .remove(&surface_id);
         self.background_effect_surface_ids.remove(&surface_id);
         self.commit_timer_resources.remove(&surface_id);
         self.surface_damage_journals.remove(&surface_id);

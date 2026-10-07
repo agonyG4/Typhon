@@ -277,6 +277,7 @@ pub(in crate::egl_renderer::tests) fn translated_capture_test_graph() -> (
         stage: None,
         fused_stages: Vec::new(),
         parameter_block: EffectParameterBlock::default(),
+        coverage: None,
         alpha_mode: EffectAlphaMode::Opaque,
         encode_output: false,
         color_conversion: EffectColorConversion::None,

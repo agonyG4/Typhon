@@ -28,6 +28,42 @@ mod tests {
     }
 
     #[test]
+    fn analytic_coverage_cpu_reference_handles_shapes_union_and_translation() {
+        let rounded_rect = EffectCoverageRoundedRect {
+            x: 10.25,
+            y: 20.5,
+            width: 72.0,
+            height: 34.0,
+            radius: 17.0,
+        };
+        let triangle = EffectCoverageTriangle {
+            a: [42.0, 54.0],
+            b: [54.0, 54.0],
+            c: [48.0, 64.0],
+        };
+        let rect_only = EffectCoverage {
+            rounded_rect: Some(rounded_rect),
+            triangle: None,
+        };
+        assert_eq!(EffectCoverage::default().coverage_at(0.0, 0.0, 0.5), 1.0);
+        assert_eq!(rect_only.coverage_at(46.0, 37.5, 0.5), 1.0);
+        assert_eq!(rect_only.coverage_at(9.0, 37.5, 0.5), 0.0);
+        let fractional = rect_only.coverage_at(10.25, 37.5, 0.5);
+        assert!((0.0..1.0).contains(&fractional));
+
+        let union = EffectCoverage {
+            rounded_rect: Some(rounded_rect),
+            triangle: Some(triangle),
+        };
+        assert_eq!(union.coverage_at(48.0, 60.0, 0.5), 1.0);
+        assert_eq!(union.coverage_at(9.0, 37.5, 0.5), 0.0);
+        assert_eq!(
+            union.translated(100.0, -5.0).unwrap().triangle.unwrap().c,
+            [148.0, 59.0]
+        );
+    }
+
+    #[test]
     fn parameter_block_rejects_duplicate_and_non_finite_values() {
         use super::super::parameters::{EffectParameterBlock, EffectUniformValue};
         use super::EffectParameterId;
@@ -234,6 +270,131 @@ pub enum EffectWorkingSpace {
 pub enum EffectAlphaMode {
     Opaque,
     Preserve,
+}
+
+/// A bounded analytic refinement applied at the final effect composite.
+/// Coordinates use output-local logical units and retain subpixel precision.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectCoverage {
+    pub rounded_rect: Option<EffectCoverageRoundedRect>,
+    pub triangle: Option<EffectCoverageTriangle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectCoverageRoundedRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub radius: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectCoverageTriangle {
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub c: [f64; 2],
+}
+
+impl EffectCoverage {
+    pub fn is_enabled(&self) -> bool {
+        self.rounded_rect.is_some() || self.triangle.is_some()
+    }
+
+    pub fn translated(&self, dx: f64, dy: f64) -> Option<Self> {
+        if !dx.is_finite() || !dy.is_finite() {
+            return None;
+        }
+        let mut translated = self.clone();
+        if let Some(rect) = &mut translated.rounded_rect {
+            rect.x += dx;
+            rect.y += dy;
+            if !rect.x.is_finite() || !rect.y.is_finite() {
+                return None;
+            }
+        }
+        if let Some(triangle) = &mut translated.triangle {
+            for point in [&mut triangle.a, &mut triangle.b, &mut triangle.c] {
+                point[0] += dx;
+                point[1] += dy;
+                if !point[0].is_finite() || !point[1].is_finite() {
+                    return None;
+                }
+            }
+        }
+        Some(translated)
+    }
+
+    /// CPU reference for the final composite's analytic coverage equation.
+    pub fn coverage_at(&self, x: f64, y: f64, aa_width: f64) -> f64 {
+        if !self.is_enabled() || !x.is_finite() || !y.is_finite() {
+            return 1.0;
+        }
+        let mut distance = f64::INFINITY;
+        if let Some(rect) = self.rounded_rect {
+            distance = distance.min(rounded_rect_signed_distance(rect, [x, y]));
+        }
+        if let Some(triangle) = self.triangle {
+            distance = distance.min(triangle_signed_distance(triangle, [x, y]));
+        }
+        let width = if aa_width.is_finite() {
+            aa_width.max(1.0e-5)
+        } else {
+            1.0e-5
+        };
+        let t = ((distance + width) / (2.0 * width)).clamp(0.0, 1.0);
+        (1.0 - t * t * (3.0 - 2.0 * t)).clamp(0.0, 1.0)
+    }
+}
+
+fn rounded_rect_signed_distance(rect: EffectCoverageRoundedRect, p: [f64; 2]) -> f64 {
+    if ![rect.x, rect.y, rect.width, rect.height, rect.radius]
+        .into_iter()
+        .all(f64::is_finite)
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+        || rect.radius < 0.0
+    {
+        return f64::INFINITY;
+    }
+    let half = [rect.width * 0.5, rect.height * 0.5];
+    let center = [rect.x + half[0], rect.y + half[1]];
+    let q = [
+        (p[0] - center[0]).abs() - (half[0] - rect.radius),
+        (p[1] - center[1]).abs() - (half[1] - rect.radius),
+    ];
+    let outside = [q[0].max(0.0), q[1].max(0.0)];
+    outside[0].hypot(outside[1]) + q[0].max(q[1]).min(0.0) - rect.radius
+}
+
+fn triangle_signed_distance(triangle: EffectCoverageTriangle, p: [f64; 2]) -> f64 {
+    let [a, b, c] = [triangle.a, triangle.b, triangle.c];
+    let cross = |u: [f64; 2], v: [f64; 2]| u[0] * v[1] - u[1] * v[0];
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let ac = [c[0] - a[0], c[1] - a[1]];
+    let area = cross(ab, ac);
+    if !area.is_finite() || area.abs() <= f64::EPSILON {
+        return f64::INFINITY;
+    }
+    let edge_distance = |start: [f64; 2], end: [f64; 2]| {
+        let edge = [end[0] - start[0], end[1] - start[1]];
+        let length_squared = edge[0] * edge[0] + edge[1] * edge[1];
+        if length_squared <= f64::EPSILON || !length_squared.is_finite() {
+            return f64::INFINITY;
+        }
+        let relative = [p[0] - start[0], p[1] - start[1]];
+        let t = ((relative[0] * edge[0] + relative[1] * edge[1]) / length_squared).clamp(0.0, 1.0);
+        let delta = [relative[0] - edge[0] * t, relative[1] - edge[1] * t];
+        delta[0].hypot(delta[1])
+    };
+    let d0 = cross([b[0] - a[0], b[1] - a[1]], [p[0] - a[0], p[1] - a[1]]);
+    let d1 = cross([c[0] - b[0], c[1] - b[1]], [p[0] - b[0], p[1] - b[1]]);
+    let d2 = cross([a[0] - c[0], a[1] - c[1]], [p[0] - c[0], p[1] - c[1]]);
+    let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
+    let distance = edge_distance(a, b)
+        .min(edge_distance(b, c))
+        .min(edge_distance(c, a));
+    if inside { -distance } else { distance }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

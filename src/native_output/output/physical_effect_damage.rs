@@ -158,6 +158,7 @@ mod tests {
             region: EffectRegion::from_rect(region),
             target_bounds: region,
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: id,
             frame_demand,
             visual_group: None,

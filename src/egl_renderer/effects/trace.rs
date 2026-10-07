@@ -1059,11 +1059,14 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} requested_capture_path={} executed_capture_path={} fallback_reason={} backdrop_capture_policy={} kawase_execution_policy={} scene_work_damage_rects={} scene_work_damage_bbox={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} coverage={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} requested_capture_path={} executed_capture_path={} fallback_reason={} backdrop_capture_policy={} kawase_execution_policy={} scene_work_damage_rects={} scene_work_damage_bbox={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
                 render_pass_kind_name(pass.kind),
+                pass.coverage
+                    .as_ref()
+                    .is_some_and(|coverage| coverage.is_enabled()),
                 pass.anchor,
                 pass.anchor_scope,
                 pass.visual_group.map_or(0, |group| group.get()),
@@ -1502,6 +1505,7 @@ mod tests {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Preserve,
             encode_output: false,
             color_conversion: EffectColorConversion::None,
@@ -1542,6 +1546,7 @@ mod tests {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Preserve,
             encode_output: false,
             color_conversion: EffectColorConversion::None,
@@ -1582,6 +1587,7 @@ mod tests {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Preserve,
             encode_output: false,
             color_conversion: EffectColorConversion::None,
@@ -1640,6 +1646,7 @@ mod tests {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Preserve,
             encode_output: false,
             color_conversion: EffectColorConversion::None,

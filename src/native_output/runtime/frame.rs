@@ -127,6 +127,7 @@ mod presentation_effect_influence_tests {
             region: EffectRegion::from_rect(rect),
             target_bounds: rect,
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: id,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,

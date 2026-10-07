@@ -16,6 +16,7 @@ use super::{
 };
 use crate::compositor::decoration::types::CapturedXdgDecorationCommit;
 use crate::compositor::layer_shell::CapturedLayerSurfaceCommitState;
+use crate::effects::EffectCoverage;
 
 // An obligation is one retained frame callback, presentation feedback, buffer
 // ownership slot (plus one slot per validated DMA-BUF plane), or explicit-sync
@@ -405,6 +406,8 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) opaque_region: Option<SurfaceInputRegion>,
     pub(super) input_region: Option<SurfaceInputRegion>,
     pub(super) background_effect: Option<BackgroundEffectRegion>,
+    /// Outer `None` is no mutation; `Some(None)` queues a coverage clear.
+    pub(super) background_effect_coverage: Option<Option<EffectCoverage>>,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) resize_commit: Option<super::ResizeCommitSnapshot>,
     pub(super) resize_capture_finalized: bool,
@@ -476,6 +479,7 @@ impl CachedSubsurfaceCommit {
             opaque_region,
             input_region,
             background_effect,
+            background_effect_coverage,
             presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
@@ -539,6 +543,9 @@ impl CachedSubsurfaceCommit {
         }
         if background_effect.is_some() {
             self.background_effect = background_effect;
+        }
+        if background_effect_coverage.is_some() {
+            self.background_effect_coverage = background_effect_coverage;
         }
         // A cached merge eliminates the older Content Update. Presentation
         // feedback is bound to that exact commit and must not follow the
@@ -1084,6 +1091,7 @@ mod window_geometry_tests {
             opaque_region: None,
             input_region: None,
             background_effect: None,
+            background_effect_coverage: None,
             presentation_feedbacks: Vec::new(),
             resize_commit: None,
             resize_capture_finalized: true,
@@ -1251,6 +1259,30 @@ mod window_geometry_tests {
         cached.merge(newer);
 
         assert_eq!(cached.background_effect, Some(second));
+    }
+
+    #[test]
+    fn cached_coverage_merge_replaces_only_with_explicit_newer_change() {
+        let shape = EffectCoverage {
+            rounded_rect: Some(crate::effects::EffectCoverageRoundedRect {
+                x: 1.25,
+                y: 2.5,
+                width: 72.0,
+                height: 34.0,
+                radius: 17.0,
+            }),
+            triangle: None,
+        };
+        let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
+        cached.background_effect_coverage = Some(Some(shape.clone()));
+        let unchanged = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
+        cached.merge(unchanged);
+        assert_eq!(cached.background_effect_coverage, Some(Some(shape.clone())));
+
+        let mut clear = cached_commit_with_window_geometry(3, XdgWindowGeometry::new(1, 2, 3, 4));
+        clear.background_effect_coverage = Some(None);
+        cached.merge(clear);
+        assert_eq!(cached.background_effect_coverage, Some(None));
     }
 
     #[test]

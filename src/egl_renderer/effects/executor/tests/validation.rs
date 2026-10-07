@@ -141,6 +141,7 @@ fn preserve_composite_execution_regions_have_single_coverage() {
             true,
             oblivion_one::effects::EffectAlphaMode::Preserve,
             0.5,
+            false,
         ),
         EffectPassBlendMode::PremultipliedSourceOver
     );
@@ -352,6 +353,7 @@ fn pruned_instance_does_not_realize_textures() {
         stage: None,
         fused_stages: Vec::new(),
         parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+        coverage: None,
         alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
         encode_output: false,
         color_conversion: EffectColorConversion::None,

@@ -925,6 +925,7 @@ pub struct CompositorState {
     background_effect_enabled: bool,
     blur_assignment: crate::compositor::blur_assignment::BlurAssignmentResolver,
     background_effect_resources: HashMap<u32, ObjectId>,
+    background_effect_coverage_resources: HashMap<u32, ObjectId>,
     background_effect_surface_ids: HashSet<u32>,
     #[allow(dead_code)] // Consumed by the internal effect assignment API as presets are enabled.
     next_internal_effect_instance_id: u64,

@@ -402,6 +402,7 @@ mod tests {
             region: region.clone(),
             target_bounds: EffectRect::new(0, 0, 10, 10).unwrap(),
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: 0,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: VisualGroupId::new(group),

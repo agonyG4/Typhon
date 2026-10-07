@@ -410,6 +410,7 @@ fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
             region: effect_region.clone(),
             target_bounds: effect_region.bounding_rect().unwrap(),
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: 17,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,

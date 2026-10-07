@@ -21,6 +21,7 @@ fn advertised_global_versions_are_centralized() {
     assert_eq!(versions::ASTREA_SHELL_AUTH_MANAGER_V1, 1);
     assert_eq!(versions::ASTREA_SCREEN_CAPTURE_MANAGER_V1, 1);
     assert_eq!(versions::EXT_BACKGROUND_EFFECT_MANAGER_V1, 1);
+    assert_eq!(versions::ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1, 1);
 
     let globals = versions::all_globals();
     assert!(globals.contains(&GlobalAdvertisement::new("wl_compositor", 6)));
@@ -40,6 +41,10 @@ fn advertised_global_versions_are_centralized() {
     )));
     assert!(globals.contains(&GlobalAdvertisement::new(
         "ext_background_effect_manager_v1",
+        1
+    )));
+    assert!(globals.contains(&GlobalAdvertisement::new(
+        "astrea_background_effect_coverage_manager_v1",
         1
     )));
 

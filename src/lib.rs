@@ -1,5 +1,6 @@
 pub mod animation_control;
 pub mod application_scope;
+pub mod astrea_background_effect_coverage;
 pub mod astrea_effects;
 pub mod astrea_screen_capture;
 pub mod astrea_shell_auth;

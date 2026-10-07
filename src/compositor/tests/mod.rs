@@ -151,6 +151,7 @@ mod astrea_shell_auth;
 mod astrea_shell_capability;
 mod astrea_shortcuts;
 mod background_effect;
+mod background_effect_coverage;
 mod data_control;
 mod data_device;
 mod data_device_compatibility;

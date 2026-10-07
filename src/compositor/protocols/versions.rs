@@ -570,6 +570,7 @@ pub(crate) const ASTREA_SHELL_AUTH_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SCREEN_CAPTURE_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_EFFECTS_MANAGER_V1: u32 = 1;
+pub(crate) const ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 3;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
@@ -640,6 +641,10 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
         ASTREA_SHELL_CONTROL_MANAGER_V1,
     ),
     GlobalAdvertisement::new("astrea_effects_manager_v1", ASTREA_EFFECTS_MANAGER_V1),
+    GlobalAdvertisement::new(
+        "astrea_background_effect_coverage_manager_v1",
+        ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1,
+    ),
     GlobalAdvertisement::new("astrea_toplevel_manager_v1", ASTREA_TOPLEVEL_MANAGER_V1),
     GlobalAdvertisement::new("xdg_wm_base", XDG_WM_BASE),
     GlobalAdvertisement::new("wl_output", WL_OUTPUT),

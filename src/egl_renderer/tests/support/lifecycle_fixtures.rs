@@ -63,6 +63,7 @@ pub(in crate::egl_renderer::tests) fn lifecycle_blur_effect_scene_for_rect(
             target_bounds: region.bounding_rect().unwrap(),
             region,
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: 1,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: Some(VisualGroupId::new(1).expect("test visual group id")),

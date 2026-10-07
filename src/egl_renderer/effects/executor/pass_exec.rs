@@ -11,13 +11,16 @@ pub(super) fn effect_pass_blend_mode(
     output_is_framebuffer: bool,
     alpha_mode: EffectAlphaMode,
     presentation_opacity: f32,
+    coverage_enabled: bool,
 ) -> EffectPassBlendMode {
     if output_is_framebuffer
         && matches!(
             kind,
             RenderPassKind::Composite | RenderPassKind::OutputPostProcess
         )
-        && (alpha_mode == EffectAlphaMode::Preserve || presentation_opacity < 1.0)
+        && (coverage_enabled
+            || alpha_mode == EffectAlphaMode::Preserve
+            || presentation_opacity < 1.0)
     {
         EffectPassBlendMode::PremultipliedSourceOver
     } else {
@@ -917,6 +920,9 @@ pub(super) fn execute_fullscreen_pass(
         output_is_framebuffer,
         pass.alpha_mode,
         presentation_opacity,
+        pass.coverage
+            .as_ref()
+            .is_some_and(oblivion_one::effects::EffectCoverage::is_enabled),
     );
     establish_effect_pass_blend_state(renderer.gl, blend_mode);
     unsafe {
@@ -942,6 +948,112 @@ pub(super) fn execute_fullscreen_pass(
             renderer
                 .gl
                 .uniform_1_f32(Some(&location), presentation_opacity);
+        }
+        if matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        ) {
+            let coverage = pass
+                .coverage
+                .as_ref()
+                .filter(|coverage| coverage.is_enabled());
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_coverage_enabled",
+            ) {
+                renderer
+                    .gl
+                    .uniform_1_i32(Some(&location), i32::from(coverage.is_some()));
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_coverage_has_rounded_rect",
+            ) {
+                renderer.gl.uniform_1_i32(
+                    Some(&location),
+                    i32::from(coverage.and_then(|value| value.rounded_rect).is_some()),
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_coverage_rounded_rect",
+            ) {
+                let rect = coverage.and_then(|value| value.rounded_rect);
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    rect.map_or(0.0, |value| value.x as f32),
+                    rect.map_or(0.0, |value| value.y as f32),
+                    rect.map_or(0.0, |value| value.width as f32),
+                    rect.map_or(0.0, |value| value.height as f32),
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_coverage_radius",
+            ) {
+                renderer.gl.uniform_1_f32(
+                    Some(&location),
+                    coverage
+                        .and_then(|value| value.rounded_rect)
+                        .map_or(0.0, |value| value.radius as f32),
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_coverage_has_triangle",
+            ) {
+                renderer.gl.uniform_1_i32(
+                    Some(&location),
+                    i32::from(coverage.and_then(|value| value.triangle).is_some()),
+                );
+            }
+            for (name, point) in [
+                (
+                    "u_effect_coverage_triangle_a",
+                    coverage.map_or([0.0, 0.0], |value| {
+                        value.triangle.map_or([0.0, 0.0], |t| t.a)
+                    }),
+                ),
+                (
+                    "u_effect_coverage_triangle_b",
+                    coverage.map_or([0.0, 0.0], |value| {
+                        value.triangle.map_or([0.0, 0.0], |t| t.b)
+                    }),
+                ),
+                (
+                    "u_effect_coverage_triangle_c",
+                    coverage.map_or([0.0, 0.0], |value| {
+                        value.triangle.map_or([0.0, 0.0], |t| t.c)
+                    }),
+                ),
+            ] {
+                if let Some(location) = uniform_location(
+                    &mut renderer.runtime.effect_shaders,
+                    renderer.gl,
+                    shader_key,
+                    program,
+                    name,
+                ) {
+                    renderer
+                        .gl
+                        .uniform_2_f32(Some(&location), point[0] as f32, point[1] as f32);
+                }
+            }
         }
         if let Some(location) = uniform_location(
             &mut renderer.runtime.effect_shaders,

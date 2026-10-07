@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="astrea_background_effect_coverage_v1">
+  <copyright>Copyright 2026 AstreaOS contributors</copyright>
+
+  <interface name="astrea_background_effect_coverage_manager_v1" version="1">
+    <description summary="authenticated analytic refinement for client background blur">
+      This private Astrea protocol adds bounded, commit-bound analytic coverage to
+      an ext-background-effect-v1 request. The public blur region remains the
+      work and visibility upper bound. Coordinates are surface-local logical
+      Wayland fixed-point values. This protocol does not change the public
+      background-effect protocol for other clients.
+    </description>
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="invalid_surface" value="1"/>
+      <entry name="coverage_exists" value="2"/>
+    </enum>
+    <request name="get_coverage">
+      <arg name="id" type="new_id" interface="astrea_background_effect_coverage_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+  </interface>
+
+  <interface name="astrea_background_effect_coverage_v1" version="1">
+    <description summary="commit-bound rounded rectangle and triangle coverage">
+      At most one rounded rectangle and one triangle are stored. Their union is
+      evaluated only during final effect composition. Requests are pending until
+      the associated wl_surface commits. clear disables analytic refinement.
+    </description>
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="surface_destroyed" value="1"/>
+      <entry name="invalid_geometry" value="2"/>
+    </enum>
+    <request name="set_rounded_rect">
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="radius" type="fixed"/>
+    </request>
+    <request name="unset_rounded_rect"/>
+    <request name="set_triangle">
+      <arg name="ax" type="fixed"/>
+      <arg name="ay" type="fixed"/>
+      <arg name="bx" type="fixed"/>
+      <arg name="by" type="fixed"/>
+      <arg name="cx" type="fixed"/>
+      <arg name="cy" type="fixed"/>
+    </request>
+    <request name="unset_triangle"/>
+    <request name="clear"/>
+    <request name="destroy" type="destructor"/>
+  </interface>
+</protocol>

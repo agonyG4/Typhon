@@ -75,6 +75,7 @@ impl CompositorState {
             opaque_region,
             input_region,
             background_effect,
+            background_effect_coverage,
             mut presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
@@ -161,6 +162,8 @@ impl CompositorState {
         }
         let input_region_changed = data.apply_input_region_change(input_region);
         let background_effect_changed = data.apply_background_effect_change(background_effect);
+        let background_effect_coverage_changed =
+            data.apply_background_effect_coverage_change(background_effect_coverage);
         if background_effect_changed {
             if data.committed_background_effect().ops().is_empty() {
                 self.background_effect_surface_ids.remove(&surface_id);
@@ -313,7 +316,10 @@ impl CompositorState {
         {
             self.refresh_pointer_focus_at_last_position();
         }
-        if background_effect_changed {
+        if background_effect_changed
+            || (background_effect_coverage_changed
+                && !data.committed_background_effect().ops().is_empty())
+        {
             self.advance_render_generation_with_scene_effect(
                 RenderGenerationCause::EffectBinding,
                 self.surface_is_visible_in_active_scene(surface_id),

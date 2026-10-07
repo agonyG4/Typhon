@@ -95,6 +95,14 @@ uniform vec2 u_effect_output_size;
 uniform int u_effect_encode_srgb;
 uniform int u_effect_force_opaque;
 uniform int u_effect_input_flip_y;
+uniform int u_effect_coverage_enabled;
+uniform int u_effect_coverage_has_rounded_rect;
+uniform vec4 u_effect_coverage_rounded_rect;
+uniform float u_effect_coverage_radius;
+uniform int u_effect_coverage_has_triangle;
+uniform vec2 u_effect_coverage_triangle_a;
+uniform vec2 u_effect_coverage_triangle_b;
+uniform vec2 u_effect_coverage_triangle_c;
 in vec2 v_uv;
 out vec4 out_color;
 
@@ -124,6 +132,60 @@ vec4 typhon_encode_premultiplied_srgb(vec4 value) {
     return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
 }
 
+float typhon_rounded_rect_distance(vec2 p) {
+    vec2 size = u_effect_coverage_rounded_rect.zw;
+    float radius = max(u_effect_coverage_radius, 0.0);
+    vec2 half_size = size * 0.5;
+    vec2 center = u_effect_coverage_rounded_rect.xy + half_size;
+    vec2 q = abs(p - center) - (half_size - vec2(radius));
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+float typhon_cross(vec2 a, vec2 b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+float typhon_segment_distance(vec2 p, vec2 a, vec2 b) {
+    vec2 edge = b - a;
+    float length_squared = dot(edge, edge);
+    float t = clamp(dot(p - a, edge) / max(length_squared, 1.0e-8), 0.0, 1.0);
+    return length(p - (a + t * edge));
+}
+
+float typhon_triangle_distance(vec2 p) {
+    vec2 a = u_effect_coverage_triangle_a;
+    vec2 b = u_effect_coverage_triangle_b;
+    vec2 c = u_effect_coverage_triangle_c;
+    float area = typhon_cross(b - a, c - a);
+    if (isnan(area) || isinf(area) || abs(area) <= 1.0e-6) return 1.0e20;
+    vec3 side = vec3(
+        typhon_cross(b - a, p - a),
+        typhon_cross(c - b, p - b),
+        typhon_cross(a - c, p - c)
+    );
+    bool inside = all(greaterThanEqual(side, vec3(0.0))) ||
+        all(lessThanEqual(side, vec3(0.0)));
+    float distance = min(
+        typhon_segment_distance(p, a, b),
+        min(typhon_segment_distance(p, b, c), typhon_segment_distance(p, c, a))
+    );
+    return inside ? -distance : distance;
+}
+
+float typhon_analytic_coverage(vec2 p) {
+    if (u_effect_coverage_enabled == 0) return 1.0;
+    float distance = 1.0e20;
+    if (u_effect_coverage_has_rounded_rect != 0) {
+        distance = min(distance, typhon_rounded_rect_distance(p));
+    }
+    if (u_effect_coverage_has_triangle != 0) {
+        distance = min(distance, typhon_triangle_distance(p));
+    }
+    if (isnan(distance) || isinf(distance)) return 0.0;
+    float aa_width = max(fwidth(distance), 1.0e-4);
+    return clamp(1.0 - smoothstep(-aa_width, aa_width, distance), 0.0, 1.0);
+}
+
 void main() {
     vec2 output_position = v_uv * u_effect_output_size;
     vec2 logical_input_uv = (output_position - u_effect_input_domain.xy) /
@@ -135,6 +197,7 @@ void main() {
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     if (u_effect_force_opaque != 0) result.a = 1.0;
     result *= clamp(u_presentation_opacity, 0.0, 1.0);
+    result *= typhon_analytic_coverage(output_position);
     out_color = typhon_sanitize_premultiplied(result);
 }
 "#;

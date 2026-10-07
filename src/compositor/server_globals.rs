@@ -1,4 +1,5 @@
 use super::*;
+use crate::astrea_background_effect_coverage::server::astrea_background_effect_coverage_manager_v1;
 use crate::astrea_effects::server::astrea_effects_manager_v1;
 use crate::astrea_screen_capture::server::astrea_screen_capture_manager_v1;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
@@ -191,6 +192,11 @@ pub(super) fn register_minimum_globals(
                 versions::ASTREA_EFFECTS_MANAGER_V1,
                 (),
             );
+        display.create_global::<
+            CompositorState,
+            astrea_background_effect_coverage_manager_v1::AstreaBackgroundEffectCoverageManagerV1,
+            _,
+        >(versions::ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1, ());
     }
     display
         .create_global::<CompositorState, astrea_toplevel_manager_v1::AstreaToplevelManagerV1, _>(

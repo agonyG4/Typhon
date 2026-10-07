@@ -17,6 +17,7 @@ use crate::compositor::{
     DragSessionPhase, SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfacePresentationState,
     XdgAssociationReservation,
 };
+use crate::effects::EffectCoverage;
 use crate::render_backend::buffer::{
     BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DrmFormat,
 };
@@ -447,6 +448,7 @@ pub(super) struct SurfaceData {
     input_region: Mutex<SurfaceInputRegionState>,
     opaque_region: Mutex<SurfaceInputRegionState>,
     background_effect: Mutex<BackgroundEffectState>,
+    background_effect_coverage: Mutex<BackgroundEffectCoverageState>,
 }
 
 #[cfg(test)]
@@ -875,6 +877,62 @@ impl SurfaceData {
             .lock()
             .map(|state| state.committed.clone())
             .unwrap_or_default()
+    }
+
+    pub(super) fn update_pending_background_effect_coverage(
+        &self,
+        update: impl FnOnce(&mut Option<EffectCoverage>),
+    ) {
+        let Ok(mut state) = self.background_effect_coverage.lock() else {
+            return;
+        };
+        let mut coverage = state
+            .pending
+            .clone()
+            .unwrap_or_else(|| state.committed.clone());
+        update(&mut coverage);
+        if coverage
+            .as_ref()
+            .is_some_and(|coverage| !coverage.is_enabled())
+        {
+            coverage = None;
+        }
+        state.pending = Some(coverage);
+    }
+
+    pub(super) fn set_pending_background_effect_coverage(&self, coverage: Option<EffectCoverage>) {
+        if let Ok(mut state) = self.background_effect_coverage.lock() {
+            state.pending = Some(coverage);
+        }
+    }
+
+    pub(super) fn take_pending_background_effect_coverage(&self) -> Option<Option<EffectCoverage>> {
+        self.background_effect_coverage
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending.take())
+    }
+
+    pub(super) fn apply_background_effect_coverage_change(
+        &self,
+        pending: Option<Option<EffectCoverage>>,
+    ) -> bool {
+        let Ok(mut state) = self.background_effect_coverage.lock() else {
+            return false;
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        let changed = state.committed != pending;
+        state.committed = pending;
+        changed
+    }
+
+    pub(super) fn committed_background_effect_coverage(&self) -> Option<EffectCoverage> {
+        self.background_effect_coverage
+            .lock()
+            .ok()
+            .and_then(|state| state.committed.clone())
     }
 
     pub(super) fn take_pending_opaque_region(&self) -> Option<SurfaceInputRegion> {
@@ -1438,6 +1496,13 @@ struct SurfaceInputRegionState {
 pub(super) struct BackgroundEffectState {
     committed: BackgroundEffectRegion,
     pending: Option<BackgroundEffectRegion>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(super) struct BackgroundEffectCoverageState {
+    committed: Option<EffectCoverage>,
+    /// Outer `None` means unchanged; `Some(None)` is a commit-bound clear.
+    pending: Option<Option<EffectCoverage>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2255,6 +2320,42 @@ mod surface_region_tests {
         )]);
         surface.set_pending_opaque_region(region.clone());
         assert_eq!(surface.take_pending_opaque_region(), Some(region));
+    }
+
+    #[test]
+    fn analytic_background_coverage_distinguishes_unchanged_clear_and_value() {
+        let surface = SurfaceData::new(1);
+        let coverage = EffectCoverage {
+            rounded_rect: Some(crate::effects::EffectCoverageRoundedRect {
+                x: 0.25,
+                y: 0.5,
+                width: 72.0,
+                height: 34.0,
+                radius: 17.0,
+            }),
+            triangle: None,
+        };
+        assert_eq!(surface.take_pending_background_effect_coverage(), None);
+        surface.set_pending_background_effect_coverage(Some(coverage.clone()));
+        assert_eq!(surface.committed_background_effect_coverage(), None);
+        assert_eq!(
+            surface.take_pending_background_effect_coverage(),
+            Some(Some(coverage.clone()))
+        );
+        assert!(surface.apply_background_effect_coverage_change(Some(Some(coverage.clone()))));
+        assert_eq!(
+            surface.committed_background_effect_coverage(),
+            Some(coverage)
+        );
+
+        surface.set_pending_background_effect_coverage(None);
+        assert_eq!(
+            surface.take_pending_background_effect_coverage(),
+            Some(None)
+        );
+        assert!(surface.apply_background_effect_coverage_change(Some(None)));
+        assert_eq!(surface.committed_background_effect_coverage(), None);
+        assert!(!surface.apply_background_effect_coverage_change(None));
     }
 
     #[test]

@@ -115,6 +115,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let input_region_change = data.take_pending_input_region();
                 let opaque_region_change = data.take_pending_opaque_region();
                 let background_effect_change = data.take_pending_background_effect();
+                let background_effect_coverage_change =
+                    data.take_pending_background_effect_coverage();
                 let mut pacing = data.take_pending_surface_pacing();
                 pacing.fifo_wait_ignored_for_synchronized_subsurface = pacing.fifo_wait_barrier
                     && state.is_effectively_synchronized_subsurface(surface_id);
@@ -245,6 +247,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     opaque_region: opaque_region_change,
                     input_region: input_region_change,
                     background_effect: background_effect_change,
+                    background_effect_coverage: background_effect_coverage_change,
                     presentation_feedbacks,
                     resize_commit: None,
                     resize_capture_finalized: false,

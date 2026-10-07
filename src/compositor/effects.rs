@@ -13,8 +13,9 @@ pub(in crate::compositor) fn resolved_effect_scene_call_count_for_test() -> usiz
 use crate::presentation_animation::PresentationRect;
 
 use crate::effects::{
-    EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectParameterDefinition,
-    EffectParameterId, EffectProgramId, EffectRect, EffectRegion, EffectUniformValue,
+    EffectCoverage, EffectFrameDemand, EffectInstanceId, EffectParameterBlock,
+    EffectParameterDefinition, EffectParameterId, EffectProgramId, EffectRect, EffectRegion,
+    EffectUniformValue,
 };
 
 use super::{
@@ -147,6 +148,7 @@ pub struct ResolvedEffectInstance {
     pub region: EffectRegion,
     pub target_bounds: EffectRect,
     pub parameter_block: EffectParameterBlock,
+    pub coverage: Option<EffectCoverage>,
     pub signature: u64,
     pub frame_demand: EffectFrameDemand,
     pub visual_group: Option<VisualGroupId>,
@@ -382,6 +384,18 @@ impl super::CompositorState {
                 let Some(target_bounds) = assignment.region.bounding_rect() else {
                     continue;
                 };
+                let coverage = if assignment.source
+                    == crate::compositor::blur_assignment::BlurAssignmentSource::Client
+                {
+                    surface_data
+                        .committed_background_effect_coverage()
+                        .and_then(|coverage| {
+                            coverage.translated(f64::from(origin.0), f64::from(origin.1))
+                        })
+                        .filter(EffectCoverage::is_enabled)
+                } else {
+                    None
+                };
                 instances.push(ResolvedEffectInstance {
                     id: background_effect_instance_id(surface.surface_id),
                     program: selected_program,
@@ -392,12 +406,14 @@ impl super::CompositorState {
                         selected_program,
                         &assignment.region,
                         &selected_parameter_block,
+                        coverage.as_ref(),
                     ),
                     frame_demand: selected_frame_demand,
                     visual_group: self.visual_group_for_surface(surface.surface_id),
                     region: assignment.region,
                     target_bounds,
                     parameter_block: selected_parameter_block.clone(),
+                    coverage,
                     anchor_scope: assignment.anchor_scope,
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
                         surface.surface_id,
@@ -531,12 +547,14 @@ impl super::CompositorState {
             region: region.clone(),
             target_bounds,
             parameter_block: parameter_block.clone(),
+            coverage: None,
             signature: internal_effect_signature(
                 surface_id,
                 anchor,
                 program,
                 &region,
                 &parameter_block,
+                None,
             ),
             frame_demand,
             visual_group: self.visual_group_for_surface(surface_id),
@@ -743,12 +761,14 @@ impl super::CompositorState {
             region: region.clone(),
             target_bounds,
             parameter_block: parameter_block.clone(),
+            coverage: None,
             signature: internal_effect_signature(
                 surface_id,
                 slot.anchor(surface_id),
                 program,
                 &region,
                 &parameter_block,
+                None,
             ),
             frame_demand: registered.program.program.frame_demand,
             visual_group: self.visual_group_for_surface(surface_id),
@@ -1048,6 +1068,7 @@ fn internal_effect_signature(
     program: EffectProgramId,
     region: &EffectRegion,
     parameter_block: &EffectParameterBlock,
+    coverage: Option<&EffectCoverage>,
 ) -> u64 {
     let mut signature = 0xcbf2_9ce4_8422_2325_u64;
     for value in [
@@ -1098,7 +1119,43 @@ fn internal_effect_signature(
         }
         signature = signature.wrapping_mul(0x1000_0000_01b3);
     }
+    hash_effect_coverage(&mut signature, coverage);
     signature
+}
+
+fn hash_effect_coverage(signature: &mut u64, coverage: Option<&EffectCoverage>) {
+    let mut hash = |value: u64| {
+        *signature ^= value;
+        *signature = signature.wrapping_mul(0x1000_0000_01b3);
+    };
+    let Some(coverage) = coverage.filter(|coverage| coverage.is_enabled()) else {
+        hash(0);
+        return;
+    };
+    hash(1);
+    if let Some(rect) = coverage.rounded_rect {
+        hash(1);
+        for value in [rect.x, rect.y, rect.width, rect.height, rect.radius] {
+            hash(value.to_bits());
+        }
+    } else {
+        hash(0);
+    }
+    if let Some(triangle) = coverage.triangle {
+        hash(1);
+        for value in [
+            triangle.a[0],
+            triangle.a[1],
+            triangle.b[0],
+            triangle.b[1],
+            triangle.c[0],
+            triangle.c[1],
+        ] {
+            hash(value.to_bits());
+        }
+    } else {
+        hash(0);
+    }
 }
 
 fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64 {
@@ -1136,6 +1193,7 @@ fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64
                 signature = signature.wrapping_mul(0x1000_0000_01b3);
             }
         }
+        hash_effect_coverage(&mut signature, instance.coverage.as_ref());
     }
     signature
 }
@@ -1164,6 +1222,7 @@ mod tests {
             region,
             target_bounds,
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: 1,
             frame_demand,
             visual_group: None,
@@ -1245,6 +1304,111 @@ mod tests {
             )],
         );
         assert_ne!(first.signature, second.signature);
+    }
+
+    #[test]
+    fn analytic_coverage_alone_changes_semantic_effect_and_scene_identity() {
+        let region = EffectRegion::from_rect(EffectRect::new(10, 20, 80, 40).unwrap());
+        let parameters = EffectParameterBlock::default();
+        let base_coverage = EffectCoverage {
+            rounded_rect: Some(crate::effects::EffectCoverageRoundedRect {
+                x: 10.25,
+                y: 20.5,
+                width: 72.0,
+                height: 34.0,
+                radius: 17.0,
+            }),
+            triangle: Some(crate::effects::EffectCoverageTriangle {
+                a: [38.0, 50.0],
+                b: [50.0, 50.0],
+                c: [44.0, 58.0],
+            }),
+        };
+        let variants = [
+            EffectCoverage {
+                rounded_rect: Some(crate::effects::EffectCoverageRoundedRect {
+                    radius: 16.0,
+                    ..base_coverage.rounded_rect.unwrap()
+                }),
+                ..base_coverage.clone()
+            },
+            EffectCoverage {
+                rounded_rect: Some(crate::effects::EffectCoverageRoundedRect {
+                    x: 10.5,
+                    ..base_coverage.rounded_rect.unwrap()
+                }),
+                ..base_coverage.clone()
+            },
+            EffectCoverage {
+                triangle: Some(crate::effects::EffectCoverageTriangle {
+                    c: [44.0, 59.0],
+                    ..base_coverage.triangle.unwrap()
+                }),
+                ..base_coverage.clone()
+            },
+            EffectCoverage {
+                triangle: None,
+                ..base_coverage.clone()
+            },
+        ];
+        let base_instance_signature = internal_effect_signature(
+            1,
+            EffectAnchor::BeforeSurface(1),
+            EffectProgramId::new(1).unwrap(),
+            &region,
+            &parameters,
+            Some(&base_coverage),
+        );
+        let base_scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                coverage: Some(base_coverage.clone()),
+                signature: base_instance_signature,
+                ..test_effect_instance(
+                    EffectInstanceId::new(1).unwrap(),
+                    crate::effects::EffectFrameDemand::OnDamage,
+                    region.clone(),
+                )
+            }],
+        );
+        let identical_scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                coverage: Some(base_coverage.clone()),
+                signature: base_instance_signature,
+                ..test_effect_instance(
+                    EffectInstanceId::new(1).unwrap(),
+                    crate::effects::EffectFrameDemand::OnDamage,
+                    region.clone(),
+                )
+            }],
+        );
+        assert_eq!(base_scene.signature, identical_scene.signature);
+
+        for coverage in variants {
+            let signature = internal_effect_signature(
+                1,
+                EffectAnchor::BeforeSurface(1),
+                EffectProgramId::new(1).unwrap(),
+                &region,
+                &parameters,
+                Some(&coverage),
+            );
+            let scene = ResolvedEffectScene::new(
+                1,
+                vec![ResolvedEffectInstance {
+                    coverage: Some(coverage),
+                    signature,
+                    ..test_effect_instance(
+                        EffectInstanceId::new(1).unwrap(),
+                        crate::effects::EffectFrameDemand::OnDamage,
+                        region.clone(),
+                    )
+                }],
+            );
+            assert_ne!(base_instance_signature, signature);
+            assert_ne!(base_scene.signature, scene.signature);
+        }
     }
 
     #[test]

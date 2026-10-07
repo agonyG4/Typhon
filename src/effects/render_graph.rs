@@ -7,11 +7,11 @@ use crate::compositor::{
 use super::registry::EffectRegistry;
 use super::{
     BUILTIN_EFFECT_PROGRAM_ID, ColorMatrixSpec, DualKawaseBlurSpec, EffectAlphaMode,
-    EffectFailurePolicy, EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId,
-    EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId, EffectRect, EffectRegion,
-    EffectRegionClipFallback, EffectSource, EffectValidationError, EffectWorkingSpace,
-    MAX_EFFECT_PROGRAM_NODES, NoiseKind, NoiseSpec, ValidatedEffectProgram, plan_effect_damage,
-    validate_effect_program,
+    EffectCoverage, EffectFailurePolicy, EffectFrameDemand, EffectInstanceId, EffectNode,
+    EffectNodeId, EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId, EffectRect,
+    EffectRegion, EffectRegionClipFallback, EffectSource, EffectValidationError,
+    EffectWorkingSpace, MAX_EFFECT_PROGRAM_NODES, NoiseKind, NoiseSpec, ValidatedEffectProgram,
+    plan_effect_damage, validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -371,6 +371,8 @@ pub struct CompiledRenderPass {
     pub stage: Option<EffectNodeKind>,
     pub fused_stages: Vec<EffectNodeKind>,
     pub parameter_block: super::EffectParameterBlock,
+    /// Present only on the final composite pass; intermediate processing stays opaque.
+    pub coverage: Option<EffectCoverage>,
     pub alpha_mode: EffectAlphaMode,
     pub encode_output: bool,
     pub color_conversion: EffectColorConversion,
@@ -1898,6 +1900,7 @@ impl GraphBuilder {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: super::EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Preserve,
             encode_output: false,
             color_conversion: EffectColorConversion::None,
@@ -2548,6 +2551,13 @@ fn compile_instance(
         .last_mut()
         .expect("final composite pass was appended");
     final_pass.alpha_mode = program.program.alpha_mode;
+    final_pass.coverage = matches!(
+        kind,
+        RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+    )
+    .then(|| instance.coverage.clone())
+    .flatten()
+    .filter(EffectCoverage::is_enabled);
     final_pass.color_conversion =
         color_conversion(final_working_space, EffectWorkingSpace::OutputEncodedSrgb);
     final_pass.encode_output =
@@ -2635,6 +2645,7 @@ mod tests {
             target_bounds: region.bounding_rect().unwrap(),
             region,
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: 7,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
@@ -2666,6 +2677,7 @@ mod tests {
             target_bounds: region.bounding_rect().expect("test effect bounds"),
             region,
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             signature: id,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
@@ -2756,6 +2768,7 @@ mod tests {
                     target_bounds: region.bounding_rect().unwrap(),
                     region,
                     parameter_block: EffectParameterBlock::default(),
+                    coverage: None,
                     signature: u64::try_from(index + 1).expect("test signature fits"),
                     frame_demand: EffectFrameDemand::OnDamage,
                     visual_group: None,
@@ -2801,6 +2814,7 @@ mod tests {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Preserve,
             encode_output: false,
             color_conversion: EffectColorConversion::None,
@@ -2809,6 +2823,110 @@ mod tests {
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
         }
+    }
+
+    #[test]
+    fn analytic_coverage_is_attached_only_to_final_composite() {
+        let (scene, registry) = blur_scene();
+        let mut instance = scene.instances[0].clone();
+        instance.coverage = Some(EffectCoverage {
+            rounded_rect: Some(EffectCoverageRoundedRect {
+                x: 100.25,
+                y: 80.5,
+                width: 72.0,
+                height: 34.0,
+                radius: 17.0,
+            }),
+            triangle: Some(EffectCoverageTriangle {
+                a: [128.0, 110.0],
+                b: [142.0, 110.0],
+                c: [135.0, 120.0],
+            }),
+        });
+        let region = instance.region.clone();
+        let scene = ResolvedEffectScene::new(2, vec![instance.clone()]);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("effect scene must compile to a render graph");
+        };
+        let instance_passes = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.instance == instance.id)
+            .collect::<Vec<_>>();
+        assert!(
+            instance_passes.iter().any(|pass| {
+                pass.kind == RenderPassKind::SceneCapture && pass.coverage.is_none()
+            })
+        );
+        assert!(instance_passes.iter().any(|pass| {
+            pass.kind == RenderPassKind::DualKawaseDownsample && pass.coverage.is_none()
+        }));
+        assert!(instance_passes.iter().any(|pass| {
+            pass.kind == RenderPassKind::DualKawaseUpsample && pass.coverage.is_none()
+        }));
+        assert!(instance_passes.iter().any(|pass| {
+            pass.kind == RenderPassKind::Composite
+                && pass.coverage.as_ref() == instance.coverage.as_ref()
+        }));
+        assert!(
+            instance_passes
+                .iter()
+                .all(|pass| { pass.kind == RenderPassKind::Composite || pass.coverage.is_none() })
+        );
+
+        let (legacy_scene, legacy_registry) = blur_scene();
+        let legacy_region = legacy_scene.instances[0].region.clone();
+        let FrameExecutionPlan::EffectGraph(legacy_graph) = compile_frame_execution_plan(
+            &legacy_scene,
+            &legacy_region,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &legacy_registry,
+        )
+        .unwrap() else {
+            panic!("legacy effect scene must compile to a render graph");
+        };
+        assert!(
+            legacy_graph
+                .passes
+                .iter()
+                .all(|pass| pass.coverage.is_none())
+        );
+        let legacy_composite = legacy_graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Composite)
+            .unwrap();
+        assert_eq!(legacy_composite.alpha_mode, EffectAlphaMode::Opaque);
+
+        let mut post_process = legacy_scene.instances[0].clone();
+        post_process.anchor = EffectAnchor::OutputPostProcess;
+        post_process.scene_order = EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess);
+        post_process.coverage = instance.coverage.clone();
+        let post_process_scene = ResolvedEffectScene::new(3, vec![post_process.clone()]);
+        let FrameExecutionPlan::EffectGraph(post_process_graph) = compile_frame_execution_plan(
+            &post_process_scene,
+            &post_process.region,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &legacy_registry,
+        )
+        .unwrap() else {
+            panic!("post-process effect scene must compile to a render graph");
+        };
+        let output_pass = post_process_graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::OutputPostProcess)
+            .unwrap();
+        assert_eq!(output_pass.coverage, post_process.coverage);
+        assert!(post_process_graph.passes.iter().all(|pass| {
+            pass.kind == RenderPassKind::OutputPostProcess || pass.coverage.is_none()
+        }));
     }
 
     fn sampling_texture(
@@ -3387,6 +3505,7 @@ mod tests {
                 target_bounds: region.bounding_rect().unwrap(),
                 region: region.clone(),
                 parameter_block: EffectParameterBlock::default(),
+                coverage: None,
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
@@ -3734,6 +3853,7 @@ mod tests {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: EffectParameterBlock::default(),
+            coverage: None,
             alpha_mode: EffectAlphaMode::Opaque,
             encode_output: false,
             color_conversion: EffectColorConversion::None,
@@ -4482,6 +4602,7 @@ mod tests {
                 target_bounds: region.bounding_rect().unwrap(),
                 region,
                 parameter_block: EffectParameterBlock::default(),
+                coverage: None,
                 signature: id,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: Some(group),
@@ -4777,6 +4898,7 @@ mod tests {
                 target_bounds: region.bounding_rect().unwrap(),
                 region: region.clone(),
                 parameter_block: EffectParameterBlock::default(),
+                coverage: None,
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
@@ -4839,6 +4961,7 @@ mod tests {
                 target_bounds: region.bounding_rect().unwrap(),
                 region: region.clone(),
                 parameter_block: EffectParameterBlock::default(),
+                coverage: None,
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
@@ -5026,6 +5149,7 @@ mod tests {
                 target_bounds: region.bounding_rect().unwrap(),
                 region: region.clone(),
                 parameter_block: EffectParameterBlock::default(),
+                coverage: None,
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
@@ -5212,6 +5336,7 @@ mod tests {
                 target_bounds: region.bounding_rect().unwrap(),
                 region: region.clone(),
                 parameter_block: EffectParameterBlock::default(),
+                coverage: None,
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,

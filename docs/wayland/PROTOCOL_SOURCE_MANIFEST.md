@@ -82,6 +82,7 @@ Generated module routing used by the locked crates is in
 `src/protocol_macro.rs`, and in `wayland-protocols-wlr-0.3.12/src/lib.rs`.
 Typhon’s local generated protocols are invoked from:
 
+- `src/astrea_background_effect_coverage.rs` -> `protocols/astrea-background-effect-coverage-v1.xml`
 - `src/astrea_shortcuts.rs` -> `protocols/astrea-shortcuts-v1.xml`
 - `src/astrea_shell_control.rs` -> `protocols/astrea-shell-control-v1.xml`
 - `src/astrea_toplevel_management.rs` -> `protocols/astrea-toplevel-management-v1.xml`
@@ -156,6 +157,7 @@ The target contract is:
 | `astrea_shell_control_manager_v1` | 1 | always |
 | `astrea_screen_capture_manager_v1` | 1 | authenticated native screenshot capability |
 | `astrea_effects_manager_v1` | 1 | qualified native background-effect capability |
+| `astrea_background_effect_coverage_manager_v1` | 1 | qualified native background-effect capability; authenticated Astrea refinement |
 | `astrea_toplevel_manager_v1` | 3 | always |
 | `ext_workspace_manager_v1` | 1 | always |
 | `xdg_wm_base` | 6 | always |

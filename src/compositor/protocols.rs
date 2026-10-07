@@ -1,6 +1,7 @@
 mod activation;
 mod advanced;
 mod background_effect;
+mod background_effect_coverage;
 mod buffers;
 mod commit_timing;
 mod core;

@@ -20,6 +20,20 @@ qualified background-effect capability. It accepts authenticated named
 programs and typed values; every mutation is checked against the owning client,
 the surface, the trusted registry, and the parameter schema.
 
+Astrea also has a separate authenticated `astrea_background_effect_coverage_v1`
+refinement for client-authored background blur. It keeps the public Wayland
+contract intact: `ext-background-effect-v1` remains the interoperable blur
+request and its integer `wl_region` remains the coarse work, damage, capture,
+and visibility upper bound. The private refinement carries at most one
+subpixel rounded rectangle and one triangle, is buffered until the associated
+`wl_surface.commit`, and is evaluated only at final composition. `EffectRegion`
+continues to describe coarse work; renderer-independent `EffectCoverage`
+describes continuous visual coverage. Coverage does not apply to automatic or
+rule-assigned blur, does not broaden the public region, and does not provide
+arbitrary paths or texture masks. See
+[`wayland/ASTREA_BACKGROUND_EFFECT_COVERAGE_V1.md`](wayland/ASTREA_BACKGROUND_EFFECT_COVERAGE_V1.md)
+for the protocol and lifecycle details.
+
 ## Graph and rendering behavior
 
 The initial production primitive is a region-local Dual Kawase backdrop blur.

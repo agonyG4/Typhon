@@ -179,6 +179,7 @@ fn resolved_effect_lifecycle_source_uses_the_captured_surface_topology() {
         region,
         target_bounds,
         parameter_block: crate::effects::EffectParameterBlock::default(),
+        coverage: None,
         signature: 1,
         frame_demand: crate::effects::EffectFrameDemand::OnDamage,
         visual_group: None,

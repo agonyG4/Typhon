@@ -870,6 +870,11 @@ fn real_gles_composite_keeps_logical_domain_and_orientation() {
         set_effect_test_uniform_2_f32(gl, program, "u_effect_output_size", 4.0, 6.0);
         set_effect_test_uniform_i32(gl, program, "u_effect_encode_srgb", 0);
         set_effect_test_uniform_i32(gl, program, "u_effect_force_opaque", 0);
+        let opacity = unsafe {
+            gl.get_uniform_location(program, "u_presentation_opacity")
+                .expect("composite presentation opacity is active")
+        };
+        unsafe { gl.uniform_1_f32(Some(&opacity), 1.0) };
     };
 
     draw_effect_test(
@@ -987,6 +992,175 @@ fn real_gles_opaque_effect_with_translucent_presentation_uses_source_over() {
             "opaque effect source-over mismatch: actual={actual}, expected={expected}, pixel={pixels:?}"
         );
     }
+
+    unsafe {
+        harness.gl.delete_texture(input_texture);
+        harness.gl.delete_program(program);
+    }
+}
+
+#[test]
+fn real_gles_analytic_coverage_has_fractional_1x_edges_and_preserves_opaque_parity() {
+    const WIDTH: u32 = 90;
+    const HEIGHT: u32 = 50;
+    let mut harness = GlesEffectTestHarness::new(WIDTH, HEIGHT);
+    let program = program::create_program_from_sources(
+        &harness.gl,
+        effects::DUAL_KAWASE_VERTEX_SHADER,
+        effects::COMPOSITE_FRAGMENT_SHADER,
+    )
+    .expect("analytic coverage composite shader compiles");
+    let input_texture = create_effect_test_texture(&harness.gl, 1, 1, &[200, 100, 50, 255]);
+    let quad = harness
+        .renderer
+        .ensure_effect_quad()
+        .expect("analytic coverage quad creates")
+        .0;
+    let background = [20.0_f32 / 255.0, 40.0 / 255.0, 80.0 / 255.0, 1.0];
+    let configure = |coverage_enabled: i32| unsafe {
+        set_effect_test_uniform_i32(&harness.gl, program, "u_effect_input", 0);
+        set_effect_test_uniform_i32(&harness.gl, program, "u_effect_target_flip_y", 0);
+        set_effect_test_uniform_i32(&harness.gl, program, "u_effect_input_flip_y", 0);
+        set_effect_test_uniform_i32(&harness.gl, program, "u_effect_encode_srgb", 0);
+        set_effect_test_uniform_i32(&harness.gl, program, "u_effect_force_opaque", 1);
+        let opacity = harness
+            .gl
+            .get_uniform_location(program, "u_presentation_opacity")
+            .expect("presentation opacity uniform is active");
+        harness.gl.uniform_1_f32(Some(&opacity), 1.0);
+        set_effect_test_uniform_4_f32(
+            &harness.gl,
+            program,
+            "u_effect_input_domain",
+            [0.0, 0.0, WIDTH as f32, HEIGHT as f32],
+        );
+        set_effect_test_uniform_2_f32(
+            &harness.gl,
+            program,
+            "u_effect_output_size",
+            WIDTH as f32,
+            HEIGHT as f32,
+        );
+        set_effect_test_uniform_i32(
+            &harness.gl,
+            program,
+            "u_effect_coverage_enabled",
+            coverage_enabled,
+        );
+        set_effect_test_uniform_i32(
+            &harness.gl,
+            program,
+            "u_effect_coverage_has_rounded_rect",
+            1,
+        );
+        set_effect_test_uniform_4_f32(
+            &harness.gl,
+            program,
+            "u_effect_coverage_rounded_rect",
+            [9.25, 7.5, 72.0, 34.0],
+        );
+        let radius = harness
+            .gl
+            .get_uniform_location(program, "u_effect_coverage_radius")
+            .expect("rounded rectangle radius uniform is active");
+        harness.gl.uniform_1_f32(Some(&radius), 17.0);
+        set_effect_test_uniform_i32(&harness.gl, program, "u_effect_coverage_has_triangle", 1);
+        set_effect_test_uniform_2_f32(
+            &harness.gl,
+            program,
+            "u_effect_coverage_triangle_a",
+            35.0,
+            40.5,
+        );
+        set_effect_test_uniform_2_f32(
+            &harness.gl,
+            program,
+            "u_effect_coverage_triangle_b",
+            47.0,
+            40.5,
+        );
+        set_effect_test_uniform_2_f32(
+            &harness.gl,
+            program,
+            "u_effect_coverage_triangle_c",
+            41.0,
+            48.0,
+        );
+    };
+
+    unsafe {
+        harness.gl.viewport(0, 0, WIDTH as i32, HEIGHT as i32);
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness
+            .gl
+            .clear_color(background[0], background[1], background[2], background[3]);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        effects::establish_effect_pass_blend_state(
+            &harness.gl,
+            effects::EffectPassBlendMode::PremultipliedSourceOver,
+        );
+        harness.gl.use_program(Some(program));
+        configure(1);
+        harness.gl.active_texture(glow::TEXTURE0);
+        harness
+            .gl
+            .bind_texture(glow::TEXTURE_2D, Some(input_texture));
+        harness.gl.enable(glow::SCISSOR_TEST);
+        // Coarse public work clip contains the body, tail, and a conservative AA guard.
+        harness.gl.scissor(7, 5, 78, 44);
+        harness.gl.bind_vertex_array(Some(quad));
+        harness.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        harness.gl.bind_vertex_array(None);
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.bind_texture(glow::TEXTURE_2D, None);
+        harness.gl.use_program(None);
+    }
+    let pixels = read_effect_test_pixels(&harness.gl, WIDTH, HEIGHT);
+    assert_effect_test_pixel(&pixels, WIDTH, 45, 24, [200, 100, 50, 255]);
+    assert_effect_test_pixel(&pixels, WIDTH, 2, 24, [20, 40, 80, 255]);
+    let partial = (5..49)
+        .flat_map(|y| (7..85).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let pixel = effect_test_pixel(&pixels, WIDTH, x, y);
+            (pixel[0] > 22 && pixel[0] < 198).then_some((x, y, pixel))
+        })
+        .expect("1x GLES edge contains a genuinely fractional coverage pixel");
+    let coverage = f32::from(partial.2[0] - 20) / 180.0;
+    eprintln!(
+        "analytic coverage GLES edge at ({}, {}): rgba={:?}, inferred_coverage={coverage:.3}",
+        partial.0, partial.1, partial.2
+    );
+    let expected_g = (100.0 * coverage + 40.0 * (1.0 - coverage)).round() as i32;
+    let expected_b = (50.0 * coverage + 80.0 * (1.0 - coverage)).round() as i32;
+    assert!((i32::from(partial.2[1]) - expected_g).abs() <= 2);
+    assert!((i32::from(partial.2[2]) - expected_b).abs() <= 2);
+    assert_eq!(partial.2[3], 255);
+
+    unsafe {
+        harness.gl.disable(glow::BLEND);
+        harness
+            .gl
+            .clear_color(background[0], background[1], background[2], background[3]);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        harness.gl.use_program(Some(program));
+        configure(0);
+        harness.gl.active_texture(glow::TEXTURE0);
+        harness
+            .gl
+            .bind_texture(glow::TEXTURE_2D, Some(input_texture));
+        harness.gl.enable(glow::SCISSOR_TEST);
+        harness.gl.scissor(7, 5, 78, 44);
+        harness.gl.bind_vertex_array(Some(quad));
+        harness.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        harness.gl.bind_vertex_array(None);
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.bind_texture(glow::TEXTURE_2D, None);
+        harness.gl.use_program(None);
+    }
+    let legacy_pixels = read_effect_test_pixels(&harness.gl, WIDTH, HEIGHT);
+    assert_effect_test_pixel(&legacy_pixels, WIDTH, 45, 24, [200, 100, 50, 255]);
+    assert_effect_test_pixel(&legacy_pixels, WIDTH, 2, 24, [20, 40, 80, 255]);
+    assert_effect_test_pixel(&legacy_pixels, WIDTH, 7, 24, [200, 100, 50, 255]);
 
     unsafe {
         harness.gl.delete_texture(input_texture);

@@ -935,6 +935,7 @@ fn effect_pass_blend_modes_are_explicit_for_each_pass_family() {
                 false,
                 oblivion_one::effects::EffectAlphaMode::Preserve,
                 1.0,
+                false,
             ),
             EffectPassBlendMode::Replace,
             "internal pass {kind:?} must replace its target"
@@ -950,6 +951,7 @@ fn effect_pass_blend_modes_are_explicit_for_each_pass_family() {
             true,
             oblivion_one::effects::EffectAlphaMode::Opaque,
             1.0,
+            false,
         ),
         EffectPassBlendMode::Replace
     );
@@ -959,6 +961,7 @@ fn effect_pass_blend_modes_are_explicit_for_each_pass_family() {
             true,
             oblivion_one::effects::EffectAlphaMode::Preserve,
             1.0,
+            false,
         ),
         EffectPassBlendMode::PremultipliedSourceOver
     );
@@ -969,11 +972,22 @@ fn effect_pass_blend_modes_are_explicit_for_each_pass_family() {
                 true,
                 oblivion_one::effects::EffectAlphaMode::Opaque,
                 opacity,
+                false,
             ),
             EffectPassBlendMode::PremultipliedSourceOver,
             "opaque final output with opacity {opacity} must source-over"
         );
     }
+    assert_eq!(
+        effect_pass_blend_mode(
+            RenderPassKind::Composite,
+            true,
+            oblivion_one::effects::EffectAlphaMode::Opaque,
+            1.0,
+            true,
+        ),
+        EffectPassBlendMode::PremultipliedSourceOver
+    );
 }
 
 #[test]
@@ -992,6 +1006,7 @@ fn builtin_background_blur_uses_source_over_below_opaque_owner_opacity() {
             true,
             program.program.alpha_mode,
             0.5,
+            false,
         ),
         EffectPassBlendMode::PremultipliedSourceOver
     );
@@ -1001,6 +1016,7 @@ fn builtin_background_blur_uses_source_over_below_opaque_owner_opacity() {
             true,
             program.program.alpha_mode,
             1.0,
+            false,
         ),
         EffectPassBlendMode::Replace
     );
