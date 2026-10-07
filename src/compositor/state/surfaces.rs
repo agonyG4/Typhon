@@ -579,66 +579,6 @@ impl CompositorState {
             );
         }
     }
-    pub(in crate::compositor) fn supersede_older_pending_attachments_for_surface(
-        &mut self,
-        surface_id: u32,
-        new_sequence: SurfaceCommitSequence,
-    ) -> Vec<wl_callback::WlCallback> {
-        let mut callbacks = Vec::new();
-        let mut retained_explicit = Vec::new();
-        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
-            if commit.surface_id == surface_id && commit.commit_sequence < new_sequence {
-                if commit.acquire_state == PendingAcquireState::Ready {
-                    retained_explicit.push(commit);
-                    continue;
-                }
-                self.note_explicit_commit_superseded(
-                    commit.surface_commit_id,
-                    commit.acquire_state,
-                    commit.frame_callbacks.len(),
-                    SurfaceCommitId::from_sequence(new_sequence),
-                    "newer_attachment_arrived",
-                );
-                if self.external_acquire_readiness {
-                    self.pending_acquire_watch_changes
-                        .push(AcquireWatchChange::Cancel {
-                            commit_id: commit.commit_id,
-                            reason: AcquireWatchCancelReason::Superseded,
-                        });
-                }
-                if let Some(resize) = commit.pending.resize_commit.as_deref() {
-                    self.release_resize_capture(surface_id, resize.commit_sequence);
-                }
-                let old_buffer_id = commit.pending.data.buffer_id().get();
-                self.release_pending_surface_buffer(commit.pending);
-                callbacks.extend(commit.frame_callbacks);
-                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
-                self.resize_flow_metrics
-                    .surface_pending_attachments_superseded = self
-                    .resize_flow_metrics
-                    .surface_pending_attachments_superseded
-                    .saturating_add(1);
-                self.resize_flow_metrics.surface_cross_queue_supersessions = self
-                    .resize_flow_metrics
-                    .surface_cross_queue_supersessions
-                    .saturating_add(1);
-                if compositor_debug_surface_logging_enabled() {
-                    eprintln!(
-                        "oblivion-one compositor: surface_commit surface={} old_sequence={} new_sequence={} old_buffer_id={} decision=supersede_pending_attachment acquire_watch_canceled={}",
-                        surface_id,
-                        commit.commit_sequence.get(),
-                        new_sequence.get(),
-                        old_buffer_id,
-                        self.external_acquire_readiness,
-                    );
-                }
-            } else {
-                retained_explicit.push(commit);
-            }
-        }
-        self.pending_explicit_sync_commits = retained_explicit;
-        callbacks
-    }
     pub(in crate::compositor) fn capture_surface_damage_presentation(
         &self,
     ) -> SurfaceDamagePresentation {
@@ -1518,11 +1458,6 @@ impl CompositorState {
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,
         );
-        let callbacks = self.cancel_pending_acquire_commits_for_surface(
-            surface_id,
-            AcquireWatchCancelReason::SurfaceDestroyed,
-        );
-        self.complete_frame_callbacks(callbacks);
         self.discard_pending_presentation_feedbacks_for_surface(surface_id);
         if let Some(feedbacks) = self
             .pending_surface_presentation_feedbacks
@@ -1812,7 +1747,7 @@ mod ordered_publication_tests {
             state.surface_publication_decision(
                 7,
                 SurfaceCommitSequence(10),
-                SurfacePublicationContext::OrderedExplicitSyncQueue,
+                SurfacePublicationContext::OrderedSurfaceTreeQueue,
             ),
             SurfacePublicationDecision::Publish
         );
@@ -1841,7 +1776,7 @@ mod ordered_publication_tests {
             &client_id,
             1,
             SurfaceCommitSequence(1),
-            SurfacePublicationContext::OrderedExplicitSyncQueue,
+            SurfacePublicationContext::OrderedSurfaceTreeQueue,
         );
         assert_eq!(decision, SurfacePublicationDecision::TerminalClient);
         assert!(state.renderable_surface(150).is_none());
@@ -1850,7 +1785,7 @@ mod ordered_publication_tests {
             150,
             SurfaceCommitSequence(1),
             None,
-            SurfacePublicationSource::ExplicitSync,
+            SurfacePublicationSource::SurfaceTree,
             decision,
         );
         let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
@@ -1879,7 +1814,7 @@ mod ordered_publication_tests {
             state.surface_publication_decision(
                 7,
                 SurfaceCommitSequence(11),
-                SurfacePublicationContext::OrderedExplicitSyncQueue,
+                SurfacePublicationContext::OrderedSurfaceTreeQueue,
             ),
             SurfacePublicationDecision::StaleAlreadyPublished
         );

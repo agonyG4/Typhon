@@ -200,9 +200,8 @@ impl CompositorState {
                     ));
                     parent_commit_applied = false;
                 } else {
-                    let callbacks = self.settle_direct_surface_buffer_before_publication(
+                    let callbacks = self.prepare_surface_tree_buffer_for_publication(
                         surface_id,
-                        commit_sequence,
                         &mut pending,
                         frame_callbacks,
                         window_geometry,
@@ -432,7 +431,7 @@ impl CompositorState {
             let decision = self.surface_publication_decision(
                 *surface_id,
                 commit.commit_sequence,
-                SurfacePublicationContext::OrderedExplicitSyncQueue,
+                SurfacePublicationContext::OrderedSurfaceTreeQueue,
             );
             (decision != SurfacePublicationDecision::Publish).then_some((
                 *surface_id,

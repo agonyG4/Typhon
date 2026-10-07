@@ -113,14 +113,13 @@ pub(in crate::compositor) enum SurfacePublicationDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum SurfacePublicationContext {
     ImmediateLatestAttachment,
-    OrderedExplicitSyncQueue,
+    OrderedSurfaceTreeQueue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(in crate::compositor) enum SurfacePublicationSource {
     Immediate,
-    ExplicitSync,
     SurfaceTree,
     RemoveContent,
 }
@@ -129,7 +128,6 @@ impl SurfacePublicationSource {
     pub(in crate::compositor) const fn as_str(self) -> &'static str {
         match self {
             Self::Immediate => "immediate",
-            Self::ExplicitSync => "explicit_sync",
             Self::SurfaceTree => "surface_tree",
             Self::RemoveContent => "remove_content",
         }
@@ -137,9 +135,7 @@ impl SurfacePublicationSource {
 
     pub(in crate::compositor) const fn publication_context(self) -> SurfacePublicationContext {
         match self {
-            Self::ExplicitSync | Self::SurfaceTree => {
-                SurfacePublicationContext::OrderedExplicitSyncQueue
-            }
+            Self::SurfaceTree => SurfacePublicationContext::OrderedSurfaceTreeQueue,
             Self::Immediate | Self::RemoveContent => {
                 SurfacePublicationContext::ImmediateLatestAttachment
             }

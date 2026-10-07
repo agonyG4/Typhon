@@ -19,6 +19,7 @@ impl WindowOpenPresentationActivity {
     }
 }
 
+mod acquire_readiness;
 mod active_scene;
 mod client_lifecycle;
 mod commit_timing_runtime;

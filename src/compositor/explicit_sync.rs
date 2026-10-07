@@ -8,17 +8,13 @@ use wayland_protocols::wp::{
     linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1,
     presentation_time::server::wp_presentation_feedback,
 };
-use wayland_server::{
-    Resource, Weak,
-    backend::ClientId,
-    protocol::{wl_callback, wl_surface},
-};
+use wayland_server::{Resource, Weak, backend::ClientId, protocol::wl_surface};
 
 use crate::syncobj::DrmSyncobjTimeline;
 
 use super::{
-    CoreComplianceMetrics, PendingSurfaceBuffer, ProtocolErrorCategory, ProtocolErrorTrace,
-    RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence, post_fatal_protocol_error,
+    CoreComplianceMetrics, ProtocolErrorCategory, ProtocolErrorTrace, SurfaceCommitSequence,
+    post_fatal_protocol_error,
 };
 
 pub(super) const SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS: u32 = 0;
@@ -192,23 +188,6 @@ impl PartialEq for ExplicitSyncPoint {
 }
 
 impl Eq for ExplicitSyncPoint {}
-
-#[derive(Debug)]
-pub(super) struct PendingExplicitSyncCommit {
-    pub(super) surface_commit_id: SurfaceCommitId,
-    pub(super) commit_id: AcquireCommitId,
-    pub(super) surface_id: u32,
-    pub(super) owner_client_id: ClientId,
-    pub(super) surface_presentation_generation: u64,
-    pub(super) commit_sequence: SurfaceCommitSequence,
-    pub(super) pending: PendingSurfaceBuffer,
-    pub(super) damage: RenderableSurfaceDamage,
-    pub(super) window_geometry: Option<super::XdgWindowGeometry>,
-    pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
-    pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    pub(super) acquire: ExplicitSyncPoint,
-    pub(super) acquire_state: PendingAcquireState,
-}
 
 #[derive(Debug)]
 pub(super) struct CapturedExplicitSyncState {

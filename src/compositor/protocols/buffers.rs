@@ -162,7 +162,7 @@ impl Dispatch<wl_buffer::WlBuffer, ShmBufferData> for CompositorState {
         resource: &wl_buffer::WlBuffer,
         _data: &ShmBufferData,
     ) {
-        state.cancel_pending_acquire_commits_for_buffer(
+        state.cancel_pending_surface_trees_for_buffer(
             resource,
             AcquireWatchCancelReason::BufferDestroyed,
         );
@@ -188,7 +188,7 @@ impl Dispatch<wl_buffer::WlBuffer, DmabufBufferData> for CompositorState {
         resource: &wl_buffer::WlBuffer,
         _data: &DmabufBufferData,
     ) {
-        state.cancel_pending_acquire_commits_for_buffer(
+        state.cancel_pending_surface_trees_for_buffer(
             resource,
             AcquireWatchCancelReason::BufferDestroyed,
         );

@@ -986,7 +986,7 @@ impl CompositorState {
                 self.note_explicit_commit_ready(commit.commit_id);
                 continue;
             }
-            let Some(commit_id) = self.acquire_commit_ids.allocate() else {
+            let Some(commit_id) = self.surface_transactions.allocate_acquire_commit_id() else {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
                     &mut self.protocol_error_trace,
@@ -1255,12 +1255,11 @@ impl CompositorState {
             );
         }
         self.update_surface_tree_slot_metrics(root_surface_id);
-        let pending_acquires = self.pending_explicit_sync_commits.len().saturating_add(
-            self.surface_transactions
-                .pending_trees()
-                .map(|transaction| transaction.dependencies.len())
-                .sum::<usize>(),
-        );
+        let pending_acquires = self
+            .surface_transactions
+            .pending_trees()
+            .map(|transaction| transaction.dependencies.len())
+            .sum::<usize>();
         self.resize_flow_metrics.max_pending_explicit_sync_commits = self
             .resize_flow_metrics
             .max_pending_explicit_sync_commits

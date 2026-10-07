@@ -51,6 +51,7 @@ pub(in crate::compositor) struct SurfaceTransactionState {
     maximum_cached_obligations_per_client: usize,
     pub(super) pending_surface_tree_transactions: Vec<PendingSurfaceTreeTransaction>,
     pub(super) next_surface_tree_transaction_id: u64,
+    acquire_commit_ids: AcquireCommitIdAllocator,
     pub(in crate::compositor) metrics: SubsurfaceTransactionMetrics,
 }
 
@@ -1061,6 +1062,10 @@ impl SurfaceTransactionState {
             .checked_add(1)
             .expect("surface tree transaction ID overflow");
         SurfaceTreeTransactionId::new(self.next_surface_tree_transaction_id)
+    }
+
+    pub(super) fn allocate_acquire_commit_id(&mut self) -> Option<AcquireCommitId> {
+        self.acquire_commit_ids.allocate()
     }
 }
 

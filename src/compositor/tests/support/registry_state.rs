@@ -312,7 +312,6 @@ pub(in crate::compositor::tests) struct XdgRoleSnapshot {
     pub(in crate::compositor::tests) toplevel_has_non_default_constraints: bool,
     pub(in crate::compositor::tests) toplevel_mode: Option<ToplevelMode>,
     pub(in crate::compositor::tests) popup_parent_surface_id: Option<u32>,
-    pub(in crate::compositor::tests) pending_explicit_sync_commits: usize,
     pub(in crate::compositor::tests) pending_surface_tree_transactions: usize,
     pub(in crate::compositor::tests) current_surface_buffer: bool,
     pub(in crate::compositor::tests) renderable_surface: bool,

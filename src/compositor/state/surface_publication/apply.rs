@@ -29,21 +29,14 @@ impl CompositorState {
         true
     }
 
-    pub(super) fn settle_direct_surface_buffer_before_publication(
+    pub(super) fn prepare_surface_tree_buffer_for_publication(
         &mut self,
         surface_id: u32,
-        commit_sequence: SurfaceCommitSequence,
         pending: &mut PendingSurfaceBuffer,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         window_geometry: Option<XdgWindowGeometry>,
     ) -> Vec<wl_callback::WlCallback> {
-        let mut callbacks =
-            self.supersede_older_pending_attachments_for_surface(surface_id, commit_sequence);
-        callbacks.extend(self.cancel_pending_acquire_commits_for_surface(
-            surface_id,
-            AcquireWatchCancelReason::Superseded,
-        ));
-        callbacks.extend(frame_callbacks);
+        let callbacks = frame_callbacks;
         self.finalize_pending_buffer_resize_capture(surface_id, pending, window_geometry);
         callbacks
     }
@@ -843,13 +836,7 @@ impl CompositorState {
             self.complete_frame_callbacks(frame_callbacks);
             return false;
         }
-        let mut callbacks =
-            self.supersede_older_pending_attachments_for_surface(surface_id, commit_sequence);
-        callbacks.extend(self.cancel_pending_acquire_commits_for_surface(
-            surface_id,
-            AcquireWatchCancelReason::Superseded,
-        ));
-        callbacks.extend(frame_callbacks);
+        let callbacks = frame_callbacks;
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         let prepared_window_exit = surface_id == root_surface_id
             && self.surface_role(surface_id) == SurfaceRole::XdgToplevel

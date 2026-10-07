@@ -158,7 +158,7 @@ pub use explicit_sync::{
 };
 use explicit_sync::{
     AcquireCommitIdAllocator, CapturedExplicitSyncState, PendingAcquireState,
-    PendingExplicitSyncCommit, PendingPresentationFeedback, RequestedPresentationFeedback,
+    PendingPresentationFeedback, RequestedPresentationFeedback,
     SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE, SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS,
     SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS, SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
     SYNCOBJ_SURFACE_ERROR_NO_BUFFER, SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
@@ -487,10 +487,13 @@ pub struct ResizeFlowMetrics {
     pub maximum_retained_configures: usize,
     pub max_preview_age_ms: u64,
     pub max_in_flight_configures: usize,
+    /// Compatibility metric name; live counts now come only from SurfaceTree acquire dependencies.
     pub max_pending_explicit_sync_commits: usize,
     pub surface_content_publishes: u64,
     pub surface_content_stale_rejections: u64,
+    /// Compatibility tombstone for the removed standalone explicit-sync queue.
     pub surface_pending_attachments_superseded: u64,
+    /// Compatibility tombstone for the removed standalone explicit-sync queue.
     pub surface_cross_queue_supersessions: u64,
     pub surface_publication_sequence_regressions: u64,
     pub surface_sampling_exact: u64,
@@ -525,6 +528,7 @@ pub struct SubsurfaceTransactionMetrics {
     pub tree_transactions_published: u64,
     pub tree_transactions_waiting_on_acquire: u64,
     pub tree_transactions_superseded: u64,
+    /// Historical name; counts SurfaceTree per-root transaction capacity pressure.
     pub explicit_sync_queue_overflow: u64,
     pub all_ready_queue_pressure: u64,
     pub bufferless_tree_commits_merged: u64,
@@ -544,6 +548,7 @@ pub struct SubsurfaceTransactionMetrics {
     pub waiting_transactions_published: u64,
     pub maximum_ready_slots_per_root: usize,
     pub maximum_waiting_slots_per_root: usize,
+    /// Historical name; records the maximum SurfaceTree transaction slots per root.
     pub maximum_explicit_sync_queue_depth: usize,
     pub maximum_cached_nodes: usize,
     pub current_cached_entries: usize,
@@ -897,8 +902,6 @@ pub struct CompositorState {
     buffer_release_metrics: BufferReleaseMetrics,
     shm_buffer_lifetime_metrics: ShmBufferLifetimeMetrics,
     frame_callback_metrics: FrameCallbackMetrics,
-    pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
-    acquire_commit_ids: AcquireCommitIdAllocator,
     pending_acquire_watch_changes: Vec<AcquireWatchChange>,
     external_acquire_readiness: bool,
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,

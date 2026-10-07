@@ -1938,12 +1938,6 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .popup_surfaces
                                 .get(&tracked_surface_id)
                                 .and_then(|popup| popup.parent_surface_id),
-                            pending_explicit_sync_commits: server
-                                .state
-                                .pending_explicit_sync_commits
-                                .iter()
-                                .filter(|commit| commit.surface_id == tracked_surface_id)
-                                .count(),
                             pending_surface_tree_transactions: server
                                 .state
                                 .surface_transactions

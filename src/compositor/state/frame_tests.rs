@@ -24,7 +24,7 @@ mod frame_consumption_tests {
     #[test]
     fn prepare_publication_does_not_create_a_submitted_frame_batch() {
         let mut state = CompositorState::default();
-        state.commit_ready_explicit_sync_buffers();
+        state.commit_ready_surface_tree_transactions();
         assert!(!state.has_submitted_frame_batch());
     }
 

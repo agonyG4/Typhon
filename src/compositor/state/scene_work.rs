@@ -5,7 +5,7 @@ use wayland_server::Resource;
 use crate::wm::WorkspaceLocation;
 
 use super::{
-    ActiveFifoBarrier, ActiveSceneSelection, CompositorState, PendingAcquireState, SceneWorkOwner,
+    ActiveFifoBarrier, ActiveSceneSelection, CompositorState, SceneWorkOwner,
     advance_nonzero_serial,
 };
 
@@ -118,17 +118,6 @@ impl CompositorState {
         for (surface_id, barrier) in self.active_fifo_barriers.iter() {
             if !self.fifo_barrier_frame_owned(*surface_id, *barrier) {
                 index.add_prepare_work(self.scene_work_owner_for_surface(*surface_id));
-            }
-        }
-        for commit in &self.pending_explicit_sync_commits {
-            let owner = self.scene_work_owner_for_surface(commit.surface_id);
-            if !self.external_acquire_readiness
-                || commit.acquire_state == PendingAcquireState::Ready
-            {
-                index.add_prepare_work(owner);
-            }
-            if !self.external_acquire_readiness && !commit.frame_callbacks.is_empty() {
-                index.add_unowned_callback(owner);
             }
         }
         for transaction in self.surface_transactions.pending_trees() {

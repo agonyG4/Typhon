@@ -7,12 +7,28 @@ impl CompositorState {
         &mut self,
         releases: &mut ShutdownDmabufReleaseSet,
     ) {
+        if self.external_acquire_readiness {
+            for transaction in self.surface_transactions.pending_trees() {
+                for dependency in &transaction.dependencies {
+                    if dependency.state == PendingAcquireState::Ready {
+                        continue;
+                    }
+                    self.pending_acquire_watch_changes
+                        .push(AcquireWatchChange::Cancel {
+                            commit_id: dependency.commit_id,
+                            reason: AcquireWatchCancelReason::BackendShutdown,
+                        });
+                }
+            }
+        }
         let cached = self.surface_transactions.drain_unpublished_commits();
         self.update_synchronized_cache_metrics();
+        let mut callbacks = Vec::new();
         for commit in cached {
-            if commit.explicit_sync.is_some() {
-                self.note_explicit_commit_destroyed(commit.commit_id, "compositor_shutdown");
-            }
+            // Prepared SurfaceTree nodes have consumed raw explicit-sync state,
+            // but their commit-debug record still needs terminal settlement.
+            self.note_explicit_commit_destroyed(commit.commit_id, "compositor_shutdown");
+            callbacks.extend(commit.frame_callbacks);
             for feedback in commit.presentation_feedbacks {
                 feedback.feedback.discarded();
             }
@@ -27,21 +43,7 @@ impl CompositorState {
                 }
             }
         }
-        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
-            self.note_explicit_commit_destroyed(commit.surface_commit_id, "compositor_shutdown");
-            for feedback in commit.presentation_feedbacks {
-                feedback.feedback.discarded();
-            }
-            let pending = commit.pending;
-            if pending.data.is_shm() && pending.explicit_release.is_none() {
-                self.release_wl_buffer_direct(pending.resource);
-            } else {
-                releases.push(DmabufReleaseObligation {
-                    buffer_id: pending.data.buffer_id(),
-                    release: pending.release_target(),
-                });
-            }
-        }
+        self.complete_frame_callbacks(callbacks);
     }
 }
 
@@ -123,18 +125,6 @@ pub(in crate::compositor) fn remove_surface_tree_dependency(
     Some(transaction.dependencies.remove(index))
 }
 
-pub(in crate::compositor) fn ready_explicit_sync_prefix_end_indices(
-    commits: impl IntoIterator<Item = (usize, u32, bool)>,
-) -> HashMap<u32, usize> {
-    let mut prefix_end = HashMap::new();
-    for (index, surface_id, ready) in commits {
-        if ready {
-            prefix_end.insert(surface_id, index);
-        }
-    }
-    prefix_end
-}
-
 #[cfg(test)]
 pub(in crate::compositor) fn ordered_surface_tree_prefix_end_indices(
     commits: impl IntoIterator<Item = (usize, u32, bool, bool)>,
@@ -183,51 +173,8 @@ where
 }
 
 #[cfg(test)]
-mod explicit_sync_commit_accounting_tests {
+mod surface_tree_ordering_tests {
     use super::*;
-
-    #[test]
-    fn ready_commits_publish_in_sequence() {
-        let prefix = ready_explicit_sync_prefix_end_indices([
-            (0, 7, true),
-            (1, 7, true),
-            (2, 7, true),
-            (3, 7, false),
-        ]);
-        assert_eq!(prefix.get(&7), Some(&2));
-    }
-
-    #[test]
-    fn ready_prefix_end_covers_ready_and_unready_combinations() {
-        assert_eq!(
-            ready_explicit_sync_prefix_end_indices([(0, 7, true), (1, 7, false)]).get(&7),
-            Some(&0)
-        );
-        assert_eq!(
-            ready_explicit_sync_prefix_end_indices([(0, 7, false), (1, 7, true)]).get(&7),
-            Some(&1)
-        );
-        assert_eq!(
-            ready_explicit_sync_prefix_end_indices([(0, 7, true), (1, 7, true), (2, 7, false),])
-                .get(&7),
-            Some(&1)
-        );
-    }
-
-    #[test]
-    fn unready_explicit_sync_commit_can_be_superseded_by_newer_state() {
-        let prefix = ready_explicit_sync_prefix_end_indices([(0, 7, false), (1, 7, true)]);
-        assert_eq!(prefix.get(&7), Some(&1));
-
-        let mut metrics = ExplicitSyncCommitMetrics::default();
-        let disposition = metrics.note_superseded(PendingAcquireState::RegistrationPending);
-        assert_eq!(
-            disposition,
-            SurfaceCommitDisposition::SupersededWhileUnready
-        );
-        assert_eq!(metrics.unready_commits_superseded, 1);
-        assert_eq!(metrics.ready_commits_superseded, 0);
-    }
 
     #[test]
     fn pacing_boundary_stops_ordered_prefix_without_superseding_it() {

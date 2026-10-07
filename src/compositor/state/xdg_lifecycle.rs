@@ -226,12 +226,8 @@ impl XdgSurfaceLifecycle {
 
 impl CompositorState {
     pub(in crate::compositor) fn has_unpublished_surface_work(&self, surface_id: u32) -> bool {
-        self.pending_explicit_sync_commits
-            .iter()
-            .any(|commit| commit.surface_id == surface_id)
-            || self
-                .surface_transactions
-                .contains_pending_surface(surface_id)
+        self.surface_transactions
+            .contains_pending_surface(surface_id)
     }
 
     pub(in crate::compositor) fn retire_unpublished_work_for_xdg_role(
@@ -239,16 +235,11 @@ impl CompositorState {
         surface_id: u32,
         reason: AcquireWatchCancelReason,
     ) {
-        let pending_commits_before = self.pending_explicit_sync_commits.len();
         let pending_trees_before = self.surface_transactions.pending_tree_count();
         let acquire_changes_before = self.pending_acquire_watch_changes.len();
 
-        let callbacks = self.cancel_pending_acquire_commits_for_surface(surface_id, reason);
-        self.complete_frame_callbacks(callbacks);
         self.cancel_pending_surface_trees_for_surface(surface_id, reason);
 
-        let pending_commits_retired =
-            pending_commits_before.saturating_sub(self.pending_explicit_sync_commits.len());
         let pending_trees_retired =
             pending_trees_before.saturating_sub(self.surface_transactions.pending_tree_count());
         let acquire_watches_cancelled = self.pending_acquire_watch_changes
@@ -265,14 +256,15 @@ impl CompositorState {
             })
             .count();
 
+        // Retained for public metric compatibility after removing the legacy standalone queue.
         self.compliance_metrics
-            .note_xdg_role_destroyed_pending_commits_retired(pending_commits_retired);
+            .note_xdg_role_destroyed_pending_commits_retired(0);
         self.compliance_metrics
             .note_xdg_role_destroyed_pending_trees_retired(pending_trees_retired);
         self.compliance_metrics
             .note_xdg_role_destroyed_acquire_watches_cancelled(acquire_watches_cancelled);
 
-        if pending_commits_retired > 0 || pending_trees_retired > 0 {
+        if pending_trees_retired > 0 {
             let latest_received = self
                 .surface_publications
                 .get(&surface_id)
@@ -283,11 +275,9 @@ impl CompositorState {
             debug_assert!(!self.has_unpublished_surface_work(surface_id));
         }
 
-        if surface_tree_debug_enabled()
-            && (pending_commits_retired > 0 || pending_trees_retired > 0)
-        {
+        if surface_tree_debug_enabled() && pending_trees_retired > 0 {
             eprintln!(
-                "oblivion-one compositor: xdg_role_destroyed_work_retired surface={surface_id} pending_commits={pending_commits_retired} pending_trees={pending_trees_retired} acquire_watches={acquire_watches_cancelled} reason={reason:?}"
+                "oblivion-one compositor: xdg_role_destroyed_work_retired surface={surface_id} pending_trees={pending_trees_retired} acquire_watches={acquire_watches_cancelled} reason={reason:?}"
             );
         }
     }

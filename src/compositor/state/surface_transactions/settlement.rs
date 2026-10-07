@@ -109,6 +109,38 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
     }
 
+    pub(in crate::compositor) fn cancel_pending_surface_trees_for_buffer(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        reason: AcquireWatchCancelReason,
+    ) {
+        let tree_roots = self
+            .surface_transactions
+            .pending_trees()
+            .filter(|transaction| {
+                transaction.nodes.iter().any(|(_, commit)| {
+                    commit.attachment.as_ref().is_some_and(|attachment| {
+                        matches!(
+                            attachment,
+                            PendingSurfaceAttachment::Buffer(pending)
+                                if same_wayland_resource(&pending.resource, buffer)
+                        )
+                    })
+                })
+            })
+            .map(|transaction| transaction.root_surface_id)
+            .collect::<Vec<_>>();
+        let mut callbacks = Vec::new();
+        for root_surface_id in tree_roots {
+            let released = self.cancel_pending_surface_trees_for_root(root_surface_id, reason);
+            if let Some(resize_commit) = released.resize_commit {
+                self.release_detached_resize_capture(root_surface_id, resize_commit);
+            }
+            callbacks.extend(released.callbacks);
+        }
+        self.complete_frame_callbacks(callbacks);
+    }
+
     fn cancel_pending_surface_tree_dependents(
         &mut self,
         canceled_refs: Vec<ContentUpdateRef>,

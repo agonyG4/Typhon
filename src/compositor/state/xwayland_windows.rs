@@ -25,11 +25,6 @@ impl CompositorState {
                 retired_id,
                 AcquireWatchCancelReason::SurfaceDestroyed,
             );
-            let callbacks = self.cancel_pending_acquire_commits_for_surface(
-                retired_id,
-                AcquireWatchCancelReason::SurfaceDestroyed,
-            );
-            self.complete_frame_callbacks(callbacks);
             self.discard_pending_presentation_feedbacks_for_surface(retired_id);
             if let Some(feedbacks) = self
                 .pending_surface_presentation_feedbacks

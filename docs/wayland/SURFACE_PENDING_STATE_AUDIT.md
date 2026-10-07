@@ -12,15 +12,15 @@ treated as a protocol gap by itself.
 The phases have directional dependencies:
 
 ```text
-Surface commit capture
+wl_surface.commit capture
         ↓
 Admission / explicit-sync preparation
         ↓
-SurfaceTransactionState or standalone explicit-sync queue
+SurfaceTransactionState
         ↓
-Readiness orchestration
+local acquire polling or native acquire readiness
         ↓
-Already-admitted, non-reentrant publication
+SurfaceTree publication
         ↓
 Canonical compositor state
 ```
@@ -31,8 +31,10 @@ the release point to the pending buffer and represents an unsignaled acquire
 as a transaction dependency. Tree publication asserts that no raw captured
 state remains and applies the prepared buffer through
 `publish_admitted_surface_buffer()`. That publication path cannot queue
-explicit-sync work or progress either readiness engine. Standalone
-explicit-sync commits keep their ordered queue and readiness path.
+explicit-sync work or progress readiness. There is no separate standalone
+explicit-sync commit queue: captured protocol state becomes either a release
+point owned by the pending buffer or a `SurfaceTreeAcquireDependency` owned by
+`SurfaceTransactionState`.
 
 | property | request-time storage owner | commit capture owner | publication owner | failure rollback | synchronized subsurface owner | teardown owner |
 |---|---|---|---|---|---|---|
@@ -46,8 +48,8 @@ explicit-sync commits keep their ordered queue and readiness path.
 | input region | `SurfaceData.input_region` | `take_pending_input_region` | current hit-test state | pending snapshot is discarded on failed transaction | cached commit input region | surface teardown |
 | viewport source/destination | `SurfaceData.viewport` | `take_pending_viewport` and `viewport_for_change` | validated logical-size publication | invalid viewport remains unpublished | cached viewport change | surface teardown |
 | frame callbacks | `SurfaceData.frame_callbacks` | `take_frame_callbacks` | frame-owned completion queues | failed commit completes/discards exactly once | cached commit callbacks | teardown/shutdown disposition |
-| presentation feedback | `SurfaceData` / explicit-sync capture | commit capture | frame-batch/presentation owner | discarded on failed or abandoned commit | cached feedback vector | teardown/shutdown disposition |
-| explicit-sync acquire/release | `SurfaceData.explicit_sync` | `CapturedExplicitSyncState`; SurfaceTree preparation consumes it before queueing | standalone pending explicit-sync queue, or SurfaceTree dependency in `SurfaceTransactionState` | protocol error leaves no unrelated fields published | release point remains on pending buffer; unsignaled acquire is a transaction dependency | acquire-watch and shutdown cleanup |
+| presentation feedback | `SurfaceData` | commit capture | frame-batch/presentation owner | discarded on failed or abandoned commit | cached feedback vector | teardown/shutdown disposition |
+| explicit-sync acquire/release | `SurfaceData.explicit_sync` | `CapturedExplicitSyncState`; SurfaceTree preparation consumes it before queueing | release point on pending buffer; unsignaled acquire in `SurfaceTreeAcquireDependency` | protocol error leaves no unrelated fields published | SurfaceTree transaction in `SurfaceTransactionState` | acquire-watch and shutdown cleanup |
 | XDG window geometry | `pending_surface_window_geometries` | commit removes one pending snapshot | XDG/window publication | invalid size posts `xdg_surface.invalid_size` | cached commit geometry | XDG/surface teardown |
 | subsurface position/stack/sync | subsurface pending maps and role lifecycle | parent transaction capture | `apply_cached_subsurface_commit` | invalid restack leaves current order unchanged | `SubsurfaceTransactionState` | role/client teardown |
 

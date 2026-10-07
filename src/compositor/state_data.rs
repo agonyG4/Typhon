@@ -32,6 +32,7 @@ pub struct CoreComplianceMetrics {
     pub client_state_leaks_detected: u64,
     pub xdg_same_role_reassociations_total: u64,
     pub xdg_cross_role_reassociation_rejections: u64,
+    /// Compatibility tombstone for the removed standalone explicit-sync queue.
     pub xdg_role_destroyed_pending_commits_retired: u64,
     pub xdg_role_destroyed_pending_trees_retired: u64,
     pub xdg_role_destroyed_acquire_watches_cancelled: u64,

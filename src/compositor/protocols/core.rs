@@ -345,19 +345,6 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
         }
     }
-
-    fn destroyed(
-        state: &mut Self,
-        _client: ClientId,
-        _resource: &wl_surface::WlSurface,
-        data: &SurfaceData,
-    ) {
-        let callbacks = state.cancel_pending_acquire_commits_for_surface(
-            data.surface_id(),
-            AcquireWatchCancelReason::ClientDisconnected,
-        );
-        state.complete_frame_callbacks(callbacks);
-    }
 }
 
 impl Dispatch<wl_callback::WlCallback, ()> for CompositorState {

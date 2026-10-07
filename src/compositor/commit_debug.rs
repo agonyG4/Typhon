@@ -29,8 +29,6 @@ impl SurfaceCommitId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceCommitDisposition {
     Published,
-    SupersededWhileUnready,
-    SupersededWhileReady,
     Rejected,
     SurfaceDestroyed,
     MergedIntoNewer,
@@ -41,8 +39,6 @@ pub(crate) struct ExplicitSyncCommitMetrics {
     pub(crate) explicit_sync_commits_captured: u64,
     pub(crate) explicit_sync_commits_became_ready: u64,
     pub(crate) explicit_sync_commits_published: u64,
-    pub(crate) ready_commits_superseded: u64,
-    pub(crate) unready_commits_superseded: u64,
     pub(crate) ready_commits_rejected_stale: u64,
     pub(crate) ready_commits_rejected_newer_attachment: u64,
     pub(crate) unready_commits_rejected_stale: u64,
@@ -55,19 +51,6 @@ pub(crate) struct ExplicitSyncCommitMetrics {
 }
 
 impl ExplicitSyncCommitMetrics {
-    pub(in crate::compositor) fn note_superseded(
-        &mut self,
-        state: PendingAcquireState,
-    ) -> SurfaceCommitDisposition {
-        if state == PendingAcquireState::Ready {
-            self.ready_commits_superseded = self.ready_commits_superseded.saturating_add(1);
-            SurfaceCommitDisposition::SupersededWhileReady
-        } else {
-            self.unready_commits_superseded = self.unready_commits_superseded.saturating_add(1);
-            SurfaceCommitDisposition::SupersededWhileUnready
-        }
-    }
-
     pub(in crate::compositor) fn note_publication_rejected(
         &mut self,
         state: PendingAcquireState,
@@ -250,75 +233,6 @@ impl super::CompositorState {
             0,
             "fence_signaled",
         );
-    }
-
-    pub(in crate::compositor) fn note_explicit_commit_superseded(
-        &mut self,
-        id: SurfaceCommitId,
-        state: PendingAcquireState,
-        callback_count: usize,
-        replacement: SurfaceCommitId,
-        reason: &str,
-    ) {
-        let live = self.commit_debug.live.remove(&id);
-        let disposition = live
-            .as_ref()
-            .map(|_| self.commit_debug.metrics.note_superseded(state));
-        self.commit_debug.metrics.callbacks_merged_from_superseded = self
-            .commit_debug
-            .metrics
-            .callbacks_merged_from_superseded
-            .saturating_add(callback_count as u64);
-        let moved = self
-            .commit_debug
-            .callbacks
-            .iter()
-            .filter_map(|(callback, owner)| {
-                (owner.commit_id == id).then_some((callback.clone(), owner.surface))
-            })
-            .collect::<Vec<_>>();
-        for (callback, surface) in moved {
-            if let Some(owner) = self.commit_debug.callbacks.get_mut(&callback) {
-                owner.commit_id = replacement;
-            }
-            if self.commit_debug.enabled {
-                commit_debug_println!(
-                    "typhon commit: event=callback_moved commit_id={} replacement_commit_id={} surface={surface} callback={callback:?} reason={reason}",
-                    id.get(),
-                    replacement.get()
-                );
-            }
-        }
-        if let (Some(live), Some(disposition)) = (live, disposition) {
-            self.trace_surface_pipeline_event(
-                SurfacePipelineEvent::CommitSuperseded,
-                live.surface,
-                SurfaceCommitSequence(live.sequence),
-                live.buffer_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
-            self.commit_log(
-                match disposition {
-                    SurfaceCommitDisposition::SupersededWhileReady => "superseded_ready",
-                    _ => "superseded_unready",
-                },
-                id,
-                live.surface,
-                live.sequence,
-                None,
-                if state == PendingAcquireState::Ready {
-                    "ready"
-                } else {
-                    "unready"
-                },
-                callback_count,
-                reason,
-            );
-        }
     }
 
     pub(in crate::compositor) fn note_explicit_commit_merged(
@@ -511,38 +425,6 @@ impl super::CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn note_explicit_commit_rejected(
-        &mut self,
-        id: SurfaceCommitId,
-        reason: &str,
-    ) {
-        let _disposition = SurfaceCommitDisposition::Rejected;
-        let Some(live) = self.commit_debug.live.remove(&id) else {
-            return;
-        };
-        self.trace_surface_pipeline_event(
-            SurfacePipelineEvent::CommitDiscarded,
-            live.surface,
-            SurfaceCommitSequence(live.sequence),
-            live.buffer_id,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        self.commit_log(
-            "destroyed",
-            id,
-            live.surface,
-            live.sequence,
-            None,
-            "rejected",
-            0,
-            reason,
-        );
-    }
-
     pub(in crate::compositor) fn note_explicit_commit_destroyed(
         &mut self,
         id: SurfaceCommitId,
@@ -623,12 +505,10 @@ impl super::CompositorState {
         self.commit_debug.summary_emitted = true;
         let m = self.commit_debug.metrics;
         Some(format!(
-            "typhon commit: event=summary captured={} became_ready={} published={} ready_superseded={} unready_superseded={} ready_rejected_stale={} ready_rejected_newer_attachment={} unready_rejected_stale={} unready_rejected_newer_attachment={} callbacks_moved={} callbacks_completed_from_published={} callbacks_completed_from_unpublished={} published_without_visual_generation={} visual_generations={} queue_overflow={} max_queue_depth={} all_ready_pressure={} unready_retirements={} live_commits={} live_callbacks={}",
+            "typhon commit: event=summary captured={} became_ready={} published={} ready_rejected_stale={} ready_rejected_newer_attachment={} unready_rejected_stale={} unready_rejected_newer_attachment={} callbacks_moved={} callbacks_completed_from_published={} callbacks_completed_from_unpublished={} published_without_visual_generation={} visual_generations={} surface_tree_queue_overflow={} max_surface_tree_queue_depth={} all_ready_pressure={} live_commits={} live_callbacks={}",
             m.explicit_sync_commits_captured,
             m.explicit_sync_commits_became_ready,
             m.explicit_sync_commits_published,
-            m.ready_commits_superseded,
-            m.unready_commits_superseded,
             m.ready_commits_rejected_stale,
             m.ready_commits_rejected_newer_attachment,
             m.unready_commits_rejected_stale,
@@ -645,7 +525,6 @@ impl super::CompositorState {
                 .metrics
                 .maximum_explicit_sync_queue_depth,
             self.surface_transactions.metrics.all_ready_queue_pressure,
-            m.unready_commits_superseded,
             self.commit_debug.live.len(),
             self.commit_debug.callbacks.len()
         ))
@@ -668,16 +547,11 @@ impl super::CompositorState {
         }
         let live = self.commit_debug.live.get(&id);
         commit_debug_println!(
-            "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={sequence} buffer_id={} acquire_state={acquire} callback_count={callbacks} pageflip_pending={} pending_queue_depth={} ready_queue_depth={} visual_generation={} reason={reason}",
+            "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={sequence} buffer_id={} acquire_state={acquire} callback_count={callbacks} pageflip_pending={} visual_generation={} reason={reason}",
             id.get(),
             live.map_or_else(|| self.root_surface_id_for_surface(surface), |l| l.root),
             buffer.map_or_else(|| "none".to_string(), |b| b.to_string()),
             self.commit_debug.pageflip_pending,
-            self.pending_explicit_sync_commits.len(),
-            self.pending_explicit_sync_commits
-                .iter()
-                .filter(|c| c.acquire_state == PendingAcquireState::Ready)
-                .count(),
             live.and_then(|l| l.visual_generation)
                 .map_or_else(|| "none".to_string(), |g| g.to_string())
         );
@@ -692,17 +566,12 @@ impl super::CompositorState {
     ) {
         if self.commit_debug.enabled {
             commit_debug_println!(
-                "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={} buffer_id=none acquire_state=none callback_count=1 callback={:?} pageflip_pending={} pending_queue_depth={} ready_queue_depth={} visual_generation=none reason={reason}",
+                "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={} buffer_id=none acquire_state=none callback_count=1 callback={:?} pageflip_pending={} visual_generation=none reason={reason}",
                 id.get(),
                 self.root_surface_id_for_surface(surface),
                 self.commit_debug.live.get(&id).map_or(0, |l| l.sequence),
                 callback.id(),
-                self.commit_debug.pageflip_pending,
-                self.pending_explicit_sync_commits.len(),
-                self.pending_explicit_sync_commits
-                    .iter()
-                    .filter(|c| c.acquire_state == PendingAcquireState::Ready)
-                    .count()
+                self.commit_debug.pageflip_pending
             );
         }
     }
@@ -718,15 +587,6 @@ mod tests {
         let second = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13));
         assert_ne!(first, second);
         assert!(second.get() > first.get());
-    }
-
-    #[test]
-    fn ready_and_unready_supersede_accounting_is_separate() {
-        let mut metrics = ExplicitSyncCommitMetrics::default();
-        metrics.note_superseded(PendingAcquireState::Ready);
-        metrics.note_superseded(PendingAcquireState::RegistrationPending);
-        assert_eq!(metrics.ready_commits_superseded, 1);
-        assert_eq!(metrics.unready_commits_superseded, 1);
     }
 
     #[test]
@@ -791,29 +651,6 @@ mod tests {
             records[0].commit_sequence,
             super::super::SurfaceCommitSequence(11)
         );
-    }
-
-    #[test]
-    fn superseded_commit_is_retained_in_surface_lineage() {
-        let mut state = super::super::CompositorState {
-            surface_pipeline_trace: super::super::surface_pipeline_trace::SurfacePipelineTrace::new(
-                true, 8,
-            ),
-            ..Default::default()
-        };
-        let id = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(11));
-        state.note_explicit_commit_captured(id, 7, 11, Some(19), &[]);
-        state.note_explicit_commit_superseded(
-            id,
-            PendingAcquireState::RegistrationPending,
-            0,
-            SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13)),
-            "test",
-        );
-        let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].kind, SurfacePipelineEvent::CommitSuperseded);
-        assert_eq!(records[0].buffer_id, Some(19));
     }
 
     #[test]

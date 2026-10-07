@@ -529,14 +529,6 @@ impl CompositorState {
             self.cache_synchronized_subsurface_commit(surface_id, commit);
             return;
         }
-        if commit.attachment.is_some() {
-            let mut superseded_callbacks = self.supersede_older_pending_attachments_for_surface(
-                surface_id,
-                commit.commit_sequence,
-            );
-            superseded_callbacks.extend(commit.frame_callbacks);
-            commit.frame_callbacks = superseded_callbacks;
-        }
         match commit.attachment.as_mut() {
             Some(PendingSurfaceAttachment::Buffer(pending)) => {
                 if let Some(mapping) = direct_mapping {

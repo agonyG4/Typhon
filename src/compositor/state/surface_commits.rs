@@ -315,11 +315,6 @@ impl CompositorState {
         self.resize_configure_flows
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
         let removed_flows = before_flows.saturating_sub(self.resize_configure_flows.len());
-        for commit in &mut self.pending_explicit_sync_commits {
-            if surface_ids.contains(&commit.surface_id) {
-                commit.pending.resize_commit = None;
-            }
-        }
         self.surface_transactions
             .clear_resize_state_for_surfaces(surface_ids);
         let before_previews = self.active_toplevel_resizes.len();

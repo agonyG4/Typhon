@@ -669,10 +669,6 @@ fn xdg_toplevel_role_destroy_retires_unpublished_explicit_sync_work() {
     wait_for_server_commands(&commands);
 
     let blocked = capture_xdg_role_snapshot(&commands, surface_id);
-    assert_eq!(
-        blocked.pending_explicit_sync_commits + blocked.pending_surface_tree_transactions,
-        1
-    );
     assert_eq!(blocked.pending_surface_tree_transactions, 1);
     assert!(!blocked.current_surface_buffer);
     assert!(!blocked.renderable_surface);
@@ -689,7 +685,6 @@ fn xdg_toplevel_role_destroy_retires_unpublished_explicit_sync_work() {
         vec![callback.id().protocol_id()]
     );
     let retired = capture_xdg_role_snapshot(&commands, surface_id);
-    assert_eq!(retired.pending_explicit_sync_commits, 0);
     assert_eq!(retired.pending_surface_tree_transactions, 0);
     assert!(!retired.current_surface_buffer);
     assert!(!retired.renderable_surface);
@@ -700,7 +695,6 @@ fn xdg_toplevel_role_destroy_retires_unpublished_explicit_sync_work() {
     acquire_timeline.signal_point(2).unwrap();
     wait_for_server_commands(&commands);
     let after_old_signal = capture_xdg_role_snapshot(&commands, surface_id);
-    assert_eq!(after_old_signal.pending_explicit_sync_commits, 0);
     assert!(!after_old_signal.current_surface_buffer);
     assert!(!after_old_signal.renderable_surface);
 
@@ -724,7 +718,6 @@ fn xdg_toplevel_role_destroy_retires_unpublished_explicit_sync_work() {
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
     let reconstructed = capture_xdg_role_snapshot(&commands, surface_id);
-    assert_eq!(reconstructed.pending_explicit_sync_commits, 0);
     assert!(reconstructed.current_surface_buffer);
     assert!(reconstructed.renderable_surface);
     assert_eq!(
@@ -822,10 +815,6 @@ fn disconnected_client_retires_pending_explicit_sync_work() {
         wait_for_server_commands(&commands);
 
         let blocked = capture_xdg_role_snapshot(&commands, surface_id);
-        assert_eq!(
-            blocked.pending_explicit_sync_commits + blocked.pending_surface_tree_transactions,
-            1
-        );
         assert_eq!(blocked.pending_surface_tree_transactions, 1);
         assert!(!blocked.renderable_surface);
     }
@@ -833,7 +822,6 @@ fn disconnected_client_retires_pending_explicit_sync_work() {
     thread::sleep(Duration::from_millis(20));
     wait_for_server_commands(&commands);
     let retired = capture_xdg_role_snapshot(&commands, surface_id);
-    assert_eq!(retired.pending_explicit_sync_commits, 0);
     assert_eq!(retired.pending_surface_tree_transactions, 0);
     assert!(!retired.surface_registered);
     assert!(!retired.renderable_surface);
@@ -913,10 +901,7 @@ fn xdg_popup_role_destroy_retires_unpublished_explicit_sync_work() {
     queue.roundtrip(&mut state).unwrap();
     wait_for_server_commands(&commands);
     let blocked = capture_xdg_role_snapshot(&commands, popup_surface_id);
-    assert_eq!(
-        blocked.pending_explicit_sync_commits + blocked.pending_surface_tree_transactions,
-        1
-    );
+    assert_eq!(blocked.pending_surface_tree_transactions, 1);
     assert!(!blocked.current_surface_buffer);
     assert!(!blocked.renderable_surface);
 
@@ -931,7 +916,6 @@ fn xdg_popup_role_destroy_retires_unpublished_explicit_sync_work() {
         vec![callback.id().protocol_id()]
     );
     let retired = capture_xdg_role_snapshot(&commands, popup_surface_id);
-    assert_eq!(retired.pending_explicit_sync_commits, 0);
     assert_eq!(retired.pending_surface_tree_transactions, 0);
     assert!(!retired.current_surface_buffer);
     assert!(!retired.renderable_surface);
