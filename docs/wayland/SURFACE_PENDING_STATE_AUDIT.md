@@ -7,9 +7,36 @@ This audit records the ownership boundary that is observable at one
 publication/validation transaction. Internal storage shape is therefore not
 treated as a protocol gap by itself.
 
+## Publication pipeline
+
+The phases have directional dependencies:
+
+```text
+Surface commit capture
+        ↓
+Admission / explicit-sync preparation
+        ↓
+SurfaceTransactionState or standalone explicit-sync queue
+        ↓
+Readiness orchestration
+        ↓
+Already-admitted, non-reentrant publication
+        ↓
+Canonical compositor state
+```
+
+`prepare_surface_tree_acquires()` consumes each cached commit's raw captured
+explicit-sync state before the SurfaceTree transaction is queued. It transfers
+the release point to the pending buffer and represents an unsignaled acquire
+as a transaction dependency. Tree publication asserts that no raw captured
+state remains and applies the prepared buffer through
+`publish_admitted_surface_buffer()`. That publication path cannot queue
+explicit-sync work or progress either readiness engine. Standalone
+explicit-sync commits keep their ordered queue and readiness path.
+
 | property | request-time storage owner | commit capture owner | publication owner | failure rollback | synchronized subsurface owner | teardown owner |
 |---|---|---|---|---|---|---|
-| attachment / NULL | `SurfaceData.pending_buffer` | `wl_surface::commit` + `surface_transactions` | `commit_surface_buffer_by_role` / unmap path | pending attachment remains unpublished; release target is terminally owned | `CachedSubsurfaceCommit.attachment` | `teardown_surface_resource` / shutdown release |
+| attachment / NULL | `SurfaceData.pending_buffer` | `wl_surface::commit` + `surface_transactions` | `publish_admitted_surface_buffer` / unmap path | pending attachment remains unpublished; release target is terminally owned | `CachedSubsurfaceCommit.attachment` | `teardown_surface_resource` / shutdown release |
 | surface damage | `SurfaceData.pending_surface_damage` | `take_pending_damage` | validated damage transaction | invalid commit never publishes damage | cached commit damage | surface teardown |
 | buffer damage | `SurfaceData.pending_buffer_damage` | `take_pending_damage` | validated damage transaction after transform/scale | invalid commit never publishes damage | cached commit damage | surface teardown |
 | offset | `SurfaceData.pending_offset` | `take_pending_offset` | role-specific commit | pending value is consumed only by its commit | cached commit offset where applicable | surface teardown |
@@ -20,7 +47,7 @@ treated as a protocol gap by itself.
 | viewport source/destination | `SurfaceData.viewport` | `take_pending_viewport` and `viewport_for_change` | validated logical-size publication | invalid viewport remains unpublished | cached viewport change | surface teardown |
 | frame callbacks | `SurfaceData.frame_callbacks` | `take_frame_callbacks` | frame-owned completion queues | failed commit completes/discards exactly once | cached commit callbacks | teardown/shutdown disposition |
 | presentation feedback | `SurfaceData` / explicit-sync capture | commit capture | frame-batch/presentation owner | discarded on failed or abandoned commit | cached feedback vector | teardown/shutdown disposition |
-| explicit-sync acquire/release | `SurfaceData.explicit_sync` | `CapturedExplicitSyncState` | pending explicit-sync commit queue | protocol error leaves no unrelated fields published | cached explicit-sync state | acquire-watch and shutdown cleanup |
+| explicit-sync acquire/release | `SurfaceData.explicit_sync` | `CapturedExplicitSyncState`; SurfaceTree preparation consumes it before queueing | standalone pending explicit-sync queue, or SurfaceTree dependency in `SurfaceTransactionState` | protocol error leaves no unrelated fields published | release point remains on pending buffer; unsignaled acquire is a transaction dependency | acquire-watch and shutdown cleanup |
 | XDG window geometry | `pending_surface_window_geometries` | commit removes one pending snapshot | XDG/window publication | invalid size posts `xdg_surface.invalid_size` | cached commit geometry | XDG/surface teardown |
 | subsurface position/stack/sync | subsurface pending maps and role lifecycle | parent transaction capture | `apply_cached_subsurface_commit` | invalid restack leaves current order unchanged | `SubsurfaceTransactionState` | role/client teardown |
 

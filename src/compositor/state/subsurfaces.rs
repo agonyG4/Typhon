@@ -617,6 +617,12 @@ impl CompositorState {
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
         };
+        debug_assert!(
+            nodes
+                .iter()
+                .all(|(_, commit)| commit.explicit_sync.is_none()),
+            "materialized SurfaceTree transactions cannot retain captured explicit-sync state"
+        );
         self.surface_transactions.metrics.tree_transactions_prepared = self
             .surface_transactions
             .metrics
@@ -781,121 +787,6 @@ impl CompositorState {
             );
         }
         changed
-    }
-
-    pub(in crate::compositor) fn publish_surface_tree(
-        &mut self,
-        root_id: u32,
-        commits: Vec<(u32, CachedSubsurfaceCommit)>,
-    ) {
-        let changed_nodes = commits.len();
-        let maximum_wait_ms = commits
-            .iter()
-            .map(|(_, commit)| commit)
-            .map(|commit| u64::try_from(commit.cached_at.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .max()
-            .unwrap_or(0);
-        self.surface_transactions
-            .metrics
-            .maximum_transaction_wait_ms = self
-            .surface_transactions
-            .metrics
-            .maximum_transaction_wait_ms
-            .max(maximum_wait_ms);
-        if compositor_debug_surface_logging_enabled() {
-            eprintln!(
-                "oblivion-one compositor: subsurface_tx root={root_id} decision=prepared changed_nodes={changed_nodes}",
-            );
-        }
-        self.begin_surface_tree_publication();
-        // Seed the authority snapshot before applying any node. Capturing only
-        // when each node is reached would allow the first applied root/child
-        // commit to become part of the supposed "before" geometry.
-        let _ = self.capture_xdg_geometry_before_surface_commit(root_id);
-        for (surface_id, commit) in commits {
-            self.apply_cached_subsurface_commit(surface_id, commit);
-        }
-        self.finish_surface_tree_publication();
-        self.debug_assert_surface_tree_invariants();
-        self.surface_transactions
-            .metrics
-            .tree_transactions_published = self
-            .surface_transactions
-            .metrics
-            .tree_transactions_published
-            .saturating_add(1);
-        if compositor_debug_surface_logging_enabled() {
-            eprintln!(
-                "oblivion-one compositor: subsurface_tx root={root_id} decision=published changed_nodes={} tree_generation={}",
-                changed_nodes, self.render_generation,
-            );
-        }
-        if crate::compositor::state::roles::surface_tree_debug_enabled() {
-            let xdg_geometry = self
-                .effective_xdg_window_geometry(root_id)
-                .map(|geometry| geometry.geometry)
-                .map_or_else(
-                    || "none".to_string(),
-                    |geometry| {
-                        format!(
-                            "{},{},{},{}",
-                            geometry.x, geometry.y, geometry.width, geometry.height
-                        )
-                    },
-                );
-            let root_commit_sequence = self
-                .renderable_surfaces
-                .iter()
-                .find(|surface| surface.surface_id == root_id)
-                .map(|surface| surface.commit_sequence.get());
-            let origins = render::surface_origins(&self.renderable_surfaces);
-            let active_surfaces = self.active_scene_surfaces();
-            let active_origins = self.active_scene_surface_origins();
-            let mut nodes = Vec::new();
-            let mut omitted = 0usize;
-            for (surface, (origin_x, origin_y)) in self.renderable_surfaces.iter().zip(origins) {
-                if self.root_surface_id_for_surface(surface.surface_id) != root_id {
-                    continue;
-                }
-                if nodes.len() == 16 {
-                    omitted = omitted.saturating_add(1);
-                    continue;
-                }
-                let relationship = self
-                    .surface_transactions
-                    .captured_relationship(surface.surface_id)
-                    .map(|relationship| relationship.relationship_id.get().to_string())
-                    .unwrap_or_else(|| "none".to_string());
-                let active_origin = active_surfaces
-                    .iter()
-                    .position(|active| active.surface_id == surface.surface_id)
-                    .and_then(|index| active_origins.get(index).copied())
-                    .map_or_else(|| "none".to_string(), |(x, y)| format!("{x},{y}"));
-                nodes.push(format!(
-                    "surface={} parent={} relationship={} local={},{} origin={},{} active_origin={} commit_sequence={}",
-                    surface.surface_id,
-                    surface
-                        .placement
-                        .parent_surface_id
-                        .map_or_else(|| "none".to_string(), |parent| parent.to_string()),
-                    relationship,
-                    surface.placement.local_x,
-                    surface.placement.local_y,
-                    origin_x,
-                    origin_y,
-                    active_origin,
-                    surface.commit_sequence.get(),
-                ));
-            }
-            eprintln!(
-                "event=surface_tree_published root={} commit_sequence={} xdg_geometry={} nodes=[{}] omitted={}",
-                root_id,
-                root_commit_sequence.map_or_else(|| "none".to_string(), |value| value.to_string()),
-                xdg_geometry,
-                nodes.join("; "),
-                omitted,
-            );
-        }
     }
 
     pub(in crate::compositor) fn pending_stack_for_parent(

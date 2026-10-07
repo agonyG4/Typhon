@@ -1604,6 +1604,7 @@ impl CompositorState {
         canceled_callbacks
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn retain_oldest_pending_acquire_for_surface(
         &mut self,
         surface_id: u32,
@@ -1996,7 +1997,7 @@ impl CompositorState {
                     })
                     .map(Box::new);
             }
-            self.commit_surface_buffer_by_role(
+            self.publish_admitted_surface_buffer(
                 commit.surface_id,
                 commit.pending,
                 commit.damage,

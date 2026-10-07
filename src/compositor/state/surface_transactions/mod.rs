@@ -2,8 +2,8 @@ use super::*;
 
 mod lineage;
 mod model;
-mod publication;
 mod queue;
+mod settlement;
 mod state;
 
 pub use model::SurfaceTreeTransactionId;

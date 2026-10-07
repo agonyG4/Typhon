@@ -104,6 +104,61 @@ fn test_pending_shm_buffer(
     }
 }
 
+fn test_pending_dmabuf_buffer(
+    state: &mut CompositorState,
+    client: &wayland_server::Client,
+    display_handle: &wayland_server::DisplayHandle,
+    object_id: u32,
+    width: u32,
+    height: u32,
+) -> PendingSurfaceBuffer {
+    let size = BufferSize::new(width, height).expect("test buffer size");
+    let stride = width.checked_mul(4).expect("test buffer stride");
+    let handle = DmabufBufferHandle::new(
+        size,
+        DrmFormat::Argb8888,
+        vec![crate::render_backend::buffer::DmabufPlane::new(
+            std::fs::File::open("/dev/null")
+                .expect("test dma-buf plane")
+                .into(),
+            crate::render_backend::buffer::DmabufPlaneDescriptor {
+                plane_index: 0,
+                offset: 0,
+                stride,
+                modifier: DrmModifier::LINEAR,
+            },
+        )],
+    )
+    .expect("test dma-buf handle");
+    let buffer_data = crate::compositor::dmabuf::DmabufBufferData {
+        identity: state.allocate_buffer_identity().expect("buffer identity"),
+        handle,
+    };
+    let resource = client
+        .create_resource::<
+            wl_buffer::WlBuffer,
+            crate::compositor::dmabuf::DmabufBufferData,
+            CompositorState,
+        >(display_handle, object_id, buffer_data.clone())
+        .expect("buffer resource");
+    PendingSurfaceBuffer {
+        resource,
+        data: PendingBufferData::Dmabuf(buffer_data),
+        x: 0,
+        y: 0,
+        explicit_release: None,
+        surface_size: None,
+        viewport_source: None,
+        viewport_destination: None,
+        buffer_scale: 1,
+        commit_sequence: SurfaceCommitSequence::initial(),
+        resize_commit: None,
+        resize_capture_finalized: false,
+        buffer_transform: wl_output::Transform::Normal,
+        opaque_region: SurfaceOpaqueRegion::None,
+    }
+}
+
 fn submit_test_unready_buffer_commit(
     state: &mut CompositorState,
     client: &wayland_server::Client,
@@ -408,5 +463,7 @@ mod coalescing;
 mod lineage;
 #[path = "mapping.rs"]
 mod mapping;
+#[path = "publication.rs"]
+mod publication;
 #[path = "queue.rs"]
 mod queue;

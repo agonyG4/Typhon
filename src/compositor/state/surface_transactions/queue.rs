@@ -919,7 +919,7 @@ impl CompositorState {
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
     ) -> Option<Vec<SurfaceTreeAcquireDependency>> {
         let mut dependencies = Vec::new();
-        for (surface_id, commit) in nodes {
+        for (surface_id, commit) in nodes.iter_mut() {
             let Some(explicit_sync) = commit.explicit_sync.take() else {
                 continue;
             };
@@ -1038,6 +1038,12 @@ impl CompositorState {
             );
             self.note_explicit_commit_acquire_wait(commit.commit_id, commit.frame_callbacks.len());
         }
+        debug_assert!(
+            nodes
+                .iter()
+                .all(|(_, commit)| commit.explicit_sync.is_none()),
+            "SurfaceTree acquire preparation must consume raw explicit-sync state"
+        );
         Some(dependencies)
     }
 

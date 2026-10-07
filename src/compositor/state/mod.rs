@@ -68,6 +68,7 @@ mod surface_commits;
 mod surface_focus;
 mod surface_mapping;
 mod surface_pacing;
+mod surface_publication;
 #[cfg(test)]
 #[path = "surface_transactions/tests/ownership.rs"]
 mod surface_transaction_ownership_tests;
