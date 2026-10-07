@@ -1502,7 +1502,7 @@ impl CompositorState {
             ));
         }
         self.unregister_fractional_scale_resources_for_surface(surface_id);
-        self.surface_placements.remove(&surface_id);
+        self.surface_topology.remove_placement(surface_id);
         self.xwayland.retired_surface_ids.remove(&surface_id);
         self.remove_current_surface_buffer(surface_id);
         self.clear_xdg_window_geometry_state(surface_id);
@@ -1515,8 +1515,8 @@ impl CompositorState {
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
         self.teardown_layer_surface(surface_id);
-        self.surface_placements
-            .retain(|_, placement| placement.parent_surface_id != Some(surface_id));
+        self.surface_topology
+            .remove_placements_with_parent(surface_id);
         let mut removed_surface_ids = vec![surface_id];
         removed_surface_ids.extend(
             self.renderable_surfaces

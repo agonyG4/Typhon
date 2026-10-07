@@ -27,16 +27,16 @@ impl CompositorState {
             .iter()
             .copied()
             .filter(|surface_id| {
-                self.surface_placements
-                    .get(surface_id)
-                    .and_then(|placement| placement.parent_surface_id)
+                self.surface_topology
+                    .parent_surface_id(*surface_id)
                     .is_none_or(|parent_id| !visible_ids.contains(&parent_id))
             })
             .collect::<Vec<_>>();
 
         for root_id in root_ids {
             let mut tree_ids = Vec::new();
-            self.append_surface_tree_order(root_id, &visible_ids, &mut tree_ids);
+            self.surface_topology
+                .append_surface_tree_order(root_id, &visible_ids, &mut tree_ids);
             for surface_id in &tree_ids {
                 seen_ids.insert(*surface_id);
             }
@@ -46,7 +46,11 @@ impl CompositorState {
             if visible_ids.contains(surface_id) && !seen_ids.contains(surface_id) {
                 let root_id = *surface_id;
                 let mut tree_ids = Vec::new();
-                self.append_surface_tree_order(root_id, &visible_ids, &mut tree_ids);
+                self.surface_topology.append_surface_tree_order(
+                    root_id,
+                    &visible_ids,
+                    &mut tree_ids,
+                );
                 for surface_id in &tree_ids {
                     seen_ids.insert(*surface_id);
                 }
@@ -183,43 +187,6 @@ impl CompositorState {
             }
         }
         None
-    }
-
-    pub(in crate::compositor) fn append_surface_tree_order(
-        &self,
-        surface_id: u32,
-        visible_ids: &HashSet<u32>,
-        ordered_ids: &mut Vec<u32>,
-    ) {
-        if !visible_ids.contains(&surface_id) || ordered_ids.contains(&surface_id) {
-            return;
-        }
-
-        if let Some(stack) = self.committed_subsurface_stacks.get(&surface_id) {
-            for stacked_id in stack {
-                if *stacked_id == surface_id {
-                    ordered_ids.push(surface_id);
-                } else {
-                    self.append_surface_tree_order(*stacked_id, visible_ids, ordered_ids);
-                }
-            }
-        } else {
-            ordered_ids.push(surface_id);
-        }
-
-        let children = self
-            .surface_placements
-            .iter()
-            .filter_map(|(child_id, placement)| {
-                (placement.parent_surface_id == Some(surface_id)
-                    && visible_ids.contains(child_id)
-                    && !ordered_ids.contains(child_id))
-                .then_some(*child_id)
-            })
-            .collect::<Vec<_>>();
-        for child_id in children {
-            self.append_surface_tree_order(child_id, visible_ids, ordered_ids);
-        }
     }
 
     pub(in crate::compositor) fn reorder_renderable_surfaces_by_window_stack(&mut self) -> bool {

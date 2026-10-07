@@ -1017,8 +1017,8 @@ mod task_05_8_tests {
         let mut titlebar = test_surface(titlebar_id, 944, 24);
         titlebar.placement = SurfacePlacement::subsurface(root_id, 0, -24);
         state
-            .surface_placements
-            .insert(titlebar_id, titlebar.placement);
+            .surface_topology
+            .set_placement(titlebar_id, titlebar.placement);
         state.append_renderable_surface(titlebar);
         state.set_test_effective_xdg_window_geometry(
             root_id,
@@ -1330,8 +1330,8 @@ mod task_05_8_tests {
         let mut titlebar = test_surface(titlebar_id, 944, 24);
         titlebar.placement = SurfacePlacement::subsurface(root_id, 0, -24);
         state
-            .surface_placements
-            .insert(titlebar_id, titlebar.placement);
+            .surface_topology
+            .set_placement(titlebar_id, titlebar.placement);
         state.append_renderable_surface(titlebar);
         state.set_test_effective_xdg_window_geometry(
             root_id,
@@ -2001,7 +2001,9 @@ mod task_05_8_tests {
         state.append_renderable_surface(test_surface(root_id, 944, 502));
         let mut child = test_surface(child_id, 100, 40);
         child.placement = SurfacePlacement::subsurface(root_id, 12, 8);
-        state.surface_placements.insert(child_id, child.placement);
+        state
+            .surface_topology
+            .set_placement(child_id, child.placement);
         state.append_renderable_surface(child);
         assert!(state.preview_resize_root_window_to(
             root_id,

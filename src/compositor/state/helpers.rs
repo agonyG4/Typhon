@@ -76,24 +76,3 @@ pub(in crate::compositor) fn update_renderable_surface_buffer(
     let _ = resize_commit;
     Ok(())
 }
-
-pub(in crate::compositor) fn root_surface_id_for_surface_in_placements(
-    placements: &HashMap<u32, SurfacePlacement>,
-    surface_id: u32,
-) -> u32 {
-    let mut current = surface_id;
-    for _ in 0..placements.len().saturating_add(1) {
-        let Some(parent) = placements
-            .get(&current)
-            .copied()
-            .unwrap_or_default()
-            .parent_surface_id
-            .filter(|parent_id| *parent_id != current)
-        else {
-            return current;
-        };
-        current = parent;
-    }
-
-    surface_id
-}

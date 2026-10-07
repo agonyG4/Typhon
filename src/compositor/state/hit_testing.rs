@@ -148,7 +148,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn root_surface_id_for_surface(&self, surface_id: u32) -> u32 {
-        root_surface_id_for_surface_in_placements(&self.surface_placements, surface_id)
+        self.surface_topology.root_surface_id(surface_id)
     }
 
     /// Return the root that owns the physically presented transform for an
@@ -161,8 +161,8 @@ impl CompositorState {
     ) -> u32 {
         let mut current = surface_id;
         for _ in 0..self
-            .surface_placements
-            .len()
+            .surface_topology
+            .placement_count()
             .saturating_add(self.popup_nodes.len())
             .saturating_add(1)
         {
@@ -170,10 +170,8 @@ impl CompositorState {
                 return node.owner_root_id;
             }
             let Some(parent_surface_id) = self
-                .surface_placements
-                .get(&current)
-                .copied()
-                .and_then(|placement| placement.parent_surface_id)
+                .surface_topology
+                .parent_surface_id(current)
                 .filter(|parent_surface_id| *parent_surface_id != current)
             else {
                 break;

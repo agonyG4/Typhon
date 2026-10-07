@@ -409,7 +409,7 @@ impl CompositorState {
             .is_some();
         self.clear_fullscreen_presentation_owner(surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgToplevel);
-        self.surface_placements.remove(&surface_id);
+        self.surface_topology.remove_placement(surface_id);
         self.xdg_configure_serials.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         if prepared_window_exit {
@@ -485,7 +485,7 @@ impl CompositorState {
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
         self.clear_xdg_window_geometry_state(surface_id);
-        self.surface_placements.remove(&surface_id);
+        self.surface_topology.remove_placement(surface_id);
         self.clear_popup_grab_for_surface_ids(&[surface_id]);
         self.popup_grab_stack.retain(|id| *id != surface_id);
         self.recent_input_serials
@@ -647,7 +647,7 @@ impl CompositorState {
         self.detach_popup_node(surface_id, PopupLifecycle::Destroyed);
         self.refresh_active_scene_popup_view();
         self.refresh_active_scene_surface_order();
-        self.surface_placements.remove(&surface_id);
+        self.surface_topology.remove_placement(surface_id);
         self.clear_xdg_window_geometry_state(surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         if !had_live_role {
@@ -779,26 +779,8 @@ impl CompositorState {
         surface_id: u32,
         ancestor_surface_id: u32,
     ) -> bool {
-        let mut current = surface_id;
-        for _ in 0..self.surface_placements.len().saturating_add(1) {
-            if current == ancestor_surface_id {
-                return true;
-            }
-            let Some(parent_surface_id) = self
-                .surface_placements
-                .get(&current)
-                .copied()
-                .and_then(|placement| placement.parent_surface_id)
-            else {
-                return false;
-            };
-            if parent_surface_id == current {
-                return false;
-            }
-            current = parent_surface_id;
-        }
-
-        false
+        self.surface_topology
+            .is_descendant_of(surface_id, ancestor_surface_id)
     }
 
     fn popup_owner_for_parent(&self, parent_id: u32) -> PopupOwner {
@@ -1464,13 +1446,10 @@ impl CompositorState {
         }
         self.clear_fullscreen_presentation_owner(root_surface_id);
 
-        let surface_placements = &self.surface_placements;
         let mut minimized_surfaces = Vec::new();
         let mut visible_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
         for surface in self.renderable_surfaces.drain(..) {
-            if root_surface_id_for_surface_in_placements(surface_placements, surface.surface_id)
-                == root_surface_id
-            {
+            if self.surface_topology.root_surface_id(surface.surface_id) == root_surface_id {
                 minimized_surfaces.push(surface);
             } else {
                 visible_surfaces.push(surface);
@@ -1698,10 +1677,8 @@ impl CompositorState {
                         .renderable_surfaces
                         .iter()
                         .filter(|surface| {
-                            root_surface_id_for_surface_in_placements(
-                                &self.surface_placements,
-                                surface.surface_id,
-                            ) == root_surface_id
+                            self.surface_topology.root_surface_id(surface.surface_id)
+                                == root_surface_id
                         })
                         .filter_map(|surface| {
                             PresentationRect::new(
@@ -2307,13 +2284,10 @@ impl CompositorState {
             let _ = self.raise_window_id(window_id);
         }
         let scene_effect = self.surface_is_visible_in_active_scene(surface_id);
-        let surface_placements = &self.surface_placements;
         let mut raised_surfaces = Vec::new();
         let mut lower_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
         for surface in self.renderable_surfaces.drain(..) {
-            if root_surface_id_for_surface_in_placements(surface_placements, surface.surface_id)
-                == surface_id
-            {
+            if self.surface_topology.root_surface_id(surface.surface_id) == surface_id {
                 raised_surfaces.push(surface);
             } else {
                 lower_surfaces.push(surface);

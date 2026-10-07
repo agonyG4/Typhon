@@ -1287,19 +1287,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let _ = reply.send(SubsurfaceStackStateSnapshot {
                             committed: server
                                 .state
-                                .committed_subsurface_stacks
-                                .get(&parent_id)
-                                .cloned(),
+                                .surface_topology
+                                .committed_stack(parent_id)
+                                .map(<[u32]>::to_vec),
                             latched: server
                                 .state
-                                .latched_subsurface_stacks
-                                .get(&parent_id)
-                                .cloned(),
+                                .surface_topology
+                                .latched_stack(parent_id)
+                                .map(<[u32]>::to_vec),
                             pending: server
                                 .state
-                                .pending_subsurface_stacks
-                                .get(&parent_id)
-                                .cloned(),
+                                .surface_topology
+                                .pending_stack(parent_id)
+                                .map(<[u32]>::to_vec),
                         });
                     }
                     ServerCommand::CaptureLayerSurfaceCommitState { surface_id, reply } => {
@@ -1913,9 +1913,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .is_some(),
                             placement: server
                                 .state
-                                .surface_placements
-                                .get(&tracked_surface_id)
-                                .copied(),
+                                .surface_topology
+                                .placement_entry(tracked_surface_id),
                             permanent_role: server.state.permanent_surface_role(tracked_surface_id),
                             xdg_association: server
                                 .state

@@ -503,7 +503,7 @@ fn tiled_dwindle_reflow_starts_from_pre_mutation_geometry_without_visual_history
         .expect("tiled insert");
     state.append_renderable_surface(test_renderable_surface(260, 640, 480));
     let source = WindowGeometry::new(SurfacePlacement::absolute_root_at(37, 49), 640, 480);
-    state.surface_placements.insert(260, source.placement);
+    state.surface_topology.set_placement(260, source.placement);
     state.renderable_surfaces[0].placement = source.placement;
     state.install_toplevel_visual_geometry(260, source);
     state.toplevel_visual_geometries.remove(&260);

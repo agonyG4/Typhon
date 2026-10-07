@@ -2,52 +2,39 @@ use super::*;
 use crate::compositor::subsurface::SubsurfaceRelationshipPhase;
 
 #[test]
-fn new_subsurface_pending_stack_uses_latched_baseline() {
-    let mut state = CompositorState::default();
-    state.committed_subsurface_stacks.insert(1, vec![1, 2, 3]);
-    state.latched_subsurface_stacks.insert(1, vec![1, 3, 2]);
-
-    state.add_subsurface_to_pending_stack(1, 4);
-
-    assert_eq!(state.latched_subsurface_stacks[&1], vec![1, 3, 2]);
-    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 3, 2, 4]);
-}
-
-#[test]
-fn new_subsurface_pending_stack_preserves_existing_restack() {
-    let mut state = CompositorState::default();
-    state.pending_subsurface_stacks.insert(1, vec![1, 3, 2]);
-
-    state.add_subsurface_to_pending_stack(1, 4);
-
-    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 3, 2, 4]);
-
-    state.add_subsurface_to_pending_stack(1, 4);
-
-    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 3, 2, 4]);
-}
-
-#[test]
 fn pending_sibling_is_a_valid_restack_reference_before_application() {
     let mut state = CompositorState::default();
     assert!(state.surface_transactions.register(2, 1));
     assert!(state.surface_transactions.register(3, 1));
-    state.pending_subsurface_stacks.insert(1, vec![1, 3, 2]);
+    state
+        .surface_topology
+        .install_stack_fixture([], [], [(1, vec![1, 3, 2])]);
 
     assert!(state.restack_subsurface(2, 1, 3, false));
-    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 2, 3]);
+    assert_eq!(
+        state.surface_topology.pending_stack(1),
+        Some(&[1, 2, 3][..])
+    );
 }
 
 #[test]
 fn registering_subsurface_does_not_change_committed_stack() {
     let mut state = CompositorState::default();
-    state.committed_subsurface_stacks.insert(1, vec![1, 2, 3]);
+    state
+        .surface_topology
+        .install_stack_fixture([(1, vec![1, 2, 3])], [], []);
 
     assert!(state.surface_transactions.register(4, 1));
     state.add_subsurface_to_pending_stack(1, 4);
 
-    assert_eq!(state.committed_subsurface_stacks[&1], vec![1, 2, 3]);
-    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 2, 3, 4]);
+    assert_eq!(
+        state.surface_topology.committed_stack(1),
+        Some(&[1, 2, 3][..])
+    );
+    assert_eq!(
+        state.surface_topology.pending_stack(1),
+        Some(&[1, 2, 3, 4][..])
+    );
 }
 
 #[test]

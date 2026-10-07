@@ -433,11 +433,12 @@ impl CompositorState {
         }
         self.renderable_surfaces = surfaces;
         self.rebuild_renderable_surface_index();
-        self.surface_placements = self
-            .renderable_surfaces
-            .iter()
-            .map(|surface| (surface.surface_id, surface.placement))
-            .collect();
+        self.surface_topology
+            .install_native_frame_placement_fixture(
+                self.renderable_surfaces
+                    .iter()
+                    .map(|surface| (surface.surface_id, surface.placement)),
+            );
         self.window_by_root_surface.clear();
         self.desktop_windows.clear();
         self.window_stacking.clear();

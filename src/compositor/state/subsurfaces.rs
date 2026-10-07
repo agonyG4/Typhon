@@ -404,11 +404,9 @@ impl CompositorState {
         let positions = self
             .surface_transactions
             .take_pending_positions_for_parent(surface_id);
-        let live_stack = self.pending_subsurface_stacks.remove(&surface_id);
-        if let Some(stack) = &live_stack {
-            self.latched_subsurface_stacks
-                .insert(surface_id, stack.clone());
-        }
+        let live_stack = self
+            .surface_topology
+            .take_pending_stack_for_capture(surface_id);
         let stack = live_stack.map(|stack| {
             self.surface_transactions
                 .capture_subsurface_stack(surface_id, stack)
@@ -781,32 +779,13 @@ impl CompositorState {
         changed
     }
 
-    pub(in crate::compositor) fn pending_stack_for_parent(
-        &mut self,
-        parent_id: u32,
-    ) -> &mut Vec<u32> {
-        self.pending_subsurface_stacks
-            .entry(parent_id)
-            .or_insert_with(|| {
-                self.latched_subsurface_stacks
-                    .get(&parent_id)
-                    .cloned()
-                    .or_else(|| self.committed_subsurface_stacks.get(&parent_id).cloned())
-                    .unwrap_or_else(|| vec![parent_id])
-            })
-    }
-
     pub(in crate::compositor) fn add_subsurface_to_pending_stack(
         &mut self,
         parent_id: u32,
         surface_id: u32,
     ) {
-        let stack = self.pending_stack_for_parent(parent_id);
-        stack.retain(|id| *id == parent_id || *id != surface_id);
-        if !stack.contains(&parent_id) {
-            stack.insert(0, parent_id);
-        }
-        stack.push(surface_id);
+        self.surface_topology
+            .add_child_to_pending_stack(parent_id, surface_id);
     }
 
     pub(in crate::compositor) fn restack_subsurface(
@@ -826,22 +805,8 @@ impl CompositorState {
         if !valid_reference {
             return false;
         }
-
-        let stack = self.pending_stack_for_parent(parent_id);
-        stack.retain(|id| *id == parent_id || *id != surface_id);
-        if !stack.contains(&parent_id) {
-            stack.insert(0, parent_id);
-        }
-        let Some(reference_index) = stack.iter().position(|id| *id == reference_id) else {
-            return false;
-        };
-        let insert_index = if above {
-            reference_index + 1
-        } else {
-            reference_index
-        };
-        stack.insert(insert_index.min(stack.len()), surface_id);
-        true
+        self.surface_topology
+            .restack_pending_child(surface_id, parent_id, reference_id, above)
     }
 
     fn apply_captured_subsurface_stack_for_parent(
@@ -869,11 +834,8 @@ impl CompositorState {
         }
         applied_stack.dedup();
         let changed = self
-            .committed_subsurface_stacks
-            .get(&parent_id)
-            .is_none_or(|current| *current != applied_stack);
-        self.committed_subsurface_stacks
-            .insert(parent_id, applied_stack);
+            .surface_topology
+            .commit_subsurface_stack(parent_id, applied_stack);
         if changed {
             self.reorder_renderable_surfaces_by_committed_stack();
             self.refresh_pointer_focus_at_last_position();
@@ -885,48 +847,17 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) {
-        self.committed_subsurface_stacks.remove(&surface_id);
-        self.latched_subsurface_stacks.remove(&surface_id);
-        self.pending_subsurface_stacks.remove(&surface_id);
-        for stack in self.committed_subsurface_stacks.values_mut() {
-            stack.retain(|id| *id != surface_id);
-            stack.dedup();
-        }
-        for stack in self.pending_subsurface_stacks.values_mut() {
-            stack.retain(|id| *id != surface_id);
-            stack.dedup();
-        }
-        for stack in self.latched_subsurface_stacks.values_mut() {
-            stack.retain(|id| *id != surface_id);
-            stack.dedup();
-        }
-        self.committed_subsurface_stacks.retain(|parent_id, stack| {
-            self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
-        });
-        self.pending_subsurface_stacks.retain(|parent_id, stack| {
-            self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
-        });
-        self.latched_subsurface_stacks.retain(|parent_id, stack| {
-            self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
-        });
+        let surface_resources = &self.surface_resources;
+        self.surface_topology
+            .cleanup_surface_stacks(surface_id, |parent_id| {
+                surface_resources.contains_key(&parent_id)
+            });
         self.reorder_renderable_surfaces_by_committed_stack();
     }
 
     fn detach_subsurface_from_parent_stack_lineage(&mut self, parent_id: u32, surface_id: u32) {
-        fn remove_from_stack(stacks: &mut HashMap<u32, Vec<u32>>, parent_id: u32, surface_id: u32) {
-            let Some(stack) = stacks.get_mut(&parent_id) else {
-                return;
-            };
-            stack.retain(|id| *id != surface_id);
-            stack.dedup();
-            if stack.len() <= 1 && stack.first().copied() == Some(parent_id) {
-                stacks.remove(&parent_id);
-            }
-        }
-
-        remove_from_stack(&mut self.committed_subsurface_stacks, parent_id, surface_id);
-        remove_from_stack(&mut self.latched_subsurface_stacks, parent_id, surface_id);
-        remove_from_stack(&mut self.pending_subsurface_stacks, parent_id, surface_id);
+        self.surface_topology
+            .detach_child_from_stack_lineage(parent_id, surface_id);
     }
 
     pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
@@ -1068,23 +999,8 @@ impl CompositorState {
                     debug_assert!(self.surface_resources.contains_key(&parent_id));
                 }
             }
-            for (parent_id, stack) in &self.committed_subsurface_stacks {
-                Self::debug_assert_subsurface_stack_invariant(*parent_id, stack);
-            }
-            for (parent_id, stack) in &self.latched_subsurface_stacks {
-                Self::debug_assert_subsurface_stack_invariant(*parent_id, stack);
-            }
-            for (parent_id, stack) in &self.pending_subsurface_stacks {
-                Self::debug_assert_subsurface_stack_invariant(*parent_id, stack);
-            }
+            self.surface_topology.debug_assert_stack_invariants();
         }
-    }
-
-    #[cfg(debug_assertions)]
-    fn debug_assert_subsurface_stack_invariant(parent_id: u32, stack: &[u32]) {
-        let mut stack_ids = HashSet::new();
-        debug_assert!(stack.iter().all(|surface_id| stack_ids.insert(*surface_id)));
-        debug_assert_eq!(stack.iter().filter(|id| **id == parent_id).count(), 1);
     }
 
     pub(in crate::compositor) fn take_and_bind_surface_presentation_feedbacks(
@@ -1118,65 +1034,6 @@ impl CompositorState {
                 feedback: feedback.feedback,
             })
             .collect()
-    }
-
-    pub(in crate::compositor) fn set_surface_placement(
-        &mut self,
-        surface_id: u32,
-        placement: SurfacePlacement,
-    ) -> bool {
-        self.set_surface_placement_with_cause(
-            surface_id,
-            placement,
-            RenderGenerationCause::SurfacePlacement,
-        )
-    }
-
-    pub(in crate::compositor) fn set_surface_placement_with_cause(
-        &mut self,
-        surface_id: u32,
-        placement: SurfacePlacement,
-        cause: RenderGenerationCause,
-    ) -> bool {
-        if self.surface_placement(surface_id) == placement {
-            return false;
-        }
-
-        self.store_surface_placement(surface_id, placement);
-        let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id) {
-            visual.placement = placement;
-        }
-
-        if let Some(surface) = self
-            .renderable_surfaces
-            .iter_mut()
-            .find(|surface| surface.surface_id == surface_id)
-        {
-            surface.placement = placement;
-            let refreshed_by_visual_assignment = self
-                .toplevel_visual_geometries
-                .contains_key(&root_surface_id)
-                || self.toplevel_surfaces.contains_key(&root_surface_id);
-            if refreshed_by_visual_assignment {
-                self.update_toplevel_visual_render_assignment(root_surface_id);
-            } else {
-                self.refresh_active_scene_surface_tree(root_surface_id);
-            }
-            if refreshed_by_visual_assignment {
-                self.compliance_metrics.prevented_duplicate_root_refreshes = self
-                    .compliance_metrics
-                    .prevented_duplicate_root_refreshes
-                    .saturating_add(1);
-            }
-            self.advance_render_generation_with_scene_effect(
-                cause,
-                self.surface_is_visible_in_active_scene(root_surface_id),
-            );
-            return true;
-        }
-
-        false
     }
 
     pub(in crate::compositor) fn refresh_surface_origin_cache(&mut self) {

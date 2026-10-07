@@ -795,10 +795,8 @@ impl CompositorState {
                 .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
         {
             let mut surface_ids = self
-                .surface_placements
-                .keys()
-                .copied()
-                .filter(|candidate| self.root_surface_id_for_surface(*candidate) == root_surface_id)
+                .surface_topology
+                .placement_surface_ids_for_root(root_surface_id)
                 .collect::<std::collections::HashSet<_>>();
             surface_ids.insert(surface_id);
             if let Some(window) = self.window_mut(window_id) {

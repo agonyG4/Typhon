@@ -4,10 +4,8 @@ use crate::xwayland::trace::{self, TraceFields};
 impl CompositorState {
     pub(in crate::compositor) fn retire_xwayland_attachment(&mut self, surface_id: u32) {
         let mut retired_ids = self
-            .surface_placements
-            .keys()
-            .copied()
-            .filter(|candidate| self.root_surface_id_for_surface(*candidate) == surface_id)
+            .surface_topology
+            .placement_surface_ids_for_root(surface_id)
             .collect::<std::collections::HashSet<_>>();
         retired_ids.insert(surface_id);
         self.xwayland
@@ -59,10 +57,8 @@ impl CompositorState {
         self.pending_xwayland_visual_content
             .remove(&root_surface_id);
         let mut surface_ids = self
-            .surface_placements
-            .keys()
-            .copied()
-            .filter(|surface_id| self.root_surface_id_for_surface(*surface_id) == root_surface_id)
+            .surface_topology
+            .placement_surface_ids_for_root(root_surface_id)
             .collect::<std::collections::HashSet<_>>();
         surface_ids.insert(root_surface_id);
 

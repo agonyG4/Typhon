@@ -79,7 +79,7 @@ fn active_lamp_geometry_stays_frozen_when_live_subsurface_moves() {
     child.height = 64;
     child.placement = SurfacePlacement::subsurface(root_surface_id, 16, 24);
     state.append_renderable_surface(child);
-    state.surface_placements.insert(
+    state.surface_topology.set_placement(
         root_surface_id + 1,
         SurfacePlacement::subsurface(root_surface_id, 16, 24),
     );
@@ -160,7 +160,7 @@ fn resolved_effect_lifecycle_source_uses_the_captured_surface_topology() {
     child.height = 64;
     child.placement = SurfacePlacement::subsurface(root_surface_id, 16, 24);
     state.append_renderable_surface(child);
-    state.surface_placements.insert(
+    state.surface_topology.set_placement(
         child_surface_id,
         SurfacePlacement::subsurface(root_surface_id, 16, 24),
     );
@@ -260,7 +260,7 @@ fn minimized_commit_keeps_live_buffer_with_captured_lifecycle_topology() {
     child.height = 64;
     child.placement = SurfacePlacement::subsurface(root_surface_id, 16, 24);
     state.append_renderable_surface(child);
-    state.surface_placements.insert(
+    state.surface_topology.set_placement(
         child_surface_id,
         SurfacePlacement::subsurface(root_surface_id, 16, 24),
     );
@@ -445,7 +445,7 @@ fn invalid_fresh_surface_snapshot_does_not_reserve_a_lifecycle_owner() {
     let mut child = ssd_test_surface(child_surface_id);
     child.placement = SurfacePlacement::subsurface(root_surface_id, 8, 12);
     state.append_renderable_surface(child);
-    state.surface_placements.insert(
+    state.surface_topology.set_placement(
         child_surface_id,
         SurfacePlacement::subsurface(root_surface_id, 8, 12),
     );

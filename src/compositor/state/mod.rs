@@ -70,10 +70,12 @@ mod surface_focus;
 mod surface_mapping;
 mod surface_pacing;
 mod surface_publication;
+mod surface_topology;
 #[cfg(test)]
 #[path = "surface_transactions/tests/ownership.rs"]
 mod surface_transaction_ownership_tests;
 pub(super) mod surface_transactions;
+pub(in crate::compositor) use surface_topology::SurfaceTopologyState;
 mod surface_tree_readiness;
 mod surfaces;
 mod synchronized_cache;

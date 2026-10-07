@@ -240,15 +240,21 @@ protocols are enabled only after the active native scanout backend is known.
 
 ## Surface geometry and decoration ownership
 
-For native XDG toplevels, `surface_placements` and
-`RenderableSurface::placement` own the compositor frame placement. Rendering,
-hit testing, popup placement, resize, and normal restore consume the central
-Effective XDG Window Geometry result. Once an explicit request becomes
-effective, its clamped rectangle remains the persistent authority until a new
-explicit request commits. A toplevel without effective explicit geometry uses
-the current logical bounds of its root surface and real `wl_subsurface`
-descendants; this implicit result follows committed tree changes and immediate
-topology mutations without becoming stored explicit state.
+`SurfaceTopologyState` owns canonical applied `SurfacePlacement` plus pending,
+latched, and committed subsurface stack order. Live `wl_subsurface` relationship
+identity, sync phase, and pending position remain in `SurfaceTransactionState`;
+a registered relationship is not applied placement until its parent commit is
+published. `RenderableSurface::placement` remains the synchronized render
+projection for live content. Rendering, hit testing, popup placement, resize,
+and normal restore query the topology owner or consume that render projection.
+
+Native XDG toplevels consume the central Effective XDG Window Geometry result.
+Once an explicit request becomes effective, its clamped rectangle remains the
+persistent authority until a new explicit request commits. A toplevel without
+effective explicit geometry uses the current logical bounds of its root surface
+and real `wl_subsurface` descendants; this implicit result follows committed
+tree changes and immediate topology mutations without becoming stored explicit
+state.
 
 An XDG popup's configured position is relative to its parent surface's
 effective XDG window-geometry origin. Typhon stores popup `SurfacePlacement`

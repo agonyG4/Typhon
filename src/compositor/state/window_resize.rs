@@ -489,11 +489,8 @@ impl CompositorState {
                 })
             });
         let Some((visual_placement, visual_width, visual_height, active_resize)) = visual else {
-            let placements = &self.surface_placements;
             for surface in &mut self.renderable_surfaces {
-                if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
-                    == root_surface_id
-                {
+                if self.surface_topology.root_surface_id(surface.surface_id) == root_surface_id {
                     surface.render_placement = None;
                     surface.visual_clip = None;
                 }
@@ -555,11 +552,8 @@ impl CompositorState {
                     SurfaceVisualAperture::logical_only(clip)
                 }
             });
-        let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
-            if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
-                != root_surface_id
-            {
+            if self.surface_topology.root_surface_id(surface.surface_id) != root_surface_id {
                 continue;
             }
             if surface.surface_id == root_surface_id {
@@ -668,11 +662,8 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) {
-        let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
-            if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
-                == root_surface_id
-            {
+            if self.surface_topology.root_surface_id(surface.surface_id) == root_surface_id {
                 surface.render_placement = None;
                 surface.visual_clip = None;
             }
