@@ -68,6 +68,15 @@ into the exact command-specific result type. Missing, null, incompatible, or
 malformed results are protocol errors (client exit `6`). Snapshot objects use
 strict version-one schemas and stable string vocabularies.
 
+`window.decoration-policy.set` accepts exactly an `id` and a `policy` of
+`server` or `client_preference`. Its command-specific success result contains
+`id`, the requested `policy`, and `effectiveMode`. The shared `windows` and
+`active-window` snapshots retain their original version-one schemas; they do
+not acquire decoration fields. Invalid policies and unknown window IDs use
+the existing `invalid_argument` error category. For an XDG window with a live
+decoration object, the reported effective mode continues to follow that
+object's configure, acknowledgement, and commit publication.
+
 Cursor mutation validation and final publication are dispatched on the native
 runtime thread. The transport only decodes bounded arguments and queues a
 response; it does not load cursor assets, access configuration files, create

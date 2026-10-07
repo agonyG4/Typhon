@@ -258,9 +258,17 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureNativeDecorationCount(Sender<usize>),
+    CaptureWindowDecorationState {
+        id: u64,
+        reply: Sender<Option<(String, String)>>,
+    },
     SetMostRecentWindowDecorationPolicy {
         policy: crate::wm::WindowDecorationPolicy,
         reply: Sender<bool>,
+    },
+    DispatchControlRequest {
+        request: crate::control::ControlRequest,
+        reply: Sender<crate::control::ControlResponse>,
     },
     CaptureNativeFrameSurfaceIds(Sender<Vec<u32>>),
     CaptureDirectScanoutSceneAnalysis(Sender<crate::compositor::DirectScanoutSceneAnalysis>),
@@ -1161,6 +1169,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .len();
                         let _ = reply.send(count);
                     }
+                    ServerCommand::CaptureWindowDecorationState { id, reply } => {
+                        let state = std::num::NonZeroU64::new(id)
+                            .map(crate::core::WindowId::new)
+                            .and_then(|id| {
+                                server.state.window(id).map(|window| {
+                                    (
+                                        window.decoration_policy.as_str().to_string(),
+                                        format!(
+                                            "{:?}",
+                                            server.state.effective_window_decoration_mode(id)
+                                        ),
+                                    )
+                                })
+                            });
+                        let _ = reply.send(state);
+                    }
                     ServerCommand::SetMostRecentWindowDecorationPolicy { policy, reply } => {
                         let changed =
                             server
@@ -1172,6 +1196,44 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     server.state.set_window_decoration_policy(window_id, policy)
                                 });
                         let _ = reply.send(changed);
+                    }
+                    ServerCommand::DispatchControlRequest { request, reply } => {
+                        let response = match crate::control::ControlCommand::parse(&request.command)
+                        {
+                            Some(crate::control::ControlCommand::Windows) => {
+                                match server
+                                    .control_window_list_snapshot()
+                                    .and_then(serde_json::to_value)
+                                {
+                                    Ok(result) => {
+                                        crate::control::ControlResponse::success(request.id, result)
+                                    }
+                                    Err(_) => crate::control::ControlResponse::failure(
+                                        request.id,
+                                        crate::control::ControlError::new(
+                                            crate::control::ControlErrorCode::Internal,
+                                            "window list snapshot failed",
+                                        ),
+                                    ),
+                                }
+                            }
+                            Some(crate::control::ControlCommand::WindowDecorationPolicySet) => {
+                                let (response, _visual_changed, _window_is_x11) = server
+                                    .dispatch_window_decoration_policy_control(
+                                        request.id,
+                                        request.args,
+                                    );
+                                response
+                            }
+                            _ => crate::control::ControlResponse::failure(
+                                request.id,
+                                crate::control::ControlError::new(
+                                    crate::control::ControlErrorCode::InvalidCommand,
+                                    "unknown control command",
+                                ),
+                            ),
+                        };
+                        let _ = reply.send(response);
                     }
                     ServerCommand::CaptureNativeFrameSurfaceIds(reply) => {
                         let _ = reply.send(

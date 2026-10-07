@@ -219,6 +219,43 @@ fn stop_server(commands: Sender<ServerCommand>, server_thread: JoinHandle<OwnCom
     stop_controllable_test_server(commands, server_thread);
 }
 
+fn astreactl_control_request(
+    commands: &Sender<ServerCommand>,
+    command: &'static str,
+    args: serde_json::Value,
+) -> Result<crate::control_snapshots::AstreactlResult, crate::astreactl::client::AstreactlError> {
+    let path = std::env::temp_dir().join(format!(
+        "astreactl-decoration-control-{}-{}.sock",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let commands = commands.clone();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request_bytes = Vec::new();
+        stream.read_to_end(&mut request_bytes).unwrap();
+        let request = crate::control::decode_request(&request_bytes).unwrap();
+        let (reply, response) = std::sync::mpsc::channel();
+        commands
+            .send(ServerCommand::DispatchControlRequest { request, reply })
+            .unwrap();
+        let response = response.recv_timeout(Duration::from_secs(2)).unwrap();
+        stream
+            .write_all(&crate::control::encode_response(&response).unwrap())
+            .unwrap();
+    });
+
+    let result =
+        crate::astreactl::client::request_with_args(&path, command, args, Duration::from_secs(2));
+    server.join().unwrap();
+    let _ = std::fs::remove_file(path);
+    result
+}
+
 fn expect_decoration_orphaned_error(connection: &Connection, decoration_id: u32) {
     let error = match connection.roundtrip() {
         Err(wayland_client::backend::WaylandError::Protocol(error)) => error,
@@ -231,6 +268,100 @@ fn expect_decoration_orphaned_error(connection: &Connection, decoration_id: u32)
         client_zxdg_toplevel_decoration_v1::Error::Orphaned as u32
     );
     assert_eq!(error.object_id, decoration_id);
+}
+
+#[test]
+fn astreactl_control_round_trip_sets_server_policy_for_xdg_without_decoration_object() {
+    let (socket_path, commands, server_thread) = start_server();
+    let client = MappedDecorationClient::connect(&socket_path, &commands, 1)
+        .expect("connect XDG client without a decoration object");
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    let windows = astreactl_control_request(&commands, "windows", serde_json::json!({}))
+        .expect("query window list through astreactl");
+    let window = match windows {
+        crate::control_snapshots::AstreactlResult::Windows(snapshot) => {
+            assert_eq!(snapshot.windows.len(), 1);
+            snapshot.windows.into_iter().next().unwrap()
+        }
+        _ => panic!("windows command returned the wrong typed result"),
+    };
+    assert_eq!(
+        window.kind,
+        crate::control_snapshots::WindowKindSnapshot::XdgToplevel
+    );
+    let window_id = window.id.0;
+    let (reply, state) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureWindowDecorationState {
+            id: window_id,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(
+        state.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Some(("client_preference".to_string(), "ClientSide".to_string()))
+    );
+
+    let configure_count_before = client.state.surface_configure_count;
+    let server_result = astreactl_control_request(
+        &commands,
+        "window.decoration-policy.set",
+        serde_json::json!({"id": window_id, "policy": "server"}),
+    )
+    .expect("server policy command succeeds");
+    match server_result {
+        crate::control_snapshots::AstreactlResult::WindowDecorationPolicy(snapshot) => {
+            assert_eq!(snapshot.id.0, window_id);
+            assert_eq!(snapshot.policy, "server");
+            assert_eq!(snapshot.effective_mode, "ServerSide");
+        }
+        _ => panic!("decoration policy command returned the wrong typed result"),
+    }
+    assert_eq!(client.state.surface_configure_count, configure_count_before);
+    assert_eq!(client.state.decoration_configure_count, 0);
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    let invalid_policy = astreactl_control_request(
+        &commands,
+        "window.decoration-policy.set",
+        serde_json::json!({"id": window_id, "policy": "invalid"}),
+    );
+    assert!(matches!(
+        invalid_policy,
+        Err(crate::astreactl::client::AstreactlError::Server(error))
+            if error.code.as_str() == "invalid_argument"
+    ));
+
+    let missing_window = astreactl_control_request(
+        &commands,
+        "window.decoration-policy.set",
+        serde_json::json!({"id": u64::MAX, "policy": "server"}),
+    );
+    assert!(matches!(
+        missing_window,
+        Err(crate::astreactl::client::AstreactlError::Server(error))
+            if error.code.as_str() == "invalid_argument"
+                && error.message == "unknown window id"
+    ));
+
+    let client_result = astreactl_control_request(
+        &commands,
+        "window.decoration-policy.set",
+        serde_json::json!({"id": window_id, "policy": "client_preference"}),
+    )
+    .expect("client preference command succeeds");
+    match client_result {
+        crate::control_snapshots::AstreactlResult::WindowDecorationPolicy(snapshot) => {
+            assert_eq!(snapshot.id.0, window_id);
+            assert_eq!(snapshot.policy, "client_preference");
+            assert_eq!(snapshot.effective_mode, "ClientSide");
+        }
+        _ => panic!("decoration policy command returned the wrong typed result"),
+    }
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+    drop(client);
+    stop_server(commands, server_thread);
 }
 
 #[test]

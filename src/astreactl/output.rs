@@ -72,11 +72,11 @@ pub fn human(result: &AstreactlResult) -> String {
             }
         }
         AstreactlResult::Windows(snapshot) => window_table(&snapshot.windows),
-        AstreactlResult::Window(window) => format!(
-            "Window {} decoration policy: {} (effective {})",
-            window.id.0,
-            sanitize_terminal_text(&window.decoration_policy),
-            sanitize_terminal_text(&window.decoration_mode)
+        AstreactlResult::WindowDecorationPolicy(snapshot) => format!(
+            "Window {} decoration policy: {} (effective mode: {})",
+            snapshot.id.0,
+            sanitize_terminal_text(&snapshot.policy),
+            sanitize_terminal_text(&snapshot.effective_mode)
         ),
         AstreactlResult::ActiveWindow(snapshot) => snapshot
             .window
@@ -270,7 +270,7 @@ fn window_table(windows: &[WindowSnapshot]) -> String {
     if windows.is_empty() {
         return "No windows".to_string();
     }
-    let mut rows = vec!["ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE".to_string()];
+    let mut rows = vec!["ID\tSTATE\tAPP\tTITLE".to_string()];
     rows.extend(windows.iter().map(|window| {
         let state = if window.minimized {
             "minimized"
@@ -280,11 +280,9 @@ fn window_table(windows: &[WindowSnapshot]) -> String {
             "unmapped"
         };
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}",
             window.id.0,
             state,
-            sanitize_terminal_text(&window.decoration_policy),
-            sanitize_terminal_text(&window.decoration_mode),
             sanitize_optional_text(window.app_id.as_deref()),
             sanitize_terminal_text(&window.title)
         )
@@ -338,6 +336,26 @@ mod tests {
     }
 
     #[test]
+    fn window_decoration_policy_output_shows_id_request_and_effective_mode() {
+        let value = AstreactlResult::WindowDecorationPolicy(
+            crate::control_snapshots::WindowDecorationPolicySnapshot {
+                id: ControlWindowId(7),
+                policy: "server".to_string(),
+                effective_mode: "ServerSide".to_string(),
+            },
+        );
+
+        assert_eq!(
+            human(&value),
+            "Window 7 decoration policy: server (effective mode: ServerSide)"
+        );
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({"id": 7, "policy": "server", "effectiveMode": "ServerSide"})
+        );
+    }
+
+    #[test]
     fn doctor_detail_is_displayed_and_sanitized() {
         let value = AstreactlResult::Doctor(DoctorSnapshot {
             healthy: false,
@@ -369,8 +387,6 @@ mod tests {
                 minimized: false,
                 maximized: false,
                 fullscreen: false,
-                decoration_policy: "client_preference".to_string(),
-                decoration_mode: "ClientSide".to_string(),
                 urgent: None,
                 skip_taskbar: false,
                 workspace: None,
@@ -383,7 +399,7 @@ mod tests {
         });
         assert_eq!(
             human(&value),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp\tTitle"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp\tTitle"
         );
     }
 
@@ -469,8 +485,6 @@ mod tests {
                 minimized: false,
                 maximized: false,
                 fullscreen: false,
-                decoration_policy: "client_preference".to_string(),
-                decoration_mode: "ClientSide".to_string(),
                 urgent: None,
                 skip_taskbar: false,
                 workspace: None,
@@ -487,30 +501,28 @@ mod tests {
     fn human_output_replaces_terminal_controls_without_mutating_json_values() {
         assert_eq!(
             human(&window_result("line1\nline2", "app")),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp\tline1 line2"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp\tline1 line2"
         );
         assert_eq!(
             human(&window_result("title", "app\tid")),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp id\ttitle"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp id\ttitle"
         );
         assert_eq!(
             human(&window_result("line1\rline2", "app")),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp\tline1 line2"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp\tline1 line2"
         );
         assert_eq!(
             human(&window_result("\u{1b}[31mred\u{1b}[0m", "app")),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp\t[31mred[0m"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp\t[31mred[0m"
         );
         assert_eq!(
             human(&window_result("\u{1b}]0;owned\u{7}Title", "app")),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp\t]0;owned Title"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp\t]0;owned Title"
         );
         let unicode = "λ".repeat(300);
         assert_eq!(
             human(&window_result(&unicode, "app")),
-            format!(
-                "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\tapp\t{unicode}"
-            )
+            format!("ID\tSTATE\tAPP\tTITLE\n7\tmapped\tapp\t{unicode}")
         );
     }
 
@@ -518,7 +530,7 @@ mod tests {
     fn normal_human_text_is_unchanged() {
         assert_eq!(
             human(&window_result("Normal Unicode — title", "org.example.App")),
-            "ID\tSTATE\tPOLICY\tDECORATION\tAPP\tTITLE\n7\tmapped\tclient_preference\tClientSide\torg.example.App\tNormal Unicode — title"
+            "ID\tSTATE\tAPP\tTITLE\n7\tmapped\torg.example.App\tNormal Unicode — title"
         );
     }
 

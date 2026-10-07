@@ -601,10 +601,6 @@ pub struct WindowSnapshot {
     pub minimized: bool,
     pub maximized: bool,
     pub fullscreen: bool,
-    #[serde(default)]
-    pub decoration_policy: String,
-    #[serde(default)]
-    pub decoration_mode: String,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub urgent: Option<bool>,
     pub skip_taskbar: bool,
@@ -616,6 +612,15 @@ pub struct WindowSnapshot {
     pub geometry: Option<GeometrySnapshot>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub focus_serial: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct WindowDecorationPolicySnapshot {
+    pub id: ControlWindowId,
+    pub policy: String,
+    pub effective_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,7 +955,7 @@ pub enum AstreactlResult {
     Doctor(DoctorSnapshot),
     Outputs(OutputListSnapshot),
     Windows(WindowListSnapshot),
-    Window(WindowSnapshot),
+    WindowDecorationPolicy(WindowDecorationPolicySnapshot),
     ActiveWindow(ActiveWindowSnapshot),
     KeyboardLayout(KeyboardLayoutSnapshot),
     KeyboardConfiguration(KeyboardConfigurationSnapshot),
@@ -1035,6 +1040,33 @@ pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_snapshot_serialization_keeps_the_strict_v1_schema() {
+        let v1 = serde_json::json!({
+            "id": 7,
+            "appId": null,
+            "title": "Game",
+            "pid": null,
+            "kind": "xdg_toplevel",
+            "mapped": true,
+            "active": false,
+            "minimized": false,
+            "maximized": false,
+            "fullscreen": false,
+            "urgent": null,
+            "skipTaskbar": false,
+            "workspace": null,
+            "output": null,
+            "geometry": null,
+            "focusSerial": null
+        });
+
+        let snapshot = serde_json::from_value::<WindowSnapshot>(v1.clone())
+            .expect("the established version-one window shape is accepted");
+
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), v1);
+    }
 
     #[test]
     fn output_snapshot_uses_strict_camel_case_mode_and_physical_fields() {
@@ -1320,8 +1352,6 @@ mod tests {
             minimized: false,
             maximized: false,
             fullscreen: false,
-            decoration_policy: "client_preference".to_string(),
-            decoration_mode: "ServerSide".to_string(),
             urgent: Some(true),
             skip_taskbar: false,
             workspace: Some("w".repeat(MAX_CONTROL_NAME_BYTES)),

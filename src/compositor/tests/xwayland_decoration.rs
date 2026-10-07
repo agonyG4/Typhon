@@ -148,8 +148,8 @@ fn runtime_decoration_policy_reconfigures_x11_frame_extents_and_snapshot() {
         .set_window_decoration_policy(window_id.get(), crate::wm::WindowDecorationPolicy::Server)
         .expect("window policy update");
     assert!(visual_changed);
-    assert_eq!(server_snapshot.decoration_policy, "server");
-    assert_eq!(server_snapshot.decoration_mode, "ServerSide");
+    assert_eq!(server_snapshot.policy, "server");
+    assert_eq!(server_snapshot.effective_mode, "ServerSide");
     assert_eq!(
         fixture.server.state.x11_effective_decoration_mode(handle),
         crate::compositor::decoration::types::DecorationMode::ServerSide
@@ -186,8 +186,8 @@ fn runtime_decoration_policy_reconfigures_x11_frame_extents_and_snapshot() {
         )
         .expect("client-preference policy update");
     assert!(visual_changed);
-    assert_eq!(client_snapshot.decoration_policy, "client_preference");
-    assert_eq!(client_snapshot.decoration_mode, "ClientSide");
+    assert_eq!(client_snapshot.policy, "client_preference");
+    assert_eq!(client_snapshot.effective_mode, "ClientSide");
     let commands = fixture.server.take_xwayland_backend_commands(0);
     assert!(commands.iter().any(|command| matches!(
         command,

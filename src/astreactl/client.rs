@@ -18,7 +18,7 @@ use crate::control_snapshots::{
     ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorSnapshot, KeyboardConfigurationSnapshot, KeyboardLayoutSnapshot,
     OutputListSnapshot, PerformanceSnapshot, StatusSnapshot, TrustedEffectsReloadSnapshot,
-    VersionSnapshot, WindowListSnapshot, WindowSnapshot,
+    VersionSnapshot, WindowDecorationPolicySnapshot, WindowListSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -86,7 +86,8 @@ fn decode_command_result(
             serde_json::from_value::<WindowListSnapshot>(value).map(AstreactlResult::Windows)
         }
         "window.decoration-policy.set" => {
-            serde_json::from_value::<WindowSnapshot>(value).map(AstreactlResult::Window)
+            serde_json::from_value::<WindowDecorationPolicySnapshot>(value)
+                .map(AstreactlResult::WindowDecorationPolicy)
         }
         "active-window" => {
             serde_json::from_value::<ActiveWindowSnapshot>(value).map(AstreactlResult::ActiveWindow)
@@ -461,6 +462,68 @@ mod tests {
                 Err(AstreactlError::MalformedResponse)
             ));
         }
+    }
+
+    #[test]
+    fn window_decoration_policy_response_decodes_to_its_command_type() {
+        let response = ControlResponse::success(
+            1,
+            serde_json::json!({
+                "id": 7,
+                "policy": "server",
+                "effectiveMode": "ServerSide"
+            }),
+        );
+
+        let decoded = decode_command_result("window.decoration-policy.set", response)
+            .expect("window decoration policy response");
+        match decoded {
+            AstreactlResult::WindowDecorationPolicy(snapshot) => {
+                assert_eq!(snapshot.id.0, 7);
+                assert_eq!(snapshot.policy, "server");
+                assert_eq!(snapshot.effective_mode, "ServerSide");
+            }
+            _ => panic!("window policy command returned the wrong typed result"),
+        }
+    }
+
+    #[test]
+    fn astreactl_request_accepts_a_window_decoration_policy_v1_response() {
+        let (path, listener) = socket();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = Vec::new();
+            stream.read_to_end(&mut request_bytes).unwrap();
+            let request: ControlRequest = serde_json::from_slice(&request_bytes).unwrap();
+            assert_eq!(request.command, "window.decoration-policy.set");
+            assert_eq!(
+                request.args,
+                serde_json::json!({"id": 7, "policy": "server"})
+            );
+            let response = ControlResponse::success(
+                request.id,
+                serde_json::json!({
+                    "id": 7,
+                    "policy": "server",
+                    "effectiveMode": "ServerSide"
+                }),
+            );
+            stream
+                .write_all(&crate::control::encode_response(&response).unwrap())
+                .unwrap();
+        });
+
+        let result = request_with_args(
+            &path,
+            "window.decoration-policy.set",
+            serde_json::json!({"id": 7, "policy": "server"}),
+            Duration::from_secs(1),
+        )
+        .expect("server result must be accepted by astreactl");
+
+        assert!(matches!(result, AstreactlResult::WindowDecorationPolicy(_)));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

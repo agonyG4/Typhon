@@ -33,9 +33,11 @@ astreactl cursor reload
 running compositor.
 
 `window decoration-policy` changes the explicit compositor policy for one
-window ID returned by `astreactl windows`. Its response reports that window's
-current policy and effective decoration mode. `astreactl windows` includes
-both values for qualification and diagnosis.
+window ID returned by `astreactl windows`. Use `server` to force server-side
+decoration or `client-preference` to restore the window's normal preference.
+The result names the window ID, requested policy, and effective decoration
+mode. The `windows` listing retains the strict protocol version-one snapshot
+shape and does not include decoration-policy fields.
 
 ## Options
 

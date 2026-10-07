@@ -1,9 +1,10 @@
 use super::OwnCompositorServer;
 use crate::compositor::window_state::ToplevelMode;
 use crate::compositor::{WindowBackend, WindowId};
+use crate::control::{ControlError, ControlErrorCode, ControlResponse};
 use crate::control_snapshots::{
-    ControlWindowId, GeometrySnapshot, WindowKindSnapshot, WindowListSnapshot, WindowSnapshot,
-    bounded_window_list,
+    ControlWindowId, GeometrySnapshot, WindowDecorationPolicySnapshot, WindowKindSnapshot,
+    WindowListSnapshot, WindowSnapshot, bounded_window_list,
 };
 use crate::wm::WindowManagementState;
 
@@ -371,8 +372,6 @@ impl OwnCompositorServer {
             minimized: window.state.is_minimized(),
             maximized: matches!(mode, ToplevelMode::Maximized),
             fullscreen: matches!(mode, ToplevelMode::Fullscreen),
-            decoration_policy: window.decoration_policy.as_str().to_string(),
-            decoration_mode: format!("{:?}", self.state.effective_window_decoration_mode(id)),
             urgent: None,
             skip_taskbar: x11 && window.is_auxiliary_x11_role(),
             workspace: control_workspace_label(window.management),
@@ -386,14 +385,90 @@ impl OwnCompositorServer {
         &mut self,
         id: u64,
         policy: crate::wm::WindowDecorationPolicy,
-    ) -> Option<(WindowSnapshot, bool)> {
+    ) -> Option<(WindowDecorationPolicySnapshot, bool)> {
         let id = std::num::NonZeroU64::new(id).map(crate::core::WindowId::new)?;
         self.state.window(id)?;
         let previous_generation = self.state.scene_render_generation;
         self.state.set_window_decoration_policy(id, policy);
         let visual_changed = self.state.scene_render_generation != previous_generation;
-        self.control_window_snapshot(id)
-            .map(|snapshot| (snapshot, visual_changed))
+        let window = self.state.window(id)?;
+        Some((
+            WindowDecorationPolicySnapshot {
+                id: ControlWindowId(window.id.get()),
+                policy: window.decoration_policy.as_str().to_string(),
+                effective_mode: format!("{:?}", self.state.effective_window_decoration_mode(id)),
+            },
+            visual_changed,
+        ))
+    }
+
+    pub fn dispatch_window_decoration_policy_control(
+        &mut self,
+        request_id: u64,
+        args: serde_json::Value,
+    ) -> (ControlResponse, bool, bool) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            id: u64,
+            policy: String,
+        }
+
+        let args = match serde_json::from_value::<Args>(args) {
+            Ok(args) => args,
+            Err(_) => {
+                return (
+                    ControlResponse::failure(
+                        request_id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "window.decoration-policy.set requires an id and policy",
+                        ),
+                    ),
+                    false,
+                    false,
+                );
+            }
+        };
+        let Some(policy) = crate::wm::WindowDecorationPolicy::parse(&args.policy) else {
+            return (
+                ControlResponse::failure(
+                    request_id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "policy must be server or client_preference",
+                    ),
+                ),
+                false,
+                false,
+            );
+        };
+        let window_is_x11 = std::num::NonZeroU64::new(args.id)
+            .map(crate::core::WindowId::new)
+            .and_then(|id| self.control_window_snapshot(id))
+            .is_some_and(|window| window.kind == WindowKindSnapshot::X11);
+        let Some((snapshot, visual_changed)) = self.set_window_decoration_policy(args.id, policy)
+        else {
+            return (
+                ControlResponse::failure(
+                    request_id,
+                    ControlError::new(ControlErrorCode::InvalidArgument, "unknown window id"),
+                ),
+                false,
+                false,
+            );
+        };
+        let response = match serde_json::to_value(snapshot) {
+            Ok(result) => ControlResponse::success(request_id, result),
+            Err(_) => ControlResponse::failure(
+                request_id,
+                ControlError::new(
+                    ControlErrorCode::Internal,
+                    "window decoration policy snapshot failed",
+                ),
+            ),
+        };
+        (response, visual_changed, window_is_x11)
     }
 
     pub fn control_window_list_snapshot(&self) -> Result<WindowListSnapshot, serde_json::Error> {

@@ -294,6 +294,7 @@ fn material_program_get_args_are_empty(args: serde_json::Value) -> bool {
 #[serde(deny_unknown_fields)]
 struct EmptyKeyboardLayoutArgs {}
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WindowDecorationPolicySetArgs {
@@ -867,41 +868,12 @@ impl NativeRuntime {
             ));
         };
         if command == ControlCommand::WindowDecorationPolicySet {
-            let args = match serde_json::from_value::<WindowDecorationPolicySetArgs>(request.args) {
-                Ok(args) => args,
-                Err(_) => {
-                    return Some(ControlResponse::failure(
-                        request.id,
-                        ControlError::new(
-                            ControlErrorCode::InvalidArgument,
-                            "window.decoration-policy.set requires an id and policy",
-                        ),
-                    ));
-                }
-            };
-            let Some(policy) = oblivion_one::wm::WindowDecorationPolicy::parse(&args.policy) else {
-                return Some(ControlResponse::failure(
-                    request.id,
-                    ControlError::new(
-                        ControlErrorCode::InvalidArgument,
-                        "policy must be server or client_preference",
-                    ),
-                ));
-            };
-            let Some((snapshot, visual_changed)) =
-                self.server.set_window_decoration_policy(args.id, policy)
-            else {
-                return Some(ControlResponse::failure(
-                    request.id,
-                    ControlError::new(ControlErrorCode::InvalidArgument, "unknown window id"),
-                ));
-            };
+            let (response, visual_changed, window_is_x11) = self
+                .server
+                .dispatch_window_decoration_policy_control(request.id, request.args);
             if visual_changed {
                 self.queued_redraw_requested = true;
-                if matches!(
-                    snapshot.kind.clone(),
-                    oblivion_one::control_snapshots::WindowKindSnapshot::X11
-                ) {
+                if window_is_x11 {
                     match self.dispatch_xwayland_scene_batch() {
                         Ok(repaint_requested) => {
                             self.queued_redraw_requested |= repaint_requested;
@@ -919,16 +891,7 @@ impl NativeRuntime {
                     }
                 }
             }
-            return Some(match serde_json::to_value(snapshot) {
-                Ok(result) => ControlResponse::success(request.id, result),
-                Err(_) => ControlResponse::failure(
-                    request.id,
-                    ControlError::new(
-                        ControlErrorCode::Internal,
-                        "window snapshot failed after decoration policy change",
-                    ),
-                ),
-            });
+            return Some(response);
         }
         if command == ControlCommand::OutputsConfigure {
             return self.dispatch_output_configure(token, request.id, request.args);
