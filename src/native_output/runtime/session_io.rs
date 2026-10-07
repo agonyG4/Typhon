@@ -548,10 +548,7 @@ impl NativeSessionIo for NativeRuntime {
             .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?
             .generation;
         self.presentation_timing.reconfigure(
-            KmsModeTiming::from_mode(
-                &self.target.mode,
-                1_000_000_000u64 / u64::from(self.refresh_hz.max(1)),
-            ),
+            KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
             generation,
         );
         self.abandon_direct_fallback();
@@ -638,8 +635,7 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn rearm_scheduler(&mut self) -> NativeResult<()> {
-        let refresh_interval =
-            Duration::from_nanos(1_000_000_000u64 / u64::from(self.refresh_hz.max(1)));
+        let refresh_interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
         self.presentation_deadline.invalidate(refresh_interval);
         self.scheduled_presentation_target = None;
         self.server.invalidate_commit_timing_targets();

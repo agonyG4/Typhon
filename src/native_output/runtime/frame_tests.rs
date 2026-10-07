@@ -109,6 +109,41 @@ fn resolved_native_frame_scene_excludes_culled_transition_owner() {
 }
 
 #[test]
+fn synchronous_modeset_candidate_is_a_client_free_transition_projection() {
+    let socket_name = format!("typhon-frame-modeset-candidate-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for synchronous modeset projection");
+    let surfaces = vec![
+        test_surface(631, 320, 200, SurfacePlacement::root_at(80, 70)),
+        test_surface(632, 1280, 800, SurfacePlacement::absolute_root_at(0, 0)),
+    ];
+    server.install_native_frame_test_scene(
+        surfaces,
+        &[
+            (631, WindowId::from_raw(631).expect("surface window id")),
+            (632, WindowId::from_raw(632).expect("fullscreen window id")),
+        ],
+        None,
+    );
+    let (callback, _client_peer) = server.test_queue_visible_frame_callback(631);
+    assert!(server.has_pending_frame_callbacks());
+    let ordinary = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(7));
+    assert_eq!(ordinary.surface_ids().count(), 2);
+
+    let candidate = ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(&server);
+
+    assert_eq!(candidate.surface_ids().count(), 0);
+    assert!(candidate.decorations.is_empty());
+    assert!(candidate.effects.instances.is_empty());
+    assert!(candidate.presentation.windows.is_empty());
+    assert!(candidate.lifecycle.samples.is_empty());
+    assert!(candidate.lifecycle_surfaces.is_empty());
+    assert!(candidate.window_exit_evidence.is_empty());
+    assert!(server.has_pending_frame_callbacks());
+    assert!(callback.is_alive());
+}
+
+#[test]
 fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
     let socket_name = format!("typhon-frame-restore-suppression-{}", process::id());
     let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)

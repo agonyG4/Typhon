@@ -11,6 +11,7 @@ use oblivion_one::native::kms::{
 };
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use oblivion_one::native::scheduler::NativeFrameScheduler;
+use oblivion_one::native_output::presentation::kms_timing::KmsModeTiming;
 use oblivion_one::private_config::{PrivateConfigError, PrivateConfigFile};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -618,8 +619,9 @@ impl NativeRuntime {
         &mut self,
         now_ns: u64,
     ) -> NativeResult<OutputConfigurationAdvance> {
+        let advance_started = Instant::now();
         if !self.parked_acquire_watches.is_empty() {
-            self.rearm_parked_acquire_watches()?;
+            self.rearm_output_acquire_watches(now_ns);
         }
         if self.pending_output_configuration.is_none()
             && let Some((transaction_id, target)) = self
@@ -753,57 +755,119 @@ impl NativeRuntime {
             self.fail_pending_output_configuration(pending, format!("TEST_ONLY: {error}"))?;
             return Ok(OutputConfigurationAdvance::Completed);
         }
+
+        if !self.scanout.can_retire_direct_after_synchronous_modeset() {
+            self.fail_pending_output_configuration(
+                pending,
+                "direct scanout ownership did not drain before synchronous modeset".to_string(),
+            )?;
+            return Ok(OutputConfigurationAdvance::Completed);
+        }
+
+        let prepared_transaction = match pending.operation {
+            OutputConfigurationOperation::TemporaryApply { previous } => {
+                let next_generation = self
+                    .output_configuration_generation
+                    .get()
+                    .wrapping_add(1)
+                    .max(1);
+                match self
+                    .output_configuration_transactions
+                    .prepare_temporary_apply(
+                        format!("output-{}", self.output_id.get()),
+                        previous,
+                        pending.target,
+                        next_generation,
+                    ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        self.fail_pending_output_configuration(
+                            pending,
+                            format!("confirmation transaction reservation failed: {error:?}"),
+                        )?;
+                        return Ok(OutputConfigurationAdvance::Completed);
+                    }
+                }
+            }
+            OutputConfigurationOperation::Rollback { .. } => None,
+        };
+
+        // Pause watch admission by not servicing explicit-sync changes while
+        // this pending request owns the cycle. Drain actual KMS ownership above,
+        // then park every remaining acquire obligation before the real commit.
+        match self
+            .acquire_watches
+            .park_for_session_suspend(&mut self.event_loop)
+        {
+            Ok(parked) => self.parked_acquire_watches.extend(parked),
+            Err(error) => {
+                if let Some(prepared) = prepared_transaction {
+                    self.output_configuration_transactions
+                        .cancel_prepared_temporary_apply(prepared);
+                }
+                self.rearm_output_acquire_watches(now_ns);
+                self.fail_pending_output_configuration(pending, error.to_string())?;
+                return Ok(OutputConfigurationAdvance::Completed);
+            }
+        }
+
+        let commit_started_at_ns = now_ns.saturating_add(
+            u64::try_from(advance_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        let commit_started = Instant::now();
         if let Err(error) = self
             .kms_backend
             .commit_runtime_modeset_candidate(&mut modeset)
         {
+            if let Some(prepared) = prepared_transaction {
+                self.output_configuration_transactions
+                    .cancel_prepared_temporary_apply(prepared);
+            }
+            self.rearm_output_acquire_watches(commit_started_at_ns);
             self.fail_pending_output_configuration(pending, format!("real commit: {error}"))?;
             return Ok(OutputConfigurationAdvance::Completed);
         }
         self.kms_backend
-            .adopt_runtime_modeset_candidate(modeset)
-            .map_err(io::Error::other)?;
-        self.publish_output_configuration(pending.target, &mut scanout, cursor, now_ns)?;
+            .adopt_committed_runtime_modeset_candidate(modeset);
+        let committed_at_ns = commit_started_at_ns
+            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+
+        if let Some(prepared) = prepared_transaction {
+            let transaction_id = self
+                .output_configuration_transactions
+                .finalize_temporary_apply(prepared, committed_at_ns);
+            self.publish_output_configuration(
+                pending.target,
+                &mut scanout,
+                cursor,
+                committed_at_ns,
+            );
+            self.perf.log("native.output_configuration_applied", || {
+                vec![
+                    NativePerfField::u64("transaction_id", transaction_id.get()),
+                    NativePerfField::u64(
+                        "configuration_generation",
+                        self.output_configuration_generation.get(),
+                    ),
+                    NativePerfField::u64("width", u64::from(self.target.width)),
+                    NativePerfField::u64("height", u64::from(self.target.height)),
+                ]
+            });
+            self.queue_output_snapshot_response_after_commit(pending.response);
+        } else {
+            self.publish_output_configuration(
+                pending.target,
+                &mut scanout,
+                cursor,
+                committed_at_ns,
+            );
+        }
 
         match pending.operation {
-            OutputConfigurationOperation::TemporaryApply { previous } => {
-                let transaction_id =
-                    match self
-                        .output_configuration_transactions
-                        .begin_temporary_apply(
-                            format!("output-{}", self.output_id.get()),
-                            previous,
-                            pending.target,
-                            self.output_configuration_generation.get(),
-                            now_ns,
-                        ) {
-                        Ok(transaction_id) => transaction_id,
-                        Err(error) => return Err(io::Error::other(format!(
-                            "temporary output applied without confirmation transaction: {error:?}"
-                        ))
-                        .into()),
-                    };
-                self.perf.log("native.output_configuration_applied", || {
-                    vec![
-                        NativePerfField::u64("transaction_id", transaction_id.get()),
-                        NativePerfField::u64(
-                            "configuration_generation",
-                            self.output_configuration_generation.get(),
-                        ),
-                        NativePerfField::u64("width", u64::from(self.target.width)),
-                        NativePerfField::u64("height", u64::from(self.target.height)),
-                    ]
-                });
-                self.queue_output_snapshot_response(pending.response)?;
-            }
+            OutputConfigurationOperation::TemporaryApply { .. } => {}
             OutputConfigurationOperation::Rollback { transaction_id } => {
                 self.output_configuration_transactions
-                    .complete_rollback(transaction_id)
-                    .map_err(|error| {
-                        io::Error::other(format!(
-                            "rollback transaction completion failed: {error:?}"
-                        ))
-                    })?;
+                    .finalize_committed_rollback(transaction_id);
                 if self.pending_output_persistence.as_ref().is_some_and(|job| {
                     matches!(job.purpose, OutputPersistencePurpose::Confirm { .. })
                 }) {
@@ -821,10 +885,56 @@ impl NativeRuntime {
                             NativePerfField::u64("height", u64::from(self.target.height)),
                         ]
                     });
-                self.queue_output_snapshot_response(pending.response)?;
+                self.queue_output_snapshot_response_after_commit(pending.response);
             }
         }
+        self.rearm_output_acquire_watches(committed_at_ns);
         Ok(OutputConfigurationAdvance::Completed)
+    }
+
+    fn rearm_output_acquire_watches(&mut self, now_ns: u64) {
+        if self.parked_acquire_watches.is_empty() {
+            self.output_reconfiguration_rearm_retry_deadline_ns = None;
+            return;
+        }
+        match self.acquire_watches.rearm_parked_requests(
+            std::mem::take(&mut self.parked_acquire_watches),
+            &mut self.event_loop,
+            now_ns,
+            &self.acquire_notifier,
+        ) {
+            Ok(already_ready) => {
+                for request in already_ready {
+                    let _ = self.server.mark_acquire_commit_ready(
+                        request.commit_id,
+                        request.surface_id,
+                        &request.acquire,
+                    );
+                }
+                self.output_reconfiguration_rearm_retry_deadline_ns = None;
+            }
+            Err(failure) => {
+                let (error, parked) = failure.into_parts();
+                self.parked_acquire_watches = parked;
+                self.output_reconfiguration_rearm_retry_deadline_ns =
+                    Some(now_ns.saturating_add(10_000_000));
+                self.perf.log("native.output_acquire_rearm_deferred", || {
+                    vec![NativePerfField::str("error", error.to_string())]
+                });
+            }
+        }
+    }
+
+    fn queue_output_snapshot_response_after_commit(
+        &mut self,
+        response: Option<(ReactorToken, u64)>,
+    ) {
+        if let Err(error) = self.queue_output_snapshot_response(response) {
+            self.perf
+                .log("native.output_configuration_response_deferred", || {
+                    vec![NativePerfField::str("error", error.to_string())]
+                });
+        }
     }
 
     fn output_configuration_safe_boundary(&self) -> OutputConfigurationSafeBoundary {
@@ -854,6 +964,7 @@ impl NativeRuntime {
                 cursor.pending_token().is_some() || cursor.worker_queued_submission().is_some()
             }) || self.cursor_output_arbitration.pending()
                 || self.pending_cursor_job.is_some(),
+            pacing_worker_reservation_owned: self.frame_pacing.worker_reservation_present(),
             output_render_fence_owned: self.output_render_fence_token.is_some(),
             deferred_worker_event_owned: self.deferred_worker_pageflip.is_some()
                 || self.deferred_worker_completion.is_some()
@@ -951,10 +1062,20 @@ impl NativeRuntime {
             .publish_effect_registry_generation((*effect_generation).clone())
             .map_err(io::Error::other)?;
         scanout.set_cursor_image(self.cursor_image.clone());
-        let scene = ResolvedNativeFrameScene::from_server(&self.server);
+        // The candidate framebuffer has target pixel dimensions while server
+        // geometry is deliberately still the old authoritative projection.
+        // Render a full-damage empty transition frame: no old logical
+        // coordinates or live client surface can be sampled, and protocol and
+        // lifecycle obligations stay pending for the first ordinary frame
+        // after publication.
+        let scene = ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(&self.server);
         let mut candidate_input_state = self.input_state.clone();
         candidate_input_state.reconfigure_output_bounds(target.width, target.height);
         let cursor = self.candidate_cursor_state(target);
+        let candidate_cursor_mode = match self.cursor_render_mode {
+            NativeCursorRenderMode::SoftwareClient => NativeCursorRenderMode::Software,
+            mode => mode,
+        };
         match &mut scanout {
             NativeScanoutBackend::AtomicEglGbm(explicit) => {
                 let slot = explicit.initial_slot();
@@ -966,7 +1087,7 @@ impl NativeRuntime {
                     &scene,
                     &self.server,
                     &candidate_input_state,
-                    self.cursor_render_mode,
+                    candidate_cursor_mode,
                     &NativeOutputDamage::full_output(target.width, target.height),
                     &mut gpu_sampling_started,
                 )? {
@@ -1000,7 +1121,7 @@ impl NativeRuntime {
                 &scene,
                 &self.server,
                 &candidate_input_state,
-                self.cursor_render_mode,
+                candidate_cursor_mode,
                 &NativeOutputDamage::full_output(target.width, target.height),
             )? {
                 NativePaintOutcome::Rendered { .. } => {
@@ -1038,9 +1159,9 @@ impl NativeRuntime {
         candidate_scanout: &mut NativeScanoutBackend,
         cursor: Option<AtomicCursorVisualState>,
         now_ns: u64,
-    ) -> NativeResult<()> {
+    ) {
         candidate_scanout.finish_initial_scanout();
-        self.scanout.release_direct_after_synchronous_modeset()?;
+        self.scanout.retire_direct_after_synchronous_modeset();
         std::mem::swap(&mut *self.scanout, candidate_scanout);
 
         self.target = target;
@@ -1051,10 +1172,16 @@ impl NativeRuntime {
         self.output_capabilities
             .mode_inventory
             .requalify(generation);
-        self.refresh_hz = native_mode_refresh_hz(&target.mode);
-        self.mode_label = format!("{}x{}@{}", target.width, target.height, self.refresh_hz);
+        self.output_refresh_rate = super::super::output::output_refresh_rate_for_mode(&target.mode);
+        self.mode_label = format!(
+            "{}x{}@{}",
+            target.width,
+            target.height,
+            self.output_refresh_rate.rounded_hz()
+        );
         self.server.set_output_size(target.width, target.height);
-        self.server.set_output_refresh_hz(self.refresh_hz);
+        self.server
+            .set_output_refresh_rate(self.output_refresh_rate);
         let input_effect = self
             .input_state
             .reconfigure_output_bounds(target.width, target.height);
@@ -1084,7 +1211,10 @@ impl NativeRuntime {
         self.presented_planes
             .rebase_after_synchronous_modeset(cursor_plane_state);
         self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
-        self.direct_scanout_qualification.invalidate();
+        // Validation keys are tied to the output's KMS geometry and plane
+        // state. Drop any qualification carried by the replacement scanout
+        // before allowing direct promotion on the next ordinary frame.
+        self.scanout.invalidate_direct_validation_cache();
         self.last_direct_candidate_key = None;
         self.scene_history.invalidate_presented_damage_history();
         self.last_client_cursor_damage = None;
@@ -1095,31 +1225,29 @@ impl NativeRuntime {
             .as_ref()
             .map_or(0, |cursor| cursor.desired_epoch());
         self.presentation_timing.reconfigure(
-            KmsModeTiming::from_mode(
-                &target.mode,
-                1_000_000_000u64 / u64::from(self.refresh_hz.max(1)),
-            ),
+            KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
             self.drm_file_generation,
         );
-        let interval = Duration::from_nanos(1_000_000_000u64 / u64::from(self.refresh_hz.max(1)));
+        let interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
         self.presentation_deadline.invalidate(interval);
         self.scheduled_presentation_target = None;
         self.server.invalidate_commit_timing_targets();
-        self.frame_scheduler = NativeFrameScheduler::new(self.refresh_hz, now_ns);
+        self.frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
+            self.output_refresh_rate.interval_ns(),
+            now_ns,
+        );
         self.render_journal.reset();
         self.adaptive_buffering.reset();
         self.pending_proven_deadline_miss = None;
         self.direct_fallback_tracker = None;
         self.queued_redraw_requested = true;
         self.frame_pacing.cancel_unsubmitted_render();
-        super::queue_visual_work(
+        super::queue_visual_work_after_synchronous_modeset(
             &mut self.frame_pacing,
             &mut self.frame_scheduler,
             now_ns,
             self.server.scene_render_generation(),
-            super::NativeVisualWorkQueueReason::SceneRepaint,
-        )?;
-        Ok(())
+        );
     }
 
     fn fail_pending_output_configuration(
@@ -1193,19 +1321,16 @@ fn output_mode_mutation_is_supported(
         )
 }
 
-fn native_mode_refresh_hz(mode: &drm_sys::drm_mode_modeinfo) -> u32 {
-    let refresh_millihz = crate::native_output::output::drm_mode_refresh_millihz(mode)
-        .unwrap_or_else(|| mode.vrefresh.saturating_mul(1_000));
-    let rounded_hz = refresh_millihz.saturating_add(500) / 1_000;
-    normalize_refresh_hz(rounded_hz.max(1))
-}
-
 pub(crate) const fn output_configuration_cycle_is_due(
     pending_request: bool,
     rollback_deadline_expired: bool,
     persistence_compensation_required: bool,
+    acquire_rearm_retry_due: bool,
 ) -> bool {
-    pending_request || rollback_deadline_expired || persistence_compensation_required
+    pending_request
+        || rollback_deadline_expired
+        || persistence_compensation_required
+        || acquire_rearm_retry_due
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1278,28 +1403,65 @@ mod tests {
 
     #[test]
     fn pending_persistence_compensation_keeps_the_runtime_cycle_armed() {
-        assert!(output_configuration_cycle_is_due(false, false, true));
-        assert!(output_configuration_cycle_is_due(true, false, false));
-        assert!(output_configuration_cycle_is_due(false, true, false));
-        assert!(!output_configuration_cycle_is_due(false, false, false));
+        assert!(output_configuration_cycle_is_due(false, false, true, false));
+        assert!(output_configuration_cycle_is_due(true, false, false, false));
+        assert!(output_configuration_cycle_is_due(false, true, false, false));
+        assert!(output_configuration_cycle_is_due(false, false, false, true));
+        assert!(!output_configuration_cycle_is_due(
+            false, false, false, false
+        ));
     }
 
     #[test]
-    fn applied_refresh_uses_exact_native_timing_when_vrefresh_is_missing() {
-        let mut mode = drm_sys::drm_mode_modeinfo {
-            clock: 407_835,
-            hdisplay: 1920,
-            hsync_start: 2008,
-            hsync_end: 2052,
-            htotal: 2200,
-            vdisplay: 1080,
-            vsync_start: 1084,
-            vsync_end: 1089,
-            vtotal: 1125,
-            ..Default::default()
-        };
-        assert_eq!(native_mode_refresh_hz(&mode), 165);
-        mode.vrefresh = 60;
-        assert_eq!(native_mode_refresh_hz(&mode), 165);
+    fn applied_refresh_and_interval_follow_one_native_timing_authority() {
+        for (clock, expected_millihz, expected_interval_ns) in [
+            (148_352, 59_940, 16_683_293),
+            (148_500, 60_000, 16_666_666),
+            (297_000, 120_000, 8_333_333),
+            (408_375, 165_000, 6_060_606),
+        ] {
+            let mode = drm_sys::drm_mode_modeinfo {
+                clock,
+                hdisplay: 1920,
+                hsync_start: 2008,
+                hsync_end: 2052,
+                htotal: 2200,
+                vdisplay: 1080,
+                vsync_start: 1084,
+                vsync_end: 1089,
+                vtotal: 1125,
+                ..Default::default()
+            };
+            let refresh = super::super::super::output::output_refresh_rate_for_mode(&mode);
+            let scheduler =
+                NativeFrameScheduler::new_with_refresh_interval_ns(refresh.interval_ns(), 0);
+            let mut deadline =
+                oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner::new(
+                    Duration::from_nanos(refresh.interval_ns()),
+                );
+            let deadline_target = deadline
+                .plan_normal(MonotonicTimestampNs::new(0), Duration::ZERO)
+                .expect("native refresh interval produces a deadline target");
+            let kms_timing = KmsModeTiming::from_mode(&mode, refresh.interval_ns());
+
+            assert_eq!(refresh.refresh_millihz(), expected_millihz);
+            assert_eq!(refresh.interval_ns(), expected_interval_ns);
+            assert_eq!(refresh.wl_output_millihertz(), expected_millihz as i32);
+            assert_eq!(
+                refresh.presentation_refresh_nsec(),
+                expected_interval_ns as u32
+            );
+            assert_eq!(scheduler.refresh_interval_ns(), expected_interval_ns);
+            assert_eq!(
+                kms_timing.refresh_interval_ns(),
+                expected_interval_ns,
+                "KMS presentation timing uses the native mode timing",
+            );
+            assert_eq!(
+                deadline_target.refresh_interval,
+                Duration::from_nanos(expected_interval_ns),
+                "presentation deadline uses the same native mode interval",
+            );
+        }
     }
 }

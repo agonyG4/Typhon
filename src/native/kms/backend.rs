@@ -711,6 +711,18 @@ impl<I: ModeBlobIo> PreparedAtomicRuntimeModeset<I> {
         })
     }
 
+    /// Consumes a candidate immediately after its successful real commit.
+    /// `commit_with` is the only operation that sets `committed`; the runtime
+    /// calls this on the same event-loop turn, with no fallible work in between.
+    pub(crate) fn adopt_committed(self) -> ActiveAtomicRuntimeMode<I> {
+        debug_assert!(self.committed, "only a committed modeset may be adopted");
+        ActiveAtomicRuntimeMode {
+            mode_blob: self.mode_blob,
+            mode: self.mode,
+            geometry: self.geometry,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn request(&self) -> &AtomicRequest {
         &self.request
@@ -808,6 +820,20 @@ impl DrmAtomicBackend {
         self.geometry = active.geometry;
         self.initial_property_count = assignment_count;
         Ok(())
+    }
+
+    /// Finalizes the runtime pipeline after the kernel accepted the exact
+    /// candidate request previously tested against this pipeline.
+    pub fn adopt_committed_runtime_modeset_candidate(
+        &mut self,
+        candidate: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+    ) {
+        let assignment_count = candidate.request.assignment_count();
+        let active = candidate.adopt_committed();
+        self.mode_blob = active.mode_blob;
+        self.mode = active.mode;
+        self.geometry = active.geometry;
+        self.initial_property_count = assignment_count;
     }
 
     pub fn test_initial_from_discovery(

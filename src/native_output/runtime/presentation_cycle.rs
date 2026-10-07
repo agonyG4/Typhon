@@ -227,7 +227,7 @@ impl NativeRuntime {
             kms_backend,
             target,
             mode_label,
-            refresh_hz,
+            output_refresh_rate,
             drm_file_generation,
             drm_timestamp_clock: _,
             presentation_clock: _,
@@ -484,7 +484,7 @@ impl NativeRuntime {
             frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
         }
         let scheduler_now = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let refresh_interval = super::plane_cycle::output_refresh_interval(*refresh_hz);
+        let refresh_interval = Duration::from_nanos(output_refresh_rate.interval_ns());
         let prediction = render_journal.prediction_at_with_kms_guard(
             scheduler_now,
             refresh_interval,
@@ -1010,7 +1010,7 @@ impl NativeRuntime {
                 target.crtc_id,
                 *drm_file_generation,
                 mode_label,
-                *refresh_hz,
+                output_refresh_rate.rounded_hz(),
                 compatibility_target,
                 compatibility_submit_window,
                 render_generation,
@@ -2424,7 +2424,7 @@ impl NativeRuntime {
                                 render_ahead,
                                 mode_label,
                                 *cursor_render_mode,
-                                *refresh_hz,
+                                output_refresh_rate.rounded_hz(),
                                 server.renderable_surfaces().len(),
                                 render_generation,
                                 scene_changed,

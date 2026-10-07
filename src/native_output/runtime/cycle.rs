@@ -467,6 +467,8 @@ impl NativeRuntime {
                 .deadline_ns()
                 .is_some_and(|deadline| deadline <= monotonic_now_ns().unwrap_or(0)),
             self.output_persistence_compensation_required,
+            self.output_reconfiguration_rearm_retry_deadline_ns
+                .is_some_and(|deadline| deadline <= monotonic_now_ns().unwrap_or(0)),
         );
         if output_configuration_cycle {
             let _ = self.advance_output_configuration(monotonic_now_ns()?)?;
@@ -1195,6 +1197,7 @@ impl NativeRuntime {
                 &request.acquire,
             );
         }
+        self.output_reconfiguration_rearm_retry_deadline_ns = None;
         Ok(())
     }
     fn dispatch_suspended_sources(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
@@ -1330,7 +1333,6 @@ impl NativeRuntime {
             kms_backend,
             target,
             mode_label,
-            refresh_hz,
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,

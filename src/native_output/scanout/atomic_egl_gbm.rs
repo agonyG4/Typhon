@@ -329,6 +329,29 @@ impl AtomicEglGbmScanout {
         self.release_direct_with_proof(DirectReleaseProof::SynchronousModeset)
     }
 
+    pub(crate) fn can_retire_direct_after_synchronous_modeset(&self) -> bool {
+        self.direct.ownership.submitted.is_none()
+    }
+
+    /// The caller has drained all pageflip and worker ownership and the
+    /// synchronous KMS modeset has completed, so the old primary is no longer
+    /// scanned out. Moving these owners out and dropping them releases each
+    /// client buffer obligation exactly once.
+    pub(crate) fn retire_direct_after_synchronous_modeset(&mut self) {
+        debug_assert!(self.direct.ownership.submitted.is_none());
+        if let DirectReleaseOutcome::Released {
+            presented,
+            suspended,
+        } = self
+            .direct
+            .ownership
+            .request_direct_release(DirectReleaseProof::SynchronousModeset, false)
+        {
+            drop(presented);
+            drop(suspended);
+        }
+    }
+
     fn release_direct_with_proof(&mut self, proof: DirectReleaseProof) -> io::Result<()> {
         match self.direct.request_direct_release(proof, false) {
             DirectReleaseOutcome::Released {

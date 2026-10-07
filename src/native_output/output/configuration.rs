@@ -75,6 +75,23 @@ pub(crate) struct OutputConfigurationTransaction {
     pub(crate) phase: OutputConfigurationTransactionPhase,
 }
 
+/// Transaction identity and rollback data reserved before the real KMS commit.
+/// It is deliberately not visible through `active()` until finalization.
+pub(crate) struct PreparedOutputConfigurationTransaction {
+    id: OutputConfigurationTransactionId,
+    output_id: String,
+    previous: NativeAppliedOutputConfiguration,
+    temporary: NativeAppliedOutputConfiguration,
+    applied_configuration_generation: u64,
+    timeout_ns: u64,
+}
+
+impl PreparedOutputConfigurationTransaction {
+    pub(crate) const fn id(&self) -> OutputConfigurationTransactionId {
+        self.id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputConfigurationTransactionError {
     Busy,
@@ -101,6 +118,7 @@ pub(crate) struct OutputConfigurationSafeBoundary {
     pub(crate) presentation_transaction_owned: bool,
     pub(crate) direct_scanout_pageflip_owned: bool,
     pub(crate) cursor_plane_work_owned: bool,
+    pub(crate) pacing_worker_reservation_owned: bool,
     pub(crate) output_render_fence_owned: bool,
     pub(crate) deferred_worker_event_owned: bool,
     pub(crate) explicit_sync_obligation_owned: bool,
@@ -129,9 +147,9 @@ impl OutputConfigurationSafeBoundary {
             || self.atomic_commit_arbiter_owned
             || self.direct_scanout_pageflip_owned
             || self.cursor_plane_work_owned
+            || self.pacing_worker_reservation_owned
             || self.output_render_fence_owned
-            || self.deferred_worker_event_owned
-            || self.explicit_sync_obligation_owned)
+            || self.deferred_worker_event_owned)
     }
 
     const fn is_safe_ignoring_output_render_fence(self) -> bool {
@@ -142,8 +160,8 @@ impl OutputConfigurationSafeBoundary {
             || self.presentation_transaction_owned
             || self.direct_scanout_pageflip_owned
             || self.cursor_plane_work_owned
-            || self.deferred_worker_event_owned
-            || self.explicit_sync_obligation_owned)
+            || self.pacing_worker_reservation_owned
+            || self.deferred_worker_event_owned)
     }
 }
 
@@ -153,6 +171,7 @@ impl OutputConfigurationSafeBoundary {
 pub(crate) struct OutputConfigurationTransactions {
     active: Option<OutputConfigurationTransaction>,
     next_id: Option<NonZeroU64>,
+    reserved_id: Option<OutputConfigurationTransactionId>,
 }
 
 impl OutputConfigurationTransactions {
@@ -160,6 +179,7 @@ impl OutputConfigurationTransactions {
         Self {
             active: None,
             next_id: NonZeroU64::new(1),
+            reserved_id: None,
         }
     }
 
@@ -168,9 +188,71 @@ impl OutputConfigurationTransactions {
     }
 
     pub(crate) fn can_begin(&self) -> bool {
-        self.active.is_none() && self.next_id.is_some()
+        self.active.is_none() && self.reserved_id.is_none() && self.next_id.is_some()
     }
 
+    pub(crate) fn prepare_temporary_apply(
+        &mut self,
+        output_id: impl Into<String>,
+        previous: NativeAppliedOutputConfiguration,
+        temporary: NativeAppliedOutputConfiguration,
+        applied_configuration_generation: u64,
+    ) -> Result<PreparedOutputConfigurationTransaction, OutputConfigurationTransactionError> {
+        if self.active.is_some() || self.reserved_id.is_some() {
+            return Err(OutputConfigurationTransactionError::Busy);
+        }
+        let id = self
+            .next_id
+            .map(OutputConfigurationTransactionId)
+            .ok_or(OutputConfigurationTransactionError::IdExhausted)?;
+        let prepared = PreparedOutputConfigurationTransaction {
+            id,
+            output_id: output_id.into(),
+            previous,
+            temporary,
+            applied_configuration_generation,
+            timeout_ns: OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS,
+        };
+        self.reserved_id = Some(id);
+        Ok(prepared)
+    }
+
+    /// Releases a precommit reservation. No transaction became visible and no
+    /// deadline was armed, so the unconsumed ID remains available.
+    pub(crate) fn cancel_prepared_temporary_apply(
+        &mut self,
+        prepared: PreparedOutputConfigurationTransaction,
+    ) {
+        if self.reserved_id == Some(prepared.id) {
+            self.reserved_id = None;
+        }
+    }
+
+    /// Moves the reserved transaction into the active slot after KMS commit.
+    /// The event loop is single threaded, and `reserved_id` blocks every other
+    /// transaction mutation while this reservation is held, so this has no
+    /// recoverable failure path.
+    pub(crate) fn finalize_temporary_apply(
+        &mut self,
+        prepared: PreparedOutputConfigurationTransaction,
+        committed_at_ns: u64,
+    ) -> OutputConfigurationTransactionId {
+        let id = prepared.id;
+        self.reserved_id = None;
+        self.next_id = id.0.get().checked_add(1).and_then(NonZeroU64::new);
+        self.active = Some(OutputConfigurationTransaction {
+            id,
+            output_id: prepared.output_id,
+            previous: prepared.previous,
+            temporary: prepared.temporary,
+            applied_configuration_generation: prepared.applied_configuration_generation,
+            rollback_deadline_ns: committed_at_ns.saturating_add(prepared.timeout_ns),
+            phase: OutputConfigurationTransactionPhase::PendingConfirmation,
+        });
+        id
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_temporary_apply(
         &mut self,
         output_id: impl Into<String>,
@@ -179,25 +261,13 @@ impl OutputConfigurationTransactions {
         applied_configuration_generation: u64,
         now_ns: u64,
     ) -> Result<OutputConfigurationTransactionId, OutputConfigurationTransactionError> {
-        if self.active.is_some() {
-            return Err(OutputConfigurationTransactionError::Busy);
-        }
-        let id = self
-            .next_id
-            .take()
-            .map(OutputConfigurationTransactionId)
-            .ok_or(OutputConfigurationTransactionError::IdExhausted)?;
-        self.next_id = id.0.get().checked_add(1).and_then(NonZeroU64::new);
-        self.active = Some(OutputConfigurationTransaction {
-            id,
-            output_id: output_id.into(),
+        let prepared = self.prepare_temporary_apply(
+            output_id,
             previous,
             temporary,
             applied_configuration_generation,
-            rollback_deadline_ns: now_ns.saturating_add(OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS),
-            phase: OutputConfigurationTransactionPhase::PendingConfirmation,
-        });
-        Ok(id)
+        )?;
+        Ok(self.finalize_temporary_apply(prepared, now_ns))
     }
 
     pub(crate) fn remaining_ms(&self, now_ns: u64) -> Option<u32> {
@@ -318,6 +388,23 @@ impl OutputConfigurationTransactions {
         }
         self.active = None;
         Ok(())
+    }
+
+    /// Finishes a rollback whose KMS restore commit has already succeeded.
+    /// The event-loop owns the transaction and cannot replace it between the
+    /// precommit validation and this finalization.
+    pub(crate) fn finalize_committed_rollback(&mut self, id: OutputConfigurationTransactionId) {
+        if self.active.as_ref().is_some_and(|transaction| {
+            transaction.id == id
+                && transaction.phase == OutputConfigurationTransactionPhase::RollingBack
+        }) {
+            self.active = None;
+        } else {
+            debug_assert!(
+                false,
+                "committed rollback lost its reserved transaction owner"
+            );
+        }
     }
 
     pub(crate) fn fail_rollback(
@@ -609,6 +696,36 @@ mod tests {
     }
 
     #[test]
+    fn prepared_display_transaction_reserves_identity_without_arming_deadline() {
+        let mut transactions = OutputConfigurationTransactions::new();
+        let previous = applied_configuration(1920, 1080, 148_352);
+        let temporary = applied_configuration(1280, 720, 74_176);
+
+        let prepared = transactions
+            .prepare_temporary_apply("output-1", previous, temporary, 2)
+            .expect("transaction capacity and identity are reserved before KMS commit");
+
+        assert_eq!(prepared.id().get(), 1);
+        assert!(transactions.active().is_none());
+        assert_eq!(transactions.deadline_ns(), None);
+        assert!(!transactions.can_begin());
+        assert!(matches!(
+            transactions.prepare_temporary_apply("output-1", previous, temporary, 2),
+            Err(OutputConfigurationTransactionError::Busy)
+        ));
+
+        let id = transactions.finalize_temporary_apply(prepared, 5_000_000_000);
+        assert_eq!(id.get(), 1);
+        assert_eq!(transactions.deadline_ns(), Some(20_000_000_000));
+        assert_eq!(
+            transactions
+                .active()
+                .map(|transaction| transaction.phase.clone()),
+            Some(OutputConfigurationTransactionPhase::PendingConfirmation)
+        );
+    }
+
+    #[test]
     fn every_existing_output_owner_blocks_the_synchronous_modeset_boundary() {
         let safe = OutputConfigurationSafeBoundary::default();
         assert!(safe.is_safe());
@@ -642,15 +759,26 @@ mod tests {
                 ..safe
             },
             OutputConfigurationSafeBoundary {
-                deferred_worker_event_owned: true,
+                pacing_worker_reservation_owned: true,
                 ..safe
             },
             OutputConfigurationSafeBoundary {
-                explicit_sync_obligation_owned: true,
+                deferred_worker_event_owned: true,
                 ..safe
             },
         ];
         assert!(blockers.into_iter().all(|boundary| !boundary.is_safe()));
+    }
+
+    #[test]
+    fn outstanding_acquire_fences_do_not_block_output_reconfiguration() {
+        let boundary = OutputConfigurationSafeBoundary {
+            explicit_sync_obligation_owned: true,
+            ..Default::default()
+        };
+
+        assert!(boundary.is_safe());
+        assert!(boundary.is_safe_to_retire_unsubmitted_ready_frame());
     }
 
     #[test]

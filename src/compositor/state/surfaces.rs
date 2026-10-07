@@ -1146,7 +1146,13 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
-        let output_refresh = OutputRefreshRate::from_hz(refresh_hz);
+        self.set_output_refresh_rate(OutputRefreshRate::from_hz(refresh_hz))
+    }
+
+    pub(in crate::compositor) fn set_output_refresh_rate(
+        &mut self,
+        output_refresh: OutputRefreshRate,
+    ) -> bool {
         if self.output_refresh == output_refresh {
             return false;
         }

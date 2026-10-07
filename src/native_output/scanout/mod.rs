@@ -600,6 +600,19 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn can_retire_direct_after_synchronous_modeset(&self) -> bool {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.can_retire_direct_after_synchronous_modeset(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => true,
+        }
+    }
+
+    pub(crate) fn retire_direct_after_synchronous_modeset(&mut self) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.retire_direct_after_synchronous_modeset();
+        }
+    }
+
     pub(crate) fn abandon_unsubmitted_compatibility_ready(&mut self) -> io::Result<bool> {
         match self {
             Self::NativeEglGbm(scanout) => {

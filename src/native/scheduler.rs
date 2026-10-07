@@ -260,14 +260,34 @@ impl NativeFrameScheduler {
         Self::with_watchdog(refresh_hz, anchor_ns, DEFAULT_PAGE_FLIP_WATCHDOG_NS)
     }
 
+    pub fn new_with_refresh_interval_ns(refresh_interval_ns: u64, anchor_ns: u64) -> Self {
+        Self::with_refresh_interval_and_watchdog(
+            refresh_interval_ns,
+            anchor_ns,
+            DEFAULT_PAGE_FLIP_WATCHDOG_NS,
+        )
+    }
+
     fn with_watchdog(refresh_hz: u32, anchor_ns: u64, watchdog_interval_ns: u64) -> Self {
         let refresh_hz = if refresh_hz == 0 {
             60
         } else {
             refresh_hz.clamp(30, 360)
         };
+        Self::with_refresh_interval_and_watchdog(
+            1_000_000_000 / u64::from(refresh_hz),
+            anchor_ns,
+            watchdog_interval_ns,
+        )
+    }
+
+    fn with_refresh_interval_and_watchdog(
+        refresh_interval_ns: u64,
+        anchor_ns: u64,
+        watchdog_interval_ns: u64,
+    ) -> Self {
         Self {
-            refresh_interval_ns: 1_000_000_000 / u64::from(refresh_hz),
+            refresh_interval_ns: refresh_interval_ns.max(1),
             anchor_ns,
             visual_work_queued: false,
             protocol_work_queued: false,
@@ -772,6 +792,13 @@ mod tests {
     #[test]
     fn worker_render_can_submit_when_next_commit_can_be_queued() {
         assert!(!rendered_primary_must_wait_for_lane(false, true, true));
+    }
+
+    #[test]
+    fn scheduler_keeps_the_native_fractional_refresh_interval() {
+        let scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(16_683_293, 0);
+
+        assert_eq!(scheduler.refresh_interval_ns(), 16_683_293);
     }
 
     fn render_ahead_context(

@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::compositor::OutputRefreshRate;
 use oblivion_one::control_snapshots::{
     FeatureState, MAX_CONTROL_OUTPUT_MODES, OutputModeSnapshot, PhysicalSizeSnapshot,
 };
@@ -377,6 +378,24 @@ pub(crate) fn drm_mode_refresh_millihz(mode: &drm_sys::drm_mode_modeinfo) -> Opt
             .then(|| mode.vrefresh.checked_mul(1000))
             .flatten()
     })
+}
+
+pub(crate) fn output_refresh_rate_for_mode(mode: &drm_sys::drm_mode_modeinfo) -> OutputRefreshRate {
+    let refresh_millihz =
+        drm_mode_refresh_millihz(mode).unwrap_or_else(|| mode.vrefresh.saturating_mul(1_000));
+    let refresh_millihz = if refresh_millihz == 0 {
+        60_000
+    } else {
+        refresh_millihz
+    };
+    let fallback_interval_ns = 1_000_000_000_000u64 / u64::from(refresh_millihz);
+    let interval_ns =
+        oblivion_one::native_output::presentation::kms_timing::KmsModeTiming::from_mode(
+            mode,
+            fallback_interval_ns,
+        )
+        .refresh_interval_ns();
+    OutputRefreshRate::from_native_timing(refresh_millihz, interval_ns)
 }
 
 pub(crate) fn physical_size_snapshot(

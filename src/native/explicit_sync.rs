@@ -139,8 +139,13 @@ pub struct ExplicitSyncWatchRegistry {
     watches_by_token: HashMap<ReactorToken, AcquireWatch>,
     watch_by_commit: HashMap<AcquireCommitId, ReactorToken>,
     fallback_requests: HashMap<AcquireCommitId, AcquireWatchRequest>,
+    parked_requests: Vec<AcquireWatchRequest>,
     fallback_schedule: FallbackSchedule,
     capability: SyncobjEventfdCapability,
+    // Generalized native-output ownership epoch. A synchronous output modeset
+    // advances it alongside DRM session-file replacement so stale acquire
+    // watches cannot outlive the KMS/framebuffer binding they were registered
+    // against; it is not a DRM file descriptor identity.
     drm_file_generation: u64,
     metrics: ExplicitSyncWatchMetrics,
     recent_completed_tokens: std::collections::VecDeque<ReactorToken>,
@@ -152,6 +157,7 @@ impl ExplicitSyncWatchRegistry {
             watches_by_token: HashMap::new(),
             watch_by_commit: HashMap::new(),
             fallback_requests: HashMap::new(),
+            parked_requests: Vec::new(),
             fallback_schedule: FallbackSchedule::new(refresh_interval_ns),
             capability: SyncobjEventfdCapability::Unknown,
             drm_file_generation,
@@ -176,8 +182,11 @@ impl ExplicitSyncWatchRegistry {
     }
 
     pub fn set_drm_file_generation(&mut self, generation: u64) {
+        // Callers must park every request before changing this epoch. Parked
+        // requests are owned outside the registry and are explicitly rebound.
         debug_assert!(self.watches_by_token.is_empty());
         debug_assert!(self.fallback_requests.is_empty());
+        debug_assert!(self.parked_requests.is_empty());
         self.drm_file_generation = generation;
     }
 
@@ -328,6 +337,7 @@ impl ExplicitSyncWatchRegistry {
         now_ns: u64,
         notifier: &N,
     ) -> Result<Vec<AcquireWatchRequest>, AcquireRearmFailure> {
+        parked.append(&mut self.parked_requests);
         let mut already_ready = Vec::new();
         while !parked.is_empty() {
             let request = parked.remove(0);
@@ -470,6 +480,7 @@ impl ExplicitSyncWatchRegistry {
         }
         self.fallback_requests.clear();
         self.fallback_schedule.entries.clear();
+        self.parked_requests.clear();
         if !self.watches_by_token.is_empty() || !self.watch_by_commit.is_empty() {
             self.metrics.leaked_watch_assertions =
                 self.metrics.leaked_watch_assertions.saturating_add(1);
@@ -484,13 +495,23 @@ impl ExplicitSyncWatchRegistry {
         &mut self,
         event_loop: &mut NativeEventLoop,
     ) -> io::Result<Vec<AcquireWatchRequest>> {
-        let parked = self
-            .watches_by_token
-            .values()
-            .map(|watch| watch.request.clone())
-            .chain(self.fallback_requests.values().cloned())
-            .collect::<Vec<_>>();
-        self.shutdown(event_loop)?;
+        let mut parked = std::mem::take(&mut self.parked_requests);
+        let tokens = self.watches_by_token.keys().copied().collect::<Vec<_>>();
+        for token in tokens {
+            match self.remove_eventfd_watch(token, event_loop) {
+                Ok(Some(request)) => parked.push(request),
+                Ok(None) => {}
+                Err(error) => {
+                    // Keep requests already removed from the reactor inside the
+                    // registry. Remaining watches still own their requests in
+                    // `watches_by_token` and will be returned by a later park.
+                    self.parked_requests = parked;
+                    return Err(error);
+                }
+            }
+        }
+        parked.extend(self.fallback_requests.drain().map(|(_, request)| request));
+        self.fallback_schedule.entries.clear();
         Ok(parked)
     }
 
@@ -1016,6 +1037,33 @@ mod tests {
                 .drm_file_generation,
             8
         );
+    }
+
+    #[test]
+    fn permanently_unsignaled_watch_is_parked_and_rearmed_for_output_generation() {
+        let notifier = FakeNotifier::pending();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let request = request(31, 41);
+        let AcquireRegistrationResult::EventfdBacked(commit_id) = registry
+            .register(request.clone(), &mut event_loop, 100, &notifier)
+            .unwrap()
+        else {
+            panic!("expected a pending eventfd watch");
+        };
+
+        let parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
+        registry.set_drm_file_generation(8);
+        let ready = registry
+            .rearm_parked_requests(parked, &mut event_loop, 200, &notifier)
+            .expect("an unsignaled fence remains a valid pending obligation");
+
+        assert!(ready.is_empty());
+        assert_eq!(registry.drm_file_generation, 8);
+        assert_eq!(registry.metrics().active_eventfd_watches, 1);
+        let rebound = &registry.watches_by_token[&registry.watch_by_commit[&commit_id]].request;
+        assert_eq!(rebound.commit_id, request.commit_id);
+        assert_eq!(rebound.surface_id, request.surface_id);
     }
 
     fn request_ids(requests: &[AcquireWatchRequest]) -> Vec<u64> {

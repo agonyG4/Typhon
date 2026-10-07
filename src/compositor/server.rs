@@ -20,11 +20,12 @@ use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
     AnimationTime, DirectScanoutSceneAnalysis, DmabufFeedbackDoctorState, DmabufKmsPreferredState,
     EffectFrameDemandSnapshot, FullscreenCompositionPlan, NativeFramePresentationTargets,
-    PresentationAnimationMetrics, PresentationCoverageContent, PresentationCoverageContentKind,
-    PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
-    PresentationSceneSample, PresentedWindowGeometry, RenderableSurface, ResolvedEffectScene,
-    SceneNodeId, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
-    SurfacePresentationCommitKey, SurfaceResourceSyncState, compositor_surface_id,
+    OutputRefreshRate, PresentationAnimationMetrics, PresentationCoverageContent,
+    PresentationCoverageContentKind, PresentationFrameSnapshot, PresentationGroupTransform,
+    PresentationRect, PresentationSceneSample, PresentedWindowGeometry, RenderableSurface,
+    ResolvedEffectScene, SceneNodeId, ShmBufferLifetimeMetrics, SurfaceCommitSequence,
+    SurfaceLocalityMetrics, SurfacePresentationCommitKey, SurfaceResourceSyncState,
+    compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -2183,7 +2184,11 @@ impl OwnCompositorServer {
     }
 
     pub fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
-        let changed = self.state.set_output_refresh_hz(refresh_hz);
+        self.set_output_refresh_rate(OutputRefreshRate::from_hz(refresh_hz))
+    }
+
+    pub fn set_output_refresh_rate(&mut self, output_refresh: OutputRefreshRate) -> bool {
+        let changed = self.state.set_output_refresh_rate(output_refresh);
         let _ = self.display.flush_clients();
         changed
     }

@@ -546,6 +546,8 @@ pub struct OutputSnapshot {
 #[serde(deny_unknown_fields)]
 pub enum OutputTransactionStateSnapshot {
     PendingConfirmation,
+    PersistencePending,
+    RollingBack,
     RollbackFailed,
 }
 

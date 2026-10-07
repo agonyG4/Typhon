@@ -2015,7 +2015,6 @@ impl NativeRuntime {
             kms_backend,
             target,
             mode_label,
-            refresh_hz,
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,
@@ -4337,21 +4336,31 @@ impl NativeRuntime {
                         OutputTransactionStateSnapshot::RollbackFailed,
                         Some(error_code.clone()),
                     ),
-                    OutputConfigurationTransactionPhase::PendingConfirmation
-                    | OutputConfigurationTransactionPhase::PersistencePending
-                    | OutputConfigurationTransactionPhase::RollingBack => {
+                    OutputConfigurationTransactionPhase::PendingConfirmation => {
                         (OutputTransactionStateSnapshot::PendingConfirmation, None)
                     }
+                    OutputConfigurationTransactionPhase::PersistencePending => {
+                        (OutputTransactionStateSnapshot::PersistencePending, None)
+                    }
+                    OutputConfigurationTransactionPhase::RollingBack => {
+                        (OutputTransactionStateSnapshot::RollingBack, None)
+                    }
+                };
+                let remaining_ms = match &transaction.phase {
+                    OutputConfigurationTransactionPhase::PendingConfirmation
+                    | OutputConfigurationTransactionPhase::PersistencePending => self
+                        .output_configuration_transactions
+                        .remaining_ms(now_ns)
+                        .unwrap_or(0),
+                    OutputConfigurationTransactionPhase::RollingBack
+                    | OutputConfigurationTransactionPhase::RollbackFailed { .. } => 0,
                 };
                 OutputTransactionSnapshot {
                     id: transaction.id.get(),
                     output_id: transaction.output_id.clone(),
                     state,
                     applied_configuration_generation: transaction.applied_configuration_generation,
-                    remaining_ms: self
-                        .output_configuration_transactions
-                        .remaining_ms(now_ns)
-                        .unwrap_or(0),
+                    remaining_ms,
                     error_code,
                 }
             });
@@ -4454,8 +4463,7 @@ impl NativeRuntime {
                 id: self.target.mode_id,
                 width: self.target.width,
                 height: self.target.height,
-                refresh_millihz: drm_mode_refresh_millihz(&self.target.mode)
-                    .unwrap_or_else(|| self.refresh_hz.saturating_mul(1000)),
+                refresh_millihz: self.output_refresh_rate.refresh_millihz(),
             }),
             physical_size_mm: self.output_capabilities.physical_size_mm.clone(),
             configuration_generation: self.output_configuration_generation.get(),

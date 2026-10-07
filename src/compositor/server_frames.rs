@@ -339,6 +339,25 @@ impl OwnCompositorServer {
         self.state.capture_frame_callbacks_for_render();
     }
 
+    #[doc(hidden)]
+    pub fn test_queue_visible_frame_callback(
+        &mut self,
+        surface_id: u32,
+    ) -> (wl_callback::WlCallback, std::os::unix::net::UnixStream) {
+        let (server_end, peer) =
+            std::os::unix::net::UnixStream::pair().expect("test callback client socket");
+        let mut display_handle = self.display.handle();
+        let client = display_handle
+            .insert_client(server_end, std::sync::Arc::new(()))
+            .expect("insert test callback client");
+        let callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(&display_handle, 1, ())
+            .expect("test callback resource");
+        self.state
+            .queue_frame_callbacks_for_surface(surface_id, vec![callback.clone()]);
+        (callback, peer)
+    }
+
     pub fn capture_frame_callbacks_for_render_with_presentation_samples(
         &mut self,
         presentation_samples: impl IntoIterator<Item = SurfacePresentationCommitKey>,

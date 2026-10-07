@@ -93,6 +93,7 @@ pub(crate) mod keyboard;
 mod layer_shell;
 mod lifecycle_compatibility;
 mod output;
+pub use output::OutputRefreshRate;
 mod pacing;
 mod plan;
 mod popup;
@@ -332,8 +333,8 @@ use lifecycle_compatibility::{
     LifecycleCompatibilityAction, LifecycleCompatibilityTrace, LifecycleCompatibilityViolation,
 };
 use output::{
-    OutputRefreshRate, OutputScale, OutputSize, send_output_description,
-    send_output_done_if_supported, send_output_mode, send_output_scale,
+    OutputScale, OutputSize, send_output_description, send_output_done_if_supported,
+    send_output_mode, send_output_scale,
 };
 use pacing::*;
 pub use plan::*;

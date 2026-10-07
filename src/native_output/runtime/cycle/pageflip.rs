@@ -660,7 +660,7 @@ impl NativeRuntime {
             kms_backend,
             target,
             mode_label: _,
-            refresh_hz,
+            output_refresh_rate,
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,
@@ -2062,7 +2062,7 @@ impl NativeRuntime {
                         callback_admission_ns: frame.callback_admission_ns,
                         callback_surface_id: frame.callback_surface_id,
                         callback_surface_is_exclusive: frame.callback_surface_is_exclusive,
-                        refresh_interval_ns: 1_000_000_000 / u64::from((*refresh_hz).max(1)),
+                        refresh_interval_ns: output_refresh_rate.interval_ns(),
                         render_missed: matches!(
                             outcome,
                             Some(KmsPresentationOutcome::RenderReadinessMiss)
@@ -2112,7 +2112,7 @@ impl NativeRuntime {
                     presented_at_ns,
                     submitted_at_ns,
                     pageflip.user_data,
-                    1_000_000u64 / u64::from((*refresh_hz).max(1)),
+                    output_refresh_rate.interval_ns() / 1_000,
                 );
                 let mut pacing_fields = vec![
                     frame_id_field(completed_frame_id),
@@ -2122,7 +2122,7 @@ impl NativeRuntime {
                 ];
                 pacing_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
                 frame_pacing.log("frame_complete", pacing_fields);
-                let refresh_interval_us = 1_000_000u64 / u64::from((*refresh_hz).max(1));
+                let refresh_interval_us = output_refresh_rate.interval_ns() / 1_000;
                 let cadence = presentation_cadence.record_with_refresh(
                     pageflip.sequence,
                     presented_at_ns / 1_000,

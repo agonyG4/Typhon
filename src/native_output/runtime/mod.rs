@@ -61,6 +61,39 @@ pub(crate) fn queue_visual_work(
     Ok(())
 }
 
+/// Used only after a synchronous modeset commit. The safe boundary has already
+/// drained worker reservations and the old unsubmitted render was canceled, so
+/// both scheduler owners can be mutated directly without a recoverable branch.
+pub(crate) fn queue_visual_work_after_synchronous_modeset(
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    now_ns: u64,
+    render_generation: u64,
+) {
+    let scheduler_visual_before = frame_scheduler.visual_work_queued();
+    let pacing_active_before = frame_pacing.active;
+    let worker_reservation_present = frame_pacing.worker_reservation_present();
+
+    frame_pacing.queue_visual(now_ns, render_generation);
+    frame_scheduler.queue_visual_work();
+
+    frame_pacing.log_visual_work_ownership(
+        "synchronous_modeset",
+        scheduler_visual_before,
+        frame_scheduler.visual_work_queued(),
+        pacing_active_before,
+        frame_pacing.active,
+        worker_reservation_present,
+        frame_pacing.active_worker_owned(),
+        render_generation,
+    );
+    debug_assert_eq!(
+        frame_scheduler.visual_work_queued(),
+        frame_pacing.active.is_some(),
+        "safe modeset boundary must leave scheduler and pacing ownership paired",
+    );
+}
+
 macro_rules! require_validation_base {
     ($context:expr, $redraw:ident) => {
         match $context {
@@ -631,7 +664,11 @@ pub(crate) struct NativeRuntime {
     output_configuration_transactions: OutputConfigurationTransactions,
     pending_output_configuration: Option<PendingOutputConfigurationRequest>,
     mode_label: String,
-    refresh_hz: u32,
+    output_refresh_rate: oblivion_one::compositor::OutputRefreshRate,
+    // Shared native-output ownership epoch. It changes after DRM session-file
+    // replacement and successful output modesets, and qualifies scanout pools,
+    // explicit-sync watches, pageflips, workers, cursor state, and presentation.
+    // It is not the semantic OutputConfigurationGeneration exposed to Settings.
     drm_file_generation: u64,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
@@ -690,6 +727,7 @@ pub(crate) struct NativeRuntime {
     output_configuration_persistence_worker_reactor_token: Option<ReactorToken>,
     pending_output_persistence: Option<PendingOutputPersistence>,
     next_output_persistence_job_id: u64,
+    output_reconfiguration_rearm_retry_deadline_ns: Option<u64>,
     output_persistence_compensation_required: bool,
     output_persistence_compensation_failed: bool,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,

@@ -67,23 +67,52 @@ impl Default for OutputScale {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct OutputRefreshRate {
-    refresh_hz: u32,
+pub struct OutputRefreshRate {
+    refresh_millihz: u32,
+    interval_ns: u64,
 }
 
 impl OutputRefreshRate {
     pub(super) fn from_hz(refresh_hz: u32) -> Self {
+        let refresh_millihz = normalize_refresh_hz(refresh_hz).saturating_mul(1_000);
         Self {
-            refresh_hz: normalize_refresh_hz(refresh_hz),
+            refresh_millihz,
+            interval_ns: 1_000_000_000_000u64 / u64::from(refresh_millihz.max(1)),
         }
     }
 
-    pub(super) fn wl_output_millihertz(self) -> i32 {
-        self.refresh_hz.saturating_mul(1_000) as i32
+    pub fn from_native_timing(refresh_millihz: u32, interval_ns: u64) -> Self {
+        if refresh_millihz == 0 {
+            return Self::from_hz(0);
+        }
+        Self {
+            refresh_millihz,
+            interval_ns: if interval_ns == 0 {
+                1_000_000_000_000u64 / u64::from(refresh_millihz)
+            } else {
+                interval_ns
+            },
+        }
     }
 
-    pub(super) fn presentation_refresh_nsec(self) -> u32 {
-        1_000_000_000 / self.refresh_hz.max(1)
+    pub const fn refresh_millihz(self) -> u32 {
+        self.refresh_millihz
+    }
+
+    pub const fn interval_ns(self) -> u64 {
+        self.interval_ns
+    }
+
+    pub fn rounded_hz(self) -> u32 {
+        self.refresh_millihz.saturating_add(500) / 1_000
+    }
+
+    pub fn wl_output_millihertz(self) -> i32 {
+        self.refresh_millihz.min(i32::MAX as u32) as i32
+    }
+
+    pub fn presentation_refresh_nsec(self) -> u32 {
+        self.interval_ns.min(u64::from(u32::MAX)) as u32
     }
 }
 
@@ -177,6 +206,22 @@ mod tests {
             OutputRefreshRate::from_hz(165).presentation_refresh_nsec(),
             6_060_606
         );
+    }
+
+    #[test]
+    fn native_refresh_preserves_fractional_wayland_rate_and_mode_interval() {
+        for (millihertz, interval_ns) in [
+            (59_940, 16_683_350),
+            (60_000, 16_666_666),
+            (120_000, 8_333_333),
+            (165_000, 6_060_606),
+        ] {
+            let refresh = OutputRefreshRate::from_native_timing(millihertz, interval_ns);
+
+            assert_eq!(refresh.wl_output_millihertz(), millihertz as i32);
+            assert_eq!(refresh.presentation_refresh_nsec(), interval_ns as u32);
+            assert_eq!(refresh.interval_ns(), interval_ns);
+        }
     }
 
     #[test]

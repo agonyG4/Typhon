@@ -45,7 +45,13 @@ impl NativeRuntime {
             cursor_response_deadline_ns: self.cursor_output_arbitration.wake_deadline_ns(now_ns),
             control_timeout_deadline_ns: control_timeout_deadline
                 .filter(|deadline| *deadline > now_ns),
-            output_configuration_deadline_ns: self.output_configuration_transactions.deadline_ns(),
+            output_configuration_deadline_ns: match (
+                self.output_configuration_transactions.deadline_ns(),
+                self.output_reconfiguration_rearm_retry_deadline_ns,
+            ) {
+                (Some(transaction), Some(retry)) => Some(transaction.min(retry)),
+                (transaction, retry) => transaction.or(retry),
+            },
             surface_pacing_deadline_ns: surface_pacing_deadline,
             dmabuf_retry_deadline_ns: dmabuf_retry_deadline,
             keyboard_repeat_deadline_ns: self

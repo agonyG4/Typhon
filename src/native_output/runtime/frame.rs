@@ -216,6 +216,45 @@ mod presentation_effect_influence_tests {
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
+    /// A synchronous modeset candidate is a conservative transition frame.
+    /// It contains no client surfaces, lifecycle sample, retained-window
+    /// evidence, or presentation animation. That keeps the new-size framebuffer
+    /// independent of the still-authoritative old logical output geometry and
+    /// leaves every live client presentation obligation for the next ordinary
+    /// frame after the KMS commit.
+    pub(crate) fn for_synchronous_output_reconfiguration(server: &'a OwnCompositorServer) -> Self {
+        let mut scene = Self::from_server(server);
+        let output_id = scene.presentation.output_id;
+        let sampled_at = scene.presentation.sampled_at;
+        let sample_time_source = scene.presentation.sample_time_source;
+        let presentation =
+            PresentationSceneSample::empty_for_output(output_id, sampled_at, sample_time_source);
+        let lifecycle = LifecycleSceneSample {
+            sampled_at,
+            samples: Vec::new(),
+        };
+
+        scene.surfaces = Cow::Owned(Vec::new());
+        scene.surface_scene_node_ids = Cow::Owned(Vec::new());
+        scene.presentation_owner_root_surface_ids = Cow::Owned(Vec::new());
+        scene.decorations.clear();
+        scene.popup_surface_ids = Cow::Owned(Vec::new());
+        scene.external_overlay_surface_ids.clear();
+        scene.visibility = FullscreenRenderPlanMetrics::default();
+        scene.snapshot = NativeSceneSnapshot::default();
+        scene.canonical_scene_evidence = None;
+        scene.scene_identity_signature = 0;
+        scene.effects = ResolvedEffectScene::default();
+        scene.presentation = presentation;
+        scene.presentation_snapshot = PresentationFrameSnapshot::from_sample(&scene.presentation);
+        scene.lifecycle = lifecycle;
+        scene.lifecycle_surfaces = Vec::new();
+        scene.lifecycle_decorations = Vec::new();
+        scene.lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&scene.lifecycle);
+        scene.window_exit_evidence.clear();
+        scene
+    }
+
     pub(crate) fn from_server(server: &'a OwnCompositorServer) -> Self {
         let (at, source) = AnimationTime::monotonic_now().map_or(
             (

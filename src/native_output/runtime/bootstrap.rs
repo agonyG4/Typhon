@@ -168,8 +168,7 @@ struct NativeRuntimeBootstrapTail {
     target: NativeAppliedOutputConfiguration,
     output_capabilities: NativeOutputCapabilities,
     mode_label: String,
-    refresh_hz: u32,
-    refresh_interval_ns: u64,
+    output_refresh_rate: oblivion_one::compositor::OutputRefreshRate,
     drm_file_generation: u64,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
@@ -206,8 +205,7 @@ impl NativeRuntime {
             target,
             output_capabilities,
             mode_label,
-            refresh_hz,
-            refresh_interval_ns,
+            output_refresh_rate,
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,
@@ -483,7 +481,12 @@ impl NativeRuntime {
             event_loop.register(fd, NativeEventSource::ChildSignal)?;
         }
         let scheduler_anchor_ns = monotonic_now_ns()?;
-        let mut frame_scheduler = NativeFrameScheduler::new(refresh_hz, scheduler_anchor_ns);
+        let refresh_interval_ns = output_refresh_rate.interval_ns();
+        let refresh_hz = output_refresh_rate.rounded_hz();
+        let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
+            refresh_interval_ns,
+            scheduler_anchor_ns,
+        );
         let refresh_interval = Duration::from_nanos(refresh_interval_ns);
         let triple_buffer_policy = AdaptiveTripleBufferPolicy::parse(
             std::env::var("OBLIVION_ONE_TRIPLE_BUFFERING")
@@ -643,7 +646,7 @@ impl NativeRuntime {
             output_configuration_transactions: OutputConfigurationTransactions::new(),
             pending_output_configuration: None,
             mode_label,
-            refresh_hz,
+            output_refresh_rate,
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,
@@ -700,6 +703,7 @@ impl NativeRuntime {
             output_configuration_persistence_worker_reactor_token,
             pending_output_persistence: None,
             next_output_persistence_job_id: 1,
+            output_reconfiguration_rearm_retry_deadline_ns: None,
             output_persistence_compensation_required: false,
             output_persistence_compensation_failed: false,
             kms_commit_worker_policy: requested_worker_policy,
@@ -913,10 +917,10 @@ impl NativeRuntime {
                 })
                 .unwrap_or("unknown")
         );
-        let mode_label = format!(
-            "{}x{}@{}",
-            target.width, target.height, target.mode.vrefresh
-        );
+        let output_refresh_rate = super::super::output::output_refresh_rate_for_mode(&target.mode);
+        let refresh_hz = output_refresh_rate.rounded_hz();
+        let refresh_interval_ns = output_refresh_rate.interval_ns();
+        let mode_label = format!("{}x{}@{}", target.width, target.height, refresh_hz);
         println!(
             "native scanout target: connector {}, crtc {}, {}x{}@{}Hz ({})",
             target.connector_id,
@@ -949,15 +953,13 @@ impl NativeRuntime {
                 NativePerfField::str("presentation_clock", drm_timestamp_clock.as_str()),
             ]
         });
-        let refresh_hz = normalize_refresh_hz(target.mode.vrefresh);
-        let refresh_interval_ns = 1_000_000_000 / u64::from(refresh_hz);
         println!(
             "native frame scheduler: {} Hz target, {} us absolute interval",
             refresh_hz,
             refresh_interval_ns / 1_000
         );
         server.set_output_size(target.width, target.height);
-        server.set_output_refresh_hz(refresh_hz);
+        server.set_output_refresh_rate(output_refresh_rate);
         let cursor_store = CursorConfigurationStore::from_environment()
             .unwrap_or_else(CursorConfigurationStore::unavailable);
         let cursor_manager =
@@ -1664,8 +1666,7 @@ impl NativeRuntime {
             target,
             output_capabilities,
             mode_label,
-            refresh_hz,
-            refresh_interval_ns,
+            output_refresh_rate,
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,
