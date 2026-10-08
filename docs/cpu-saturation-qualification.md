@@ -2,13 +2,17 @@
 
 ## Current result
 
-The V2 investigation found Typhon running natively and collected one 300-second
-idle baseline (598 valid probe samples). The user instructed us not to run
-Cyberpunk 2077, so the reported game workload and interaction condition were not
-reproduced. The idle data does not establish H1–H4 and does not qualify a runtime
-change. See the [V2 architecture review](cpu-saturation-architecture-review-v2.md)
-for source evidence, the idle sample summary, the upstream comparison, and the
-missing measurements. No runtime behavior changed.
+The October 8 Cyberpunk capture supplied with this task shows substantial native
+reactor contention and 22,613 repeated effect-owner warnings. It is evidence of
+contention, not proof that every reported stall had the same cause. The follow-up
+records the capture limits, the effects diagnostic repair, opt-in cycle CPU-time
+instrumentation, the RT safety decision, and the still-unrun hardware A/B:
+[October 8 follow-up](cpu-saturation-2026-10-08-followup.md).
+
+The earlier V2 idle-only result is historical. No Cyberpunk A/B run has yet
+qualified the code changes or established that CPU starvation is resolved. See
+the [V2 architecture review](cpu-saturation-architecture-review-v2.md) for the
+original idle trial and its evidence.
 
 ## Probe
 
@@ -73,12 +77,17 @@ bin/start-oblivion-one-tty
 ```
 
 The slow-cycle trace keeps at most 96 cycles that exceeded the refresh interval
-and dumps them on clean runtime teardown. It gives post-wake phase durations,
-input counts, render/submission state, timer lateness and wake context; it is not
-a percentile distribution of all cycles. The pointer trace keeps eight
-transition records and logs completed observations. It covers routing-to-input
-service, phase duration, cycle return and next reactor wake; it is not a generic
-input-event-to-physical-presentation latency measurement.
+by default and dumps them on clean runtime teardown. Set
+`TYPHON_SLOW_CYCLE_TRACE_CAPACITY` to a value from 1 through 65,536 to raise the
+bounded ring size. Set `TYPHON_SLOW_CYCLE_THREAD_CPU=1` to add opt-in
+`CLOCK_THREAD_CPUTIME_ID` samples; the reported wall-minus-CPU value is an
+off-CPU estimate, not scheduler run-queue delay. These options are described in
+the [October 8 follow-up](cpu-saturation-2026-10-08-followup.md). The trace gives
+post-wake phase durations, input counts, render/submission state, timer lateness
+and wake context; it is not a percentile distribution of all cycles. The pointer
+trace keeps eight transition records and logs completed observations. It covers
+routing-to-input service, phase duration, cycle return and next reactor wake; it
+is not a generic input-event-to-physical-presentation latency measurement.
 
 The presentation transaction trace is separately opt-in and defaults to a
 4096-event bounded ring. Its JSONL `PageflipPresented.timestamp_ns` events give
@@ -179,11 +188,12 @@ Report absolute p50/p95/p99 values, sample counts, individual trial spread, and
 whether counter/trace coverage was complete. The pointer trace is transition
 based and the slow-cycle ring is bounded; do not present either as complete
 per-event percentiles. A scheduler policy experiment should be considered only
-after H1 is supported and thread/child inheritance can be controlled. No `nice`,
-`SCHED_RR`, or cgroup-weight change is recommended for everyday use from the
-current evidence.
+after H1 is supported and thread/child inheritance can be controlled. The
+October 8 capture supports contention as a contributor, but the RT safety gate
+remains closed; see the follow-up for the specific recovery and inheritance
+blockers.
 
-## Evidence ledger for this checkout
+## Pre-October 8 V2 evidence ledger
 
 - **Observed in V2:** native Typhon was running with the reactor and worker
   threads on `SCHED_OTHER`. One 300-second idle probe trial recorded 598 valid

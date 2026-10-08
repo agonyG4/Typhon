@@ -41,6 +41,7 @@ Environment:
   OBLIVION_ONE_SCANOUT_BACKEND native scanout: auto, gpu/native-egl-gbm (explicit Atomic), native-egl-gbm-opaque (rollback), gbm-cpu-write/cpu, or dumb
   OBLIVION_ONE_NATIVE_APP_GPU  native apps: auto, gpu, or cpu
   OBLIVION_ONE_PROFILE   auto, debug, or release (default: auto; native uses release)
+  OBLIVION_ONE_BINARY    optional release binary path (default: repo target/release/oblivion-one)
   OBLIVION_ONE_PERF_LOG  set to 1/true/debug to emit structured native perf logs
   OBLIVION_ONE_LOG_FILE  native-session log path (default: ~/.local/state/oblivion-one/session.log)
 
@@ -115,7 +116,7 @@ unset DISPLAY
 
 command=()
 if [[ "$profile" == "release" ]]; then
-    release_binary="$repo_dir/target/release/oblivion-one"
+    release_binary="${OBLIVION_ONE_BINARY:-$repo_dir/target/release/oblivion-one}"
     command=("$release_binary" compositor --socket "$socket" "$@")
 elif [[ "$profile" == "debug" ]]; then
     command=(cargo run --manifest-path "$repo_dir/Cargo.toml" -- compositor --socket "$socket" "$@")
