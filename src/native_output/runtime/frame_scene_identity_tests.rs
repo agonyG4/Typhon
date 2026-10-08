@@ -1,5 +1,7 @@
 use super::frame::ResolvedNativeFrameScene;
-use super::frame_scene_identity::filter_surface_scene_nodes;
+use super::frame_scene_identity::{
+    filter_surface_scene_nodes, filter_surface_scene_nodes_with_owners,
+};
 use super::scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
 use super::*;
 use oblivion_one::compositor::{
@@ -125,6 +127,42 @@ fn filtering_active_surfaces_keeps_scene_node_identity_paired() {
         [902]
     );
     assert_eq!(nodes.as_ref(), &[node(8)]);
+}
+
+#[test]
+fn surface_identity_projections_reject_misaligned_slices_in_all_profiles() {
+    let two_surfaces = || vec![surface(905, 10, 10), surface(906, 20, 20)];
+    let scene_nodes = vec![node(17), node(18)];
+    let owner_roots = vec![905, 906];
+
+    let surfaces_without_owners = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        filter_surface_scene_nodes(
+            std::borrow::Cow::Owned(two_surfaces()),
+            std::borrow::Cow::Owned(vec![node(17)]),
+            |_| true,
+        )
+    }));
+    assert!(surfaces_without_owners.is_err());
+
+    let missing_scene_node = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        filter_surface_scene_nodes_with_owners(
+            std::borrow::Cow::Owned(two_surfaces()),
+            std::borrow::Cow::Owned(vec![node(17)]),
+            std::borrow::Cow::Owned(owner_roots.clone()),
+            |_| true,
+        )
+    }));
+    assert!(missing_scene_node.is_err());
+
+    let missing_owner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        filter_surface_scene_nodes_with_owners(
+            std::borrow::Cow::Owned(two_surfaces()),
+            std::borrow::Cow::Owned(scene_nodes),
+            std::borrow::Cow::Owned(vec![905]),
+            |_| true,
+        )
+    }));
+    assert!(missing_owner.is_err());
 }
 
 #[test]

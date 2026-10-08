@@ -76,7 +76,11 @@ pub(crate) fn filter_surface_scene_nodes<'a, F>(
 where
     F: FnMut(&RenderableSurface) -> bool,
 {
-    debug_assert_eq!(surfaces.len(), scene_nodes.len());
+    assert_eq!(
+        surfaces.len(),
+        scene_nodes.len(),
+        "native frame surfaces and SceneNode IDs must stay aligned before filtering"
+    );
     let mut filtered_surfaces = Vec::with_capacity(surfaces.len());
     let mut filtered_scene_nodes = Vec::with_capacity(scene_nodes.len());
     for (surface, scene_node) in surfaces.iter().zip(scene_nodes.iter().copied()) {
@@ -105,8 +109,16 @@ pub(crate) fn filter_surface_scene_nodes_with_owners<'a, F>(
 where
     F: FnMut(&RenderableSurface) -> bool,
 {
-    debug_assert_eq!(surfaces.len(), scene_nodes.len());
-    debug_assert_eq!(surfaces.len(), owner_roots.len());
+    assert_eq!(
+        surfaces.len(),
+        scene_nodes.len(),
+        "native frame surfaces and SceneNode IDs must stay aligned before filtering"
+    );
+    assert_eq!(
+        surfaces.len(),
+        owner_roots.len(),
+        "native frame surfaces and presentation owners must stay aligned before filtering"
+    );
     let mut filtered_surfaces = Vec::with_capacity(surfaces.len());
     let mut filtered_scene_nodes = Vec::with_capacity(scene_nodes.len());
     let mut filtered_owner_roots = Vec::with_capacity(owner_roots.len());
