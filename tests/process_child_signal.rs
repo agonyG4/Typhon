@@ -1,10 +1,14 @@
 use oblivion_one::process::{
     ChildExit, ChildSupervisor, ProcessGroupPolicy, ProcessKind, ProcessOptions, RestartPolicy,
-    SpawnCommand, block_sigchld_for_current_thread, sigchld_is_blocked_for_current_thread,
+    SpawnCommand, block_runtime_signals_for_current_thread, block_sigchld_for_current_thread,
+    prepare_child_signal_mask, prepare_runtime_signal_handling,
+    sigchld_is_blocked_for_current_thread,
 };
 use std::{
-    fs::File,
+    fs::{self, File, OpenOptions},
+    io::Write,
     os::fd::OwnedFd,
+    os::unix::process::CommandExt,
     process::Command,
     sync::{
         Arc,
@@ -17,6 +21,10 @@ use std::{
 const PROBE_MODE: &str = "TYPHON_CHILD_SIGNAL_PROBE";
 const PROBE_EXIT_CODE: &str = "TYPHON_CHILD_SIGNAL_PROBE_EXIT_CODE";
 const PROBE_ASSERT_UNRELATED: &str = "TYPHON_CHILD_SIGNAL_ASSERT_UNRELATED";
+const TERMINATION_FIXTURE_MODE: &str = "TYPHON_RUNTIME_SIGNAL_FIXTURE";
+const TERMINATION_FIXTURE_READY: &str = "TYPHON_RUNTIME_SIGNAL_READY";
+const TERMINATION_FIXTURE_EVENTS: &str = "TYPHON_RUNTIME_SIGNAL_EVENTS";
+const TERMINATION_FIXTURE_COUNT: &str = "TYPHON_RUNTIME_SIGNAL_COUNT";
 
 fn probe_command(exit_code: i32, descendant: bool) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -56,6 +64,9 @@ fn child_signal_mask_probe() {
     };
     assert!(mode == "direct" || mode == "descendant");
     assert!(!sigchld_is_blocked_for_current_thread().unwrap());
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        assert!(!signal_is_blocked(signal));
+    }
     if std::env::var_os(PROBE_ASSERT_UNRELATED).is_some() {
         assert!(signal_is_blocked(libc::SIGUSR1));
     }
@@ -70,6 +81,226 @@ fn child_signal_mask_probe() {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+#[test]
+fn managed_termination_signal_fixture() {
+    let Some(mode) = std::env::var_os(TERMINATION_FIXTURE_MODE) else {
+        return;
+    };
+    assert_eq!(mode, "signalfd");
+    let ready_path = std::env::var_os(TERMINATION_FIXTURE_READY).unwrap();
+    let events_path = std::env::var_os(TERMINATION_FIXTURE_EVENTS).unwrap();
+    let expected_count = std::env::var(TERMINATION_FIXTURE_COUNT)
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    prepare_runtime_signal_handling().unwrap();
+    let mut supervisor = ChildSupervisor::with_sigchld_reaper().unwrap();
+    let signal_fd = supervisor.signal_fd().unwrap();
+    fs::write(ready_path, b"ready").unwrap();
+
+    let mut handled = 0;
+    while handled < expected_count {
+        let mut ready = libc::pollfd {
+            fd: signal_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe {
+            // SAFETY: `ready` is a valid one-element poll array and the
+            // descriptor is owned by `supervisor` for the duration of poll.
+            libc::poll(&mut ready, 1, 5_000)
+        };
+        assert!(result > 0, "timed out waiting for a managed signal");
+        supervisor.reap_exited().unwrap();
+        let signal = supervisor.take_termination_signal().unwrap();
+        let mut events = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)
+            .unwrap();
+        writeln!(events, "{}", signal.as_str()).unwrap();
+        handled += 1;
+    }
+}
+
+fn signal_fixture_command(
+    ready_path: &std::path::Path,
+    events_path: &std::path::Path,
+    count: usize,
+) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("managed_termination_signal_fixture")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(TERMINATION_FIXTURE_MODE, "signalfd")
+        .env(TERMINATION_FIXTURE_READY, ready_path)
+        .env(TERMINATION_FIXTURE_EVENTS, events_path)
+        .env(TERMINATION_FIXTURE_COUNT, count.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    unsafe {
+        command.pre_exec(prepare_managed_signals_fixture_before_exec);
+    }
+    command
+}
+
+fn block_managed_signals_before_exec() -> std::io::Result<()> {
+    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&mut mask) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for signal in [
+        libc::SIGCHLD,
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGHUP,
+        libc::SIGQUIT,
+    ] {
+        if unsafe { libc::sigaddset(&mut mask, signal) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let result = unsafe { libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn prepare_managed_signals_fixture_before_exec() -> std::io::Result<()> {
+    block_managed_signals_before_exec()?;
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    action.sa_sigaction = libc::SIG_IGN;
+    action.sa_flags = 0;
+    for signal in [
+        libc::SIGCHLD,
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGHUP,
+        libc::SIGQUIT,
+    ] {
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_signal_fixture(ready_path: &std::path::Path, child: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if ready_path.exists() {
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "signal fixture exited before ready"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("signal fixture did not become ready");
+}
+
+fn wait_for_signal_events(
+    events_path: &std::path::Path,
+    expected_count: usize,
+    child: &mut std::process::Child,
+) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let events = fs::read_to_string(events_path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if events.len() >= expected_count {
+            return events;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "signal fixture exited before handling signals"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("signal fixture did not handle {expected_count} signals");
+}
+
+fn signal_test_paths(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::path::Path::new("/mnt/Aether/Desktop/GitHub/Typhon-target")
+        .join("signal-test-data")
+        .join(format!(
+            "typhon-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    fs::create_dir_all(&root).unwrap();
+    (root.join("ready"), root.join("events"))
+}
+
+#[test]
+fn compositor_signal_delivery_is_graceful_for_direct_and_process_group_targets() {
+    for (name, signal_number, signal_name, group_delivery) in [
+        ("hup", libc::SIGHUP, "SIGHUP", false),
+        ("int", libc::SIGINT, "SIGINT", false),
+        ("quit", libc::SIGQUIT, "SIGQUIT", false),
+        ("term", libc::SIGTERM, "SIGTERM", false),
+        ("group-term", libc::SIGTERM, "SIGTERM", true),
+    ] {
+        let (ready_path, events_path) = signal_test_paths(name);
+        let mut child = signal_fixture_command(&ready_path, &events_path, 1)
+            .spawn()
+            .unwrap();
+        wait_for_signal_fixture(&ready_path, &mut child);
+        let pid = i32::try_from(child.id()).unwrap();
+        let target = if group_delivery { -pid } else { pid };
+        assert_eq!(unsafe { libc::kill(target, signal_number) }, 0);
+        assert_eq!(
+            wait_for_signal_events(&events_path, 1, &mut child),
+            [signal_name]
+        );
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(ready_path.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn compositor_repeated_signals_are_received_without_forcing_process_exit() {
+    let (ready_path, events_path) = signal_test_paths("repeated-signal");
+    let mut child = signal_fixture_command(&ready_path, &events_path, 2)
+        .spawn()
+        .unwrap();
+    wait_for_signal_fixture(&ready_path, &mut child);
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGTERM) },
+        0
+    );
+    assert_eq!(
+        wait_for_signal_events(&events_path, 1, &mut child),
+        ["SIGTERM"]
+    );
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGTERM) },
+        0
+    );
+    assert_eq!(
+        wait_for_signal_events(&events_path, 2, &mut child),
+        ["SIGTERM", "SIGTERM"]
+    );
+    assert!(child.wait().unwrap().success());
+    fs::remove_dir_all(ready_path.parent().unwrap()).unwrap();
 }
 
 fn signal_is_blocked(signal: libc::c_int) -> bool {
@@ -116,7 +347,7 @@ fn block_signal_for_test(signal: libc::c_int) {
 }
 
 #[test]
-fn supervisor_spawn_unblocks_sigchld_only_in_the_child() {
+fn supervisor_spawn_unblocks_managed_signals_only_in_the_child() {
     block_sigchld_for_current_thread().unwrap();
     assert!(sigchld_is_blocked_for_current_thread().unwrap());
     let mut supervisor = ChildSupervisor::with_sigchld_reaper().unwrap();
@@ -128,6 +359,19 @@ fn supervisor_spawn_unblocks_sigchld_only_in_the_child() {
         .unwrap();
     assert!(sigchld_is_blocked_for_current_thread().unwrap());
     assert_eq!(reap_pid(&mut supervisor, pid).status.code(), Some(0));
+}
+
+#[test]
+fn direct_command_signal_reset_unblocks_typhon_signals_only_in_the_child() {
+    block_runtime_signals_for_current_thread().unwrap();
+    block_signal_for_test(libc::SIGUSR1);
+    let mut command = probe_command(0, false);
+    command.env(PROBE_ASSERT_UNRELATED, "1");
+    prepare_child_signal_mask(&mut command);
+    let mut child = command.spawn().unwrap();
+
+    assert!(sigchld_is_blocked_for_current_thread().unwrap());
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]

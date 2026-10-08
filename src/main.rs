@@ -183,10 +183,10 @@ fn import_activation_environment(socket_name: &str) {
         runtime_dir.as_deref(),
     );
 
-    match Command::new("dbus-update-activation-environment")
-        .args(&args)
-        .status()
-    {
+    let mut command = Command::new("dbus-update-activation-environment");
+    command.args(&args);
+    oblivion_one::process::prepare_child_signal_mask(&mut command);
+    match command.status() {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!(
             "oblivion-one: D-Bus activation environment update failed with status {status}"
@@ -278,9 +278,12 @@ fn native_protocol_names() -> Vec<&'static str> {
 }
 
 fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
-    // Block process-directed SIGCHLD before constructing the Wayland server or
-    // entering any native driver, graphics-library, or worker initialization.
-    oblivion_one::process::block_sigchld_for_current_thread()?;
+    if !options.check_only {
+        // Block process-directed child and termination signals before
+        // constructing the Wayland server or entering native initialization.
+        // The runtime signalfd later routes them through the native reactor.
+        oblivion_one::process::prepare_runtime_signal_handling()?;
+    }
     let plan = CompositorPlan::new(&options.socket_name)
         .with_frame_pacing_capabilities(FramePacingProtocolCapabilities::qualified_native());
     println!("Typhon native compositor");

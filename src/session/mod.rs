@@ -194,13 +194,14 @@ fn seat_manager_available() -> bool {
 }
 
 fn pkg_config_library_exists(name: &str) -> bool {
-    Command::new("pkg-config")
+    let mut command = Command::new("pkg-config");
+    command
         .arg("--exists")
         .arg(name)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    crate::process::prepare_child_signal_mask(&mut command);
+    command.status().is_ok_and(|status| status.success())
 }
 
 fn first_device_with_prefix(root: &Path, prefix: &str) -> Option<PathBuf> {

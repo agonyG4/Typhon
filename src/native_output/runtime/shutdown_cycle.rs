@@ -83,13 +83,13 @@ impl NativeRuntime {
                 self.termination.record_shortcut_shutdown();
                 let snapshot = self.termination_snapshot();
                 self.termination.capture_pre_cleanup_snapshot(snapshot);
-                native_shutdown_debug_log("shortcut_exit_requested");
+                native_shutdown_debug_log("shutdown_requested");
                 native_shutdown_debug_log("shutdown_begin");
-                println!("native input exit requested; shutting down cleanly");
+                println!("native shutdown requested; shutting down cleanly");
                 self.process_supervisor.begin_quiesce();
                 self.log_shutdown_transition(transition);
             }
-            None => native_shutdown_debug_log("shortcut_exit_requested_duplicate"),
+            None => native_shutdown_debug_log("shutdown_requested_duplicate"),
         }
         self.advance_shutdown_lifecycle_without_cycle()
     }

@@ -24,6 +24,7 @@ enum ProcessLiveness {
 #[serde(rename_all = "snake_case")]
 pub(super) enum ExitCategory {
     Normal,
+    Signal,
     Error,
     Panic,
     Unknown,
@@ -63,6 +64,8 @@ pub(super) struct TerminationCause {
     pub(super) failure_kind: Option<ExitFailureKind>,
     pub(super) phase: RuntimePhase,
     pub(super) error_chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) signal: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -276,6 +279,17 @@ impl NativeTerminationJournal {
             failure_kind: None,
             phase: RuntimePhase::ShutdownRequest,
             error_chain: None,
+            signal: None,
+        });
+    }
+
+    pub(super) fn record_signal_shutdown(&mut self, signal: &'static str) {
+        self.record_first_cause(TerminationCause {
+            category: ExitCategory::Signal,
+            failure_kind: None,
+            phase: RuntimePhase::ShutdownRequest,
+            error_chain: None,
+            signal: Some(signal),
         });
     }
 
@@ -297,6 +311,7 @@ impl NativeTerminationJournal {
             failure_kind: Some(failure_kind),
             phase,
             error_chain: Some(format_error_chain(error)),
+            signal: None,
         });
     }
 
@@ -321,6 +336,7 @@ impl NativeTerminationJournal {
                 "Rust panic during native runtime unwinding; see Rust panic output for details"
                     .to_string(),
             ),
+            signal: None,
         });
         true
     }
@@ -345,7 +361,7 @@ impl NativeTerminationJournal {
         status: TerminationRecordStatus,
     ) -> TerminationSummary {
         TerminationSummary {
-            schema_version: 2,
+            schema_version: 3,
             status,
             metadata: self.metadata.clone(),
             cause: self.first_cause.clone().unwrap_or(TerminationCause {
@@ -353,6 +369,7 @@ impl NativeTerminationJournal {
                 failure_kind: None,
                 phase: self.runtime_phase,
                 error_chain: None,
+                signal: None,
             }),
             cause_observed_at_unix_ms: self.cause_observed_at_unix_ms,
             runtime_phase: self.runtime_phase,
@@ -862,6 +879,19 @@ mod tests {
     }
 
     #[test]
+    fn signal_shutdown_records_signal_and_preserves_first_cause() {
+        let mut journal = NativeTerminationJournal::new();
+
+        journal.record_signal_shutdown("SIGTERM");
+        journal.record_signal_shutdown("SIGINT");
+        journal.record_shortcut_shutdown();
+
+        let cause = journal.first_cause().expect("first signal cause");
+        assert_eq!(cause.category, ExitCategory::Signal);
+        assert_eq!(cause.signal, Some("SIGTERM"));
+    }
+
+    #[test]
     fn diagnostic_write_failure_is_returned_without_losing_the_cause() {
         struct FailingWriter;
         impl io::Write for FailingWriter {
@@ -899,8 +929,20 @@ mod tests {
         write_summary_file(&path, &summary).expect("write summary file");
         let bytes = fs::read(&path).expect("read summary file");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["cause"]["category"], "normal");
         fs::remove_dir_all(directory).expect("remove test output directory");
+    }
+
+    #[test]
+    fn signal_shutdown_serializes_the_signal_cause() {
+        let mut journal = NativeTerminationJournal::new();
+        journal.record_signal_shutdown("SIGTERM");
+        let summary = journal.summary(None, TerminationRecordStatus::Completed);
+
+        let json = serde_json::to_value(summary).expect("serialize termination summary");
+        assert_eq!(json["cause"]["category"], "signal");
+        assert_eq!(json["cause"]["signal"], "SIGTERM");
     }
 
     #[test]

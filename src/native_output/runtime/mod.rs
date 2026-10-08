@@ -871,11 +871,11 @@ impl NativeRuntime {
             .expect("bootstrap termination journal")
             .persist_run_started();
         let result = (|| {
-            // Block process-directed SIGCHLD before any native driver, graphics
-            // library, or compositor initialization can create a thread.  Every
-            // later worker inherits this mask and the child supervisor's signalfd
-            // remains the sole normal notification path.
-            oblivion_one::process::block_sigchld_for_current_thread()?;
+            // Block process-directed child and termination signals before any
+            // native driver, graphics library, or compositor initialization
+            // can create a thread. The child supervisor's signalfd remains the
+            // normal delivery path for all five managed signals.
+            oblivion_one::process::prepare_runtime_signal_handling()?;
             frame::initialize_effect_owner_diagnostics();
             Self::bootstrap_native(config, &mut termination)
         })();

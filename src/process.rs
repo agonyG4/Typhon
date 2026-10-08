@@ -1,5 +1,7 @@
 mod child_signal;
 
+pub use child_signal::prepare_child_signal_mask;
+
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -30,6 +32,36 @@ pub struct SpawnedProcess {
 pub struct SpawnedProcessWithStderr {
     pub process: SpawnedProcess,
     pub stderr: OwnedFd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTerminationSignal {
+    Hangup,
+    Interrupt,
+    Quit,
+    Terminate,
+}
+
+impl RuntimeTerminationSignal {
+    /// Return the conventional signal name used in termination diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hangup => "SIGHUP",
+            Self::Interrupt => "SIGINT",
+            Self::Quit => "SIGQUIT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    fn from_raw(signal: libc::c_int) -> Option<Self> {
+        match signal {
+            libc::SIGHUP => Some(Self::Hangup),
+            libc::SIGINT => Some(Self::Interrupt),
+            libc::SIGQUIT => Some(Self::Quit),
+            libc::SIGTERM => Some(Self::Terminate),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -357,7 +389,8 @@ pub struct ChildSupervisor {
     restart_suppression_count: u64,
     quiescing: bool,
     shutdown: Option<SupervisorShutdown>,
-    sigchld_fd: Option<OwnedFd>,
+    signal_fd: Option<OwnedFd>,
+    pending_termination_signal: Option<RuntimeTerminationSignal>,
 }
 
 impl ChildSupervisor {
@@ -372,19 +405,30 @@ impl ChildSupervisor {
             restart_suppression_count: 0,
             quiescing: false,
             shutdown: None,
-            sigchld_fd: None,
+            signal_fd: None,
+            pending_termination_signal: None,
         }
     }
 
+    /// Create the signalfd used for child-exit and compositor termination
+    /// signals. All managed signals are blocked on the current thread before
+    /// the descriptor is created.
     pub fn with_sigchld_reaper() -> io::Result<Self> {
-        block_sigchld_for_current_thread()?;
+        block_runtime_signals_for_current_thread()?;
         let mut supervisor = Self::new();
-        supervisor.sigchld_fd = Some(create_sigchld_signalfd()?);
+        supervisor.signal_fd = Some(create_runtime_signalfd()?);
         Ok(supervisor)
     }
 
     pub fn signal_fd(&self) -> Option<RawFd> {
-        self.sigchld_fd.as_ref().map(AsRawFd::as_raw_fd)
+        self.signal_fd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// Return the first compositor termination signal read since the previous
+    /// call. Repeated signals are consumed, but do not replace that first
+    /// request while it remains pending.
+    pub fn take_termination_signal(&mut self) -> Option<RuntimeTerminationSignal> {
+        self.pending_termination_signal.take()
     }
 
     pub fn set_restart_guard(&mut self, guard: RestartGuard) {
@@ -517,7 +561,7 @@ impl ChildSupervisor {
     }
 
     pub fn reap_exited(&mut self) -> io::Result<Vec<ChildExit>> {
-        self.drain_sigchld()?;
+        self.drain_signal_fd()?;
         let mut exited = Vec::new();
         let ids = self.children.keys().copied().collect::<Vec<_>>();
         for id in ids {
@@ -569,7 +613,7 @@ impl ChildSupervisor {
         child: &mut ManagedChild,
         status: ExitStatus,
     ) -> io::Result<Option<SpawnedProcess>> {
-        if self.quiescing {
+        if self.quiescing || self.pending_termination_signal.is_some() {
             return Ok(None);
         }
         let should_restart = match child.options.restart_policy {
@@ -770,8 +814,8 @@ impl ChildSupervisor {
         self.pid_to_id.clear();
     }
 
-    fn drain_sigchld(&self) -> io::Result<()> {
-        let Some(fd) = self.sigchld_fd.as_ref() else {
+    fn drain_signal_fd(&mut self) -> io::Result<()> {
+        let Some(fd) = self.signal_fd.as_ref() else {
             return Ok(());
         };
         let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
@@ -793,6 +837,17 @@ impl ChildSupervisor {
             }
             if read == 0 {
                 return Ok(());
+            }
+            if usize::try_from(read).ok() != Some(std::mem::size_of::<libc::signalfd_siginfo>()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short read from compositor signal descriptor",
+                ));
+            }
+            // SAFETY: the exact `signalfd_siginfo` size was read above.
+            let signal = unsafe { info.assume_init_ref().ssi_signo as libc::c_int };
+            if let Some(signal) = RuntimeTerminationSignal::from_raw(signal) {
+                self.pending_termination_signal.get_or_insert(signal);
             }
         }
     }
@@ -930,12 +985,12 @@ impl Drop for ChildSupervisor {
     }
 }
 
-fn create_sigchld_signalfd() -> io::Result<OwnedFd> {
-    block_sigchld_for_current_thread()?;
-    let mask = sigchld_mask()?;
+fn create_runtime_signalfd() -> io::Result<OwnedFd> {
+    block_runtime_signals_for_current_thread()?;
+    let mask = runtime_signal_mask()?;
     let fd = unsafe {
-        // SAFETY: `mask` is initialized with SIGCHLD and the returned
-        // descriptor is configured nonblocking and close-on-exec.
+        // SAFETY: `mask` is initialized with compositor-managed signals and
+        // the returned descriptor is configured nonblocking and close-on-exec.
         libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK)
     };
     if fd < 0 {
@@ -944,6 +999,36 @@ fn create_sigchld_signalfd() -> io::Result<OwnedFd> {
         // SAFETY: `signalfd` returned a new owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
+}
+
+fn runtime_signal_mask() -> io::Result<libc::sigset_t> {
+    let mut mask = unsafe {
+        // SAFETY: zeroed storage is valid for `sigemptyset` to initialize.
+        std::mem::zeroed::<libc::sigset_t>()
+    };
+    if unsafe {
+        // SAFETY: `mask` is valid writable signal-set storage.
+        libc::sigemptyset(&mut mask)
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    for signal in [
+        libc::SIGCHLD,
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+    ] {
+        if unsafe {
+            // SAFETY: `mask` was initialized by `sigemptyset` above.
+            libc::sigaddset(&mut mask, signal)
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(mask)
 }
 
 fn sigchld_mask() -> io::Result<libc::sigset_t> {
@@ -985,6 +1070,63 @@ pub fn block_sigchld_for_current_thread() -> io::Result<()> {
     } else {
         Err(io::Error::from_raw_os_error(result))
     }
+}
+
+/// Block SIGCHLD and the four termination signals handled by the native
+/// reactor. Call before creating threads so all runtime threads inherit the
+/// mask and process-directed signals are consumed through the signalfd.
+pub fn block_runtime_signals_for_current_thread() -> io::Result<()> {
+    let mask = runtime_signal_mask()?;
+    let result = unsafe {
+        // SAFETY: `mask` is a fully initialized signal set and the null old
+        // mask pointer is permitted because the caller does not need it.
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut())
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+/// Reset inherited dispositions for SIGCHLD and the four compositor
+/// termination signals, then block them for the signalfd-driven runtime.
+/// Call before creating threads or acquiring native output resources.
+pub fn prepare_runtime_signal_handling() -> io::Result<()> {
+    block_runtime_signals_for_current_thread()?;
+
+    let mut action = unsafe {
+        // SAFETY: zeroed storage is valid to initialize the Linux `sigaction`
+        // fields before filling its mask, handler, and flags below.
+        std::mem::zeroed::<libc::sigaction>()
+    };
+    if unsafe {
+        // SAFETY: `action.sa_mask` is valid writable signal-set storage.
+        libc::sigemptyset(&mut action.sa_mask)
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    action.sa_sigaction = libc::SIG_DFL;
+    action.sa_flags = 0;
+
+    for signal in [
+        libc::SIGCHLD,
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+    ] {
+        if unsafe {
+            // SAFETY: `action` is fully initialized and the null old-action
+            // pointer is allowed because no inherited action is needed.
+            libc::sigaction(signal, &action, std::ptr::null_mut())
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 pub fn sigchld_is_blocked_for_current_thread() -> io::Result<bool> {

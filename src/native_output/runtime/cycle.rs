@@ -209,8 +209,20 @@ impl NativeRuntime {
         self.server.set_commit_debug_pageflip_pending(
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );
+        let mut signal_shutdown_requested = false;
         if work_domains.children || self.shutdown.state() == ShutdownState::StoppingChildren {
             self.reap_supervised_children(&cycle)?;
+            if let Some(signal) = self.process_supervisor.take_termination_signal()
+                && self.shutdown.is_running()
+            {
+                self.termination.record_signal_shutdown(signal.as_str());
+                self.request_native_shutdown()?;
+                signal_shutdown_requested = true;
+            }
+        }
+        if signal_shutdown_requested {
+            self.finish_slow_cycle(&cycle, render_attempted)?;
+            return Ok(());
         }
         self.sync_xwayland_selection_metadata()?;
         self.sync_xwayland_dnd()?;
