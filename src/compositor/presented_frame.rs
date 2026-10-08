@@ -430,6 +430,25 @@ mod tests {
     }
 
     #[test]
+    fn canonical_capture_rejects_misaligned_surface_identity_projections() {
+        let output_id = OutputId::from_raw(1).expect("test output id");
+        let scene_node_ids = [SceneNodeId::from_raw(1).expect("test scene node")];
+
+        let snapshot = super::PresentedCanonicalSceneSnapshot::capture(
+            output_id,
+            1,
+            0,
+            &[],
+            &scene_node_ids,
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
     fn mismatched_unified_publication_is_all_or_nothing() {
         let mut state = CompositorState::new(None);
         let output_id = state.native_output_id().expect("test output id");
