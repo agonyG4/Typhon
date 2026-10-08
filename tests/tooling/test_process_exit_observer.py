@@ -1,10 +1,13 @@
 import importlib.util
 import json
 import os
+import pty
+import select
 import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 from pathlib import Path
@@ -68,7 +71,7 @@ class ObserverIntegrationTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.state_dir = Path(self.temp_dir.name) / "state"
 
-    def start_observer(self, command, profile="release"):
+    def start_observer(self, command, profile="release", **popen_options):
         return subprocess.Popen(
             [
                 sys.executable,
@@ -85,7 +88,20 @@ class ObserverIntegrationTests(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            **popen_options,
         )
+
+    def wait_for_compositor_pid(self, observer):
+        record_dir = self.state_dir / "diagnostics" / "process-exits"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            records = list(record_dir.glob("*.json")) if record_dir.exists() else []
+            if records:
+                record = json.loads(records[0].read_text())
+                if record.get("compositor_pid"):
+                    return record["compositor_pid"]
+            time.sleep(0.01)
+        self.fail(f"observer {observer.pid} did not record the compositor PID")
 
     def read_record(self):
         records = list((self.state_dir / "diagnostics" / "process-exits").glob("*.json"))
@@ -146,16 +162,7 @@ class ObserverIntegrationTests(unittest.TestCase):
         )
         self.addCleanup(self.cleanup_observer, observer)
 
-        record_path = self.state_dir / "diagnostics" / "process-exits"
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            records = list(record_path.glob("*.json")) if record_path.exists() else []
-            if records and json.loads(records[0].read_text()).get("compositor_pid"):
-                break
-            time.sleep(0.01)
-        else:
-            self.fail("observer did not record the compositor PID before signal delivery")
-
+        self.wait_for_compositor_pid(observer)
         os.kill(observer.pid, signal.SIGTERM)
         _, stderr = observer.communicate(timeout=10)
         self.assertEqual(observer.returncode, 128 + signal.SIGTERM, stderr)
@@ -164,6 +171,163 @@ class ObserverIntegrationTests(unittest.TestCase):
         self.assertIsNone(record["exit_code"])
         self.assertEqual(record["terminating_signal"]["name"], "SIGTERM")
         self.assertEqual(record["signals_received"], [signal.SIGTERM])
+
+    def test_direct_compositor_signal_is_observed_without_observer_forwarding(self):
+        observer = self.start_observer(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+        self.addCleanup(self.cleanup_observer, observer)
+
+        compositor_pid = self.wait_for_compositor_pid(observer)
+        os.kill(compositor_pid, signal.SIGTERM)
+        _, stderr = observer.communicate(timeout=10)
+
+        self.assertEqual(observer.returncode, 128 + signal.SIGTERM, stderr)
+        record = self.read_record()
+        self.assertEqual(record["classification"], "signal_termination")
+        self.assertEqual(record["terminating_signal"]["name"], "SIGTERM")
+        self.assertEqual(record["signals_received"], [])
+
+    def test_shared_process_group_signal_is_forwarded_twice_after_graceful_handler(self):
+        events_path = Path(self.temp_dir.name) / "group-signal-events.json"
+        ready_path = Path(self.temp_dir.name) / "group-signal-ready"
+        graceful_path = Path(self.temp_dir.name) / "group-signal-graceful"
+        child = (
+            "import json, signal, sys, time\n"
+            "from pathlib import Path\n"
+            "events_path, ready_path, graceful_path = map(Path, sys.argv[1:])\n"
+            "events = []\n"
+            "def on_term(signum, frame):\n"
+            "    events.append(signum)\n"
+            "    events_path.write_text(json.dumps(events))\n"
+            "    if len(events) == 1:\n"
+            "        time.sleep(0.1)\n"
+            "        graceful_path.write_text('first TERM handled')\n"
+            "    else:\n"
+            "        raise SystemExit(92)\n"
+            "signal.signal(signal.SIGTERM, on_term)\n"
+            "ready_path.write_text('ready')\n"
+            "while True: time.sleep(1)\n"
+        )
+        observer = self.start_observer(
+            [sys.executable, "-c", child, str(events_path), str(ready_path), str(graceful_path)],
+            start_new_session=True,
+        )
+        self.addCleanup(self.cleanup_observer, observer)
+        compositor_pid = self.wait_for_compositor_pid(observer)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready_path.exists():
+            time.sleep(0.01)
+        self.assertTrue(ready_path.exists(), "compositor signal handler was not ready")
+        self.assertEqual(os.getpgid(compositor_pid), observer.pid)
+
+        # Hold the observer until the compositor has completed one graceful
+        # TERM handler. Resuming it releases the group-delivered TERM to the
+        # observer, whose forwarder sends a second TERM to the compositor.
+        os.kill(observer.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                state = next(
+                    line.split()[1]
+                    for line in Path(f"/proc/{observer.pid}/status").read_text().splitlines()
+                    if line.startswith("State:")
+                )
+            except (OSError, StopIteration):
+                state = None
+            if state == "T":
+                break
+            time.sleep(0.005)
+        self.assertEqual(state, "T", "observer did not stop before the group signal")
+        os.killpg(observer.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not graceful_path.exists():
+            time.sleep(0.01)
+        self.assertTrue(graceful_path.exists(), "compositor did not finish its first TERM handler")
+        os.kill(observer.pid, signal.SIGCONT)
+
+        _, stderr = observer.communicate(timeout=10)
+        self.assertEqual(observer.returncode, 92, stderr)
+        self.assertEqual(json.loads(events_path.read_text()), [signal.SIGTERM, signal.SIGTERM])
+        record = self.read_record()
+        self.assertEqual(record["signals_received"], [signal.SIGTERM])
+        self.assertEqual(record["classification"], "nonzero_exit")
+        self.assertEqual(record["exit_code"], 92)
+
+    @unittest.skipUnless(hasattr(termios, "TIOCSCTTY"), "requires Linux PTY session ioctls")
+    def test_tty_launcher_has_controlling_terminal_and_foreground_process_group(self):
+        facts_path = Path(self.temp_dir.name) / "pty-child-facts.json"
+        fake_compositor = Path(self.temp_dir.name) / "fake-pty-compositor"
+        fake_compositor.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['OBSERVER_TEST_FACTS']).write_text(json.dumps({"
+            "'pid': os.getpid(), 'session_id': os.getsid(0), 'process_group': os.getpgrp(), "
+            "'foreground_process_group': os.tcgetpgrp(0), 'tty_name': os.ttyname(0), "
+            "'stdin_is_tty': os.isatty(0)}))\n"
+        )
+        fake_compositor.chmod(0o755)
+        master_fd, slave_fd = pty.openpty()
+        tty_name = os.ttyname(slave_fd)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "OBLIVION_ONE_BINARY": str(fake_compositor),
+                "OBLIVION_ONE_PROFILE": "release",
+                "OBLIVION_ONE_STATE_DIR": str(self.state_dir),
+                "OBLIVION_ONE_LOG_FILE": str(Path(self.temp_dir.name) / "pty-session.log"),
+                "OBLIVION_ONE_SKIP_INPUT_GROUP_CHECK": "1",
+                "OBSERVER_TEST_FACTS": str(facts_path),
+                "XDG_SESSION_ID": "isolated-pty-session",
+            }
+        )
+        bootstrap = (
+            "import fcntl, os, sys, termios\n"
+            "fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+            "os.tcsetpgrp(0, os.getpgrp())\n"
+            "os.execv(sys.argv[1], [sys.argv[1]])\n"
+        )
+        launcher = REPO_ROOT / "bin" / "start-oblivion-one-tty"
+        process = subprocess.Popen(
+            [sys.executable, "-c", bootstrap, str(launcher)],
+            env=environment,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        try:
+            deadline = time.monotonic() + 10
+            while process.poll() is None and time.monotonic() < deadline:
+                readable, _, _ = select.select([master_fd], [], [], 0.05)
+                if readable:
+                    try:
+                        os.read(master_fd, 4096)
+                    except OSError:
+                        break
+            self.assertIsNotNone(process.poll(), "PTY launcher did not exit")
+            self.assertEqual(process.wait(timeout=2), 0)
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=2)
+            os.close(master_fd)
+
+        facts = json.loads(facts_path.read_text())
+        record = self.read_record()
+        self.assertEqual(facts["session_id"], process.pid)
+        self.assertEqual(record["observer_pid"], process.pid)
+        self.assertEqual(facts["process_group"], process.pid)
+        self.assertEqual(facts["foreground_process_group"], process.pid)
+        self.assertEqual(facts["tty_name"], tty_name)
+        self.assertTrue(facts["stdin_is_tty"])
+        self.assertEqual(record["session_identity"]["desktop_session_id"], "isolated-pty-session")
 
     def test_diagnostic_storage_failure_does_not_prevent_child_launch(self):
         self.state_dir.parent.mkdir(parents=True, exist_ok=True)

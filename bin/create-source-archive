@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+aether_root="/mnt/Aether/Desktop/GitHub"
+
+usage() {
+    cat <<EOF
+create-source-archive
+
+Creates a ZIP of the committed Typhon source tree using git archive.
+
+Usage:
+  bin/create-source-archive [absolute-output-path]
+
+The default output is a timestamped Typhon-source ZIP under:
+  $aether_root
+
+The output path must be under that directory. The archive contains all files
+tracked by the selected commit, including bin/ and tests/.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    usage
+    exit 0
+fi
+if [[ $# -gt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+output_path="${1:-$aether_root/Typhon-source-$(date -u +%Y%m%d-%H%M%S)-$$.zip}"
+output_dir="$(realpath -m -- "$(dirname -- "$output_path")")"
+aether_real="$(realpath -e -- "$aether_root")"
+case "$output_dir/" in
+    "$aether_real/"*) ;;
+    *)
+        echo "create-source-archive: output must be under $aether_real" >&2
+        exit 2
+        ;;
+esac
+mkdir -p -- "$output_dir"
+output_path="$output_dir/$(basename -- "$output_path")"
+
+git -C "$repo_dir" rev-parse --verify HEAD >/dev/null
+temporary_path="$(mktemp "$output_path.tmp.XXXXXX")"
+trap 'rm -f -- "$temporary_path"' EXIT
+git -C "$repo_dir" archive \
+    --format=zip \
+    --prefix=Typhon/ \
+    --output="$temporary_path" \
+    HEAD
+mv -f -- "$temporary_path" "$output_path"
+trap - EXIT
+printf '%s\n' "$output_path"
