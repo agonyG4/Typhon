@@ -1950,7 +1950,7 @@ impl OwnCompositorServer {
     }
 
     pub fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {
-        self.resolved_effect_scene().frame_demand_snapshot()
+        self.state.effect_frame_demand_snapshot()
     }
 
     pub fn render_generation_cause(&self) -> RenderGenerationCause {

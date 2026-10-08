@@ -291,6 +291,19 @@ impl super::CompositorState {
         self.effect_scene_summary
     }
 
+    pub(in crate::compositor) fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {
+        // Cursor-only presentation cycles still ask whether visual effects
+        // need a frame. The published summary is refreshed with scene/effect
+        // mutations, so static scenes can answer without rebuilding and
+        // sorting every resolved effect instance. Continuous effects keep the
+        // existing live resolution path to preserve their current damage.
+        if self.effect_scene_summary.continuous_instance_count == 0 {
+            EffectFrameDemandSnapshot::default()
+        } else {
+            self.resolved_effect_scene().frame_demand_snapshot()
+        }
+    }
+
     #[allow(dead_code)] // Used by internal effect assignment and later protocol adapters.
     pub(in crate::compositor) fn set_effect_scene_summary(&mut self, summary: EffectSceneSummary) {
         self.effect_scene_summary = summary;
@@ -1281,6 +1294,59 @@ mod tests {
         let demand = EffectFrameDemandSnapshot::from_visible_instances([instance]);
         assert!(demand.continuous_visible);
         assert!(demand.dirty_region.contains_point(10, 20));
+    }
+
+    #[test]
+    fn static_effect_demand_reuses_the_published_summary() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        let program = EffectProgramId::new(1).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+        for surface_id in 1..=20 {
+            assert!(state.set_internal_surface_effect_with_parameters(
+                surface_id,
+                EffectAnchor::BeforeSurface(surface_id),
+                program,
+                region.clone(),
+                EffectParameterBlock::default(),
+                crate::effects::EffectFrameDemand::OnDamage,
+            ));
+        }
+
+        let resolved_before = resolved_effect_scene_call_count_for_test();
+        assert_eq!(
+            state.effect_frame_demand_snapshot(),
+            EffectFrameDemandSnapshot::default()
+        );
+        assert_eq!(
+            resolved_effect_scene_call_count_for_test(),
+            resolved_before,
+            "static effects must not rebuild the effect scene to answer frame demand"
+        );
+    }
+
+    #[test]
+    fn continuous_effect_demand_keeps_its_current_dirty_region() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        let program = EffectProgramId::new(1).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+        assert!(state.set_internal_surface_effect_with_parameters(
+            42,
+            EffectAnchor::BeforeSurface(42),
+            program,
+            region,
+            EffectParameterBlock::default(),
+            crate::effects::EffectFrameDemand::Continuous,
+        ));
+
+        let resolved_before = resolved_effect_scene_call_count_for_test();
+        let demand = state.effect_frame_demand_snapshot();
+        assert!(demand.continuous_visible);
+        assert!(demand.dirty_region.contains_point(100, 80));
+        assert_eq!(
+            resolved_effect_scene_call_count_for_test(),
+            resolved_before.saturating_add(1),
+            "continuous effects retain live scene resolution for damage"
+        );
     }
 
     #[test]
