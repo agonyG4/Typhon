@@ -29,9 +29,13 @@ pub(super) enum SlowCyclePhase {
     RendererAndFence = 11,
     PostRenderBookkeeping = 12,
     ReadyFrameKmsHandoff = 13,
+    EglContextActivation = 14,
+    RenderTargetPreparation = 15,
+    SceneDrawing = 16,
+    NativeRenderFenceExport = 17,
 }
 
-const SLOW_CYCLE_PHASE_COUNT: usize = 14;
+const SLOW_CYCLE_PHASE_COUNT: usize = 18;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SlowCycleContext {
@@ -379,6 +383,9 @@ impl NativeSlowCycleTrace {
                 thread_cpu_time_ns(),
             );
         }
+        // The final four slots are nested renderer details. Keep them in the
+        // record for attribution, but exclude them from the top-level sum so
+        // the aggregate phases below are not counted twice.
         let measured_phase_ns = [
             SlowCyclePhase::PostWakeMaintenance,
             SlowCyclePhase::PageflipDrain,
@@ -425,7 +432,7 @@ impl NativeSlowCycleTrace {
             return;
         };
         eprintln!(
-            "typhon_slow_cycle_trace clock=cycle_wall:CLOCK_MONOTONIC thread_cpu:CLOCK_THREAD_CPUTIME_ID off_cpu_estimate=wall_minus_thread_cpu_not_runqueue_delay capacity={} evicted_records={} thread_cpu_enabled={}",
+            "typhon_slow_cycle_trace clock=cycle_wall:CLOCK_MONOTONIC phase_durations:std::time::Instant_monotonic thread_cpu:CLOCK_THREAD_CPUTIME_ID off_cpu_estimate=wall_minus_thread_cpu_not_runqueue_delay capacity={} evicted_records={} thread_cpu_enabled={} phase_names=post_wake_maintenance,pageflip_drain,xwayland_reactor,timer_deadline,wayland_input,cursor_control,xwayland_scene,acquire_prepare,presentation_cursor_planning,scene_resolve_and_damage,output_transaction_preparation,renderer_and_fence,post_render_bookkeeping,ready_frame_kms_handoff,egl_context_activation,render_target_preparation,scene_drawing,native_render_fence_export nested_phase_indices=14-15:output_transaction_preparation,16-17:renderer_and_fence",
             state.capacity, state.evicted_records, state.thread_cpu_enabled,
         );
         for record in &state.records {
@@ -680,6 +687,26 @@ mod tests {
                 .phase(SlowCyclePhase::WaylandInput),
             450
         );
+    }
+
+    #[test]
+    fn nested_render_phases_are_retained_without_double_counting() {
+        let mut trace = NativeSlowCycleTrace::new(true);
+        trace.start_cycle_after_wake(1_000, 100, SlowCycleContext::default());
+        trace.record_phase_duration(SlowCyclePhase::OutputTransactionPreparation, 200);
+        trace.record_phase_duration(SlowCyclePhase::RendererAndFence, 700);
+        trace.record_phase_duration(SlowCyclePhase::EglContextActivation, 100);
+        trace.record_phase_duration(SlowCyclePhase::RenderTargetPreparation, 100);
+        trace.record_phase_duration(SlowCyclePhase::SceneDrawing, 400);
+        trace.record_phase_duration(SlowCyclePhase::NativeRenderFenceExport, 200);
+        trace.finish_cycle(2_000);
+
+        let record = trace.retained_records().next().unwrap();
+        assert_eq!(record.phase(SlowCyclePhase::EglContextActivation), 100);
+        assert_eq!(record.phase(SlowCyclePhase::RenderTargetPreparation), 100);
+        assert_eq!(record.phase(SlowCyclePhase::SceneDrawing), 400);
+        assert_eq!(record.phase(SlowCyclePhase::NativeRenderFenceExport), 200);
+        assert_eq!(record.unattributed_ns, 100);
     }
 
     #[test]

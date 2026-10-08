@@ -1583,6 +1583,8 @@ impl NativeRuntime {
                         let render_observed_at_ns = monotonic_now_ns()?;
                         let render_call_started_at_ns =
                             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
+                        let mut render_phase_durations =
+                            slow_cycle_enabled.then(AtomicRenderPhaseDurations::default);
                         frame_pacing
                             .begin_render_attempt(pacing_mode, render_ahead)
                             .map_err(io::Error::other)?;
@@ -1600,7 +1602,7 @@ impl NativeRuntime {
                             render_buffer_snapshot,
                         );
                         frame_pacing.log("render_begin", render_begin_fields);
-                        #[rustfmt::skip] let render_outcome = explicit.render_frame(
+                        #[rustfmt::skip] let render_result = explicit.render_frame(
                             frame_renderer,
                             server,
                             output_transactions,
@@ -1636,10 +1638,30 @@ impl NativeRuntime {
                             release_safety,
                             dmabuf_gpu_release_lease_id,
                             vrr_policy,
+                            render_phase_durations.as_mut(),
                         ).inspect_err(|_| {
                             frame_pacing.note_predictive_o1_failed();
                             frame_pacing.cancel_unsubmitted_render();
-                        })?;
+                        });
+                        if let Some(durations) = render_phase_durations.as_ref() {
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::EglContextActivation,
+                                durations.egl_context_activation_ns,
+                            );
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::RenderTargetPreparation,
+                                durations.render_target_preparation_ns,
+                            );
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::SceneDrawing,
+                                durations.scene_drawing_ns,
+                            );
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::NativeRenderFenceExport,
+                                durations.native_render_fence_export_ns,
+                            );
+                        }
+                        let render_outcome = render_result?;
                         if let Some(start_ns) = render_call_started_at_ns {
                             let render_finished_at_ns = match monotonic_now_ns() {
                                 Ok(now) => now,

@@ -1090,6 +1090,7 @@ impl NativeRuntime {
                     candidate_cursor_mode,
                     &NativeOutputDamage::full_output(target.width, target.height),
                     &mut gpu_sampling_started,
+                    None,
                 )? {
                     AtomicSlotRenderOutcome::Rendered(frame) => {
                         let frame = *frame;

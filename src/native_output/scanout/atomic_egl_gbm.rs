@@ -48,6 +48,18 @@ use crate::native_output::presentation::transaction::{
     O1PrepareIntent, OutputPresentationStateKey, kms_presentation_state_is_represented,
 };
 
+fn elapsed_nanos(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct AtomicRenderPhaseDurations {
+    pub(crate) egl_context_activation_ns: u64,
+    pub(crate) render_target_preparation_ns: u64,
+    pub(crate) scene_drawing_ns: u64,
+    pub(crate) native_render_fence_export_ns: u64,
+}
+
 #[cfg(test)]
 mod confirmed_pageflip_tests;
 mod direct;
@@ -892,10 +904,20 @@ impl AtomicEglGbmScanout {
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
         gpu_sampling_started: &mut bool,
+        mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicSlotRenderOutcome> {
-        self.egl
-            .make_current(self.egl_display, None, None, Some(self.egl_context))
-            .map_err(native_egl_io_error)?;
+        let context_activation_started = phase_durations.as_ref().map(|_| Instant::now());
+        let context_activation =
+            self.egl
+                .make_current(self.egl_display, None, None, Some(self.egl_context));
+        if let (Some(durations), Some(started)) =
+            (phase_durations.as_deref_mut(), context_activation_started)
+        {
+            durations.egl_context_activation_ns = elapsed_nanos(started);
+        }
+        context_activation.map_err(native_egl_io_error)?;
+
+        let target_preparation_started = phase_durations.as_ref().map(|_| Instant::now());
         let (framebuffer, buffer_age) = {
             let slot = self.slot(slot)?;
             let presentation_serial = self
@@ -904,6 +926,7 @@ impl AtomicEglGbmScanout {
                 .map_or(0, AtomicOutputSwapchain::presentation_serial);
             (slot.gl_framebuffer, slot.buffer_age(presentation_serial))
         };
+        let sampleable_texture = self.slot(slot)?.texture;
         let mut request = renderer.egl_scene_draw_request(
             self.width,
             self.height,
@@ -914,24 +937,35 @@ impl AtomicEglGbmScanout {
             Some(damage.as_renderer_damage(self.width, self.height)),
         );
         request.frame_id = Some(frame_id);
+        if let (Some(durations), Some(started)) =
+            (phase_durations.as_deref_mut(), target_preparation_started)
+        {
+            durations.render_target_preparation_ns = durations
+                .render_target_preparation_ns
+                .saturating_add(elapsed_nanos(started));
+        }
         let started = Instant::now();
         *gpu_sampling_started = true;
-        let outcome = self
-            .scene
-            .draw_scene_to_target(
-                &self.egl,
-                self.egl_display,
-                EglOutputRenderTarget {
-                    framebuffer,
-                    sampleable_texture: Some(self.slot(slot)?.texture),
-                    width: self.width,
-                    height: self.height,
-                    buffer_age,
-                    framebuffer_origin: OutputFramebufferOrigin::TopLeftScanout,
-                },
-                request,
-            )
-            .map_err(native_egl_io_error)?;
+        let scene_drawing_started = phase_durations.as_ref().map(|_| Instant::now());
+        let outcome = self.scene.draw_scene_to_target(
+            &self.egl,
+            self.egl_display,
+            EglOutputRenderTarget {
+                framebuffer,
+                sampleable_texture: Some(sampleable_texture),
+                width: self.width,
+                height: self.height,
+                buffer_age,
+                framebuffer_origin: OutputFramebufferOrigin::TopLeftScanout,
+            },
+            request,
+        );
+        if let (Some(durations), Some(scene_started)) =
+            (phase_durations.as_deref_mut(), scene_drawing_started)
+        {
+            durations.scene_drawing_ns = elapsed_nanos(scene_started);
+        }
+        let outcome = outcome.map_err(native_egl_io_error)?;
         match outcome {
             EglFrameOutcome::Rendered {
                 commit,
@@ -939,8 +973,15 @@ impl AtomicEglGbmScanout {
                 lifecycle_evidence,
             } => {
                 self.scene.trace_render_fence_export_begin();
-                let fence = self.create_render_fence()?;
+                let fence_started = phase_durations.as_ref().map(|_| Instant::now());
+                let fence_result = self.create_render_fence();
+                if let (Some(durations), Some(started)) =
+                    (phase_durations.as_deref_mut(), fence_started)
+                {
+                    durations.native_render_fence_export_ns = elapsed_nanos(started);
+                }
                 self.scene.trace_render_fence_export_end();
+                let fence = fence_result?;
                 Ok(AtomicSlotRenderOutcome::Rendered(Box::new(
                     AtomicRenderedFrameParts {
                         slot,
@@ -1034,6 +1075,7 @@ impl AtomicEglGbmScanout {
         dmabuf_gpu_release_safety: DmabufGpuReleaseSafety,
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
         vrr_policy: VrrPolicy,
+        mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let cursor_visible = matches!(
             cursor.as_ref(),
@@ -1156,12 +1198,31 @@ impl AtomicEglGbmScanout {
         } else {
             pacing_mode
         };
-        let (slot, frame_id, pool_generation) = {
+        let slot_acquisition_started = phase_durations.as_ref().map(|_| Instant::now());
+        let slot_result = {
             let swapchain = self.swapchain_mut()?;
-            let slot = swapchain.acquire_render_slot_for_limit(future_primary_limit)?;
-            (slot, swapchain.next_frame_id(), swapchain.pool_generation())
+            swapchain.acquire_render_slot_for_limit(future_primary_limit)
         };
-        let framebuffer_id = match self.framebuffer(slot) {
+        if let (Some(durations), Some(started)) =
+            (phase_durations.as_deref_mut(), slot_acquisition_started)
+        {
+            durations.render_target_preparation_ns = elapsed_nanos(started);
+        }
+        let slot = slot_result?;
+        let (frame_id, pool_generation) = {
+            let swapchain = self.swapchain()?;
+            (swapchain.next_frame_id(), swapchain.pool_generation())
+        };
+        let framebuffer_started = phase_durations.as_ref().map(|_| Instant::now());
+        let framebuffer_result = self.framebuffer(slot);
+        if let (Some(durations), Some(started)) =
+            (phase_durations.as_deref_mut(), framebuffer_started)
+        {
+            durations.render_target_preparation_ns = durations
+                .render_target_preparation_ns
+                .saturating_add(elapsed_nanos(started));
+        }
+        let framebuffer_id = match framebuffer_result {
             Ok(framebuffer) => framebuffer.get(),
             Err(error) => {
                 self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
@@ -1418,6 +1479,7 @@ impl AtomicEglGbmScanout {
                 cursor_mode,
                 &render_damage,
                 &mut gpu_sampling_started,
+                phase_durations.as_deref_mut(),
             );
             (
                 outcome,

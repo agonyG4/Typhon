@@ -221,6 +221,35 @@ process caused I/O. Existing slow-cycle wall/CPU measurements still make
 wall-minus-thread-CPU only an off-CPU estimate. Use `sched_wakeup` and
 `sched_switch` tracing for run-queue attribution where host policy permits it.
 
+## Rendering stall attribution
+
+`TYPHON_SLOW_CYCLE_TRACE=1` keeps the bounded slow-cycle ring. Its
+`CLOCK_MONOTONIC` cycle timestamps and `std::time::Instant` monotonic phase
+durations are emitted at shutdown; phase durations are elapsed intervals, not
+absolute timestamps. `TYPHON_SLOW_CYCLE_THREAD_CPU=1` also samples
+`CLOCK_THREAD_CPUTIME_ID` around each cycle. The log header names each phase
+array position. Positions 0–13 retain their existing meaning. Positions 14–17
+are nested render details and are excluded from the top-level phase sum:
+
+- 14, `egl_context_activation`: the `eglMakeCurrent` call.
+- 15, `render_target_preparation`: swapchain slot acquisition, framebuffer and
+  buffer-age lookup, and construction of the scene draw request.
+- 16, `scene_drawing`: `draw_scene_to_target`, including scene traversal,
+  effects, and GL command encoding.
+- 17, `native_render_fence_export`: EGL native-fence creation, `glFlush`, fd
+  duplication, and EGL sync destruction.
+
+The existing parent phases remain useful: `OutputTransactionPreparation`
+includes positions 14–15, while `RendererAndFence` includes positions 16–17.
+The detailed phase timers are sampled only when the slow-cycle trace is
+enabled; they add no clock reads when disabled. They measure wall intervals,
+not per-phase CPU or scheduler wait. `AcquirePrepare`,
+`PresentationCursorPlanning`, `PageflipDrain`, and `ReadyFrameKmsHandoff` remain
+the existing boundaries for synchronization, cursor planning, completion
+drain, and KMS handoff. Rendering and fence semantics are unchanged. The
+`render_fence_export` effect trace now emits its end marker even if fence
+creation fails.
+
 ## Validation and limitations
 
 The regression suite covers incremental overwrite deltas, explicit loss ranges,

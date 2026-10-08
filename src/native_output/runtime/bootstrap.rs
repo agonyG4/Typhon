@@ -1380,6 +1380,7 @@ impl NativeRuntime {
                 cursor_render_mode,
                 &initial_damage,
                 &mut initial_gpu_sampling_started,
+                None,
             )? {
                 AtomicSlotRenderOutcome::Rendered(parts) => *parts,
                 AtomicSlotRenderOutcome::Skipped { slot, reason, .. } => {
