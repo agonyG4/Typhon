@@ -2,7 +2,7 @@
 
 ## Status and evidence
 
-The current checkout is authoritative. The supplied archive `Typhon-source(20261008-141911).zip` and RFC `TYPHON_CURSOR_RESPONSIVENESS_ARCHITECTURE_RFC_2026-10-08.md` were not present under `/home/agony`; no source comparison against those files was possible. The CodebaseMCP project was `home-agony-GitHub-Typhon`, generation `2026-10-08T15:31:47Z`, full index mode. Its coverage report marked `cycle_dispatch.rs:2010` and `presentation_cycle.rs:299` as parse-partial; those ranges were read directly. `frame.rs` had changed metadata after edits and was read directly as well.
+The current checkout is authoritative. The supplied archive `Typhon-source(20261008-141911).zip` and RFC `TYPHON_CURSOR_RESPONSIVENESS_ARCHITECTURE_RFC_2026-10-08.md` were not present under `/home/agony`; no source comparison against those files was possible. The CodebaseMCP project was `home-agony-GitHub-Typhon`, generation `2026-10-08T15:34:35Z`, full index mode. Its coverage report marked `cycle_dispatch.rs:2010` and `presentation_cycle.rs:299` as parse-partial; those ranges were read directly. `frame.rs` had changed metadata after edits and was read directly as well.
 
 | Evidence class | Finding |
 |---|---|
