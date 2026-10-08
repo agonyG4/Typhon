@@ -855,6 +855,7 @@ impl NativeRuntime {
         // later worker inherits this mask and the child supervisor's signalfd
         // remains the sole normal notification path.
         oblivion_one::process::block_sigchld_for_current_thread()?;
+        frame::initialize_effect_owner_diagnostics();
         Self::bootstrap_native(config)
     }
 

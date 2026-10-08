@@ -2,7 +2,14 @@ use super::*;
 use oblivion_one::effects::{
     EffectRect, EffectRegion, EffectRegistryGeneration, effect_output_influence_region,
 };
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use oblivion_one::compositor::{
     AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
@@ -16,6 +23,33 @@ use super::frame_scene_identity::{
     filter_surface_scene_nodes_with_owners, finalize_snapshot,
 };
 use super::window_exit_frame::resolve_window_exit_frame_parts;
+
+static EFFECT_OWNER_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
+static MISSING_PRESENTATION_OWNER_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
+static MISSING_EFFECT_PROGRAM_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn initialize_effect_owner_diagnostics() {
+    let _ = EFFECT_OWNER_DIAGNOSTICS_ENABLED.get_or_init(|| {
+        std::env::var_os("TYPHON_EFFECT_OWNER_DIAGNOSTICS").is_some_and(|value| value == "1")
+    });
+}
+
+fn effect_owner_diagnostics_enabled() -> bool {
+    EFFECT_OWNER_DIAGNOSTICS_ENABLED
+        .get()
+        .copied()
+        .unwrap_or(false)
+}
+
+fn claim_effect_diagnostic(enabled: bool, emitted: &AtomicBool) -> bool {
+    enabled && !emitted.swap(true, Ordering::Relaxed)
+}
+
+fn log_effect_diagnostic_once(emitted: &AtomicBool, write: impl FnOnce()) {
+    if claim_effect_diagnostic(effect_owner_diagnostics_enabled(), emitted) {
+        write();
+    }
+}
 
 #[cfg(test)]
 use super::frame_scene_identity::{
@@ -62,9 +96,14 @@ fn freeze_presentation_effect_influences(
             oblivion_one::compositor::EffectAnchor::OutputPostProcess => continue,
         };
         let Some((scene_node_id, root_surface_id)) = owner_for_surface(surface_id) else {
-            eprintln!(
-                "native effects: anchor surface={surface_id} has no presentation owner SceneNode; skipping owner damage evidence"
-            );
+            // Presentation influence records exist only for window-group
+            // animation transforms. Keep non-window and stale anchors out of
+            // that ownership map; physical effect damage was frozen separately.
+            log_effect_diagnostic_once(&MISSING_PRESENTATION_OWNER_DIAGNOSTIC_EMITTED, || {
+                eprintln!(
+                    "native effects: an effect anchor has no presentation animation owner; physical effect damage remains tracked"
+                );
+            });
             continue;
         };
         let region = match registry_generation.effect_for_program(instance.program) {
@@ -74,10 +113,11 @@ fn freeze_presentation_effect_influences(
                 output_bounds,
             ),
             None => {
-                eprintln!(
-                    "native effects: resolved program {:?} for owner {:?} is missing from the captured registry generation; using output bounds for presentation damage",
-                    instance.program, scene_node_id
-                );
+                log_effect_diagnostic_once(&MISSING_EFFECT_PROGRAM_DIAGNOSTIC_EMITTED, || {
+                    eprintln!(
+                        "native effects: a resolved program is missing from the captured registry generation; using output bounds for presentation damage"
+                    );
+                });
                 EffectRegion::from_rect(output_bounds)
             }
         };
@@ -113,6 +153,7 @@ mod presentation_effect_influence_tests {
         EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId,
         EffectRegistryGeneration,
     };
+    use std::sync::atomic::AtomicBool;
 
     fn instance(
         id: u64,
@@ -213,6 +254,41 @@ mod presentation_effect_influence_tests {
         assert_eq!(influences.len(), 1);
         assert_eq!(influences[0].region, EffectRegion::from_rect(output_bounds));
         assert_eq!(influences[0].presentation_owner_root_surface_id, 70);
+    }
+
+    #[test]
+    fn effect_without_presentation_owner_keeps_physical_damage() {
+        let generation = EffectRegistryGeneration::with_builtin_background_blur();
+        let program = oblivion_one::effects::builtin_background_blur_program_id();
+        let output_bounds = EffectRect::new(0, 0, 400, 300).expect("output bounds");
+        let rect = EffectRect::new(50, 50, 30, 30).expect("effect region");
+        let effects = ResolvedEffectScene::new(
+            1,
+            vec![instance(1, program, EffectAnchor::BeforeSurface(10), rect)],
+        );
+
+        let influences =
+            freeze_presentation_effect_influences(&effects, &generation, output_bounds, |_| None);
+        let physical_damage = freeze_native_effect_damage(&effects, &generation, output_bounds);
+
+        assert!(influences.is_empty());
+        assert_eq!(physical_damage.instances.len(), 1);
+        assert_eq!(
+            physical_damage.instances[0].region,
+            EffectRegion::from_rect(rect)
+        );
+        assert!(!physical_damage.conservative_full);
+    }
+
+    #[test]
+    fn effect_diagnostic_emission_is_disabled_or_bounded() {
+        let disabled_budget = AtomicBool::new(false);
+        assert!(!claim_effect_diagnostic(false, &disabled_budget));
+        assert!(!disabled_budget.load(Ordering::Relaxed));
+
+        let enabled_budget = AtomicBool::new(false);
+        assert!(claim_effect_diagnostic(true, &enabled_budget));
+        assert!(!claim_effect_diagnostic(true, &enabled_budget));
     }
 }
 

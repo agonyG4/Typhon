@@ -580,26 +580,10 @@ impl CompositorState {
         &self,
         root_surface_id: u32,
     ) -> Option<SceneNodeId> {
-        let group = self
-            .window_id_for_surface(root_surface_id)
-            .and_then(|window_id| self.scene_node_id_for_window_group(window_id));
-        #[cfg(test)]
-        {
-            group.or_else(|| {
-                // Layer roots have no window group in tests. Keep their
-                // synthetic scene nodes separate from window-group IDs.
-                let id = if self.layer_surfaces.contains_key(&root_surface_id) {
-                    (1_u64 << 63) | u64::from(root_surface_id)
-                } else {
-                    u64::from(root_surface_id)
-                };
-                SceneNodeId::from_raw(id)
-            })
-        }
-        #[cfg(not(test))]
-        {
-            group
-        }
+        // Presentation transforms belong to window groups. Non-window scene
+        // identities and physical effect damage are resolved independently.
+        self.window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.scene_node_id_for_window_group(window_id))
     }
 
     pub(in crate::compositor) fn presentation_animation_metrics(
@@ -1343,6 +1327,18 @@ impl CompositorState {
     #[cfg(test)]
     pub(in crate::compositor) const fn active_scene_surface_update_count(&self) -> u64 {
         self.active_scene_view.incremental_surface_update_count()
+    }
+}
+
+#[cfg(test)]
+mod presentation_owner_tests {
+    use super::*;
+
+    #[test]
+    fn root_without_window_group_has_no_presentation_owner() {
+        let state = CompositorState::new(None);
+
+        assert_eq!(state.presentation_scene_node_id_for_root(900), None);
     }
 }
 
