@@ -5,6 +5,7 @@ use crate::native_output::controller::{
 use crate::system_action_transport::NativeSystemActionTransport;
 use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
 use oblivion_one::core::OutputId;
+use termination::{NativeTerminationJournal, RuntimePhase, TerminationSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeVisualWorkQueueReason {
@@ -169,6 +170,7 @@ mod shutdown;
 mod shutdown_cycle;
 mod slow_cycle;
 mod system_action_io;
+mod termination;
 mod wake_plan;
 mod window_exit_frame;
 mod work_domains;
@@ -714,6 +716,7 @@ pub(crate) struct NativeRuntime {
     dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry,
     control_server: NativeControlServer,
     system_action_transport: NativeSystemActionTransport,
+    termination: NativeTerminationJournal,
     started_at: Instant,
     vrr_policy: VrrPolicy,
     xwayland: XwaylandService,
@@ -869,14 +872,25 @@ impl NativeRuntime {
     }
 
     pub(crate) fn run(&mut self) -> NativeResult<()> {
+        self.termination.set_phase(RuntimePhase::RuntimeCycle);
         match self.run_native_cycle() {
             Ok(()) => Ok(()),
             Err(error) => {
-                let _ = self
+                self.termination.record_runtime_error(error.as_ref());
+                self.termination.set_phase(RuntimePhase::EmergencyCleanup);
+                if let Err(cleanup_error) = self
                     .xwayland
-                    .emergency_cleanup(&mut self.process_supervisor);
-                let _ = self.sync_xwayland_reactor_sources();
-                let _ = self.process_supervisor.kill_session_owned_now();
+                    .emergency_cleanup(&mut self.process_supervisor)
+                {
+                    self.termination.record_cleanup_error(&cleanup_error);
+                }
+                if let Err(cleanup_error) = self.sync_xwayland_reactor_sources() {
+                    self.termination
+                        .record_cleanup_error(cleanup_error.as_ref());
+                }
+                if let Err(cleanup_error) = self.process_supervisor.kill_session_owned_now() {
+                    self.termination.record_cleanup_error(&cleanup_error);
+                }
                 Err(error)
             }
         }
@@ -950,26 +964,79 @@ impl NativeRuntime {
     ) -> DmabufGpuReleaseQualificationSummary {
         self.dmabuf_gpu_release_registry.qualification_summary()
     }
+
+    fn termination_snapshot(&self) -> TerminationSnapshot {
+        let worker = self.kms_commit_worker.as_ref();
+        let fatal_reason = worker.and_then(|worker| worker.fatal_reason_name());
+        let pending_pageflip_token = self
+            .atomic_commit_arbiter
+            .pending_atomic_token()
+            .map(PageFlipToken::get)
+            .or_else(|| self.scanout.pending_page_flip_token())
+            .or_else(|| {
+                self.atomic_cursor
+                    .as_ref()
+                    .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
+            });
+        TerminationSnapshot {
+            latest_submitted_frame_id: self.scene_history.latest_submitted_frame_id(),
+            latest_presented_frame_id: self.scene_history.presented_frame_id(),
+            pageflip_pending: self.scanout.page_flip_pending()
+                || self.atomic_commit_arbiter.atomic_commit_pending()
+                || worker.is_some_and(|worker| worker.inflight()),
+            pending_pageflip_token,
+            kms_worker_present: worker.is_some(),
+            kms_worker_lifecycle: worker.map(|worker| worker.lifecycle_name()),
+            kms_worker_queue_depth: worker.map_or(0, |worker| worker.queue_depth()),
+            kms_worker_inflight: worker.is_some_and(|worker| worker.inflight()),
+            kms_worker_fatal_reason: fatal_reason,
+            seat_state: self.session.state_name(),
+            seat_session_active: self.session.permits_output() && self.seat_session.is_some(),
+            active_gpu_release_leases: self.dmabuf_gpu_release_registry.active_count(),
+            active_output_transactions: self.output_transactions.active_count(),
+            submitted_kms_ownership: self
+                .submitted_worker_ownership
+                .len()
+                .saturating_add(self.emergency_quarantined_submitted_ownership.len()),
+            quarantined_kms_ownership: self
+                .worker_quarantine
+                .jobs
+                .len()
+                .saturating_add(self.emergency_quarantined_worker_jobs.len()),
+            kms_teardown_safety: self.kms_teardown_safety.as_str(),
+        }
+    }
 }
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        let mut termination_snapshot = self.termination_snapshot();
+        self.termination.set_phase(RuntimePhase::EmergencyCleanup);
         self.fail_pending_screen_captures("session_inactive");
         self.dmem_foreground.shutdown();
         frame::dump_effect_owner_diagnostics();
         self.slow_cycle_trace.dump();
-        let _ = self
+        if let Err(error) = self
             .dmabuf_gpu_release_registry
-            .cancel_all(&mut self.event_loop, &mut self.server);
+            .cancel_all(&mut self.event_loop, &mut self.server)
+        {
+            self.termination.record_cleanup_error(&error);
+        }
         self.quiesce_system_action_transport();
-        let _ = self.control_server.shutdown(&mut self.event_loop);
+        if let Err(error) = self.control_server.shutdown(&mut self.event_loop) {
+            self.termination.record_cleanup_error(&error);
+        }
         if let Some(token) = self.cursor_io_worker_reactor_token.take() {
-            let _ = self.event_loop.unregister(token);
+            if let Err(error) = self.event_loop.unregister(token) {
+                self.termination.record_cleanup_error(&error);
+            }
         }
         self.pending_cursor_job = None;
         self.cursor_io_worker.take();
         if let Some(token) = self.keyboard_persistence_worker_reactor_token.take() {
-            let _ = self.event_loop.unregister(token);
+            if let Err(error) = self.event_loop.unregister(token) {
+                self.termination.record_cleanup_error(&error);
+            }
         }
         self.pending_keyboard_job = None;
         self.keyboard_persistence_worker.take();
@@ -977,30 +1044,54 @@ impl Drop for NativeRuntime {
             .output_configuration_persistence_worker_reactor_token
             .take()
         {
-            let _ = self.event_loop.unregister(token);
+            if let Err(error) = self.event_loop.unregister(token) {
+                self.termination.record_cleanup_error(&error);
+            }
         }
         self.pending_output_persistence = None;
         self.output_configuration_persistence_worker.take();
         if let Some(worker) = self.kms_commit_worker.take() {
             if let Some(token) = self.kms_commit_worker_reactor_token.take() {
-                let _ = self.event_loop.unregister(token);
+                if let Err(error) = self.event_loop.unregister(token) {
+                    self.termination.record_cleanup_error(&error);
+                }
             }
             if self.shutdown.is_shutting_down() {
-                let _ = worker.force_shutdown_abandon();
+                if let Err(error) = worker.force_shutdown_abandon() {
+                    self.termination
+                        .record_cleanup_error(&io::Error::other(format!(
+                            "KMS worker shutdown abandon failed: {error:?}"
+                        )));
+                }
             }
             worker.request_quiesce();
-            let _ = worker.join();
-            let _ = self.drain_kms_worker_events_for_teardown(&worker);
-            let _ = self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs());
+            if let Err(error) = worker.join() {
+                self.termination
+                    .record_cleanup_error(&io::Error::other(format!(
+                        "KMS worker join failed: {error:?}"
+                    )));
+            }
+            if let Err(error) = self.drain_kms_worker_events_for_teardown(&worker) {
+                self.termination.record_cleanup_error(error.as_ref());
+            }
+            if let Err(error) = self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs())
+            {
+                self.termination.record_cleanup_error(error.as_ref());
+            }
             self.worker_quarantine
                 .cursor_sidecars
                 .extend(worker.take_pending_cursor_sidecar());
         }
         self.revoke_xwayland_private_client();
-        let _ = self
+        if let Err(error) = self
             .xwayland
-            .emergency_cleanup(&mut self.process_supervisor);
-        let _ = self.sync_xwayland_reactor_sources();
+            .emergency_cleanup(&mut self.process_supervisor)
+        {
+            self.termination.record_cleanup_error(&error);
+        }
+        if let Err(error) = self.sync_xwayland_reactor_sources() {
+            self.termination.record_cleanup_error(error.as_ref());
+        }
         if oblivion_one::xwayland::trace::enabled() {
             for line in oblivion_one::xwayland::trace::take_recent_lifecycle_trace() {
                 eprintln!("oblivion-one xwayland: lifecycle_ring_dump=true {line}");
@@ -1074,13 +1165,16 @@ impl Drop for NativeRuntime {
                 );
             }
         }
+        self.termination.set_phase(RuntimePhase::KmsTeardown);
         if !self.establish_kms_teardown_safety().permits_release() {
             self.retain_unproven_teardown_ownership();
+            termination_snapshot.kms_teardown_safety = self.kms_teardown_safety.as_str();
             self.cursor_responsiveness.dump(
                 &self.presentation_trace,
                 self.server.pointer_input_metrics_snapshot(),
                 &self.cursor_output_arbitration,
             );
+            termination::emit_summary(&self.termination.summary(termination_snapshot));
             return;
         }
         self.presented_planes.primary = None;
@@ -1089,12 +1183,15 @@ impl Drop for NativeRuntime {
             && let Err(error) = self.scanout.release_direct_for_target_destroyed()
         {
             eprintln!("native direct target-destroyed release was not proven safe: {error}");
+            self.termination.record_cleanup_error(&error);
             self.retain_unproven_teardown_ownership();
+            termination_snapshot.kms_teardown_safety = self.kms_teardown_safety.as_str();
             self.cursor_responsiveness.dump(
                 &self.presentation_trace,
                 self.server.pointer_input_metrics_snapshot(),
                 &self.cursor_output_arbitration,
             );
+            termination::emit_summary(&self.termination.summary(termination_snapshot));
             return;
         }
         let terminal_callback_transactions = self.output_transactions.active_transaction_ids();
@@ -1228,10 +1325,12 @@ impl Drop for NativeRuntime {
             dmabuf_qualification.pageflip_to_release_lag_p95_us,
             dmabuf_qualification.pageflip_to_release_lag_p99_us,
         );
+        termination_snapshot.kms_teardown_safety = self.kms_teardown_safety.as_str();
         self.cursor_responsiveness.dump(
             &self.presentation_trace,
             self.server.pointer_input_metrics_snapshot(),
             &self.cursor_output_arbitration,
         );
+        termination::emit_summary(&self.termination.summary(termination_snapshot));
     }
 }

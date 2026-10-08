@@ -383,6 +383,7 @@ impl NativeRuntime {
                     proof_from_restoration(outcome)
                 }
                 Err(error) => {
+                    self.termination.record_cleanup_error(&error);
                     eprintln!(
                         "native KMS restore could not prove a safe boundary; attempting explicit target destruction: {error}"
                     );
@@ -390,6 +391,7 @@ impl NativeRuntime {
                     match self.destroy_kms_target() {
                         Ok(proof) => proof,
                         Err(error) => {
+                            self.termination.record_cleanup_error(error.as_ref());
                             eprintln!(
                                 "native KMS target destruction could not prove a safe boundary; retaining ownership: {error}"
                             );

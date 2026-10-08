@@ -598,7 +598,9 @@ fn should_continue_resuming_recovery(
 impl NativeRuntime {
     #[allow(clippy::collapsible_if)]
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
+        self.termination.set_phase(RuntimePhase::ReactorWait);
         let wakeup = self.event_loop.wait()?;
+        self.termination.set_phase(RuntimePhase::RuntimeCycle);
         let slow_cycle_start_ns = if self.slow_cycle_trace.enabled() {
             let start_ns = monotonic_now_ns()?;
             let xwayland_totals = self.xwayland.slow_cycle_totals();
@@ -622,17 +624,21 @@ impl NativeRuntime {
             None
         };
         self.service_dmabuf_gpu_releases(&wakeup.dmabuf_gpu_release_tokens)?;
+        self.termination.set_phase(RuntimePhase::KmsWorker);
         self.check_kms_commit_worker_health()?;
         if wakeup.reasons.kms_commit_worker() || wakeup.reasons.drm() {
             // Submit acknowledgments establish physical pending ownership
             // before the DRM pageflip validation below runs.
             self.process_kms_worker_events()?;
         }
+        self.termination.set_phase(RuntimePhase::RuntimeCycle);
         self.retire_settled_output_terminals();
         let deferred_worker_pageflip = self.deferred_worker_pageflip.take();
         let deferred_worker_completion = self.deferred_worker_completion.take();
         let worker_timeout_pending = self.worker_timeout_pending.take();
+        self.termination.set_phase(RuntimePhase::SeatEvents);
         let disabled_observed = self.dispatch_runtime_seat_events(&wakeup)?;
+        self.termination.set_phase(RuntimePhase::RuntimeCycle);
         let resuming_recovery_wake = should_continue_resuming_recovery(
             wakeup.reasons.output_render_fence(),
             self.session.is_resuming(),
@@ -642,7 +648,9 @@ impl NativeRuntime {
             if let Some(token) = self.output_render_fence_token.take() {
                 self.event_loop.unregister(token)?;
             }
+            self.termination.set_phase(RuntimePhase::SessionRecovery);
             self.continue_native_session_recovery()?;
+            self.termination.set_phase(RuntimePhase::RuntimeCycle);
         }
         if self.session.permits_output()
             && (wakeup.reasons.drm()
@@ -869,6 +877,7 @@ impl NativeRuntime {
                 input_drain_us: 0,
                 raw_input_events: 0,
                 coalesced_input_events: 0,
+                cursor_motion_sample_id: None,
                 shutdown_requested: false,
             });
         }
@@ -2399,6 +2408,7 @@ impl NativeRuntime {
             input_drain_us: 0,
             raw_input_events: 0,
             coalesced_input_events: 0,
+            cursor_motion_sample_id: None,
             shutdown_requested: false,
         })
     }

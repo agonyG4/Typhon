@@ -1,4 +1,9 @@
-use std::{error::Error, fmt, io, path::PathBuf, process::ExitCode};
+use std::{
+    error::Error,
+    fmt, io,
+    path::PathBuf,
+    process::{Command, ExitCode},
+};
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -29,7 +34,17 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("oblivion-one: {error}");
+            let error_chain = bounded_error_chain(error.as_ref());
+            let runtime_phase = native_startup_phase(error.as_ref()).unwrap_or("runtime");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "termination",
+                    "exit_category": "error",
+                    "runtime_phase": runtime_phase,
+                    "error_chain": error_chain,
+                })
+            );
             ExitCode::from(1)
         }
     }
@@ -116,6 +131,104 @@ fn with_native_startup_context<T>(
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn bounded_error_chain(error: &(dyn Error + 'static)) -> String {
+    const MAX_BYTES: usize = 2_048;
+    let mut chain = String::new();
+    let mut current = Some(error);
+    let mut depth = 0;
+    while let Some(cause) = current {
+        if depth > 0 && chain.len() < MAX_BYTES {
+            chain.push_str(": ");
+        }
+        let rendered = cause.to_string();
+        let available = MAX_BYTES.saturating_sub(chain.len());
+        if rendered.len() <= available {
+            chain.push_str(&rendered);
+        } else {
+            let mut end = available;
+            while !rendered.is_char_boundary(end) {
+                end -= 1;
+            }
+            chain.push_str(&rendered[..end]);
+            if chain.len() >= MAX_BYTES.saturating_sub(3) {
+                chain.truncate(MAX_BYTES.saturating_sub(3));
+            }
+            chain.push_str("...");
+            break;
+        }
+        depth += 1;
+        if depth >= 8 {
+            if cause.source().is_some() {
+                chain.push_str(": [source chain truncated]");
+            }
+            break;
+        }
+        current = cause.source();
+    }
+    chain
+}
+
+fn native_startup_phase(error: &(dyn Error + 'static)) -> Option<&'static str> {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(startup) = cause.downcast_ref::<NativeStartupError>() {
+            return Some(startup.phase);
+        }
+        current = cause.source();
+    }
+    None
+}
+
+fn activation_environment_args(
+    socket_name: &str,
+    current_desktop: &str,
+    session_type: &str,
+    display: Option<&str>,
+    runtime_dir: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--systemd".to_string(),
+        format!("WAYLAND_DISPLAY={socket_name}"),
+        format!("XDG_CURRENT_DESKTOP={current_desktop}"),
+        format!("XDG_SESSION_TYPE={session_type}"),
+    ];
+    if let Some(display) = display {
+        args.push(format!("DISPLAY={display}"));
+    }
+    if let Some(runtime_dir) = runtime_dir {
+        args.push(format!("XDG_RUNTIME_DIR={runtime_dir}"));
+    }
+    args
+}
+
+fn import_activation_environment(socket_name: &str) {
+    let current_desktop =
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "OblivionOne".to_string());
+    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "wayland".to_string());
+    let display = std::env::var("DISPLAY").ok();
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    let args = activation_environment_args(
+        socket_name,
+        &current_desktop,
+        &session_type,
+        display.as_deref(),
+        runtime_dir.as_deref(),
+    );
+
+    match Command::new("dbus-update-activation-environment")
+        .args(&args)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!(
+            "oblivion-one: D-Bus activation environment update failed with status {status}"
+        ),
+        Err(error) => {
+            eprintln!("oblivion-one: could not update D-Bus activation environment: {error}")
+        }
+    }
 }
 
 fn parse_args(args: Vec<String>) -> Result<CliCommand, io::Error> {
@@ -225,6 +338,10 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     if options.check_only {
         return Ok(());
     }
+
+    // The Wayland endpoint now exists, so D-Bus and systemd-activated clients
+    // can safely inherit its display name instead of a stale parent value.
+    import_activation_environment(server.socket_name());
 
     println!("Starting native bootstrap; Typhon requires a TTY/SDDM seat and usable DRM output.");
     with_native_startup_context(
@@ -428,6 +545,42 @@ mod tests {
         assert!(error.to_string().contains("native bootstrap"));
         assert!(error.to_string().contains("seat denied"));
         assert_eq!(error.source().unwrap().to_string(), "seat denied");
+        let chain = bounded_error_chain(error.as_ref());
+        assert!(chain.contains("native bootstrap: seat denied"));
+        assert_eq!(
+            native_startup_phase(error.as_ref()),
+            Some("native bootstrap")
+        );
+    }
+
+    #[test]
+    fn activation_environment_uses_bound_socket_and_current_session_values() {
+        let args = activation_environment_args(
+            "oblivion-one-sddm",
+            "OblivionOne",
+            "wayland",
+            Some(":2"),
+            Some("/run/user/1000"),
+        );
+
+        assert_eq!(
+            args,
+            [
+                "--systemd",
+                "WAYLAND_DISPLAY=oblivion-one-sddm",
+                "XDG_CURRENT_DESKTOP=OblivionOne",
+                "XDG_SESSION_TYPE=wayland",
+                "DISPLAY=:2",
+                "XDG_RUNTIME_DIR=/run/user/1000",
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_environment_does_not_import_absent_display() {
+        let args = activation_environment_args("wayland-7", "OblivionOne", "wayland", None, None);
+        assert!(args.contains(&"WAYLAND_DISPLAY=wayland-7".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("DISPLAY=")));
     }
 
     #[test]

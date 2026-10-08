@@ -3,6 +3,7 @@ use super::*;
 
 impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
+        self.termination.set_phase(RuntimePhase::ShutdownRequest);
         self.fail_pending_screen_captures("session_inactive");
         self.quiesce_system_action_transport();
         self.input_state.clear_keyboard_repeat();
@@ -79,6 +80,7 @@ impl NativeRuntime {
             .request_shutdown(now_ns, pending_pageflip_token)
         {
             Some(transition) => {
+                self.termination.record_shortcut_shutdown();
                 native_shutdown_debug_log("shortcut_exit_requested");
                 native_shutdown_debug_log("shutdown_begin");
                 println!("native input exit requested; shutting down cleanly");
@@ -91,6 +93,7 @@ impl NativeRuntime {
     }
 
     pub(super) fn advance_shutdown_lifecycle_without_cycle(&mut self) -> NativeResult<()> {
+        self.termination.set_phase(RuntimePhase::PageflipDrain);
         let cycle = NativeCycleState {
             wakeup: NativeWakeup {
                 reasons: Default::default(),
@@ -126,6 +129,7 @@ impl NativeRuntime {
             input_drain_us: 0,
             raw_input_events: 0,
             coalesced_input_events: 0,
+            cursor_motion_sample_id: None,
             shutdown_requested: false,
         };
         self.advance_shutdown_lifecycle(&cycle)
@@ -135,6 +139,7 @@ impl NativeRuntime {
         let Some(reason) = self.shutdown.begin_kms_restore() else {
             return Ok(());
         };
+        self.termination.set_phase(RuntimePhase::KmsTeardown);
         native_shutdown_debug_log("input_backend_stop");
         let forced_timeout = matches!(reason, KmsRestoreReason::ForcedPageflipTimeout { .. });
         if forced_timeout {

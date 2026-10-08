@@ -47,6 +47,7 @@ pub(crate) struct NativeSceneHistory {
     presented: Option<NativeFrameSceneSnapshot>,
     ready: Option<NativeFrameSceneSnapshot>,
     submitted: VecDeque<(u64, NativeFrameSceneSnapshot)>,
+    latest_submitted_frame_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,7 @@ impl NativeSceneHistory {
             presented: Some(presented),
             ready: None,
             submitted: VecDeque::new(),
+            latest_submitted_frame_id: None,
         }
     }
 
@@ -97,6 +99,10 @@ impl NativeSceneHistory {
 
     pub(crate) fn presented_frame_id(&self) -> Option<u64> {
         self.presented.as_ref().map(|snapshot| snapshot.frame_id)
+    }
+
+    pub(crate) fn latest_submitted_frame_id(&self) -> Option<u64> {
+        self.latest_submitted_frame_id
     }
 
     #[cfg(test)]
@@ -228,6 +234,7 @@ impl NativeSceneHistory {
         let Some(snapshot) = self.ready.take() else {
             return false;
         };
+        self.latest_submitted_frame_id = Some(snapshot.frame_id);
         self.submitted.push_back((token, snapshot));
         true
     }
@@ -1022,6 +1029,28 @@ mod tests {
             history.presented.as_ref().map(|frame| frame.frame_id),
             Some(3)
         );
+    }
+
+    #[test]
+    fn latest_submitted_frame_diagnostic_is_independent_of_presented_frame() {
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert_eq!(history.latest_submitted_frame_id(), None);
+
+        history.replace_ready(snapshot(2));
+        assert!(history.queue_submission(20));
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
+        assert_eq!(history.presented_frame_id(), Some(1));
+
+        history.replace_ready(snapshot(3));
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
+        assert!(history.queue_submission(30));
+        assert_eq!(history.latest_submitted_frame_id(), Some(3));
+
+        assert!(history.promote_pageflip(20));
+        assert_eq!(history.presented_frame_id(), Some(2));
+        assert_eq!(history.latest_submitted_frame_id(), Some(3));
+        history.invalidate_presented_damage_history();
+        assert_eq!(history.latest_submitted_frame_id(), Some(3));
     }
 
     #[test]

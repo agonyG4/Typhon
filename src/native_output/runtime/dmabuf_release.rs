@@ -666,7 +666,6 @@ impl DmabufGpuReleaseRegistry {
             .retire_composited_without_pageflip(transaction_id, reason)
     }
 
-    #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {
         self.watches.len()
     }

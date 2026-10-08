@@ -699,6 +699,7 @@ impl NativeRuntime {
             dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
             system_action_transport,
+            termination: NativeTerminationJournal::new(),
             started_at: Instant::now(),
             vrr_policy,
             xwayland,

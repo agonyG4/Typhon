@@ -186,8 +186,10 @@ impl NativeRuntime {
 
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
         while !self.shutdown.is_complete() {
+            self.termination.set_phase(RuntimePhase::RuntimeCycle);
             self.run_cycle()?;
         }
+        self.termination.set_phase(RuntimePhase::Complete);
         native_shutdown_debug_log("shutdown_complete");
         Ok(())
     }
@@ -830,6 +832,7 @@ impl NativeRuntime {
             match self.shutdown.state() {
                 ShutdownState::Running | ShutdownState::Complete => return Ok(()),
                 ShutdownState::Requested => {
+                    self.termination.set_phase(RuntimePhase::ShutdownRequest);
                     if let Some(transition) = self.shutdown.advance_requested() {
                         self.log_shutdown_transition(transition);
                         if self.shutdown.state() == ShutdownState::Draining {
@@ -840,6 +843,7 @@ impl NativeRuntime {
                     }
                 }
                 ShutdownState::Draining => {
+                    self.termination.set_phase(RuntimePhase::PageflipDrain);
                     if let Some(token) = cycle.completed_pageflip_token
                         && let Some(transition) = self.shutdown.note_pageflip_event(token)
                     {
@@ -872,6 +876,7 @@ impl NativeRuntime {
                     return Ok(());
                 }
                 ShutdownState::StoppingChildren => {
+                    self.termination.set_phase(RuntimePhase::StoppingChildren);
                     if self.shutdown.mark_child_stop_started() {
                         native_shutdown_debug_log("shell_children_stop");
                         self.perf.log("native.shutdown_children", || {
@@ -909,6 +914,7 @@ impl NativeRuntime {
                     return Ok(());
                 }
                 ShutdownState::Restoring => {
+                    self.termination.set_phase(RuntimePhase::KmsTeardown);
                     self.restore_kms_for_shutdown()?;
                     return Ok(());
                 }

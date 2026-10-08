@@ -315,6 +315,29 @@ impl KmsCommitWorkerHandle {
         }
     }
 
+    pub(crate) fn fatal_reason_name(&self) -> Option<&'static str> {
+        self.fatal_reason().map(|reason| match reason {
+            KmsWorkerFatalReason::Panic => "panic",
+            KmsWorkerFatalReason::EventNotification => "event_notification",
+        })
+    }
+
+    pub(crate) fn lifecycle_name(&self) -> &'static str {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.lifecycle {
+            KmsWorkerLifecycle::Running => "running",
+            KmsWorkerLifecycle::Quiescing => "quiescing",
+            KmsWorkerLifecycle::ShutdownQuiescing => "shutdown_quiescing",
+            KmsWorkerLifecycle::ShutdownAbandoning => "shutdown_abandoning",
+            KmsWorkerLifecycle::Stopped => "stopped",
+            KmsWorkerLifecycle::Fatal => "fatal",
+        }
+    }
+
     pub(crate) fn mark_admission_fatal(&self) {
         mark_fatal(&self.shared, KmsWorkerFatalReason::EventNotification, false);
     }
