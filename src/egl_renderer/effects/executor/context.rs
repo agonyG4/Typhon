@@ -91,6 +91,225 @@ impl<'a> EffectExecutionContext<'a> {
 }
 
 impl EffectExecutionContext<'_> {
+    /// Execute the persistent ordinary scene plan command-first. The plan
+    /// contains only command and repair indices; scene payloads and textures
+    /// stay owned by their existing renderer state.
+    pub(in crate::egl_renderer) fn draw_scene_region_plan(&mut self) -> RendererResult<()> {
+        if !self
+            .scene
+            .scene_region_plan
+            .is_executable_for(&self.scene.commands)
+        {
+            return Err(std::io::Error::other("ordinary scene region plan is stale").into());
+        }
+        let opacity_location = if self.runtime.capture_in_progress
+            || self.scene.capture_unattenuated_visual_group.is_some()
+        {
+            self.capture_uniform_location("u_opacity")
+        } else {
+            self.scene.presentation_opacity_location
+        };
+        let required_size = self.scene.vertices.len() * std::mem::size_of::<EglTexturedVertex>();
+        ensure_vertex_buffer_capacity(
+            self.gl,
+            self.scene.scene_vertex_buffer,
+            &mut self.scene.scene_vertex_buffer_capacity,
+            required_size,
+        );
+        let mut uploaded = false;
+        if self.scene.scene_geometry_dirty {
+            unsafe {
+                self.gl
+                    .bind_buffer(glow::ARRAY_BUFFER, Some(self.scene.scene_vertex_buffer));
+                self.gl.buffer_sub_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    0,
+                    bytemuck::cast_slice(self.scene.vertices.as_slice()),
+                );
+            }
+            self.scene.scene_geometry_dirty = false;
+            uploaded = true;
+        }
+        unsafe {
+            self.gl
+                .bind_vertex_array(Some(self.scene.scene_vertex_array));
+        }
+
+        let mut commands_considered = 0usize;
+        let mut commands_executed = 0usize;
+        let mut commands_rejected_outside_damage = 0usize;
+        let mut missing_required_decoration_resources = 0usize;
+        let mut texture_binds = 0usize;
+        let mut draw_calls = 0usize;
+        for planned in self.scene.scene_region_plan.commands.iter().copied() {
+            let command = &self.scene.commands[planned.command_index];
+            commands_considered += 1;
+            let bypass_presentation_clip = self
+                .scene
+                .capture_unclipped_presentation_owner
+                .is_some_and(|owner| {
+                    command
+                        .visual_group
+                        .and_then(|group| self.scene.presentation_visual_group_owners.get(&group))
+                        .is_some_and(|command_owner| *command_owner == owner)
+                });
+            let presentation_clip = if bypass_presentation_clip {
+                None
+            } else {
+                command.presentation_clip
+            };
+            let output_clip = match presentation_clip {
+                Some(clip) => match output_rect_for_egl_clip(clip) {
+                    Some(clip) => Some(clip),
+                    None => continue,
+                },
+                None => None,
+            };
+            let repair_indices = self.scene.scene_region_plan.repair_indices_for(planned);
+            let has_active_clip = repair_indices.iter().copied().any(|repair_index| {
+                let Some(repair) = self
+                    .scene
+                    .scene_region_plan
+                    .repairs
+                    .get(repair_index)
+                    .copied()
+                else {
+                    return false;
+                };
+                output_clip
+                    .map_or(Some(repair), |clip| intersect_output_rect(repair, clip))
+                    .is_some_and(|clip| command.bounds.intersects_output_rect(clip))
+            });
+            if !has_active_clip {
+                commands_rejected_outside_damage += repair_indices.len();
+                continue;
+            }
+            let Some(texture) = self.texture_for_layer(command.layer) else {
+                if Self::is_required_decoration_layer(command.layer) {
+                    missing_required_decoration_resources += 1;
+                }
+                continue;
+            };
+
+            unsafe {
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                texture_binds += 1;
+                let filter = match command.sampling {
+                    SurfaceSampling::ExactNearest => glow::NEAREST,
+                    SurfaceSampling::ScaledLinear => glow::LINEAR,
+                } as i32;
+                // Texture min/mag filters belong to the bound texture, so set
+                // them for every command binding instead of trusting the
+                // legacy cache that is not keyed by texture.
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                if let Some(location) = opacity_location.as_ref() {
+                    let presentation_opacity =
+                        if self.scene.capture_unattenuated_visual_group == command.visual_group {
+                            1.0
+                        } else {
+                            self.scene
+                                .presentation_opacities
+                                .get(planned.command_index)
+                                .copied()
+                                .unwrap_or(1.0)
+                        };
+                    self.gl.uniform_1_f32(Some(location), presentation_opacity);
+                }
+            }
+
+            for repair_index in self
+                .scene
+                .scene_region_plan
+                .repair_indices_for(planned)
+                .iter()
+                .copied()
+            {
+                let Some(repair) = self
+                    .scene
+                    .scene_region_plan
+                    .repairs
+                    .get(repair_index)
+                    .copied()
+                else {
+                    continue;
+                };
+                let effective_scissor = match output_clip {
+                    Some(clip) => intersect_output_rect(repair, clip),
+                    None => Some(repair),
+                };
+                let Some(effective_scissor) = effective_scissor else {
+                    continue;
+                };
+                self.set_scene_scissor(Some(effective_scissor));
+                if !command.bounds.intersects_output_rect(effective_scissor) {
+                    commands_rejected_outside_damage += 1;
+                    continue;
+                }
+                unsafe {
+                    self.gl.draw_arrays(
+                        glow::TRIANGLES,
+                        command.vertex_start as i32,
+                        command.vertex_count as i32,
+                    );
+                }
+                commands_executed += 1;
+                draw_calls += 1;
+            }
+        }
+        self.set_scene_scissor(None);
+        unsafe {
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+
+        self.scene.frame_stats.commands_considered = self
+            .scene
+            .frame_stats
+            .commands_considered
+            .saturating_add(commands_considered);
+        self.scene.frame_stats.commands_executed = self
+            .scene
+            .frame_stats
+            .commands_executed
+            .saturating_add(commands_executed);
+        self.scene.frame_stats.commands_rejected_outside_damage = self
+            .scene
+            .frame_stats
+            .commands_rejected_outside_damage
+            .saturating_add(commands_rejected_outside_damage);
+        self.scene.frame_stats.missing_required_decoration_resources = self
+            .scene
+            .frame_stats
+            .missing_required_decoration_resources
+            .saturating_add(missing_required_decoration_resources);
+        self.scene.frame_stats.texture_binds = self
+            .scene
+            .frame_stats
+            .texture_binds
+            .saturating_add(texture_binds);
+        self.scene.frame_stats.base_region_texture_binds = texture_binds;
+        self.scene.frame_stats.draw_calls =
+            self.scene.frame_stats.draw_calls.saturating_add(draw_calls);
+        self.scene.frame_stats.base_region_draw_calls = draw_calls;
+        self.scene.frame_stats.draw_command_replays = self
+            .scene
+            .frame_stats
+            .draw_command_replays
+            .saturating_add(commands_executed);
+        if uploaded {
+            self.scene.frame_stats.scene_vbo_uploads =
+                self.scene.frame_stats.scene_vbo_uploads.saturating_add(1);
+            self.scene.frame_stats.scene_vbo_upload_bytes = self
+                .scene
+                .frame_stats
+                .scene_vbo_upload_bytes
+                .saturating_add(required_size);
+        }
+        Ok(())
+    }
+
     pub(super) fn begin_effect_repaint(
         &mut self,
         plan: &RepaintPlan,

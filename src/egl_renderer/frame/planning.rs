@@ -17,7 +17,10 @@ use super::super::{
         resolve_effect_execution_for_repaint_plan_with_diagnostics,
     },
     effects::{EffectExecutionSelection, graph_metrics},
-    geometry::{SurfaceConsumerPlan, add_surface_consumers_for_command_range},
+    geometry::{
+        SceneExecutionMode, SurfaceConsumerPlan, add_surface_consumers_for_command_range,
+        scene_execution_mode,
+    },
     resources::{ResourceTelemetry, surface::SurfaceResourceInputs},
 };
 use super::{
@@ -641,11 +644,18 @@ impl FramePipeline<'_> {
     ) -> SurfaceConsumerPlan {
         let (width, height) = self.scene.current_size;
         let repair_rects = super::super::repaint_plan_output_rects(&planned.plan, width, height);
-        self.scene
-            .scene_region_plan
-            .build(&self.scene.commands, &repair_rects);
+        let execution_mode = scene_execution_mode();
+        if execution_mode == SceneExecutionMode::Legacy {
+            self.scene.scene_region_plan.clear_for_legacy();
+            self.scene.frame_stats.base_region_legacy_mode_frames = 1;
+        } else {
+            self.scene
+                .scene_region_plan
+                .build(&self.scene.commands, &repair_rects);
+        }
         let region_plan = &self.scene.scene_region_plan;
-        self.scene.frame_stats.base_region_plan_builds = 1;
+        self.scene.frame_stats.base_region_plan_builds =
+            usize::from(execution_mode != SceneExecutionMode::Legacy);
         self.scene.frame_stats.base_region_input_rects = region_plan.stats.input_rects;
         self.scene.frame_stats.base_region_normalized_rects = region_plan.stats.normalized_rects;
         self.scene.frame_stats.base_region_commands_visited =
@@ -658,8 +668,9 @@ impl FramePipeline<'_> {
             .frame_stats
             .base_region_occlusion_overflow_fallbacks =
             region_plan.stats.occlusion_overflow_fallbacks;
-        self.scene.frame_stats.base_region_legacy_fallbacks =
-            usize::from(region_plan.fallback.is_some());
+        self.scene.frame_stats.base_region_legacy_fallbacks = usize::from(
+            execution_mode != SceneExecutionMode::Legacy && region_plan.fallback.is_some(),
+        );
         self.scene.frame_stats.legacy_scene_scan_pairs_baseline =
             self.scene.commands.len().saturating_mul(repair_rects.len());
         let mut consumer_plan =

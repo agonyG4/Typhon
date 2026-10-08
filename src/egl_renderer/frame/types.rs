@@ -55,6 +55,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub base_region_draw_calls: usize,
     pub base_region_occlusion_overflow_fallbacks: usize,
     pub base_region_legacy_fallbacks: usize,
+    pub base_region_legacy_mode_frames: usize,
     pub legacy_scene_scan_pairs_baseline: usize,
     pub scissor_passes: usize,
     pub planner_passes: usize,

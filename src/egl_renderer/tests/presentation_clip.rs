@@ -138,6 +138,109 @@ fn real_gles_clip_intersects_frame_damage_scissor() {
 }
 
 #[test]
+fn real_gles_region_scene_draw_matches_legacy_inside_disjoint_repairs() {
+    let mut harness = GlesEffectTestHarness::new(4, 1);
+    harness.install_texture_backed_output();
+    let red_pixel = rgba_to_pixel([255, 0, 0, 255]);
+    let green_pixel = rgba_to_pixel([0, 128, 0, 128]);
+    let red_texture = create_effect_test_texture(&harness.gl, 1, 1, &[255, 0, 0, 255]);
+    let green_texture = create_effect_test_texture(&harness.gl, 1, 1, &[0, 128, 0, 128]);
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(red_pixel), red_texture);
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(green_pixel), green_texture);
+    let scene = &mut harness.renderer.scene_state;
+    scene.vertices.clear();
+    scene.commands.clear();
+    push_draw_command(
+        &mut scene.vertices,
+        &mut scene.commands,
+        EglDrawLayer::SolidRgba(red_pixel),
+        EglRect::new(0.0, 0.0, 4.0, 1.0),
+        4,
+        1,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    push_draw_command(
+        &mut scene.vertices,
+        &mut scene.commands,
+        EglDrawLayer::SolidRgba(green_pixel),
+        EglRect::new(0.0, 0.0, 4.0, 1.0),
+        4,
+        1,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    scene.presentation_opacities = vec![1.0; 2];
+    let repairs = [OutputRect::new(1, 0, 1, 1), OutputRect::new(2, 0, 1, 1)];
+    scene.scene_region_plan.build(&scene.commands, &repairs);
+    assert_eq!(scene.scene_region_plan.fallback, None);
+
+    unsafe {
+        harness.gl.clear_color(0.0, 0.0, 1.0, 1.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        harness.gl.enable(glow::SCISSOR_TEST);
+        for repair in repairs {
+            scene.set_scene_scissor(&harness.gl, Some(repair));
+            harness.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        harness.gl.disable(glow::SCISSOR_TEST);
+    }
+    harness
+        .renderer
+        .effect_execution_context()
+        .draw_scene_region_plan()
+        .expect("region-native scene draws");
+    let candidate = read_effect_test_pixels(&harness.gl, 4, 1);
+    assert_eq!(
+        harness
+            .renderer
+            .scene_state
+            .frame_stats
+            .base_region_texture_binds,
+        2
+    );
+    assert_eq!(
+        harness
+            .renderer
+            .scene_state
+            .frame_stats
+            .base_region_draw_calls,
+        4
+    );
+
+    unsafe {
+        harness.renderer.establish_ordinary_scene_state();
+        harness.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    harness
+        .renderer
+        .draw_command_batch(true, None)
+        .expect("legacy full-current reference draws");
+    let reference = read_effect_test_pixels(&harness.gl, 4, 1);
+    for x in 1..=2 {
+        let offset = x as usize * 4;
+        assert_eq!(
+            &candidate[offset..offset + 4],
+            &reference[offset..offset + 4],
+            "candidate output differs from the legacy full-current reference at x={x}"
+        );
+    }
+    assert_effect_test_pixel(&candidate, 4, 0, 0, [0, 0, 255, 255]);
+    assert_effect_test_pixel(&candidate, 4, 3, 0, [0, 0, 255, 255]);
+
+    unsafe {
+        harness.gl.delete_texture(red_texture);
+        harness.gl.delete_texture(green_texture);
+    }
+}
+
+#[test]
 fn popup_visual_group_inherits_window_group_clip_from_its_presentation_owner() {
     let mut harness = GlesEffectTestHarness::new(16, 16);
     let root = test_shm_surface(RenderableSurfaceDamage::full());

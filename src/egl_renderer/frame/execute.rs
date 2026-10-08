@@ -262,91 +262,131 @@ impl FramePipeline<'_> {
                 framebuffer_origin,
             )
             .ok_or_else(|| std::io::Error::other("repaint execution conversion failed"))?;
-        match execution {
-            RenderExecution::Full => {
+        let region_plan_valid = self
+            .scene
+            .scene_region_plan
+            .is_executable_for(&self.scene.commands);
+        let region_execution_requested = self.scene.frame_stats.base_region_legacy_mode_frames == 0
+            && self.scene.scene_region_plan.fallback.is_none();
+        if region_execution_requested && !region_plan_valid {
+            self.scene.frame_stats.base_region_legacy_fallbacks = self
+                .scene
+                .frame_stats
+                .base_region_legacy_fallbacks
+                .saturating_add(1);
+        }
+        let use_region_execution = region_execution_requested
+            && region_plan_valid
+            && !self.scene.scene_region_plan.repairs.is_empty();
+        if use_region_execution {
+            let repair_count = self.scene.scene_region_plan.repairs.len();
+            for repair_index in 0..repair_count {
+                let repair = self.scene.scene_region_plan.repairs[repair_index];
+                self.scene.set_scene_scissor(self.gl, Some(repair));
                 unsafe {
-                    self.gl.disable(glow::SCISSOR_TEST);
                     self.gl.clear(glow::COLOR_BUFFER_BIT);
                 }
-                self.draw_command_batch(true, None)?;
-                self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
-                self.draw_lamp_overlay(None)?;
-                self.draw_squash_overlay(None)?;
-                self.draw_command_batch(false, None)?;
             }
-            RenderExecution::Scissored {
-                scissors,
-                disable_scissor_after,
-            } => {
-                unsafe {
-                    self.gl.enable(glow::SCISSOR_TEST);
-                }
-                let mut draw_result = Ok(());
-                for phase in legacy_scene_scissored_phase_plan(scissors.len()) {
-                    if draw_result.is_err() {
-                        break;
-                    }
-                    match phase {
-                        LegacySceneScissoredPhase::BaseRepair(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            unsafe {
-                                self.gl.scissor(x, y, width, height);
-                                self.gl.clear(glow::COLOR_BUFFER_BIT);
-                            }
-                            let output_rect = super::super::gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_command_batch(true, output_rect);
-                        }
-                        LegacySceneScissoredPhase::PrepareLifecycleSources => {
-                            draw_result =
-                                self.prepare_lifecycle_visual_sources(plan, framebuffer_origin);
-                        }
-                        LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            unsafe {
-                                self.gl.enable(glow::SCISSOR_TEST);
-                                self.gl.scissor(x, y, width, height);
-                            }
-                        }
-                        LegacySceneScissoredPhase::Lamp(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            let output_rect = super::super::gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_lamp_overlay(output_rect);
-                        }
-                        LegacySceneScissoredPhase::Squash(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            let output_rect = super::super::gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_squash_overlay(output_rect);
-                        }
-                        LegacySceneScissoredPhase::ExternalOverlays(index) => {
-                            let [x, y, width, height] = scissors[index];
-                            let output_rect = super::super::gl_scissor_to_output_rect(
-                                [x, y, width, height],
-                                self.scene.current_size.1,
-                                framebuffer_origin,
-                            );
-                            draw_result = self.draw_command_batch(false, output_rect);
-                        }
-                    }
-                }
-                if disable_scissor_after {
+            self.scene.set_scene_scissor(self.gl, None);
+            self.effect_execution_context().draw_scene_region_plan()?;
+
+            // Lifecycle source capture observes the complete repaired base
+            // scene, matching the legacy phase boundary.
+            self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
+            for repair_index in 0..repair_count {
+                let repair = self.scene.scene_region_plan.repairs[repair_index];
+                self.draw_lamp_overlay(Some(repair))?;
+                self.draw_squash_overlay(Some(repair))?;
+                self.draw_command_batch(false, Some(repair))?;
+            }
+            self.scene.frame_stats.scissor_passes = repair_count;
+        } else {
+            match execution {
+                RenderExecution::Full => {
                     unsafe {
                         self.gl.disable(glow::SCISSOR_TEST);
+                        self.gl.clear(glow::COLOR_BUFFER_BIT);
                     }
+                    self.draw_command_batch(true, None)?;
+                    self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
+                    self.draw_lamp_overlay(None)?;
+                    self.draw_squash_overlay(None)?;
+                    self.draw_command_batch(false, None)?;
                 }
-                draw_result?;
-                self.scene.frame_stats.scissor_passes = scissors.len();
+                RenderExecution::Scissored {
+                    scissors,
+                    disable_scissor_after,
+                } => {
+                    unsafe {
+                        self.gl.enable(glow::SCISSOR_TEST);
+                    }
+                    let mut draw_result = Ok(());
+                    for phase in legacy_scene_scissored_phase_plan(scissors.len()) {
+                        if draw_result.is_err() {
+                            break;
+                        }
+                        match phase {
+                            LegacySceneScissoredPhase::BaseRepair(index) => {
+                                let [x, y, width, height] = scissors[index];
+                                unsafe {
+                                    self.gl.scissor(x, y, width, height);
+                                    self.gl.clear(glow::COLOR_BUFFER_BIT);
+                                }
+                                let output_rect = super::super::gl_scissor_to_output_rect(
+                                    [x, y, width, height],
+                                    self.scene.current_size.1,
+                                    framebuffer_origin,
+                                );
+                                draw_result = self.draw_command_batch(true, output_rect);
+                            }
+                            LegacySceneScissoredPhase::PrepareLifecycleSources => {
+                                draw_result =
+                                    self.prepare_lifecycle_visual_sources(plan, framebuffer_origin);
+                            }
+                            LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
+                                let [x, y, width, height] = scissors[index];
+                                unsafe {
+                                    self.gl.enable(glow::SCISSOR_TEST);
+                                    self.gl.scissor(x, y, width, height);
+                                }
+                            }
+                            LegacySceneScissoredPhase::Lamp(index) => {
+                                let [x, y, width, height] = scissors[index];
+                                let output_rect = super::super::gl_scissor_to_output_rect(
+                                    [x, y, width, height],
+                                    self.scene.current_size.1,
+                                    framebuffer_origin,
+                                );
+                                draw_result = self.draw_lamp_overlay(output_rect);
+                            }
+                            LegacySceneScissoredPhase::Squash(index) => {
+                                let [x, y, width, height] = scissors[index];
+                                let output_rect = super::super::gl_scissor_to_output_rect(
+                                    [x, y, width, height],
+                                    self.scene.current_size.1,
+                                    framebuffer_origin,
+                                );
+                                draw_result = self.draw_squash_overlay(output_rect);
+                            }
+                            LegacySceneScissoredPhase::ExternalOverlays(index) => {
+                                let [x, y, width, height] = scissors[index];
+                                let output_rect = super::super::gl_scissor_to_output_rect(
+                                    [x, y, width, height],
+                                    self.scene.current_size.1,
+                                    framebuffer_origin,
+                                );
+                                draw_result = self.draw_command_batch(false, output_rect);
+                            }
+                        }
+                    }
+                    if disable_scissor_after {
+                        unsafe {
+                            self.gl.disable(glow::SCISSOR_TEST);
+                        }
+                    }
+                    draw_result?;
+                    self.scene.frame_stats.scissor_passes = scissors.len();
+                }
             }
         }
 

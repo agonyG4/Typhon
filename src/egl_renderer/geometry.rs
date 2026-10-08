@@ -1,10 +1,34 @@
 use glow::HasContext;
 use oblivion_one::compositor::ServerFrameColor;
+use std::sync::OnceLock;
 
 use super::{OutputFramebufferOrigin, OutputRect};
 
 pub(super) const MIN_VERTEX_BUFFER_BYTES: usize = 4096;
 pub(super) const VERTEX_STRIDE: i32 = std::mem::size_of::<EglTexturedVertex>() as i32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SceneExecutionMode {
+    Auto,
+    Region,
+    Legacy,
+}
+
+pub(super) fn parse_scene_execution_mode(value: Option<&str>) -> SceneExecutionMode {
+    match value {
+        Some("region") => SceneExecutionMode::Region,
+        Some("legacy") => SceneExecutionMode::Legacy,
+        _ => SceneExecutionMode::Auto,
+    }
+}
+
+pub(super) fn scene_execution_mode() -> SceneExecutionMode {
+    static MODE: OnceLock<SceneExecutionMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var("TYPHON_SCENE_EXECUTION_MODE").ok();
+        parse_scene_execution_mode(value.as_deref())
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct EglRect {
@@ -229,10 +253,15 @@ pub(super) struct SceneRegionPlan {
     pub(super) consumer_plan: SurfaceConsumerPlan,
     pub(super) stats: SceneRegionPlanStats,
     pub(super) fallback: Option<SceneRegionFallback>,
+    command_count: usize,
     repair_scratch: Vec<SceneRepairVisibility>,
 }
 
 impl SceneRegionPlan {
+    pub(super) fn clear_for_legacy(&mut self) {
+        self.clear_for_build();
+    }
+
     pub(super) fn build(&mut self, commands: &[EglDrawCommand], repairs: &[OutputRect]) {
         self.clear_for_build();
         self.stats.input_rects = repairs.len();
@@ -252,6 +281,7 @@ impl SceneRegionPlan {
             self.fallback = Some(SceneRegionFallback::TooManyCommands);
             return;
         }
+        self.command_count = commands.len();
 
         self.repairs.extend_from_slice(repairs);
         self.stats.normalized_rects = repairs.len();
@@ -373,6 +403,15 @@ impl SceneRegionPlan {
         &self.clip_repair_indices[command.clips_start..command.clips_start + command.clips_len]
     }
 
+    pub(super) fn is_executable_for(&self, commands: &[EglDrawCommand]) -> bool {
+        self.fallback.is_none()
+            && self.command_count == commands.len()
+            && commands.len() <= MAX_SCENE_REGION_COMMANDS
+            && self.commands.len() <= MAX_SCENE_REGION_COMMANDS
+            && self.repairs.len() <= MAX_SCENE_REGION_REPAIRS
+            && self.clip_repair_indices.len() <= MAX_SCENE_REGION_CLIP_PIECES
+    }
+
     pub(super) fn has_command_clip(&self, command_index: usize, repair_index: usize) -> bool {
         self.commands
             .iter()
@@ -385,7 +424,7 @@ impl SceneRegionPlan {
         commands: &[EglDrawCommand],
         repairs: &[OutputRect],
     ) -> SurfaceConsumerPlan {
-        if self.fallback.is_some() || self.repairs != repairs {
+        if self.fallback.is_some() || self.repairs != repairs || !self.is_executable_for(commands) {
             plan_surface_consumers(commands, repairs)
         } else {
             self.consumer_plan.clone()
@@ -399,6 +438,7 @@ impl SceneRegionPlan {
         self.consumer_plan.surface_ids.clear();
         self.stats.clear();
         self.fallback = None;
+        self.command_count = 0;
         self.repair_scratch.clear();
     }
 
@@ -1353,6 +1393,27 @@ mod tests {
         assert_eq!(plan.fallback, Some(SceneRegionFallback::ClipArenaOverflow));
         assert!(plan.clip_repair_indices.is_empty());
         assert!(plan.commands.is_empty());
+    }
+
+    #[test]
+    fn scene_execution_mode_invalid_values_fail_closed_to_auto() {
+        assert_eq!(parse_scene_execution_mode(None), SceneExecutionMode::Auto);
+        assert_eq!(
+            parse_scene_execution_mode(Some("region")),
+            SceneExecutionMode::Region
+        );
+        assert_eq!(
+            parse_scene_execution_mode(Some("legacy")),
+            SceneExecutionMode::Legacy
+        );
+        assert_eq!(
+            parse_scene_execution_mode(Some("invalid")),
+            SceneExecutionMode::Auto
+        );
+        assert_eq!(
+            parse_scene_execution_mode(Some("REGION")),
+            SceneExecutionMode::Auto
+        );
     }
 
     #[test]
