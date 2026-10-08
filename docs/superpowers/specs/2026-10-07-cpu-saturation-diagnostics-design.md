@@ -2,8 +2,8 @@
 
 ## Investigation snapshot
 
-The Codebase Memory project `home-agony-GitHub-Typhon` was indexed at generation
-`2026-10-07T23:54:27Z`; the relevant source paths had no recorded coverage gaps.
+The Codebase Memory project `home-agony-GitHub-Typhon` was refreshed at generation
+`2026-10-08T00:45:41Z`; the relevant source paths had no recorded coverage gaps.
 This is a best-effort graph signal, not a completeness guarantee.
 
 ### Source-proven behavior
@@ -40,6 +40,40 @@ This is a best-effort graph signal, not a completeness guarantee.
   diagnostics change.
 - A source search found no scheduler API or `CPUWeight` configuration. App
   scope setup does not establish a compositor scheduling policy.
+- `NativeRuntime::bootstrap()` blocks `SIGCHLD` before native initialization;
+  `run()` runs the reactor on the calling thread (`src/native_output/runtime/mod.rs:852-873`).
+  The initial KMS worker starts during `finish_bootstrap()`
+  (`src/native_output/runtime/bootstrap.rs:355-367`) and can be recreated during
+  recovery (`src/native_output/runtime/kms_worker.rs:849-893`; worker creation is
+  `src/native_output/kms_worker/thread.rs:196-212`). Other production worker
+  creation sites include cursor I/O (`src/cursor_manager.rs:796-811`), keyboard
+  persistence (`src/keyboard_persistence.rs:408-425`), application-scope
+  registration (`src/application_scope.rs:212-225`), dmem foreground
+  (`src/native/dmem_foreground.rs:1040-1043`), output-configuration persistence
+  (`src/native_output/runtime/output_configuration.rs:105-126`), and optional
+  pacing trace sinks (`src/native_output/pacing.rs:2418-2427`,
+  `src/compositor/pacing.rs:86-100`). Some workers are conditional or can start
+  after the reactor begins, so applying a policy only once to the reactor would
+  leave an inheritance boundary to audit. The source scan covers explicit
+  `std::thread` creation; internal threads created by graphics and driver
+  libraries are outside that source inventory and remain unqualified.
+- Native application children go through
+  `spawn_native_process()` → `prepare_application_spawn()` →
+  `SpawnCommand::spawn()` → `ChildSupervisor::spawn_inner()`
+  (`src/native_output/launch.rs:368-377`, `src/application_scope.rs:354-401`,
+  `src/process.rs:192-213,438-456`). XWayland uses `SpawnCommand` in
+  `XwaylandService` (`src/xwayland/launch.rs:26-43`,
+  `src/xwayland/service.rs:1017-1035`); session detection also launches
+  `pkg-config` directly (`src/session/mod.rs:196-204`). The spawn setup configures
+  child file descriptors and signal masks; it does not reset scheduling policy
+  or nice values. Application scopes do not set compositor scheduler policy.
+- Linux's POSIX-thread defaults inherit scheduling attributes from the creating
+  thread, while `SCHED_RESET_ON_FORK` is documented for fork-created children.
+  That flag resets inherited `SCHED_FIFO`/`SCHED_RR` and negative nice in child
+  processes; it does not remove the need to account for late-created worker
+  threads. A `nice`-only mode has no such reset flag. See
+  [`pthread_attr_getinheritsched(3)`](https://man7.org/linux/man-pages/man3/pthread_attr_getinheritsched.3p.html)
+  and [`sched(7)`](https://man7.org/linux/man-pages/man7/sched.7.html).
 
 ### Observed machine state and qualification gap
 
@@ -61,8 +95,9 @@ not a substitute for either.
 Add an optional external Python collector and an English qualification runbook.
 The collector samples per-thread runtime and scheduler wait from
 `/proc/<pid>/task/<tid>/schedstat`, thread nice/policy/affinity, CPU/memory/I/O
-pressure, cgroup CPU quota/throttling, CPU frequency and thermal sensors. It
-writes outside the checkout and reports p50/p95/p99 sample distributions.
+pressure, cgroup CPU quota/weight hierarchy and throttling, CPU frequency and
+thermal sensors. It writes outside the checkout and reports p50/p95/p99 sample
+distributions.
 Existing Typhon slow-cycle and pointer-transition traces supply application
 phase context; the runbook explains that they do not independently establish
 physical presentation cadence or kernel runnable delay.
@@ -70,6 +105,10 @@ physical presentation cadence or kernel runnable delay.
 No compositor hot-path instrumentation, screenshot budget, `nice`, `SCHED_RR`,
 cgroup weight, KMS ownership, or event-loop changes are justified without target
 measurements. Default startup and effective policy therefore remain unchanged.
+The worker and child lifecycle audit also leaves no safe one-time reactor policy
+transition to recommend: helper workers may start later, the KMS worker can be
+recreated during recovery, and child-launch helpers do not reset `nice` or
+scheduler settings themselves.
 
 ## Verification
 
