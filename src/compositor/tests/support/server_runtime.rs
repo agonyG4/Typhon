@@ -235,6 +235,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
         reply: Sender<(String, bool)>,
     },
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
+    CaptureEffectDemandState(
+        Sender<(
+            crate::compositor::effects::EffectSceneSummary,
+            crate::compositor::effects::EffectFrameDemandSnapshot,
+            ResolvedEffectScene,
+        )>,
+    ),
     CaptureFocusedPresentationEffectSceneAfter {
         elapsed_nanos: u64,
         reply: Sender<ResolvedEffectScene>,
@@ -1051,6 +1058,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureResolvedEffectScene(reply) => {
                         let _ = reply.send(server.resolved_effect_scene());
+                    }
+                    ServerCommand::CaptureEffectDemandState(reply) => {
+                        let resolved = server.resolved_effect_scene();
+                        let summary = server.state.effect_scene_summary();
+                        let demand = server.state.effect_frame_demand_snapshot();
+                        let _ = reply.send((summary, demand, resolved));
                     }
                     ServerCommand::SetMaterialProgramConfiguration {
                         configuration,

@@ -379,6 +379,9 @@ impl CompositorState {
                 commit_sequence.get(),
             )
         });
+        if window_geometry_changed && self.surface_tree_generation.is_none() {
+            self.refresh_effect_scene_summary();
+        }
         if committed_popup && surface_was_renderable && !window_geometry_changed {
             self.compliance_metrics.note_surface_commit_geometry_noop();
         }

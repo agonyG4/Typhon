@@ -171,12 +171,17 @@ impl CompositorState {
         } else {
             "fullscreen_owner_set"
         };
-        self.fullscreen_presentation = Some(FullscreenPresentationState {
+        let next_owner = FullscreenPresentationState {
             owner_root_surface_id: surface_id,
             output_width: self.output_size.width,
             output_height: self.output_size.height,
-        });
+        };
+        let changed = self.fullscreen_presentation != Some(next_owner);
+        self.fullscreen_presentation = Some(next_owner);
         self.refresh_presentation_feedback_eligibility();
+        if changed && self.surface_tree_generation.is_none() {
+            self.refresh_effect_scene_summary();
+        }
         if crate::compositor::fullscreen::fullscreen_trace_enabled() {
             eprintln!(
                 "oblivion-one fullscreen: event={event} root_surface_id={surface_id} reason=authoritative_mode_state"
@@ -191,6 +196,9 @@ impl CompositorState {
         {
             self.fullscreen_presentation = None;
             self.refresh_presentation_feedback_eligibility();
+            if self.surface_tree_generation.is_none() {
+                self.refresh_effect_scene_summary();
+            }
             if crate::compositor::fullscreen::fullscreen_trace_enabled() {
                 eprintln!(
                     "oblivion-one fullscreen: event=fullscreen_owner_cleared root_surface_id={surface_id} reason=authoritative_mode_or_lifecycle_transition"

@@ -50,12 +50,15 @@ fn material_default_manifest() -> EffectManifest {
 fn capture_effect_scene(commands: &Sender<ServerCommand>) -> ResolvedEffectScene {
     let (reply, receiver) = mpsc::channel();
     commands
-        .send(ServerCommand::CaptureResolvedEffectScene(reply))
+        .send(ServerCommand::CaptureEffectDemandState(reply))
         .expect("effect scene capture command should be accepted");
     wait_for_server_commands(commands);
-    receiver
+    let (cached_summary, cached_demand, resolved) = receiver
         .recv_timeout(Duration::from_secs(1))
-        .expect("effect scene capture should complete")
+        .expect("effect scene capture should complete");
+    assert_eq!(cached_summary, resolved.summary);
+    assert_eq!(cached_demand, resolved.frame_demand_snapshot());
+    resolved
 }
 
 fn sole_background_blur(
@@ -602,9 +605,13 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         .unwrap();
     wait_for_server_commands(&commands);
 
-    let mut blur_policy = crate::blur_policy::BlurPolicyConfig::default();
-    blur_policy.enabled = true;
-    blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::Auto;
+    let mut blur_policy = crate::blur_policy::BlurPolicyConfig {
+        applications: crate::blur_policy::BlurApplicationPolicy {
+            wayland: crate::blur_policy::BlurApplicationMode::Auto,
+            ..crate::blur_policy::BlurApplicationPolicy::default()
+        },
+        ..crate::blur_policy::BlurPolicyConfig::default()
+    };
     replace_blur_policy_config(&commands, blur_policy.clone());
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -792,6 +799,72 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         assert!(
             capture_effect_scene(&commands).is_empty(),
             "private coverage without a committed public blur must not create an effect"
+        );
+        Ok(())
+    })();
+
+    stop_controllable_test_server(commands, server_thread);
+    result.unwrap();
+}
+
+#[test]
+fn published_effect_demand_tracks_workspace_visibility_changes() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.state.set_background_effect_enabled(true);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    commands
+        .send(ServerCommand::AuthorizeAstreaShellPid(std::process::id()))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let blur_policy = crate::blur_policy::BlurPolicyConfig {
+        applications: crate::blur_policy::BlurApplicationPolicy {
+            wayland: crate::blur_policy::BlurApplicationMode::Auto,
+            ..crate::blur_policy::BlurApplicationPolicy::default()
+        },
+        ..crate::blur_policy::BlurPolicyConfig::default()
+    };
+    replace_blur_policy_config(&commands, blur_policy);
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let (surface, _xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 100)?;
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+
+        let initial = capture_effect_scene(&commands);
+        assert_eq!(initial.summary.visible_instance_count, 1);
+        assert_eq!(initial.summary.continuous_instance_count, 0);
+
+        commands
+            .send(ServerCommand::ActivateWorkspace { workspace: 2 })
+            .expect("workspace activation command should be accepted");
+        wait_for_server_commands(&commands);
+        let hidden = capture_effect_scene(&commands);
+        assert!(
+            hidden.is_empty(),
+            "inactive-workspace blur must be excluded"
+        );
+        assert_eq!(hidden.summary.visible_instance_count, 0);
+
+        commands
+            .send(ServerCommand::ActivateWorkspace { workspace: 1 })
+            .expect("workspace activation command should be accepted");
+        wait_for_server_commands(&commands);
+        let restored = capture_effect_scene(&commands);
+        assert_eq!(restored.summary.visible_instance_count, 1);
+        assert_eq!(
+            restored.instances[0].frame_demand,
+            EffectFrameDemand::OnDamage
         );
         Ok(())
     })();

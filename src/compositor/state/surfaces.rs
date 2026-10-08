@@ -988,6 +988,10 @@ impl CompositorState {
         for root_surface_id in pending_window_open_animations {
             self.maybe_begin_window_open_animation(root_surface_id);
         }
+        // SurfaceTree publication batches can update surface bounds, XDG
+        // geometry, blur assignment inputs, and active-scene membership. Keep
+        // the effect-demand summary aligned once all nodes are authoritative.
+        self.refresh_effect_scene_summary();
     }
 
     pub(in crate::compositor) fn set_render_generation(
@@ -1451,7 +1455,7 @@ impl CompositorState {
         self.active_commit_timing_targets.remove(&surface_id);
         self.fifo_resources.remove(&surface_id);
         self.release_protocol_surface_effects_for_surface(surface_id);
-        self.internal_surface_effects.remove(&surface_id);
+        let removed_internal_effect = self.internal_surface_effects.remove(&surface_id).is_some();
         self.background_effect_resources.remove(&surface_id);
         self.background_effect_coverage_resources
             .remove(&surface_id);
@@ -1560,6 +1564,11 @@ impl CompositorState {
         if self.renderable_surfaces.len() != previous_renderable_count {
             self.rebuild_active_scene_view();
             self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
+        } else if removed_internal_effect {
+            // The scene rebuild normally republishes the summary after a
+            // visible surface is removed. Keep the published summary current
+            // for internal effect anchors that outlive renderable membership.
+            self.refresh_effect_scene_summary();
         }
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],

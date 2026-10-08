@@ -572,6 +572,15 @@ mod tests {
         state
     }
 
+    fn assert_cached_effect_demand_matches_resolution(state: &crate::compositor::CompositorState) {
+        let resolved = state.resolved_effect_scene();
+        assert_eq!(state.effect_scene_summary(), resolved.summary);
+        assert_eq!(
+            state.effect_frame_demand_snapshot(),
+            resolved.frame_demand_snapshot()
+        );
+    }
+
     #[test]
     fn material_program_selection_changes_only_scene_selection_not_registry() {
         let directory = material_config_home();
@@ -633,6 +642,7 @@ mod tests {
 
         assert!(update.changed);
         assert_eq!(update.snapshot.effective_program, "glass.liquid");
+        assert_cached_effect_demand_matches_resolution(&state);
         assert_eq!(state.scene_render_generation, previous_scene_generation + 1);
         assert!(std::sync::Arc::ptr_eq(
             &state.trusted_effect_registry.current(),
@@ -667,6 +677,7 @@ mod tests {
                 ..MaterialConfiguration::default()
             })
             .unwrap();
+        assert_cached_effect_demand_matches_resolution(&state);
         let material_registry = state.trusted_effect_registry.current();
         let current_builtin_radius = material_registry
             .program(crate::effects::BUILTIN_BACKGROUND_BLUR_NAME)
@@ -716,6 +727,7 @@ mod tests {
             )
             .unwrap();
         state.note_trusted_effect_registry_reload();
+        assert_cached_effect_demand_matches_resolution(&state);
         let fallback = state.material_program_selection_snapshot();
         assert_eq!(fallback.configuration.requested_program, "glass.liquid");
         assert_eq!(
@@ -739,6 +751,7 @@ mod tests {
             )
             .unwrap();
         assert!(!same_requested_program.changed);
+        assert_cached_effect_demand_matches_resolution(&state);
         assert_eq!(same_requested_program.snapshot, fallback);
         assert_eq!(
             state.scene_render_generation,
@@ -1196,6 +1209,7 @@ mod tests {
 
         assert!(update.changed);
         assert_eq!(update.snapshot.parameter_generation, 1);
+        assert_cached_effect_demand_matches_resolution(&state);
         assert_eq!(state.material_program_parameter_control.generation(), 1);
         assert_eq!(
             state.material_program_selection_snapshot().generation,
@@ -1216,6 +1230,7 @@ mod tests {
             .set_material_program_parameter_configuration(candidate)
             .unwrap();
         assert!(!replay.changed);
+        assert_cached_effect_demand_matches_resolution(&state);
         assert_eq!(state.material_program_parameter_control.generation(), 1);
         assert_eq!(state.scene_render_generation, scene_generation);
 

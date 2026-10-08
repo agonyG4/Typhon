@@ -1,103 +1,141 @@
-# Hardware cursor responsiveness diagnostics
+# Cursor responsiveness diagnostics and hardware qualification
 
-## Purpose and scope
+## Scope
 
-This diagnostic extension measures ordinary pointer motion through input dispatch, hit testing, effect-scene resolution, cursor arbitration, Atomic KMS submission, and pageflip observation. It is opt-in, bounded, and records to memory during the session. It does not change scheduling, cursor priority, Predictive O1, KMS ownership, or rendering behavior.
+The opt-in cursor trace follows sampled pointer-motion batches through input dispatch, hit testing, effect-scene resolution, cursor arbitration, and attributable Atomic KMS transactions. It observes existing decisions and does not change scheduling, cursor priority, rendering, or KMS ownership.
 
-Pageflip timestamps are compositor/kernel presentation observations. They are not optical measurements of when pixels became visible.
+Pageflip timestamps are compositor/kernel transaction observations. They do not measure optical pixel visibility or hardware-cursor scanout latency.
 
-## Existing telemetry and blind spots
+## Trace costs and timing boundaries
 
-| Stage | Existing evidence | Blind spot |
-|---|---|---|
-| CPU and scheduler | `scripts/typhon_cpu_saturation_probe.py` samples per-thread runtime, runnable wait, timeslices, scheduler policy, affinity, CPU pressure, and visible cgroup counters. Its report calculates per-thread p50/p95/p99 and preserves missing/reset counters as unknown. | It does not observe pointer batches, hit tests, effects, cursor epochs, or KMS operations. |
-| Native input | `cycle_dispatch.rs` counts all raw and coalesced input events and captures libinput timestamps. `NativePointerTimingTrace` retains eight pointer-constraint transition observations, including input service and dispatch spans. | Those timing records are transition based. Input counts are not motion-only, and normal motion does not receive a per-batch latency sample. Hardware event timestamps use a different clock domain from `CLOCK_MONOTONIC`; subtracting them directly would be invalid. |
-| Hit testing | `pointer_scene_hit_at` tracks calls, cache hits/misses, full scans, groups/surfaces inspected, locality fast hits, and cumulative CPU nanoseconds when pointer instrumentation is enabled. The uncached path scans visual-stack groups and surfaces from front to back. | There is no production percentile distribution or ordinary-motion correlation for these metrics. |
-| Effect scene | `resolved_effect_scene` builds and orders visible effect instances, walking active scene surfaces when the background effect is enabled. A test-only call counter exists. | Production duration and per-motion association are not measured. |
-| Cursor arbitration | `NativeCursorOutputArbitration` keeps desired epoch, response-window/coalescing counts, plane-delta plan/submission counts, primary deferrals, piggyback counts, and software updates. Primary work wins; a due idle hardware cursor update can use a plane delta when the plane is usable and software overlay work is absent. | Existing values are cumulative counters. There is no per-epoch time series for the actual disposition or an input timestamp attached to the desired epoch. A newer desired epoch can supersede an older pending epoch. |
-| Atomic KMS and presentation | `PresentationTransactionTraceRing` retains transaction build, worker queue, KMS submit start/return, and pageflip observations, keyed by output transaction ID. Its ordinary default capacity is 4096 events. `trace_cursor_kms_submit` can log cursor epoch, transaction ID, token, and plane assignment when pointer presentation logging is enabled. | Existing events do not tie ordinary motion to a cursor epoch. The separate cursor submit diagnostic is synchronous text output and is not used by this protocol. A pageflip observation must not be described as optical presentation. |
-| Slow cycles | `NativeSlowCycleTrace` retains only cycles that exceed the refresh interval, with 96 records by default. It describes cycle phases, input counts, rendering/submission state, and wake context. | It is not a distribution of ordinary input cycles and cannot isolate per-motion hit-test or effect-scene cost. |
+Set `TYPHON_CURSOR_RESPONSIVENESS_TRACE=1` to enable the bounded trace. It samples one in every 16 nonempty pointer-motion batches by default. The sample ring defaults to 32,768 entries and is clamped to 1–65,536. The separate cursor-transaction history is bounded at 65,536 entries by default. The output is serialized at clean runtime teardown rather than synchronously for each motion.
 
-## Diagnostic design
+Sample IDs increase by one for each retained sample. The trace stops assigning IDs after `u64::MAX` rather than repeating an ID. FIFO lookup uses the offset from the oldest retained ID and verifies that the record at that offset has the requested ID; absent and evicted IDs return no record. The per-output latest-epoch index is updated when a sample is completed and cleared when that indexed sample is evicted. Its size is bounded by the retained records, so epoch supersession does not walk the history.
 
-Add a dedicated `NativeCursorResponsivenessTrace` with `TYPHON_CURSOR_RESPONSIVENESS_TRACE=1`. It retains every 16th ordinary pointer-motion batch in a fixed-capacity ring (default 32,768 samples, maximum 65,536); counters cover every batch, including unsampled batches. Capacity and eviction counts are reported. The disabled path checks the cached enable flag before taking diagnostic clocks, scanning input batches for motion counts, or formatting records. Sampled batches record the direct thread CPU time for creating and retaining the sample.
+`trace_write_cpu_ns` starts immediately before the sampled timing-capture closure. It ends after record construction, FIFO eviction/insertion, and the O(1) lookup of the newly appended record. The final clock read, storing that measured value and adding it to the aggregate are outside the interval because they occur after its endpoint. The per-output latest-epoch index update happens when dispatch completion is recorded, after this interval. Per-batch counters updated before the sampling branch, libinput dispatch, semantic input routing, and work after `record_motion_batch()` returns are also outside this field. Compare trace-off and trace-on trials to measure total instrumentation impact; this field is only the sampled record-retention cost.
 
-Each retained sample carries:
+With the trace disabled, `record_motion_batch()` returns before invoking its lazy capture closure or reading diagnostic clocks. The ring is constructed with zero capacity and the empty hash map allocates no buckets; the disabled call path performs no trace-owned heap allocation. The runtime caller also gates pointer-motion event scanning on the cached trace-enabled flag.
 
-- a monotonically increasing sample ID;
-- the source-clock oldest/newest libinput motion timestamps in microseconds, without converting them to monotonic time;
-- raw and coalesced pointer-motion event counts for that native input batch;
-- monotonic input-batch materialization, compositor dispatch start/end, and arbitration timestamps. Libinput event timestamps remain in their source clock and are never subtracted from monotonic timestamps;
-- hit-test call/cache/scan/group/surface deltas and cumulative hit-test CPU time for that batch;
-- exact effect-scene resolution duration for the output scene built in the same cycle;
-- the output cursor epoch, arbitration disposition, and whether a later epoch superseded it as the desired cursor state.
+The published effect-demand summary is refreshed when effect registrations, material selection or parameters, background blur configuration, fullscreen ownership, XDG geometry, active-scene membership, or effect-relevant surface geometry changes. Incremental scene updates compare the fields used by effect bounds and blur assignment before refreshing the summary. A surface-tree publication defers its scene-geometry invalidation and refreshes at the transaction boundary after its nodes become authoritative; explicit effect-configuration changes may also trigger a refresh during publication. Pure cursor motion never invalidates this summary. Geometry-preserving content commits can still take the conservative end-of-transaction refresh path. Static scenes can answer frame-demand queries from the published summary; when the summary reports a continuous effect, the compositor still resolves the live scene to preserve time-dependent dirty regions. Tests compare cached demand against a fresh resolution across registration/removal, material changes, workspace visibility changes, blur toggles, internal-anchor destruction, fullscreen/XDG geometry updates, and static/continuous demand.
 
-The disposition is observed from the existing arbitration inputs and is recorded as one of `PiggybackPrimary`, `DeferForPrimary`, `SubmitPlaneDelta`, `SoftwareOverlay`, or `Noop`. The instrumentation does not feed a decision back into the scheduler.
+The retained records distinguish these clock domains and stages:
 
-Add a bounded `CursorEpochTransactionBuilt` observation for a primary or cursor-plane transaction whose plane assignment carries an Atomic cursor epoch. It carries output ID, transaction ID, epoch, and build timestamp. Existing worker queue, KMS submit start/return, and `PageflipPresented` observations join by transaction ID. A compact cursor-transaction history is retained separately from the general presentation-event ring, with the same configurable capacity (default 65,536 when this diagnostic is enabled, maximum 65,536). The general event ring remains bounded independently. Attribution requires matching output and epoch, a matching arbitration epoch, and a transaction built no earlier than that arbitration. Evicted or missing cursor transactions remain unknown. The trace does not infer an epoch for unrelated transactions.
+- Libinput's source-clock oldest/newest event timestamps in microseconds. They are not subtracted from monotonic timestamps.
+- Monotonic input-batch materialization, dispatch start/completion, and cursor-arbitration times.
+- Hit-test counter and CPU-time deltas for the sampled dispatch.
+- Effect-scene resolution duration where resolution is associated with that cycle. A missing value is unknown, not zero.
+- Cursor epoch, disposition, and supersession.
+- A transaction joined by output and epoch, subject to matching arbitration and build-time constraints; worker queue, KMS submit start/return, and pageflip observation values appear only when present.
 
-For synchronous Atomic primary submission, the start observation is taken immediately before `submit_ready_frame`; the existing primary registration records the return timestamp after the call succeeds. Plane-delta start and return are observed around the cursor submit call. The KMS worker already supplies its queue, submit-start, and submit-return timestamps. The per-sample output includes these absolute monotonic observation timestamps and their derived intervals where available. The queue-wait percentile is based only on worker-submitted transactions that have both endpoints.
+Percentile records include their valid sample count. Do not interpret a percentile from fewer than 1,000 observations as a stable tail estimate. KMS queue wait uses only worker transactions with both queue and submit-start timestamps. Submission-to-pageflip is an observed transaction interval, not optical latency.
 
-The response trace is dumped at clean runtime teardown, not synchronously per input event. Sampled ring-write CPU time is recorded so its direct cost is visible. The protocol also compares otherwise identical trace-disabled and trace-enabled trials to measure total runtime overhead.
+Run the manual capacity benchmark with:
 
-## Reproducible 1920x1080@165Hz protocol
-
-Run three 300-second trials per condition from a clean Typhon start. Confirm `bin/start-oblivion-one-tty` selects 1920x1080@165Hz and record the actual mode. Use one release build and hold GPU driver, VRR/presentation settings, cursor settings, power profile, applications, input device, and all trace flags constant. Use the same recorded HID/uinput motion path and speed for every trial.
-
-Prepare two conditions with the same application/window set and pointer route:
-
-1. **Empty active workspace:** move the same windows to an inactive workspace and verify the active workspace has no visible windows.
-2. **Populated active workspace:** show 24 windows in the active workspace, using the same geometry and stacking order for every run. Leave the same applications running in both conditions.
-
-Use output scale 1x. Replay one saved uinput motion sequence at the same event rate and timestamps in both conditions. A fixed route is a continuous rectangular loop through logical coordinates `(96,96)`, `(1824,96)`, `(1824,984)`, `(96,984)`, and back to `(96,96)`. Store the replay fixture and its SHA-256 with each trial; keep pointer acceleration/speed and replay rate unchanged. Let the loop run for all 300 seconds. This makes the pointer cross the same screen regions while visible-window count changes.
-
-For each trial, write all data to a new directory beneath `/mnt/Aether/Desktop/GitHub/Typhon-cursor-responsiveness/`. Run the CPU probe for 300 seconds at a 0.5-second interval. Use the same release build, display mode, VRR/presentation configuration, GPU driver, power profile, cursor settings, applications, and recorded HID/uinput motion path for every run. Use the same pointer path, dwell time, input sample rate, and window geometry/stacking order within each workspace condition. The active workspace is empty in one condition; in the other, show the same 24 windows while keeping those applications running in both.
-
-Enable the same traces in all six workspace trials. The cursor diagnostic also enables its bounded presentation transaction ring. Set `TYPHON_CURSOR_RESPONSIVENESS_TRACE=1`, `TYPHON_CURSOR_RESPONSIVENESS_TRACE_CAPACITY=32768`, `TYPHON_CURSOR_RESPONSIVENESS_TRACE_FILE="$TRIAL_DIR/cursor-responsiveness.jsonl"`, and `OBLIVION_ONE_PRESENTATION_TRACE_CAPACITY=65536`. Keep the existing `TYPHON_SLOW_CYCLE_TRACE=1`, `TYPHON_POINTER_TIMING_TRACE=1`, and `OBLIVION_ONE_PRESENTATION_TRACE=1` settings consistent. Do not set `OBLIVION_ONE_PRESENTATION_TRACE_FILE`; the cursor trace includes valid joined KMS timestamps and writes once at runtime teardown without synchronous per-motion logging. The CPU probe's output path must be beneath Aether as required by its own path validation.
-
-Launch each trial through the 165 Hz TTY entry point from a separate terminal using the same settings:
-
-```bash
-findmnt -T /mnt/Aether/Desktop/GitHub
-TRIAL_DIR=/mnt/Aether/Desktop/GitHub/Typhon-cursor-responsiveness/populated-1
-mkdir -p "$TRIAL_DIR"
-export TYPHON_SLOW_CYCLE_TRACE=1
-export TYPHON_POINTER_TIMING_TRACE=1
-export TYPHON_CURSOR_RESPONSIVENESS_TRACE=1
-export TYPHON_CURSOR_RESPONSIVENESS_TRACE_CAPACITY=32768
-export TYPHON_CURSOR_RESPONSIVENESS_TRACE_FILE="$TRIAL_DIR/cursor-responsiveness.jsonl"
-export OBLIVION_ONE_PRESENTATION_TRACE=1
-export OBLIVION_ONE_PRESENTATION_TRACE_CAPACITY=65536
-export OBLIVION_ONE_LOG_FILE="$TRIAL_DIR/session.log"
-export OBLIVION_ONE_PROFILE=release
-bin/start-oblivion-one-tty
+```sh
+CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target rtk cargo test --locked --bin oblivion-one native_output::runtime::cursor_responsiveness::tests::benchmark_lookup_cost_across_retained_sample_capacities -- --ignored --nocapture
 ```
 
-After checking that the process is the native Typhon instance and recording the actual mode, run the existing 300-second CPU probe from another terminal as shown in `docs/cpu-saturation-qualification.md`. Start the motion replay at the probe's start and retain its log and checksum beside `os.jsonl`.
+The benchmark reports `sample`, `sample_mut`, and `note_cursor_epoch` cost at capacities 16, 1,024, 16,384, and 32,768. It has no wall-clock assertion; compare its output on the same machine and build profile. Verify `CARGO_TARGET_DIR` resolves under `/mnt/Aether/Desktop/GitHub/Typhon-target` before building.
 
-To measure the added trace overhead, run an additional matched trace-off/trace-on pair for each workspace condition with the same probe and input workload. Leave the slow-cycle and pointer-transition settings unchanged; turn off both `TYPHON_CURSOR_RESPONSIVENESS_TRACE` and `OBLIVION_ONE_PRESENTATION_TRACE` for the off run. Compare reactor CPU, the probe's runnable-wait percentiles, pointer timing, and throughput. Report the diagnostic's `trace_write_cpu_ns` percentiles and total directly. Do not interpret an off run as providing the per-motion stage percentiles.
+Compare the trace API's disabled and enabled path with:
 
-Report every trial separately and then the three-run spread. Include the count next to every percentile; do not compare any percentile based on fewer than 1,000 observations. Include:
+```sh
+CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target cargo test --locked --bin oblivion-one native_output::runtime::cursor_responsiveness::tests::benchmark_trace_disabled_vs_enabled_motion_batch_cost -- --ignored --nocapture
+```
 
-- p50/p95/p99 and sample counts for input-batch-to-dispatch-complete, dispatch duration, dispatch-complete-to-arbitration, per-batch hit-test CPU, effect-scene resolution, KMS queue wait, KMS submit duration, and submit-return-to-pageflip-observation;
-- raw and coalesced pointer-motion counts, the ratio `(raw - coalesced) / raw`, retained samples, sampled fraction, sample evictions, cursor transaction-history retention/evictions, retained cursor transaction counts for build/worker-queue/KMS-start/KMS-return/pageflip observations, general presentation event retention/evictions, and missing/unattributed joins;
-- cumulative-counter deltas for hit-test calls/cache hits/cache misses/full scans/groups/surfaces/CPU nanoseconds and cursor-arbitration response windows/coalescing/piggyback/plane-delta/defer/software updates, plus per-thread runnable-wait/runtime/timeslices and visible cgroup `cpu.stat` counters from the CPU probe;
-- the per-sample trace-record CPU cost and a paired trace-off/trace-on comparison of reactor CPU, pointer percentiles, and runnable wait under the same motion workload.
+This microbenchmark processes one million synthetic motion batches with the default 16:1 sample stride and 32,768-record ring. It includes sampled record creation, completion, and epoch-index maintenance when enabled; it excludes input decoding, caller-side pointer-event scanning, hit testing, effects, rendering, and KMS. On this host, a single unoptimized test-profile run on 2026-10-08 measured 11 ns/batch disabled and 105 ns/batch enabled (94 ns/batch added), with 62,500 samples, 29,732 FIFO evictions, and 26.94 ms total `trace_write_cpu_ns`. The separate capacity run measured `sample` at 38–42 ns/op, `sample_mut` at 39–44 ns/op, and `note_cursor_epoch` at 275–302 ns/op across all four ring sizes. These are single-run microbenchmark observations, not end-to-end overhead or stable tail estimates. The paired trace-off/on hardware trials below remain necessary before trusting compositor latency attribution.
 
-The libinput timestamps are source timestamps, not a calibrated hardware-to-monotonic measurement. Report monotonic stages from the compositor's input-batch materialization or dispatch-start timestamp. Label submit-return-to-pageflip as an observed transaction interval; do not call it optical latency. Keep KMS queue, submit, and pageflip percentiles restricted to valid joins and show the associated sample counts. Report insufficient counts instead of treating missing data as zero.
+## Host preflight
 
-## Evidence required before selecting a fix
+Run these read-only checks from the existing desktop session before planning a native TTY trial. They do not start Typhon:
 
-Use the populated-versus-empty deltas to identify which measured stage grows with active-window count. Longer dispatch duration points toward input handling; longer dispatch-complete-to-arbitration time isolates delay after event handling and can be compared with reactor runnable wait. High hit-test duration accompanied by increased full scans/groups/surfaces points toward hit testing. High effect-scene resolution time that scales with scene/effect count points toward scene resolution. Repeated supersession/piggyback/defer decisions or longer dispatch-complete-to-arbitration time points toward cursor arbitration progress. Long KMS queue wait, submit duration, or submit-return-to-pageflip intervals point toward KMS/driver timing. These are attribution clues, not diagnoses by themselves; reproduce the same result across trials and inspect whether tracing changes it before proposing a behavior change.
+```fish
+hyprctl monitors -j | jq -er '[.[] | select(.focused)][0] | {name, description, width, height, refreshRate, scale}'
+set active_mode (hyprctl monitors -j | jq -er '[.[] | select(.focused)][0] | "\(.width)x\(.height)@\(.refreshRate | round)"')
+printf 'Record this mode for the later TTY trial: %s\n' "$active_mode"
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+findmnt -T /mnt/Aether/Desktop/GitHub
+```
 
-## Initial implementation record
+On the host used to prepare this procedure, the focused Hyprland output was DP-1 at 1920×1080, scale 1, `164.99899` Hz; the selected NVIDIA device was GeForce RTX 3060 Ti with driver 615.71.09. Treat these as a dated host observation, not a requirement. Record the actual output, refresh, GPU, and driver for each qualification session. Typhon's `OBLIVION_ONE_MODE` parser rounds a fractional refresh to integer Hz; for that observed mode, the corresponding exact selector is `1920x1080@165`.
 
-Implementation adds bounded per-motion samples, session hit-test and arbitration counter deltas, and a compact cursor-epoch transaction history for valid KMS joins. Sampling is one batch in sixteen; the sample history defaults to 32,768 entries and the cursor transaction history defaults to 65,536 entries when enabled, with configurable sample capacity and eviction counts. The focused tests cover disabled lazy capture, empty batches, bounded retention, matching and rejected epoch/output/time attribution, event-ring eviction, supersession, and primary-piggyback/plane-delta disposition.
+The active desktop in this environment is not Typhon. Do not invoke either Typhon startup script during this preflight or while doing the current desktop work. Hardware runs are a later, explicit operator action from a TTY only when replacing the current session is intended.
 
-Focused verification passed on the current checkout with build output directed to `/mnt/Aether/Desktop/GitHub/Typhon-target`:
+## Trial matrix
 
-- `CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target rtk cargo test --bin oblivion-one native_output::runtime::cursor_responsiveness::tests:: -- --nocapture` — 11 passed.
-- `CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target rtk cargo test --bin oblivion-one native_output::presentation::trace::tests:: -- --nocapture` — 7 passed.
-- `rustfmt --config skip_children=true --edition 2024 --check` on the diagnostics source files passed; `git diff --check` passed. The repository-wide format check still reports pre-existing formatting in unrelated `compositor/effects.rs` and `runtime/termination.rs` edits.
+Use one release binary and keep the output mode, VRR/tearing policy, GPU driver, power profile, cursor setting, pointer device and polling rate, applications, and background services fixed. For each workload, perform three matched trace-off/trace-on pairs, alternating pair order where practical:
 
-No physical 1920x1080@165Hz A/B capture or trace-off/trace-on overhead trial has been run. The diagnostic therefore identifies no winning cause and selects no behavior fix. Pageflip observations remain kernel/compositor timestamps, not optical presentation measurements.
+| Workload | Visible workspace | Activity |
+|---|---|---|
+| Empty | No visible application windows; keep the same applications running on another workspace | Same pointer route as other trials |
+| Populated static | A recorded, fixed set of visible windows (prefer 20 where available) | No deliberate window movement, video, or animation |
+| Populated dynamic | The same visible window set and geometry | Reproducible client updates or animation; record which applications and update source |
+
+Keep the pointer route and duration identical within each trace-off/on pair. If no controlled uinput replay is available, use the same recorded manual route and mark it as a less controlled input source; this checkout does not provide a motion-replay utility. Record window count, visible surfaces if available, geometry/stacking, output scale, workload applications, input-device rate, actual output mode, and any environmental differences in every trial directory.
+
+Each trial should last 300 seconds. At 16:1 sampling, 1,000 trace samples require at least 16,000 nonempty motion batches; report the actual count. If any metric has fewer than 1,000 valid observations, report its count and mark the percentile insufficient.
+
+Trace-off turns off only `TYPHON_CURSOR_RESPONSIVENESS_TRACE` and `OBLIVION_ONE_PRESENTATION_TRACE`; keep `TYPHON_SLOW_CYCLE_TRACE` and `TYPHON_POINTER_TIMING_TRACE` identical in both runs. This paired comparison measures the cursor/presentation tracing increment on top of those common diagnostics. Do not claim that trace-off provides per-motion cursor-stage percentiles.
+
+## Fish launch and capture workflow
+
+Build the release binary only after verifying the Aether target path. Never build into the checkout's `target/` directory:
+
+```fish
+set target_dir /mnt/Aether/Desktop/GitHub/Typhon-target
+realpath "$target_dir"
+findmnt -T "$target_dir"
+env CARGO_TARGET_DIR="$target_dir" rtk cargo build --locked --release
+```
+
+When a hardware trial is explicitly scheduled, start it from the TTY entry point using the mode recorded during preflight. The following Fish block shows the trace-on settings; do not run it in the active desktop session:
+
+```fish
+set trial_dir /mnt/Aether/Desktop/GitHub/Typhon-cursor-responsiveness/populated-static-on-01
+mkdir -p "$trial_dir"
+set -gx OBLIVION_ONE_PROFILE release
+set -gx OBLIVION_ONE_BINARY /mnt/Aether/Desktop/GitHub/Typhon-target/release/oblivion-one
+set -gx OBLIVION_ONE_MODE 'WIDTHxHEIGHT@HZ' # replace with the recorded output mode
+set -gx OBLIVION_ONE_LOG_FILE "$trial_dir/session.log"
+set -gx TYPHON_SLOW_CYCLE_TRACE 1
+set -gx TYPHON_POINTER_TIMING_TRACE 1
+set -gx TYPHON_CURSOR_RESPONSIVENESS_TRACE 1
+set -gx TYPHON_CURSOR_RESPONSIVENESS_TRACE_CAPACITY 32768
+set -gx TYPHON_CURSOR_RESPONSIVENESS_TRACE_FILE "$trial_dir/cursor-responsiveness.jsonl"
+set -gx OBLIVION_ONE_PRESENTATION_TRACE 1
+set -gx OBLIVION_ONE_PRESENTATION_TRACE_CAPACITY 65536
+exec /home/agony/GitHub/Typhon/bin/start-oblivion-one-tty
+```
+
+Use a distinct `$trial_dir` for every trace-off/on run. For trace-off, set both cursor and presentation trace variables to `0` and remove `TYPHON_CURSOR_RESPONSIVENESS_TRACE_FILE` with `set -e TYPHON_CURSOR_RESPONSIVENESS_TRACE_FILE`. Keep the slow-cycle and pointer timing variables unchanged. Do not set `OBLIVION_ONE_PRESENTATION_TRACE_FILE`; the cursor trace joins bounded presentation observations and writes its report at clean teardown.
+
+After Typhon has been started manually for a trial, open a second terminal and confirm the PID before sampling. Do not make the capture script start or restart the compositor:
+
+```fish
+set trial_dir /mnt/Aether/Desktop/GitHub/Typhon-cursor-responsiveness/populated-static-on-01
+mkdir -p "$trial_dir"
+pgrep -a -x oblivion-one
+set pid (read -P 'Enter the PID shown for the Typhon compositor: ')
+ps -p "$pid" -o pid=,uid=,comm=,args=
+python3 /home/agony/GitHub/Typhon/scripts/typhon_cpu_saturation_probe.py --pid "$pid" --duration 300 --interval 0.5 --output "$trial_dir/os.jsonl"
+```
+
+Confirm the displayed command and UID identify the intended native Typhon process before entering the PID. Keep the CPU probe output below `/mnt/Aether/Desktop/GitHub`; the probe rejects output elsewhere. Start the same pointer route/workload for the full capture interval. Stop Typhon through the intended session path so the bounded cursor trace can flush at clean teardown.
+
+The Fish syntax above was checked with Fish 4.9.3. The only launch binary defaults in the TTY script are overridden above, so neither a build nor capture writes artifacts under the source checkout.
+
+## Trial report contents
+
+Keep each run's trace, `os.jsonl`, session log, and a short metadata file together. Report each run separately, then the three-pair spread. Include:
+
+- p50/p95/p99 plus valid counts for input-batch-to-dispatch-complete, dispatch duration, dispatch-complete-to-arbitration, hit-test CPU, effect-scene resolution, KMS queue wait, KMS submit duration, and submit-return-to-pageflip observation;
+- raw/coalesced motion counts, `(raw - coalesced) / raw`, retained samples, sampled fraction, sample evictions, retained/evicted cursor transactions, observation counts for transaction build/worker queue/KMS start/KMS return/pageflip, general presentation-event retention/evictions, and missing/unattributed joins;
+- cursor-disposition ratios with the decision count as denominator, superseded samples, hit-test call/cache/miss/full-scan/group/surface/CPU deltas, and arbitration response-window/coalescing/piggyback/plane-delta/defer/software counters;
+- CPU probe per-thread runtime, runnable wait and timeslices, scheduler policy/affinity, pressure, and available cgroup `cpu.stat` counters;
+- `trace_write_cpu_ns` distribution and total from trace-on, plus paired trace-off/on changes in process CPU, runnable wait, and any comparable input/dispatch metric.
+
+Compare empty to populated-static to identify costs that scale with visual scene size. Compare populated-static to populated-dynamic to separate scene complexity from ongoing client updates. Increased dispatch time, hit-test work, or effect-resolution time are attribution clues; higher runnable wait, KMS queue delay, driver submission time, or primary frame misses provide different clues. Repeat a difference across pairs and check trace overhead before recommending cursor scheduling work. Do not infer optical display latency from a pageflip.
+
+## Current qualification status
+
+The host GPU and focused output were inspected, and the Fish command forms and CPU-probe CLI were checked. No Typhon compositor was launched, no active session was displaced, and no trace-off/trace-on hardware trial has run. There are no hardware latency or trace-overhead results yet; cursor scheduling changes are not justified until these measurements identify a repeatable bottleneck.

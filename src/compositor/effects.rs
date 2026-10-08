@@ -1244,6 +1244,15 @@ mod tests {
         }
     }
 
+    fn assert_cached_effect_demand_matches_resolution(state: &crate::compositor::CompositorState) {
+        let resolved = state.resolved_effect_scene();
+        assert_eq!(state.effect_scene_summary(), resolved.summary);
+        assert_eq!(
+            state.effect_frame_demand_snapshot(),
+            resolved.frame_demand_snapshot()
+        );
+    }
+
     #[test]
     fn presentation_effect_regions_follow_group_scale() {
         let transform = PresentationGroupTransform::new(
@@ -1346,6 +1355,91 @@ mod tests {
             resolved_effect_scene_call_count_for_test(),
             resolved_before.saturating_add(1),
             "continuous effects retain live scene resolution for damage"
+        );
+    }
+
+    #[test]
+    fn published_effect_demand_tracks_registration_removal_and_background_toggle() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        let program = EffectProgramId::new(1).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+        assert_cached_effect_demand_matches_resolution(&state);
+
+        for surface_id in 1..=20 {
+            assert!(state.set_internal_surface_effect_with_parameters(
+                surface_id,
+                EffectAnchor::BeforeSurface(surface_id),
+                program,
+                region.clone(),
+                EffectParameterBlock::default(),
+                crate::effects::EffectFrameDemand::OnDamage,
+            ));
+            assert_cached_effect_demand_matches_resolution(&state);
+        }
+        assert_eq!(state.effect_scene_summary().visible_instance_count, 20);
+        assert_eq!(
+            state.effect_frame_demand_snapshot(),
+            EffectFrameDemandSnapshot::default()
+        );
+
+        assert!(state.set_internal_surface_effect_with_parameters(
+            1,
+            EffectAnchor::BeforeSurface(1),
+            program,
+            region.clone(),
+            EffectParameterBlock::default(),
+            crate::effects::EffectFrameDemand::Continuous,
+        ));
+        assert_cached_effect_demand_matches_resolution(&state);
+        assert!(state.effect_frame_demand_snapshot().continuous_visible);
+
+        assert!(state.set_internal_surface_effect_with_parameters(
+            1,
+            EffectAnchor::BeforeSurface(1),
+            program,
+            region.clone(),
+            EffectParameterBlock::default(),
+            crate::effects::EffectFrameDemand::OnDamage,
+        ));
+        assert_cached_effect_demand_matches_resolution(&state);
+
+        assert!(state.clear_internal_surface_effect(1));
+        assert_cached_effect_demand_matches_resolution(&state);
+        for surface_id in 2..=20 {
+            assert!(state.clear_internal_surface_effect(surface_id));
+            assert_cached_effect_demand_matches_resolution(&state);
+        }
+
+        state.set_background_effect_enabled(true);
+        assert_cached_effect_demand_matches_resolution(&state);
+        state.set_background_effect_enabled(false);
+        assert_cached_effect_demand_matches_resolution(&state);
+    }
+
+    #[test]
+    fn destroying_an_internal_effect_anchor_refreshes_the_published_summary() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+        assert!(state.set_internal_surface_effect_with_parameters(
+            42,
+            EffectAnchor::BeforeSurface(42),
+            EffectProgramId::new(1).unwrap(),
+            region,
+            EffectParameterBlock::default(),
+            crate::effects::EffectFrameDemand::Continuous,
+        ));
+        assert_eq!(state.effect_scene_summary().continuous_instance_count, 1);
+
+        state.teardown_surface_resource(
+            42,
+            crate::compositor::SurfaceTeardownReason::ExplicitDestroy,
+        );
+
+        assert_cached_effect_demand_matches_resolution(&state);
+        assert_eq!(state.effect_scene_summary(), EffectSceneSummary::default());
+        assert_eq!(
+            state.effect_frame_demand_snapshot(),
+            EffectFrameDemandSnapshot::default()
         );
     }
 

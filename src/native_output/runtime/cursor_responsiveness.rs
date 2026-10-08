@@ -6,7 +6,11 @@ use crate::native_output::presentation::trace::{
 use crate::native_output::presentation::transaction::OutputTransactionId;
 use oblivion_one::compositor::PointerInputMetricsSnapshot;
 use oblivion_one::core::OutputId;
-use std::{collections::VecDeque, fmt::Write as _, path::PathBuf};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Write as _,
+    path::PathBuf,
+};
 
 const DEFAULT_CAPACITY: usize = 32_768;
 const MAX_CAPACITY: usize = 65_536;
@@ -197,7 +201,10 @@ pub(crate) struct CursorResponsivenessSample {
     pub(crate) superseded_by_epoch: Option<u64>,
     pub(crate) effect_scene_resolution_ns: Option<u64>,
     pub(crate) effect_scene_visible_instances: Option<usize>,
-    /// CPU time spent creating and retaining this sampled record.
+    /// CPU time from sampled timing capture through ring insertion and the
+    /// O(1) newest-record lookup. This excludes per-batch counters updated
+    /// before sampling, input processing around this method, and writing this
+    /// measured value plus its aggregate after the ending clock read.
     pub(crate) trace_write_cpu_ns: Option<u64>,
 }
 
@@ -207,7 +214,11 @@ pub(crate) struct NativeCursorResponsivenessTrace {
     capacity: usize,
     sample_stride: u64,
     records: VecDeque<CursorResponsivenessSample>,
-    next_sample_id: u64,
+    /// Next usable ID. `None` means the u64 ID space was exhausted.
+    next_sample_id: Option<u64>,
+    /// Highest retained sample ID with a cursor epoch for each output.
+    /// Kept in sync with FIFO retention so supersession never scans history.
+    latest_epoch_sample_by_output: HashMap<OutputId, u64>,
     pub(crate) motion_batches: u64,
     pub(crate) sampled_batches: u64,
     pub(crate) raw_motion_events: u64,
@@ -261,7 +272,8 @@ impl NativeCursorResponsivenessTrace {
             capacity,
             sample_stride: sample_stride.max(1),
             records: VecDeque::with_capacity(if enabled { capacity } else { 0 }),
-            next_sample_id: 1,
+            next_sample_id: Some(1),
+            latest_epoch_sample_by_output: HashMap::new(),
             motion_batches: 0,
             sampled_batches: 0,
             raw_motion_events: 0,
@@ -306,13 +318,22 @@ impl NativeCursorResponsivenessTrace {
             return None;
         }
 
+        let sample_id = self.next_sample_id?;
         let trace_start_cpu_ns = super::pointer_timing::thread_cpu_time_ns();
         let timing = capture()?;
-        let sample_id = self.next_sample_id;
-        self.next_sample_id = self.next_sample_id.saturating_add(1);
+        self.next_sample_id = sample_id.checked_add(1);
         self.sampled_batches = self.sampled_batches.saturating_add(1);
         if self.records.len() == self.capacity {
-            self.records.pop_front();
+            if let Some(evicted) = self.records.pop_front()
+                && let Some(output_id) = evicted.output_id
+                && evicted.cursor_epoch.is_some()
+                && self.latest_epoch_sample_by_output.get(&output_id) == Some(&evicted.sample_id)
+            {
+                // The evicted record was the highest retained ID for this
+                // output. FIFO order guarantees no older retained record can
+                // replace it; newer incomplete records have no epoch entry.
+                self.latest_epoch_sample_by_output.remove(&output_id);
+            }
             self.evicted_samples = self.evicted_samples.saturating_add(1);
         }
         self.records.push_back(CursorResponsivenessSample {
@@ -336,12 +357,16 @@ impl NativeCursorResponsivenessTrace {
             effect_scene_visible_instances: None,
             trace_write_cpu_ns: None,
         });
+        // VecDeque::back_mut is the O(1) lookup needed to attach the measured
+        // write cost. Take the ending timestamp only after that lookup.
+        let sample = self
+            .records
+            .back_mut()
+            .expect("a newly retained sample is the ring's newest record");
         let elapsed_cpu_ns = trace_start_cpu_ns
             .zip(super::pointer_timing::thread_cpu_time_ns())
             .map(|(start, end)| end.saturating_sub(start));
-        if let Some(sample) = self.sample_mut(sample_id) {
-            sample.trace_write_cpu_ns = elapsed_cpu_ns;
-        }
+        sample.trace_write_cpu_ns = elapsed_cpu_ns;
         if let Some(elapsed_cpu_ns) = elapsed_cpu_ns {
             self.trace_write_cpu_total_ns =
                 self.trace_write_cpu_total_ns.saturating_add(elapsed_cpu_ns);
@@ -370,22 +395,30 @@ impl NativeCursorResponsivenessTrace {
         sample.cursor_epoch = cursor_epoch;
         sample.dispatch_completed_at_ns = Some(dispatch_completed_at_ns);
         sample.hit_test_delta = Some(hit_test_after.delta_since(sample.hit_test_before));
+        if cursor_epoch.is_some() {
+            self.latest_epoch_sample_by_output
+                .entry(output_id)
+                .and_modify(|latest| *latest = (*latest).max(sample_id))
+                .or_insert(sample_id);
+        }
     }
 
     pub(crate) fn note_cursor_epoch(&mut self, output_id: OutputId, epoch: u64) {
         if !self.enabled {
             return;
         }
-        for sample in self.records.iter_mut().rev() {
-            if sample.output_id != Some(output_id) {
-                continue;
-            }
-            if let Some(previous_epoch) = sample.cursor_epoch {
-                if epoch > previous_epoch {
-                    sample.superseded_by_epoch = Some(epoch);
-                }
-                break;
-            }
+        let Some(sample_id) = self.latest_epoch_sample_by_output.get(&output_id).copied() else {
+            return;
+        };
+        let Some(sample) = self.sample_mut(sample_id) else {
+            // Be conservative if future changes break index synchronization.
+            self.latest_epoch_sample_by_output.remove(&output_id);
+            return;
+        };
+        if let Some(previous_epoch) = sample.cursor_epoch
+            && epoch > previous_epoch
+        {
+            sample.superseded_by_epoch = Some(epoch);
         }
     }
 
@@ -463,15 +496,19 @@ impl NativeCursorResponsivenessTrace {
     }
 
     pub(crate) fn sample(&self, sample_id: u64) -> Option<&CursorResponsivenessSample> {
+        let oldest_id = self.records.front()?.sample_id;
+        let index = usize::try_from(sample_id.checked_sub(oldest_id)?).ok()?;
         self.records
-            .iter()
-            .find(|sample| sample.sample_id == sample_id)
+            .get(index)
+            .filter(|sample| sample.sample_id == sample_id)
     }
 
     fn sample_mut(&mut self, sample_id: u64) -> Option<&mut CursorResponsivenessSample> {
+        let oldest_id = self.records.front()?.sample_id;
+        let index = usize::try_from(sample_id.checked_sub(oldest_id)?).ok()?;
         self.records
-            .iter_mut()
-            .find(|sample| sample.sample_id == sample_id)
+            .get_mut(index)
+            .filter(|sample| sample.sample_id == sample_id)
     }
 
     pub(crate) fn cursor_transaction_attribution(
@@ -925,7 +962,10 @@ const fn disposition_name(disposition: NativeCursorOutputDisposition) -> &'stati
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorHitTestCounters, CursorMotionBatchTiming, NativeCursorResponsivenessTrace};
+    use super::{
+        CursorHitTestCounters, CursorMotionBatchTiming, DEFAULT_CAPACITY, DEFAULT_SAMPLE_STRIDE,
+        NativeCursorResponsivenessTrace,
+    };
     use crate::native_output::input::{
         KeyboardDeviceId, NativeHardwareInputEvent, NativeKeyboardInputEvent, PointerMotionSample,
         RelativeMotion,
@@ -986,12 +1026,20 @@ mod tests {
     }
 
     fn sample(trace: &mut NativeCursorResponsivenessTrace, epoch: u64) -> u64 {
+        sample_on_output(trace, output_id(), epoch)
+    }
+
+    fn sample_on_output(
+        trace: &mut NativeCursorResponsivenessTrace,
+        output_id: OutputId,
+        epoch: u64,
+    ) -> u64 {
         let id = trace
             .record_motion_batch(1, 1, || Some(timing()))
             .expect("stride one retains each nonempty batch");
         trace.complete_motion_batch(
             id,
-            output_id(),
+            output_id,
             Some(epoch),
             200,
             CursorHitTestCounters::default(),
@@ -1029,6 +1077,210 @@ mod tests {
         assert_eq!(trace.raw_motion_events, 3);
         assert_eq!(trace.coalesced_motion_events, 3);
         assert_eq!(trace.evicted_samples, 1);
+    }
+
+    #[test]
+    fn sample_lookup_returns_none_for_an_empty_ring_and_indexes_multiple_samples() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 4, 1);
+        assert!(trace.sample(1).is_none());
+        assert!(trace.sample_mut(1).is_none());
+
+        let first = sample(&mut trace, 1);
+        let second = sample(&mut trace, 2);
+        let third = sample(&mut trace, 3);
+
+        assert_eq!(
+            trace.sample(first).map(|sample| sample.cursor_epoch),
+            Some(Some(1))
+        );
+        assert_eq!(
+            trace.sample(second).map(|sample| sample.cursor_epoch),
+            Some(Some(2))
+        );
+        assert_eq!(
+            trace.sample(third).map(|sample| sample.cursor_epoch),
+            Some(Some(3))
+        );
+    }
+
+    #[test]
+    fn sample_lookup_tracks_oldest_and_newest_after_full_capacity_eviction() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 3, 1);
+        let evicted = sample(&mut trace, 1);
+        let oldest = sample(&mut trace, 2);
+        let middle = sample(&mut trace, 3);
+        let newest = sample(&mut trace, 4);
+
+        assert!(trace.sample(evicted).is_none());
+        assert!(trace.sample_mut(evicted).is_none());
+        assert_eq!(
+            trace.sample(oldest).map(|sample| sample.sample_id),
+            Some(oldest)
+        );
+        assert_eq!(
+            trace.sample(middle).map(|sample| sample.sample_id),
+            Some(middle)
+        );
+        assert_eq!(
+            trace.sample(newest).map(|sample| sample.sample_id),
+            Some(newest)
+        );
+        assert_eq!(trace.records.len(), 3);
+        assert_eq!(trace.evicted_samples, 1);
+    }
+
+    #[test]
+    fn sample_mut_changes_oldest_and_newest_retained_records() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 3, 1);
+        let oldest = sample(&mut trace, 1);
+        sample(&mut trace, 2);
+        let newest = sample(&mut trace, 3);
+
+        trace.sample_mut(oldest).unwrap().raw_motion_events = 101;
+        trace.sample_mut(newest).unwrap().raw_motion_events = 303;
+
+        assert_eq!(trace.sample(oldest).unwrap().raw_motion_events, 101);
+        assert_eq!(trace.sample(newest).unwrap().raw_motion_events, 303);
+    }
+
+    #[test]
+    fn sample_ids_do_not_repeat_after_u64_saturation() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 2, 1);
+        trace.next_sample_id = Some(u64::MAX);
+
+        assert_eq!(
+            trace.record_motion_batch(1, 1, || Some(timing())),
+            Some(u64::MAX)
+        );
+        assert_eq!(trace.record_motion_batch(1, 1, || Some(timing())), None);
+    }
+
+    #[test]
+    fn cursor_epoch_updates_the_newest_sample_for_its_output() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 32, 1);
+        let older_output_one = sample_on_output(&mut trace, output_id(), 1);
+        for epoch in 1..=15 {
+            sample_on_output(&mut trace, other_output_id(), epoch);
+        }
+        let newest_output_one = sample_on_output(&mut trace, output_id(), 2);
+
+        trace.note_cursor_epoch(output_id(), 3);
+
+        assert_eq!(
+            trace.sample(newest_output_one).unwrap().superseded_by_epoch,
+            Some(3)
+        );
+        assert_eq!(
+            trace.sample(older_output_one).unwrap().superseded_by_epoch,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cursor_epoch_index_does_not_refer_to_an_evicted_sample() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 2, 1);
+        let evicted_output_one = sample_on_output(&mut trace, output_id(), 1);
+        sample_on_output(&mut trace, other_output_id(), 2);
+        let retained_output_two = sample_on_output(&mut trace, other_output_id(), 3);
+
+        trace.note_cursor_epoch(output_id(), 4);
+
+        assert!(trace.sample(evicted_output_one).is_none());
+        assert_eq!(
+            trace
+                .sample(retained_output_two)
+                .unwrap()
+                .superseded_by_epoch,
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "manual capacity-scaling benchmark; reports timings without thresholds"]
+    fn benchmark_lookup_cost_across_retained_sample_capacities() {
+        use std::time::Instant;
+
+        const ITERATIONS: u64 = 20_000;
+        for capacity in [16, 1_024, 16_384, 32_768] {
+            let mut trace = NativeCursorResponsivenessTrace::new(true, capacity, 1);
+            let mut newest_id = 0;
+            for epoch in 1..=capacity as u64 {
+                newest_id = sample(&mut trace, epoch);
+            }
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(trace.sample(newest_id).map(|sample| sample.sample_id));
+            }
+            let sample_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let sample = trace
+                    .sample_mut(newest_id)
+                    .expect("newest record remains retained");
+                sample.raw_motion_events ^= 1;
+                std::hint::black_box(sample.raw_motion_events);
+            }
+            let sample_mut_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+            let started = Instant::now();
+            for epoch in 0..ITERATIONS {
+                trace.note_cursor_epoch(output_id(), capacity as u64 + epoch + 1);
+            }
+            let note_epoch_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+            eprintln!(
+                "cursor trace retained={capacity} iterations={ITERATIONS} sample_ns/op={sample_ns} sample_mut_ns/op={sample_mut_ns} note_cursor_epoch_ns/op={note_epoch_ns}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual trace-off/on instrumentation-cost benchmark; reports timings without thresholds"]
+    fn benchmark_trace_disabled_vs_enabled_motion_batch_cost() {
+        use std::time::Instant;
+
+        const MOTION_BATCHES: u64 = 1_000_000;
+        let mut disabled =
+            NativeCursorResponsivenessTrace::new(false, DEFAULT_CAPACITY, DEFAULT_SAMPLE_STRIDE);
+        let started = Instant::now();
+        for _ in 0..MOTION_BATCHES {
+            let trace = std::hint::black_box(&mut disabled);
+            std::hint::black_box(trace.record_motion_batch(1, 1, || {
+                panic!("disabled trace must not capture motion timing")
+            }));
+        }
+        let disabled_ns_per_batch = started.elapsed().as_nanos() / u128::from(MOTION_BATCHES);
+        assert_eq!(disabled.motion_batches, 0);
+
+        let mut enabled =
+            NativeCursorResponsivenessTrace::new(true, DEFAULT_CAPACITY, DEFAULT_SAMPLE_STRIDE);
+        let started = Instant::now();
+        for batch in 1..=MOTION_BATCHES {
+            let sample_id = enabled.record_motion_batch(1, 1, || Some(timing()));
+            if let Some(sample_id) = sample_id {
+                enabled.complete_motion_batch(
+                    sample_id,
+                    output_id(),
+                    Some(batch),
+                    batch,
+                    CursorHitTestCounters::default(),
+                );
+            }
+            std::hint::black_box(sample_id);
+        }
+        let enabled_ns_per_batch = started.elapsed().as_nanos() / u128::from(MOTION_BATCHES);
+
+        eprintln!(
+            "cursor trace motion batches={MOTION_BATCHES} sample_stride={} capacity={} disabled_ns/batch={disabled_ns_per_batch} enabled_ns/batch={enabled_ns_per_batch} added_ns/batch={} samples={} evicted_samples={} trace_write_cpu_total_ns={}",
+            DEFAULT_SAMPLE_STRIDE,
+            DEFAULT_CAPACITY,
+            enabled_ns_per_batch.saturating_sub(disabled_ns_per_batch),
+            enabled.sampled_batches,
+            enabled.evicted_samples,
+            enabled.trace_write_cpu_total_ns,
+        );
     }
 
     #[test]

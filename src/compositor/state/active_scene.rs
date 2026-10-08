@@ -1111,7 +1111,9 @@ impl CompositorState {
         self.advance_pointer_hit_generation();
         self.refresh_frame_work_visibility();
         self.rebuild_scene_work_index();
-        self.refresh_effect_scene_summary();
+        if self.surface_tree_generation.is_none() {
+            self.refresh_effect_scene_summary();
+        }
         update
     }
 
@@ -1137,6 +1139,9 @@ impl CompositorState {
         if popup_surface_ids != self.active_scene_view.popup_surface_ids {
             self.active_scene_view.popup_surface_ids = popup_surface_ids;
             self.advance_pointer_hit_generation();
+            if self.surface_tree_generation.is_none() {
+                self.refresh_effect_scene_summary();
+            }
         }
     }
 
@@ -1183,12 +1188,15 @@ impl CompositorState {
             return;
         };
         if let Some(index) = cached_index {
-            let origin_changed = {
+            let (origin_changed, effect_scene_geometry_changed) = {
                 let previous = &self.active_scene_view.surfaces[index];
-                previous.x != updated.x
-                    || previous.y != updated.y
-                    || previous.placement != updated.placement
-                    || previous.render_placement != updated.render_placement
+                (
+                    previous.x != updated.x
+                        || previous.y != updated.y
+                        || previous.placement != updated.placement
+                        || previous.render_placement != updated.render_placement,
+                    effect_scene_surface_geometry_changed(previous, &updated),
+                )
             };
             self.active_scene_view.surfaces[index] = updated;
             self.active_scene_view.presentation_owner_roots_in_order[index] =
@@ -1201,6 +1209,9 @@ impl CompositorState {
                 .active_scene_view
                 .incremental_surface_update_count
                 .saturating_add(1);
+            if effect_scene_geometry_changed && self.surface_tree_generation.is_none() {
+                self.refresh_effect_scene_summary();
+            }
         } else {
             self.rebuild_active_scene_view();
         }
@@ -1229,6 +1240,7 @@ impl CompositorState {
         let mut updated = 0usize;
         let mut membership_changed = false;
         let mut origins_changed = false;
+        let mut effect_scene_geometry_changed = false;
         for surface_id in affected {
             let visible = self.surface_is_visible_in_active_scene(surface_id);
             let cached_index = self
@@ -1243,6 +1255,8 @@ impl CompositorState {
             match (visible, cached_index) {
                 (true, Some(index)) => {
                     let previous = &self.active_scene_view.surfaces[index];
+                    effect_scene_geometry_changed |=
+                        effect_scene_surface_geometry_changed(previous, &source);
                     origins_changed |= previous.x != source.x
                         || previous.y != source.y
                         || previous.placement != source.placement
@@ -1267,6 +1281,9 @@ impl CompositorState {
                 .active_scene_view
                 .incremental_surface_update_count
                 .saturating_add(updated as u64);
+            if effect_scene_geometry_changed && self.surface_tree_generation.is_none() {
+                self.refresh_effect_scene_summary();
+            }
         }
     }
 
@@ -1330,18 +1347,6 @@ impl CompositorState {
     }
 }
 
-#[cfg(test)]
-mod presentation_owner_tests {
-    use super::*;
-
-    #[test]
-    fn root_without_window_group_has_no_presentation_owner() {
-        let state = CompositorState::new(None);
-
-        assert_eq!(state.presentation_scene_node_id_for_root(900), None);
-    }
-}
-
 fn saturating_i32_from_f64(value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -1354,4 +1359,36 @@ fn saturating_u32_from_f64(value: f64) -> u32 {
         return 1;
     }
     value.clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+fn effect_scene_surface_geometry_changed(
+    previous: &RenderableSurface,
+    updated: &RenderableSurface,
+) -> bool {
+    previous.x != updated.x
+        || previous.y != updated.y
+        || previous.width != updated.width
+        || previous.height != updated.height
+        || previous.placement != updated.placement
+        || previous.render_placement != updated.render_placement
+        || previous.render_target_size != updated.render_target_size
+        || previous.visual_clip != updated.visual_clip
+        || previous.viewport_source != updated.viewport_source
+        || previous.viewport_destination != updated.viewport_destination
+        || previous.buffer_scale != updated.buffer_scale
+        || previous.buffer_transform != updated.buffer_transform
+        || previous.opaque_region() != updated.opaque_region()
+        || previous.buffer.alpha_capability() != updated.buffer.alpha_capability()
+}
+
+#[cfg(test)]
+mod presentation_owner_tests {
+    use super::*;
+
+    #[test]
+    fn root_without_window_group_has_no_presentation_owner() {
+        let state = CompositorState::new(None);
+
+        assert_eq!(state.presentation_scene_node_id_for_root(900), None);
+    }
 }
