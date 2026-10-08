@@ -1016,11 +1016,14 @@ fn audit_trace_output(
     max_files: usize,
     expected_source: (u32, u128),
     expected_events: u64,
-) -> (u64, u64, u64) {
-    let mut next_sequence = 1u128;
+) -> (u64, u64, u64, u64, bool) {
+    let mut next_sequence = None;
+    let mut first_sequence = None;
+    let mut retention_expired = false;
     let mut events = 0u64;
     let mut loss_ranges = 0u64;
     let mut lost_events = 0u64;
+    let mut audited_records = 0u64;
     for index in (0..max_files).rev() {
         let candidate = if index == 0 {
             path.to_path_buf()
@@ -1038,32 +1041,54 @@ fn audit_trace_output(
                 assert!(record.process_id.is_none());
                 assert!(record.source_id.is_none());
                 assert!(record.sequence.is_none());
+                retention_expired = true;
                 continue;
             }
             assert_eq!(record.process_id, Some(expected_source.0));
             assert_eq!(record.source_id, Some(expected_source.1));
             if let Some(sequence) = record.sequence {
+                first_sequence.get_or_insert(sequence);
                 assert_eq!(
-                    sequence, next_sequence,
+                    sequence,
+                    *next_sequence.get_or_insert(sequence),
                     "event sequence has an unexplained gap"
                 );
-                next_sequence += 1;
+                next_sequence = Some(sequence + 1);
                 events += 1;
+                audited_records += 1;
             } else {
                 assert_eq!(record.kind.as_deref(), Some("loss"));
                 assert_eq!(record.reason.as_deref(), Some("retention_overwrite"));
                 let from_sequence = record.from_sequence.expect("loss has a start sequence");
                 let to_sequence = record.to_sequence.expect("loss has an end sequence");
-                assert_eq!(from_sequence, next_sequence, "loss range is out of order");
+                first_sequence.get_or_insert(from_sequence);
+                assert_eq!(
+                    from_sequence,
+                    *next_sequence.get_or_insert(from_sequence),
+                    "loss range is out of order"
+                );
                 assert!(to_sequence >= from_sequence);
                 lost_events += (to_sequence - from_sequence + 1) as u64;
-                next_sequence = to_sequence + 1;
+                next_sequence = Some(to_sequence + 1);
                 loss_ranges += 1;
+                audited_records += 1;
             }
         }
     }
-    assert_eq!(next_sequence, u128::from(expected_events) + 1);
-    (events, loss_ranges, lost_events)
+    if let Some(first_sequence) = first_sequence {
+        assert!(
+            first_sequence == 1 || retention_expired,
+            "history prefix is absent without a retention-expiry record"
+        );
+    }
+    assert_eq!(next_sequence.unwrap_or(1), u128::from(expected_events) + 1);
+    (
+        events,
+        loss_ranges,
+        lost_events,
+        audited_records,
+        retention_expired,
+    )
 }
 
 fn find_last_newline_before(
@@ -1128,6 +1153,65 @@ mod tests {
             startup_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(2),
         }
+    }
+
+    #[test]
+    fn trace_audit_accepts_an_explicitly_expired_history_prefix() {
+        let root = unique_path("audit-expired-prefix");
+        let path = root.join("trace.jsonl");
+        let source = (std::process::id(), 0xabc_u128);
+        let first_event = PresentationTransactionTraceRecord {
+            sequence: 101,
+            process_id: source.0,
+            source_id: source.1,
+            event: event(101),
+        };
+        let mut old_file = String::new();
+        append_trace_record_jsonl(&mut old_file, TraceExportRecord::Event(first_event));
+        append_trace_record_jsonl(
+            &mut old_file,
+            TraceExportRecord::LostRange {
+                process_id: source.0,
+                source_id: source.1,
+                from_sequence: 102,
+                to_sequence: 104,
+            },
+        );
+        fs::write(rotated_path(&path, 1), old_file).expect("rotated trace file is written");
+
+        let final_event = PresentationTransactionTraceRecord {
+            sequence: 105,
+            process_id: source.0,
+            source_id: source.1,
+            event: event(105),
+        };
+        let mut active_file = RETENTION_EXPIRED_JSONL.to_owned();
+        append_trace_record_jsonl(&mut active_file, TraceExportRecord::Event(final_event));
+        fs::write(&path, active_file).expect("active trace file is written");
+
+        assert_eq!(
+            audit_trace_output(&path, 2, source, 105),
+            (2, 1, 3, 3, true)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "history prefix is absent without a retention-expiry record")]
+    fn trace_audit_rejects_an_unexplained_history_prefix() {
+        let root = unique_path("audit-unexplained-prefix");
+        let path = root.join("trace.jsonl");
+        let source = (std::process::id(), 0xdef_u128);
+        let record = PresentationTransactionTraceRecord {
+            sequence: 105,
+            process_id: source.0,
+            source_id: source.1,
+            event: event(105),
+        };
+        let mut output = String::new();
+        append_trace_record_jsonl(&mut output, TraceExportRecord::Event(record));
+        fs::write(&path, output).expect("active trace file is written");
+
+        let _ = audit_trace_output(&path, 1, source, 105);
     }
 
     fn wait_until_active(writer: &mut PresentationTraceWriter) {
@@ -2204,7 +2288,13 @@ mod tests {
             }
             writer.shutdown(&streaming_ring);
             report_phases("streaming_push_and_handoff", capacity, &streaming_samples);
-            let (audited_events, loss_range_records, unpersisted_events) = audit_trace_output(
+            let (
+                audited_events,
+                loss_range_records,
+                retained_transport_lost_events,
+                audited_records,
+                history_expired,
+            ) = audit_trace_output(
                 &path,
                 4,
                 streaming_ring.source_identity(),
@@ -2216,11 +2306,7 @@ mod tests {
             );
             assert_eq!(
                 loss_range_records,
-                writer
-                    .stats
-                    .records_written
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(audited_events)
+                audited_records.saturating_sub(audited_events)
             );
             let retained_file_bytes = (0..4)
                 .filter_map(|index| {
@@ -2233,14 +2319,18 @@ mod tests {
                 })
                 .sum::<u64>();
             println!(
-                "benchmark=streaming_results capacity={capacity} attempted={} enqueued={} written={} batches={} records={} loss_range_records={} unpersisted_events={} bytes={} consumer_stalls={} retention_drops={} file_bytes={} file_bytes_max={}",
+                "benchmark=streaming_results capacity={capacity} attempted={} enqueued={} written={} batches={} records={} retained_records={} retained_loss_ranges={} retained_transport_lost_events={} producer_unpersisted_events={} history_expired={} bytes={} consumer_stalls={} ring_retention_drops={} file_bytes={} file_bytes_max={}",
                 iterations,
                 writer.stats.events_enqueued.load(Ordering::Relaxed),
                 writer.stats.events_written.load(Ordering::Relaxed),
                 writer.stats.batches_written.load(Ordering::Relaxed),
                 writer.stats.records_written.load(Ordering::Relaxed),
+                audited_records,
                 loss_range_records,
-                unpersisted_events,
+                retained_transport_lost_events,
+                (iterations as u64)
+                    .saturating_sub(writer.stats.events_written.load(Ordering::Relaxed)),
+                history_expired,
                 writer.stats.bytes_written.load(Ordering::Relaxed),
                 writer.stats.consumer_stalls.load(Ordering::Relaxed),
                 streaming_ring.dropped(),
