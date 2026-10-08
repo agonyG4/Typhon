@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const MAX_ERROR_CHAIN_BYTES: usize = 2_048;
@@ -54,7 +55,67 @@ pub(super) struct TerminationCause {
     pub(super) error_chain: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct TerminationRunMetadata {
+    pub(super) session_id: String,
+    pub(super) process_id: u32,
+    pub(super) boot_id: Option<String>,
+    pub(super) desktop_session_id: Option<String>,
+    pub(super) started_at_unix_ms: u64,
+}
+
+impl TerminationRunMetadata {
+    fn current() -> Self {
+        let process_id = std::process::id();
+        let started_at_unix_ms = unix_time_ms();
+        let boot_id = read_kernel_identifier("/proc/sys/kernel/random/boot_id");
+        let session_id = read_kernel_identifier("/proc/sys/kernel/random/uuid")
+            .filter(|value| {
+                value
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() || character == '-')
+            })
+            .unwrap_or_else(|| format!("{process_id}-{started_at_unix_ms}"));
+        let desktop_session_id = std::env::var("XDG_SESSION_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(128).collect());
+
+        Self {
+            session_id,
+            process_id,
+            boot_id,
+            desktop_session_id,
+            started_at_unix_ms,
+        }
+    }
+}
+
+fn read_kernel_identifier(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TerminationRecordStatus {
+    Running,
+    FatalCheckpoint,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(super) struct TerminationSnapshot {
     pub(super) latest_submitted_frame_id: Option<u64>,
     pub(super) latest_presented_frame_id: Option<u64>,
@@ -100,32 +161,29 @@ impl Default for TerminationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct TerminationSummary {
     pub(super) schema_version: u8,
+    pub(super) status: TerminationRecordStatus,
+    pub(super) metadata: TerminationRunMetadata,
     pub(super) cause: TerminationCause,
+    pub(super) cause_observed_at_unix_ms: Option<u64>,
     pub(super) runtime_phase: RuntimePhase,
-    pub(super) latest_submitted_frame_id: Option<u64>,
-    pub(super) latest_presented_frame_id: Option<u64>,
-    pub(super) pageflip_pending: bool,
-    pub(super) pending_pageflip_token: Option<u64>,
-    pub(super) kms_worker_present: bool,
-    pub(super) kms_worker_lifecycle: Option<&'static str>,
-    pub(super) kms_worker_queue_depth: usize,
-    pub(super) kms_worker_inflight: bool,
-    pub(super) kms_worker_fatal_reason: Option<&'static str>,
-    pub(super) seat_state: &'static str,
-    pub(super) seat_session_active: bool,
-    pub(super) active_gpu_release_leases: usize,
-    pub(super) active_output_transactions: usize,
-    pub(super) submitted_kms_ownership: usize,
-    pub(super) quarantined_kms_ownership: usize,
-    pub(super) kms_teardown_safety: &'static str,
+    pub(super) pre_cleanup_runtime_phase: Option<RuntimePhase>,
+    pub(super) pre_cleanup_captured_at_unix_ms: Option<u64>,
+    pub(super) pre_cleanup_snapshot: Option<TerminationSnapshot>,
+    pub(super) final_kms_teardown_outcome: Option<&'static str>,
+    pub(super) recorded_at_unix_ms: u64,
     pub(super) cleanup_error: Option<String>,
     pub(super) cleanup_error_count: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct NativeTerminationJournal {
     first_cause: Option<TerminationCause>,
     runtime_phase: RuntimePhase,
+    metadata: TerminationRunMetadata,
+    cause_observed_at_unix_ms: Option<u64>,
+    pre_cleanup_snapshot: Option<TerminationSnapshot>,
+    pre_cleanup_runtime_phase: Option<RuntimePhase>,
+    pre_cleanup_captured_at_unix_ms: Option<u64>,
     cleanup_error: Option<String>,
     cleanup_error_count: u32,
 }
@@ -138,11 +196,52 @@ impl Default for RuntimePhase {
 
 impl NativeTerminationJournal {
     pub(super) fn new() -> Self {
-        Self::default()
+        Self {
+            first_cause: None,
+            runtime_phase: RuntimePhase::Bootstrap,
+            metadata: TerminationRunMetadata::current(),
+            cause_observed_at_unix_ms: None,
+            pre_cleanup_snapshot: None,
+            pre_cleanup_runtime_phase: None,
+            pre_cleanup_captured_at_unix_ms: None,
+            cleanup_error: None,
+            cleanup_error_count: 0,
+        }
     }
 
     pub(super) fn set_phase(&mut self, phase: RuntimePhase) {
         self.runtime_phase = phase;
+    }
+
+    pub(super) fn capture_pre_cleanup_snapshot(&mut self, snapshot: TerminationSnapshot) {
+        if self.pre_cleanup_snapshot.is_some() {
+            return;
+        }
+        self.pre_cleanup_runtime_phase = Some(self.runtime_phase);
+        self.pre_cleanup_captured_at_unix_ms = Some(unix_time_ms());
+        self.pre_cleanup_snapshot = Some(snapshot);
+    }
+
+    pub(super) fn persist_run_started(&self) {
+        let summary = self.summary(None, TerminationRecordStatus::Running);
+        let path = run_record_path(&summary.metadata.session_id);
+        if let Err(error) = write_summary_file(&path, &summary) {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "oblivion-one: run-start marker write failed: {error}"
+            );
+        }
+    }
+
+    pub(super) fn persist_fatal_checkpoint(&self) {
+        let summary = self.summary(None, TerminationRecordStatus::FatalCheckpoint);
+        let path = run_record_path(&summary.metadata.session_id);
+        if let Err(error) = write_summary_file(&path, &summary) {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "oblivion-one: fatal termination checkpoint write failed: {error}"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -190,35 +289,32 @@ impl NativeTerminationJournal {
     fn record_first_cause(&mut self, cause: TerminationCause) {
         if self.first_cause.is_none() {
             self.first_cause = Some(cause);
+            self.cause_observed_at_unix_ms = Some(unix_time_ms());
         }
     }
 
-    pub(super) fn summary(&self, snapshot: TerminationSnapshot) -> TerminationSummary {
+    pub(super) fn summary(
+        &self,
+        final_kms_teardown_outcome: Option<&'static str>,
+        status: TerminationRecordStatus,
+    ) -> TerminationSummary {
         TerminationSummary {
-            schema_version: 1,
+            schema_version: 2,
+            status,
+            metadata: self.metadata.clone(),
             cause: self.first_cause.clone().unwrap_or(TerminationCause {
                 category: ExitCategory::Unknown,
                 failure_kind: None,
                 phase: self.runtime_phase,
                 error_chain: None,
             }),
+            cause_observed_at_unix_ms: self.cause_observed_at_unix_ms,
             runtime_phase: self.runtime_phase,
-            latest_submitted_frame_id: snapshot.latest_submitted_frame_id,
-            latest_presented_frame_id: snapshot.latest_presented_frame_id,
-            pageflip_pending: snapshot.pageflip_pending,
-            pending_pageflip_token: snapshot.pending_pageflip_token,
-            kms_worker_present: snapshot.kms_worker_present,
-            kms_worker_lifecycle: snapshot.kms_worker_lifecycle,
-            kms_worker_queue_depth: snapshot.kms_worker_queue_depth,
-            kms_worker_inflight: snapshot.kms_worker_inflight,
-            kms_worker_fatal_reason: snapshot.kms_worker_fatal_reason,
-            seat_state: snapshot.seat_state,
-            seat_session_active: snapshot.seat_session_active,
-            active_gpu_release_leases: snapshot.active_gpu_release_leases,
-            active_output_transactions: snapshot.active_output_transactions,
-            submitted_kms_ownership: snapshot.submitted_kms_ownership,
-            quarantined_kms_ownership: snapshot.quarantined_kms_ownership,
-            kms_teardown_safety: snapshot.kms_teardown_safety,
+            pre_cleanup_runtime_phase: self.pre_cleanup_runtime_phase,
+            pre_cleanup_captured_at_unix_ms: self.pre_cleanup_captured_at_unix_ms,
+            pre_cleanup_snapshot: self.pre_cleanup_snapshot,
+            final_kms_teardown_outcome,
+            recorded_at_unix_ms: unix_time_ms(),
             cleanup_error: self.cleanup_error.clone(),
             cleanup_error_count: self.cleanup_error_count,
         }
@@ -274,13 +370,30 @@ pub(super) fn write_summary_file(path: &Path, summary: &TerminationSummary) -> i
 
 pub(super) fn emit_summary(summary: &TerminationSummary) {
     let stderr_result = write_summary(&mut io::stderr().lock(), summary);
-    let path = termination_summary_path();
-    let file_result = write_summary_file(&path, summary);
-    if let Err(file_error) = file_result {
+    let run_path = run_record_path(&summary.metadata.session_id);
+    let run_result = write_summary_file(&run_path, summary);
+    let termination_result = write_summary_file(&termination_summary_path(), summary);
+    if let Err(file_error) = run_result.as_ref() {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "oblivion-one: run record file write failed: {file_error}"
+        );
+    }
+    if let Err(file_error) = termination_result.as_ref() {
         let _ = writeln!(
             io::stderr().lock(),
             "oblivion-one: termination summary file write failed: {file_error}"
         );
+    }
+    if run_result.is_ok() && termination_result.is_ok() {
+        if let Err(error) = fs::remove_file(&run_path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "oblivion-one: completed run marker cleanup failed: {error}"
+            );
+        }
     }
     if let Err(stderr_error) = stderr_result {
         let _ = writeln!(
@@ -290,7 +403,7 @@ pub(super) fn emit_summary(summary: &TerminationSummary) {
     }
 }
 
-fn termination_summary_path() -> std::path::PathBuf {
+fn termination_diagnostics_dir() -> std::path::PathBuf {
     let state_dir = env::var_os("OBLIVION_ONE_STATE_DIR")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
@@ -300,10 +413,24 @@ fn termination_summary_path() -> std::path::PathBuf {
                 .map(|value| std::path::PathBuf::from(value).join("oblivion-one"))
         })
         .unwrap_or_else(oblivion_one::default_state_dir);
-    state_dir.join("diagnostics").join("last-termination.json")
+    state_dir.join("diagnostics")
 }
 
-fn format_error_chain(error: &dyn Error) -> String {
+fn run_record_path(session_id: &str) -> std::path::PathBuf {
+    run_record_path_in(&termination_diagnostics_dir(), session_id)
+}
+
+fn run_record_path_in(diagnostics_dir: &Path, session_id: &str) -> std::path::PathBuf {
+    diagnostics_dir
+        .join("incomplete-runs")
+        .join(format!("{session_id}.json"))
+}
+
+fn termination_summary_path() -> std::path::PathBuf {
+    termination_diagnostics_dir().join("last-termination.json")
+}
+
+pub(crate) fn format_error_chain(error: &dyn Error) -> String {
     let mut output = BoundedString::new(MAX_ERROR_CHAIN_BYTES.saturating_sub(3));
     let mut current = Some(error);
     let mut depth = 0;
@@ -312,8 +439,8 @@ fn format_error_chain(error: &dyn Error) -> String {
             let _ = output.write_str(": ");
         }
         let _ = write!(output, "{cause}");
-        depth += 1;
         let source = cause.source();
+        depth += 1;
         if output.truncated || depth == 8 {
             current = source;
             break;
@@ -323,9 +450,24 @@ fn format_error_chain(error: &dyn Error) -> String {
     if output.truncated {
         output.value.push_str("...");
     } else if depth == 8 && current.is_some() {
-        let _ = output.write_str(": [source chain truncated]");
+        append_bounded_suffix(&mut output.value, ": [source chain truncated]");
     }
     output.value
+}
+
+fn append_bounded_suffix(value: &mut String, suffix: &str) {
+    if value.len().saturating_add(suffix.len()) <= MAX_ERROR_CHAIN_BYTES {
+        value.push_str(suffix);
+        return;
+    }
+
+    let prefix_limit = MAX_ERROR_CHAIN_BYTES.saturating_sub(suffix.len());
+    let mut end = prefix_limit.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(suffix);
 }
 
 struct BoundedString {
@@ -364,8 +506,8 @@ impl fmt::Write for BoundedString {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitCategory, ExitFailureKind, NativeTerminationJournal, RuntimePhase, TerminationSnapshot,
-        write_summary, write_summary_file,
+        ExitCategory, ExitFailureKind, NativeTerminationJournal, RuntimePhase,
+        TerminationRecordStatus, TerminationSnapshot, write_summary, write_summary_file,
     };
     use std::{error::Error, fmt, fs, io, path::PathBuf};
 
@@ -525,7 +667,8 @@ mod tests {
 
         let mut journal = NativeTerminationJournal::new();
         journal.record_shortcut_shutdown();
-        let summary = journal.summary(TerminationSnapshot::default());
+        journal.capture_pre_cleanup_snapshot(TerminationSnapshot::default());
+        let summary = journal.summary(None, TerminationRecordStatus::Completed);
 
         let error = write_summary(&mut FailingWriter, &summary)
             .expect_err("failed sink must be visible to the fallback reporter");
@@ -542,7 +685,8 @@ mod tests {
         let path = directory.join("last-termination.json");
         let mut journal = NativeTerminationJournal::new();
         journal.record_shortcut_shutdown();
-        let summary = journal.summary(TerminationSnapshot::default());
+        journal.capture_pre_cleanup_snapshot(TerminationSnapshot::default());
+        let summary = journal.summary(None, TerminationRecordStatus::Completed);
 
         write_summary_file(&path, &summary).expect("write summary file");
         let bytes = fs::read(&path).expect("read summary file");
@@ -558,7 +702,8 @@ mod tests {
         let path = blocker.join("last-termination.json");
         let mut journal = NativeTerminationJournal::new();
         journal.record_shortcut_shutdown();
-        let summary = journal.summary(TerminationSnapshot::default());
+        journal.capture_pre_cleanup_snapshot(TerminationSnapshot::default());
+        let summary = journal.summary(None, TerminationRecordStatus::Completed);
 
         let error = write_summary_file(&path, &summary).expect_err("path parent is a regular file");
         assert_eq!(
@@ -579,25 +724,43 @@ mod tests {
             pageflip_pending: true,
             kms_worker_present: true,
             kms_worker_lifecycle: Some("quiescing"),
-            kms_teardown_safety: "safe_disable",
+            kms_teardown_safety: "unknown",
             ..TerminationSnapshot::default()
         };
 
-        let summary = journal.summary(snapshot);
-        assert_eq!(summary.latest_submitted_frame_id, Some(41));
-        assert_eq!(summary.latest_presented_frame_id, Some(40));
-        assert!(summary.pageflip_pending);
-        assert_eq!(summary.kms_teardown_safety, "safe_disable");
+        journal.capture_pre_cleanup_snapshot(snapshot);
+        let summary = journal.summary(Some("safe_disable"), TerminationRecordStatus::Completed);
+        let pre_cleanup = summary
+            .pre_cleanup_snapshot
+            .expect("pre-cleanup snapshot is captured");
+        assert_eq!(pre_cleanup.latest_submitted_frame_id, Some(41));
+        assert_eq!(pre_cleanup.latest_presented_frame_id, Some(40));
+        assert!(pre_cleanup.pageflip_pending);
+        assert_eq!(pre_cleanup.kms_teardown_safety, "unknown");
+        assert_eq!(summary.final_kms_teardown_outcome, Some("safe_disable"));
 
         let mut encoded = Vec::new();
         write_summary(&mut encoded, &summary).expect("serialize termination summary");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("valid JSON");
-        assert_eq!(json["latest_submitted_frame_id"], 41);
-        assert_eq!(json["latest_presented_frame_id"], 40);
-        assert_eq!(json["pageflip_pending"], true);
-        assert_eq!(json["kms_worker_present"], true);
-        assert_eq!(json["kms_worker_lifecycle"], "quiescing");
-        assert_eq!(json["kms_teardown_safety"], "safe_disable");
+        assert_eq!(
+            json["pre_cleanup_snapshot"]["latest_submitted_frame_id"],
+            41
+        );
+        assert_eq!(
+            json["pre_cleanup_snapshot"]["latest_presented_frame_id"],
+            40
+        );
+        assert_eq!(json["pre_cleanup_snapshot"]["pageflip_pending"], true);
+        assert_eq!(json["pre_cleanup_snapshot"]["kms_worker_present"], true);
+        assert_eq!(
+            json["pre_cleanup_snapshot"]["kms_worker_lifecycle"],
+            "quiescing"
+        );
+        assert_eq!(
+            json["pre_cleanup_snapshot"]["kms_teardown_safety"],
+            "unknown"
+        );
+        assert_eq!(json["final_kms_teardown_outcome"], "safe_disable");
     }
 
     #[test]
@@ -607,17 +770,39 @@ mod tests {
         journal.set_phase(RuntimePhase::KmsTeardown);
         journal.record_runtime_error(&io::Error::other("target destroy failed"));
 
-        let summary = journal.summary(TerminationSnapshot {
-            kms_teardown_safety: "unproven",
+        journal.capture_pre_cleanup_snapshot(TerminationSnapshot {
+            kms_teardown_safety: "unknown",
             submitted_kms_ownership: 2,
             active_gpu_release_leases: 3,
             ..TerminationSnapshot::default()
         });
+        let summary = journal.summary(Some("unproven"), TerminationRecordStatus::Completed);
 
         assert_eq!(summary.cause.category, ExitCategory::Normal);
-        assert_eq!(summary.kms_teardown_safety, "unproven");
-        assert_eq!(summary.submitted_kms_ownership, 2);
-        assert_eq!(summary.active_gpu_release_leases, 3);
+        assert_eq!(
+            summary
+                .pre_cleanup_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.kms_teardown_safety),
+            Some("unknown")
+        );
+        assert_eq!(summary.final_kms_teardown_outcome, Some("unproven"));
+        assert_eq!(
+            summary
+                .pre_cleanup_snapshot
+                .as_ref()
+                .unwrap()
+                .submitted_kms_ownership,
+            2
+        );
+        assert_eq!(
+            summary
+                .pre_cleanup_snapshot
+                .as_ref()
+                .unwrap()
+                .active_gpu_release_leases,
+            3
+        );
         assert_eq!(summary.cleanup_error_count, 1);
         assert!(
             summary
@@ -625,5 +810,71 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("target destroy failed"))
         );
+    }
+
+    #[test]
+    fn run_metadata_and_checkpoints_keep_one_stable_session_identity() {
+        let mut journal = NativeTerminationJournal::new();
+        journal.set_phase(RuntimePhase::ReactorWait);
+        let started = journal.summary(None, TerminationRecordStatus::Running);
+        journal.record_runtime_error(&io::Error::other("reactor failed"));
+        journal.capture_pre_cleanup_snapshot(TerminationSnapshot {
+            latest_submitted_frame_id: Some(19),
+            ..TerminationSnapshot::default()
+        });
+
+        let checkpoint = journal.summary(None, TerminationRecordStatus::FatalCheckpoint);
+        let completed = journal.summary(Some("safe_disable"), TerminationRecordStatus::Completed);
+
+        assert!(!started.metadata.session_id.is_empty());
+        assert_eq!(started.metadata.process_id, std::process::id());
+        assert!(started.metadata.started_at_unix_ms > 0);
+        assert_eq!(checkpoint.metadata, started.metadata);
+        assert_eq!(completed.metadata, started.metadata);
+        assert!(
+            checkpoint.cause_observed_at_unix_ms.unwrap() >= started.metadata.started_at_unix_ms
+        );
+        assert_eq!(checkpoint.status, TerminationRecordStatus::FatalCheckpoint);
+        assert_eq!(checkpoint.final_kms_teardown_outcome, None);
+        assert_eq!(
+            checkpoint
+                .pre_cleanup_snapshot
+                .unwrap()
+                .latest_submitted_frame_id,
+            Some(19)
+        );
+        assert_eq!(completed.status, TerminationRecordStatus::Completed);
+        assert_eq!(completed.final_kms_teardown_outcome, Some("safe_disable"));
+        assert!(completed.recorded_at_unix_ms >= checkpoint.recorded_at_unix_ms);
+    }
+
+    #[test]
+    fn current_run_marker_identifies_a_new_run_without_replacing_last_termination() {
+        let directory = test_output_path("termination-run-marker-test");
+        let previous_termination = directory.join("last-termination.json");
+        let mut previous_journal = NativeTerminationJournal::new();
+        previous_journal.record_shortcut_shutdown();
+        previous_journal.capture_pre_cleanup_snapshot(TerminationSnapshot::default());
+        let previous = previous_journal.summary(None, TerminationRecordStatus::Completed);
+        write_summary_file(&previous_termination, &previous).expect("write previous record");
+
+        let current_journal = NativeTerminationJournal::new();
+        let current = current_journal.summary(None, TerminationRecordStatus::Running);
+        let current_run = super::run_record_path_in(&directory, &current.metadata.session_id);
+        write_summary_file(&current_run, &current).expect("write current run marker");
+
+        let previous_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&previous_termination).expect("read previous record"))
+                .expect("valid previous JSON");
+        let current_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&current_run).expect("read current marker"))
+                .expect("valid current JSON");
+        assert_ne!(
+            previous_json["metadata"]["session_id"],
+            current_json["metadata"]["session_id"]
+        );
+        assert_eq!(previous_json["status"], "completed");
+        assert_eq!(current_json["status"], "running");
+        fs::remove_dir_all(directory).expect("remove test output directory");
     }
 }

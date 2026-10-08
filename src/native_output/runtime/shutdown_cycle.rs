@@ -81,6 +81,8 @@ impl NativeRuntime {
         {
             Some(transition) => {
                 self.termination.record_shortcut_shutdown();
+                let snapshot = self.termination_snapshot();
+                self.termination.capture_pre_cleanup_snapshot(snapshot);
                 native_shutdown_debug_log("shortcut_exit_requested");
                 native_shutdown_debug_log("shutdown_begin");
                 println!("native input exit requested; shutting down cleanly");

@@ -5,7 +5,9 @@ use crate::native_output::controller::{
 use crate::system_action_transport::NativeSystemActionTransport;
 use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
 use oblivion_one::core::OutputId;
-use termination::{NativeTerminationJournal, RuntimePhase, TerminationSnapshot};
+use termination::{
+    NativeTerminationJournal, RuntimePhase, TerminationRecordStatus, TerminationSnapshot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeVisualWorkQueueReason {
@@ -171,6 +173,7 @@ mod shutdown_cycle;
 mod slow_cycle;
 mod system_action_io;
 mod termination;
+pub(crate) use termination::format_error_chain;
 mod wake_plan;
 mod window_exit_frame;
 mod work_domains;
@@ -862,13 +865,30 @@ mod trusted_reload_tests {
 
 impl NativeRuntime {
     pub(crate) fn bootstrap(config: NativeRuntimeConfig) -> NativeResult<Self> {
-        // Block process-directed SIGCHLD before any native driver, graphics
-        // library, or compositor initialization can create a thread.  Every
-        // later worker inherits this mask and the child supervisor's signalfd
-        // remains the sole normal notification path.
-        oblivion_one::process::block_sigchld_for_current_thread()?;
-        frame::initialize_effect_owner_diagnostics();
-        Self::bootstrap_native(config)
+        let mut termination = Some(NativeTerminationJournal::new());
+        termination
+            .as_ref()
+            .expect("bootstrap termination journal")
+            .persist_run_started();
+        let result = (|| {
+            // Block process-directed SIGCHLD before any native driver, graphics
+            // library, or compositor initialization can create a thread.  Every
+            // later worker inherits this mask and the child supervisor's signalfd
+            // remains the sole normal notification path.
+            oblivion_one::process::block_sigchld_for_current_thread()?;
+            frame::initialize_effect_owner_diagnostics();
+            Self::bootstrap_native(config, &mut termination)
+        })();
+        if let Err(error) = &result
+            && let Some(mut termination) = termination.take()
+        {
+            termination.record_runtime_error(error.as_ref());
+            termination.capture_pre_cleanup_snapshot(TerminationSnapshot::default());
+            termination::emit_summary(
+                &termination.summary(None, TerminationRecordStatus::Completed),
+            );
+        }
+        result
     }
 
     pub(crate) fn run(&mut self) -> NativeResult<()> {
@@ -877,6 +897,9 @@ impl NativeRuntime {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.termination.record_runtime_error(error.as_ref());
+                let snapshot = self.termination_snapshot();
+                self.termination.capture_pre_cleanup_snapshot(snapshot);
+                self.termination.persist_fatal_checkpoint();
                 self.termination.set_phase(RuntimePhase::EmergencyCleanup);
                 if let Err(cleanup_error) = self
                     .xwayland
@@ -1010,7 +1033,8 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
-        let mut termination_snapshot = self.termination_snapshot();
+        let snapshot = self.termination_snapshot();
+        self.termination.capture_pre_cleanup_snapshot(snapshot);
         self.termination.set_phase(RuntimePhase::EmergencyCleanup);
         self.fail_pending_screen_captures("session_inactive");
         self.dmem_foreground.shutdown();
@@ -1168,13 +1192,15 @@ impl Drop for NativeRuntime {
         self.termination.set_phase(RuntimePhase::KmsTeardown);
         if !self.establish_kms_teardown_safety().permits_release() {
             self.retain_unproven_teardown_ownership();
-            termination_snapshot.kms_teardown_safety = self.kms_teardown_safety.as_str();
             self.cursor_responsiveness.dump(
                 &self.presentation_trace,
                 self.server.pointer_input_metrics_snapshot(),
                 &self.cursor_output_arbitration,
             );
-            termination::emit_summary(&self.termination.summary(termination_snapshot));
+            termination::emit_summary(&self.termination.summary(
+                Some(self.kms_teardown_safety.as_str()),
+                TerminationRecordStatus::Completed,
+            ));
             return;
         }
         self.presented_planes.primary = None;
@@ -1185,13 +1211,15 @@ impl Drop for NativeRuntime {
             eprintln!("native direct target-destroyed release was not proven safe: {error}");
             self.termination.record_cleanup_error(&error);
             self.retain_unproven_teardown_ownership();
-            termination_snapshot.kms_teardown_safety = self.kms_teardown_safety.as_str();
             self.cursor_responsiveness.dump(
                 &self.presentation_trace,
                 self.server.pointer_input_metrics_snapshot(),
                 &self.cursor_output_arbitration,
             );
-            termination::emit_summary(&self.termination.summary(termination_snapshot));
+            termination::emit_summary(&self.termination.summary(
+                Some(self.kms_teardown_safety.as_str()),
+                TerminationRecordStatus::Completed,
+            ));
             return;
         }
         let terminal_callback_transactions = self.output_transactions.active_transaction_ids();
@@ -1325,12 +1353,14 @@ impl Drop for NativeRuntime {
             dmabuf_qualification.pageflip_to_release_lag_p95_us,
             dmabuf_qualification.pageflip_to_release_lag_p99_us,
         );
-        termination_snapshot.kms_teardown_safety = self.kms_teardown_safety.as_str();
         self.cursor_responsiveness.dump(
             &self.presentation_trace,
             self.server.pointer_input_metrics_snapshot(),
             &self.cursor_output_arbitration,
         );
-        termination::emit_summary(&self.termination.summary(termination_snapshot));
+        termination::emit_summary(&self.termination.summary(
+            Some(self.kms_teardown_safety.as_str()),
+            TerminationRecordStatus::Completed,
+        ));
     }
 }

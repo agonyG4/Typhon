@@ -134,40 +134,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 }
 
 fn bounded_error_chain(error: &(dyn Error + 'static)) -> String {
-    const MAX_BYTES: usize = 2_048;
-    let mut chain = String::new();
-    let mut current = Some(error);
-    let mut depth = 0;
-    while let Some(cause) = current {
-        if depth > 0 && chain.len() < MAX_BYTES {
-            chain.push_str(": ");
-        }
-        let rendered = cause.to_string();
-        let available = MAX_BYTES.saturating_sub(chain.len());
-        if rendered.len() <= available {
-            chain.push_str(&rendered);
-        } else {
-            let mut end = available;
-            while !rendered.is_char_boundary(end) {
-                end -= 1;
-            }
-            chain.push_str(&rendered[..end]);
-            if chain.len() >= MAX_BYTES.saturating_sub(3) {
-                chain.truncate(MAX_BYTES.saturating_sub(3));
-            }
-            chain.push_str("...");
-            break;
-        }
-        depth += 1;
-        if depth >= 8 {
-            if cause.source().is_some() {
-                chain.push_str(": [source chain truncated]");
-            }
-            break;
-        }
-        current = cause.source();
-    }
-    chain
+    native_output::format_error_chain(error)
 }
 
 fn native_startup_phase(error: &(dyn Error + 'static)) -> Option<&'static str> {
@@ -185,7 +152,6 @@ fn activation_environment_args(
     socket_name: &str,
     current_desktop: &str,
     session_type: &str,
-    display: Option<&str>,
     runtime_dir: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -194,10 +160,7 @@ fn activation_environment_args(
         format!("XDG_CURRENT_DESKTOP={current_desktop}"),
         format!("XDG_SESSION_TYPE={session_type}"),
     ];
-    if let Some(display) = display {
-        args.push(format!("DISPLAY={display}"));
-    }
-    if let Some(runtime_dir) = runtime_dir {
+    if let Some(runtime_dir) = runtime_dir.filter(|value| !value.trim().is_empty()) {
         args.push(format!("XDG_RUNTIME_DIR={runtime_dir}"));
     }
     args
@@ -207,13 +170,16 @@ fn import_activation_environment(socket_name: &str) {
     let current_desktop =
         std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "OblivionOne".to_string());
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "wayland".to_string());
-    let display = std::env::var("DISPLAY").ok();
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    // The user manager is shared across graphical sessions. The launcher
+    // clears inherited DISPLAY, and this compositor has not started its own
+    // XWayland yet, so importing DISPLAY here could publish another session's
+    // stale X server to newly activated services. Leave any existing shared
+    // DISPLAY untouched rather than unsetting it for other sessions.
     let args = activation_environment_args(
         socket_name,
         &current_desktop,
         &session_type,
-        display.as_deref(),
         runtime_dir.as_deref(),
     );
 
@@ -496,8 +462,44 @@ SDDM integration is available through bin/install-start-oblivion-one --sddm-sess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug)]
+    struct TestError {
+        message: String,
+        source: Option<Box<TestError>>,
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(&self.message)
+        }
+    }
+
+    impl Error for TestError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn Error + 'static))
+        }
+    }
+
+    fn error_chain(count: usize, message: impl Fn(usize) -> String) -> TestError {
+        assert!(count > 0);
+        let mut error = TestError {
+            message: message(count - 1),
+            source: None,
+        };
+        for index in (0..count - 1).rev() {
+            error = TestError {
+                message: message(index),
+                source: Some(Box::new(error)),
+            };
+        }
+        error
+    }
 
     #[test]
     fn parse_native_compositor_defaults_without_product_mode_state() {
@@ -554,12 +556,64 @@ mod tests {
     }
 
     #[test]
+    fn bounded_error_chain_handles_multibyte_truncation_without_panicking() {
+        let error = error_chain(1, |_| format!("{}éétail", "a".repeat(2_044)));
+
+        let formatted = bounded_error_chain(&error);
+
+        assert!(formatted.len() <= 2_048);
+        assert!(formatted.is_char_boundary(formatted.len()));
+    }
+
+    #[test]
+    fn bounded_error_chain_keeps_oversized_messages_within_the_byte_limit() {
+        let error = error_chain(1, |_| "🧪".repeat(2_000));
+
+        let formatted = bounded_error_chain(&error);
+
+        assert!(formatted.len() <= 2_048);
+        assert!(formatted.is_char_boundary(formatted.len()));
+    }
+
+    #[test]
+    fn bounded_error_chain_includes_nested_sources() {
+        let error = error_chain(2, |index| format!("error-{index}"));
+
+        let formatted = bounded_error_chain(&error);
+
+        assert_eq!(formatted, "error-0: error-1");
+    }
+
+    #[test]
+    fn bounded_error_chain_marks_only_chains_longer_than_eight_sources() {
+        let exactly_eight = error_chain(8, |index| format!("error-{index}"));
+        let more_than_eight = error_chain(9, |index| format!("error-{index}"));
+
+        let exactly_eight = bounded_error_chain(&exactly_eight);
+        let more_than_eight = bounded_error_chain(&more_than_eight);
+
+        assert!(exactly_eight.contains("error-7"));
+        assert!(!exactly_eight.contains("source chain truncated"));
+        assert!(more_than_eight.contains("source chain truncated"));
+        assert!(!more_than_eight.contains("error-8"));
+    }
+
+    #[test]
+    fn bounded_error_chain_caps_marker_after_eight_long_sources() {
+        let error = error_chain(9, |_| "x".repeat(253));
+
+        let formatted = bounded_error_chain(&error);
+
+        assert!(formatted.len() <= 2_048);
+        assert!(formatted.is_char_boundary(formatted.len()));
+    }
+
+    #[test]
     fn activation_environment_uses_bound_socket_and_current_session_values() {
         let args = activation_environment_args(
             "oblivion-one-sddm",
             "OblivionOne",
             "wayland",
-            Some(":2"),
             Some("/run/user/1000"),
         );
 
@@ -570,7 +624,6 @@ mod tests {
                 "WAYLAND_DISPLAY=oblivion-one-sddm",
                 "XDG_CURRENT_DESKTOP=OblivionOne",
                 "XDG_SESSION_TYPE=wayland",
-                "DISPLAY=:2",
                 "XDG_RUNTIME_DIR=/run/user/1000",
             ]
         );
@@ -578,8 +631,25 @@ mod tests {
 
     #[test]
     fn activation_environment_does_not_import_absent_display() {
-        let args = activation_environment_args("wayland-7", "OblivionOne", "wayland", None, None);
+        let args = activation_environment_args("wayland-7", "OblivionOne", "wayland", None);
         assert!(args.contains(&"WAYLAND_DISPLAY=wayland-7".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("DISPLAY=")));
+    }
+
+    #[test]
+    fn activation_environment_omits_inherited_stale_display_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let display = std::env::var_os("DISPLAY");
+        unsafe { std::env::set_var("DISPLAY", ":stale") };
+
+        let args = activation_environment_args("wayland-7", "OblivionOne", "wayland", None);
+
+        unsafe {
+            match display {
+                Some(value) => std::env::set_var("DISPLAY", value),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
         assert!(!args.iter().any(|arg| arg.starts_with("DISPLAY=")));
     }
 

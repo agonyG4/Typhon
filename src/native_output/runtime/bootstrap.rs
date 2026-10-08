@@ -192,7 +192,10 @@ struct NativeRuntimeBootstrapTail {
     initial_presented_scene: NativeFrameSceneSnapshot,
 }
 impl NativeRuntime {
-    fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
+    fn finish_bootstrap(
+        parts: NativeRuntimeBootstrapTail,
+        termination: &mut Option<NativeTerminationJournal>,
+    ) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
             mut server,
             output_id,
@@ -699,7 +702,9 @@ impl NativeRuntime {
             dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
             system_action_transport,
-            termination: NativeTerminationJournal::new(),
+            termination: termination
+                .take()
+                .expect("bootstrap termination journal available"),
             started_at: Instant::now(),
             vrr_policy,
             xwayland,
@@ -796,17 +801,30 @@ impl NativeRuntime {
             scaled_primary_probe: ScaledPrimaryProbeCache::default(),
             slow_cycle_trace: NativeSlowCycleTrace::from_env(),
         };
-        if xwayland_environment_materialized {
-            runtime
-                .resource_efficiency_mut()
-                .record_xwayland_environment_materialization();
+        let finish_result: NativeResult<()> = (|| {
+            if xwayland_environment_materialized {
+                runtime
+                    .resource_efficiency_mut()
+                    .record_xwayland_environment_materialization();
+            }
+            runtime.sync_controller_reactor_sources()?;
+            runtime.install_native_wake_plan(initial_wake_plan, scheduler_anchor_ns)?;
+            runtime.attach_xwayland_private_client()?;
+            Ok(())
+        })();
+        if let Err(error) = finish_result {
+            runtime.termination.record_runtime_error(error.as_ref());
+            let snapshot = runtime.termination_snapshot();
+            runtime.termination.capture_pre_cleanup_snapshot(snapshot);
+            runtime.termination.persist_fatal_checkpoint();
+            return Err(error);
         }
-        runtime.sync_controller_reactor_sources()?;
-        runtime.install_native_wake_plan(initial_wake_plan, scheduler_anchor_ns)?;
-        runtime.attach_xwayland_private_client()?;
         Ok(runtime)
     }
-    pub(super) fn bootstrap_native(config: NativeRuntimeConfig) -> NativeResult<Self> {
+    pub(super) fn bootstrap_native(
+        config: NativeRuntimeConfig,
+        termination: &mut Option<NativeTerminationJournal>,
+    ) -> NativeResult<Self> {
         let controller_policy = ControllerPolicy::from_env()?;
         let NativeRuntimeConfig {
             mut server,
@@ -1678,41 +1696,44 @@ impl NativeRuntime {
                 NativePerfField::u64("output_generation", drm_file_generation),
             ]
         });
-        Self::finish_bootstrap(NativeRuntimeBootstrapTail {
-            server,
-            output_id,
-            keyboard_store,
-            cursor_image,
-            cursor_manager,
-            perf,
-            kms,
-            kms_backend,
-            target,
-            output_capabilities,
-            mode_label,
-            output_refresh_rate,
-            drm_file_generation,
-            drm_timestamp_clock,
-            presentation_clock,
-            scanout,
-            frame_renderer,
-            input_state,
-            cursor_preference,
-            cursor_scheduling_policy,
-            direct_scanout_preference,
-            pre_kms_atomic_cursor,
-            pre_kms_legacy_cursor,
-            cursor_render_mode,
-            input_plan,
-            controller_policy,
-            seat_session,
-            startup_app,
-            effective_app_gpu_policy,
-            dmabuf_feedback_compatibility,
-            dmabuf_feedback_compat_metrics,
-            vrr_policy,
-            initial_presented_scene,
-        })
+        Self::finish_bootstrap(
+            NativeRuntimeBootstrapTail {
+                server,
+                output_id,
+                keyboard_store,
+                cursor_image,
+                cursor_manager,
+                perf,
+                kms,
+                kms_backend,
+                target,
+                output_capabilities,
+                mode_label,
+                output_refresh_rate,
+                drm_file_generation,
+                drm_timestamp_clock,
+                presentation_clock,
+                scanout,
+                frame_renderer,
+                input_state,
+                cursor_preference,
+                cursor_scheduling_policy,
+                direct_scanout_preference,
+                pre_kms_atomic_cursor,
+                pre_kms_legacy_cursor,
+                cursor_render_mode,
+                input_plan,
+                controller_policy,
+                seat_session,
+                startup_app,
+                effective_app_gpu_policy,
+                dmabuf_feedback_compatibility,
+                dmabuf_feedback_compat_metrics,
+                vrr_policy,
+                initial_presented_scene,
+            },
+            termination,
+        )
     }
 }
 fn native_dmabuf_feedback_compatibility(

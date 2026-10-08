@@ -15,9 +15,9 @@ Review date: 2026-10-08. The current working tree is the implementation source o
 
 Before this change, the runtime returned its original error, but the CLI displayed only the outer `Display` text after cleanup had already produced KMS, child, and renderer logs. Several emergency cleanup results were discarded. KMS teardown logs describe the cleanup outcome (`Restored`, `SafeDisable`, or unproven ownership); they do not identify the initial failure. Detailed performance output is optional and therefore could not serve as the only termination record.
 
-The new journal is fixed-size: it keeps the first typed cause, current runtime phase, one bounded cleanup error, and a count of later cleanup failures. It stores no per-frame event history and writes only from process exit/`Drop`, never in frame processing. The summary includes latest submitted and presented frame IDs, pageflip token/state, KMS worker state, seat state, active GPU release leases, output transactions, submitted/quarantined KMS ownership, and final KMS teardown safety. JSON is bounded; the file is written through a same-directory temporary file and rename with private permissions. Stderr remains an independent sink.
+The new journal keeps the first typed cause, current runtime phase, one bounded cleanup error, and a count of later cleanup failures. It stores no per-frame event history. A per-run marker is written before native seat/KMS bootstrap; a fatal runtime checkpoint is written after capturing the first error and before emergency cleanup. The final summary is written from `Drop`. These writes never run in frame processing. Records include a random per-run session ID, PID, optional boot and desktop-session IDs, and start/cause/capture/record timestamps. The pre-cleanup pageflip, frame, worker, seat, and GPU ownership snapshot is separate from the final KMS teardown outcome. JSON is bounded; files are written through same-directory temporary files and rename with private permissions. Stderr remains an independent sink.
 
-There is no safe in-process final event after `SIGKILL`; the summary may therefore be absent or describe the preceding termination if the process is killed before `Drop` runs. No signal handler was added.
+There is no safe in-process final event after `SIGKILL`; the matching per-run marker remains at its last known status (`running` or `fatal_checkpoint`) if the process is killed before final cleanup. `last-termination.json` may still describe an older completed run, so compare `metadata.session_id`, PID, boot ID, and timestamps with the files under `diagnostics/incomplete-runs/`. No signal handler was added.
 
 ## Scene ownership and damage findings
 
@@ -58,6 +58,8 @@ The supplied incident report gives approximately 74,021 owner warnings. A separa
 
 The GTK portal startup failures were reviewed separately from compositor termination. The user-session journal showed earlier `xdg-desktop-portal-gtk` starts failing with an empty display and a later successful start; the failures predate the available Typhon session log. This establishes an activation/display-environment issue to investigate independently, not a cause of the compositor exit.
 
+The D-Bus/systemd activation environment is shared by the user's graphical sessions. Typhon publishes its bound `WAYLAND_DISPLAY` and Wayland desktop metadata after the Wayland socket exists, and does not clear shared variables on session exit. It does not publish inherited `DISPLAY`: the native launcher clears it, and Typhon has not started its own XWayland at that point. A pre-existing manager `DISPLAY` can remain when no current X11 display is supplied; clearing it globally could break another session. New portal activations receive the current Wayland display and `XDG_SESSION_TYPE=wayland`, but deployments that activate X11-only services through the shared user manager still need a session-scoped environment strategy. A failed startup can also leave the just-published Wayland name in that shared manager until another session updates it; the old socket is gone, and Typhon deliberately does not globally unset it.
+
 The current blur policy contains `layers.default: "enabled"`, which is not accepted by the Rust schema (`client_only` or `disabled`). The loader logs the validation error and uses built-in defaults. No user configuration was edited, and `enabled` was not silently reinterpreted. The material configuration passed its schema validation.
 
 ## External design references
@@ -71,23 +73,24 @@ These references informed invariants only; no code was transplanted:
 
 ## Retrieving diagnostics
 
-The last orderly termination summary is written to:
+The last completed termination summary is written to:
 
 ```text
 ${OBLIVION_ONE_STATE_DIR}/diagnostics/last-termination.json
 ```
 
-When that override is absent, `XDG_STATE_HOME/oblivion-one/diagnostics/last-termination.json` is used; otherwise the default is `~/.local/state/oblivion-one/diagnostics/last-termination.json`. The same JSON record is written to stderr and therefore appears in the launcher's `session.log` when started through `bin/start-oblivion-one`.
+When that override is absent, `XDG_STATE_HOME/oblivion-one/diagnostics/last-termination.json` is used; otherwise the default is `~/.local/state/oblivion-one/diagnostics/last-termination.json`. The same JSON record is written to stderr and therefore appears in the launcher's `session.log` when started through `bin/start-oblivion-one`. A crashed or still-running session has a matching marker at `diagnostics/incomplete-runs/<session_id>.json`; successful finalization removes that marker after writing the final summary.
 
 For a future exit, inspect the summary and matching boot/session logs:
 
 ```sh
 cat "${OBLIVION_ONE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oblivion-one}/diagnostics/last-termination.json"
+ls -lt "${OBLIVION_ONE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oblivion-one}/diagnostics/incomplete-runs"
 journalctl --user -b -u xdg-desktop-portal-gtk.service
 journalctl -b --since '10 minutes ago' | rg -i 'typhon|oblivion-one|drm|seat|oom|xid'
 ```
 
-If the process was forcibly killed, use the preceding summary only as last-known state and inspect the boot journal/kernel log for the kill event. Do not treat the preceding summary as proof of the forced-kill cause.
+If a marker remains with `status: running`, termination was not recorded in-process. If it has `status: fatal_checkpoint`, its `cause` and `pre_cleanup_snapshot` were persisted before emergency cleanup; `final_kms_teardown_outcome` is absent by design. Match the marker's `metadata.session_id` to `last-termination.json` before using the latter as the final record. A forced kill still cannot identify its own cause; inspect the boot journal/kernel log. Never treat an older `last-termination.json` as proof of the newer session's exit cause.
 
 ## Rollback
 
