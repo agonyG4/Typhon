@@ -810,9 +810,9 @@ pub(crate) struct NativeRuntime {
     astrea_launch_tracker: AstreaLaunchLifecycleTracker,
     shutdown: NativeShutdownLifecycle,
     presentation_trace: PresentationTransactionTraceRing,
-    presentation_trace_export_cursor: Option<u128>,
+    presentation_trace_writer:
+        Option<crate::native_output::presentation::trace_writer::PresentationTraceWriter>,
     cursor_reveal_trace: Option<CursorRevealTraceLedger>,
-    presentation_trace_path: Option<std::path::PathBuf>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
     render_telemetry: NativeRenderTelemetry,
     scaled_primary_probe: crate::native_output::scanout::ScaledPrimaryProbeCache,
@@ -1201,6 +1201,9 @@ impl Drop for NativeRuntime {
                 self.server.pointer_input_metrics_snapshot(),
                 &self.cursor_output_arbitration,
             );
+            if let Some(writer) = self.presentation_trace_writer.as_mut() {
+                writer.shutdown(&self.presentation_trace);
+            }
             termination::emit_summary(&self.termination.summary(
                 Some(self.kms_teardown_safety.as_str()),
                 TerminationRecordStatus::Completed,
@@ -1220,6 +1223,9 @@ impl Drop for NativeRuntime {
                 self.server.pointer_input_metrics_snapshot(),
                 &self.cursor_output_arbitration,
             );
+            if let Some(writer) = self.presentation_trace_writer.as_mut() {
+                writer.shutdown(&self.presentation_trace);
+            }
             termination::emit_summary(&self.termination.summary(
                 Some(self.kms_teardown_safety.as_str()),
                 TerminationRecordStatus::Completed,
@@ -1362,6 +1368,9 @@ impl Drop for NativeRuntime {
             self.server.pointer_input_metrics_snapshot(),
             &self.cursor_output_arbitration,
         );
+        if let Some(writer) = self.presentation_trace_writer.as_mut() {
+            writer.shutdown(&self.presentation_trace);
+        }
         termination::emit_summary(&self.termination.summary(
             Some(self.kms_teardown_safety.as_str()),
             TerminationRecordStatus::Completed,

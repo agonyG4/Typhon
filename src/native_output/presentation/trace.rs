@@ -3,10 +3,17 @@ use oblivion_one::core::OutputId;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Write as _,
-    sync::atomic::{AtomicU64, Ordering},
+    fs::File,
+    io::Read as _,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_TRACE_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+static TRACE_SOURCE_NONCE: OnceLock<u128> = OnceLock::new();
 
 const HISTOGRAM_BUCKETS_NS: [u64; 8] = [
     100_000,
@@ -234,7 +241,7 @@ pub(crate) struct PresentationTransactionSummary {
 pub(crate) struct PresentationTransactionTraceRecord {
     pub(crate) sequence: u128,
     pub(crate) process_id: u32,
-    pub(crate) source_id: u64,
+    pub(crate) source_id: u128,
     pub(crate) event: PresentationTransactionEvent,
 }
 
@@ -243,7 +250,7 @@ pub(crate) enum TraceExportRecord {
     Event(PresentationTransactionTraceRecord),
     LostRange {
         process_id: u32,
-        source_id: u64,
+        source_id: u128,
         from_sequence: u128,
         to_sequence: u128,
     },
@@ -254,7 +261,7 @@ pub(crate) struct PresentationTransactionTraceRing {
     capacity: usize,
     events: VecDeque<PresentationTransactionTraceRecord>,
     process_id: u32,
-    source_id: u64,
+    source_id: u128,
     next_sequence: u128,
     sequence_exhausted: bool,
     dropped: u64,
@@ -264,6 +271,15 @@ pub(crate) struct PresentationTransactionTraceRing {
     cursor_epoch_transactions_dropped: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TraceDeltaPlan {
+    first_retained: u128,
+    offset: usize,
+    event_count: usize,
+    lost_from: Option<u128>,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TraceExport {
     Unchanged,
@@ -276,7 +292,7 @@ impl PresentationTransactionTraceRing {
             capacity,
             events: VecDeque::with_capacity(capacity),
             process_id: std::process::id(),
-            source_id: NEXT_TRACE_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            source_id: next_trace_source_id(),
             next_sequence: 1,
             sequence_exhausted: false,
             dropped: 0,
@@ -292,7 +308,7 @@ impl PresentationTransactionTraceRing {
             capacity,
             events: VecDeque::new(),
             process_id: std::process::id(),
-            source_id: NEXT_TRACE_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            source_id: 0,
             next_sequence: 1,
             sequence_exhausted: false,
             dropped: 0,
@@ -354,8 +370,17 @@ impl PresentationTransactionTraceRing {
         self.enabled
     }
 
+    pub(crate) const fn source_identity(&self) -> (u32, u128) {
+        (self.process_id, self.source_id)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.events.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_event_capacity(&self) -> usize {
+        self.events.capacity()
     }
 
     pub(crate) const fn dropped(&self) -> u64 {
@@ -507,52 +532,88 @@ impl PresentationTransactionTraceRing {
         self.events.iter().map(|record| record.event)
     }
 
-    pub(crate) fn export_delta(&self, previous: Option<u128>) -> TraceExport {
+    fn delta_plan(&self, previous: Option<u128>) -> Option<TraceDeltaPlan> {
         let Some(first_retained) = self.events.front().map(|record| record.sequence) else {
-            return TraceExport::Unchanged;
+            return None;
         };
         let Some(last_retained) = self.events.back().map(|record| record.sequence) else {
-            return TraceExport::Unchanged;
+            return None;
         };
         if previous.is_some_and(|sequence| sequence >= last_retained) {
-            return TraceExport::Unchanged;
+            return None;
         }
 
-        let first_requested = previous
-            .and_then(|sequence| sequence.checked_add(1))
-            .unwrap_or(1);
-        let lost_count = usize::from(first_requested < first_retained);
+        let first_requested = match previous {
+            Some(sequence) => sequence.checked_add(1)?,
+            None => 1,
+        };
+        let lost_from = (first_requested < first_retained).then_some(first_requested);
         let first_exported = first_requested.max(first_retained);
         let event_count = usize::try_from(last_retained - first_exported + 1)
             .unwrap_or(self.events.len())
             .min(self.events.len());
-        let mut records = Vec::with_capacity(event_count.saturating_add(lost_count));
-        if lost_count != 0 {
+
+        Some(TraceDeltaPlan {
+            first_retained,
+            offset: usize::try_from(first_exported - first_retained).unwrap_or(usize::MAX),
+            event_count,
+            lost_from,
+        })
+    }
+
+    pub(crate) fn append_delta_records(
+        &self,
+        previous: Option<u128>,
+        records: &mut Vec<TraceExportRecord>,
+    ) -> Option<u128> {
+        let plan = self.delta_plan(previous)?;
+        let loss_records = usize::from(plan.lost_from.is_some());
+        let available = records.capacity().saturating_sub(records.len());
+        if available <= loss_records {
+            return None;
+        }
+        let event_count = plan.event_count.min(available - loss_records);
+        if event_count == 0 {
+            return None;
+        }
+        if let Some(from_sequence) = plan.lost_from {
             records.push(TraceExportRecord::LostRange {
                 process_id: self.process_id,
                 source_id: self.source_id,
-                from_sequence: first_requested,
-                to_sequence: first_retained - 1,
+                from_sequence,
+                to_sequence: plan.first_retained - 1,
             });
         }
-
-        let offset = usize::try_from(first_exported - first_retained).unwrap_or(usize::MAX);
-        records.extend(
-            self.events
-                .iter()
-                .skip(offset)
-                .copied()
-                .map(TraceExportRecord::Event),
-        );
-        if records.is_empty() {
-            TraceExport::Unchanged
-        } else {
-            TraceExport::Append(records)
+        for offset in plan.offset..plan.offset + event_count {
+            if let Some(record) = self.events.get(offset) {
+                records.push(TraceExportRecord::Event(*record));
+            }
         }
+        records.last().and_then(|record| match record {
+            TraceExportRecord::Event(record) => Some(record.sequence),
+            TraceExportRecord::LostRange { .. } => None,
+        })
     }
 
-    pub(crate) fn export_cursor(&self) -> Option<u128> {
+    #[cfg(test)]
+    pub(crate) fn export_delta(&self, previous: Option<u128>) -> TraceExport {
+        let Some(plan) = self.delta_plan(previous) else {
+            return TraceExport::Unchanged;
+        };
+        let mut records =
+            Vec::with_capacity(plan.event_count + usize::from(plan.lost_from.is_some()));
+        let sequence = self.append_delta_records(previous, &mut records);
+        debug_assert_eq!(sequence, self.latest_sequence());
+        TraceExport::Append(records)
+    }
+
+    pub(crate) fn latest_sequence(&self) -> Option<u128> {
         self.events.back().map(|record| record.sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn export_cursor(&self) -> Option<u128> {
+        self.latest_sequence()
     }
 
     #[cfg(test)]
@@ -598,7 +659,7 @@ fn append_event_jsonl(output: &mut String, record: PresentationTransactionTraceR
         } => {
             let _ = writeln!(
                 output,
-                "{{\"schema_version\":1,\"record\":\"event\",\"source\":\"native_reactor\",\"process_id\":{},\"source_id\":{},\"sequence\":{},\"event\":\"{}\",\"output_id\":{},\"cursor_epoch\":{},\"transaction_id\":{},\"timestamp_ns\":{}}}",
+                "{{\"schema_version\":1,\"record\":\"event\",\"source\":\"native_reactor\",\"process_id\":{},\"source_id\":{},\"sequence\":{},\"event\":\"{}\",\"output_id\":{},\"cursor_epoch\":{},\"transaction_id\":{},\"timestamp_clock\":\"CLOCK_MONOTONIC\",\"timestamp_ns\":{}}}",
                 record.process_id,
                 record.source_id,
                 record.sequence,
@@ -612,7 +673,7 @@ fn append_event_jsonl(output: &mut String, record: PresentationTransactionTraceR
         _ => {
             let _ = writeln!(
                 output,
-                "{{\"schema_version\":1,\"record\":\"event\",\"source\":\"native_reactor\",\"process_id\":{},\"source_id\":{},\"sequence\":{},\"event\":\"{}\",\"transaction_id\":{},\"timestamp_ns\":{}}}",
+                "{{\"schema_version\":1,\"record\":\"event\",\"source\":\"native_reactor\",\"process_id\":{},\"source_id\":{},\"sequence\":{},\"event\":\"{}\",\"transaction_id\":{},\"timestamp_clock\":\"CLOCK_MONOTONIC\",\"timestamp_ns\":{}}}",
                 record.process_id,
                 record.source_id,
                 record.sequence,
@@ -622,6 +683,32 @@ fn append_event_jsonl(output: &mut String, record: PresentationTransactionTraceR
             );
         }
     }
+}
+
+fn next_trace_source_id() -> u128 {
+    let sequence = NEXT_TRACE_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let nonce = *TRACE_SOURCE_NONCE.get_or_init(random_trace_source_nonce);
+    let source_id = nonce ^ ((u128::from(std::process::id()) << 64) | u128::from(sequence));
+    source_id.max(1)
+}
+
+fn random_trace_source_nonce() -> u128 {
+    let mut bytes = [0; 16];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        let source_id = u128::from_ne_bytes(bytes);
+        if source_id != 0 {
+            return source_id;
+        }
+    }
+
+    let monotonic_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (u128::from(std::process::id()) << 96) ^ (monotonic_seed << 32)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -720,6 +807,14 @@ mod tests {
         assert_eq!(ring.events.capacity(), 0);
         assert_eq!(ring.cursor_epoch_transactions.capacity(), 0);
         assert_eq!(ring.cursor_epoch_transaction_order.capacity(), 0);
+        assert_eq!(ring.source_identity().1, 0);
+    }
+
+    #[test]
+    fn enabled_trace_sources_have_distinct_identities() {
+        let first = PresentationTransactionTraceRing::new(8);
+        let second = PresentationTransactionTraceRing::new(8);
+        assert_ne!(first.source_identity(), second.source_identity());
     }
 
     #[test]
@@ -743,6 +838,7 @@ mod tests {
         let mut serialized = String::new();
         append_trace_record_jsonl(&mut serialized, delta[0]);
         assert!(serialized.contains("\"timestamp_ns\":2"));
+        assert!(serialized.contains("\"timestamp_clock\":\"CLOCK_MONOTONIC\""));
         assert!(!serialized.contains("\"timestamp_ns\":1"));
     }
 

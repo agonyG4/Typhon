@@ -654,6 +654,22 @@ impl NativeRuntime {
         let xwayland_environment_materialized = xwayland_app_environment.is_some();
         let cursor_hit_test_baseline = crate::pointer_debug::cursor_responsiveness_trace_enabled()
             .then(|| server.pointer_input_metrics_snapshot());
+        let presentation_trace = PresentationTransactionTraceRing::from_env();
+        let presentation_trace_writer = if presentation_trace.enabled() {
+            std::env::var_os("OBLIVION_ONE_PRESENTATION_TRACE_FILE")
+                .map(std::path::PathBuf::from)
+                .and_then(|path| {
+                    match crate::native_output::presentation::trace_writer::PresentationTraceWriter::start(path, &presentation_trace) {
+                        Ok(writer) => Some(writer),
+                        Err(error) => {
+                            eprintln!("Typhon presentation trace writer unavailable: {error}");
+                            None
+                        }
+                    }
+                })
+        } else {
+            None
+        };
         let mut runtime = Self {
             server,
             output_id,
@@ -790,12 +806,10 @@ impl NativeRuntime {
             process_supervisor,
             astrea_launch_tracker: AstreaLaunchLifecycleTracker::default(),
             shutdown: NativeShutdownLifecycle::new(),
-            presentation_trace: PresentationTransactionTraceRing::from_env(),
-            presentation_trace_export_cursor: None,
+            presentation_trace,
+            presentation_trace_writer,
             cursor_reveal_trace: crate::pointer_debug::cursor_presentation_trace_enabled()
                 .then(CursorRevealTraceLedger::new),
-            presentation_trace_path: std::env::var_os("OBLIVION_ONE_PRESENTATION_TRACE_FILE")
-                .map(std::path::PathBuf::from),
             timing_scopes: std::collections::BTreeMap::new(),
             render_telemetry: NativeRenderTelemetry::default(),
             scaled_primary_probe: ScaledPrimaryProbeCache::default(),

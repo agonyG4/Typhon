@@ -7,4 +7,5 @@ pub(crate) mod plane;
 pub(crate) mod plane_policy;
 pub(crate) mod qualification;
 pub(crate) mod trace;
+pub(crate) mod trace_writer;
 pub(crate) mod transaction;

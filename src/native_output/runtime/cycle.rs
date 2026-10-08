@@ -2,7 +2,6 @@ use super::*;
 use crate::native_output::screen_capture::{
     CaptureDimensions, RGBA8888_FORMAT, create_sealed_memfd,
 };
-use std::io::Write as _;
 
 #[path = "cycle_direct.rs"]
 mod cycle_direct;
@@ -22,50 +21,6 @@ pub fn run(
         app_gpu_preference,
     })?;
     runtime.run()
-}
-
-#[cfg(test)]
-mod trace_export_tests {
-    use super::{NativeResult, TraceExport, TraceExportRecord, write_presentation_trace_export};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn unique_trace_path() -> (PathBuf, PathBuf) {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "typhon-presentation-trace-export-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        (root.clone(), root.join("trace.jsonl"))
-    }
-
-    #[test]
-    fn failed_trace_export_keeps_cursor_for_retry() -> NativeResult<()> {
-        let (root, path) = unique_trace_path();
-        std::fs::create_dir_all(&path)?;
-        let previous = Some(4);
-        let mut export_cursor = previous;
-        let export = TraceExport::Append(vec![TraceExportRecord::LostRange {
-            process_id: std::process::id(),
-            source_id: 1,
-            from_sequence: 5,
-            to_sequence: 5,
-        }]);
-
-        assert!(
-            write_presentation_trace_export(&path, export.clone(), Some(5), &mut export_cursor,)
-                .is_err()
-        );
-        assert_eq!(export_cursor, previous);
-
-        std::fs::remove_dir_all(&path)?;
-        write_presentation_trace_export(&path, export, Some(5), &mut export_cursor)?;
-        assert_eq!(export_cursor, Some(5));
-        assert!(std::fs::read_to_string(&path)?.contains("\"to_sequence\":5"));
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -711,7 +666,6 @@ impl NativeRuntime {
             )?;
         }
         cycle.fast_path_completed = !prepare_outcome.acquire_service_ran && !presentation_work;
-        self.flush_presentation_trace()?;
         if self.pointer_timing.enabled() {
             self.pointer_timing.record_cycle_return(monotonic_now_ns()?);
         }
@@ -724,6 +678,7 @@ impl NativeRuntime {
         cycle: &NativeCycleState,
         render_attempted: bool,
     ) -> NativeResult<()> {
+        self.flush_presentation_trace();
         if !self.slow_cycle_trace.enabled() {
             return Ok(());
         }
@@ -804,20 +759,10 @@ impl NativeRuntime {
         Ok(outcome)
     }
 
-    fn flush_presentation_trace(&mut self) -> NativeResult<()> {
-        let Some(path) = self.presentation_trace_path.as_ref() else {
-            return Ok(());
-        };
-        let export = self
-            .presentation_trace
-            .export_delta(self.presentation_trace_export_cursor);
-        let cursor = self.presentation_trace.export_cursor();
-        write_presentation_trace_export(
-            path,
-            export,
-            cursor,
-            &mut self.presentation_trace_export_cursor,
-        )
+    fn flush_presentation_trace(&mut self) {
+        if let Some(writer) = self.presentation_trace_writer.as_mut() {
+            writer.submit(&self.presentation_trace);
+        }
     }
 
     pub(super) fn advance_shutdown_lifecycle(
@@ -1745,32 +1690,4 @@ impl NativeRuntime {
         }
         Ok(outcome)
     }
-}
-
-fn write_presentation_trace_export(
-    path: &std::path::Path,
-    export: TraceExport,
-    cursor: Option<u128>,
-    export_cursor: &mut Option<u128>,
-) -> NativeResult<()> {
-    match export {
-        TraceExport::Unchanged => return Ok(()),
-        TraceExport::Append(records) => {
-            if records.is_empty() {
-                *export_cursor = cursor;
-                return Ok(());
-            }
-            let mut delta = String::with_capacity(records.len().saturating_mul(160));
-            for record in records {
-                append_trace_record_jsonl(&mut delta, record);
-            }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?
-                .write_all(delta.as_bytes())?;
-        }
-    }
-    *export_cursor = cursor;
-    Ok(())
 }
