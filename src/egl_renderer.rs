@@ -338,6 +338,7 @@ impl GlesSceneRenderer {
                 presentation_visual_group_clips: HashMap::new(),
                 presentation_visual_group_owners: HashMap::new(),
                 scene_visibility_plan: Vec::new(),
+                scene_region_plan: geometry::SceneRegionPlan::default(),
                 scene_cache_key: None,
                 presented_scene_key: None,
                 current_checkpoint_scene_causal_snapshot: None,

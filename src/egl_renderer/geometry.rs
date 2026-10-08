@@ -380,6 +380,18 @@ impl SceneRegionPlan {
             .is_some_and(|command| self.repair_indices_for(*command).contains(&repair_index))
     }
 
+    pub(super) fn surface_consumers_or_legacy(
+        &self,
+        commands: &[EglDrawCommand],
+        repairs: &[OutputRect],
+    ) -> SurfaceConsumerPlan {
+        if self.fallback.is_some() || self.repairs != repairs {
+            plan_surface_consumers(commands, repairs)
+        } else {
+            self.consumer_plan.clone()
+        }
+    }
+
     fn clear_for_build(&mut self) {
         self.repairs.clear();
         self.commands.clear();
@@ -1219,6 +1231,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let oracle = legacy_repair_plans(&commands, &repairs);
+                let legacy_consumers = plan_surface_consumers(&commands, &repairs);
                 let mut plan = SceneRegionPlan::default();
 
                 plan.build(&commands, &repairs);
@@ -1234,6 +1247,11 @@ mod tests {
                         .iter()
                         .map(|(_, stats)| stats.commands_visited)
                         .sum::<usize>()
+                );
+                assert_eq!(
+                    plan.surface_consumers_or_legacy(&commands, &repairs)
+                        .surface_ids(),
+                    legacy_consumers.surface_ids()
                 );
                 for (repair_index, (decisions, legacy_stats)) in oracle.iter().enumerate() {
                     assert_eq!(
@@ -1262,23 +1280,25 @@ mod tests {
 
     #[test]
     fn scene_region_plan_falls_back_for_overlapping_repairs() {
-        let commands = vec![test_command(
-            EglRect::new(0.0, 0.0, 100.0, 100.0),
-            Vec::new(),
-        )];
+        let mut surface = test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new());
+        surface.layer = EglDrawLayer::Surface(31);
+        let commands = vec![surface];
+        let repairs = [
+            OutputRect::new(0, 0, 20, 20),
+            OutputRect::new(10, 10, 20, 20),
+        ];
         let mut plan = SceneRegionPlan::default();
 
-        plan.build(
-            &commands,
-            &[
-                OutputRect::new(0, 0, 20, 20),
-                OutputRect::new(10, 10, 20, 20),
-            ],
-        );
+        plan.build(&commands, &repairs);
 
         assert_eq!(plan.fallback, Some(SceneRegionFallback::OverlappingRepairs));
         assert!(plan.commands.is_empty());
         assert!(plan.clip_repair_indices.is_empty());
+        assert_eq!(
+            plan.surface_consumers_or_legacy(&commands, &repairs)
+                .surface_ids(),
+            &[31]
+        );
     }
 
     #[test]
