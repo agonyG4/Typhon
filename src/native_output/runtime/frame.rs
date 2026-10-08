@@ -103,6 +103,26 @@ fn freeze_presentation_effect_influences(
     effects: &ResolvedEffectScene,
     registry_generation: &EffectRegistryGeneration,
     output_bounds: EffectRect,
+    owner_for_surface: impl FnMut(u32) -> Option<(SceneNodeId, u32)>,
+) -> Vec<crate::native_output::output::NativePresentationEffectInfluenceSnapshot> {
+    freeze_presentation_effect_influences_with_diagnostics(
+        effects,
+        registry_generation,
+        output_bounds,
+        effect_owner_diagnostics_enabled(),
+        &MISSING_PRESENTATION_OWNER_DIAGNOSTICS,
+        &MISSING_EFFECT_PROGRAM_DIAGNOSTICS,
+        owner_for_surface,
+    )
+}
+
+fn freeze_presentation_effect_influences_with_diagnostics(
+    effects: &ResolvedEffectScene,
+    registry_generation: &EffectRegistryGeneration,
+    output_bounds: EffectRect,
+    diagnostics_enabled: bool,
+    missing_owner_diagnostics: &AtomicU64,
+    missing_program_diagnostics: &AtomicU64,
     mut owner_for_surface: impl FnMut(u32) -> Option<(SceneNodeId, u32)>,
 ) -> Vec<crate::native_output::output::NativePresentationEffectInfluenceSnapshot> {
     let mut influences =
@@ -119,10 +139,7 @@ fn freeze_presentation_effect_influences(
             // Presentation influence records exist only for window-group
             // animation transforms. Keep non-window and stale anchors out of
             // that ownership map; physical effect damage was frozen separately.
-            record_effect_diagnostic(
-                effect_owner_diagnostics_enabled(),
-                &MISSING_PRESENTATION_OWNER_DIAGNOSTICS,
-            );
+            record_effect_diagnostic(diagnostics_enabled, missing_owner_diagnostics);
             continue;
         };
         let region = match registry_generation.effect_for_program(instance.program) {
@@ -132,10 +149,7 @@ fn freeze_presentation_effect_influences(
                 output_bounds,
             ),
             None => {
-                record_effect_diagnostic(
-                    effect_owner_diagnostics_enabled(),
-                    &MISSING_EFFECT_PROGRAM_DIAGNOSTICS,
-                );
+                record_effect_diagnostic(diagnostics_enabled, missing_program_diagnostics);
                 EffectRegion::from_rect(output_bounds)
             }
         };
@@ -309,6 +323,51 @@ mod presentation_effect_influence_tests {
         record_effect_diagnostic(true, &enabled_count);
         assert_eq!(take_effect_diagnostic_occurrences(&enabled_count), 2);
         assert_eq!(take_effect_diagnostic_occurrences(&enabled_count), 0);
+    }
+
+    #[test]
+    fn unchanged_missing_owner_effect_is_bounded_over_ten_thousand_frames() {
+        const FRAME_COUNT: u64 = 10_000;
+
+        let generation = EffectRegistryGeneration::with_builtin_background_blur();
+        let program = oblivion_one::effects::builtin_background_blur_program_id();
+        let output_bounds = EffectRect::new(0, 0, 400, 300).expect("output bounds");
+        let rect = EffectRect::new(50, 50, 30, 30).expect("effect region");
+        let effects = ResolvedEffectScene::new(
+            1,
+            vec![instance(1, program, EffectAnchor::BeforeSurface(10), rect)],
+        );
+        let missing_owner_count = AtomicU64::new(0);
+        let missing_program_count = AtomicU64::new(0);
+
+        for _ in 0..FRAME_COUNT {
+            let influences = freeze_presentation_effect_influences_with_diagnostics(
+                &effects,
+                &generation,
+                output_bounds,
+                true,
+                &missing_owner_count,
+                &missing_program_count,
+                |_| None,
+            );
+            assert!(influences.is_empty());
+
+            let physical_damage = freeze_native_effect_damage(&effects, &generation, output_bounds);
+            assert_eq!(physical_damage.instances.len(), 1);
+            assert_eq!(
+                physical_damage.instances[0].region,
+                EffectRegion::from_rect(rect)
+            );
+            assert!(!physical_damage.conservative_full);
+        }
+
+        assert_eq!(missing_owner_count.load(Ordering::Relaxed), FRAME_COUNT);
+        assert_eq!(missing_program_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            take_effect_diagnostic_occurrences(&missing_owner_count),
+            FRAME_COUNT
+        );
+        assert_eq!(take_effect_diagnostic_occurrences(&missing_owner_count), 0);
     }
 }
 
