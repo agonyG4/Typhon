@@ -145,6 +145,7 @@ impl NativeTerminationJournal {
         self.runtime_phase = phase;
     }
 
+    #[cfg(test)]
     pub(super) fn first_cause(&self) -> Option<&TerminationCause> {
         self.first_cause.as_ref()
     }
