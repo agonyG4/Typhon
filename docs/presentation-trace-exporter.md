@@ -69,6 +69,19 @@ highest persisted sequence for the same process/source identity across the
 active and retained rotated files. A partial final JSONL record in the active
 file is truncated before appending.
 
+When rotation or retention pruning removes a nonempty file, the next successful
+batch begins with a versioned `retention_expired` JSONL metadata record scoped
+to the trace file set. It has no event sequence or producer identity and is
+never counted as a `loss` record. This marks that an older history prefix
+expired without inventing a producer-loss range. Event and `loss` records
+retain their source identities and monotonic sequence order; a retained set
+can therefore start above sequence one while remaining internally continuous.
+Each later file eviction emits a fresh marker, so the marker itself remains
+within the same file-count and byte limits. If storage fails permanently before
+that batch can be written, the writer reports the I/O failure and cannot promise
+that the marker reached disk; trace files are diagnostic output, not
+crash-safe storage.
+
 The writer retries recoverable open and write failures with bounded backoff.
 If a write partially succeeds, it truncates the file to the batch start before
 retrying. Failure to roll back is fatal to that trace writer, not to the
