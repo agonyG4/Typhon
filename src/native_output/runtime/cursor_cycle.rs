@@ -153,13 +153,13 @@ pub(crate) struct NativeResolvedCursor {
 pub(crate) const fn resolve_native_cursor_source(
     input: NativeCursorSourceInput,
 ) -> NativeResolvedCursor {
-    // Pointer lock is the only state that hides even compositor-owned
-    // feedback. Otherwise compositor interactions precede active DnD, then
-    // client surface/shape requests and the ordinary theme fallback.
-    let source = if input.pointer_lock_hidden {
-        NativeResolvedCursorSource::Hidden
-    } else if input.interaction_override_active {
+    // Preserve the existing compositor move/resize takeover precedence over
+    // pointer lock. Otherwise a hidden lock beats DnD, followed by client
+    // surface/shape requests and the ordinary theme fallback.
+    let source = if input.interaction_override_active {
         NativeResolvedCursorSource::InteractionOverride
+    } else if input.pointer_lock_hidden {
+        NativeResolvedCursorSource::Hidden
     } else if input.wayland_dnd_active {
         NativeResolvedCursorSource::WaylandDnd
     } else if input.client_explicitly_hidden {
@@ -544,8 +544,8 @@ mod tests {
                     client_shape_active: true,
                     ..Default::default()
                 },
-                NativeResolvedCursorSource::Hidden,
-                false,
+                NativeResolvedCursorSource::InteractionOverride,
+                true,
             ),
             (
                 NativeCursorSourceInput {

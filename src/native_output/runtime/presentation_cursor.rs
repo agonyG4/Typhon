@@ -7,9 +7,10 @@ use crate::native_output::presentation::plane::{
 };
 
 /// Resolve the compositor cursor image shared by normal presentation and
-/// cursor-change publication. Pointer lock hides presentation; otherwise the
-/// priority is compositor interaction, live Wayland DnD, client cursor shape,
-/// then the compositor's ordinary shape fallback.
+/// cursor-change publication. Image priority is compositor interaction, live
+/// Wayland DnD, client cursor shape, then the compositor's ordinary fallback;
+/// the visibility resolver separately applies pointer-lock hiding, preserving
+/// the existing move/resize takeover behavior.
 pub(super) fn active_cursor_image(
     server: &OwnCompositorServer,
     cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
