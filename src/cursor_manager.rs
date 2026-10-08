@@ -344,11 +344,19 @@ impl CursorThemeManager {
         let Ok(shape) = ProtocolCursorShape::try_from(shape_value) else {
             return pointer;
         };
+        // A theme without a `grabbing` cursor should still communicate an
+        // active drag. Reuse the already-loaded Move image, without loading an
+        // extra asset or bypassing the protocol-shape cache cap.
+        let fallback = if shape == ProtocolCursorShape::Grabbing {
+            self.active_image_for_shape(CompositorCursorShape::Move)
+        } else {
+            pointer.clone()
+        };
         if let Some(image) = self.protocol_shape_cache.get(&shape) {
             return image.clone();
         }
         if self.protocol_shape_fallbacks.contains(&shape) {
-            return pointer;
+            return fallback;
         }
         let image = load_protocol_shape_image(
             &self.active.configuration.theme,
@@ -357,7 +365,7 @@ impl CursorThemeManager {
         )
         .ok()
         .flatten()
-        .unwrap_or_else(|| pointer.clone());
+        .unwrap_or_else(|| fallback.clone());
         if Arc::ptr_eq(&image, &pointer)
             || self.protocol_shape_cache.len() >= MAX_PROTOCOL_CURSOR_SHAPES
         {
@@ -1226,5 +1234,36 @@ mod tests {
         let image = manager.active_image_for_protocol_shape(0);
 
         assert!(Arc::ptr_eq(&image, &pointer));
+    }
+
+    #[test]
+    fn missing_grabbing_shape_uses_the_loaded_move_cursor_fallback() {
+        let pointer = Arc::new(CompositorCursorImage::from_argb8888(vec![1], 1, 1, 0, 0).unwrap());
+        let movement = Arc::new(CompositorCursorImage::from_argb8888(vec![2], 1, 1, 0, 0).unwrap());
+        let images = CursorShapeImages::from_images(
+            pointer.clone(),
+            movement.clone(),
+            pointer.clone(),
+            pointer.clone(),
+            pointer.clone(),
+            pointer,
+        );
+        let configuration = CursorConfiguration::new("default", 24).unwrap();
+        let mut manager = CursorThemeManager::new(
+            configuration.clone(),
+            LoadedCursorTheme::from_images(configuration, images, CursorAssetSource::SystemTheme),
+            CursorConfigSource::Default,
+            CursorPersistenceSnapshot::Missing,
+            CursorConfigurationStore::unavailable(CursorPersistenceError::Missing),
+            Box::new(TestLoader),
+        );
+        manager
+            .protocol_shape_fallbacks
+            .insert(ProtocolCursorShape::Grabbing);
+
+        let grabbing =
+            manager.active_image_for_protocol_shape(ProtocolCursorShape::Grabbing as u32);
+
+        assert!(Arc::ptr_eq(&grabbing, &movement));
     }
 }

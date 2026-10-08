@@ -6,6 +6,29 @@ use crate::native_output::presentation::plane::{
     CursorRevision, CursorSource, PresentedCursorDelivery, PresentedCursorState,
 };
 
+/// Resolve the compositor cursor image shared by normal presentation and
+/// cursor-change publication. Pointer lock hides presentation; otherwise the
+/// priority is compositor interaction, live Wayland DnD, client cursor shape,
+/// then the compositor's ordinary shape fallback.
+pub(super) fn active_cursor_image(
+    server: &OwnCompositorServer,
+    cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
+) -> std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage> {
+    if server.interaction_cursor_override_active() {
+        cursor_manager.active_image_for_shape(server.compositor_cursor_shape())
+    } else if server.wayland_pointer_dnd_cursor_active() {
+        cursor_manager.active_image_for_protocol_shape(
+            wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Shape::Grabbing
+                as u32,
+        )
+    } else {
+        match server.client_cursor_shape() {
+            Some(shape) => cursor_manager.active_image_for_protocol_shape(shape),
+            None => cursor_manager.active_image_for_shape(server.compositor_cursor_shape()),
+        }
+    }
+}
+
 pub(super) fn synchronize_active_cursor_image(
     server: &OwnCompositorServer,
     cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
@@ -15,14 +38,7 @@ pub(super) fn synchronize_active_cursor_image(
     queued_redraw_requested: &mut bool,
 ) {
     cursor_manager.collect_retired_generations();
-    let image = if server.interaction_cursor_override_active() {
-        cursor_manager.active_image_for_shape(server.compositor_cursor_shape())
-    } else {
-        match server.client_cursor_shape() {
-            Some(shape) => cursor_manager.active_image_for_protocol_shape(shape),
-            None => cursor_manager.active_image_for_shape(server.compositor_cursor_shape()),
-        }
-    };
+    let image = active_cursor_image(server, cursor_manager);
     if !std::sync::Arc::ptr_eq(cursor_image, &image) {
         *cursor_image = image.clone();
         frame_renderer.set_cursor_image(image.clone());
@@ -77,10 +93,13 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
     bool,
     bool,
 ) {
-    let client_cursor = server.client_cursor_render_state();
     let source_input = native_cursor_source_input(server, input_state);
     let resolved_cursor = resolve_native_cursor_source(source_input);
-    let client_surface_content_active = source_input.client_surface_content_active;
+    let client_cursor = (resolved_cursor.source
+        == super::cursor_cycle::NativeResolvedCursorSource::ClientSurface)
+        .then(|| server.client_cursor_render_state())
+        .flatten();
+    let client_surface_content_active = client_cursor.is_some();
     if server.cursor_reveal_authority().is_some() {
         let (pointer_x, pointer_y) = server.last_pointer_position();
         crate::pointer_debug::cursor_presentation_log_lazy(|| {

@@ -1030,6 +1030,7 @@ impl CompositorState {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
         let moves_visible_cursor = changed
             && (self.interaction_cursor_override.is_some()
+                || self.wayland_pointer_dnd_session_active()
                 || self.client_cursor_render_state().is_some());
         self.last_pointer_x = x;
         self.last_pointer_y = y;
@@ -1049,6 +1050,7 @@ impl CompositorState {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
         let moves_visible_cursor = changed
             && (self.interaction_cursor_override.is_some()
+                || self.wayland_pointer_dnd_session_active()
                 || self.client_cursor_render_state().is_some());
         self.update_pointer_position(x, y);
         moves_visible_cursor
@@ -1071,6 +1073,7 @@ impl CompositorState {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
         let moves_visible_cursor = changed
             && (self.interaction_cursor_override.is_some()
+                || self.wayland_pointer_dnd_session_active()
                 || self.client_cursor_render_state().is_some());
         self.update_pointer_position_state(x, y);
         moves_visible_cursor

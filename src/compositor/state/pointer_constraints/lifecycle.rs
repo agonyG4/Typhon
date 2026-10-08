@@ -25,8 +25,13 @@ impl CompositorState {
 
     pub(in crate::compositor) fn sync_cursor_visibility_request(&mut self) {
         self.refresh_presentation_feedback_eligibility();
-        let desired_visible = self.interaction_cursor_override.is_some()
-            || self.cursor_visibility.theme_fallback_visible();
+        // Pointer lock remains authoritative. Otherwise compositor
+        // interactions and active Wayland DnD use a compositor cursor even
+        // when the ordinary client cursor claim is hidden or client-owned.
+        let desired_visible = self.cursor_visibility.lock_hidden_constraint_id.is_none()
+            && (self.interaction_cursor_override.is_some()
+                || self.wayland_pointer_dnd_session_active()
+                || self.cursor_visibility.theme_fallback_visible());
         if self.cursor_visibility.visible == desired_visible {
             return;
         }

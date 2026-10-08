@@ -155,6 +155,7 @@ mod background_effect_coverage;
 mod data_control;
 mod data_device;
 mod data_device_compatibility;
+mod data_device_workspace;
 mod direct_scanout;
 mod drag_icon;
 mod frame_pacing;

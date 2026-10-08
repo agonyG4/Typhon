@@ -1805,6 +1805,11 @@ impl OwnCompositorServer {
         self.state.interaction_cursor_override_active()
     }
 
+    /// Whether a live Wayland pointer-driven drag owns cursor presentation.
+    pub fn wayland_pointer_dnd_cursor_active(&self) -> bool {
+        self.state.wayland_pointer_dnd_session_active()
+    }
+
     pub fn compositor_cursor_shape(&self) -> crate::cursor_theme::CompositorCursorShape {
         self.state.compositor_cursor_shape()
     }

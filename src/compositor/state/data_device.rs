@@ -360,6 +360,8 @@ impl CompositorState {
         self.clear_pointer_focus();
         self.update_active_drag_icon_position();
         self.update_drag_target_at(self.last_pointer_x, self.last_pointer_y);
+        self.sync_cursor_visibility_request();
+        self.advance_cursor_generation();
     }
 
     pub(super) fn begin_drag_with_origin(
@@ -403,6 +405,13 @@ impl CompositorState {
             .icon_surface
             .as_ref()
             .map(compositor_surface_id)
+    }
+
+    pub(in crate::compositor) fn reconcile_wayland_dnd_target_after_scene_transition(&mut self) {
+        if !self.wayland_pointer_dnd_session_active() {
+            return;
+        }
+        self.update_drag_target_at(self.last_pointer_x, self.last_pointer_y);
     }
 
     fn activate_drag_icon_visual(&mut self, surface_id: u32) {
@@ -459,6 +468,13 @@ impl CompositorState {
         }
     }
 
+    fn pointer_target_at_for_drag(&mut self, x: f64, y: f64) -> Option<PointerTarget> {
+        match self.pointer_scene_hit_at(x, y) {
+            PointerSceneHit::Client { target } => Some(target),
+            PointerSceneHit::Decoration { .. } | PointerSceneHit::None => None,
+        }
+    }
+
     pub(in crate::compositor) fn update_drag_target_at(&mut self, x: f64, y: f64) {
         let Some(active) = self.active_drag.as_ref() else {
             return;
@@ -469,7 +485,7 @@ impl CompositorState {
         let session_id = active.id;
         let origin = active.origin.clone();
         let previous_target = active.target.clone();
-        let target = self.pointer_target_at(x, y);
+        let target = self.pointer_target_at_for_drag(x, y);
 
         if let Some(target) = target.as_ref() {
             let surface_id = compositor_surface_id(&target.surface);
@@ -1196,6 +1212,9 @@ impl CompositorState {
                 }
             }
         }
+        self.hide_drag_icon_surface(active.icon_surface.as_ref());
+        self.sync_cursor_visibility_request();
+        self.advance_cursor_generation();
     }
 
     pub(in crate::compositor) fn finish_drag_offer(
@@ -1383,11 +1402,7 @@ impl CompositorState {
             self.xwayland_dnd_data_requests
                 .retain(|request| request.offer_id != offer.id());
         }
-        if let Some(icon) = active.icon_surface {
-            let icon_surface_id = compositor_surface_id(&icon);
-            self.hide_renderable_surface_subtree(icon_surface_id);
-            self.deactivate_role_instance(icon_surface_id);
-        }
+        self.hide_drag_icon_surface(active.icon_surface.as_ref());
         if remove_offer
             && let Some(offer) = active
                 .target
@@ -1395,6 +1410,16 @@ impl CompositorState {
                 .and_then(ActiveDragTarget::wayland_offer)
         {
             self.data_offers.remove(&offer.id());
+        }
+        self.sync_cursor_visibility_request();
+        self.advance_cursor_generation();
+    }
+
+    fn hide_drag_icon_surface(&mut self, icon: Option<&wl_surface::WlSurface>) {
+        if let Some(icon) = icon {
+            let icon_surface_id = compositor_surface_id(icon);
+            self.hide_renderable_surface_subtree(icon_surface_id);
+            self.deactivate_role_instance(icon_surface_id);
         }
     }
 
