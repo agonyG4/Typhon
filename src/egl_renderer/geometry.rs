@@ -70,6 +70,9 @@ impl EglRect {
 
 const MAX_OPAQUE_COVERAGE_PIECES: usize = 32;
 const MAX_VISIBLE_REGION_PIECES: usize = MAX_OPAQUE_COVERAGE_PIECES;
+const MAX_SCENE_REGION_REPAIRS: usize = 256;
+const MAX_SCENE_REGION_COMMANDS: usize = 65_536;
+const MAX_SCENE_REGION_CLIP_PIECES: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EglVisibilityDecision {
@@ -154,6 +157,262 @@ impl EglVisibleRegion {
             self.len = 1;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SceneRegionFallback {
+    OverlappingRepairs,
+    TooManyRepairs,
+    TooManyCommands,
+    ClipArenaOverflow,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SceneRegionRepairStats {
+    pub(super) commands_visited: usize,
+    pub(super) commands_drawable: usize,
+    pub(super) commands_rejected_outside_remaining: usize,
+    pub(super) commands_rejected_occluded: usize,
+    pub(super) opaque_rectangles_subtracted: usize,
+    pub(super) overflow_fallback: bool,
+    pub(super) early_terminated: bool,
+    pub(super) peak_region_pieces: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SceneRegionPlanStats {
+    pub(super) input_rects: usize,
+    pub(super) normalized_rects: usize,
+    pub(super) outer_commands_visited: usize,
+    pub(super) command_repair_tests: usize,
+    pub(super) planned_commands: usize,
+    pub(super) clip_pieces: usize,
+    pub(super) occlusion_overflow_fallbacks: usize,
+    pub(super) repairs: Vec<SceneRegionRepairStats>,
+}
+
+impl SceneRegionPlanStats {
+    fn clear(&mut self) {
+        self.input_rects = 0;
+        self.normalized_rects = 0;
+        self.outer_commands_visited = 0;
+        self.command_repair_tests = 0;
+        self.planned_commands = 0;
+        self.clip_pieces = 0;
+        self.occlusion_overflow_fallbacks = 0;
+        self.repairs.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PlannedSceneCommand {
+    pub(super) command_index: usize,
+    pub(super) clips_start: usize,
+    pub(super) clips_len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SceneRepairVisibility {
+    repair: EglRect,
+    remaining: EglVisibleRegion,
+    terminated: bool,
+}
+
+/// Reusable command-major visibility plan for ordinary scene repair work.
+/// Commands remain owned by `SceneRenderState`; this stores command indices
+/// and bounded repair-index clips only.
+#[derive(Debug, Default)]
+pub(super) struct SceneRegionPlan {
+    pub(super) repairs: Vec<OutputRect>,
+    pub(super) commands: Vec<PlannedSceneCommand>,
+    pub(super) clip_repair_indices: Vec<usize>,
+    pub(super) consumer_plan: SurfaceConsumerPlan,
+    pub(super) stats: SceneRegionPlanStats,
+    pub(super) fallback: Option<SceneRegionFallback>,
+    repair_scratch: Vec<SceneRepairVisibility>,
+}
+
+impl SceneRegionPlan {
+    pub(super) fn build(&mut self, commands: &[EglDrawCommand], repairs: &[OutputRect]) {
+        self.clear_for_build();
+        self.stats.input_rects = repairs.len();
+        if repairs.len() > MAX_SCENE_REGION_REPAIRS {
+            self.fallback = Some(SceneRegionFallback::TooManyRepairs);
+            return;
+        }
+        if repairs.iter().enumerate().any(|(index, repair)| {
+            repairs[index + 1..]
+                .iter()
+                .any(|other| output_rects_overlap(*repair, *other))
+        }) {
+            self.fallback = Some(SceneRegionFallback::OverlappingRepairs);
+            return;
+        }
+        if commands.len() > MAX_SCENE_REGION_COMMANDS {
+            self.fallback = Some(SceneRegionFallback::TooManyCommands);
+            return;
+        }
+
+        self.repairs.extend_from_slice(repairs);
+        self.stats.normalized_rects = repairs.len();
+        self.repair_scratch.reserve(repairs.len());
+        for repair in repairs {
+            let rect = EglRect::new(
+                repair.x as f32,
+                repair.y as f32,
+                repair.width as f32,
+                repair.height as f32,
+            );
+            self.repair_scratch.push(SceneRepairVisibility {
+                repair: rect,
+                remaining: EglVisibleRegion::new(rect),
+                terminated: false,
+            });
+            self.stats.repairs.push(SceneRegionRepairStats {
+                peak_region_pieces: usize::from(rect.width > 0.0 && rect.height > 0.0),
+                ..Default::default()
+            });
+        }
+
+        for command_index in (0..commands.len()).rev() {
+            if self.repair_scratch.iter().all(|state| state.terminated) {
+                break;
+            }
+            self.stats.outer_commands_visited += 1;
+            let command = &commands[command_index];
+            let visible_bounds = command.visible_bounds();
+            let clips_start = self.clip_repair_indices.len();
+            let mut drawable = false;
+            for (repair_index, state) in self.repair_scratch.iter_mut().enumerate() {
+                if state.terminated {
+                    continue;
+                }
+                let repair_stats = &mut self.stats.repairs[repair_index];
+                repair_stats.commands_visited += 1;
+                if state.remaining.is_empty() {
+                    repair_stats.early_terminated = true;
+                    state.terminated = true;
+                    continue;
+                }
+                self.stats.command_repair_tests += 1;
+                let Some(visible_bounds) = visible_bounds else {
+                    repair_stats.commands_rejected_outside_remaining += 1;
+                    continue;
+                };
+                if !state.remaining.intersects(visible_bounds) {
+                    repair_stats.commands_rejected_outside_remaining += 1;
+                    continue;
+                }
+
+                drawable = true;
+                repair_stats.commands_drawable += 1;
+                if self.clip_repair_indices.len() == MAX_SCENE_REGION_CLIP_PIECES {
+                    self.set_fallback(SceneRegionFallback::ClipArenaOverflow);
+                    return;
+                }
+                self.clip_repair_indices.push(repair_index);
+                if let EglDrawLayer::Surface(surface_id) = command.layer {
+                    self.consumer_plan.add_surface(surface_id);
+                }
+
+                if state.remaining.occlusion_disabled {
+                    continue;
+                }
+                for opaque_region in &command.opaque_regions {
+                    let Some(opaque_region) = command
+                        .presentation_clip
+                        .map_or(Some(*opaque_region), |clip| {
+                            opaque_region.intersection(clip)
+                        })
+                    else {
+                        continue;
+                    };
+                    repair_stats.opaque_rectangles_subtracted += 1;
+                    if !state.remaining.subtract(opaque_region) {
+                        repair_stats.overflow_fallback = true;
+                        self.stats.occlusion_overflow_fallbacks += 1;
+                        state.remaining.disable_occlusion(state.repair);
+                        break;
+                    }
+                    repair_stats.peak_region_pieces =
+                        repair_stats.peak_region_pieces.max(state.remaining.len);
+                    if state.remaining.is_empty() {
+                        repair_stats.early_terminated = true;
+                        state.terminated = true;
+                        break;
+                    }
+                }
+            }
+            let clips_len = self.clip_repair_indices.len() - clips_start;
+            if drawable {
+                if self.commands.len() == MAX_SCENE_REGION_COMMANDS {
+                    self.set_fallback(SceneRegionFallback::TooManyCommands);
+                    return;
+                }
+                self.commands.push(PlannedSceneCommand {
+                    command_index,
+                    clips_start,
+                    clips_len,
+                });
+            }
+        }
+
+        self.commands.reverse();
+        for stats in &mut self.stats.repairs {
+            stats.commands_rejected_occluded = commands
+                .len()
+                .saturating_sub(stats.commands_drawable)
+                .saturating_sub(stats.commands_rejected_outside_remaining);
+        }
+        self.consumer_plan.finish();
+        self.stats.planned_commands = self.commands.len();
+        self.stats.clip_pieces = self.clip_repair_indices.len();
+    }
+
+    pub(super) fn repair_indices_for(&self, command: PlannedSceneCommand) -> &[usize] {
+        &self.clip_repair_indices[command.clips_start..command.clips_start + command.clips_len]
+    }
+
+    pub(super) fn has_command_clip(&self, command_index: usize, repair_index: usize) -> bool {
+        self.commands
+            .iter()
+            .find(|command| command.command_index == command_index)
+            .is_some_and(|command| self.repair_indices_for(*command).contains(&repair_index))
+    }
+
+    fn clear_for_build(&mut self) {
+        self.repairs.clear();
+        self.commands.clear();
+        self.clip_repair_indices.clear();
+        self.consumer_plan.surface_ids.clear();
+        self.stats.clear();
+        self.fallback = None;
+        self.repair_scratch.clear();
+    }
+
+    fn set_fallback(&mut self, fallback: SceneRegionFallback) {
+        self.fallback = Some(fallback);
+        self.repairs.clear();
+        self.commands.clear();
+        self.clip_repair_indices.clear();
+        self.consumer_plan.surface_ids.clear();
+        self.stats.planned_commands = 0;
+        self.stats.clip_pieces = 0;
+    }
+}
+
+fn output_rects_overlap(left: OutputRect, right: OutputRect) -> bool {
+    if left.width == 0 || left.height == 0 || right.width == 0 || right.height == 0 {
+        return false;
+    }
+    let left_x = i64::from(left.x);
+    let left_y = i64::from(left.y);
+    let right_x = i64::from(right.x);
+    let right_y = i64::from(right.y);
+    left_x < right_x + i64::from(right.width)
+        && right_x < left_x + i64::from(left.width)
+        && left_y < right_y + i64::from(right.height)
+        && right_y < left_y + i64::from(left.height)
 }
 
 pub(super) fn plan_visibility(
@@ -894,6 +1153,186 @@ mod tests {
             vertex_count: 6,
             sampling: SurfaceSampling::ScaledLinear,
         }
+    }
+
+    fn legacy_repair_plans(
+        commands: &[EglDrawCommand],
+        repairs: &[OutputRect],
+    ) -> Vec<(Vec<EglVisibilityDecision>, EglVisibilityPlanStats)> {
+        repairs
+            .iter()
+            .map(|repair| {
+                let mut decisions = Vec::new();
+                let stats = plan_visibility(
+                    commands,
+                    EglRect::new(
+                        repair.x as f32,
+                        repair.y as f32,
+                        repair.width as f32,
+                        repair.height as f32,
+                    ),
+                    &mut decisions,
+                );
+                (decisions, stats)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scene_region_plan_matches_legacy_visibility_for_disjoint_repairs() {
+        for command_count in [1, 4, 16, 64] {
+            for repair_count in [1, 2, 4, 8, 16, 32] {
+                let commands = (0..command_count)
+                    .map(|index| {
+                        let mut command = test_command(
+                            EglRect::new(
+                                (index % 4) as f32 * 32.0,
+                                (index / 4) as f32 * 24.0,
+                                48.0,
+                                40.0,
+                            ),
+                            if index % 3 == 0 {
+                                vec![EglRect::new(
+                                    (index % 4) as f32 * 32.0,
+                                    (index / 4) as f32 * 24.0,
+                                    24.0,
+                                    40.0,
+                                )]
+                            } else {
+                                Vec::new()
+                            },
+                        );
+                        if index % 5 == 0 {
+                            command.presentation_clip = Some(EglRect::new(0.0, 0.0, 36.0, 24.0));
+                        } else if index % 7 == 0 {
+                            command.presentation_clip = Some(EglRect::new(0.0, 0.0, 0.0, 24.0));
+                        }
+                        if index % 4 == 0 {
+                            command.layer = EglDrawLayer::Surface(index as u32 + 1);
+                        }
+                        command
+                    })
+                    .collect::<Vec<_>>();
+                let repairs = (0..repair_count)
+                    .map(|index| {
+                        OutputRect::new((index % 8) as i32 * 40, (index / 8) as i32 * 40, 32, 32)
+                    })
+                    .collect::<Vec<_>>();
+                let oracle = legacy_repair_plans(&commands, &repairs);
+                let mut plan = SceneRegionPlan::default();
+
+                plan.build(&commands, &repairs);
+
+                assert_eq!(
+                    plan.fallback, None,
+                    "{command_count} commands, {repair_count} repairs"
+                );
+                assert_eq!(plan.stats.outer_commands_visited, command_count);
+                assert_eq!(
+                    plan.stats.command_repair_tests,
+                    oracle
+                        .iter()
+                        .map(|(_, stats)| stats.commands_visited)
+                        .sum::<usize>()
+                );
+                for (repair_index, (decisions, legacy_stats)) in oracle.iter().enumerate() {
+                    assert_eq!(
+                        plan.stats.repairs[repair_index].commands_rejected_outside_remaining,
+                        legacy_stats.commands_rejected_outside_remaining
+                    );
+                    assert_eq!(
+                        plan.stats.repairs[repair_index].commands_rejected_occluded,
+                        legacy_stats.commands_rejected_occluded
+                    );
+                    assert_eq!(
+                        plan.stats.repairs[repair_index].overflow_fallback,
+                        legacy_stats.overflow_fallback
+                    );
+                    for (command_index, decision) in decisions.iter().enumerate() {
+                        assert_eq!(
+                            plan.has_command_clip(command_index, repair_index),
+                            *decision == EglVisibilityDecision::Drawable,
+                            "command {command_index}, repair {repair_index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scene_region_plan_falls_back_for_overlapping_repairs() {
+        let commands = vec![test_command(
+            EglRect::new(0.0, 0.0, 100.0, 100.0),
+            Vec::new(),
+        )];
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build(
+            &commands,
+            &[
+                OutputRect::new(0, 0, 20, 20),
+                OutputRect::new(10, 10, 20, 20),
+            ],
+        );
+
+        assert_eq!(plan.fallback, Some(SceneRegionFallback::OverlappingRepairs));
+        assert!(plan.commands.is_empty());
+        assert!(plan.clip_repair_indices.is_empty());
+    }
+
+    #[test]
+    fn scene_region_plan_preserves_per_repair_occlusion_overflow_fallback() {
+        let opaque_regions = (0..6)
+            .flat_map(|row| {
+                (0..6).map(move |column| {
+                    EglRect::new(column as f32 * 16.0, row as f32 * 16.0, 8.0, 8.0)
+                })
+            })
+            .collect();
+        let commands = vec![
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), opaque_regions),
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+        ];
+        let repairs = [
+            OutputRect::new(0, 0, 100, 100),
+            OutputRect::new(120, 0, 100, 100),
+        ];
+        let oracle = legacy_repair_plans(&commands, &repairs);
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build(&commands, &repairs);
+
+        assert_eq!(plan.fallback, None);
+        assert_eq!(plan.stats.occlusion_overflow_fallbacks, 1);
+        for (repair_index, (decisions, stats)) in oracle.iter().enumerate() {
+            assert_eq!(
+                plan.stats.repairs[repair_index].overflow_fallback,
+                stats.overflow_fallback
+            );
+            for (command_index, decision) in decisions.iter().enumerate() {
+                assert_eq!(
+                    plan.has_command_clip(command_index, repair_index),
+                    *decision == EglVisibilityDecision::Drawable
+                );
+            }
+        }
+        assert!(!plan.has_command_clip(0, 1));
+    }
+
+    #[test]
+    fn scene_region_plan_bounds_command_clip_storage() {
+        let commands = (0..=MAX_SCENE_REGION_CLIP_PIECES)
+            .map(|_| test_command(EglRect::new(0.0, 0.0, 1.0, 1.0), Vec::new()))
+            .collect::<Vec<_>>();
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build(&commands, &[OutputRect::new(0, 0, 1, 1)]);
+
+        assert_eq!(plan.fallback, Some(SceneRegionFallback::ClipArenaOverflow));
+        assert!(plan.clip_repair_indices.is_empty());
+        assert!(plan.commands.is_empty());
     }
 
     #[test]
