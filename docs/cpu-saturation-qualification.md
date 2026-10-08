@@ -2,15 +2,13 @@
 
 ## Current result
 
-This checkout has an optional external Linux probe and a repeatable workload
-procedure. It does **not** have a Typhon saturation result: during this
-investigation Typhon was not running, the active compositor was Hyprland, a game
-was using the NVIDIA GPU, available memory was about 1.8 GiB, swap use was about
-11 GiB, and memory pressure was elevated. No CPU load was added to that desktop.
-`stress-ng` was not installed, so the timed load command below was not exercised.
-
-The host did provide the requested display and GPU: 1920x1080 at 164.999 Hz and
-an NVIDIA RTX 3060 Ti. That alone does not qualify Typhon's behavior.
+The V2 investigation found Typhon running natively and collected one 300-second
+idle baseline (598 valid probe samples). The user instructed us not to run
+Cyberpunk 2077, so the reported game workload and interaction condition were not
+reproduced. The idle data does not establish H1–H4 and does not qualify a runtime
+change. See the [V2 architecture review](cpu-saturation-architecture-review-v2.md)
+for source evidence, the idle sample summary, the upstream comparison, and the
+missing measurements. No runtime behavior changed.
 
 ## Probe
 
@@ -187,9 +185,10 @@ current evidence.
 
 ## Evidence ledger for this checkout
 
-- **Observed:** the session display was 1920x1080 at 164.999 Hz and the GPU was an
-  RTX 3060 Ti. Typhon was not running; no target `schedstat`, input timing, cycle
-  trace or presentation cadence was collected. No saturation workload was run.
+- **Observed in V2:** native Typhon was running with the reactor and worker
+  threads on `SCHED_OTHER`. One 300-second idle probe trial recorded 598 valid
+  samples; the game, saturation, and interaction workloads were not run. No
+  input timing, slow-cycle trace, or presentation cadence was collected.
 - **Source-proven:** `NativeRuntime::bootstrap()` blocks `SIGCHLD` before native
   initialization and `run()` enters the reactor loop
   (`src/native_output/runtime/mod.rs:852-873`,
