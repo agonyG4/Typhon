@@ -406,68 +406,105 @@ impl CompositorState {
         }) {
             self.invalidate_locked_relative_recipient_cache();
         }
-        let preserved_dnd_grab_root = self
+        let preserved_dnd_grab_surface = self
             .implicit_pointer_grab
             .as_ref()
             .filter(|grab| {
-                if grab.routing != ImplicitPointerRouting::WaylandDnd
-                    || !root_surface_ids.contains(&grab.root_surface_id)
-                {
-                    return false;
-                }
-                let Some(active) = self.active_drag.as_ref() else {
-                    return false;
-                };
-                let Some(origin_surface) = active.origin.wayland_origin_surface() else {
-                    return false;
-                };
-                let origin_surface_id = compositor_surface_id(origin_surface);
-                let origin_root_surface_id = self.root_surface_id_for_surface(origin_surface_id);
-                let same_client = origin_surface
-                    .client()
-                    .zip(grab.surface.client())
-                    .is_some_and(|(origin, grab)| origin.id() == grab.id());
-                matches!(
-                    &active.id,
-                    crate::xwayland::CanonicalDndSessionId::Wayland(_)
-                ) && active.lifecycle_driver == DragLifecycleDriver::WaylandImplicitPointerGrab
-                    && active.phase == DragSessionPhase::Dragging
-                    && origin_root_surface_id == grab.root_surface_id
-                    && origin_root_surface_id
-                        == self.root_surface_id_for_surface(compositor_surface_id(&grab.surface))
-                    && same_client
-                    && self
-                        .held_pointer_buttons
-                        .iter()
-                        .any(|press| press.root_surface_id == grab.root_surface_id)
+                root_surface_ids.contains(&grab.root_surface_id)
+                    && self.wayland_dnd_grab_owns_held_gesture(grab)
             })
-            .map(|grab| grab.root_surface_id);
+            .map(|grab| (grab.root_surface_id, compositor_surface_id(&grab.surface)));
         if self.implicit_pointer_grab.as_ref().is_some_and(|grab| {
             root_surface_ids.contains(&grab.root_surface_id)
                 || root_surface_ids.contains(
                     &self.root_surface_id_for_surface(compositor_surface_id(&grab.surface)),
                 )
-        }) && preserved_dnd_grab_root.is_none()
+        }) && preserved_dnd_grab_surface.is_none()
         {
             self.end_implicit_pointer_grab("workspace-switch");
         }
         self.held_pointer_buttons.retain(|press| {
-            Some(press.root_surface_id) == preserved_dnd_grab_root
-                || (!root_surface_ids.contains(&press.root_surface_id)
-                    && !window_ids
-                        .iter()
-                        .any(|window_id| press.window_id == Some(*window_id)))
+            preserved_dnd_grab_surface.is_some_and(|(root_surface_id, surface_id)| {
+                press.root_surface_id == root_surface_id
+                    && compositor_surface_id(&press.surface) == surface_id
+            }) || (!root_surface_ids.contains(&press.root_surface_id)
+                && !window_ids
+                    .iter()
+                    .any(|window_id| press.window_id == Some(*window_id)))
         });
         if self.last_pointer_press.as_ref().is_some_and(|press| {
-            Some(press.root_surface_id) != preserved_dnd_grab_root
-                && (root_surface_ids.contains(&press.root_surface_id)
-                    || window_ids
-                        .iter()
-                        .any(|window_id| press.window_id == Some(*window_id)))
+            let departing = root_surface_ids.contains(&press.root_surface_id)
+                || window_ids
+                    .iter()
+                    .any(|window_id| press.window_id == Some(*window_id));
+            let still_owned =
+                preserved_dnd_grab_surface.is_some_and(|(root_surface_id, surface_id)| {
+                    press.root_surface_id == root_surface_id
+                        && compositor_surface_id(&press.surface) == surface_id
+                        && self.held_pointer_buttons.iter().any(|held| {
+                            held.button == press.button
+                                && held.root_surface_id == root_surface_id
+                                && compositor_surface_id(&held.surface) == surface_id
+                        })
+                });
+            departing && !still_owned
         }) {
             self.last_pointer_press = None;
         }
         self.clear_popup_grab_for_surface_ids(&root_surface_ids);
+    }
+
+    fn wayland_dnd_grab_owns_held_gesture(&self, grab: &ImplicitPointerGrab) -> bool {
+        if grab.routing != ImplicitPointerRouting::WaylandDnd {
+            return false;
+        }
+
+        let grab_surface_id = compositor_surface_id(&grab.surface);
+        if !grab.surface.is_alive()
+            || self.root_surface_id_for_surface(grab_surface_id) != grab.root_surface_id
+            || !self
+                .renderable_surfaces
+                .iter()
+                .any(|surface| surface.surface_id == grab_surface_id)
+            || !self.held_pointer_buttons.iter().any(|press| {
+                press.root_surface_id == grab.root_surface_id
+                    && compositor_surface_id(&press.surface) == grab_surface_id
+                    && press.surface.is_alive()
+                    && press
+                        .surface
+                        .client()
+                        .zip(grab.surface.client())
+                        .is_some_and(|(press_client, grab_client)| {
+                            press_client.id() == grab_client.id()
+                        })
+            })
+        {
+            return false;
+        }
+
+        let Some(active) = self.active_drag.as_ref() else {
+            // Cancellation ends the transfer, not the still-held physical
+            // gesture. The verified Wayland DnD grab remains its owner until
+            // the final button release removes this routing state.
+            return true;
+        };
+        let Some(origin_surface) = active.origin.wayland_origin_surface() else {
+            return false;
+        };
+        let origin_surface_id = compositor_surface_id(origin_surface);
+        let same_client = origin_surface
+            .client()
+            .zip(grab.surface.client())
+            .is_some_and(|(origin, grab)| origin.id() == grab.id());
+
+        matches!(
+            &active.id,
+            crate::xwayland::CanonicalDndSessionId::Wayland(_)
+        ) && active.lifecycle_driver == DragLifecycleDriver::WaylandImplicitPointerGrab
+            && active.phase == DragSessionPhase::Dragging
+            && origin_surface.is_alive()
+            && self.root_surface_id_for_surface(origin_surface_id) == grab.root_surface_id
+            && same_client
     }
 
     fn plan_workspace_membership_transition(

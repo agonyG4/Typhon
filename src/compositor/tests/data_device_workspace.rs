@@ -333,8 +333,101 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
         Some(special_icon_surface_id)
     );
 
+    // A second held button belongs to the same physical Wayland DnD grab.
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x111,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
     cancel_active_drag_for_test(&commands);
     queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_active_drag_icon_surface(&commands), None);
+    let dnd_enters_after_cancel = state.data_device_enter_count;
+    let dnd_leaves_after_cancel = state.data_device_leave_count;
+    let drops_after_cancel = state.data_device_drop_count;
+    let finishes_after_cancel = state.data_source_dnd_finished_count;
+
+    // Special-workspace scene rebuilds and moving the DnD origin family out
+    // of the visible scene must also preserve this cancelled physical grab.
+    let destination_internal_id =
+        resolve_internal_surface_id(&commands, destination.id().protocol_id());
+    let destination_window_id = capture_window_id_for_surface(&commands, destination_internal_id)
+        .expect("cancelled DnD origin must remain a mapped window");
+    let (move_reply, move_result) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::MoveWindowToWorkspace {
+            window_id: destination_window_id,
+            workspace: 3,
+            reply: move_reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(move_result.recv().unwrap());
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.data_source_cancelled_count, 1);
+    assert_eq!(capture_active_drag_icon_surface(&commands), None);
+    let pointer_motion_after_origin_move = state.pointer_motion_count;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 2.0,
+            y: pointer_y + 2.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.pointer_motion_count, pointer_motion_after_origin_move,
+        "moving a cancelled DnD origin family must not release held pointer routing"
+    );
+    let (move_reply, move_result) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::MoveWindowToWorkspace {
+            window_id: destination_window_id,
+            workspace: 1,
+            reply: move_reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(move_result.recv().unwrap());
+    queue.roundtrip(&mut state).unwrap();
+    for _ in 0..2 {
+        commands
+            .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+        assert_eq!(state.data_source_cancelled_count, 1);
+        assert_eq!(capture_active_drag_icon_surface(&commands), None);
+        assert_eq!(
+            state.pointer_motion_count, pointer_motion_after_origin_move,
+            "special-workspace transitions must keep ordinary pointer routing suppressed"
+        );
+    }
+
+    // Cancellation ends the transfer and icon, but the physical grab still
+    // owns client pointer routing across workspace changes until both buttons
+    // are released.
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 2 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.data_source_cancelled_count, 1);
+    assert!(
+        !state.event_timeline.iter().any(|event| matches!(
+            event,
+            TestWaylandEvent::PointerEnter { .. }
+                | TestWaylandEvent::PointerMotion
+                | TestWaylandEvent::PointerButtonPressed
+                | TestWaylandEvent::PointerButtonReleased
+        )),
+        "workspace departure must not resume ordinary pointer events after DnD cancellation"
+    );
     let pointer_motion_before_cancelled_release = state.pointer_motion_count;
     commands
         .send(ServerCommand::PointerMotion {
@@ -348,6 +441,29 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
         state.pointer_motion_count,
         pointer_motion_before_cancelled_release
     );
+
+    // A round trip must not lose the still-held physical ownership either.
+    for workspace in [1, 2] {
+        state.event_timeline.clear();
+        commands
+            .send(ServerCommand::ActivateWorkspace { workspace })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+        assert_eq!(state.data_source_cancelled_count, 1);
+        assert!(
+            !state
+                .event_timeline
+                .iter()
+                .any(|event| matches!(event, TestWaylandEvent::PointerEnter { .. })),
+            "ordinary pointer focus must remain suppressed during a cancelled DnD gesture"
+        );
+    }
+    assert_eq!(state.data_device_enter_count, dnd_enters_after_cancel);
+    assert_eq!(state.data_device_leave_count, dnd_leaves_after_cancel);
+    assert_eq!(state.data_device_drop_count, drops_after_cancel);
+    assert_eq!(state.data_source_dnd_finished_count, finishes_after_cancel);
+
     state.event_timeline.clear();
     commands
         .send(ServerCommand::PointerButton {
@@ -358,13 +474,62 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(state.data_source_cancelled_count, 1);
+    assert_eq!(state.data_device_drop_count, drops_after_cancel);
     assert_eq!(capture_active_drag_icon_surface(&commands), None);
     assert!(
         !state
             .event_timeline
             .iter()
             .any(|event| matches!(event, TestWaylandEvent::PointerButtonReleased)),
-        "cancelled DnD release must not be duplicated as an ordinary button event"
+        "cancelled DnD first release must not be delivered to the client"
+    );
+    let pointer_motion_before_final_cancelled_release = state.pointer_motion_count;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 3.0,
+            y: pointer_y + 3.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.pointer_motion_count, pointer_motion_before_final_cancelled_release,
+        "remaining held button must keep ordinary pointer routing suppressed"
+    );
+    state.event_timeline.clear();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x111,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.data_source_cancelled_count, 1);
+    assert_eq!(state.data_device_drop_count, drops_after_cancel);
+    assert_eq!(state.data_device_enter_count, dnd_enters_after_cancel);
+    assert_eq!(state.data_device_leave_count, dnd_leaves_after_cancel);
+    assert_eq!(state.data_source_dnd_finished_count, finishes_after_cancel);
+    assert!(
+        !state
+            .event_timeline
+            .iter()
+            .any(|event| matches!(event, TestWaylandEvent::PointerButtonReleased)),
+        "final cancelled DnD release must not be delivered to the client"
+    );
+    let pointer_motion_after_cancelled_release = state.pointer_motion_count;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 4.0,
+            y: pointer_y + 4.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.pointer_motion_count,
+        pointer_motion_after_cancelled_release + 1,
+        "ordinary pointer routing must resume after the final physical release"
     );
 
     // A second sourced drag exercises the empty-workspace path. The old
@@ -484,12 +649,54 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     let drops_before_source_destroy = state.data_device_drop_count;
+    let cancels_before_source_destroy = state.data_source_cancelled_count;
     destroyed_source.destroy();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(capture_active_drag_icon_surface(&commands), None);
     assert_eq!(state.data_device_drop_count, drops_before_source_destroy);
+    assert_eq!(
+        state.data_source_cancelled_count,
+        cancels_before_source_destroy
+    );
+    let enters_after_source_destroy = state.data_device_enter_count;
+    let leaves_after_source_destroy = state.data_device_leave_count;
+    let finishes_after_source_destroy = state.data_source_dnd_finished_count;
+
+    // Source destruction cancels the transfer but keeps the valid origin
+    // surface's physical pointer grab until release, including across a
+    // workspace round trip.
+    for workspace in [2, 1, 2] {
+        state.event_timeline.clear();
+        commands
+            .send(ServerCommand::ActivateWorkspace { workspace })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+        assert_eq!(state.data_device_drop_count, drops_before_source_destroy);
+        assert_eq!(
+            state.data_source_cancelled_count,
+            cancels_before_source_destroy
+        );
+        assert_eq!(state.data_device_enter_count, enters_after_source_destroy);
+        assert_eq!(state.data_device_leave_count, leaves_after_source_destroy);
+        assert_eq!(
+            state.data_source_dnd_finished_count,
+            finishes_after_source_destroy
+        );
+        assert_eq!(capture_active_drag_icon_surface(&commands), None);
+        assert!(
+            !state.event_timeline.iter().any(|event| matches!(
+                event,
+                TestWaylandEvent::PointerEnter { .. }
+                    | TestWaylandEvent::PointerMotion
+                    | TestWaylandEvent::PointerButtonPressed
+                    | TestWaylandEvent::PointerButtonReleased
+            )),
+            "destroying the data source must not release pointer routing during workspace changes"
+        );
+    }
     let pointer_motion_before_destroyed_release = state.pointer_motion_count;
     commands
         .send(ServerCommand::PointerMotion {
@@ -512,10 +719,33 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(state.data_device_drop_count, drops_before_source_destroy);
+    assert_eq!(
+        state.data_source_cancelled_count,
+        cancels_before_source_destroy
+    );
     assert_eq!(capture_active_drag_icon_surface(&commands), None);
+    let pointer_motion_after_destroyed_release = state.pointer_motion_count;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 5.0,
+            y: pointer_y + 5.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.pointer_motion_count,
+        pointer_motion_after_destroyed_release + 1,
+        "ordinary pointer motion resumes after source-destroyed DnD releases"
+    );
 
     // Negative control: an ordinary client implicit grab still ends when its
     // root leaves the workspace, and subsequent clicks work normally.
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 1 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     state.event_timeline.clear();
     commands
         .send(ServerCommand::PointerButton {
@@ -592,6 +822,81 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
             .iter()
             .any(|event| matches!(event, TestWaylandEvent::PointerButtonReleased))
     );
+
+    // Destroying the initiating surface invalidates the physical grab. Unlike
+    // source destruction, this must not preserve a dangling WaylandDnd route.
+    let destroyed_origin_icon = compositor.create_surface(&qh, ());
+    let destroyed_origin_source = manager.create_data_source(&qh, ());
+    destroyed_origin_source.offer("text/plain".to_string());
+    destroyed_origin_source.set_actions(client_wl_data_device_manager::DndAction::Copy);
+    commit_test_buffered_surface(&destroyed_origin_icon, &shm, &qh, 24, 24).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let cancels_before_origin_destroy = state.data_source_cancelled_count;
+    let drops_before_origin_destroy = state.data_device_drop_count;
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let destroyed_origin_serial = state
+        .pointer_button_serial
+        .expect("origin-destruction drag must begin with a real pointer serial");
+    device.start_drag(
+        Some(&destroyed_origin_source),
+        &destination,
+        Some(&destroyed_origin_icon),
+        destroyed_origin_serial,
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(capture_active_drag_icon_surface(&commands).is_some());
+
+    _destination_toplevel.destroy();
+    destination_xdg.destroy();
+    destination.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.data_source_cancelled_count,
+        cancels_before_origin_destroy + 1
+    );
+    assert_eq!(capture_active_drag_icon_surface(&commands), None);
+
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 2 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let pointer_motion_after_origin_destroy = state.pointer_motion_count;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x + 6.0,
+            y: pointer_y + 6.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state.pointer_motion_count,
+        pointer_motion_after_origin_destroy + 1,
+        "a destroyed initiating surface must not retain a stale DnD pointer route"
+    );
+    assert_eq!(state.data_device_drop_count, drops_before_origin_destroy);
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.data_device_drop_count, drops_before_origin_destroy);
 
     let _server = stop_controllable_test_server(commands, server_thread);
 }
