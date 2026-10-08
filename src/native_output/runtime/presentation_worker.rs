@@ -1068,6 +1068,16 @@ pub(super) fn submit_explicit_ready_for_presentation(
         return Ok(result);
     }
     let trace_snapshot = explicit.swapchain()?.ready_cursor_trace_reveal();
+    let submit_started_at_ns = presentation_trace
+        .enabled()
+        .then(monotonic_now_ns)
+        .and_then(Result::ok);
+    if let Some(timestamp_ns) = submit_started_at_ns {
+        presentation_trace.push(PresentationTransactionEvent::KmsSubmitStarted {
+            transaction_id,
+            timestamp_ns,
+        });
+    }
     let (token, framebuffer_id, transaction_id) =
         explicit.submit_ready_frame(kms_backend, server, output_transactions, vrr_policy)?;
     if let Some(snapshot) = trace_snapshot

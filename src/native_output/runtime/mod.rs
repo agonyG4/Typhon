@@ -119,6 +119,7 @@ mod bootstrap_runtime_capabilities_tests;
 mod commit_timing;
 mod controller_io;
 mod cursor_cycle;
+mod cursor_responsiveness;
 mod cycle;
 mod cycle_dispatch;
 mod direct_plan;
@@ -311,6 +312,7 @@ pub(super) struct NativeCycleState {
     pub(super) input_drain_us: u64,
     pub(super) raw_input_events: usize,
     pub(super) coalesced_input_events: usize,
+    pub(super) cursor_motion_sample_id: Option<u64>,
     pub(super) shutdown_requested: bool,
 }
 
@@ -333,6 +335,7 @@ pub(super) struct NativeCycleMicroturnBaseline {
     input_drain_us: u64,
     raw_input_events: usize,
     coalesced_input_events: usize,
+    cursor_motion_sample_id: Option<u64>,
     shutdown_requested: bool,
     tick_us: u64,
 }
@@ -357,6 +360,7 @@ impl NativeCycleState {
             input_drain_us: self.input_drain_us,
             raw_input_events: self.raw_input_events,
             coalesced_input_events: self.coalesced_input_events,
+            cursor_motion_sample_id: self.cursor_motion_sample_id,
             shutdown_requested: self.shutdown_requested,
             tick_us: self.tick_us,
         }
@@ -386,6 +390,9 @@ impl NativeCycleState {
         self.coalesced_input_events = baseline
             .coalesced_input_events
             .saturating_add(self.coalesced_input_events);
+        self.cursor_motion_sample_id = self
+            .cursor_motion_sample_id
+            .or(baseline.cursor_motion_sample_id);
         self.shutdown_requested |= baseline.shutdown_requested;
         self.tick_us = baseline.tick_us.saturating_add(self.tick_us);
     }
@@ -442,6 +449,7 @@ mod microturn_tests {
             input_drain_us: 17,
             raw_input_events: 18,
             coalesced_input_events: 19,
+            cursor_motion_sample_id: None,
             shutdown_requested: true,
         }
     }
@@ -788,6 +796,7 @@ pub(crate) struct NativeRuntime {
     frame_pacing: NativeFramePacing,
     wake_authority: NativeWakeAuthorityMetrics,
     pointer_timing: NativePointerTimingTrace,
+    cursor_responsiveness: cursor_responsiveness::NativeCursorResponsivenessTrace,
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
@@ -1067,6 +1076,11 @@ impl Drop for NativeRuntime {
         }
         if !self.establish_kms_teardown_safety().permits_release() {
             self.retain_unproven_teardown_ownership();
+            self.cursor_responsiveness.dump(
+                &self.presentation_trace,
+                self.server.pointer_input_metrics_snapshot(),
+                &self.cursor_output_arbitration,
+            );
             return;
         }
         self.presented_planes.primary = None;
@@ -1076,6 +1090,11 @@ impl Drop for NativeRuntime {
         {
             eprintln!("native direct target-destroyed release was not proven safe: {error}");
             self.retain_unproven_teardown_ownership();
+            self.cursor_responsiveness.dump(
+                &self.presentation_trace,
+                self.server.pointer_input_metrics_snapshot(),
+                &self.cursor_output_arbitration,
+            );
             return;
         }
         let terminal_callback_transactions = self.output_transactions.active_transaction_ids();
@@ -1208,6 +1227,11 @@ impl Drop for NativeRuntime {
             dmabuf_qualification.pageflip_to_release_lag_p50_us,
             dmabuf_qualification.pageflip_to_release_lag_p95_us,
             dmabuf_qualification.pageflip_to_release_lag_p99_us,
+        );
+        self.cursor_responsiveness.dump(
+            &self.presentation_trace,
+            self.server.pointer_input_metrics_snapshot(),
+            &self.cursor_output_arbitration,
         );
     }
 }

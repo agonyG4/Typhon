@@ -258,6 +258,11 @@ pub(super) fn submit_ready_frame(
                 .swapchain()?
                 .ready_transaction_id()
                 .ok_or_else(|| io::Error::other("ready explicit frame has no transaction ID"))?;
+            super::presentation_transactions::trace_cursor_epoch_transaction(
+                output_transactions,
+                presentation_trace,
+                transaction_id,
+            );
             let presentation_mode = output_transactions
                 .transaction(transaction_id)
                 .ok_or_else(|| {

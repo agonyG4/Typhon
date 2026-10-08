@@ -126,6 +126,10 @@ pub(in crate::compositor) fn pointer_debug_enabled() -> bool {
     crate::pointer_debug::enabled()
 }
 
+pub(in crate::compositor) fn pointer_hit_instrumentation_enabled() -> bool {
+    pointer_debug_enabled() || crate::pointer_debug::cursor_responsiveness_trace_enabled()
+}
+
 #[cfg(test)]
 fn pointer_debug_message<T>(enabled: bool, message: impl FnOnce() -> T) -> Option<T> {
     enabled.then(message)

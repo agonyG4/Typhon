@@ -88,6 +88,8 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) canonical_scene_evidence: Option<PresentedCanonicalSceneSnapshot>,
     pub(crate) scene_identity_signature: u64,
     pub(crate) effects: ResolvedEffectScene,
+    pub(crate) effect_scene_resolution_ns: Option<u64>,
+    pub(crate) effect_scene_visible_instances: usize,
     pub(crate) presentation: PresentationSceneSample,
     pub(crate) presentation_snapshot: PresentationFrameSnapshot,
     pub(crate) lifecycle: LifecycleSceneSample,
@@ -461,11 +463,16 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
         let effect_registry_generation = server.trusted_effect_registry().current();
+        let effect_scene_started = crate::pointer_debug::cursor_responsiveness_trace_enabled()
+            .then(std::time::Instant::now);
         let canonical_effects = server.resolved_effect_scene_for_presentation_with_lifecycle(
             &presentation,
             &fullscreen_plan,
             &lifecycle,
         );
+        let effect_scene_resolution_ns = effect_scene_started
+            .map(|started| started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        let effect_scene_visible_instances = canonical_effects.instances.len();
         let exit_surface_ids = exits
             .iter()
             .flat_map(|exit| {
@@ -619,6 +626,8 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_evidence,
             scene_identity_signature,
             effects,
+            effect_scene_resolution_ns,
+            effect_scene_visible_instances,
             presentation,
             presentation_snapshot,
             lifecycle,
@@ -644,6 +653,8 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_evidence: self.canonical_scene_evidence,
             scene_identity_signature: self.scene_identity_signature,
             effects: self.effects,
+            effect_scene_resolution_ns: self.effect_scene_resolution_ns,
+            effect_scene_visible_instances: self.effect_scene_visible_instances,
             presentation: self.presentation,
             presentation_snapshot: self.presentation_snapshot,
             lifecycle: self.lifecycle,
@@ -934,7 +945,6 @@ impl NativeCursorOutputArbitration {
         self.deadline_ns.filter(|deadline_ns| *deadline_ns > now_ns)
     }
 
-    #[cfg(test)]
     pub(crate) const fn desired_epoch(&self) -> u64 {
         self.desired_epoch
     }
@@ -1129,14 +1139,31 @@ pub(crate) fn plane_delta_allowed_at_deadline(
     cursor_state_changed: bool,
     hardware_usable: bool,
 ) -> bool {
-    let disposition = arbitration.disposition(now_ns, primary_work_pending, hardware_usable);
-    arbitration.note_disposition(disposition);
+    let disposition = cursor_output_disposition_at_deadline(
+        arbitration,
+        _policy,
+        now_ns,
+        primary_work_pending,
+        hardware_usable,
+    );
     // Piggyback is a primary-priority policy, not a permanent prohibition on
     // idle cursor updates.  `disposition` has already selected
     // `PiggybackPrimary` whenever primary work is ready.  Once the output
     // opportunity matures with no primary work, allowing the one queued cursor
     // update prevents a permanently armed deadline in the diagnostic mode.
     cursor_state_changed && disposition == NativeCursorOutputDisposition::SubmitPlaneDelta
+}
+
+pub(crate) fn cursor_output_disposition_at_deadline(
+    arbitration: &mut NativeCursorOutputArbitration,
+    _policy: NativeCursorSchedulingPolicy,
+    now_ns: u64,
+    primary_work_pending: bool,
+    hardware_usable: bool,
+) -> NativeCursorOutputDisposition {
+    let disposition = arbitration.disposition(now_ns, primary_work_pending, hardware_usable);
+    arbitration.note_disposition(disposition);
+    disposition
 }
 
 impl NativeCursorPreference {

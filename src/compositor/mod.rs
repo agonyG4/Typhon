@@ -369,7 +369,7 @@ pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
 pub use selection::*;
 pub use server::MaterialProgramSetError;
 pub use server::MaterialSetError;
-pub use server::{OwnCompositorServer, XwaylandClientIdentity};
+pub use server::{OwnCompositorServer, PointerInputMetricsSnapshot, XwaylandClientIdentity};
 pub use server_error::CompositorError;
 use shm::{
     ShmBufferData, ShmPoolData, WL_SHM_FORMAT_ABGR8888, WL_SHM_FORMAT_ABGR2101010,

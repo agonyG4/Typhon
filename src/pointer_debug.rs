@@ -4,6 +4,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 #[allow(dead_code)]
 static TIMING_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static CURSOR_PRESENTATION_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+static CURSOR_RESPONSIVENESS_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static CURSOR_PRESENTATION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn enabled() -> bool {
@@ -30,6 +31,13 @@ pub(crate) fn log_lazy(message: impl FnOnce() -> String) {
 pub(crate) fn cursor_presentation_trace_enabled() -> bool {
     *CURSOR_PRESENTATION_TRACE_ENABLED.get_or_init(|| {
         std::env::var_os("TYPHON_CURSOR_PRESENTATION_TRACE").is_some_and(|value| value == "1")
+    })
+}
+
+pub(crate) fn cursor_responsiveness_trace_enabled() -> bool {
+    *CURSOR_RESPONSIVENESS_TRACE_ENABLED.get_or_init(|| {
+        std::env::var("TYPHON_CURSOR_RESPONSIVENESS_TRACE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
     })
 }
 

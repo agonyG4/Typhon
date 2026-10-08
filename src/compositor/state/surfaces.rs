@@ -893,7 +893,8 @@ impl CompositorState {
             material_program_control,
             material_program_parameter_control,
             trusted_effect_registry,
-            pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
+            pointer_hit_instrumentation_enabled:
+                super::support_types::pointer_hit_instrumentation_enabled(),
             ..Self::default()
         };
         state.native_output_id = state.output_id_allocator.allocate().ok();

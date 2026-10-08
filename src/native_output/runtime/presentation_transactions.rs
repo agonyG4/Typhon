@@ -1156,7 +1156,31 @@ pub(super) fn build_cursor_transaction(
         transaction_id,
         timestamp_ns: created_at.get(),
     });
+    trace_cursor_epoch_transaction(output_transactions, presentation_trace, transaction_id);
     Ok(transaction_id)
+}
+
+pub(super) fn trace_cursor_epoch_transaction(
+    output_transactions: &OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    transaction_id: OutputTransactionId,
+) {
+    let Some(transaction) = output_transactions.transaction(transaction_id) else {
+        return;
+    };
+    let crate::native_output::presentation::transaction::CursorPlaneAssignment::Atomic {
+        desired_epoch,
+        ..
+    } = transaction.descriptor().planes().cursor()
+    else {
+        return;
+    };
+    presentation_trace.push(PresentationTransactionEvent::CursorEpochTransactionBuilt {
+        output_id: output_transactions.output_id(),
+        cursor_epoch: *desired_epoch,
+        transaction_id,
+        timestamp_ns: transaction.descriptor().created_at().get(),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1293,6 +1317,16 @@ pub(super) fn submit_plane_delta(
                 submitted_delivery,
                 Some(cursor_source_for_trace(cursor)),
             );
+            let trace_kms_submit = presentation_trace.enabled();
+            let kms_submit_started_at_ns =
+                trace_kms_submit.then(monotonic_now_ns).and_then(Result::ok);
+            if let Some(timestamp_ns) = kms_submit_started_at_ns {
+                presentation_trace.push(PresentationTransactionEvent::KmsSubmitStarted {
+                    transaction_id,
+                    timestamp_ns,
+                });
+            }
+            let kms_submit_started = trace_kms_submit.then(std::time::Instant::now);
             match kms_backend.submit_cursor_flip_with_presentation(
                 desired.as_ref(),
                 token,
@@ -1300,6 +1334,16 @@ pub(super) fn submit_plane_delta(
                 content_type,
             ) {
                 Ok(()) => {
+                    let kms_submit_returned_at_ns = kms_submit_started_at_ns.map(|started_at_ns| {
+                        monotonic_now_ns().unwrap_or_else(|_| {
+                            let elapsed_ns = kms_submit_started
+                                .map(|started| started.elapsed().as_nanos())
+                                .unwrap_or_default()
+                                .min(u128::from(u64::MAX))
+                                as u64;
+                            started_at_ns.saturating_add(elapsed_ns)
+                        })
+                    });
                     if let Some(submitter) = kms_backend.atomic_commit_submitter() {
                         trace_cursor_kms_submit(
                             submitter.pipeline(),
@@ -1342,10 +1386,12 @@ pub(super) fn submit_plane_delta(
                             MonotonicTimestampNs::new(submission_at_ns),
                         )
                         .map_err(io::Error::other)?;
-                    presentation_trace.push(PresentationTransactionEvent::KmsSubmitReturned {
-                        transaction_id,
-                        timestamp_ns: submission_at_ns,
-                    });
+                    if let Some(timestamp_ns) = kms_submit_returned_at_ns {
+                        presentation_trace.push(PresentationTransactionEvent::KmsSubmitReturned {
+                            transaction_id,
+                            timestamp_ns,
+                        });
+                    }
                     let submitted_state = cursor.begin_submission_at_revision_with_capability_key(
                         token,
                         submitted_state,

@@ -54,6 +54,12 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) pointer_constraint_reconciliations: u64,
 }
 
+impl CompositorState {
+    pub(in crate::compositor) fn pointer_input_metrics_snapshot(&self) -> PointerInputMetrics {
+        self.pointer_hit_metrics
+    }
+}
+
 #[cfg(test)]
 impl PointerSceneHitCache {
     pub(in crate::compositor) fn new_for_test(

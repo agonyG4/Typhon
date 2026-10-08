@@ -1,5 +1,9 @@
 use super::transaction::{DirectScanoutCandidateKey, OutputTransactionId};
-use std::{collections::VecDeque, fmt::Write as _};
+use oblivion_one::core::OutputId;
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Write as _,
+};
 
 const HISTOGRAM_BUCKETS_NS: [u64; 8] = [
     100_000,
@@ -24,6 +28,12 @@ pub(crate) enum PresentationTransactionEvent {
         timestamp_ns: u64,
     },
     TransactionBuilt {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+    },
+    CursorEpochTransactionBuilt {
+        output_id: OutputId,
+        cursor_epoch: u64,
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
@@ -116,12 +126,25 @@ pub(crate) enum PresentationTransactionEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorEpochPresentationTrace {
+    pub(crate) output_id: OutputId,
+    pub(crate) cursor_epoch: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) transaction_built_at_ns: u64,
+    pub(crate) worker_queued_at_ns: Option<u64>,
+    pub(crate) kms_submit_started_at_ns: Option<u64>,
+    pub(crate) kms_submit_returned_at_ns: Option<u64>,
+    pub(crate) pageflip_observed_at_ns: Option<u64>,
+}
+
 impl PresentationTransactionEvent {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ContentObserved { .. } => "content_observed",
             Self::AcquireReady { .. } => "acquire_ready",
             Self::TransactionBuilt { .. } => "transaction_built",
+            Self::CursorEpochTransactionBuilt { .. } => "cursor_epoch_transaction_built",
             Self::RenderStarted { .. } => "render_started",
             Self::RenderCompleted { .. } => "render_completed",
             Self::SceneIdentity { .. } => "scene_identity",
@@ -148,6 +171,7 @@ impl PresentationTransactionEvent {
             Self::ContentObserved { transaction_id, .. }
             | Self::AcquireReady { transaction_id, .. }
             | Self::TransactionBuilt { transaction_id, .. }
+            | Self::CursorEpochTransactionBuilt { transaction_id, .. }
             | Self::RenderStarted { transaction_id, .. }
             | Self::RenderCompleted { transaction_id, .. }
             | Self::SceneIdentity { transaction_id, .. }
@@ -174,6 +198,7 @@ impl PresentationTransactionEvent {
             Self::ContentObserved { timestamp_ns, .. }
             | Self::AcquireReady { timestamp_ns, .. }
             | Self::TransactionBuilt { timestamp_ns, .. }
+            | Self::CursorEpochTransactionBuilt { timestamp_ns, .. }
             | Self::RenderStarted { timestamp_ns, .. }
             | Self::RenderCompleted { timestamp_ns, .. }
             | Self::SceneIdentity { timestamp_ns, .. }
@@ -208,6 +233,9 @@ pub(crate) struct PresentationTransactionTraceRing {
     events: VecDeque<PresentationTransactionEvent>,
     dropped: u64,
     enabled: bool,
+    cursor_epoch_transactions: HashMap<OutputTransactionId, CursorEpochPresentationTrace>,
+    cursor_epoch_transaction_order: VecDeque<OutputTransactionId>,
+    cursor_epoch_transactions_dropped: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,22 +252,33 @@ impl PresentationTransactionTraceRing {
             events: VecDeque::with_capacity(capacity),
             dropped: 0,
             enabled: true,
+            cursor_epoch_transactions: HashMap::with_capacity(capacity),
+            cursor_epoch_transaction_order: VecDeque::with_capacity(capacity),
+            cursor_epoch_transactions_dropped: 0,
         }
     }
 
     pub(crate) fn disabled(capacity: usize) -> Self {
-        let mut ring = Self::new(capacity);
-        ring.enabled = false;
-        ring
+        Self {
+            capacity,
+            events: VecDeque::new(),
+            dropped: 0,
+            enabled: false,
+            cursor_epoch_transactions: HashMap::new(),
+            cursor_epoch_transaction_order: VecDeque::new(),
+            cursor_epoch_transactions_dropped: 0,
+        }
     }
 
     pub(crate) fn from_env() -> Self {
+        let cursor_trace_enabled = crate::pointer_debug::cursor_responsiveness_trace_enabled();
         let enabled = std::env::var("OBLIVION_ONE_PRESENTATION_TRACE")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
+            || cursor_trace_enabled;
         let capacity = std::env::var("OBLIVION_ONE_PRESENTATION_TRACE_CAPACITY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4096)
+            .unwrap_or(if cursor_trace_enabled { 65_536 } else { 4096 })
             .clamp(1, 65_536);
         if enabled {
             Self::new(capacity)
@@ -255,11 +294,16 @@ impl PresentationTransactionTraceRing {
             }
             return;
         }
+        self.record_cursor_epoch_event(event);
         if self.events.len() == self.capacity {
             self.events.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
         self.events.push_back(event);
+    }
+
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enabled
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -268,6 +312,105 @@ impl PresentationTransactionTraceRing {
 
     pub(crate) const fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    pub(crate) fn cursor_epoch_transactions(
+        &self,
+    ) -> impl Iterator<Item = CursorEpochPresentationTrace> + '_ {
+        self.cursor_epoch_transaction_order
+            .iter()
+            .filter_map(|transaction_id| {
+                self.cursor_epoch_transactions.get(transaction_id).copied()
+            })
+    }
+
+    pub(crate) const fn cursor_epoch_transactions_dropped(&self) -> u64 {
+        self.cursor_epoch_transactions_dropped
+    }
+
+    fn record_cursor_epoch_event(&mut self, event: PresentationTransactionEvent) {
+        match event {
+            PresentationTransactionEvent::CursorEpochTransactionBuilt {
+                output_id,
+                cursor_epoch,
+                transaction_id,
+                timestamp_ns,
+            } => {
+                if !self.cursor_epoch_transactions.contains_key(&transaction_id) {
+                    if self.cursor_epoch_transaction_order.len() == self.capacity
+                        && let Some(evicted) = self.cursor_epoch_transaction_order.pop_front()
+                    {
+                        self.cursor_epoch_transactions.remove(&evicted);
+                        self.cursor_epoch_transactions_dropped =
+                            self.cursor_epoch_transactions_dropped.saturating_add(1);
+                    }
+                    self.cursor_epoch_transaction_order
+                        .push_back(transaction_id);
+                }
+                self.cursor_epoch_transactions.insert(
+                    transaction_id,
+                    CursorEpochPresentationTrace {
+                        output_id,
+                        cursor_epoch,
+                        transaction_id,
+                        transaction_built_at_ns: timestamp_ns,
+                        worker_queued_at_ns: None,
+                        kms_submit_started_at_ns: None,
+                        kms_submit_returned_at_ns: None,
+                        pageflip_observed_at_ns: None,
+                    },
+                );
+            }
+            PresentationTransactionEvent::WorkerQueued {
+                transaction_id,
+                timestamp_ns,
+            } => {
+                if let Some(cursor_transaction) =
+                    self.cursor_epoch_transactions.get_mut(&transaction_id)
+                {
+                    cursor_transaction
+                        .worker_queued_at_ns
+                        .get_or_insert(timestamp_ns);
+                }
+            }
+            PresentationTransactionEvent::KmsSubmitStarted {
+                transaction_id,
+                timestamp_ns,
+            } => {
+                if let Some(cursor_transaction) =
+                    self.cursor_epoch_transactions.get_mut(&transaction_id)
+                {
+                    cursor_transaction
+                        .kms_submit_started_at_ns
+                        .get_or_insert(timestamp_ns);
+                }
+            }
+            PresentationTransactionEvent::KmsSubmitReturned {
+                transaction_id,
+                timestamp_ns,
+            } => {
+                if let Some(cursor_transaction) =
+                    self.cursor_epoch_transactions.get_mut(&transaction_id)
+                {
+                    cursor_transaction
+                        .kms_submit_returned_at_ns
+                        .get_or_insert(timestamp_ns);
+                }
+            }
+            PresentationTransactionEvent::PageflipPresented {
+                transaction_id,
+                timestamp_ns,
+            } => {
+                if let Some(cursor_transaction) =
+                    self.cursor_epoch_transactions.get_mut(&transaction_id)
+                {
+                    cursor_transaction
+                        .pageflip_observed_at_ns
+                        .get_or_insert(timestamp_ns);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[allow(dead_code)]
@@ -348,13 +491,33 @@ impl PresentationTransactionTraceRing {
 }
 
 fn append_event_jsonl(output: &mut String, event: PresentationTransactionEvent) {
-    let _ = writeln!(
-        output,
-        "{{\"event\":\"{}\",\"transaction_id\":{},\"timestamp_ns\":{}}}",
-        event.name(),
-        event.transaction_id().get(),
-        event.timestamp_ns(),
-    );
+    match event {
+        PresentationTransactionEvent::CursorEpochTransactionBuilt {
+            output_id,
+            cursor_epoch,
+            transaction_id,
+            timestamp_ns,
+        } => {
+            let _ = writeln!(
+                output,
+                "{{\"event\":\"{}\",\"output_id\":{},\"cursor_epoch\":{},\"transaction_id\":{},\"timestamp_ns\":{}}}",
+                event.name(),
+                output_id.get(),
+                cursor_epoch,
+                transaction_id.get(),
+                timestamp_ns,
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                output,
+                "{{\"event\":\"{}\",\"transaction_id\":{},\"timestamp_ns\":{}}}",
+                event.name(),
+                event.transaction_id().get(),
+                event.timestamp_ns(),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +562,7 @@ impl TimingSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oblivion_one::core::OutputId;
     use std::num::NonZeroU64;
 
     fn event(timestamp_ns: u64) -> PresentationTransactionEvent {
@@ -406,6 +570,52 @@ mod tests {
             transaction_id: OutputTransactionId::new(NonZeroU64::new(1).unwrap()),
             timestamp_ns,
         }
+    }
+
+    fn transaction_id(value: u64) -> OutputTransactionId {
+        OutputTransactionId::new(NonZeroU64::new(value).unwrap())
+    }
+
+    fn cursor_epoch_event(
+        transaction_id: OutputTransactionId,
+        cursor_epoch: u64,
+    ) -> PresentationTransactionEvent {
+        PresentationTransactionEvent::CursorEpochTransactionBuilt {
+            output_id: OutputId::from_raw(1).unwrap(),
+            cursor_epoch,
+            transaction_id,
+            timestamp_ns: cursor_epoch * 10,
+        }
+    }
+
+    #[test]
+    fn cursor_epoch_history_is_bounded_and_tracks_only_cursor_transactions() {
+        let mut ring = PresentationTransactionTraceRing::new(2);
+        let first = transaction_id(1);
+        let second = transaction_id(2);
+        let third = transaction_id(3);
+        ring.push(cursor_epoch_event(first, 1));
+        ring.push(cursor_epoch_event(second, 2));
+        ring.push(cursor_epoch_event(third, 3));
+        ring.push(PresentationTransactionEvent::KmsSubmitStarted {
+            transaction_id: third,
+            timestamp_ns: 31,
+        });
+
+        let retained = ring.cursor_epoch_transactions().collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].transaction_id, second);
+        assert_eq!(retained[1].transaction_id, third);
+        assert_eq!(retained[1].kms_submit_started_at_ns, Some(31));
+        assert_eq!(ring.cursor_epoch_transactions_dropped(), 1);
+    }
+
+    #[test]
+    fn disabled_trace_does_not_allocate_event_or_cursor_histories() {
+        let ring = PresentationTransactionTraceRing::disabled(128);
+        assert_eq!(ring.events.capacity(), 0);
+        assert_eq!(ring.cursor_epoch_transactions.capacity(), 0);
+        assert_eq!(ring.cursor_epoch_transaction_order.capacity(), 0);
     }
 
     #[test]

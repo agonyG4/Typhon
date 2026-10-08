@@ -1964,6 +1964,7 @@ impl NativeRuntime {
         let perf = self.perf;
         let Self {
             server,
+            output_id,
             perf: _,
             kms,
             kms_backend,
@@ -2005,6 +2006,7 @@ impl NativeRuntime {
             process_supervisor,
             render_telemetry,
             pointer_timing,
+            cursor_responsiveness,
             #[cfg(test)]
             native_io_recorder,
             shutdown: _,
@@ -2022,6 +2024,7 @@ impl NativeRuntime {
         let mut coalesced_input_events = 0;
         let mut input_event_timestamp_usec = None;
         let timing_enabled = pointer_timing.enabled();
+        let cursor_trace_enabled = cursor_responsiveness.enabled();
         let pending_constraint_requests_before_settlement =
             server.pointer_constraint_backend_request_count();
         native_pointer_debug_log_lazy(|| {
@@ -2205,7 +2208,13 @@ impl NativeRuntime {
                     input_batch.coalesced.clear();
                     input_batch.budget_exhausted = false;
                 }
-                let queue_drain_end_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+                let queue_drain_end_at_ns = if timing_enabled {
+                    Some(monotonic_now_ns()?)
+                } else if cursor_trace_enabled {
+                    monotonic_now_ns().ok()
+                } else {
+                    None
+                };
                 if let Some(start_ns) = queue_drain_start_at_ns {
                     pointer_timing.record_queue_drain(
                         start_ns,
@@ -2248,8 +2257,19 @@ impl NativeRuntime {
                     .iter()
                     .filter_map(|event| event.timestamp_usec())
                     .max();
+                let raw_pointer_motion = if cursor_trace_enabled {
+                    super::cursor_responsiveness::pointer_motion_event_stats(&input_batch.raw)
+                } else {
+                    Default::default()
+                };
                 input_batch.coalesce_pointer_motion_events();
                 coalesced_input_events = input_batch.coalesced.len();
+                let coalesced_pointer_motion_events = if cursor_trace_enabled {
+                    super::cursor_responsiveness::pointer_motion_event_stats(&input_batch.coalesced)
+                        .count
+                } else {
+                    0
+                };
                 if input_batch
                     .coalesced
                     .iter()
@@ -2270,6 +2290,26 @@ impl NativeRuntime {
                         pre_read_observation.batch = Some(timing_batch);
                     }
                 }
+                let cursor_motion_sample_id =
+                    if cursor_trace_enabled && raw_pointer_motion.count > 0 {
+                        cursor_responsiveness.record_motion_batch(
+                            raw_pointer_motion.count,
+                            coalesced_pointer_motion_events,
+                            || {
+                                Some(super::cursor_responsiveness::CursorMotionBatchTiming {
+                                    input_batch_materialized_at_ns: queue_drain_end_at_ns?,
+                                    dispatch_started_at_ns: monotonic_now_ns().ok()?,
+                                    source_oldest_timestamp_usec: raw_pointer_motion
+                                        .oldest_timestamp_usec,
+                                    source_newest_timestamp_usec: raw_pointer_motion
+                                        .newest_timestamp_usec,
+                                    hit_test_before: server.pointer_input_metrics_snapshot().into(),
+                                })
+                            },
+                        )
+                    } else {
+                        None
+                    };
                 native_pointer_debug_log_lazy(|| {
                     format!(
                         "input.semantic_epoch batch id={:?} raw={} coalesced={} oldest_ts_us={:?} newest_ts_us={:?} budget_exhausted={} continuation={}",
@@ -2409,6 +2449,23 @@ impl NativeRuntime {
                 });
                 if !input_epoch.backlog_pending() {
                     input_state.set_native_input_epoch_debug(None, None);
+                }
+                if cursor_trace_enabled && raw_pointer_motion.count > 0 {
+                    let cursor_epoch = atomic_cursor.as_ref().map(|cursor| cursor.desired_epoch());
+                    if let Some(sample_id) = cursor_motion_sample_id {
+                        if let Some(dispatch_completed_at_ns) = monotonic_now_ns().ok() {
+                            cursor_responsiveness.complete_motion_batch(
+                                sample_id,
+                                *output_id,
+                                cursor_epoch,
+                                dispatch_completed_at_ns,
+                                server.pointer_input_metrics_snapshot().into(),
+                            );
+                        }
+                        cycle.cursor_motion_sample_id = Some(sample_id);
+                    } else if let Some(cursor_epoch) = cursor_epoch {
+                        cursor_responsiveness.note_cursor_epoch(*output_id, cursor_epoch);
+                    }
                 }
             }
             if should_service_keyboard_repeat(

@@ -110,6 +110,20 @@ pub struct OwnCompositorServer {
     #[cfg(test)]
     pub(super) wayland_flush_count: u64,
 }
+
+/// Bounded counters used by the opt-in native cursor responsiveness trace.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PointerInputMetricsSnapshot {
+    pub calls: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub full_scene_scans: u64,
+    pub owner_locality_fast_hits: u64,
+    pub groups_inspected: u64,
+    pub surfaces_inspected: u64,
+    pub cpu_ns: u64,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandClientIdentity {
     pub client_id: ClientId,
@@ -150,6 +164,22 @@ impl Drop for OwnCompositorServer {
     }
 }
 impl OwnCompositorServer {
+    /// Return cumulative hit-test counters for opt-in native diagnostics.
+    #[doc(hidden)]
+    pub fn pointer_input_metrics_snapshot(&self) -> PointerInputMetricsSnapshot {
+        let metrics = self.state.pointer_input_metrics_snapshot();
+        PointerInputMetricsSnapshot {
+            calls: metrics.pointer_scene_hit_calls,
+            cache_hits: metrics.pointer_scene_hit_cache_hits,
+            cache_misses: metrics.pointer_scene_hit_cache_misses,
+            full_scene_scans: metrics.full_scene_hit_scans,
+            owner_locality_fast_hits: metrics.owner_locality_fast_hits,
+            groups_inspected: metrics.pointer_scene_hit_groups_inspected,
+            surfaces_inspected: metrics.pointer_scene_hit_surfaces_inspected,
+            cpu_ns: metrics.pointer_scene_hit_cpu_nanos,
+        }
+    }
+
     /// Records meaningful user input through the compositor's shared idle authority.
     pub fn notify_user_activity(&mut self) {
         self.state.notify_user_activity_at(Instant::now());

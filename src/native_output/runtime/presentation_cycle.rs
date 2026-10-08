@@ -4,8 +4,8 @@ use super::commit_timing::{
 };
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
-    NativeRepaintInputs, native_repaint_decision, plane_delta_allowed_at_deadline,
-    update_cursor_output_arbitration,
+    NativeCursorOutputDisposition, NativeRepaintInputs, cursor_output_disposition_at_deadline,
+    native_repaint_decision, update_cursor_output_arbitration,
 };
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, pacing_mode_for_target,
@@ -284,6 +284,7 @@ impl NativeRuntime {
             presentation_cadence: _,
             frame_pacing,
             presentation_trace,
+            cursor_responsiveness,
             cursor_reveal_trace,
             slow_cycle_trace,
             last_acquire_ready_at_ns,
@@ -814,14 +815,29 @@ impl NativeRuntime {
             || direct_candidate_changed
             || atomic_commit_blocks_cursor
             || scanout.ready_frame_queued();
-        let plane_delta_allowed = plane_delta_allowed_at_deadline(
-            cursor_output_arbitration,
-            *cursor_scheduling_policy,
-            scheduler_now.get(),
-            primary_work_for_cursor,
-            cursor_state_changed,
-            cursor_plane_update_usable,
-        );
+        let cursor_disposition = if cursor_state_changed {
+            let disposition = cursor_output_disposition_at_deadline(
+                cursor_output_arbitration,
+                *cursor_scheduling_policy,
+                scheduler_now.get(),
+                primary_work_for_cursor,
+                cursor_plane_update_usable,
+            );
+            cursor_responsiveness.record_arbitration(
+                cycle.cursor_motion_sample_id,
+                *output_id,
+                cursor_output_arbitration
+                    .pending()
+                    .then_some(cursor_output_arbitration.desired_epoch()),
+                scheduler_now.get(),
+                disposition,
+            );
+            disposition
+        } else {
+            NativeCursorOutputDisposition::Noop
+        };
+        let plane_delta_allowed =
+            cursor_disposition == NativeCursorOutputDisposition::SubmitPlaneDelta;
         let presentation_path = plan_native_presentation_path(NativePresentationPlanInput {
             direct_active: presented_planes
                 .primary
@@ -1340,6 +1356,13 @@ impl NativeRuntime {
                     }),
                     (current_client_cursor_damage, current_software_cursor_damage),
                 );
+                if let Some(duration_ns) = resolved_scene.effect_scene_resolution_ns {
+                    cursor_responsiveness.record_effect_scene_resolution(
+                        cycle.cursor_motion_sample_id,
+                        duration_ns,
+                        resolved_scene.effect_scene_visible_instances,
+                    );
+                }
                 let output_damage = output_damage.union_effect_region(
                     &resolved_scene
                         .snapshot_ref()

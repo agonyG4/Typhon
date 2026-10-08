@@ -649,6 +649,8 @@ impl NativeRuntime {
             pending_launches.push_back(launch);
         }
         let xwayland_environment_materialized = xwayland_app_environment.is_some();
+        let cursor_hit_test_baseline = crate::pointer_debug::cursor_responsiveness_trace_enabled()
+            .then(|| server.pointer_input_metrics_snapshot());
         let mut runtime = Self {
             server,
             output_id,
@@ -772,6 +774,10 @@ impl NativeRuntime {
             frame_pacing,
             wake_authority: NativeWakeAuthorityMetrics::default(),
             pointer_timing: NativePointerTimingTrace::from_env(),
+            cursor_responsiveness:
+                super::cursor_responsiveness::NativeCursorResponsivenessTrace::from_env(
+                    cursor_hit_test_baseline,
+                ),
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
