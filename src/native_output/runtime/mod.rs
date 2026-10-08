@@ -947,6 +947,7 @@ impl Drop for NativeRuntime {
     fn drop(&mut self) {
         self.fail_pending_screen_captures("session_inactive");
         self.dmem_foreground.shutdown();
+        frame::dump_effect_owner_diagnostics();
         self.slow_cycle_trace.dump();
         let _ = self
             .dmabuf_gpu_release_registry
