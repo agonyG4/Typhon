@@ -180,6 +180,21 @@ latency result.
 | 4,096 | 23 ns | 73 / 84 / 91 ns | 1,032,396 B; 3.54 ms | 139 / 157 / 176 ns | 15,782 / 49,152; 77 ranges / 33,370 events; 123; 88; 3,988,087 B |
 | 65,536 | 23 ns | 72 / 135 / 151 ns | 16,580,813 B; 52.4 ms | 138 / 171 / 222 ns | 246,293 / 786,432; 1,263 ranges / 540,139 events; 1,920; 1,407; 62,528,051 B |
 
+An additional optimized-profile run used the same ignored benchmark with
+`cargo test --release`. It completed once at each capacity:
+
+| Capacity | Legacy full-history JSONL size; after-wrap median serialization | Streaming push + handoff after wraps p50/p95/p99 | Persisted / attempted; producer-unpersisted events; file bytes |
+| ---: | ---: | ---: | ---: |
+| 64 | 16,137 B; 10.4 µs | 74 / 136 / 993 ns | 709 / 768; 59; 176,636 B |
+| 4,096 | 1,028,299 B; 1.12 ms | 51 / 62 / 73 ns | 24,096 / 49,152; 25,056; 6,066,265 B |
+| 65,536 | 16,515,276 B; 12.66 ms | 51 / 61 / 71 ns | 225,786 / 786,432; 560,646; 57,001,008 B |
+
+At capacity 65,536, the optimized run's single first-overwrite handoff sample
+was 84 ns; the five legacy serialization samples at that boundary had a median
+of 12.67 ms. The optimized run stayed below the 64 MiB file-set bound and did
+not expire history. This is one optimized run, not an independent-trial
+distribution.
+
 The benchmark parses retained loss ranges in sequence order across active and
 rotated files. It checks that the retained suffix is continuous through the
 last attempted sequence. If an older prefix expired, that suffix may start
@@ -216,8 +231,9 @@ latency. Three earlier runs at capacity 65,536 had streaming p99 values from
 222–267 ns and producer loss from 531,393–540,139 events. A later run measured
 p50/p95/p99 of 249/303/2,518 ns after ten wraps and 541,692 producer-unpersisted
 events; it retained 61,620,640 bytes and did not expire file history. The larger
-tail sample shows that the p99 is sensitive to host scheduling and should not be
-treated as a stable compositor-latency result. These are host-local indicative
+tail sample differs from the single optimized run's 71 ns p99. These results
+show that the p99 is sensitive to host scheduling and should not be treated as a
+stable compositor-latency result. They are host-local indicative
 microbenchmarks, not Cyberpunk responsiveness measurements.
 
 The CPU saturation probe now samples per-TID minor/major faults and voluntary /
