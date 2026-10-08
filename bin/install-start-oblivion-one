@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source_script="$script_dir/start-oblivion-one"
 source_tty_script="$script_dir/start-oblivion-one-tty"
+source_observer_script="$script_dir/observe-compositor-exit.py"
 
 usage() {
     cat <<EOF
@@ -85,14 +86,12 @@ case "${1:-}" in
         exit 0
         ;;
     --system)
-        target="/usr/local/bin/start-oblivion-one"
-        tty_target="/usr/local/bin/start-oblivion-one-tty"
         if command -v pkexec >/dev/null 2>&1; then
-            pkexec install -Dm755 "$source_script" "$target"
-            exec pkexec install -Dm755 "$source_tty_script" "$tty_target"
+            exec pkexec install -m755 \
+                "$source_script" "$source_tty_script" "$source_observer_script" /usr/local/bin/
         fi
-        sudo install -Dm755 "$source_script" "$target"
-        exec sudo install -Dm755 "$source_tty_script" "$tty_target"
+        exec sudo install -m755 \
+            "$source_script" "$source_tty_script" "$source_observer_script" /usr/local/bin/
         ;;
     --sddm-session)
         shift
@@ -127,6 +126,7 @@ case "${1:-}" in
         ln -sfn "$source_tty_script" "$tty_target"
         chmod +x "$source_script"
         chmod +x "$source_tty_script"
+        chmod +x "$source_observer_script"
         echo "Installed: $target -> $source_script"
         echo "Installed: $tty_target -> $source_tty_script"
         echo "Open it with: start-oblivion-one"

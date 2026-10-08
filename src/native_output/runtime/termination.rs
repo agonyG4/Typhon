@@ -11,6 +11,14 @@ use std::{
 
 const MAX_ERROR_CHAIN_BYTES: usize = 2_048;
 const MAX_SUMMARY_BYTES: usize = 16_384;
+const MAX_STALE_INCOMPLETE_RUN_RECORDS: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -225,6 +233,17 @@ impl NativeTerminationJournal {
     }
 
     pub(super) fn persist_run_started(&self) {
+        let incomplete_runs_dir = incomplete_runs_dir();
+        if let Err(error) = prune_stale_incomplete_runs(
+            &incomplete_runs_dir,
+            self.metadata.boot_id.as_deref(),
+            process_liveness,
+        ) {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "oblivion-one: stale run marker retention failed: {error}"
+            );
+        }
         let summary = self.summary(None, TerminationRecordStatus::Running);
         let path = run_record_path(&summary.metadata.session_id);
         if let Err(error) = write_summary_file(&path, &summary) {
@@ -447,10 +466,104 @@ fn run_record_path(session_id: &str) -> std::path::PathBuf {
     run_record_path_in(&termination_diagnostics_dir(), session_id)
 }
 
+fn incomplete_runs_dir() -> std::path::PathBuf {
+    termination_diagnostics_dir().join("incomplete-runs")
+}
+
 fn run_record_path_in(diagnostics_dir: &Path, session_id: &str) -> std::path::PathBuf {
     diagnostics_dir
         .join("incomplete-runs")
         .join(format!("{session_id}.json"))
+}
+
+fn process_liveness(process_id: u32) -> ProcessLiveness {
+    match fs::metadata(format!("/proc/{process_id}")) {
+        Ok(_) => ProcessLiveness::Alive,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ProcessLiveness::Dead,
+        Err(_) => ProcessLiveness::Unknown,
+    }
+}
+
+fn prune_stale_incomplete_runs(
+    directory: &Path,
+    current_boot_id: Option<&str>,
+    mut process_state: impl FnMut(u32) -> ProcessLiveness,
+) -> io::Result<usize> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut stale = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "json")
+        {
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.len() > MAX_SUMMARY_BYTES as u64 {
+                continue;
+            }
+            let contents = match fs::read(&path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let record: serde_json::Value = match serde_json::from_slice(&contents) {
+                Ok(record) => record,
+                Err(_) => continue,
+            };
+            if !matches!(
+                record.get("status").and_then(serde_json::Value::as_str),
+                Some("running" | "fatal_checkpoint")
+            ) {
+                continue;
+            }
+            let Some(record_metadata) = record.get("metadata") else {
+                continue;
+            };
+            let Some(process_id) = record_metadata
+                .get("process_id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+            let record_boot_id = record_metadata
+                .get("boot_id")
+                .and_then(serde_json::Value::as_str);
+            let boot_changed = current_boot_id
+                .zip(record_boot_id)
+                .is_some_and(|(current, recorded)| current != recorded);
+            if !boot_changed && process_state(process_id) != ProcessLiveness::Dead {
+                continue;
+            }
+            let recorded_start = record_metadata
+                .get("started_at_unix_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    metadata
+                        .modified()
+                        .ok()?
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                })
+                .unwrap_or(0);
+            stale.push((recorded_start, path));
+        }
+    }
+
+    stale.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let remove_count = stale.len().saturating_sub(MAX_STALE_INCOMPLETE_RUN_RECORDS);
+    for (_, path) in stale.into_iter().take(remove_count) {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(remove_count)
 }
 
 fn termination_summary_path() -> std::path::PathBuf {
@@ -533,8 +646,9 @@ impl fmt::Write for BoundedString {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitCategory, ExitFailureKind, NativeTerminationJournal, RuntimePhase,
-        TerminationRecordStatus, TerminationSnapshot, write_summary, write_summary_file,
+        ExitCategory, ExitFailureKind, MAX_STALE_INCOMPLETE_RUN_RECORDS, NativeTerminationJournal,
+        ProcessLiveness, RuntimePhase, TerminationRecordStatus, TerminationSnapshot,
+        prune_stale_incomplete_runs, write_summary, write_summary_file,
     };
     use std::{error::Error, fmt, fs, io, path::PathBuf};
 
@@ -970,5 +1084,77 @@ mod tests {
         assert_eq!(previous_json["status"], "completed");
         assert_eq!(current_json["status"], "running");
         fs::remove_dir_all(directory).expect("remove test output directory");
+    }
+
+    #[test]
+    fn stale_incomplete_run_retention_keeps_recent_evidence_and_uncertain_records() {
+        let directory = test_output_path("termination-incomplete-retention-test");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create incomplete run directory");
+
+        for index in 0..40 {
+            let marker = serde_json::json!({
+                "status": "fatal_checkpoint",
+                "metadata": {
+                    "session_id": format!("stale-{index:02}"),
+                    "process_id": 20_000 + index,
+                    "boot_id": if index == 0 { "current-boot" } else { "previous-boot" },
+                    "started_at_unix_ms": index,
+                },
+            });
+            fs::write(
+                directory.join(format!("stale-{index:02}.json")),
+                serde_json::to_vec(&marker).expect("serialize stale marker"),
+            )
+            .expect("write stale marker");
+        }
+
+        for (name, pid, boot_id) in [
+            ("live", 30_001, "current-boot"),
+            ("uncertain", 30_002, "current-boot"),
+        ] {
+            let marker = serde_json::json!({
+                "status": "running",
+                "metadata": {
+                    "session_id": name,
+                    "process_id": pid,
+                    "boot_id": boot_id,
+                    "started_at_unix_ms": 100,
+                },
+            });
+            fs::write(
+                directory.join(format!("{name}.json")),
+                serde_json::to_vec(&marker).expect("serialize live marker"),
+            )
+            .expect("write live marker");
+        }
+        fs::write(directory.join("unreadable-evidence.json"), b"not json")
+            .expect("write uncertain marker");
+
+        prune_stale_incomplete_runs(&directory, Some("current-boot"), |pid| match pid {
+            20_000 => ProcessLiveness::Dead,
+            20_001..=20_039 | 30_001 => ProcessLiveness::Alive,
+            30_002 => ProcessLiveness::Unknown,
+            _ => ProcessLiveness::Dead,
+        })
+        .expect("prune stale markers");
+
+        let retained_stale = (0..40)
+            .filter(|index| directory.join(format!("stale-{index:02}.json")).exists())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained_stale.len(),
+            MAX_STALE_INCOMPLETE_RUN_RECORDS,
+            "only the most recent stale markers should remain"
+        );
+        assert!(!directory.join("stale-00.json").exists());
+        assert!(!directory.join("stale-07.json").exists());
+        assert!(directory.join("stale-08.json").exists());
+        assert!(directory.join("stale-39.json").exists());
+        assert!(directory.join("live.json").exists());
+        assert!(directory.join("uncertain.json").exists());
+        assert!(directory.join("unreadable-evidence.json").exists());
+
+        fs::remove_dir_all(directory).expect("remove incomplete run directory");
     }
 }
