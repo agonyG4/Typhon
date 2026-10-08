@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 
 use super::perf::native_perf_log_value_enabled;
+use super::pointer_timing::thread_cpu_time_ns;
 
 pub(super) const SLOW_CYCLE_RING_CAPACITY: usize = 96;
+const SLOW_CYCLE_TRACE_MAX_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SlowCycleClass {
@@ -46,8 +48,15 @@ pub(super) struct SlowCycleContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SlowCycleRecord {
+    /// CLOCK_MONOTONIC timestamp captured immediately after the reactor wakes.
     pub(super) cycle_start_ns: u64,
+    /// CLOCK_MONOTONIC elapsed time from `cycle_start_ns` to cycle completion.
     pub(super) total_ns: u64,
+    /// CPU time spent on this thread between the post-wake and finish samples.
+    pub(super) thread_cpu_ns: Option<u64>,
+    /// Wall time minus thread CPU time; this is an off-CPU estimate, not a
+    /// scheduler run-queue delay measurement.
+    pub(super) off_cpu_estimate_ns: Option<u64>,
     pub(super) refresh_interval_ns: u64,
     pub(super) class: SlowCycleClass,
     /// Existing `NativeCycleState::tick_us`: server-side Wayland dispatch time.
@@ -56,6 +65,8 @@ pub(super) struct SlowCycleRecord {
     /// semantic input routing and coalescing are outside this measurement.
     pub(super) input_backend_drain_us: u64,
     pub(super) compositor_render_us: u64,
+    /// Wall-time residual not assigned to the currently instrumented phases.
+    /// It is not, by itself, scheduler delay or off-CPU time.
     pub(super) unattributed_ns: u64,
     phase_ns: [u64; SLOW_CYCLE_PHASE_COUNT],
     pub(super) wake_reasons: u32,
@@ -86,6 +97,8 @@ impl Default for SlowCycleRecord {
         Self {
             cycle_start_ns: 0,
             total_ns: 0,
+            thread_cpu_ns: None,
+            off_cpu_estimate_ns: None,
             refresh_interval_ns: 0,
             class: SlowCycleClass::Slow,
             wayland_dispatch_us: 0,
@@ -128,6 +141,7 @@ impl SlowCycleRecord {
 #[derive(Debug, Clone, Copy)]
 struct ActiveSlowCycle {
     record: SlowCycleRecord,
+    thread_cpu_start_ns: Option<u64>,
     x11_events_total: u64,
     x11_property_replies_total: u64,
     xwm_budget_exhaustions_total: u64,
@@ -136,6 +150,9 @@ struct ActiveSlowCycle {
 #[derive(Debug)]
 struct SlowCycleTraceState {
     records: VecDeque<SlowCycleRecord>,
+    capacity: usize,
+    evicted_records: u64,
+    thread_cpu_enabled: bool,
     active: Option<ActiveSlowCycle>,
 }
 
@@ -149,13 +166,33 @@ impl NativeSlowCycleTrace {
         let enabled = std::env::var("TYPHON_SLOW_CYCLE_TRACE")
             .ok()
             .is_some_and(|value| native_perf_log_value_enabled(&value));
-        Self::new(enabled)
+        if !enabled {
+            return Self::new(false);
+        }
+
+        let capacity = std::env::var("TYPHON_SLOW_CYCLE_TRACE_CAPACITY").ok();
+        let thread_cpu_enabled = std::env::var("TYPHON_SLOW_CYCLE_THREAD_CPU")
+            .ok()
+            .is_some_and(|value| native_perf_log_value_enabled(&value));
+        Self::with_options(
+            true,
+            parse_trace_capacity(capacity.as_deref()),
+            thread_cpu_enabled,
+        )
     }
 
     pub(super) fn new(enabled: bool) -> Self {
+        Self::with_options(enabled, SLOW_CYCLE_RING_CAPACITY, false)
+    }
+
+    fn with_options(enabled: bool, capacity: usize, thread_cpu_enabled: bool) -> Self {
+        let capacity = capacity.clamp(1, SLOW_CYCLE_TRACE_MAX_CAPACITY);
         Self {
             state: enabled.then(|| SlowCycleTraceState {
-                records: VecDeque::with_capacity(SLOW_CYCLE_RING_CAPACITY),
+                records: VecDeque::with_capacity(capacity),
+                capacity,
+                evicted_records: 0,
+                thread_cpu_enabled,
                 active: None,
             }),
         }
@@ -187,6 +224,7 @@ impl NativeSlowCycleTrace {
         };
         state.active = Some(ActiveSlowCycle {
             record,
+            thread_cpu_start_ns: state.thread_cpu_enabled.then(thread_cpu_time_ns).flatten(),
             x11_events_total: context.x11_events_total,
             x11_property_replies_total: context.x11_property_replies_total,
             xwm_budget_exhaustions_total: context.xwm_budget_exhaustions_total,
@@ -334,6 +372,13 @@ impl NativeSlowCycleTrace {
         if active.record.total_ns <= active.record.refresh_interval_ns {
             return;
         }
+        if state.thread_cpu_enabled {
+            apply_thread_cpu_attribution(
+                &mut active.record,
+                active.thread_cpu_start_ns,
+                thread_cpu_time_ns(),
+            );
+        }
         let measured_phase_ns = [
             SlowCyclePhase::PostWakeMaintenance,
             SlowCyclePhase::PageflipDrain,
@@ -360,8 +405,9 @@ impl NativeSlowCycleTrace {
         } else {
             SlowCycleClass::Slow
         };
-        if state.records.len() == SLOW_CYCLE_RING_CAPACITY {
+        if state.records.len() == state.capacity {
             state.records.pop_front();
+            state.evicted_records = state.evicted_records.saturating_add(1);
         }
         state.records.push_back(active.record);
     }
@@ -378,12 +424,18 @@ impl NativeSlowCycleTrace {
         let Some(state) = self.state.as_ref() else {
             return;
         };
+        eprintln!(
+            "typhon_slow_cycle_trace clock=cycle_wall:CLOCK_MONOTONIC thread_cpu:CLOCK_THREAD_CPUTIME_ID off_cpu_estimate=wall_minus_thread_cpu_not_runqueue_delay capacity={} evicted_records={} thread_cpu_enabled={}",
+            state.capacity, state.evicted_records, state.thread_cpu_enabled,
+        );
         for record in &state.records {
             eprintln!(
-                "typhon_slow_cycle class={:?} start_ns={} total_ns={} refresh_ns={} wayland_dispatch_us={} input_backend_drain_us={} compositor_render_us={} unattributed_ns={} phases_ns={:?} wake=0x{:x} continuation=0x{:x} domains=0x{:x} ready_sources={} blocked_ns={} timer_lateness_ns={:?} x11_events={} x11_property_replies={} xwm_budget_exhausted={} xwm_events_translated={} xwm_commands_executed={} input_raw={} input_coalesced={} input_ready={} input_backlog_pending={} render_attempted={} frame_rendered={} frame_submitted={} pageflip_pending={} kms_queue_depth={} kms_worker_active={}",
+                "typhon_slow_cycle class={:?} start_ns={} total_ns={} thread_cpu_ns={:?} off_cpu_estimate_ns={:?} refresh_ns={} wayland_dispatch_us={} input_backend_drain_us={} compositor_render_us={} unattributed_ns={} phases_ns={:?} wake=0x{:x} continuation=0x{:x} domains=0x{:x} ready_sources={} blocked_ns={} timer_lateness_ns={:?} x11_events={} x11_property_replies={} xwm_budget_exhausted={} xwm_events_translated={} xwm_commands_executed={} input_raw={} input_coalesced={} input_ready={} input_backlog_pending={} render_attempted={} frame_rendered={} frame_submitted={} pageflip_pending={} kms_queue_depth={} kms_worker_active={}",
                 record.class,
                 record.cycle_start_ns,
                 record.total_ns,
+                record.thread_cpu_ns,
+                record.off_cpu_estimate_ns,
                 record.refresh_interval_ns,
                 record.wayland_dispatch_us,
                 record.input_backend_drain_us,
@@ -416,11 +468,38 @@ impl NativeSlowCycleTrace {
     }
 }
 
+fn parse_trace_capacity(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|capacity| capacity.clamp(1, SLOW_CYCLE_TRACE_MAX_CAPACITY))
+        .unwrap_or(SLOW_CYCLE_RING_CAPACITY)
+}
+
+fn apply_thread_cpu_attribution(
+    record: &mut SlowCycleRecord,
+    start_cpu_ns: Option<u64>,
+    end_cpu_ns: Option<u64>,
+) {
+    record.thread_cpu_ns = None;
+    record.off_cpu_estimate_ns = None;
+    let Some(thread_cpu_ns) = end_cpu_ns
+        .zip(start_cpu_ns)
+        .and_then(|(end, start)| end.checked_sub(start))
+    else {
+        return;
+    };
+    record.thread_cpu_ns = Some(thread_cpu_ns);
+    // The CPU clock sample is taken just after the monotonic end timestamp;
+    // saturating subtraction accounts for that measurement skew.
+    record.off_cpu_estimate_ns = Some(record.total_ns.saturating_sub(thread_cpu_ns));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeSlowCycleTrace, SLOW_CYCLE_RING_CAPACITY, SlowCycleClass, SlowCycleContext,
-        SlowCyclePhase,
+        NativeSlowCycleTrace, SLOW_CYCLE_RING_CAPACITY, SLOW_CYCLE_TRACE_MAX_CAPACITY,
+        SlowCycleClass, SlowCycleContext, SlowCyclePhase, apply_thread_cpu_attribution,
+        parse_trace_capacity,
     };
 
     fn context() -> SlowCycleContext {
@@ -526,6 +605,56 @@ mod tests {
             records.last().unwrap().cycle_start_ns,
             50 + (SLOW_CYCLE_RING_CAPACITY as u64 - 1) * 10
         );
+    }
+
+    #[test]
+    fn trace_capacity_parser_is_bounded_and_defaults_safely() {
+        assert_eq!(parse_trace_capacity(None), SLOW_CYCLE_RING_CAPACITY);
+        assert_eq!(parse_trace_capacity(Some("4096")), 4096);
+        assert_eq!(parse_trace_capacity(Some("0")), 1);
+        assert_eq!(
+            parse_trace_capacity(Some("999999")),
+            SLOW_CYCLE_TRACE_MAX_CAPACITY
+        );
+        assert_eq!(
+            parse_trace_capacity(Some("invalid")),
+            SLOW_CYCLE_RING_CAPACITY
+        );
+    }
+
+    #[test]
+    fn configured_ring_capacity_is_respected() {
+        let mut trace = NativeSlowCycleTrace::with_options(true, 3, false);
+        for index in 0..5 {
+            trace.start_cycle_after_wake(index * 10, 1, SlowCycleContext::default());
+            trace.finish_cycle(index * 10 + 2);
+        }
+
+        let records = trace.retained_records().collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].cycle_start_ns, 20);
+        assert_eq!(records[2].cycle_start_ns, 40);
+        assert_eq!(trace.state.as_ref().unwrap().evicted_records, 2);
+    }
+
+    #[test]
+    fn thread_cpu_time_is_distinguished_from_off_cpu_estimate() {
+        let mut record = super::SlowCycleRecord {
+            total_ns: 1_000,
+            ..super::SlowCycleRecord::default()
+        };
+        apply_thread_cpu_attribution(&mut record, Some(200), Some(900));
+
+        assert_eq!(record.thread_cpu_ns, Some(700));
+        assert_eq!(record.off_cpu_estimate_ns, Some(300));
+
+        apply_thread_cpu_attribution(&mut record, Some(200), Some(1_300));
+        assert_eq!(record.thread_cpu_ns, Some(1_100));
+        assert_eq!(record.off_cpu_estimate_ns, Some(0));
+
+        apply_thread_cpu_attribution(&mut record, None, Some(900));
+        assert_eq!(record.thread_cpu_ns, None);
+        assert_eq!(record.off_cpu_estimate_ns, None);
     }
 
     #[test]
