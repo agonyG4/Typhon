@@ -83,6 +83,37 @@ starts; if its deadline expires, the writer is detached and normal teardown
 continues. A blocked filesystem write can outlive that deadline, but cannot
 hold the reactor or compositor process open.
 
+## Writer startup lifecycle
+
+File recovery is asynchronous. `PresentationTraceWriter::start_with_config()`
+creates the existing bounded queues and one writer thread, then returns in the
+`Initializing` state without waiting for filesystem recovery. The worker sends
+its recovered source sequence through a one-slot readiness channel and waits
+for an explicit activation message before consuming trace batches. Only the
+reactor can send that message, so a timed-out or abandoned worker cannot
+activate itself later.
+
+The reactor polls readiness from its existing trace submission work; startup
+adds no timer or polling source. The reactor must accept readiness within one
+second of writer creation. The deadline is checked at those existing polls, so
+a first poll after the deadline fails closed even if recovery completed
+earlier. If readiness is an error, the worker panics, the result misses the
+deadline, or shutdown begins first, file export becomes `Disabled`. The
+in-memory trace ring remains available, and the runtime does not retry or spawn
+another writer for that trace source. Startup outcomes join the existing
+aggregated writer counters.
+
+Cancellation closes the readiness and activation channels and sets the worker
+stop flag. A filesystem call already in progress cannot generally be
+interrupted, so the reactor drops the `JoinHandle` and continues; that thread
+owns only its paths, file handles, channels, stop flag, and shared counters. It
+does not borrow runtime or renderer state. If the filesystem call returns, the
+worker observes the closed channel or stop flag and exits without entering the
+writer loop. Shutdown during initialization does not wait. Active-writer
+shutdown retains the existing 50 ms total budget, and a worker is joined only
+after its completion signal and `JoinHandle::is_finished()` both confirm it
+has finished; otherwise it is detached.
+
 Tracing remains opt-in through `OBLIVION_ONE_PRESENTATION_TRACE=1` or the
 existing cursor-responsiveness diagnostic setting. Without a trace output path,
 the ring can still provide bounded in-memory diagnostics. With diagnostics

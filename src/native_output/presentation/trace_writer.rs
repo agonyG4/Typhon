@@ -25,11 +25,13 @@ const MAX_TRACE_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_TRACE_MAX_FILES: usize = 4;
 const MAX_TRACE_FILES: usize = 16;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 struct TraceWriterConfig {
     max_file_bytes: u64,
     max_files: usize,
+    startup_timeout: Duration,
     shutdown_timeout: Duration,
 }
 
@@ -48,6 +50,7 @@ impl TraceWriterConfig {
         Self {
             max_file_bytes,
             max_files,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
@@ -67,6 +70,9 @@ struct TraceWriterStats {
     buffer_return_failures: AtomicU64,
     shutdown_unqueued_events: AtomicU64,
     shutdown_timeouts: AtomicU64,
+    startup_errors: AtomicU64,
+    startup_timeouts: AtomicU64,
+    startup_cancellations: AtomicU64,
     writer_panics: AtomicU64,
 }
 
@@ -78,6 +84,9 @@ impl TraceWriterStats {
         let return_failures = self.buffer_return_failures.load(Ordering::Relaxed);
         let shutdown_unqueued = self.shutdown_unqueued_events.load(Ordering::Relaxed);
         let shutdown_timeouts = self.shutdown_timeouts.load(Ordering::Relaxed);
+        let startup_errors = self.startup_errors.load(Ordering::Relaxed);
+        let startup_timeouts = self.startup_timeouts.load(Ordering::Relaxed);
+        let startup_cancellations = self.startup_cancellations.load(Ordering::Relaxed);
         let panics = self.writer_panics.load(Ordering::Relaxed);
         if write_errors == 0
             && stalls == 0
@@ -85,12 +94,15 @@ impl TraceWriterStats {
             && return_failures == 0
             && shutdown_unqueued == 0
             && shutdown_timeouts == 0
+            && startup_errors == 0
+            && startup_timeouts == 0
+            && startup_cancellations == 0
             && panics == 0
         {
             return;
         }
         eprintln!(
-            "typhon presentation trace writer: write_errors={write_errors} retries={} consumer_stalls={stalls} worker_disconnects={disconnects} buffer_return_failures={return_failures} events_enqueued={} events_written={} batches_written={} records_written={} bytes_written={} shutdown_unqueued_events={shutdown_unqueued} shutdown_timeouts={shutdown_timeouts} panics={panics}",
+            "typhon presentation trace writer: write_errors={write_errors} retries={} consumer_stalls={stalls} worker_disconnects={disconnects} buffer_return_failures={return_failures} events_enqueued={} events_written={} batches_written={} records_written={} bytes_written={} shutdown_unqueued_events={shutdown_unqueued} shutdown_timeouts={shutdown_timeouts} startup_errors={startup_errors} startup_timeouts={startup_timeouts} startup_cancellations={startup_cancellations} panics={panics}",
             self.retries.load(Ordering::Relaxed),
             self.events_enqueued.load(Ordering::Relaxed),
             self.events_written.load(Ordering::Relaxed),
@@ -285,7 +297,8 @@ impl TraceBatchProducer {
 }
 
 pub(crate) struct PresentationTraceWriter {
-    producer: TraceBatchProducer,
+    producer: Option<TraceBatchProducer>,
+    lifecycle: WriterLifecycle,
     worker: Option<JoinHandle<()>>,
     completion: Receiver<()>,
     stop_requested: Arc<AtomicBool>,
@@ -293,6 +306,36 @@ pub(crate) struct PresentationTraceWriter {
     config: TraceWriterConfig,
     closed: bool,
 }
+
+enum WriterLifecycle {
+    Initializing {
+        ready: Receiver<io::Result<Option<u128>>>,
+        activate: SyncSender<()>,
+        deadline: Instant,
+    },
+    Active,
+    Disabled,
+}
+
+enum StartupPoll {
+    Pending,
+    Ready(Option<u128>),
+    Failed,
+    TimedOut,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TraceWriterTestHooks {
+    before_recovery: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_recovery: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_ready_sent: Option<Arc<dyn Fn() + Send + Sync>>,
+    before_write: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Default)]
+struct TraceWriterTestHooks;
 
 impl PresentationTraceWriter {
     pub(crate) fn start(
@@ -306,6 +349,15 @@ impl PresentationTraceWriter {
         path: PathBuf,
         config: TraceWriterConfig,
         trace: &PresentationTransactionTraceRing,
+    ) -> io::Result<Self> {
+        Self::start_with_hooks(path, config, trace, TraceWriterTestHooks::default())
+    }
+
+    fn start_with_hooks(
+        path: PathBuf,
+        config: TraceWriterConfig,
+        trace: &PresentationTransactionTraceRing,
+        test_hooks: TraceWriterTestHooks,
     ) -> io::Result<Self> {
         let source_identity = trace.source_identity();
         let (sender, receiver) = mpsc::sync_channel(TRACE_QUEUE_BATCH_CAPACITY);
@@ -322,21 +374,42 @@ impl PresentationTraceWriter {
         let worker_stop = Arc::clone(&stop_requested);
         let (completion_sender, completion) = mpsc::sync_channel(1);
         let (ready_sender, ready) = mpsc::sync_channel(1);
+        let (activate_sender, activate_receiver) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + config.startup_timeout;
         let worker = thread::Builder::new()
             .name("typhon-trace-writer".to_owned())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if let Some(hook) = test_hooks.before_recovery.as_ref() {
+                        hook();
+                    }
                     let file_writer = TraceFileWriter::new(path, config);
                     match file_writer.resume_sequence(source_identity) {
                         Ok(last_sequence) => {
-                            let _ = ready_sender.send(Ok(last_sequence));
-                            run_writer(
-                                file_writer,
-                                receiver,
-                                reusable_sender,
-                                worker_stats.as_ref(),
-                                &worker_stop,
-                            );
+                            if worker_stop.load(Ordering::Acquire) {
+                                return;
+                            }
+                            #[cfg(test)]
+                            if let Some(hook) = test_hooks.after_recovery.as_ref() {
+                                hook();
+                            }
+                            if ready_sender.send(Ok(last_sequence)).is_ok() {
+                                #[cfg(test)]
+                                if let Some(hook) = test_hooks.after_ready_sent.as_ref() {
+                                    hook();
+                                }
+                                if activate_receiver.recv().is_ok() {
+                                    run_writer(
+                                        file_writer,
+                                        receiver,
+                                        reusable_sender,
+                                        worker_stats.as_ref(),
+                                        &worker_stop,
+                                        test_hooks,
+                                    );
+                                }
+                            }
                         }
                         Err(error) => {
                             let _ = ready_sender.send(Err(error));
@@ -349,28 +422,18 @@ impl PresentationTraceWriter {
                 let _ = completion_sender.try_send(());
             })?;
 
-        let last_enqueued_sequence = match ready.recv() {
-            Ok(Ok(sequence)) => sequence,
-            Ok(Err(error)) => {
-                worker.thread().unpark();
-                let _ = worker.join();
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = worker.join();
-                return Err(io::Error::other(
-                    "presentation trace writer failed during file recovery",
-                ));
-            }
-        };
-
         Ok(Self {
-            producer: TraceBatchProducer::new(
+            producer: Some(TraceBatchProducer::new(
                 sender,
                 reusable_batches,
                 Arc::clone(&stats),
-                last_enqueued_sequence,
-            ),
+                None,
+            )),
+            lifecycle: WriterLifecycle::Initializing {
+                ready,
+                activate: activate_sender,
+                deadline,
+            },
             worker: Some(worker),
             completion,
             stop_requested,
@@ -381,39 +444,132 @@ impl PresentationTraceWriter {
     }
 
     pub(crate) fn submit(&mut self, trace: &PresentationTransactionTraceRing) {
-        self.producer.submit(trace, false);
+        self.poll_startup();
+        if let Some(producer) = self.producer.as_mut()
+            && matches!(&self.lifecycle, WriterLifecycle::Active)
+        {
+            producer.submit(trace, false);
+        }
+    }
+
+    fn poll_startup(&mut self) {
+        let poll = match &self.lifecycle {
+            WriterLifecycle::Initializing {
+                ready, deadline, ..
+            } => {
+                if Instant::now() >= *deadline {
+                    StartupPoll::TimedOut
+                } else {
+                    match ready.try_recv() {
+                        Ok(Ok(sequence)) if Instant::now() < *deadline => {
+                            StartupPoll::Ready(sequence)
+                        }
+                        Ok(Ok(_)) | Err(TryRecvError::Empty) if Instant::now() >= *deadline => {
+                            StartupPoll::TimedOut
+                        }
+                        Ok(Ok(sequence)) => StartupPoll::Ready(sequence),
+                        Ok(Err(_)) | Err(TryRecvError::Disconnected) => StartupPoll::Failed,
+                        Err(TryRecvError::Empty) => StartupPoll::Pending,
+                    }
+                }
+            }
+            WriterLifecycle::Active | WriterLifecycle::Disabled => StartupPoll::Pending,
+        };
+
+        match poll {
+            StartupPoll::Pending => {}
+            StartupPoll::Ready(last_sequence) => {
+                let activated = match &self.lifecycle {
+                    WriterLifecycle::Initializing { activate, .. } => activate.try_send(()).is_ok(),
+                    WriterLifecycle::Active | WriterLifecycle::Disabled => false,
+                };
+                if activated {
+                    if let Some(producer) = self.producer.as_mut() {
+                        producer.last_enqueued_sequence = last_sequence;
+                    }
+                    self.lifecycle = WriterLifecycle::Active;
+                } else {
+                    self.stats.startup_errors.fetch_add(1, Ordering::Relaxed);
+                    self.abandon_initializing_writer();
+                }
+            }
+            StartupPoll::Failed => {
+                self.stats.startup_errors.fetch_add(1, Ordering::Relaxed);
+                self.abandon_initializing_writer();
+            }
+            StartupPoll::TimedOut => {
+                self.stats.startup_timeouts.fetch_add(1, Ordering::Relaxed);
+                self.abandon_initializing_writer();
+            }
+        }
+    }
+
+    fn abandon_initializing_writer(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        if let Some(producer) = self.producer.as_mut() {
+            producer.close();
+        }
+        self.lifecycle = WriterLifecycle::Disabled;
+        // Recovery may be inside an uninterruptible filesystem call. The
+        // worker owns no runtime state; dropping its handle detaches it.
+        self.worker.take();
+    }
+
+    fn abandon_initializing_writer_for_shutdown(&mut self) {
+        if matches!(&self.lifecycle, WriterLifecycle::Initializing { .. }) {
+            self.stats
+                .startup_cancellations
+                .fetch_add(1, Ordering::Relaxed);
+            self.abandon_initializing_writer();
+        }
     }
 
     pub(crate) fn shutdown(&mut self, trace: &PresentationTransactionTraceRing) {
         if self.closed {
             return;
         }
+        self.poll_startup();
+        self.abandon_initializing_writer_for_shutdown();
+        if !matches!(&self.lifecycle, WriterLifecycle::Active) {
+            if let Some(producer) = self.producer.as_mut() {
+                self.stats.shutdown_unqueued_events.fetch_add(
+                    producer.pending_event_count(trace.latest_sequence()),
+                    Ordering::Relaxed,
+                );
+                producer.close();
+            }
+            self.stop_requested.store(true, Ordering::Release);
+            self.closed = true;
+            self.stats.report_if_needed();
+            return;
+        }
         let deadline = Instant::now() + self.config.shutdown_timeout;
         let latest_sequence = trace.latest_sequence();
-        while self.producer.pending_event_count(latest_sequence) != 0 && Instant::now() < deadline {
-            self.producer.submit(trace, true);
-            if self.producer.pending_event_count(latest_sequence) != 0 {
+        let producer = self
+            .producer
+            .as_mut()
+            .expect("active trace writer has its producer");
+        while producer.pending_event_count(latest_sequence) != 0 && Instant::now() < deadline {
+            producer.submit(trace, true);
+            if producer.pending_event_count(latest_sequence) != 0 {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                self.producer
-                    .wait_for_writer_progress(remaining.min(Duration::from_millis(1)));
+                producer.wait_for_writer_progress(remaining.min(Duration::from_millis(1)));
             }
         }
         self.stats.shutdown_unqueued_events.fetch_add(
-            self.producer.pending_event_count(latest_sequence),
+            producer.pending_event_count(latest_sequence),
             Ordering::Relaxed,
         );
 
         self.stop_requested.store(true, Ordering::Release);
-        self.producer.close();
+        producer.close();
         if let Some(worker) = self.worker.as_ref() {
             worker.thread().unpark();
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match self.completion.recv_timeout(remaining) {
             Ok(()) => {
-                if let Some(worker) = self.worker.take() {
-                    let _ = worker.join();
-                }
+                self.join_worker_if_finished();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.stats.shutdown_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -426,6 +582,16 @@ impl PresentationTraceWriter {
         self.closed = true;
         self.stats.report_if_needed();
     }
+
+    fn join_worker_if_finished(&mut self) {
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        } else {
+            self.worker.take();
+        }
+    }
 }
 
 impl Drop for PresentationTraceWriter {
@@ -433,8 +599,16 @@ impl Drop for PresentationTraceWriter {
         if self.closed {
             return;
         }
+        self.abandon_initializing_writer_for_shutdown();
         self.stop_requested.store(true, Ordering::Release);
-        self.producer.close();
+        if let Some(producer) = self.producer.as_mut() {
+            producer.close();
+        }
+        if !matches!(&self.lifecycle, WriterLifecycle::Active) {
+            self.worker.take();
+            self.stats.report_if_needed();
+            return;
+        }
         if let Some(worker) = self.worker.as_ref() {
             worker.thread().unpark();
         }
@@ -442,9 +616,8 @@ impl Drop for PresentationTraceWriter {
             .completion
             .recv_timeout(self.config.shutdown_timeout)
             .is_ok()
-            && let Some(worker) = self.worker.take()
         {
-            let _ = worker.join();
+            self.join_worker_if_finished();
         }
         self.worker.take();
         self.stats.report_if_needed();
@@ -457,12 +630,19 @@ fn run_writer(
     reusable_sender: SyncSender<TraceBatch>,
     stats: &TraceWriterStats,
     stop_requested: &AtomicBool,
+    test_hooks: TraceWriterTestHooks,
 ) {
+    #[cfg(not(test))]
+    let _ = test_hooks;
     let mut output = String::with_capacity(TRACE_BATCH_EVENT_CAPACITY * 384);
     let mut retry_delay = Duration::from_millis(10);
     while let Ok(mut batch) = receiver.recv() {
         let mut written = false;
         loop {
+            #[cfg(test)]
+            if let Some(hook) = test_hooks.before_write.as_ref() {
+                hook();
+            }
             match file_writer.write_batch(&batch, &mut output) {
                 Ok(bytes) => {
                     stats
@@ -895,8 +1075,45 @@ mod tests {
         TraceWriterConfig {
             max_file_bytes,
             max_files,
+            startup_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(2),
         }
+    }
+
+    fn wait_until_active(writer: &mut PresentationTraceWriter) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            writer.poll_startup();
+            if matches!(&writer.lifecycle, WriterLifecycle::Active) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "trace writer did not become active"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn blocked_hook(
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(move || {
+            entered.wait();
+            release.wait();
+        })
+    }
+
+    fn set_startup_deadline(writer: &mut PresentationTraceWriter, deadline: Instant) {
+        let WriterLifecycle::Initializing {
+            deadline: writer_deadline,
+            ..
+        } = &mut writer.lifecycle
+        else {
+            panic!("writer is not initializing");
+        };
+        *writer_deadline = deadline;
     }
 
     fn unique_path(label: &str) -> PathBuf {
@@ -960,6 +1177,7 @@ mod tests {
             &ring,
         )
         .expect("writer thread starts");
+        wait_until_active(&mut writer);
         writer.submit(&ring);
         assert_eq!(writer.stats.events_enqueued.load(Ordering::Relaxed), 0);
         writer.shutdown(&ring);
@@ -971,6 +1189,210 @@ mod tests {
         assert!(first < second);
         assert!(contents.contains("\"transaction_id\":1"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_timeout_and_shutdown_do_not_wait_for_recovery() {
+        let path = unique_path("blocked-recovery").join("trace.jsonl");
+        let ring = PresentationTransactionTraceRing::new(8);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let started_at = Instant::now();
+        let mut writer = PresentationTraceWriter::start_with_hooks(
+            path,
+            TraceWriterConfig {
+                startup_timeout: Duration::from_millis(20),
+                shutdown_timeout: Duration::from_millis(30),
+                ..test_config(1024 * 1024, 2)
+            },
+            &ring,
+            TraceWriterTestHooks {
+                before_recovery: Some(blocked_hook(Arc::clone(&entered), Arc::clone(&release))),
+                ..TraceWriterTestHooks::default()
+            },
+        )
+        .expect("spawning the optional writer is enough to start");
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        entered.wait();
+        set_startup_deadline(&mut writer, Instant::now() - Duration::from_millis(1));
+        writer.poll_startup();
+        assert!(matches!(&writer.lifecycle, WriterLifecycle::Disabled));
+
+        let shutdown_started = Instant::now();
+        writer.shutdown(&ring);
+        writer.shutdown(&ring);
+        assert!(shutdown_started.elapsed() < Duration::from_millis(100));
+
+        release.wait();
+        assert!(
+            writer
+                .completion
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn readiness_queued_at_deadline_is_rejected_without_activation() {
+        let path = unique_path("ready-boundary").join("trace.jsonl");
+        let ring = PresentationTransactionTraceRing::new(8);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let mut writer = PresentationTraceWriter::start_with_hooks(
+            path,
+            TraceWriterConfig {
+                startup_timeout: Duration::from_millis(50),
+                ..test_config(1024 * 1024, 2)
+            },
+            &ring,
+            TraceWriterTestHooks {
+                after_ready_sent: Some(blocked_hook(Arc::clone(&entered), Arc::clone(&release))),
+                ..TraceWriterTestHooks::default()
+            },
+        )
+        .expect("writer thread starts");
+        entered.wait();
+        set_startup_deadline(&mut writer, Instant::now() - Duration::from_nanos(1));
+        release.wait();
+        writer.poll_startup();
+        assert!(matches!(&writer.lifecycle, WriterLifecycle::Disabled));
+        assert_eq!(writer.stats.startup_timeouts.load(Ordering::Relaxed), 1);
+        assert!(
+            writer
+                .completion
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        writer.shutdown(&ring);
+    }
+
+    #[test]
+    fn recovery_result_after_timeout_cannot_reactivate_or_start_export() {
+        let path = unique_path("late-recovery").join("trace.jsonl");
+        let ring = PresentationTransactionTraceRing::new(8);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let mut writer = PresentationTraceWriter::start_with_hooks(
+            path,
+            test_config(1024 * 1024, 2),
+            &ring,
+            TraceWriterTestHooks {
+                after_recovery: Some(blocked_hook(Arc::clone(&entered), Arc::clone(&release))),
+                ..TraceWriterTestHooks::default()
+            },
+        )
+        .expect("writer thread starts");
+        entered.wait();
+        set_startup_deadline(&mut writer, Instant::now() - Duration::from_millis(1));
+        writer.poll_startup();
+        assert!(matches!(&writer.lifecycle, WriterLifecycle::Disabled));
+        release.wait();
+        assert!(
+            writer
+                .completion
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        writer.poll_startup();
+        assert!(matches!(&writer.lifecycle, WriterLifecycle::Disabled));
+        assert_eq!(writer.stats.startup_timeouts.load(Ordering::Relaxed), 1);
+        writer.shutdown(&ring);
+    }
+
+    #[test]
+    fn worker_panic_before_readiness_disables_file_export() {
+        let path = unique_path("startup-panic").join("trace.jsonl");
+        let ring = PresentationTransactionTraceRing::new(8);
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let mut writer = PresentationTraceWriter::start_with_hooks(
+            path,
+            test_config(1024 * 1024, 2),
+            &ring,
+            TraceWriterTestHooks {
+                before_recovery: Some(Arc::new(move || {
+                    let _ = entered_sender.send(());
+                    panic!("injected trace recovery panic");
+                })),
+                ..TraceWriterTestHooks::default()
+            },
+        )
+        .expect("writer thread starts before recovery");
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reached recovery");
+        assert!(
+            writer
+                .completion
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        writer.poll_startup();
+        assert!(matches!(&writer.lifecycle, WriterLifecycle::Disabled));
+        assert_eq!(writer.stats.writer_panics.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.stats.startup_errors.load(Ordering::Relaxed), 1);
+        writer.shutdown(&ring);
+    }
+
+    #[test]
+    fn recovery_error_is_reported_as_disabled_optional_export() {
+        let root = unique_path("recovery-error");
+        fs::write(&root, b"the trace parent is not a directory").unwrap();
+        let path = root.join("trace.jsonl");
+        let ring = PresentationTransactionTraceRing::new(8);
+        let mut writer =
+            PresentationTraceWriter::start_with_config(path, test_config(1024 * 1024, 2), &ring)
+                .expect("filesystem recovery is asynchronous");
+        assert!(
+            writer
+                .completion
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        writer.poll_startup();
+        assert!(matches!(&writer.lifecycle, WriterLifecycle::Disabled));
+        assert_eq!(writer.stats.startup_errors.load(Ordering::Relaxed), 1);
+        writer.shutdown(&ring);
+        fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_for_a_writer_blocked_in_file_work() {
+        let path = unique_path("blocked-write").join("trace.jsonl");
+        let mut ring = PresentationTransactionTraceRing::new(8);
+        ring.push(event(1));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let mut writer = PresentationTraceWriter::start_with_hooks(
+            path,
+            TraceWriterConfig {
+                shutdown_timeout: Duration::from_millis(30),
+                ..test_config(1024 * 1024, 2)
+            },
+            &ring,
+            TraceWriterTestHooks {
+                before_write: Some(blocked_hook(Arc::clone(&entered), Arc::clone(&release))),
+                ..TraceWriterTestHooks::default()
+            },
+        )
+        .expect("writer thread starts");
+        wait_until_active(&mut writer);
+        writer
+            .producer
+            .as_mut()
+            .expect("active writer has a producer")
+            .submit(&ring, true);
+        entered.wait();
+        let shutdown_started = Instant::now();
+        writer.shutdown(&ring);
+        assert!(shutdown_started.elapsed() < Duration::from_millis(100));
+        assert_eq!(writer.stats.shutdown_timeouts.load(Ordering::Relaxed), 1);
+        release.wait();
+        assert!(
+            writer
+                .completion
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -986,6 +1408,7 @@ mod tests {
             &ring,
         )
         .expect("first writer starts");
+        wait_until_active(&mut first_writer);
         first_writer.submit(&ring);
         first_writer.shutdown(&ring);
 
@@ -1002,6 +1425,7 @@ mod tests {
             &ring,
         )
         .expect("writer restarts and truncates the incomplete tail");
+        wait_until_active(&mut restarted_writer);
         restarted_writer.submit(&ring);
         restarted_writer.shutdown(&ring);
 
@@ -1103,6 +1527,7 @@ mod tests {
             &ring,
         )
         .expect("writer thread starts");
+        wait_until_active(&mut writer);
         writer.shutdown(&ring);
 
         let mut total = 0;
@@ -1194,11 +1619,13 @@ mod tests {
             TraceWriterConfig {
                 max_file_bytes: 64 * 1024,
                 max_files: 2,
+                startup_timeout: Duration::from_secs(1),
                 shutdown_timeout: Duration::from_millis(100),
             },
             &ring,
         )
         .expect("writer thread starts even when the path will fail");
+        wait_until_active(&mut writer);
         fs::remove_dir_all(&root).unwrap();
         fs::write(&root, b"parent is now a regular file").unwrap();
         writer.submit(&ring);
@@ -1218,6 +1645,7 @@ mod tests {
         let mut writer =
             PresentationTraceWriter::start_with_config(path, test_config(64 * 1024, 1), &ring)
                 .expect("writer setup should not perform the failing write");
+        wait_until_active(&mut writer);
         writer.submit(&ring);
         writer.shutdown(&ring);
         assert!(writer.stats.write_errors.load(Ordering::Relaxed) > 0);
@@ -1302,11 +1730,13 @@ mod tests {
                 TraceWriterConfig {
                     max_file_bytes: 16 * 1024 * 1024,
                     max_files: 4,
+                    startup_timeout: Duration::from_secs(1),
                     shutdown_timeout: Duration::from_secs(10),
                 },
                 &streaming_ring,
             )
             .expect("streaming writer starts");
+            wait_until_active(&mut writer);
             let mut streaming_samples = Vec::with_capacity(iterations);
             for _ in 0..iterations {
                 let started_at = Instant::now();
