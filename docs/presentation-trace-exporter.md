@@ -180,14 +180,17 @@ latency result.
 | 4,096 | 23 ns | 73 / 84 / 91 ns | 1,032,396 B; 3.54 ms | 139 / 157 / 176 ns | 15,782 / 49,152; 77 ranges / 33,370 events; 123; 88; 3,988,087 B |
 | 65,536 | 23 ns | 72 / 135 / 151 ns | 16,580,813 B; 52.4 ms | 138 / 171 / 222 ns | 246,293 / 786,432; 1,263 ranges / 540,139 events; 1,920; 1,407; 62,528,051 B |
 
-The final column's loss ranges were parsed in sequence order across the active
-and rotated files. The benchmark asserts that every attempted event is either
-present as an event record or covered by exactly one loss range. `retention_drops`
-is a separate ring-overwrite counter: it also counts events that had already
-been persisted, so it is not the writer loss count. The producer deliberately
-ran much faster than a 165 Hz workload; the writer fell behind at the two larger
-capacities, but output stayed within the configured 16 MiB × 4 file bound and
-the loss was explicit.
+The benchmark parses retained loss ranges in sequence order across active and
+rotated files. It checks that the retained suffix is continuous through the
+last attempted sequence. If an older prefix expired, that suffix may start
+above one only when a `retention_expired` marker is present. Lifetime
+`producer_unpersisted_events` is computed from attempts minus successfully
+persisted event records; retained loss-range totals describe only the ranges
+still present on disk. `retention_drops` is a separate ring-overwrite counter:
+it also counts events that had already been persisted, so it is not the writer
+loss count. The producer deliberately ran much faster than a 165 Hz workload;
+the writer fell behind at the two larger capacities, but output stayed within
+the configured 16 MiB × 4 file bound and loss remained explicit.
 
 The benchmark also records pre-saturation and first-overwrite latency.
 First-overwrite results have one sample and are single observations, not
@@ -209,9 +212,13 @@ with no per-event formatting or vector growth; JSON formatting and file writes
 remain on the diagnostic thread.
 
 Runs were repeated, and scheduling variation affected stream loss and tail
-latency: at capacity 65,536, streaming p99 ranged from 222–267 ns, and the
-explicit loss count ranged from 531,393–540,139 events across three ordinary
-benchmark runs. Treat the p50/p95/p99 values as host-local indicative data.
+latency. Three earlier runs at capacity 65,536 had streaming p99 values from
+222–267 ns and producer loss from 531,393–540,139 events. A later run measured
+p50/p95/p99 of 249/303/2,518 ns after ten wraps and 541,692 producer-unpersisted
+events; it retained 61,620,640 bytes and did not expire file history. The larger
+tail sample shows that the p99 is sensitive to host scheduling and should not be
+treated as a stable compositor-latency result. These are host-local indicative
+microbenchmarks, not Cyberpunk responsiveness measurements.
 
 The CPU saturation probe now samples per-TID minor/major faults and voluntary /
 involuntary context switches from `/proc`, plus system `pswpin`/`pswpout` page
