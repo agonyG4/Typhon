@@ -441,6 +441,15 @@ mod tests {
     }
 
     #[test]
+    fn child_signal_wakeup_bypasses_controller_and_transport_fast_paths() {
+        let domains = NativeWorkDomains::classify(&wakeup(CHILD_SIGNAL), &state());
+
+        assert!(domains.children);
+        assert!(!domains.only_controller_work());
+        assert!(!domains.only_system_action_transport_work());
+    }
+
+    #[test]
     fn system_action_handshake_deadline_timer_is_transport_only_work() {
         let mut wakeup = wakeup(TIMER);
         wakeup.reasons.mark_system_action_transport();

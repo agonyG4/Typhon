@@ -580,7 +580,7 @@ impl NativeRuntime {
         {
             return Ok(());
         }
-        for exit in self.process_supervisor.reap_exited()? {
+        for exit in self.process_supervisor.reap_exited_after_signal_poll()? {
             let xwayland_exit = self.xwayland.handle_process_exit(&exit)?;
             if xwayland_exit {
                 self.revoke_xwayland_private_client();

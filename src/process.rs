@@ -431,6 +431,14 @@ impl ChildSupervisor {
         self.pending_termination_signal.take()
     }
 
+    /// Ingest pending SIGCHLD and compositor termination events without
+    /// processing child exits. A termination event remains available through
+    /// `take_termination_signal` if a later read fails, and suppresses future
+    /// child restarts immediately, even after its typed cause is taken.
+    pub fn poll_runtime_signals(&mut self) -> io::Result<()> {
+        self.drain_signal_fd()
+    }
+
     pub fn set_restart_guard(&mut self, guard: RestartGuard) {
         self.restart_guard = guard;
     }
@@ -561,7 +569,15 @@ impl ChildSupervisor {
     }
 
     pub fn reap_exited(&mut self) -> io::Result<Vec<ChildExit>> {
-        self.drain_signal_fd()?;
+        self.poll_runtime_signals()?;
+        self.reap_exited_after_signal_poll()
+    }
+
+    /// Reap child exits after the caller has ingested pending signal events.
+    /// Runtime cycles use this to attribute a termination request before any
+    /// fallible child or XWayland exit processing. Other callers should use
+    /// `reap_exited`, which preserves the poll-and-reap contract.
+    pub fn reap_exited_after_signal_poll(&mut self) -> io::Result<Vec<ChildExit>> {
         let mut exited = Vec::new();
         let ids = self.children.keys().copied().collect::<Vec<_>>();
         for id in ids {
@@ -815,30 +831,46 @@ impl ChildSupervisor {
     }
 
     fn drain_signal_fd(&mut self) -> io::Result<()> {
-        let Some(fd) = self.signal_fd.as_ref() else {
+        let Some(fd) = self.signal_fd.as_ref().map(AsRawFd::as_raw_fd) else {
             return Ok(());
         };
-        let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
-        loop {
+
+        self.drain_signal_fd_with(|info| {
             let read = unsafe {
                 libc::read(
-                    fd.as_raw_fd(),
+                    fd,
                     info.as_mut_ptr().cast(),
                     std::mem::size_of::<libc::signalfd_siginfo>(),
                 )
             };
             if read < 0 {
-                let error = io::Error::last_os_error();
-                return match error.kind() {
-                    io::ErrorKind::WouldBlock => Ok(()),
-                    io::ErrorKind::Interrupted => continue,
-                    _ => Err(error),
-                };
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(read as usize)
             }
+        })
+    }
+
+    fn drain_signal_fd_with(
+        &mut self,
+        mut read_signal: impl FnMut(
+            &mut std::mem::MaybeUninit<libc::signalfd_siginfo>,
+        ) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let mut info = std::mem::MaybeUninit::<libc::signalfd_siginfo>::uninit();
+        loop {
+            let read = match read_signal(&mut info) {
+                Ok(read) => read,
+                Err(error) => match error.kind() {
+                    io::ErrorKind::WouldBlock => return Ok(()),
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return Err(error),
+                },
+            };
             if read == 0 {
                 return Ok(());
             }
-            if usize::try_from(read).ok() != Some(std::mem::size_of::<libc::signalfd_siginfo>()) {
+            if read != std::mem::size_of::<libc::signalfd_siginfo>() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "short read from compositor signal descriptor",
@@ -848,6 +880,7 @@ impl ChildSupervisor {
             let signal = unsafe { info.assume_init_ref().ssi_signo as libc::c_int };
             if let Some(signal) = RuntimeTerminationSignal::from_raw(signal) {
                 self.pending_termination_signal.get_or_insert(signal);
+                self.begin_quiesce();
             }
         }
     }
@@ -1195,6 +1228,93 @@ mod tests {
         }
     }
 
+    fn write_signal_info(
+        info: &mut std::mem::MaybeUninit<libc::signalfd_siginfo>,
+        signal: libc::c_int,
+    ) {
+        unsafe {
+            info.write(std::mem::zeroed());
+            (*info.as_mut_ptr()).ssi_signo = signal as u32;
+        }
+    }
+
+    #[test]
+    fn termination_signal_survives_a_later_signal_fd_error_and_quiesces_restarts() {
+        let mut supervisor = ChildSupervisor::new();
+        let signal_size = std::mem::size_of::<libc::signalfd_siginfo>();
+        let mut reads = 0;
+
+        let error = supervisor
+            .drain_signal_fd_with(|info| {
+                reads += 1;
+                if reads == 1 {
+                    write_signal_info(info, libc::SIGTERM);
+                    Ok(signal_size)
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                }
+            })
+            .expect_err("the injected descriptor error remains visible");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            supervisor.take_termination_signal(),
+            Some(RuntimeTerminationSignal::Terminate)
+        );
+        assert!(supervisor.quiescing);
+    }
+
+    #[test]
+    fn signal_ingestion_retries_interrupted_reads_and_stops_at_eagain() {
+        let mut supervisor = ChildSupervisor::new();
+        let signal_size = std::mem::size_of::<libc::signalfd_siginfo>();
+        let mut reads = 0;
+
+        supervisor
+            .drain_signal_fd_with(|info| {
+                reads += 1;
+                match reads {
+                    1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    2 => {
+                        write_signal_info(info, libc::SIGCHLD);
+                        Ok(signal_size)
+                    }
+                    _ => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                }
+            })
+            .expect("EINTR is retried and EAGAIN ends the drain");
+
+        assert_eq!(reads, 3);
+        assert_eq!(supervisor.take_termination_signal(), None);
+        assert!(!supervisor.quiescing);
+    }
+
+    #[test]
+    fn short_signal_fd_read_is_reported_without_discarding_a_prior_signal() {
+        let mut supervisor = ChildSupervisor::new();
+        let signal_size = std::mem::size_of::<libc::signalfd_siginfo>();
+        let mut reads = 0;
+
+        let error = supervisor
+            .drain_signal_fd_with(|info| {
+                reads += 1;
+                if reads == 1 {
+                    write_signal_info(info, libc::SIGHUP);
+                    Ok(signal_size)
+                } else {
+                    Ok(1)
+                }
+            })
+            .expect_err("short signalfd records are rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            supervisor.take_termination_signal(),
+            Some(RuntimeTerminationSignal::Hangup)
+        );
+        assert!(supervisor.quiescing);
+    }
+
     #[test]
     fn launched_child_is_registered_with_supervisor() {
         let mut supervisor = ChildSupervisor::new();
@@ -1316,6 +1436,42 @@ mod tests {
             .expect("spawn child");
 
         supervisor.begin_quiesce();
+        let exits = wait_for_reap(&mut supervisor);
+
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].restarted_pid, None);
+        assert_eq!(supervisor.active_count(), 0);
+    }
+
+    #[test]
+    fn observed_termination_suppresses_restart_after_the_signal_is_taken() {
+        let mut supervisor = ChildSupervisor::new();
+        supervisor
+            .spawn_restartable(
+                || Ok(shell_command("exit 1")),
+                ProcessOptions::new(ProcessKind::ShellSessionCritical)
+                    .with_restart_policy(RestartPolicy::CriticalSessionComponent),
+            )
+            .expect("spawn restartable critical child");
+
+        let signal_size = std::mem::size_of::<libc::signalfd_siginfo>();
+        let mut reads = 0;
+        supervisor
+            .drain_signal_fd_with(|info| {
+                reads += 1;
+                if reads == 1 {
+                    write_signal_info(info, libc::SIGTERM);
+                    Ok(signal_size)
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EAGAIN))
+                }
+            })
+            .expect("ingest termination intent");
+        assert_eq!(
+            supervisor.take_termination_signal(),
+            Some(RuntimeTerminationSignal::Terminate)
+        );
+
         let exits = wait_for_reap(&mut supervisor);
 
         assert_eq!(exits.len(), 1);

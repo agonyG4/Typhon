@@ -211,16 +211,26 @@ impl NativeRuntime {
         );
         let mut signal_shutdown_requested = false;
         if work_domains.children || self.shutdown.state() == ShutdownState::StoppingChildren {
-            self.reap_supervised_children(&cycle)?;
+            let signal_poll_error = self.process_supervisor.poll_runtime_signals().err();
             if let Some(signal) = self.process_supervisor.take_termination_signal()
                 && self.shutdown.is_running()
             {
                 self.termination.record_signal_shutdown(signal.as_str());
-                self.request_native_shutdown()?;
+                if let Err(error) = self.request_native_shutdown_before_child_processing() {
+                    if let Some(signal_poll_error) = signal_poll_error {
+                        self.termination.record_cleanup_error(&signal_poll_error);
+                    }
+                    return Err(error);
+                }
                 signal_shutdown_requested = true;
             }
+            if let Some(error) = signal_poll_error {
+                return Err(error.into());
+            }
+            self.reap_supervised_children(&cycle)?;
         }
         if signal_shutdown_requested {
+            self.advance_shutdown_lifecycle_without_cycle()?;
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }

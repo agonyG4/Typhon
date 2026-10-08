@@ -667,7 +667,28 @@ mod tests {
         ProcessLiveness, RuntimePhase, TerminationRecordStatus, TerminationSnapshot,
         prune_stale_incomplete_runs, write_summary, write_summary_file,
     };
-    use std::{error::Error, fmt, fs, io, path::PathBuf};
+    use std::{error::Error, fmt, fs, io, path::PathBuf, process::Command};
+
+    struct RestoreSignalMask(libc::sigset_t);
+
+    impl RestoreSignalMask {
+        fn capture() -> Self {
+            let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            let result = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut old_mask)
+            };
+            assert_eq!(result, 0, "capture test-thread signal mask");
+            Self(old_mask)
+        }
+    }
+
+    impl Drop for RestoreSignalMask {
+        fn drop(&mut self) {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+            }
+        }
+    }
 
     fn test_output_path(name: &str) -> PathBuf {
         std::env::current_exe()
@@ -889,6 +910,130 @@ mod tests {
         let cause = journal.first_cause().expect("first signal cause");
         assert_eq!(cause.category, ExitCategory::Signal);
         assert_eq!(cause.signal, Some("SIGTERM"));
+    }
+
+    #[test]
+    fn a_preexisting_runtime_error_cannot_be_replaced_by_a_later_signal() {
+        let mut journal = NativeTerminationJournal::new();
+        journal.record_runtime_error(&io::Error::other("earlier reactor failure"));
+        journal.record_signal_shutdown("SIGTERM");
+
+        let cause = journal
+            .first_cause()
+            .expect("earlier runtime error remains");
+        assert_eq!(cause.category, ExitCategory::Error);
+        assert_eq!(cause.signal, None);
+        assert!(
+            cause
+                .error_chain
+                .as_deref()
+                .is_some_and(|error| error.contains("earlier reactor failure"))
+        );
+    }
+
+    #[test]
+    fn consumed_signal_precedes_a_later_child_reaping_error() {
+        use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions};
+
+        let _restore_mask = RestoreSignalMask::capture();
+        let mut supervisor = ChildSupervisor::with_sigchld_reaper().expect("create signalfd");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        let child = supervisor
+            .spawn(
+                command,
+                ProcessOptions::new(ProcessKind::Application).session_owned(false),
+            )
+            .expect("spawn child");
+
+        let mut child_status = 0;
+        let waited = unsafe {
+            libc::waitpid(
+                libc::pid_t::try_from(child).expect("child pid fits pid_t"),
+                &mut child_status,
+                0,
+            )
+        };
+        assert_eq!(waited, libc::pid_t::try_from(child).unwrap());
+
+        let signal_thread = unsafe { libc::pthread_self() };
+        assert_eq!(
+            unsafe { libc::pthread_kill(signal_thread, libc::SIGTERM) },
+            0
+        );
+        let mut readiness = libc::pollfd {
+            fd: supervisor.signal_fd().expect("signalfd fd"),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut readiness, 1, 2_000) };
+        assert_eq!(ready, 1, "SIGTERM is pending before child processing");
+
+        let mut journal = NativeTerminationJournal::new();
+        supervisor
+            .poll_runtime_signals()
+            .expect("read all pending signal records");
+        let signal = supervisor
+            .take_termination_signal()
+            .expect("SIGTERM was ingested before child processing");
+        journal.record_signal_shutdown(signal.as_str());
+
+        // The runtime requests shutdown here, before entering fallible child
+        // and XWayland exit processing.
+        let reap_result = supervisor.reap_exited_after_signal_poll();
+        if let Err(error) = &reap_result {
+            // NativeRuntime::run classifies this later failure as cleanup
+            // because the signal cause has already been published.
+            journal.record_runtime_error(error);
+        }
+
+        assert!(reap_result.is_err(), "external wait makes try_wait fail");
+        let cause = journal.first_cause().expect("termination cause");
+        assert_eq!(cause.category, ExitCategory::Signal);
+        assert_eq!(cause.signal, Some("SIGTERM"));
+        assert_eq!(journal.cleanup_error_count, 1);
+        assert!(journal.cleanup_error.as_deref().is_some_and(|error| {
+            error.contains("No child processes") || error.contains("no child processes")
+        }));
+    }
+
+    #[test]
+    fn child_reaping_error_without_a_termination_signal_remains_primary() {
+        use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions};
+
+        let mut supervisor = ChildSupervisor::new();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        let child = supervisor
+            .spawn(
+                command,
+                ProcessOptions::new(ProcessKind::Application).session_owned(false),
+            )
+            .expect("spawn child");
+        let mut child_status = 0;
+        let waited = unsafe {
+            libc::waitpid(
+                libc::pid_t::try_from(child).expect("child pid fits pid_t"),
+                &mut child_status,
+                0,
+            )
+        };
+        assert_eq!(waited, libc::pid_t::try_from(child).unwrap());
+
+        let mut journal = NativeTerminationJournal::new();
+        supervisor
+            .poll_runtime_signals()
+            .expect("no signal descriptor means no events");
+        assert_eq!(supervisor.take_termination_signal(), None);
+        let error = supervisor
+            .reap_exited_after_signal_poll()
+            .expect_err("external wait makes try_wait fail");
+        journal.record_runtime_error(&error);
+
+        let cause = journal.first_cause().expect("child error is primary");
+        assert_eq!(cause.category, ExitCategory::Error);
+        assert_eq!(cause.signal, None);
+        assert_eq!(journal.cleanup_error_count, 0);
     }
 
     #[test]

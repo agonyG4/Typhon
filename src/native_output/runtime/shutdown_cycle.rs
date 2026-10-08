@@ -3,6 +3,16 @@ use super::*;
 
 impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
+        self.request_native_shutdown_inner(true)
+    }
+
+    /// Queue a signal-driven request before child processing, then let the
+    /// caller advance the lifecycle after XWayland has handled current exits.
+    pub(super) fn request_native_shutdown_before_child_processing(&mut self) -> NativeResult<()> {
+        self.request_native_shutdown_inner(false)
+    }
+
+    fn request_native_shutdown_inner(&mut self, advance_without_cycle: bool) -> NativeResult<()> {
         self.termination.set_phase(RuntimePhase::ShutdownRequest);
         self.fail_pending_screen_captures("session_inactive");
         self.quiesce_system_action_transport();
@@ -91,7 +101,11 @@ impl NativeRuntime {
             }
             None => native_shutdown_debug_log("shutdown_requested_duplicate"),
         }
-        self.advance_shutdown_lifecycle_without_cycle()
+        if advance_without_cycle {
+            self.advance_shutdown_lifecycle_without_cycle()
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn advance_shutdown_lifecycle_without_cycle(&mut self) -> NativeResult<()> {
