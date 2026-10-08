@@ -26,7 +26,7 @@ pub fn run(
 
 #[cfg(test)]
 mod trace_export_tests {
-    use super::{NativeResult, TraceExport, write_presentation_trace_export};
+    use super::{NativeResult, TraceExport, TraceExportRecord, write_presentation_trace_export};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,29 +44,25 @@ mod trace_export_tests {
     fn failed_trace_export_keeps_cursor_for_retry() -> NativeResult<()> {
         let (root, path) = unique_trace_path();
         std::fs::create_dir_all(&path)?;
-        let previous = Some((4, 0));
+        let previous = Some(4);
         let mut export_cursor = previous;
+        let export = TraceExport::Append(vec![TraceExportRecord::LostRange {
+            process_id: std::process::id(),
+            source_id: 1,
+            from_sequence: 5,
+            to_sequence: 5,
+        }]);
 
         assert!(
-            write_presentation_trace_export(
-                &path,
-                TraceExport::Append("event\n".to_owned()),
-                (5, 0),
-                &mut export_cursor,
-            )
-            .is_err()
+            write_presentation_trace_export(&path, export.clone(), Some(5), &mut export_cursor,)
+                .is_err()
         );
         assert_eq!(export_cursor, previous);
 
         std::fs::remove_dir_all(&path)?;
-        write_presentation_trace_export(
-            &path,
-            TraceExport::Append("event\n".to_owned()),
-            (5, 0),
-            &mut export_cursor,
-        )?;
-        assert_eq!(export_cursor, Some((5, 0)));
-        assert_eq!(std::fs::read_to_string(&path)?, "event\n");
+        write_presentation_trace_export(&path, export, Some(5), &mut export_cursor)?;
+        assert_eq!(export_cursor, Some(5));
+        assert!(std::fs::read_to_string(&path)?.contains("\"to_sequence\":5"));
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1754,15 +1750,19 @@ impl NativeRuntime {
 fn write_presentation_trace_export(
     path: &std::path::Path,
     export: TraceExport,
-    cursor: (usize, u64),
-    export_cursor: &mut Option<(usize, u64)>,
+    cursor: Option<u128>,
+    export_cursor: &mut Option<u128>,
 ) -> NativeResult<()> {
     match export {
         TraceExport::Unchanged => return Ok(()),
-        TraceExport::Append(delta) => {
-            if delta.is_empty() {
-                *export_cursor = Some(cursor);
+        TraceExport::Append(records) => {
+            if records.is_empty() {
+                *export_cursor = cursor;
                 return Ok(());
+            }
+            let mut delta = String::with_capacity(records.len().saturating_mul(160));
+            for record in records {
+                append_trace_record_jsonl(&mut delta, record);
             }
             std::fs::OpenOptions::new()
                 .create(true)
@@ -1770,13 +1770,7 @@ fn write_presentation_trace_export(
                 .open(path)?
                 .write_all(delta.as_bytes())?;
         }
-        TraceExport::Replace(contents) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, contents)?;
-        }
     }
-    *export_cursor = Some(cursor);
+    *export_cursor = cursor;
     Ok(())
 }
