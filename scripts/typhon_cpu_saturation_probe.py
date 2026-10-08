@@ -19,7 +19,14 @@ OUTPUT_ROOT = Path("/mnt/Aether/Desktop/GitHub")
 PROC_ROOT = Path("/proc")
 SYS_CPU_ROOT = Path("/sys/devices/system/cpu")
 THERMAL_ROOT = Path("/sys/class/thermal")
-THREAD_METRICS = ("cpu_percent", "runnable_wait_ms_per_second")
+THREAD_METRICS = (
+    "cpu_percent",
+    "runnable_wait_ms_per_second",
+    "minor_faults_per_second",
+    "major_faults_per_second",
+    "voluntary_context_switches_per_second",
+    "involuntary_context_switches_per_second",
+)
 
 
 def parse_schedstat(contents: str) -> tuple[int, int, int]:
@@ -58,6 +65,41 @@ def parse_proc_start_time(contents: str) -> int:
     return parse_proc_stat(contents)[1]
 
 
+def parse_proc_stat_counters(contents: str) -> dict[str, int]:
+    """Read Linux task start time, minor faults, and major faults."""
+    closing_parenthesis = contents.rfind(")")
+    if closing_parenthesis < 0:
+        raise ValueError("process stat is missing the comm terminator")
+    fields = contents[closing_parenthesis + 1 :].split()
+    if len(fields) <= 19 or len(fields[0]) != 1:
+        raise ValueError("process stat is missing task counters")
+    try:
+        return {
+            "start_time_ticks": int(fields[19]),
+            "minor_faults": int(fields[7]),
+            "major_faults": int(fields[9]),
+        }
+    except ValueError as error:
+        raise ValueError("process stat task counters must be integers") from error
+
+
+def parse_proc_status_context_switches(contents: str) -> dict[str, int]:
+    """Read voluntary and involuntary context-switch counters from proc status."""
+    keys = {
+        "voluntary_ctxt_switches": "voluntary_context_switches",
+        "nonvoluntary_ctxt_switches": "involuntary_context_switches",
+    }
+    result = {}
+    for line in contents.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name in keys:
+            try:
+                result[keys[name]] = int(value.strip())
+            except ValueError as error:
+                raise ValueError("context-switch counters must be integers") from error
+    return result
+
+
 def parse_psi(contents: str) -> dict[str, dict[str, float | int]]:
     """Parse Linux pressure-stall information without filling missing fields."""
     result: dict[str, dict[str, float | int]] = {}
@@ -85,6 +127,17 @@ def parse_cpu_stat(contents: str) -> dict[str, int]:
         fields = line.split()
         if len(fields) == 2:
             result[fields[0]] = int(fields[1])
+    return result
+
+
+def parse_vmstat(contents: str) -> dict[str, int]:
+    """Return global page swap-in and swap-out counters in pages."""
+    selected = {"pswpin": "swap_in_pages", "pswpout": "swap_out_pages"}
+    result = {}
+    for line in contents.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] in selected:
+            result[selected[fields[0]]] = int(fields[1])
     return result
 
 
@@ -314,6 +367,7 @@ def system_snapshot() -> dict[str, Any]:
     return {
         "pressure": pressures,
         "memory": memory,
+        "vmstat": parse_vmstat(read_text(Path("/proc/vmstat")) or ""),
         "cpu_frequency": {"readings": len(frequencies), "mean_khz": mean_frequency},
         "kernel_schedstats_enabled": read_text(
             Path("/proc/sys/kernel/sched_schedstats")
@@ -358,16 +412,23 @@ def thread_snapshot(pid: int) -> dict[int, dict[str, Any]]:
             continue
         schedstat_contents = read_text(task_path / "schedstat")
         task_stat_contents = read_text(task_path / "stat")
+        task_status_contents = read_text(task_path / "status")
         counters = None
         if schedstat_contents is not None:
             try:
                 counters = parse_schedstat(schedstat_contents)
             except ValueError:
                 pass
-        start_time_ticks = None
+        task_counters = None
         if task_stat_contents is not None:
             try:
-                start_time_ticks = parse_proc_stat(task_stat_contents)[1]
+                task_counters = parse_proc_stat_counters(task_stat_contents)
+            except ValueError:
+                pass
+        context_switches = None
+        if task_status_contents is not None:
+            try:
+                context_switches = parse_proc_status_context_switches(task_status_contents)
             except ValueError:
                 pass
         try:
@@ -384,7 +445,11 @@ def thread_snapshot(pid: int) -> dict[int, dict[str, Any]]:
             affinity = None
         result[tid] = {
             "name": read_text(task_path / "comm"),
-            "start_time_ticks": start_time_ticks,
+            "start_time_ticks": task_counters.get("start_time_ticks") if task_counters else None,
+            "minor_faults": task_counters.get("minor_faults") if task_counters else None,
+            "major_faults": task_counters.get("major_faults") if task_counters else None,
+            "voluntary_context_switches": context_switches.get("voluntary_context_switches") if context_switches else None,
+            "involuntary_context_switches": context_switches.get("involuntary_context_switches") if context_switches else None,
             "runtime_ns": counters[0] if counters else None,
             "runnable_wait_ns": counters[1] if counters else None,
             "timeslices": counters[2] if counters else None,
@@ -414,9 +479,13 @@ def sampled_threads(
             ("runtime_ns", "runtime_delta_ns"),
             ("runnable_wait_ns", "runnable_wait_delta_ns"),
             ("timeslices", "timeslices_delta"),
+            ("minor_faults", "minor_faults_delta"),
+            ("major_faults", "major_faults_delta"),
+            ("voluntary_context_switches", "voluntary_context_switches_delta"),
+            ("involuntary_context_switches", "involuntary_context_switches_delta"),
         ):
-            current_value = thread[counter]
-            prior_value = prior[counter] if prior is not None else None
+            current_value = thread.get(counter)
+            prior_value = prior.get(counter) if prior is not None else None
             delta = None
             if (
                 current_value is not None
@@ -437,6 +506,18 @@ def sampled_threads(
             if wait_delta is not None and elapsed_ns > 0
             else None
         )
+        for counter in (
+            "minor_faults",
+            "major_faults",
+            "voluntary_context_switches",
+            "involuntary_context_switches",
+        ):
+            delta = row[f"{counter}_delta"]
+            row[f"{counter}_per_second"] = (
+                delta / elapsed_ns * 1_000_000_000
+                if delta is not None and elapsed_ns > 0
+                else None
+            )
         result.append(row)
     return result
 
@@ -545,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
     sample_count = 0
     previous_threads = thread_snapshot(args.pid)
     previous_cgroup = cgroup_snapshot(cgroup_path)
+    previous_system = system_snapshot()
     previous_time_ns = time.monotonic_ns()
     deadline_ns = previous_time_ns + int(args.duration * 1_000_000_000)
     interrupted = False
@@ -561,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             current_time_ns = time.monotonic_ns()
             current_threads = thread_snapshot(args.pid)
             current_cgroup = cgroup_snapshot(cgroup_path)
+            current_system = system_snapshot()
             elapsed_ns = current_time_ns - previous_time_ns
             threads = sampled_threads(current_threads, previous_threads, elapsed_ns)
             sample = {
@@ -568,7 +651,12 @@ def main(argv: list[str] | None = None) -> int:
                 "sequence": sample_count + 1,
                 "monotonic_ns": current_time_ns,
                 "elapsed_ns": elapsed_ns,
-                "system": system_snapshot(),
+                "system": {
+                    **current_system,
+                    "vmstat_delta": counter_delta(
+                        current_system.get("vmstat"), previous_system.get("vmstat")
+                    ),
+                },
                 "cgroup": {
                     **(current_cgroup or {}),
                     "cpu_stat_delta": counter_delta(
@@ -593,6 +681,7 @@ def main(argv: list[str] | None = None) -> int:
                         metric_observations[thread_key][metric].append(float(value))
             previous_threads = current_threads
             previous_cgroup = current_cgroup
+            previous_system = current_system
             previous_time_ns = current_time_ns
     except KeyboardInterrupt:
         interrupted = True

@@ -9,8 +9,11 @@ from scripts.typhon_cpu_saturation_probe import (
     parse_meminfo,
     parse_psi,
     parse_proc_stat,
+    parse_proc_stat_counters,
     parse_proc_start_time,
+    parse_proc_status_context_switches,
     parse_schedstat,
+    parse_vmstat,
     percentile,
     percentile_summary,
     sampled_threads,
@@ -49,6 +52,25 @@ class ParseSchedstatTests(unittest.TestCase):
             with self.subTest(contents=contents), self.assertRaises(ValueError):
                 parse_proc_start_time(contents)
 
+    def test_reads_task_fault_counters_from_proc_stat(self) -> None:
+        fields = ["R"] + [str(value) for value in range(4, 23)]
+        self.assertEqual(
+            parse_proc_stat_counters(f"123 (typhon) {' '.join(fields)}"),
+            {"start_time_ticks": 22, "minor_faults": 10, "major_faults": 12},
+        )
+
+    def test_reads_context_switch_counters_from_proc_status(self) -> None:
+        self.assertEqual(
+            parse_proc_status_context_switches(
+                "Name:\ttyphon\nvoluntary_ctxt_switches:\t19\n"
+                "nonvoluntary_ctxt_switches:\t4\n"
+            ),
+            {
+                "voluntary_context_switches": 19,
+                "involuntary_context_switches": 4,
+            },
+        )
+
 
 class ParsePressureTests(unittest.TestCase):
     def test_parses_present_pressure_fields(self) -> None:
@@ -73,6 +95,12 @@ class ParsePressureTests(unittest.TestCase):
         )
         self.assertEqual(parsed["mem_available_bytes"], 409_600)
         self.assertEqual(parsed["swap_used_bytes"], 1_536_000)
+
+    def test_vmstat_reports_active_swap_io_counters_in_pages(self) -> None:
+        self.assertEqual(
+            parse_vmstat("pswpin 120\npgfault 4000\npswpout 17\n"),
+            {"swap_in_pages": 120, "swap_out_pages": 17},
+        )
 
 
 class CounterTests(unittest.TestCase):
@@ -153,6 +181,36 @@ class CounterTests(unittest.TestCase):
         self.assertEqual(result[0]["cpu_percent"], 20.0)
         self.assertEqual(result[0]["runnable_wait_ms_per_second"], 100.0)
         self.assertIsNone(result[1]["runtime_delta_ns"])
+
+    def test_thread_delta_reports_faults_and_context_switch_rates(self) -> None:
+        previous = {
+            10: {
+                "start_time_ticks": 7,
+                "runtime_ns": 0,
+                "runnable_wait_ns": 0,
+                "timeslices": 0,
+                "minor_faults": 10,
+                "major_faults": 2,
+                "voluntary_context_switches": 4,
+                "involuntary_context_switches": 1,
+            }
+        }
+        current = {
+            10: {
+                **previous[10],
+                "minor_faults": 16,
+                "major_faults": 3,
+                "voluntary_context_switches": 10,
+                "involuntary_context_switches": 3,
+            }
+        }
+        result = sampled_threads(current, previous, 2_000_000_000)[0]
+        self.assertEqual(result["minor_faults_delta"], 6)
+        self.assertEqual(result["major_faults_delta"], 1)
+        self.assertEqual(result["voluntary_context_switches_delta"], 6)
+        self.assertEqual(result["involuntary_context_switches_delta"], 2)
+        self.assertEqual(result["major_faults_per_second"], 0.5)
+        self.assertEqual(result["involuntary_context_switches_per_second"], 1.0)
 
     def test_does_not_compute_deltas_across_reused_thread_ids(self) -> None:
         previous = {
