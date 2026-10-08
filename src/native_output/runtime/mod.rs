@@ -1033,8 +1033,12 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        let panic_unwinding = self.termination.record_panic_if_unwinding();
         let snapshot = self.termination_snapshot();
         self.termination.capture_pre_cleanup_snapshot(snapshot);
+        if panic_unwinding {
+            self.termination.persist_fatal_checkpoint();
+        }
         self.termination.set_phase(RuntimePhase::EmergencyCleanup);
         self.fail_pending_screen_captures("session_inactive");
         self.dmem_foreground.shutdown();

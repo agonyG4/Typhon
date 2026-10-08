@@ -17,6 +17,7 @@ const MAX_SUMMARY_BYTES: usize = 16_384;
 pub(super) enum ExitCategory {
     Normal,
     Error,
+    Panic,
     Unknown,
 }
 
@@ -28,6 +29,7 @@ pub(super) enum ExitFailureKind {
     KmsWorker,
     Seat,
     KmsTeardown,
+    Panic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -277,6 +279,31 @@ impl NativeTerminationJournal {
             phase,
             error_chain: Some(format_error_chain(error)),
         });
+    }
+
+    pub(super) fn record_panic_if_unwinding(&mut self) -> bool {
+        if !std::thread::panicking() {
+            return false;
+        }
+
+        if self.first_cause.is_some() {
+            self.record_cleanup_error(&io::Error::other(
+                "panic during native runtime cleanup; see Rust panic output for details",
+            ));
+            return true;
+        }
+
+        let phase = self.runtime_phase;
+        self.record_first_cause(TerminationCause {
+            category: ExitCategory::Panic,
+            failure_kind: Some(ExitFailureKind::Panic),
+            phase,
+            error_chain: Some(
+                "Rust panic during native runtime unwinding; see Rust panic output for details"
+                    .to_string(),
+            ),
+        });
+        true
     }
 
     pub(super) fn record_cleanup_error(&mut self, error: &dyn Error) {
@@ -596,6 +623,73 @@ mod tests {
         let chain = cause.error_chain.as_deref().expect("captured error chain");
         assert!(chain.contains("outer: inner reactor failure"));
         assert!(chain.contains("inner reactor failure"));
+    }
+
+    #[test]
+    fn panic_during_native_unwind_is_recorded_before_cleanup() {
+        let mut journal = NativeTerminationJournal::new();
+        journal.set_phase(RuntimePhase::ReactorWait);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            struct RecordPanicOnDrop<'a>(&'a mut NativeTerminationJournal);
+
+            impl Drop for RecordPanicOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.record_panic_if_unwinding();
+                }
+            }
+
+            let _record_panic = RecordPanicOnDrop(&mut journal);
+            panic!("simulated native runtime panic");
+        }));
+
+        assert!(unwind.is_err());
+        let cause = journal.first_cause().expect("panic is the first cause");
+        assert_eq!(cause.category, ExitCategory::Panic);
+        assert_eq!(cause.failure_kind, Some(ExitFailureKind::Panic));
+        assert_eq!(cause.phase, RuntimePhase::ReactorWait);
+        assert!(
+            cause
+                .error_chain
+                .as_deref()
+                .is_some_and(|chain| chain.contains("Rust panic"))
+        );
+    }
+
+    #[test]
+    fn panic_during_cleanup_does_not_replace_the_first_runtime_error() {
+        let mut journal = NativeTerminationJournal::new();
+        journal.set_phase(RuntimePhase::ReactorWait);
+        journal.record_runtime_error(&io::Error::other("first reactor failure"));
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            struct RecordPanicOnDrop<'a>(&'a mut NativeTerminationJournal);
+
+            impl Drop for RecordPanicOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.record_panic_if_unwinding();
+                }
+            }
+
+            let _record_panic = RecordPanicOnDrop(&mut journal);
+            panic!("simulated cleanup panic");
+        }));
+
+        assert!(unwind.is_err());
+        let cause = journal.first_cause().expect("first runtime error remains");
+        assert_eq!(cause.category, ExitCategory::Error);
+        assert!(
+            cause
+                .error_chain
+                .as_deref()
+                .is_some_and(|chain| chain.contains("first reactor failure"))
+        );
+        assert!(
+            journal
+                .summary(None, TerminationRecordStatus::FatalCheckpoint)
+                .cleanup_error
+                .is_some_and(|error| error.contains("panic during native runtime cleanup"))
+        );
     }
 
     #[test]
