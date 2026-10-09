@@ -24,8 +24,11 @@ The retained records distinguish these clock domains and stages:
 - Monotonic input-batch materialization, dispatch start/completion, and cursor-arbitration times.
 - Hit-test counter and CPU-time deltas for the sampled dispatch.
 - Effect-scene resolution duration where resolution is associated with that cycle. A missing value is unknown, not zero.
-- Cursor epoch, disposition, and supersession.
+- Cursor epoch, policy (`auto`, `piggyback`, or `software`), arbitration reason, pending-since age, freshness deadline, overdue age, retry-not-before, and supersession.
+- Primary carrier/ownership state, physical cursor target sequence and presentation time, worker wake time, and commit-complete deadline.
 - A transaction joined by output and epoch, subject to matching arbitration and build-time constraints; worker queue, KMS submit start/return, and pageflip observation values appear only when present.
+
+Each sampled input record is followed by an `arbitration_evidence` JSONL record. Cursor age at arbitration is recorded directly; age at transaction build, worker queue, KMS submit, and pageflip is derived from the preserved pending-since timestamp and the exact same output/epoch transaction join. These ages retain the original pending-since timestamp across coalesced epochs and retries. A missing join is reported as missing data, not zero latency. Pageflip-derived cursor age is still an observed presentation interval, not optical visibility.
 
 Percentile records include their valid sample count. Do not interpret a percentile from fewer than 1,000 observations as a stable tail estimate. KMS queue wait uses only worker transactions with both queue and submit-start timestamps. Submission-to-pageflip is an observed transaction interval, not optical latency.
 
@@ -60,6 +63,34 @@ findmnt -T /mnt/Aether/Desktop/GitHub
 On the host used to prepare this procedure, the focused Hyprland output was DP-1 at 1920×1080, scale 1, `164.99899` Hz; the selected NVIDIA device was GeForce RTX 3060 Ti with driver 615.71.09. Treat these as a dated host observation, not a requirement. Record the actual output, refresh, GPU, and driver for each qualification session. Typhon's `OBLIVION_ONE_MODE` parser rounds a fractional refresh to integer Hz; for that observed mode, the corresponding exact selector is `1920x1080@165`.
 
 The active desktop in this environment is not Typhon. Do not invoke either Typhon startup script during this preflight or while doing the current desktop work. Hardware runs are a later, explicit operator action from a TTY only when replacing the current session is intended.
+
+## Auto versus Piggyback hardware A/B
+
+Run the same release binary and keep every setting other than `OBLIVION_ONE_CURSOR_SCHEDULING` fixed. Do not let a script restart the active desktop compositor. Start Typhon manually from the intended TTY session, use the same recorded 165 Hz mode for both runs, and keep `OBLIVION_ONE_CURSOR=hardware`.
+
+First compare with low-overhead tracing disabled:
+
+1. Steam visible, continuous UI updates and scrolling, and several visible windows, at 165 Hz with the hardware cursor.
+2. Repeat that same desktop workload with Cyberpunk running.
+
+Use matched run lengths and repeat the order in both directions where practical. Record the binary SHA, mode, VRR/tearing settings, GPU/driver, pointer device/rate, applications, and workload duration. For each policy, run the same Fish launch block from the TTY, changing only the marked scheduling value:
+
+```fish
+set -gx OBLIVION_ONE_PROFILE release
+set -gx OBLIVION_ONE_BINARY /mnt/Aether/Desktop/GitHub/Typhon-target/release/oblivion-one
+set -gx OBLIVION_ONE_MODE '1920x1080@165'
+set -gx OBLIVION_ONE_CURSOR hardware
+set -gx OBLIVION_ONE_VRR auto
+set -gx OBLIVION_ONE_TEARING off
+set -gx OBLIVION_ONE_CURSOR_SCHEDULING auto # set to piggyback for the baseline run
+exec /home/agony/GitHub/Typhon/bin/start-oblivion-one-tty
+```
+
+The second run uses the identical block and binary with `OBLIVION_ONE_CURSOR_SCHEDULING=piggyback`. If the actual display mode or VRR/tearing policy differs from these example values, record the real settings and use those same values in both runs. Do not compare different binaries or change cursor, mode, VRR, or tearing settings between arms.
+
+After the subjective low-overhead comparison, repeat both workloads with the existing cursor-responsiveness and presentation traces enabled. Keep all trace settings identical between the Auto and Piggyback runs, write each run to a separate trace file, and do not restart the compositor automatically.
+
+Report p50/p95/p99 and observation counts for input batch → dispatch complete, dispatch complete → arbitration, arbitration → transaction build, arbitration → worker queue, worker queue → KMS submit, KMS submit duration, submit return → pageflip observation, and cursor age at arbitration/worker queue/KMS submit/pageflip. Also report policy and reason ratios, independent PlaneDelta submissions per second, ready-primary piggybacks, unready-primary bypass decisions, EBUSY retries, target misses, primary presentation rate, and primary target misses. Pageflip remains a compositor/kernel observation, not optical cursor latency.
 
 ## Trial matrix
 

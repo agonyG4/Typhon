@@ -2,7 +2,7 @@
 
 ## Status and evidence
 
-The current checkout is authoritative. The supplied archive `Typhon-source(20261008-141911).zip` and RFC `TYPHON_CURSOR_RESPONSIVENESS_ARCHITECTURE_RFC_2026-10-08.md` were not present under `/home/agony`; no source comparison against those files was possible. The CodebaseMCP project was `home-agony-GitHub-Typhon`, generation `2026-10-08T15:34:35Z`, full index mode. Its coverage report marked `cycle_dispatch.rs:2010` and `presentation_cycle.rs:299` as parse-partial; those ranges were read directly. `frame.rs` had changed metadata after edits and was read directly as well.
+The current live checkout is authoritative. CodebaseMCP was refreshed as `home-agony-GitHub-Typhon`, generation `2026-10-09T14:22:54Z`. Its coverage report marked `cycle_dispatch.rs:2019` and `presentation_cycle.rs:301` as parse-partial; those ranges and the required runtime source were read directly. The supplied task's source findings were confirmed, including primary-first disposition, policy modes not being distinguished, refresh-boundary deadlines, EBUSY deadline sliding, scene prediction leaking into PlaneDelta target planning, worker wake pacing, and acquire/prepare preceding cursor presentation.
 
 | Evidence class | Finding |
 |---|---|
@@ -24,6 +24,7 @@ libinput fd readiness
        -> pointer constraints, focus/hit testing, seat events
        -> canonical pointer and cursor desired state
   -> input-routing checkpoints before later cycle tail work
+  -> matured Auto cursor-service checkpoint before acquire/prepare
   -> render_present_and_update_metrics
        -> effect frame-demand query
        -> cursor image/visibility and plane eligibility
@@ -42,10 +43,10 @@ The actual code dispatches bounded input work; it does not equate each physical 
 | Semantic input, seat, focus, constraints | `NativeInputState` and `CompositorState`; pointer scene hit testing is in `src/compositor/state/hit_testing.rs`. It already has generation-qualified cache and owner-locality fast paths, with a front-to-back scan fallback. |
 | Cursor image and desired position | Existing cursor manager / atomic cursor state, including cursor image revision, hotspot, visibility, and desired epoch. The output cursor arbitration does not own a second pointer-position truth. |
 | Scene and effects | `CompositorState` owns effect bindings and `EffectSceneSummary`; `OwnCompositorServer` exposes the frame-demand query. `ResolvedNativeFrameScene` captures presentation-specific effect damage and animation-owner influences. |
-| Presentation decision | `NativeCursorOutputArbitration` selects `PiggybackPrimary`, `DeferForPrimary`, `SubmitPlaneDelta`, software overlay, or no operation. Primary work retains priority; an eligible, due idle hardware cursor can use a plane delta. |
+| Presentation decision | `NativeCursorOutputArbitration` tracks cursor age, a KMS service opportunity, retry timing, and primary/KMS ownership. Auto distinguishes an attachable ready carrier from dirty scene work and an owned KMS lane. |
 | KMS submission and completion | One `AtomicCommitArbiter` and the existing worker/output transaction path own Atomic admission, submission, and completion identity. Cursor scheduling is a class within that authority, not a second submitter. |
 
-The input batch budget and checkpoints bound work between reactor opportunities. They do not guarantee a real-time bound: kernel scheduling, the compositor thread's non-interruptible sections, GPU/EGL waits, Atomic backpressure, and driver behavior remain relevant. The source alone cannot determine which of those dominated the hardware observation.
+The input batch budget bounds dispatch. The cursor checkpoint runs after pageflip drain, bounded input, session/shutdown checks, and output-transition checks, immediately before acquire/prepare. It calls the same cursor presentation helper, `AtomicCommitArbiter`, output transaction ledger, and KMS worker as the later presentation path. It does not resolve effects or render scene work. It is enabled only for a matured Auto hardware cursor without an attachable primary carrier; it skips independent admission when a ready frame, worker/KMS ownership, or unavailable worker lane blocks it. Primary acquire/prepare continues after cursor admission or deferral. Kernel scheduling, GPU/EGL waits, Atomic backpressure, and driver behavior still limit any real-world bound.
 
 ## Scene-on-change implementation
 
@@ -53,7 +54,7 @@ The input batch budget and checkpoints bound work between reactor opportunities.
 
 `CompositorState::effect_frame_demand_snapshot()` now returns the default snapshot when the published continuous count is zero. When that count is nonzero, it retains the existing `resolved_effect_scene().frame_demand_snapshot()` path so dynamic effects continue to advance and current dirty regions are preserved. No new generation counter, parallel scene cache, retained surface reference, KMS owner, or cross-thread state was added.
 
-The summary's validity depends on existing mutation publication: surface effect binding/removal, trusted effect/material changes, blur assignment and scene publication, and background-effect changes refresh or replace it. The optimization depends on those mutation paths continuing to publish the summary. Tests exercise 20 static per-surface effects without scene resolution and a continuous effect with live dirty-region resolution. Existing rendering, cursor policy, KMS ordering, direct scanout, buffering, and VRR policy are unchanged.
+The summary's validity depends on existing mutation publication: surface effect binding/removal, trusted effect/material changes, blur assignment and scene publication, and background-effect changes refresh or replace it. The optimization depends on those mutation paths continuing to publish the summary. Tests exercise 20 static per-surface effects without scene resolution and a continuous effect with live dirty-region resolution. The effect optimization leaves rendering, KMS ordering, direct scanout, buffering, and VRR policy unchanged. Cursor scheduling is described separately below.
 
 ## Effect-anchor diagnostics
 
@@ -61,13 +62,21 @@ Presentation effect influences are used to attach effect influence regions to wi
 
 The current bounded diagnostic uses two process-wide atomic occurrence counters, disabled unless `TYPHON_EFFECT_OWNER_DIAGNOSTICS=1`; teardown emits one aggregate line per nonzero reason. It retains constant memory and performs no per-occurrence formatting or synchronous I/O. A missing presentation owner can describe a legitimate non-window surface as well as an unmapped/stale reference. The current lookup does not carry enough identity/classification data to distinguish those cases, and the old IDs 3, 4, and 7 cannot be classified retrospectively. Do not interpret the aggregate count as proof of stale ownership. The repeated-frame test uses a fixed effect scene for 10,000 resolutions, checks bounded counter accumulation, and verifies physical damage each time.
 
-## Cursor arbitration decision
+## Cursor scheduling policies and service opportunities
 
-No arbitration policy change was made. The existing disposition order is explicit: no pending desired epoch means `Noop`; pending primary work chooses `PiggybackPrimary`; a cursor before its response deadline is deferred while a primary response window is open; an eligible due hardware cursor with no software overlay need chooses `SubmitPlaneDelta`; remaining work is software overlay. Desired cursor epoch and image state are selected for a plane plan, then carried by the existing output transaction identity and KMS arbiter/worker. Worker admission and KMS submission are distinct from KMS acceptance and later pageflip feedback; feedback is matched by output generation and transaction/token identity. Pageflip feedback still does not measure optical cursor visibility.
+The existing `OBLIVION_ONE_CURSOR_SCHEDULING` modes now have distinct meanings:
 
-Submitted-epoch settlement clears only the matching current desired epoch. If a newer desired epoch arrived while the older submission was in flight, the newer epoch remains pending with a refreshed response window. This latest-wins display-state handling does not coalesce away ordered client input events.
+- `auto` uses a KMS-timed service opportunity. It waits for an attachable ready primary carrier, then permits an independent PlaneDelta at that target's decision deadline when no binding primary target or occupied KMS lane owns the opportunity. Dirty or unready primary scene work alone does not defer a matured cursor indefinitely.
+- `piggyback` preserves legacy primary-first behavior and is the same-binary A/B rollback baseline.
+- `software` keeps cursor presentation on the existing software path.
 
-This policy can permit repeated piggybacking while primary work remains ready. No bounded-fairness change is justified without measured cursor age, primary deadlines, worker reservations, in-flight state, VRR policy, and A/B comparison. Cursor movement remains latest-wins for display state while protocol input events retain semantic order. A high polling-rate mouse does not imply one KMS commit per event.
+Auto derives a physical `PresentationTarget` and `KmsSubmitWindow` from the existing presentation deadline and KMS timing model. The target decision deadline is the worker wake time minus a 2 ms transaction-preparation guard. PlaneDelta planning uses this cursor guard plus KMS apply and dispatch costs; full primary scene prediction is excluded. Advisory scheduled visual targets do not become cursor carriers. Reserved primary targets remain ordering lower bounds, including while their scene is unrendered, so an independent cursor target follows the reservation.
+
+Cursor motion replaces the desired latest epoch while the same physical service opportunity remains pending. `pending_since_ns` preserves original cursor age. EBUSY sets `retry_not_before_ns` without resetting that age or moving the absolute freshness deadline. Trace evidence includes retry timing and overdue age. If a physical opportunity is missed, a later target can be planned while the absolute age remains. Matured deadlines are omitted from future wake requests to avoid a past-deadline spin.
+
+The reactor checkpoint runs before acquire/prepare because source tracing showed that primary preparation could otherwise run before the later cursor decision. It does not cancel or mutate queued/frozen transactions and does not independently admit work when a primary is ready, attachable, or owns the lane. Cursor submission continues through the exact output transaction, cursor revision, generation, framebuffer pin, Atomic arbiter, worker, and pageflip token paths. Sidecars remain latest-wins only before primary freeze. Existing async/tearing and direct-scanout validation remain authoritative. Pageflip feedback is a presentation observation, not optical visibility.
+
+Motion-only late-latching remains out of scope. It would need a separately justified frozen image, visibility, hotspot, capability, framebuffer, and output-generation contract plus evidence for the submitted motion revision.
 
 ## Upstream comparison
 
@@ -87,6 +96,6 @@ Smithay, wlroots, and Mutter implement useful components, not a reason to replac
 
 `docs/cursor-responsiveness-diagnostics.md` specifies bounded per-motion / transaction tracing and repeatable empty-versus-populated workspace trials. Hardware runs must use the actual target NVIDIA system and report input-service age, hit testing, effect resolution, cursor disposition, KMS queue/submit/feedback intervals, per-thread scheduling, primary pacing, and trace overhead separately. Pageflip feedback is not optical cursor latency.
 
-No hardware A/B trial was run for this change. The host reports an NVIDIA GeForce RTX 3060 Ti with driver `615.71.09` and a connected `card0-DP-1`, but an Xorg/Hyprland session currently owns `seat0` and no Typhon process is running. The active refresh mode and Typhon's 165 Hz path were not verified; starting a second native compositor on that seat would disturb the user's running session.
+No hardware A/B trial was run for this change. The active desktop belongs to another compositor; this work did not restart or replace it. Existing host information is a dated observation and does not qualify Typhon cursor latency.
 
-The full requested scenario matrix, numeric p50/p95/p99 before/after comparison, GPU cost, and NVIDIA/VRR/Direct Scanout qualification remain open until the hardware trials are run. Advanced spatial indexing, arbitration fairness changes, input priorities, and cross-thread scene work remain gated on those measurements. The missing-owner aggregate does not distinguish legitimate non-window anchors from stale mappings; improving that classification requires the owner registry to expose a safe bounded reason code.
+The scenario matrix, numeric p50/p95/p99 before/after comparison, GPU cost, and NVIDIA/VRR/Direct Scanout qualification remain open until hardware trials run. Deterministic tests establish policy behavior and ordering invariants; they do not prove cursor-age improvement or primary-throughput parity on hardware. The missing-owner aggregate does not distinguish legitimate non-window anchors from stale mappings; improving that classification requires the owner registry to expose a safe bounded reason code.
