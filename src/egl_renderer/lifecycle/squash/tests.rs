@@ -163,6 +163,15 @@ fn assert_squash_textures_have_filter(
     }
 }
 
+fn set_squash_test_texture_filter(gl: &glow::Context, texture: glow::Texture, filter: u32) {
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+}
+
 #[test]
 fn squash_uses_linear_sampling_for_each_resolved_window_texture() {
     let mut harness = GlesEffectTestHarness::new(4, 4);
@@ -175,6 +184,62 @@ fn squash_uses_linear_sampling_for_each_resolved_window_texture() {
         2,
         "both lifecycle textures must reach an executed GLES draw"
     );
+    assert_squash_textures_have_filter(&harness.gl, textures, glow::LINEAR as i32);
+}
+
+#[test]
+fn squash_tracks_filter_per_texture_across_consecutive_commands() {
+    let mut harness = GlesEffectTestHarness::new(4, 4);
+    let textures = prepare_two_window_sampling_draw(&mut harness);
+    set_squash_test_texture_filter(&harness.gl, textures[0], glow::NEAREST);
+    set_squash_test_texture_filter(&harness.gl, textures[1], glow::LINEAR);
+    let first = harness.renderer.lifecycle.squash.commands[0].clone();
+    let second = harness.renderer.lifecycle.squash.commands[1].clone();
+    let mut first_nearest = first.clone();
+    first_nearest.command.sampling = SurfaceSampling::ExactNearest;
+    let mut first_linear = first;
+    first_linear.command.sampling = SurfaceSampling::ScaledLinear;
+    let mut second_nearest = second;
+    second_nearest.command.sampling = SurfaceSampling::ExactNearest;
+    harness.renderer.lifecycle.squash.commands = vec![
+        first_nearest.clone(),
+        first_linear,
+        first_nearest,
+        second_nearest,
+    ];
+
+    draw_squash_sampling_pass(&mut harness);
+
+    assert_eq!(
+        harness.renderer.lifecycle.evidence().consumed.len(),
+        2,
+        "both lifecycle windows must reach an executed GLES draw"
+    );
+    assert_eq!(
+        sampling_test_texture_filters(&harness.gl, textures[0]),
+        (glow::NEAREST as i32, glow::NEAREST as i32),
+        "the first texture must follow its final ExactNearest command"
+    );
+    assert_eq!(
+        sampling_test_texture_filters(&harness.gl, textures[1]),
+        (glow::NEAREST as i32, glow::NEAREST as i32),
+        "the second texture must receive ExactNearest after the first texture alternates modes"
+    );
+}
+
+#[test]
+fn squash_reapplies_filter_after_an_earlier_pass_changes_texture_state() {
+    let mut harness = GlesEffectTestHarness::new(4, 4);
+    let textures = prepare_two_window_sampling_draw(&mut harness);
+    for texture in textures {
+        set_squash_test_texture_filter(&harness.gl, texture, glow::NEAREST);
+    }
+    for command in &mut harness.renderer.lifecycle.squash.commands {
+        command.command.sampling = SurfaceSampling::ScaledLinear;
+    }
+
+    draw_squash_sampling_pass(&mut harness);
+
     assert_squash_textures_have_filter(&harness.gl, textures, glow::LINEAR as i32);
 }
 
