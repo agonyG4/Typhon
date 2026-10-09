@@ -4,13 +4,15 @@ use super::commit_timing::{
 };
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
-    NativeCursorOutputDisposition, NativeRepaintInputs, cursor_output_disposition_at_deadline,
-    native_repaint_decision, update_cursor_output_arbitration,
+    NativeCursorOutputDisposition, NativeCursorPrimaryState, NativeRepaintInputs,
+    cursor_output_disposition_for_primary_state, native_repaint_decision,
+    update_cursor_output_arbitration,
 };
 use super::planner::{
-    NativePresentationPath, NativePresentationPlanInput, pacing_mode_for_target,
-    pending_target_for_scanout, plan_native_presentation_path, plan_visual_target_for_budget,
-    prepare_presentation_target, reactive_or_commit_timing_target,
+    NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
+    pacing_mode_for_target, pending_target_for_scanout, plan_cursor_service_opportunity,
+    plan_native_presentation_path, plan_visual_target_for_budget, prepare_presentation_target,
+    reactive_or_commit_timing_target,
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
@@ -423,6 +425,34 @@ impl NativeRuntime {
             atomic_cursor.as_ref(),
             *cursor_render_mode,
         );
+        let scheduler_now = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let refresh_interval = Duration::from_nanos(output_refresh_rate.interval_ns());
+        let prediction = render_journal.prediction_at_with_kms_guard(
+            scheduler_now,
+            refresh_interval,
+            presentation_timing.apply_guard_ns(),
+        );
+        frame_pacing.note_prediction(prediction);
+        let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
+        let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
+        let pending_target = if explicit_output {
+            pending_target_for_scanout(scanout)?
+        } else {
+            None
+        };
+        let primary_ordering_target =
+            cursor_primary_ordering_target(*scheduled_presentation_target, pending_target);
+        let cursor_target_opportunity = plan_cursor_service_opportunity(
+            presentation_deadline,
+            presentation_timing,
+            scheduler_now,
+            primary_ordering_target,
+            prediction.kms_dispatch_budget_ns,
+        );
+        let cursor_service_opportunity = (*cursor_scheduling_policy
+            == super::frame::NativeCursorSchedulingPolicy::Auto)
+            .then_some(cursor_target_opportunity)
+            .flatten();
         log_client_cursor_path_if_changed(
             *output_id,
             last_client_cursor_path,
@@ -438,12 +468,14 @@ impl NativeRuntime {
         let (_cursor_epoch_changed, cursor_deadline_due, cursor_work_pending) =
             update_cursor_output_arbitration(
                 cursor_output_arbitration,
+                *cursor_scheduling_policy,
                 cursor_epoch,
                 *last_submitted_cursor_epoch,
                 pacing_now_ns,
                 frame_scheduler,
                 client_cursor_software_work,
                 hardware_cursor_work_pending,
+                cursor_service_opportunity,
             );
         let primary_redraw_requested = primary_redraw_requested(
             redraw_requested,
@@ -484,16 +516,6 @@ impl NativeRuntime {
         } else if repaint_decision.protocol_only_present {
             frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
         }
-        let scheduler_now = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let refresh_interval = Duration::from_nanos(output_refresh_rate.interval_ns());
-        let prediction = render_journal.prediction_at_with_kms_guard(
-            scheduler_now,
-            refresh_interval,
-            presentation_timing.apply_guard_ns(),
-        );
-        frame_pacing.note_prediction(prediction);
-        let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
-        let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
         let vrr_policy = *vrr_policy;
         let tearing_policy = oblivion_one::compositor::TearingPolicy::from_environment(
             std::env::var("OBLIVION_ONE_TEARING").ok().as_deref(),
@@ -508,11 +530,6 @@ impl NativeRuntime {
             tearing_policy.allows_async_request() && solitary_fullscreen && surface_async_hint;
         let reactive_presentation_candidate =
             phase1_reactive_pacing_candidate(adaptive_sync_candidate, async_candidate);
-        let pending_target = if explicit_output {
-            pending_target_for_scanout(scanout)?
-        } else {
-            None
-        };
         let triple_capability = match scanout.explicit_output_swapchain() {
             Some(swapchain) => derive_triple_capability(TripleCapabilityInputs {
                 atomic_kms: kms_backend.effective_kind() == KmsBackendKind::Atomic,
@@ -816,26 +833,60 @@ impl NativeRuntime {
             || atomic_commit_blocks_cursor
             || scanout.ready_frame_queued();
         let cursor_disposition = if cursor_state_changed {
-            let disposition = cursor_output_disposition_at_deadline(
+            let queued_kind = atomic_commit_arbiter.worker_queued_kind();
+            let submitted_kind = atomic_commit_arbiter.kernel_submitted_kind();
+            let primary_state = NativeCursorPrimaryState {
+                primary_scene_work_pending: primary_work_for_cursor,
+                ready_primary_carrier_attachable: sidecar_opportunity,
+                primary_target_owned: scanout.ready_frame_queued(),
+                primary_worker_queued: queued_kind.is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        AtomicCommitKind::CompositedPrimary { .. }
+                            | AtomicCommitKind::DirectPrimary { .. }
+                    )
+                }),
+                primary_kernel_submitted: submitted_kind.is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        AtomicCommitKind::CompositedPrimary { .. }
+                            | AtomicCommitKind::DirectPrimary { .. }
+                    )
+                }),
+                independent_kms_admission: (!atomic_commit_arbiter.atomic_commit_pending()
+                    || can_queue_worker_cursor)
+                    && !scanout.ready_frame_queued()
+                    && (!worker_mode || worker_queue_available || can_queue_worker_cursor),
+            };
+            let disposition = cursor_output_disposition_for_primary_state(
                 cursor_output_arbitration,
                 *cursor_scheduling_policy,
                 scheduler_now.get(),
-                primary_work_for_cursor,
+                primary_state,
                 cursor_plane_update_usable,
             );
-            cursor_responsiveness.record_arbitration(
+            cursor_responsiveness.record_arbitration_evidence(
                 cycle.cursor_motion_sample_id,
                 *output_id,
                 cursor_output_arbitration
                     .pending()
                     .then_some(cursor_output_arbitration.desired_epoch()),
                 scheduler_now.get(),
+                *cursor_scheduling_policy,
+                cursor_output_arbitration,
+                primary_state,
+                cursor_output_arbitration
+                    .service_opportunity()
+                    .or(cursor_service_opportunity),
                 disposition,
             );
             disposition
         } else {
             NativeCursorOutputDisposition::Noop
         };
+        let auto_independent_service_due = *cursor_scheduling_policy
+            == super::frame::NativeCursorSchedulingPolicy::Auto
+            && cursor_disposition == NativeCursorOutputDisposition::SubmitPlaneDelta;
         let plane_delta_allowed =
             cursor_disposition == NativeCursorOutputDisposition::SubmitPlaneDelta;
         let presentation_path = plan_native_presentation_path(NativePresentationPlanInput {
@@ -845,11 +896,13 @@ impl NativeRuntime {
                 && !pending_interactive_visual_work,
             direct_candidate_changed,
             direct_candidate_eligible,
-            primary_visual_work_pending: primary_visual_work_pending && !sidecar_opportunity,
+            primary_visual_work_pending: primary_visual_work_pending
+                && !sidecar_opportunity
+                && !auto_independent_service_due,
             cursor_changed: cursor_state_changed,
             cursor_hardware_usable,
             cursor_visible,
-            composition_required,
+            composition_required: composition_required && !auto_independent_service_due,
             atomic_commit_pending: atomic_commit_blocks_cursor,
             plane_delta_allowed,
             render_ahead_requested: scheduler_decision == SchedulerDecision::RenderAhead,
@@ -867,35 +920,24 @@ impl NativeRuntime {
             && let Some(cursor) = atomic_cursor.as_mut()
             && (!atomic_commit_arbiter.atomic_commit_pending() || can_queue_worker_cursor)
             && !scanout.ready_frame_queued()
+            && (*cursor_scheduling_policy != super::frame::NativeCursorSchedulingPolicy::Auto
+                || cursor_output_arbitration.service_opportunity().is_some()
+                || cursor_service_opportunity.is_some())
         {
             let desired = effective_cursor.clone();
-            let cursor_target = (*scheduled_presentation_target)
-                .or_else(|| {
-                    pending_target.and_then(|pending_target| {
-                        presentation_deadline.reactive_target_after(
-                            scheduler_now,
-                            predicted_total_cost,
-                            pending_target,
-                        )
-                    })
-                })
-                .or_else(|| {
-                    presentation_deadline.reactive_target(scheduler_now, predicted_total_cost)
-                })
-                .ok_or_else(|| {
-                    io::Error::other("cursor-only Atomic output has no presentation target")
-                })?;
-            let cursor_submit_window = presentation_timing
-                .submit_window(
-                    cursor_target.presentation_time.get(),
-                    cursor_target.submit_not_before().get(),
-                    prediction.kms_dispatch_budget_ns,
-                )
-                .map(Some)
-                .unwrap_or_else(|_| {
-                    presentation_timing.record_unreachable_target();
-                    None
-                });
+            let cursor_opportunity =
+                if *cursor_scheduling_policy == super::frame::NativeCursorSchedulingPolicy::Auto {
+                    cursor_output_arbitration
+                        .service_opportunity()
+                        .or(cursor_target_opportunity)
+                } else {
+                    cursor_target_opportunity
+                };
+            let opportunity = cursor_opportunity.ok_or_else(|| {
+                io::Error::other("cursor-only Atomic output has no reachable KMS opportunity")
+            })?;
+            let (cursor_target, cursor_submit_window) =
+                (opportunity.target, Some(opportunity.submit_window));
             #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
             let Some(decision) = present_cursor_for_presentation(
                 worker_mode,

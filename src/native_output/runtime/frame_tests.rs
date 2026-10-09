@@ -1,6 +1,6 @@
 use crate::native_output::runtime::frame::{
     NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorRenderMode,
-    NativeFrameRenderer, ResolvedNativeFrameScene,
+    NativeCursorSchedulingPolicy, NativeFrameRenderer, ResolvedNativeFrameScene,
 };
 use crate::native_output::runtime::frame_scene_identity::{
     finalize_snapshot, reset_snapshot_work_counters, snapshot_work_counters, visibility_signature,
@@ -524,8 +524,222 @@ fn cursor_submit_consumes_only_exact_queued_epoch() {
 
     assert!(arbitration.pending());
     assert_eq!(arbitration.desired_epoch(), 11);
-    assert_eq!(arbitration.deadline_ns(), Some(200));
+    assert_eq!(arbitration.deadline_ns(), Some(100));
+    assert_eq!(arbitration.pending_since_ns(), Some(1));
+    assert_eq!(arbitration.pending_age_ns(120), Some(119));
 
     arbitration.consume_submitted_epoch(11, 220, 300);
     assert!(!arbitration.pending());
+}
+
+#[test]
+fn busy_retry_moves_transport_retry_without_sliding_cursor_service_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request_hardware(1, 100, 200);
+
+    for (busy_at_ns, retry_not_before_ns) in [(500, 600), (700, 800), (900, 1_000)] {
+        arbitration.note_kms_busy_retry();
+        arbitration.set_retry_not_before(retry_not_before_ns);
+
+        assert_eq!(arbitration.deadline_ns(), Some(200));
+        assert_eq!(arbitration.pending_since_ns(), Some(100));
+        assert_eq!(
+            arbitration.pending_age_ns(busy_at_ns),
+            Some(busy_at_ns - 100)
+        );
+        assert_eq!(arbitration.retry_not_before_ns(), Some(retry_not_before_ns));
+        assert!(!arbitration.due(retry_not_before_ns - 1));
+        assert!(arbitration.due(retry_not_before_ns));
+        assert_eq!(
+            arbitration.wake_deadline_ns(busy_at_ns),
+            Some(retry_not_before_ns)
+        );
+        assert_eq!(arbitration.wake_deadline_ns(retry_not_before_ns), None);
+    }
+    assert_eq!(arbitration.kms_busy_retries, 3);
+}
+
+#[test]
+fn matured_cursor_deadline_remains_due_without_requesting_a_past_wake() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request_hardware(1, 10, 20);
+
+    assert_eq!(arbitration.wake_deadline_ns(19), Some(20));
+    assert!(arbitration.due(20));
+    assert_eq!(arbitration.wake_deadline_ns(20), None);
+    assert_eq!(arbitration.wake_deadline_ns(100), None);
+    assert!(arbitration.pending());
+}
+
+#[test]
+fn auto_prefers_ready_carriers_and_never_steals_owned_or_busy_lanes() {
+    use super::NativeCursorPrimaryState;
+
+    let mut ready_arbitration = NativeCursorOutputArbitration::default();
+    ready_arbitration.request_hardware(1, 10, 20);
+    assert_eq!(
+        super::cursor_output_disposition_for_primary_state(
+            &mut ready_arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            20,
+            NativeCursorPrimaryState {
+                ready_primary_carrier_attachable: true,
+                primary_scene_work_pending: true,
+                independent_kms_admission: false,
+                ..Default::default()
+            },
+            true,
+        ),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+
+    let mut queued_carrier_arbitration = NativeCursorOutputArbitration::default();
+    queued_carrier_arbitration.request_hardware(3, 10, 20);
+    assert_eq!(
+        super::cursor_output_disposition_for_primary_state(
+            &mut queued_carrier_arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            20,
+            NativeCursorPrimaryState {
+                primary_scene_work_pending: true,
+                ready_primary_carrier_attachable: true,
+                primary_worker_queued: true,
+                independent_kms_admission: false,
+                ..Default::default()
+            },
+            true,
+        ),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+
+    for (target_owned, lane_available) in [(true, true), (false, false)] {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware(2, 10, 20);
+        assert_eq!(
+            super::cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                20,
+                NativeCursorPrimaryState {
+                    primary_scene_work_pending: true,
+                    primary_target_owned: target_owned,
+                    independent_kms_admission: lane_available,
+                    ..Default::default()
+                },
+                true,
+            ),
+            NativeCursorOutputDisposition::DeferForPrimary
+        );
+    }
+}
+
+#[test]
+fn auto_ready_carrier_before_service_deadline_uses_latest_cursor_without_plane_delta() {
+    use super::NativeCursorPrimaryState;
+
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request_hardware(1, 10, 100);
+    for epoch in 2..=32 {
+        arbitration.request_hardware(epoch, 10 + epoch, 100);
+    }
+
+    assert_eq!(arbitration.desired_epoch(), 32);
+    assert_eq!(
+        super::cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            99,
+            NativeCursorPrimaryState {
+                primary_scene_work_pending: true,
+                ready_primary_carrier_attachable: true,
+                independent_kms_admission: false,
+                ..Default::default()
+            },
+            true,
+        ),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+    assert_eq!(arbitration.plane_delta_plans(), 0);
+    assert_eq!(arbitration.ready_primary_piggybacks, 1);
+}
+
+#[test]
+fn auto_never_admits_cursor_ahead_of_queued_or_submitted_primary_even_if_lane_snapshot_is_stale() {
+    use super::NativeCursorPrimaryState;
+
+    for primary_state in [
+        NativeCursorPrimaryState {
+            primary_worker_queued: true,
+            independent_kms_admission: true,
+            ..Default::default()
+        },
+        NativeCursorPrimaryState {
+            primary_kernel_submitted: true,
+            independent_kms_admission: true,
+            ..Default::default()
+        },
+    ] {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware(8, 10, 20);
+        assert_eq!(
+            super::cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                20,
+                primary_state,
+                true,
+            ),
+            NativeCursorOutputDisposition::DeferForPrimary
+        );
+    }
+
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request_hardware(9, 10, 20);
+    assert_eq!(
+        super::cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            20,
+            NativeCursorPrimaryState {
+                // Even a stale positive carrier snapshot cannot make a
+                // kernel-submitted primary mutable after freeze.
+                ready_primary_carrier_attachable: true,
+                primary_kernel_submitted: true,
+                independent_kms_admission: true,
+                ..Default::default()
+            },
+            true,
+        ),
+        NativeCursorOutputDisposition::DeferForPrimary
+    );
+}
+
+#[test]
+fn auto_unready_scene_bypasses_after_deadline_and_keeps_latest_epoch() {
+    use super::NativeCursorPrimaryState;
+
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request_hardware(1, 100, 200);
+    for epoch in 2..=1_000 {
+        arbitration.request_hardware(epoch, 100 + epoch, 200);
+    }
+    assert_eq!(arbitration.desired_epoch(), 1_000);
+    assert_eq!(arbitration.pending_since_ns(), Some(100));
+    assert_eq!(arbitration.changes_coalesced(), 999);
+    assert_eq!(
+        super::cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            200,
+            NativeCursorPrimaryState {
+                primary_scene_work_pending: true,
+                independent_kms_admission: true,
+                ..Default::default()
+            },
+            true,
+        ),
+        NativeCursorOutputDisposition::SubmitPlaneDelta
+    );
+    assert_eq!(arbitration.plane_delta_plans(), 1);
+    assert_eq!(arbitration.unready_primary_bypass_decisions, 1);
 }

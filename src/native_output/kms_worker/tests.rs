@@ -887,6 +887,18 @@ fn busy_retry_budget_is_bounded_and_returns_one_terminal_event() {
             .count(),
         1
     );
+    let retry_not_before = events
+        .iter()
+        .filter_map(|event| match event {
+            KmsWorkerEvent::BusyDeferred {
+                retry_not_before_ns,
+                ..
+            } => Some(*retry_not_before_ns),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retry_not_before.len(), 2);
+    assert!(retry_not_before[0] < retry_not_before[1]);
     assert_eq!(*executor.submitted.lock().unwrap(), vec![9, 9, 9]);
     handle.request_quiesce();
     handle.join().unwrap();

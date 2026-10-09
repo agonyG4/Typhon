@@ -1,11 +1,77 @@
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, KmsPolicy};
 use oblivion_one::native::presentation_deadline::{
-    MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget, PresentationTargetReason,
+    MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget,
+    PresentationTargetAuthority, PresentationTargetReason,
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use oblivion_one::{compositor::OwnCompositorServer, native::scheduler::NativeFrameScheduler};
 use std::io;
 use std::time::Duration;
+
+use crate::native_output::presentation::kms_timing::{KmsPresentationTimingModel, KmsSubmitWindow};
+
+/// Bounded time for the reactor to build and enqueue a cursor-only Atomic
+/// transaction before the KMS worker's timed wake. This is intentionally
+/// independent of primary scene render prediction.
+pub(crate) const CURSOR_PREPARATION_GUARD_NS: u64 = 2_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorServiceOpportunity {
+    pub(crate) target: PresentationTarget,
+    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) service_deadline_ns: u64,
+    pub(crate) ordering_after_primary: Option<PresentationTarget>,
+}
+
+/// Plan the next legal physical cursor service opportunity using only the
+/// cursor preparation guard and KMS dispatch/apply costs. A reserved primary
+/// target remains an ordering lower bound; an advisory visual target is not
+/// cursor ownership and is ignored.
+pub(crate) fn plan_cursor_service_opportunity(
+    planner: &PresentationDeadlinePlanner,
+    timing: &KmsPresentationTimingModel,
+    now: MonotonicTimestampNs,
+    primary_target: Option<PresentationTarget>,
+    kms_dispatch_budget_ns: u64,
+) -> Option<CursorServiceOpportunity> {
+    let ready_cost_ns = CURSOR_PREPARATION_GUARD_NS
+        .saturating_add(timing.apply_guard_ns())
+        .saturating_add(kms_dispatch_budget_ns);
+    let ready_cost = Duration::from_nanos(ready_cost_ns);
+    let binding_primary_target =
+        primary_target.filter(|target| target.authority() == PresentationTargetAuthority::Reserved);
+    let target = match binding_primary_target {
+        Some(primary_target) => planner.reactive_target_after(now, ready_cost, primary_target),
+        None => planner.reactive_target(now, ready_cost),
+    }?;
+    let submit_window = timing
+        .submit_window(
+            target.presentation_time.get(),
+            target.submit_not_before().get(),
+            kms_dispatch_budget_ns,
+        )
+        .ok()?;
+    let service_deadline_ns = submit_window
+        .worker_wake_at_ns()
+        .saturating_sub(CURSOR_PREPARATION_GUARD_NS);
+    (service_deadline_ns >= now.get()).then_some(CursorServiceOpportunity {
+        target,
+        submit_window,
+        service_deadline_ns,
+        ordering_after_primary: binding_primary_target,
+    })
+}
+
+pub(crate) fn cursor_primary_ordering_target(
+    scheduled_target: Option<PresentationTarget>,
+    pending_target: Option<PresentationTarget>,
+) -> Option<PresentationTarget> {
+    [scheduled_target, pending_target]
+        .into_iter()
+        .flatten()
+        .filter(|target| target.authority() == PresentationTargetAuthority::Reserved)
+        .max_by_key(|target| target.physical_claim().sequence)
+}
 
 pub(super) fn pending_target_for_scanout(
     scanout: &super::super::scanout::NativeScanoutBackend,
@@ -382,16 +448,23 @@ pub(crate) fn plan_native_presentation_path(
 
 #[cfg(test)]
 mod tests {
-    use super::super::frame::plane_delta_allowed_at_deadline;
+    use super::super::frame::{
+        cursor_output_disposition_at_deadline, plane_delta_allowed_at_deadline,
+    };
     use super::super::{
         NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorSchedulingPolicy,
     };
+    use crate::native_output::presentation::kms_timing::{
+        KmsModeTiming, KmsPresentationTimingModel,
+    };
     use crate::native_output::{NativeScanoutKind, runtime::NativeCursorPreference};
+    use drm_sys::drm_mode_modeinfo;
     use oblivion_one::native::kms::{
         AtomicKmsError, AtomicKmsErrorKind, KmsBackendKind, KmsPolicy,
     };
     use oblivion_one::native::presentation_deadline::{
-        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+        MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget,
+        PresentationTargetReason,
     };
 
     use super::*;
@@ -700,14 +773,14 @@ mod tests {
     }
 
     #[test]
-    fn continuous_move_keeps_cursor_traffic_from_consuming_primary_opportunities() {
+    fn piggyback_policy_preserves_primary_first_behavior_under_continuous_motion() {
         let mut arbitration = NativeCursorOutputArbitration::default();
 
         for epoch in 1..=1_024 {
             arbitration.request_hardware(epoch, epoch, epoch.saturating_add(1));
             assert!(!plane_delta_allowed_at_deadline(
                 &mut arbitration,
-                NativeCursorSchedulingPolicy::Auto,
+                NativeCursorSchedulingPolicy::Piggyback,
                 epoch.saturating_add(1),
                 true,
                 true,
@@ -724,6 +797,370 @@ mod tests {
         assert_eq!(arbitration.plane_delta_submissions(), 0);
         assert_eq!(arbitration.plane_delta_deferred_for_primary(), 0);
         assert!(!arbitration.pending());
+    }
+
+    #[test]
+    fn cursor_target_and_service_time_ignore_five_hundred_ms_scene_prediction() {
+        const REFRESH_NS: u64 = 6_060_606;
+        const KMS_DISPATCH_BUDGET_NS: u64 = 500_000;
+        let now = MonotonicTimestampNs::new(1_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        #[derive(Clone, Copy)]
+        struct Prediction {
+            total_cost_ns: u64,
+            kms_dispatch_budget_ns: u64,
+        }
+        let scene_predictions = [
+            Prediction {
+                total_cost_ns: 1_000_000,
+                kms_dispatch_budget_ns: KMS_DISPATCH_BUDGET_NS,
+            },
+            Prediction {
+                total_cost_ns: 500_000_000,
+                kms_dispatch_budget_ns: KMS_DISPATCH_BUDGET_NS,
+            },
+        ];
+
+        let opportunities = scene_predictions.map(|prediction| {
+            assert!(prediction.total_cost_ns > 0);
+            plan_cursor_service_opportunity(
+                &planner,
+                &timing,
+                now,
+                None,
+                prediction.kms_dispatch_budget_ns,
+            )
+            .expect("cursor has a reachable KMS opportunity")
+        });
+
+        assert_eq!(
+            opportunities[0].target.identity(),
+            opportunities[1].target.identity()
+        );
+        assert_eq!(
+            opportunities[0].target.presentation_time,
+            opportunities[1].target.presentation_time
+        );
+        assert_eq!(
+            opportunities[0].service_deadline_ns,
+            opportunities[1].service_deadline_ns
+        );
+    }
+
+    #[test]
+    fn independent_cursor_target_ignores_advisory_target_and_follows_binding_target() {
+        const REFRESH_NS: u64 = 10_000_000;
+        let now = MonotonicTimestampNs::new(1_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let advisory = planner
+            .reactive_target(now, Duration::from_millis(500))
+            .expect("advisory visual target");
+        let binding = scheduled_target();
+        let independent =
+            plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000).unwrap();
+        let with_advisory =
+            plan_cursor_service_opportunity(&planner, &timing, now, Some(advisory), 500_000)
+                .unwrap();
+        let after_binding =
+            plan_cursor_service_opportunity(&planner, &timing, now, Some(binding), 500_000)
+                .unwrap();
+
+        assert_eq!(
+            independent.target.identity(),
+            with_advisory.target.identity()
+        );
+        assert!(after_binding.target.sequence > binding.sequence);
+    }
+
+    #[test]
+    fn newly_reserved_primary_invalidates_pending_cursor_target_without_sliding_age() {
+        const REFRESH_NS: u64 = 10_000_000;
+        let now = MonotonicTimestampNs::new(1_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let initial = plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000)
+            .expect("initial cursor service opportunity");
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware_for_opportunity(1, now.get(), initial);
+
+        // A primary reservation may arrive after cursor debt was first
+        // observed. Give it the cursor's current physical claim so that the
+        // existing target is no longer legal for an independent cursor.
+        let mut binding = scheduled_target();
+        binding.sequence = initial.target.sequence;
+        binding.presentation_time = initial.target.presentation_time;
+        binding.clock_generation = initial.target.clock_generation;
+        binding.physical_claim = initial.target.physical_claim();
+        assert_eq!(binding.authority(), PresentationTargetAuthority::Reserved);
+        let after_binding = plan_cursor_service_opportunity(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(now.get().saturating_add(100_000)),
+            Some(binding),
+            500_000,
+        )
+        .expect("cursor opportunity after the new primary reservation");
+        assert!(after_binding.target.physical_claim().sequence > binding.physical_claim().sequence);
+
+        arbitration.request_hardware_for_opportunity(
+            2,
+            now.get().saturating_add(100_000),
+            after_binding,
+        );
+
+        assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
+        assert_eq!(arbitration.deadline_ns(), Some(initial.service_deadline_ns));
+        assert_eq!(arbitration.service_opportunity(), Some(after_binding));
+    }
+
+    #[test]
+    fn cursor_service_windows_are_future_and_kms_timed_at_supported_refresh_rates() {
+        let now = MonotonicTimestampNs::new(2_000_000_000);
+
+        for hz in [60u64, 120, 144, 165, 240] {
+            let refresh_ns = 1_000_000_000 / hz;
+            let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(refresh_ns));
+            planner.note_presented(now);
+            let timing = KmsPresentationTimingModel::new(
+                KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), refresh_ns),
+                9,
+            );
+            let opportunity =
+                plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000).unwrap();
+
+            assert!(opportunity.target.presentation_time.get() > now.get());
+            assert!(opportunity.service_deadline_ns >= now.get());
+            assert_eq!(
+                opportunity.submit_window.worker_wake_at_ns(),
+                opportunity.service_deadline_ns + CURSOR_PREPARATION_GUARD_NS
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_motion_keeps_one_service_deadline_and_replans_missed_targets_without_resetting_age() {
+        const REFRESH_NS: u64 = 10_000_000;
+        let now = MonotonicTimestampNs::new(1_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let first = plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000)
+            .expect("initial cursor service opportunity");
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware_for_opportunity(1, now.get(), first);
+        let original_deadline = first.service_deadline_ns;
+
+        let same_physical_target_later_deadline = CursorServiceOpportunity {
+            service_deadline_ns: original_deadline.saturating_add(100_000),
+            ..first
+        };
+        arbitration.request_hardware_for_opportunity(
+            2,
+            now.get().saturating_add(50_000),
+            same_physical_target_later_deadline,
+        );
+        assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
+        assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
+        assert_eq!(arbitration.service_opportunity(), Some(first));
+
+        let missed_at = first
+            .submit_window
+            .commit_complete_deadline_ns()
+            .saturating_add(1);
+        let next = plan_cursor_service_opportunity(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(missed_at),
+            None,
+            500_000,
+        )
+        .expect("later physical cursor target");
+        assert!(next.target.sequence > first.target.sequence);
+        arbitration.request_hardware_for_opportunity(3, missed_at, next);
+        assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
+        assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
+        assert_eq!(
+            arbitration
+                .service_opportunity()
+                .map(|opportunity| opportunity.target.sequence),
+            Some(next.target.sequence)
+        );
+        assert!(!arbitration.due(missed_at));
+        assert_eq!(
+            arbitration.wake_deadline_ns(missed_at),
+            Some(next.service_deadline_ns)
+        );
+    }
+
+    #[test]
+    fn auto_services_latest_cursor_after_bounded_wait_with_unready_primary_work() {
+        const SERVICE_DEADLINE_NS: u64 = 10_000;
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware(1, 100, SERVICE_DEADLINE_NS);
+
+        for epoch in 2..=1_024 {
+            arbitration.request_hardware(epoch, epoch * 100, SERVICE_DEADLINE_NS + epoch);
+        }
+
+        assert_eq!(arbitration.desired_epoch(), 1_024);
+        assert_eq!(
+            cursor_output_disposition_at_deadline(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                SERVICE_DEADLINE_NS - 1,
+                true,
+                true,
+            ),
+            NativeCursorOutputDisposition::DeferForPrimary
+        );
+        assert_eq!(
+            cursor_output_disposition_at_deadline(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                SERVICE_DEADLINE_NS,
+                true,
+                true,
+            ),
+            NativeCursorOutputDisposition::SubmitPlaneDelta
+        );
+        assert_eq!(arbitration.plane_delta_plans(), 1);
+    }
+
+    #[test]
+    fn auto_165_hz_stress_coalesces_1000_hz_motion_and_preserves_primary_opportunities() {
+        use super::super::frame::{
+            NativeCursorPrimaryState, cursor_output_disposition_for_primary_state,
+        };
+
+        const SIMULATION_NS: u64 = 1_000_000_000;
+        const INPUT_INTERVAL_NS: u64 = 1_000_000;
+        const DISPLAY_HZ: u64 = 165;
+        const REFRESH_NS: u64 = SIMULATION_NS / DISPLAY_HZ;
+        // Model the service decision before the physical target, with room
+        // for cursor transaction construction and ordinary KMS dispatch.
+        const DECISION_LEAD_NS: u64 = 2_500_000;
+
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        let mut input_epoch = 0_u64;
+        let mut max_cursor_age_ns = 0_u64;
+        let mut independent_services = 0_u64;
+        let mut ready_primary_piggybacks = 0_u64;
+        let mut baseline_primary_misses = 0_u64;
+        let mut auto_primary_misses = 0_u64;
+        let mut max_worker_queue_depth = 0_usize;
+
+        for opportunity in 0..DISPLAY_HZ {
+            let service_deadline_ns = (opportunity + 1)
+                .saturating_mul(REFRESH_NS)
+                .saturating_sub(DECISION_LEAD_NS);
+            let mut updates_for_opportunity = 0_u64;
+            while input_epoch < SIMULATION_NS / INPUT_INTERVAL_NS {
+                let next_input_at_ns = (input_epoch + 1) * INPUT_INTERVAL_NS;
+                if next_input_at_ns > service_deadline_ns {
+                    break;
+                }
+                input_epoch += 1;
+                updates_for_opportunity += 1;
+                arbitration.request_hardware(input_epoch, next_input_at_ns, service_deadline_ns);
+            }
+            if updates_for_opportunity == 0 {
+                continue;
+            }
+
+            let pending_since_ns = arbitration.pending_since_ns().unwrap();
+            let age_at_decision_ns = service_deadline_ns.saturating_sub(pending_since_ns);
+            max_cursor_age_ns = max_cursor_age_ns.max(age_at_decision_ns);
+            assert!(age_at_decision_ns <= REFRESH_NS);
+            let latest_epoch = input_epoch;
+            assert_eq!(arbitration.desired_epoch(), latest_epoch);
+
+            // Primary frames arriving before or exactly at the decision
+            // deadline can carry the newest cursor state. A frame arriving
+            // just after it missed its own already-reserved target; cursor
+            // planning places an independent target after that reservation.
+            let primary_ready_by_deadline = opportunity % 4 < 2;
+            let disposition = cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                service_deadline_ns,
+                NativeCursorPrimaryState {
+                    primary_scene_work_pending: true,
+                    ready_primary_carrier_attachable: primary_ready_by_deadline,
+                    independent_kms_admission: true,
+                    ..Default::default()
+                },
+                true,
+            );
+
+            if primary_ready_by_deadline {
+                assert_eq!(disposition, NativeCursorOutputDisposition::PiggybackPrimary);
+                ready_primary_piggybacks += 1;
+            } else {
+                assert_eq!(disposition, NativeCursorOutputDisposition::SubmitPlaneDelta);
+                independent_services += 1;
+            }
+
+            // The model releases the single worker slot at the next physical
+            // opportunity. No second cursor job is admitted for this slot.
+            let worker_queue_depth = 1;
+            max_worker_queue_depth = max_worker_queue_depth.max(worker_queue_depth);
+            assert!(worker_queue_depth <= 1);
+            arbitration.consume(latest_epoch);
+
+            if opportunity % 4 == 2 {
+                // The same late-ready primary would miss before and after
+                // cursor scheduling because its scene was not ready at its
+                // reserved target. The independent cursor target is ordered
+                // after that binding reservation (covered by the target
+                // authority planner regression above).
+                baseline_primary_misses += 1;
+                auto_primary_misses += 1;
+            }
+        }
+
+        // The final few input samples arrive after the last in-second service
+        // decision. They remain pending for one later opportunity and still
+        // coalesce to the latest desired epoch.
+        let next_service_deadline_ns = (DISPLAY_HZ + 1)
+            .saturating_mul(REFRESH_NS)
+            .saturating_sub(DECISION_LEAD_NS);
+        while input_epoch < SIMULATION_NS / INPUT_INTERVAL_NS {
+            input_epoch += 1;
+            arbitration.request_hardware(
+                input_epoch,
+                input_epoch * INPUT_INTERVAL_NS,
+                next_service_deadline_ns,
+            );
+        }
+
+        assert_eq!(input_epoch, 1_000);
+        assert!(independent_services <= DISPLAY_HZ);
+        assert!(ready_primary_piggybacks > 0);
+        assert!(independent_services > 0);
+        assert_eq!(independent_services + ready_primary_piggybacks, DISPLAY_HZ);
+        assert_eq!(max_worker_queue_depth, 1);
+        assert_eq!(auto_primary_misses, baseline_primary_misses);
+        assert!(max_cursor_age_ns <= REFRESH_NS);
+        assert!(arbitration.pending());
+        assert_eq!(arbitration.desired_epoch(), 1_000);
+        assert_eq!(arbitration.pending_since_ns(), Some(998_000_000));
     }
 
     #[test]

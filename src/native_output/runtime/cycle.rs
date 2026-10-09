@@ -44,6 +44,177 @@ struct AcquirePrepareOutcome {
 }
 
 impl NativeRuntime {
+    /// Admit a matured Auto cursor service before potentially expensive scene
+    /// acquire/prepare work. This uses the ordinary arbiter and worker path;
+    /// it does not resolve effects, render, or create a second KMS authority.
+    fn service_matured_auto_cursor_before_prepare(
+        &mut self,
+        cycle: &NativeCycleState,
+    ) -> NativeResult<bool> {
+        if self.cursor_scheduling_policy != NativeCursorSchedulingPolicy::Auto
+            || self.kms_commit_worker_transport
+                != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+            || !self.shutdown.is_running()
+            || !self.session.permits_output()
+            || self.pending_output_configuration.is_some()
+            || self.scanout.ready_frame_queued()
+            || self.atomic_commit_arbiter.atomic_commit_pending()
+        {
+            return Ok(false);
+        }
+        let Some(cursor) = self.atomic_cursor.as_mut() else {
+            return Ok(false);
+        };
+        if self.cursor_render_mode != NativeCursorRenderMode::Hardware
+            || cursor.pending_token().is_some()
+            || !self.cursor_output_arbitration.pending()
+            || !cursor.needs_submission_for(Some(cursor.desired()))
+            || (cursor.desired().visible && cursor.desired().framebuffer_id.is_none())
+        {
+            return Ok(false);
+        }
+        let Some(worker) = self.kms_commit_worker.as_ref() else {
+            return Ok(false);
+        };
+
+        let now_ns = monotonic_now_ns()?;
+        let now = MonotonicTimestampNs::new(now_ns);
+        let refresh_interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
+        let prediction = self.render_journal.prediction_at_with_kms_guard(
+            now,
+            refresh_interval,
+            self.presentation_timing.apply_guard_ns(),
+        );
+        let pending_target = super::planner::pending_target_for_scanout(&self.scanout)?;
+        let candidate = super::planner::plan_cursor_service_opportunity(
+            &self.presentation_deadline,
+            &self.presentation_timing,
+            now,
+            super::planner::cursor_primary_ordering_target(
+                self.scheduled_presentation_target,
+                pending_target,
+            ),
+            prediction.kms_dispatch_budget_ns,
+        );
+        if let Some(candidate) = candidate {
+            self.cursor_output_arbitration
+                .request_hardware_for_opportunity(cursor.desired_epoch(), now_ns, candidate);
+        }
+        let Some(opportunity) = self.cursor_output_arbitration.service_opportunity() else {
+            return Ok(false);
+        };
+        let attachable_primary = worker.attachable_primary(
+            self.drm_file_generation,
+            self.target.crtc_id,
+            opportunity.target,
+        );
+        let independent_kms_admission = worker.admission_available()
+            && worker.queue_depth() == 0
+            && !worker.submission_active()
+            && !worker.inflight();
+        let queued_kind = self.atomic_commit_arbiter.worker_queued_kind();
+        let submitted_kind = self.atomic_commit_arbiter.kernel_submitted_kind();
+        let primary_state = NativeCursorPrimaryState {
+            primary_scene_work_pending: self.queued_redraw_requested
+                || self.server.has_pending_frame_prepare_work()
+                || self.frame_scheduler.visual_work_queued(),
+            ready_primary_carrier_attachable: attachable_primary.is_some(),
+            primary_target_owned: self.scanout.ready_frame_queued(),
+            primary_worker_queued: queued_kind.is_some_and(|kind| {
+                matches!(
+                    kind,
+                    AtomicCommitKind::CompositedPrimary { .. }
+                        | AtomicCommitKind::DirectPrimary { .. }
+                )
+            }),
+            primary_kernel_submitted: submitted_kind.is_some_and(|kind| {
+                matches!(
+                    kind,
+                    AtomicCommitKind::CompositedPrimary { .. }
+                        | AtomicCommitKind::DirectPrimary { .. }
+                )
+            }),
+            independent_kms_admission,
+        };
+        let desired = cursor.desired().clone();
+        let hardware_usable =
+            !desired.visible || desired.framebuffer_id.is_some() || cursor.current().visible;
+        let disposition = super::frame::cursor_output_disposition_for_primary_state(
+            &mut self.cursor_output_arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            now_ns,
+            primary_state,
+            hardware_usable,
+        );
+        self.cursor_responsiveness.record_arbitration_evidence(
+            cycle.cursor_motion_sample_id,
+            self.output_id,
+            Some(cursor.desired_epoch()),
+            now_ns,
+            NativeCursorSchedulingPolicy::Auto,
+            &self.cursor_output_arbitration,
+            primary_state,
+            Some(opportunity),
+            disposition,
+        );
+        if disposition != super::frame::NativeCursorOutputDisposition::SubmitPlaneDelta {
+            return Ok(false);
+        }
+
+        let cursor_epoch = cursor.desired_epoch();
+        let mut effective_cursor = Some(desired.clone());
+        let validation_base = crate::native_output::kms_worker::KmsValidationBase::Presented {
+            output_id: self.output_id,
+            snapshot: self.presented_planes,
+            output_generation: self.drm_file_generation,
+            crtc_id: self.target.crtc_id,
+        };
+        let decision = super::presentation_worker::present_cursor_for_presentation(
+            true,
+            Some(worker),
+            &self.kms_backend,
+            cursor,
+            Some(desired),
+            &mut self.atomic_commit_arbiter,
+            &mut self.output_transactions,
+            &mut self.presentation_trace,
+            opportunity.target,
+            Some(opportunity.submit_window),
+            self.target.crtc_id,
+            self.drm_file_generation,
+            super::planner::pacing_mode_for_target(Some(opportunity.target)),
+            cursor_epoch,
+            validation_base,
+            &mut self.last_submitted_cursor_epoch,
+            &mut self.cursor_output_arbitration,
+            &mut self.frame_scheduler,
+            now_ns,
+            self.perf,
+            false,
+            &mut self.cursor_render_mode,
+            &mut self.server,
+            &mut effective_cursor,
+            &mut self.queued_redraw_requested,
+            &mut self.last_client_cursor_damage,
+            &mut self.last_software_cursor_damage,
+            None,
+            None,
+            None,
+            &mut self.cursor_reveal_trace,
+            self.vrr_policy,
+        )?;
+        if decision.is_some() {
+            self.arm_runtime_deadline()?;
+            return Ok(true);
+        }
+        // Admission can become unavailable between the lane snapshot and the
+        // worker reservation. Back off until the next refresh while retaining
+        // the original freshness deadline and pending cursor age.
+        self.cursor_output_arbitration
+            .set_retry_not_before(self.frame_scheduler.next_refresh_deadline_ns(now_ns));
+        Ok(false)
+    }
+
     fn queued_visual_work_deadline_due(&self, now_ns: u64) -> bool {
         let scheduled_target_due = self
             .scheduled_presentation_target
@@ -554,6 +725,7 @@ impl NativeRuntime {
                 &mut cycle,
                 NativeInputRoutingGuardCheckpoint::BeforeAcquirePrepare,
             )?;
+            let _ = self.service_matured_auto_cursor_before_prepare(&cycle)?;
         }
         let prepare_outcome = if prepare_operation_plan.service_acquire_and_prepare {
             let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;

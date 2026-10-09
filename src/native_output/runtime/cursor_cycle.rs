@@ -1,5 +1,7 @@
+use super::planner::CursorServiceOpportunity;
 use super::*;
 
+#[cfg(test)]
 pub(crate) fn observe_atomic_cursor_output_liveness(
     atomic_cursor: Option<&NativeAtomicCursor>,
     arbitration: &mut NativeCursorOutputArbitration,
@@ -7,6 +9,28 @@ pub(crate) fn observe_atomic_cursor_output_liveness(
     now_ns: u64,
     cursor_render_mode: NativeCursorRenderMode,
     effective_cursor_visible: bool,
+) -> bool {
+    observe_atomic_cursor_output_liveness_with_policy(
+        atomic_cursor,
+        arbitration,
+        frame_scheduler,
+        now_ns,
+        cursor_render_mode,
+        effective_cursor_visible,
+        NativeCursorSchedulingPolicy::Piggyback,
+        None,
+    )
+}
+
+pub(crate) fn observe_atomic_cursor_output_liveness_with_policy(
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    arbitration: &mut NativeCursorOutputArbitration,
+    frame_scheduler: &NativeFrameScheduler,
+    now_ns: u64,
+    cursor_render_mode: NativeCursorRenderMode,
+    effective_cursor_visible: bool,
+    policy: NativeCursorSchedulingPolicy,
+    service_opportunity: Option<CursorServiceOpportunity>,
 ) -> bool {
     let Some(cursor) = atomic_cursor else {
         return false;
@@ -30,11 +54,23 @@ pub(crate) fn observe_atomic_cursor_output_liveness(
     if !needed {
         return false;
     }
-    arbitration.request_hardware(
-        cursor.desired_epoch(),
-        now_ns,
-        frame_scheduler.next_refresh_deadline_ns(now_ns),
-    );
+    if policy == NativeCursorSchedulingPolicy::Auto {
+        if let Some(opportunity) = service_opportunity {
+            arbitration.request_hardware_for_opportunity(
+                cursor.desired_epoch(),
+                now_ns,
+                opportunity,
+            );
+        } else {
+            arbitration.request_hardware_unplanned(cursor.desired_epoch(), now_ns);
+        }
+    } else {
+        arbitration.request_hardware(
+            cursor.desired_epoch(),
+            now_ns,
+            frame_scheduler.next_refresh_deadline_ns(now_ns),
+        );
+    }
     true
 }
 
@@ -45,8 +81,8 @@ pub(crate) fn defer_cursor_after_busy(
     perf: NativePerfLogger,
     reason: &'static str,
 ) {
-    arbitration.defer_after_busy(now_ns, scheduler.next_refresh_deadline_ns(now_ns));
-    scheduler.note_immediate_completion();
+    arbitration.note_kms_busy_retry();
+    arbitration.set_retry_not_before(scheduler.next_refresh_deadline_ns(now_ns));
     perf.log("native.cursor", || {
         vec![
             NativePerfField::str("event", "deferred"),

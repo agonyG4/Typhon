@@ -1,5 +1,8 @@
-use super::frame::NativeCursorOutputArbitration;
-use super::frame::NativeCursorOutputDisposition;
+use super::frame::{
+    NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorPrimaryState,
+    NativeCursorSchedulingPolicy,
+};
+use super::planner::CursorServiceOpportunity;
 use crate::native_output::presentation::trace::{
     CursorEpochPresentationTrace, PresentationTransactionTraceRing,
 };
@@ -76,6 +79,10 @@ struct CursorArbitrationCounters {
     cursor_state_piggybacked: u64,
     idle_hardware_updates: u64,
     idle_software_updates: u64,
+    ready_primary_piggybacks: u64,
+    unready_primary_bypass_decisions: u64,
+    kms_busy_retries: u64,
+    cursor_service_target_misses: u64,
 }
 
 impl CursorArbitrationCounters {
@@ -89,6 +96,10 @@ impl CursorArbitrationCounters {
             cursor_state_piggybacked: arbitration.cursor_state_piggybacked(),
             idle_hardware_updates: arbitration.idle_hardware_updates(),
             idle_software_updates: arbitration.idle_software_updates(),
+            ready_primary_piggybacks: arbitration.ready_primary_piggybacks,
+            unready_primary_bypass_decisions: arbitration.unready_primary_bypass_decisions,
+            kms_busy_retries: arbitration.kms_busy_retries,
+            cursor_service_target_misses: arbitration.cursor_service_target_misses,
         }
     }
 
@@ -118,6 +129,18 @@ impl CursorArbitrationCounters {
             idle_software_updates: self
                 .idle_software_updates
                 .saturating_sub(before.idle_software_updates),
+            ready_primary_piggybacks: self
+                .ready_primary_piggybacks
+                .saturating_sub(before.ready_primary_piggybacks),
+            unready_primary_bypass_decisions: self
+                .unready_primary_bypass_decisions
+                .saturating_sub(before.unready_primary_bypass_decisions),
+            kms_busy_retries: self
+                .kms_busy_retries
+                .saturating_sub(before.kms_busy_retries),
+            cursor_service_target_misses: self
+                .cursor_service_target_misses
+                .saturating_sub(before.cursor_service_target_misses),
         }
     }
 }
@@ -198,6 +221,23 @@ pub(crate) struct CursorResponsivenessSample {
     pub(crate) arbitration_cursor_epoch: Option<u64>,
     pub(crate) arbitration_at_ns: Option<u64>,
     pub(crate) disposition: Option<NativeCursorOutputDisposition>,
+    pub(crate) policy: Option<&'static str>,
+    pub(crate) arbitration_reason: Option<&'static str>,
+    pub(crate) cursor_pending_since_ns: Option<u64>,
+    pub(crate) cursor_age_at_arbitration_ns: Option<u64>,
+    pub(crate) cursor_overdue_age_ns: Option<u64>,
+    pub(crate) cursor_service_deadline_ns: Option<u64>,
+    pub(crate) cursor_target_service_deadline_ns: Option<u64>,
+    pub(crate) cursor_retry_not_before_ns: Option<u64>,
+    pub(crate) primary_ready_carrier: Option<bool>,
+    pub(crate) primary_target_owned: Option<bool>,
+    pub(crate) primary_worker_queued: Option<bool>,
+    pub(crate) primary_kernel_submitted: Option<bool>,
+    pub(crate) independent_kms_admission: Option<bool>,
+    pub(crate) cursor_target_sequence: Option<u64>,
+    pub(crate) cursor_target_presentation_ns: Option<u64>,
+    pub(crate) cursor_worker_wake_ns: Option<u64>,
+    pub(crate) cursor_commit_complete_deadline_ns: Option<u64>,
     pub(crate) superseded_by_epoch: Option<u64>,
     pub(crate) effect_scene_resolution_ns: Option<u64>,
     pub(crate) effect_scene_visible_instances: Option<usize>,
@@ -352,6 +392,23 @@ impl NativeCursorResponsivenessTrace {
             arbitration_cursor_epoch: None,
             arbitration_at_ns: None,
             disposition: None,
+            policy: None,
+            arbitration_reason: None,
+            cursor_pending_since_ns: None,
+            cursor_age_at_arbitration_ns: None,
+            cursor_overdue_age_ns: None,
+            cursor_service_deadline_ns: None,
+            cursor_target_service_deadline_ns: None,
+            cursor_retry_not_before_ns: None,
+            primary_ready_carrier: None,
+            primary_target_owned: None,
+            primary_worker_queued: None,
+            primary_kernel_submitted: None,
+            independent_kms_admission: None,
+            cursor_target_sequence: None,
+            cursor_target_presentation_ns: None,
+            cursor_worker_wake_ns: None,
+            cursor_commit_complete_deadline_ns: None,
             superseded_by_epoch: None,
             effect_scene_resolution_ns: None,
             effect_scene_visible_instances: None,
@@ -471,6 +528,55 @@ impl NativeCursorResponsivenessTrace {
                 .is_some_and(|sample_epoch| cursor_epoch > sample_epoch)
         {
             sample.superseded_by_epoch = Some(cursor_epoch);
+        }
+    }
+
+    pub(crate) fn record_arbitration_evidence(
+        &mut self,
+        sample_id: Option<u64>,
+        output_id: OutputId,
+        cursor_epoch: Option<u64>,
+        at_ns: u64,
+        policy: NativeCursorSchedulingPolicy,
+        arbitration: &NativeCursorOutputArbitration,
+        primary: NativeCursorPrimaryState,
+        opportunity: Option<CursorServiceOpportunity>,
+        disposition: NativeCursorOutputDisposition,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let sample_id = sample_id.or_else(|| {
+            (cursor_epoch.is_some() || arbitration.pending())
+                .then(|| self.latest_epoch_sample_by_output.get(&output_id).copied())
+                .flatten()
+        });
+        self.record_arbitration(sample_id, output_id, cursor_epoch, at_ns, disposition);
+        let Some(sample) = sample_id.and_then(|sample_id| self.sample_mut(sample_id)) else {
+            return;
+        };
+        sample.policy = Some(policy.as_str());
+        sample.arbitration_reason = Some(arbitration_reason(policy, primary, disposition));
+        sample.cursor_pending_since_ns = arbitration.pending_since_ns();
+        sample.cursor_age_at_arbitration_ns = arbitration.pending_age_ns(at_ns);
+        sample.cursor_service_deadline_ns = arbitration.deadline_ns();
+        sample.cursor_overdue_age_ns = arbitration
+            .deadline_ns()
+            .filter(|deadline| *deadline <= at_ns)
+            .map(|deadline| at_ns.saturating_sub(deadline));
+        sample.cursor_retry_not_before_ns = arbitration.retry_not_before_ns();
+        sample.primary_ready_carrier = Some(primary.ready_primary_carrier_attachable);
+        sample.primary_target_owned = Some(primary.primary_target_owned);
+        sample.primary_worker_queued = Some(primary.primary_worker_queued);
+        sample.primary_kernel_submitted = Some(primary.primary_kernel_submitted);
+        sample.independent_kms_admission = Some(primary.independent_kms_admission);
+        if let Some(opportunity) = opportunity {
+            sample.cursor_target_sequence = Some(opportunity.target.sequence);
+            sample.cursor_target_presentation_ns = Some(opportunity.target.presentation_time.get());
+            sample.cursor_worker_wake_ns = Some(opportunity.submit_window.worker_wake_at_ns());
+            sample.cursor_commit_complete_deadline_ns =
+                Some(opportunity.submit_window.commit_complete_deadline_ns());
+            sample.cursor_target_service_deadline_ns = Some(opportunity.service_deadline_ns);
         }
     }
 
@@ -610,7 +716,7 @@ impl NativeCursorResponsivenessTrace {
         );
         let _ = writeln!(
             output,
-            "{{\"type\":\"cumulative_counter_deltas\",\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"arbitration_response_windows_opened\":{},\"arbitration_changes_coalesced\":{},\"arbitration_plane_delta_plans\":{},\"arbitration_plane_delta_submissions\":{},\"arbitration_deferred_for_primary\":{},\"arbitration_piggybacked\":{},\"arbitration_idle_hardware_updates\":{},\"arbitration_idle_software_updates\":{}}}",
+            "{{\"type\":\"cumulative_counter_deltas\",\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"arbitration_response_windows_opened\":{},\"arbitration_changes_coalesced\":{},\"arbitration_plane_delta_plans\":{},\"arbitration_plane_delta_submissions\":{},\"arbitration_deferred_for_primary\":{},\"arbitration_piggybacked\":{},\"arbitration_idle_hardware_updates\":{},\"arbitration_idle_software_updates\":{},\"ready_primary_piggybacks\":{},\"unready_primary_bypass_decisions\":{},\"kms_busy_retries\":{},\"cursor_service_target_misses\":{}}}",
             hit_test_delta.calls,
             hit_test_delta.cache_hits,
             hit_test_delta.cache_misses,
@@ -627,6 +733,10 @@ impl NativeCursorResponsivenessTrace {
             arbitration_delta.cursor_state_piggybacked,
             arbitration_delta.idle_hardware_updates,
             arbitration_delta.idle_software_updates,
+            arbitration_delta.ready_primary_piggybacks,
+            arbitration_delta.unready_primary_bypass_decisions,
+            arbitration_delta.kms_busy_retries,
+            arbitration_delta.cursor_service_target_misses,
         );
         let cursor_transactions = presentation_trace
             .cursor_epoch_transactions()
@@ -719,6 +829,8 @@ impl NativeCursorResponsivenessTrace {
         let mut kms_queue = Vec::new();
         let mut kms_submit = Vec::new();
         let mut submit_to_pageflip = Vec::new();
+        let mut arbitration_to_build = Vec::new();
+        let mut arbitration_to_worker_queue = Vec::new();
         let mut missing_transaction = 0u64;
         let mut missing_submit = 0u64;
         let mut missing_pageflip = 0u64;
@@ -727,6 +839,16 @@ impl NativeCursorResponsivenessTrace {
                 missing_transaction = missing_transaction.saturating_add(1);
                 continue;
             };
+            if let Some(arbitration_at) = sample.arbitration_at_ns {
+                arbitration_to_build.push(
+                    attribution
+                        .transaction_built_at_ns
+                        .saturating_sub(arbitration_at),
+                );
+                if let Some(queued) = attribution.worker_queued_at_ns {
+                    arbitration_to_worker_queue.push(queued.saturating_sub(arbitration_at));
+                }
+            }
             if let (Some(queued), Some(started)) = (
                 attribution.worker_queued_at_ns,
                 attribution.kms_submit_started_at_ns,
@@ -751,6 +873,16 @@ impl NativeCursorResponsivenessTrace {
             }
         }
         append_percentile_summary(&mut output, "kms_queue_wait_ns", kms_queue.into_iter());
+        append_percentile_summary(
+            &mut output,
+            "arbitration_to_transaction_build_ns",
+            arbitration_to_build.into_iter(),
+        );
+        append_percentile_summary(
+            &mut output,
+            "arbitration_to_worker_queue_ns",
+            arbitration_to_worker_queue.into_iter(),
+        );
         append_percentile_summary(
             &mut output,
             "kms_submit_duration_ns",
@@ -880,6 +1012,25 @@ fn append_sample_jsonl(
             .zip(value.pageflip_observed_at_ns)
             .map(|(returned, pageflip)| pageflip.saturating_sub(returned))
     });
+    let pending_age_at_worker_queue_ns = sample.cursor_pending_since_ns.and_then(|pending_since| {
+        attribution
+            .and_then(|value| value.worker_queued_at_ns)
+            .map(|queued| queued.saturating_sub(pending_since))
+    });
+    let pending_age_at_transaction_built_ns =
+        sample.cursor_pending_since_ns.and_then(|pending_since| {
+            attribution.map(|value| value.transaction_built_at_ns.saturating_sub(pending_since))
+        });
+    let pending_age_at_kms_submit_ns = sample.cursor_pending_since_ns.and_then(|pending_since| {
+        attribution
+            .and_then(|value| value.kms_submit_started_at_ns)
+            .map(|submitted| submitted.saturating_sub(pending_since))
+    });
+    let pending_age_at_pageflip_ns = sample.cursor_pending_since_ns.and_then(|pending_since| {
+        attribution
+            .and_then(|value| value.pageflip_observed_at_ns)
+            .map(|pageflip| pageflip.saturating_sub(pending_since))
+    });
     let _ = writeln!(
         output,
         "{{\"type\":\"sample\",\"sample_id\":{},\"raw_motion_events\":{},\"coalesced_motion_events\":{},\"source_oldest_timestamp_usec\":{},\"source_newest_timestamp_usec\":{},\"input_batch_materialized_at_ns\":{},\"dispatch_started_at_ns\":{},\"dispatch_completed_at_ns\":{},\"dispatch_duration_ns\":{},\"input_batch_to_dispatch_complete_ns\":{},\"dispatch_to_arbitration_ns\":{},\"dispatch_complete_to_arbitration_ns\":{},\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"effect_scene_resolution_ns\":{},\"effect_scene_visible_instances\":{},\"output_id\":{},\"cursor_epoch\":{},\"arbitration_cursor_epoch\":{},\"arbitration_at_ns\":{},\"disposition\":\"{}\",\"superseded_by_epoch\":{},\"trace_write_cpu_ns\":{},\"cursor_transaction_id\":{},\"cursor_transaction_built_at_ns\":{},\"worker_queued_at_ns\":{},\"kms_submit_started_at_ns\":{},\"kms_submit_returned_at_ns\":{},\"pageflip_observed_at_ns\":{},\"kms_queue_wait_ns\":{},\"kms_submit_duration_ns\":{},\"submit_return_to_pageflip_observation_ns\":{},\"pageflip_timestamp_kind\":\"compositor_observed_not_optical\"}}",
@@ -944,10 +1095,71 @@ fn append_sample_jsonl(
         json_number(kms_submit_duration_ns),
         json_number(submit_return_to_pageflip_ns),
     );
+    let _ = writeln!(
+        output,
+        "{{\"type\":\"arbitration_evidence\",\"sample_id\":{},\"policy\":{},\"reason\":{},\"pending_since_ns\":{},\"cursor_age_at_arbitration_ns\":{},\"service_deadline_ns\":{},\"overdue_age_ns\":{},\"target_service_deadline_ns\":{},\"retry_not_before_ns\":{},\"primary_ready_carrier\":{},\"primary_target_owned\":{},\"primary_worker_queued\":{},\"primary_kernel_submitted\":{},\"independent_kms_admission\":{},\"cursor_target_sequence\":{},\"cursor_target_presentation_ns\":{},\"worker_wake_ns\":{},\"commit_complete_deadline_ns\":{},\"cursor_age_at_transaction_build_ns\":{},\"cursor_age_at_worker_queue_ns\":{},\"cursor_age_at_kms_submit_ns\":{},\"cursor_age_at_pageflip_observation_ns\":{}}}",
+        sample.sample_id,
+        json_string(sample.policy),
+        json_string(sample.arbitration_reason),
+        json_number(sample.cursor_pending_since_ns),
+        json_number(sample.cursor_age_at_arbitration_ns),
+        json_number(sample.cursor_service_deadline_ns),
+        json_number(sample.cursor_overdue_age_ns),
+        json_number(sample.cursor_target_service_deadline_ns),
+        json_number(sample.cursor_retry_not_before_ns),
+        json_bool(sample.primary_ready_carrier),
+        json_bool(sample.primary_target_owned),
+        json_bool(sample.primary_worker_queued),
+        json_bool(sample.primary_kernel_submitted),
+        json_bool(sample.independent_kms_admission),
+        json_number(sample.cursor_target_sequence),
+        json_number(sample.cursor_target_presentation_ns),
+        json_number(sample.cursor_worker_wake_ns),
+        json_number(sample.cursor_commit_complete_deadline_ns),
+        json_number(pending_age_at_transaction_built_ns),
+        json_number(pending_age_at_worker_queue_ns),
+        json_number(pending_age_at_kms_submit_ns),
+        json_number(pending_age_at_pageflip_ns),
+    );
 }
 
 fn json_number(value: Option<u64>) -> String {
     value.map_or_else(|| "null".to_owned(), |number| number.to_string())
+}
+
+fn json_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    }
+}
+
+fn json_string(value: Option<&'static str>) -> String {
+    value.map_or_else(|| "null".to_owned(), |value| format!("\"{value}\""))
+}
+
+const fn arbitration_reason(
+    policy: NativeCursorSchedulingPolicy,
+    primary: NativeCursorPrimaryState,
+    disposition: NativeCursorOutputDisposition,
+) -> &'static str {
+    match (policy, disposition) {
+        (NativeCursorSchedulingPolicy::Piggyback, _) => "legacy_piggyback_policy",
+        (_, NativeCursorOutputDisposition::SoftwareOverlay) => "software_required",
+        (_, NativeCursorOutputDisposition::PiggybackPrimary) => "ready_primary_carrier",
+        (_, NativeCursorOutputDisposition::DeferForPrimary) if primary.primary_target_owned => {
+            "primary_target_owned"
+        }
+        (_, NativeCursorOutputDisposition::DeferForPrimary)
+            if !primary.independent_kms_admission =>
+        {
+            "kms_lane_busy"
+        }
+        (_, NativeCursorOutputDisposition::DeferForPrimary) => "waiting_for_service_window",
+        (_, NativeCursorOutputDisposition::SubmitPlaneDelta) => "independent_service_due",
+        (_, NativeCursorOutputDisposition::Noop) => "no_pending_cursor",
+    }
 }
 
 const fn disposition_name(disposition: NativeCursorOutputDisposition) -> &'static str {
@@ -1174,6 +1386,41 @@ mod tests {
             trace.sample(older_output_one).unwrap().superseded_by_epoch,
             Some(2)
         );
+    }
+
+    #[test]
+    fn arbitration_evidence_keeps_original_pending_age_on_latest_sample() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 4, 1);
+        let sample_id = sample(&mut trace, 1);
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware(1, 100, 200);
+        arbitration.request_hardware(2, 220, 300);
+
+        trace.record_arbitration_evidence(
+            None,
+            output_id(),
+            Some(2),
+            250,
+            NativeCursorSchedulingPolicy::Auto,
+            &arbitration,
+            super::super::frame::NativeCursorPrimaryState {
+                independent_kms_admission: true,
+                ..Default::default()
+            },
+            None,
+            NativeCursorOutputDisposition::SubmitPlaneDelta,
+        );
+
+        let sample = trace.sample(sample_id).unwrap();
+        assert_eq!(sample.cursor_pending_since_ns, Some(100));
+        assert_eq!(sample.cursor_age_at_arbitration_ns, Some(150));
+        assert_eq!(sample.cursor_service_deadline_ns, Some(200));
+        assert_eq!(sample.cursor_overdue_age_ns, Some(50));
+        assert_eq!(sample.superseded_by_epoch, Some(2));
+
+        let mut jsonl = String::new();
+        super::append_sample_jsonl(&mut jsonl, *sample, None);
+        assert!(jsonl.contains("\"overdue_age_ns\":50"));
     }
 
     #[test]
@@ -1507,7 +1754,7 @@ mod tests {
         primary_arbitration.request_hardware(20, 0, 10);
         let primary_disposition = cursor_output_disposition_at_deadline(
             &mut primary_arbitration,
-            NativeCursorSchedulingPolicy::Auto,
+            NativeCursorSchedulingPolicy::Piggyback,
             10,
             true,
             true,

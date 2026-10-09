@@ -104,6 +104,7 @@ pub(crate) enum KmsWorkerEvent {
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
         retry: u8,
+        retry_not_before_ns: u64,
     },
     BusyExhausted {
         job: KmsCommitJob,
@@ -1244,6 +1245,13 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .metrics
                         .busy_retries
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let delay = if retries == 1 {
+                        Duration::from_micros(100)
+                    } else {
+                        Duration::from_micros(400)
+                    };
+                    let retry_not_before_ns = monotonic_now_ns()
+                        .saturating_add(u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX));
                     if !publish_event(
                         &shared,
                         KmsWorkerEvent::BusyDeferred {
@@ -1251,19 +1259,13 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             transaction_id: job.transaction_id,
                             token: job.token,
                             retry: retries,
+                            retry_not_before_ns,
                         },
                     ) {
                         retain_fatal_job(&shared, job, false);
                         return;
                     }
-                    let delay = if retries == 1 {
-                        Duration::from_micros(100)
-                    } else {
-                        Duration::from_micros(400)
-                    };
-                    let deadline = monotonic_now_ns()
-                        .saturating_add(u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX));
-                    if wait_until_or_quiesce(&shared, deadline).is_none() {
+                    if wait_until_or_quiesce(&shared, retry_not_before_ns).is_none() {
                         quiesce_with_jobs(&shared, vec![job]);
                         return;
                     }

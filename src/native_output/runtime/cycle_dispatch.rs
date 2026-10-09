@@ -1,4 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
+use super::planner::{
+    cursor_primary_ordering_target, pending_target_for_scanout, plan_cursor_service_opportunity,
+};
 use super::*;
 
 use oblivion_one::compositor::MaterialSetError;
@@ -1977,6 +1980,7 @@ impl NativeRuntime {
             frame_renderer,
             input_state,
             cursor_preference,
+            cursor_scheduling_policy,
             cursor_render_mode,
             atomic_cursor,
             legacy_cursor,
@@ -1991,6 +1995,11 @@ impl NativeRuntime {
             drm_reactor_token: _,
             cursor_output_arbitration,
             frame_scheduler,
+            output_refresh_rate,
+            presentation_timing,
+            presentation_deadline,
+            scheduled_presentation_target,
+            render_journal,
             effective_app_gpu_policy,
             scene_history: _,
             queued_redraw_requested,
@@ -2569,13 +2578,37 @@ impl NativeRuntime {
             }
             let effective_cursor_visible =
                 resolve_native_cursor_for_server(server, input_state).visible;
-            let _ = observe_atomic_cursor_output_liveness(
+            let now_ns = monotonic_now_ns()?;
+            let cursor_service_opportunity = if *cursor_scheduling_policy
+                == NativeCursorSchedulingPolicy::Auto
+            {
+                let now = MonotonicTimestampNs::new(now_ns);
+                let refresh_interval = Duration::from_nanos(output_refresh_rate.interval_ns());
+                let prediction = render_journal.prediction_at_with_kms_guard(
+                    now,
+                    refresh_interval,
+                    presentation_timing.apply_guard_ns(),
+                );
+                let pending_target = pending_target_for_scanout(scanout)?;
+                plan_cursor_service_opportunity(
+                    presentation_deadline,
+                    presentation_timing,
+                    now,
+                    cursor_primary_ordering_target(*scheduled_presentation_target, pending_target),
+                    prediction.kms_dispatch_budget_ns,
+                )
+            } else {
+                None
+            };
+            let _ = observe_atomic_cursor_output_liveness_with_policy(
                 atomic_cursor.as_ref(),
                 cursor_output_arbitration,
                 frame_scheduler,
-                monotonic_now_ns()?,
+                now_ns,
                 *cursor_render_mode,
                 effective_cursor_visible,
+                *cursor_scheduling_policy,
+                cursor_service_opportunity,
             );
             let client_flush = server.end_native_input_batch()?;
             if timing_enabled {

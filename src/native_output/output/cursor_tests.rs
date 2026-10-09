@@ -766,12 +766,14 @@ fn idle_theme_cursor_motion_opens_plane_delta_deadline_without_scene_damage() {
     let scheduler = NativeFrameScheduler::new(165, 0);
     let (cursor_changed, deadline_due, cursor_work_pending) = update_cursor_output_arbitration(
         &mut arbitration,
+        crate::native_output::runtime::NativeCursorSchedulingPolicy::Piggyback,
         cursor.desired_epoch(),
         INITIAL_CURSOR_EPOCH,
         1_000,
         &scheduler,
         false,
         true,
+        None,
     );
 
     assert!(cursor_changed);
@@ -780,12 +782,14 @@ fn idle_theme_cursor_motion_opens_plane_delta_deadline_without_scene_damage() {
     let deadline = arbitration.deadline_ns().expect("cursor deadline is armed");
     let (_, deadline_due, cursor_work_pending) = update_cursor_output_arbitration(
         &mut arbitration,
+        crate::native_output::runtime::NativeCursorSchedulingPolicy::Piggyback,
         cursor.desired_epoch(),
         INITIAL_CURSOR_EPOCH,
         deadline,
         &scheduler,
         false,
         true,
+        None,
     );
     assert!(deadline_due);
     assert!(cursor_work_pending);

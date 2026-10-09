@@ -223,12 +223,14 @@ pub(super) use atomic_commit::{
     register_atomic_primary_submission,
 };
 #[cfg(test)]
+pub(super) use cursor_cycle::observe_atomic_cursor_output_liveness;
+#[cfg(test)]
 pub(crate) use cursor_cycle::{
     NativeCursorSourceInput, NativeResolvedCursorSource, resolve_native_cursor_source,
 };
 pub(super) use cursor_cycle::{
     atomic_cursor_visibility_policy, effective_atomic_cursor_state, log_client_cursor_path,
-    observe_atomic_cursor_output_liveness, resolve_client_cursor_path,
+    observe_atomic_cursor_output_liveness_with_policy, resolve_client_cursor_path,
     resolve_native_cursor_for_server, synchronize_cursor_state_for_server,
 };
 pub(crate) use cycle::run;
@@ -240,10 +242,10 @@ pub(crate) use frame::earliest_native_deadline;
 #[cfg(test)]
 pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
-    NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
-    NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
-    NativePointerConstraintBackendAction, ResolvedNativeFrameScene, native_pointer_debug_log_lazy,
-    normalize_refresh_hz,
+    NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorPrimaryState,
+    NativeCursorRenderMode, NativeCursorSchedulingPolicy, NativeFrameRenderer,
+    NativePointerConstraintBackend, NativePointerConstraintBackendAction, ResolvedNativeFrameScene,
+    native_pointer_debug_log_lazy, normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{

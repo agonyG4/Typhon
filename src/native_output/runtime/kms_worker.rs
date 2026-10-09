@@ -1612,7 +1612,13 @@ impl NativeRuntime {
                 }
                 self.fail_queued_worker_job(job, error, WorkerRejectionKind::RealSubmit)?;
             }
-            KmsWorkerEvent::BusyDeferred { .. } => {
+            KmsWorkerEvent::BusyDeferred {
+                retry_not_before_ns,
+                ..
+            } => {
+                self.cursor_output_arbitration.note_kms_busy_retry();
+                self.cursor_output_arbitration
+                    .set_retry_not_before(retry_not_before_ns);
                 if self
                     .atomic_commit_arbiter
                     .worker_queued_kind()

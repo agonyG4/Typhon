@@ -498,14 +498,13 @@ impl NativeRuntime {
             }
             if error.kind == oblivion_one::native::kms::AtomicKmsErrorKind::Busy {
                 let now_ns = monotonic_now_ns()?;
-                self.cursor_output_arbitration.defer_after_busy(
-                    now_ns,
-                    self.frame_scheduler.next_refresh_deadline_ns(now_ns),
-                );
+                self.cursor_output_arbitration
+                    .set_retry_not_before(self.frame_scheduler.next_refresh_deadline_ns(now_ns));
                 if let Some(worker) = self.kms_commit_worker.as_ref() {
                     worker.record_cursor_worker_rejection_retryable();
                 }
             } else {
+                self.cursor_output_arbitration.clear_pending();
                 let cursor = self
                     .atomic_cursor
                     .as_mut()

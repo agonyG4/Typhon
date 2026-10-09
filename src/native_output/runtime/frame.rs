@@ -22,6 +22,7 @@ use super::frame_scene_identity::{
     assert_surface_owner_alignment, assert_surface_scene_node_alignment,
     filter_surface_scene_nodes_with_owners, finalize_snapshot,
 };
+use super::planner::CursorServiceOpportunity;
 use super::window_exit_frame::resolve_window_exit_frame_parts;
 
 static EFFECT_OWNER_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -945,10 +946,25 @@ pub(crate) enum NativeCursorOutputDisposition {
     Noop,
 }
 
+/// Snapshot of primary/KMS ownership relevant to one cursor service
+/// opportunity. `primary_scene_work_pending` alone is deliberately not a
+/// carrier: Auto may bypass unready scene work after its service window.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeCursorPrimaryState {
+    pub(crate) primary_scene_work_pending: bool,
+    pub(crate) ready_primary_carrier_attachable: bool,
+    pub(crate) primary_target_owned: bool,
+    pub(crate) primary_worker_queued: bool,
+    pub(crate) primary_kernel_submitted: bool,
+    pub(crate) independent_kms_admission: bool,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeCursorOutputArbitration {
     pending_since_ns: Option<u64>,
     deadline_ns: Option<u64>,
+    retry_not_before_ns: Option<u64>,
+    service_opportunity: Option<CursorServiceOpportunity>,
     desired_epoch: u64,
     primary_response_window_open: bool,
     hardware_cursor_pending: bool,
@@ -961,32 +977,93 @@ pub(crate) struct NativeCursorOutputArbitration {
     pub(crate) cursor_state_piggybacked: u64,
     pub(crate) idle_hardware_updates: u64,
     pub(crate) idle_software_updates: u64,
+    pub(crate) ready_primary_piggybacks: u64,
+    pub(crate) unready_primary_bypass_decisions: u64,
+    pub(crate) kms_busy_retries: u64,
+    pub(crate) cursor_service_target_misses: u64,
 }
 
 impl NativeCursorOutputArbitration {
     #[cfg(test)]
     pub(crate) fn request(&mut self, epoch: u64, now_ns: u64, deadline_ns: u64) {
-        self.request_with_source(epoch, now_ns, deadline_ns, false);
+        self.request_with_source(epoch, now_ns, Some(deadline_ns), None, false);
     }
 
     pub(crate) fn request_hardware(&mut self, epoch: u64, now_ns: u64, deadline_ns: u64) {
-        self.request_with_source(epoch, now_ns, deadline_ns, true);
+        self.request_with_source(epoch, now_ns, Some(deadline_ns), None, true);
+    }
+
+    pub(crate) fn request_hardware_unplanned(&mut self, epoch: u64, now_ns: u64) {
+        self.request_with_source(epoch, now_ns, None, None, true);
+    }
+
+    pub(crate) fn request_hardware_for_opportunity(
+        &mut self,
+        epoch: u64,
+        now_ns: u64,
+        opportunity: CursorServiceOpportunity,
+    ) {
+        self.request_with_source(
+            epoch,
+            now_ns,
+            Some(opportunity.service_deadline_ns),
+            Some(opportunity),
+            true,
+        );
     }
 
     fn request_with_source(
         &mut self,
         epoch: u64,
         now_ns: u64,
-        deadline_ns: u64,
+        deadline_ns: Option<u64>,
+        opportunity: Option<CursorServiceOpportunity>,
         hardware_cursor: bool,
     ) {
         if self.pending_since_ns.is_none() {
             self.pending_since_ns = Some(now_ns);
-            self.deadline_ns = Some(deadline_ns);
+            self.deadline_ns = opportunity
+                .map(|opportunity| opportunity.service_deadline_ns)
+                .or(deadline_ns);
+            self.retry_not_before_ns = None;
+            self.service_opportunity = opportunity;
             self.primary_response_window_open = true;
             self.response_windows_opened = self.response_windows_opened.saturating_add(1);
-        } else if epoch != self.desired_epoch {
-            self.changes_coalesced = self.changes_coalesced.saturating_add(1);
+        } else {
+            if epoch != self.desired_epoch {
+                self.changes_coalesced = self.changes_coalesced.saturating_add(1);
+            }
+            if let Some(opportunity) = opportunity {
+                if self.deadline_ns.is_none() {
+                    self.deadline_ns = Some(opportunity.service_deadline_ns);
+                }
+                let replace_opportunity = self.service_opportunity.is_none_or(|current| {
+                    let current_claim = current.target.physical_claim();
+                    let new_reservation_invalidates_current =
+                        opportunity.ordering_after_primary.is_some_and(|primary| {
+                            let primary_claim = primary.physical_claim();
+                            current_claim.clock_generation == primary_claim.clock_generation
+                                && current_claim.sequence <= primary_claim.sequence
+                        });
+                    let current_service_window_matured = current.service_deadline_ns <= now_ns
+                        || current.target.presentation_time.get() <= now_ns
+                        || current.submit_window.commit_complete_deadline_ns() <= now_ns;
+                    current.target.identity() != opportunity.target.identity()
+                        && (new_reservation_invalidates_current || current_service_window_matured)
+                });
+                if replace_opportunity {
+                    // A later physical target may become necessary when a
+                    // new reserved primary target invalidates this one or
+                    // when the existing service window matures. The
+                    // absolute freshness deadline above stays fixed, so this
+                    // replanning does not erase cursor age.
+                    self.service_opportunity = Some(opportunity);
+                    if self.deadline_ns.is_some_and(|deadline| deadline <= now_ns) {
+                        self.cursor_service_target_misses =
+                            self.cursor_service_target_misses.saturating_add(1);
+                    }
+                }
+            }
         }
         self.desired_epoch = epoch;
         self.hardware_cursor_pending |= hardware_cursor;
@@ -996,24 +1073,54 @@ impl NativeCursorOutputArbitration {
         self.deadline_ns
     }
 
+    pub(crate) const fn service_opportunity(&self) -> Option<CursorServiceOpportunity> {
+        self.service_opportunity
+    }
+
     /// Return the cursor response deadline only while it is still a future
     /// temporal boundary.  Matured debt remains pending for disposition and
     /// exact epoch settlement, but its old timestamp must not poll the owner
     /// that now controls progress.
     pub(crate) fn wake_deadline_ns(&self, now_ns: u64) -> Option<u64> {
-        self.deadline_ns.filter(|deadline_ns| *deadline_ns > now_ns)
+        let deadline_ns = self
+            .deadline_ns
+            .into_iter()
+            .chain(
+                self.service_opportunity
+                    .map(|opportunity| opportunity.service_deadline_ns),
+            )
+            .chain(self.retry_not_before_ns)
+            .max()?;
+        (deadline_ns > now_ns).then_some(deadline_ns)
     }
 
     pub(crate) const fn desired_epoch(&self) -> u64 {
         self.desired_epoch
     }
 
+    pub(crate) const fn pending_since_ns(&self) -> Option<u64> {
+        self.pending_since_ns
+    }
+
+    pub(crate) const fn retry_not_before_ns(&self) -> Option<u64> {
+        self.retry_not_before_ns
+    }
+
+    pub(crate) fn pending_age_ns(&self, now_ns: u64) -> Option<u64> {
+        self.pending_since_ns
+            .map(|pending_since_ns| now_ns.saturating_sub(pending_since_ns))
+    }
+
     pub(crate) const fn pending(&self) -> bool {
-        self.deadline_ns.is_some()
+        self.pending_since_ns.is_some()
     }
 
     pub(crate) fn due(&self, now_ns: u64) -> bool {
         self.deadline_ns.is_some_and(|deadline| now_ns >= deadline)
+            && self
+                .service_opportunity
+                .is_none_or(|opportunity| now_ns >= opportunity.service_deadline_ns)
+            && self.retry_not_before_ns.is_none_or(|retry| now_ns >= retry)
     }
 
     pub(crate) fn set_software_overlay_pending(&mut self, pending: bool) {
@@ -1048,6 +1155,37 @@ impl NativeCursorOutputArbitration {
                 self.idle_software_updates = self.idle_software_updates.saturating_add(1);
             }
             NativeCursorOutputDisposition::Noop => {}
+        }
+    }
+
+    pub(crate) fn note_policy_disposition(
+        &mut self,
+        policy: NativeCursorSchedulingPolicy,
+        primary: NativeCursorPrimaryState,
+        disposition: NativeCursorOutputDisposition,
+    ) {
+        self.note_disposition(disposition);
+        match (policy, disposition) {
+            (
+                NativeCursorSchedulingPolicy::Auto,
+                NativeCursorOutputDisposition::PiggybackPrimary,
+            ) if primary.ready_primary_carrier_attachable => {
+                self.ready_primary_piggybacks = self.ready_primary_piggybacks.saturating_add(1);
+            }
+            (
+                NativeCursorSchedulingPolicy::Auto,
+                NativeCursorOutputDisposition::SubmitPlaneDelta,
+            ) if primary.primary_scene_work_pending => {
+                self.unready_primary_bypass_decisions =
+                    self.unready_primary_bypass_decisions.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn note_kms_busy_retry(&mut self) {
+        if self.pending() {
+            self.kms_busy_retries = self.kms_busy_retries.saturating_add(1);
         }
     }
 
@@ -1087,6 +1225,7 @@ impl NativeCursorOutputArbitration {
         self.idle_software_updates
     }
 
+    #[cfg(test)]
     pub(crate) fn disposition(
         &self,
         now_ns: u64,
@@ -1132,24 +1271,25 @@ impl NativeCursorOutputArbitration {
             self.clear_pending();
             return;
         }
-        // A newer epoch was coalesced while the submitted job was waiting in
-        // the worker.  The old epoch is consumed, while the newer epoch gets
-        // a fresh response window and refresh-boundary deadline.
-        self.pending_since_ns = Some(now_ns);
-        self.deadline_ns = Some(next_deadline_ns);
-        self.primary_response_window_open = true;
-        self.response_windows_opened = self.response_windows_opened.saturating_add(1);
+        // A newer epoch arrived while the transaction was owned. Preserve
+        // its original freshness debt; the next runtime planning pass fills
+        // in a new physical KMS target without moving this deadline.
+        let _ = (now_ns, next_deadline_ns);
+        self.service_opportunity = None;
+        self.retry_not_before_ns = None;
     }
 
-    pub(crate) fn defer_after_busy(&mut self, now_ns: u64, next_deadline_ns: u64) {
+    pub(crate) fn set_retry_not_before(&mut self, retry_not_before_ns: u64) {
         if self.pending() {
-            self.deadline_ns = Some(next_deadline_ns.max(now_ns.saturating_add(1)));
+            self.retry_not_before_ns = Some(retry_not_before_ns);
         }
     }
 
     pub(crate) fn clear_pending(&mut self) {
         self.pending_since_ns = None;
         self.deadline_ns = None;
+        self.retry_not_before_ns = None;
+        self.service_opportunity = None;
         self.desired_epoch = 0;
         self.primary_response_window_open = false;
         self.hardware_cursor_pending = false;
@@ -1159,22 +1299,35 @@ impl NativeCursorOutputArbitration {
 
 pub(crate) fn update_cursor_output_arbitration(
     arbitration: &mut NativeCursorOutputArbitration,
+    policy: NativeCursorSchedulingPolicy,
     cursor_epoch: u64,
     last_submitted_cursor_epoch: u64,
     now_ns: u64,
     frame_scheduler: &NativeFrameScheduler,
     software_overlay_pending: bool,
     hardware_cursor_work_pending: bool,
+    service_opportunity: Option<CursorServiceOpportunity>,
 ) -> (bool, bool, bool) {
     arbitration.set_software_overlay_pending(software_overlay_pending);
     let hardware_cursor_changed =
         hardware_cursor_work_pending && cursor_epoch != last_submitted_cursor_epoch;
     let output_cursor_work_changed = hardware_cursor_changed || software_overlay_pending;
     if output_cursor_work_changed {
+        let deadline_ns = service_opportunity.map_or_else(
+            || match policy {
+                NativeCursorSchedulingPolicy::Auto => None,
+                NativeCursorSchedulingPolicy::Piggyback
+                | NativeCursorSchedulingPolicy::Software => {
+                    Some(frame_scheduler.next_refresh_deadline_ns(now_ns))
+                }
+            },
+            |opportunity| Some(opportunity.service_deadline_ns),
+        );
         arbitration.request_with_source(
             cursor_epoch,
             now_ns,
-            frame_scheduler.next_refresh_deadline_ns(now_ns),
+            deadline_ns,
+            service_opportunity,
             hardware_cursor_changed,
         );
     }
@@ -1190,9 +1343,10 @@ pub(crate) fn update_cursor_output_arbitration(
 #[path = "frame_tests.rs"]
 mod tests;
 
+#[cfg(test)]
 pub(crate) fn plane_delta_allowed_at_deadline(
     arbitration: &mut NativeCursorOutputArbitration,
-    _policy: NativeCursorSchedulingPolicy,
+    policy: NativeCursorSchedulingPolicy,
     now_ns: u64,
     primary_work_pending: bool,
     cursor_state_changed: bool,
@@ -1200,7 +1354,7 @@ pub(crate) fn plane_delta_allowed_at_deadline(
 ) -> bool {
     let disposition = cursor_output_disposition_at_deadline(
         arbitration,
-        _policy,
+        policy,
         now_ns,
         primary_work_pending,
         hardware_usable,
@@ -1213,15 +1367,72 @@ pub(crate) fn plane_delta_allowed_at_deadline(
     cursor_state_changed && disposition == NativeCursorOutputDisposition::SubmitPlaneDelta
 }
 
+#[cfg(test)]
 pub(crate) fn cursor_output_disposition_at_deadline(
     arbitration: &mut NativeCursorOutputArbitration,
-    _policy: NativeCursorSchedulingPolicy,
+    policy: NativeCursorSchedulingPolicy,
     now_ns: u64,
     primary_work_pending: bool,
     hardware_usable: bool,
 ) -> NativeCursorOutputDisposition {
-    let disposition = arbitration.disposition(now_ns, primary_work_pending, hardware_usable);
-    arbitration.note_disposition(disposition);
+    // This compatibility entry point models `primary_work_pending` as dirty
+    // scene work. Runtime arbitration supplies the richer ownership snapshot
+    // through `cursor_output_disposition_for_primary_state`.
+    let primary_state = NativeCursorPrimaryState {
+        primary_scene_work_pending: primary_work_pending,
+        ready_primary_carrier_attachable: policy == NativeCursorSchedulingPolicy::Piggyback
+            && primary_work_pending,
+        independent_kms_admission: true,
+        ..NativeCursorPrimaryState::default()
+    };
+    cursor_output_disposition_for_primary_state(
+        arbitration,
+        policy,
+        now_ns,
+        primary_state,
+        hardware_usable,
+    )
+}
+
+pub(crate) fn cursor_output_disposition_for_primary_state(
+    arbitration: &mut NativeCursorOutputArbitration,
+    policy: NativeCursorSchedulingPolicy,
+    now_ns: u64,
+    primary: NativeCursorPrimaryState,
+    hardware_usable: bool,
+) -> NativeCursorOutputDisposition {
+    let disposition = if !arbitration.pending() {
+        NativeCursorOutputDisposition::Noop
+    } else if policy == NativeCursorSchedulingPolicy::Software {
+        NativeCursorOutputDisposition::SoftwareOverlay
+    } else if policy == NativeCursorSchedulingPolicy::Piggyback
+        && (primary.primary_scene_work_pending
+            || primary.ready_primary_carrier_attachable
+            || primary.primary_target_owned
+            || primary.primary_worker_queued
+            || primary.primary_kernel_submitted)
+    {
+        NativeCursorOutputDisposition::PiggybackPrimary
+    } else if primary.ready_primary_carrier_attachable && !primary.primary_kernel_submitted {
+        NativeCursorOutputDisposition::PiggybackPrimary
+    } else if !arbitration.due(now_ns) {
+        if arbitration.primary_response_window_open {
+            NativeCursorOutputDisposition::DeferForPrimary
+        } else {
+            NativeCursorOutputDisposition::Noop
+        }
+    } else if primary.primary_target_owned
+        || primary.primary_worker_queued
+        || primary.primary_kernel_submitted
+        || !primary.independent_kms_admission
+    {
+        NativeCursorOutputDisposition::DeferForPrimary
+    } else if hardware_usable && !arbitration.software_overlay_pending {
+        NativeCursorOutputDisposition::SubmitPlaneDelta
+    } else {
+        NativeCursorOutputDisposition::SoftwareOverlay
+    };
+    arbitration.note_policy_disposition(policy, primary, disposition);
     disposition
 }
 

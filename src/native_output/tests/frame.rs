@@ -1299,8 +1299,17 @@ fn software_cursor_work_does_not_open_a_hardware_cursor_deadline() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     let scheduler = NativeFrameScheduler::new(165, 0);
 
-    let (changed, deadline_due, cursor_work_pending) =
-        update_cursor_output_arbitration(&mut arbitration, 2, 1, 1_000, &scheduler, false, false);
+    let (changed, deadline_due, cursor_work_pending) = update_cursor_output_arbitration(
+        &mut arbitration,
+        crate::native_output::runtime::NativeCursorSchedulingPolicy::Software,
+        2,
+        1,
+        1_000,
+        &scheduler,
+        false,
+        false,
+        None,
+    );
 
     assert!(!changed);
     assert!(!deadline_due);
@@ -1313,8 +1322,17 @@ fn software_client_cursor_work_keeps_the_existing_deadline_path() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     let scheduler = NativeFrameScheduler::new(165, 0);
 
-    let (changed, deadline_due, cursor_work_pending) =
-        update_cursor_output_arbitration(&mut arbitration, 0, 0, 1_000, &scheduler, true, false);
+    let (changed, deadline_due, cursor_work_pending) = update_cursor_output_arbitration(
+        &mut arbitration,
+        crate::native_output::runtime::NativeCursorSchedulingPolicy::Software,
+        0,
+        0,
+        1_000,
+        &scheduler,
+        true,
+        false,
+        None,
+    );
 
     assert!(changed);
     assert!(!deadline_due);
@@ -1475,12 +1493,14 @@ fn one_hundred_cursor_changes_produce_one_plane_delta_plan() {
 }
 
 #[test]
-fn busy_cursor_submission_moves_to_the_next_output_deadline() {
+fn busy_cursor_submission_moves_retry_without_sliding_freshness_deadline() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     arbitration.request(1, 1_000, 2_000);
-    arbitration.defer_after_busy(2_000, 3_000);
+    arbitration.note_kms_busy_retry();
+    arbitration.set_retry_not_before(3_000);
 
-    assert_eq!(arbitration.deadline_ns(), Some(3_000));
+    assert_eq!(arbitration.deadline_ns(), Some(2_000));
+    assert_eq!(arbitration.retry_not_before_ns(), Some(3_000));
     assert_eq!(arbitration.wake_deadline_ns(2_000), Some(3_000));
     assert_eq!(
         arbitration.disposition(2_001, false, true),
