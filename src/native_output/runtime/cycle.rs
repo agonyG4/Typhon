@@ -98,8 +98,28 @@ impl NativeRuntime {
             prediction.kms_dispatch_budget_ns,
         );
         if let Some(candidate) = candidate {
+            if self.cursor_output_arbitration.pending()
+                && self.cursor_output_arbitration.desired_epoch() == cursor.desired_epoch()
+            {
+                self.cursor_output_arbitration
+                    .reconcile_pending_service_opportunity(candidate, now_ns);
+            } else {
+                self.cursor_output_arbitration
+                    .request_hardware_for_opportunity(cursor.desired_epoch(), now_ns, candidate);
+            }
+        } else if !self
+            .cursor_output_arbitration
+            .planning_retry_ns()
+            .is_some_and(|retry_ns| retry_ns > now_ns)
+        {
+            // Do not fall through to a stale physical target when current
+            // presentation authorities cannot produce a valid opportunity.
             self.cursor_output_arbitration
-                .request_hardware_for_opportunity(cursor.desired_epoch(), now_ns, candidate);
+                .request_hardware_for_planning_retry(
+                    cursor.desired_epoch(),
+                    now_ns,
+                    self.frame_scheduler.next_refresh_deadline_ns(now_ns),
+                );
         }
         let Some(opportunity) = self.cursor_output_arbitration.service_opportunity() else {
             return Ok(false);

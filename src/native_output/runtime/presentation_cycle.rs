@@ -83,6 +83,21 @@ pub(crate) const fn primary_redraw_requested(
         || (cursor_deadline_due && client_cursor_software_work)
 }
 
+/// Hardware Auto cursor work is admitted as a PlaneDelta and must not seed a
+/// primary scene render. Software fallback and legacy policy work keep their
+/// existing visual repaint path.
+pub(crate) const fn cursor_work_requires_primary_repaint(
+    policy: super::frame::NativeCursorSchedulingPolicy,
+    cursor_deadline_due: bool,
+    cursor_output_work_pending: bool,
+    software_overlay_pending: bool,
+) -> bool {
+    cursor_deadline_due
+        && cursor_output_work_pending
+        && (!matches!(policy, super::frame::NativeCursorSchedulingPolicy::Auto)
+            || software_overlay_pending)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn admit_repaint_visual_work(
     frame_pacing: &mut NativeFramePacing,
@@ -466,18 +481,23 @@ impl NativeRuntime {
             perf,
         );
         let _ = client_cursor;
-        let (_cursor_epoch_changed, cursor_deadline_due, cursor_work_pending) =
-            update_cursor_output_arbitration(
-                cursor_output_arbitration,
-                *cursor_scheduling_policy,
-                cursor_epoch,
-                *last_submitted_cursor_epoch,
-                pacing_now_ns,
-                frame_scheduler,
-                client_cursor_software_work,
-                hardware_cursor_work_pending,
-                cursor_service_opportunity,
-            );
+        let (cursor_output_work_changed, cursor_deadline_due, _) = update_cursor_output_arbitration(
+            cursor_output_arbitration,
+            *cursor_scheduling_policy,
+            cursor_epoch,
+            *last_submitted_cursor_epoch,
+            pacing_now_ns,
+            frame_scheduler,
+            client_cursor_software_work,
+            hardware_cursor_work_pending,
+            cursor_service_opportunity,
+        );
+        let cursor_work_pending = cursor_work_requires_primary_repaint(
+            *cursor_scheduling_policy,
+            cursor_deadline_due,
+            cursor_output_work_changed,
+            client_cursor_software_work,
+        );
         let primary_redraw_requested = primary_redraw_requested(
             redraw_requested,
             *queued_redraw_requested,

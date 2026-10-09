@@ -1,4 +1,5 @@
 use super::presentation_cycle::complete_compatibility_no_visual_change;
+use super::presentation_cycle::cursor_work_requires_primary_repaint;
 use super::*;
 use crate::native_output::runtime::commit_timing::logical_scene_changed;
 use crate::native_output::scanout::{NativePaintOutcome, NativePaintStats, NativeScanoutKind};
@@ -6,6 +7,57 @@ use oblivion_one::compositor::{DesktopFrameCopyKind, DesktopSceneRebuildKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_COMPATIBILITY_SKIP_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn auto_hardware_cursor_deadline_does_not_queue_primary_render_work() {
+    let cursor_work_pending =
+        cursor_work_requires_primary_repaint(NativeCursorSchedulingPolicy::Auto, true, true, false);
+    assert!(!cursor_work_pending);
+    assert!(!primary_redraw_requested(false, false, true, false));
+
+    let repaint = native_repaint_decision(NativeRepaintInputs {
+        accepted_clients: false,
+        render_generation_changed: false,
+        pending_frame_work: false,
+        only_pending_surface_frame_callbacks: false,
+        redraw_requested: false,
+        cursor_work_pending,
+        effect_work_pending: false,
+        effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
+        page_flip_pending: false,
+    });
+    assert!(!repaint.repaint);
+
+    let mut frame_scheduler = NativeFrameScheduler::new(165, 0);
+    let mut queued_redraw_requested = false;
+    let mut frame_pacing = NativeFramePacing::from_env();
+    admit_repaint_visual_work(
+        &mut frame_pacing,
+        &mut frame_scheduler,
+        1,
+        0,
+        false,
+        repaint.repaint,
+        &mut queued_redraw_requested,
+        true,
+        false,
+    )
+    .expect("an idle hardware cursor does not create primary visual ownership");
+    assert!(!frame_scheduler.visual_work_queued());
+    assert!(!queued_redraw_requested);
+    assert!(cursor_work_requires_primary_repaint(
+        NativeCursorSchedulingPolicy::Auto,
+        true,
+        true,
+        true,
+    ));
+    assert!(cursor_work_requires_primary_repaint(
+        NativeCursorSchedulingPolicy::Piggyback,
+        true,
+        true,
+        false,
+    ));
+}
 
 fn skipped_outcome() -> NativePaintOutcome {
     NativePaintOutcome::Skipped(NativePaintStats {

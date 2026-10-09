@@ -981,6 +981,238 @@ mod tests {
     }
 
     #[test]
+    fn auto_replans_before_due_disposition_without_replacing_reachable_opportunity() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let input_ns = 1_000_000_000;
+        let input_time = MonotonicTimestampNs::new(input_ns);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(input_time);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let first = plan_cursor_service_opportunity(&planner, &timing, input_time, None, 500_000)
+            .expect("initial KMS-timed opportunity");
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        let (cursor_work, initial_due, initial_plane_delta) = update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            42,
+            41,
+            input_ns,
+            &scheduler,
+            false,
+            true,
+            Some(first),
+        );
+        assert!(cursor_work);
+        assert!(!initial_due);
+        assert!(!initial_plane_delta);
+        let initial_wake_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: input_ns,
+            cursor_response_deadline_ns: arbitration.wake_deadline_ns(input_ns),
+            cursor_planning_deadline_ns: arbitration.planning_retry_wake_deadline_ns(input_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            initial_wake_plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorResponse,
+                at_ns: first.service_deadline_ns,
+            })
+        );
+        assert!(cycle_tail_requires_runtime_wake_plan(
+            true,
+            false,
+            false,
+            arbitration.has_future_wake_requirement(input_ns),
+        ));
+
+        // Model the actual presentation-cycle order: the CursorResponse
+        // timer wakes, then the planner runs again before disposition. A
+        // one-nanosecond late wake selects a later target while O1 is still
+        // physically reachable.
+        let replan_ns = first.service_deadline_ns.saturating_add(1);
+        assert!(replan_ns < first.submit_window.commit_complete_deadline_ns());
+        let replanned = plan_cursor_service_opportunity(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(replan_ns),
+            None,
+            500_000,
+        )
+        .expect("planner returns a fresh future opportunity before disposition");
+        assert_ne!(replanned.target.identity(), first.target.identity());
+        assert!(replanned.service_deadline_ns > replan_ns);
+
+        let (cursor_work, deadline_due, cursor_plane_delta_due) = update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            42,
+            41,
+            replan_ns,
+            &scheduler,
+            false,
+            true,
+            Some(replanned),
+        );
+        assert!(cursor_work);
+        assert!(deadline_due);
+        assert!(cursor_plane_delta_due);
+
+        assert!(
+            !super::super::presentation_cycle::cursor_work_requires_primary_repaint(
+                NativeCursorSchedulingPolicy::Auto,
+                true,
+                true,
+                false,
+            )
+        );
+        assert_eq!(arbitration.pending_since_ns(), Some(input_ns));
+        assert_eq!(arbitration.deadline_ns(), Some(first.service_deadline_ns));
+        assert_eq!(arbitration.response_windows_opened, 1);
+        assert_eq!(
+            arbitration.service_opportunity(),
+            Some(first),
+            "service admission maturity must not expire O1 while its physical target remains reachable"
+        );
+        let disposition = cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            replan_ns,
+            NativeCursorPrimaryState {
+                independent_kms_admission: true,
+                ..NativeCursorPrimaryState::default()
+            },
+            true,
+        );
+        assert_eq!(
+            disposition,
+            NativeCursorOutputDisposition::SubmitPlaneDelta,
+            "the same unsatisfied epoch must submit after its original service deadline"
+        );
+        let selected = arbitration
+            .service_opportunity()
+            .expect("the PlaneDelta owns a real physical KMS opportunity");
+        assert!(selected.submit_window.worker_wake_at_ns() > replan_ns);
+        assert!(selected.submit_window.commit_complete_deadline_ns() > replan_ns);
+        arbitration.note_plane_delta_submission();
+        arbitration.consume_submitted_epoch(
+            42,
+            selected.submit_window.worker_wake_at_ns(),
+            scheduler.next_refresh_deadline_ns(selected.submit_window.worker_wake_at_ns()),
+        );
+        assert!(!arbitration.pending());
+        assert_eq!(arbitration.plane_delta_submissions(), 1);
+        assert_eq!(
+            arbitration.desired_epoch(),
+            0,
+            "the admitted cursor epoch settles without a later client event"
+        );
+        assert_eq!(
+            cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                replan_ns,
+                NativeCursorPrimaryState {
+                    independent_kms_admission: true,
+                    ..NativeCursorPrimaryState::default()
+                },
+                true,
+            ),
+            NativeCursorOutputDisposition::Noop,
+            "settlement leaves no repeat PlaneDelta work"
+        );
+    }
+
+    #[test]
+    fn overdue_auto_cursor_survives_repeated_expired_target_rebinding() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let input_ns = 2_000_000_000;
+        let input_time = MonotonicTimestampNs::new(input_ns);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(input_time);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let first = plan_cursor_service_opportunity(&planner, &timing, input_time, None, 500_000)
+            .expect("initial KMS-timed opportunity");
+        let original_deadline = first.service_deadline_ns;
+        let mut current = first;
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            42,
+            41,
+            input_ns,
+            &scheduler,
+            false,
+            true,
+            Some(first),
+        );
+
+        // Model repeated timer-only cycles where each prior physical target
+        // is genuinely past before disposition can reserve the replacement.
+        // The desired epoch arrives only once and no scene or primary work
+        // occurs during these replans.
+        let mut now_ns = input_ns;
+        for _ in 0..4 {
+            now_ns = current
+                .submit_window
+                .commit_complete_deadline_ns()
+                .saturating_add(1);
+            let next = plan_cursor_service_opportunity(
+                &planner,
+                &timing,
+                MonotonicTimestampNs::new(now_ns),
+                None,
+                500_000,
+            )
+            .expect("a later legal physical target can be planned");
+            assert_ne!(next.target.identity(), current.target.identity());
+            update_cursor_output_arbitration(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                42,
+                41,
+                now_ns,
+                &scheduler,
+                false,
+                true,
+                Some(next),
+            );
+
+            assert_eq!(arbitration.pending_since_ns(), Some(input_ns));
+            assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
+            assert!(arbitration.due(now_ns), "matured freshness debt is sticky");
+            assert!(next.submit_window.worker_wake_at_ns() > now_ns);
+            current = next;
+        }
+
+        assert_eq!(
+            cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                now_ns,
+                NativeCursorPrimaryState {
+                    independent_kms_admission: true,
+                    ..NativeCursorPrimaryState::default()
+                },
+                true,
+            ),
+            NativeCursorOutputDisposition::SubmitPlaneDelta,
+            "the overdue cursor is handed to the worker immediately; the worker owns its future KMS wake"
+        );
+        assert_eq!(arbitration.desired_epoch(), 42);
+    }
+
+    #[test]
     fn auto_idle_cursor_without_initial_opportunity_replans_and_settles_epoch() {
         const REFRESH_NS: u64 = 1_000_000_000 / 165;
         let event_ns = 1_000_000_000;
@@ -1233,6 +1465,11 @@ mod tests {
         assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
         assert_eq!(arbitration.deadline_ns(), Some(initial.service_deadline_ns));
         assert_eq!(arbitration.service_opportunity(), Some(after_binding));
+        assert_eq!(
+            arbitration.wake_deadline_ns(now.get() + 100_000),
+            Some(initial.service_deadline_ns),
+            "rebinding a physical target must retain the original freshness wake"
+        );
     }
 
     #[test]
@@ -1345,11 +1582,13 @@ mod tests {
                 .map(|opportunity| opportunity.target.sequence),
             Some(next.target.sequence)
         );
-        assert!(!arbitration.due(missed_at));
+        assert!(arbitration.due(missed_at));
         assert_eq!(
             arbitration.wake_deadline_ns(missed_at),
-            Some(next.service_deadline_ns)
+            None,
+            "matured freshness must not be postponed to a replacement target's service point"
         );
+        assert!(next.submit_window.worker_wake_at_ns() > missed_at);
     }
 
     #[test]
