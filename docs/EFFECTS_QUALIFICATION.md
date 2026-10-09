@@ -16,14 +16,18 @@ target directory:
 
 ```bash
 export CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target
-rtk cargo fmt --all -- --check
-rtk cargo check --locked --all-targets
-rtk cargo clippy --locked --all-targets -- -D warnings
-rtk cargo test --locked effects
-rtk cargo test --locked egl_renderer
-rtk cargo test --locked native_output
-rtk cargo test --locked
-rtk bin/qualify-presentation --dry-run
+export CARGO_HOME=/mnt/Aether/Desktop/GitHub/Cargo-home
+printf 'CARGO_TARGET_DIR=%s\nCARGO_HOME=%s\n' "$CARGO_TARGET_DIR" "$CARGO_HOME"
+case "$(realpath -m "$CARGO_TARGET_DIR")" in /mnt/Aether/Desktop/GitHub/*) ;; *) exit 2 ;; esac
+case "$(realpath -m "$CARGO_HOME")" in /mnt/Aether/Desktop/GitHub/*) ;; *) exit 2 ;; esac
+cargo fmt --all -- --check
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked effects
+cargo test --locked egl_renderer
+cargo test --locked native_output
+cargo test --locked
+bin/qualify-presentation --dry-run
 ```
 
 The Surface/VisualGroup effect-surface prerequisite is included in this
@@ -320,15 +324,15 @@ number of candidate-command visibility evaluations returned by
 regions. It can differ from `replay_capture_commands * execution_regions` when
 indices are malformed or future filtering changes the work.
 
-`replay_capture_scene_scan_pairs` is the actual number of scene-command
-iterations performed by the existing draw phase across all Replay execution
-regions. It measures full-scene scanning and is intentionally independent of
-candidate planning. `max_capture_scene_commands` is the total scene command
+`replay_capture_scene_scan_pairs` retains the legacy full-vector scan baseline:
+`scene_commands_total * execution_regions`. It is preserved for comparisons
+with older logs and is not the number of full-scene iterations on the
+region-native path. `max_capture_scene_commands` is the total scene command
 count observed by the max pass, so native analysis can compare it with
-`max_capture_scene_scan_pairs`. `*_planner_commands_*` come from the existing
-visibility planner, while `*_commands_executed` and `*_draw_calls` come from
-the existing renderer draw counters; occluded, outside-damage, and unavailable
-commands are not counted as executed draws.
+`max_capture_scene_scan_pairs`. `*_planner_commands_*` come from the visibility
+planner, while `*_commands_executed` and `*_draw_calls` come from the renderer
+draw counters; occluded, outside-damage, and unavailable commands are not
+counted as executed draws.
 
 `replay_capture_materialization_rects` counts incoming Replay materialization
 rectangles. `replay_capture_execution_regions` counts the actual rectangles
@@ -423,10 +427,11 @@ max_composite_scene_replay_scene_vbo_upload_bytes
 command range supplied to the scene replay. In particular,
 `command_count = command_end - command_start` is not a count of physical
 draws. `scene_commands_total` is the complete scene command-vector population.
-The current `draw_command_batch_range()` implementation scans that complete
-vector once for each active work rectangle, so `scene_scan_pairs` describes
-`scene_commands_total * active_work_rects`. It is a workload metric for the
-current full-vector scan and must not be interpreted as executed draws.
+`composite_scene_replay_scene_scan_pairs` retains the legacy baseline
+`scene_commands_total * active_work_rects` for comparisons with older logs. It
+must not be read as current full-vector work or as executed draws. Actual
+region-native planning work is reported separately by the `effect_scene_replay_*`
+fields below.
 
 `command_region_pairs` describes the logical command range multiplied by the
 active work-rectangle count. `active_work_rects`, `active_work_pixels`, and
@@ -559,6 +564,123 @@ timestamp with `end < start` is discarded rather than being subtracted with
 unsigned underflow. Timer-query records are useful qualification evidence, but
 GPU timing alone is not hardware qualification: real hardware, display-mode,
 presentation, and visual-acceptance runs remain required.
+
+### Region-native scene execution counters
+
+The native per-frame repaint record includes actual region-plan counters from
+`GlesSceneFrameStats`. These fields are emitted with the existing
+`OBLIVION_ONE_PERF_LOG=1` diagnostics; they add no clocks or timer reads to the
+command or clip loops:
+
+```text
+base_region_plan_builds base_region_input_rects base_region_normalized_rects
+base_region_commands_visited base_region_command_repair_tests
+base_region_planned_commands base_region_clip_pieces
+base_region_texture_binds base_region_draw_calls
+base_region_occlusion_overflow_fallbacks base_region_legacy_fallbacks
+base_region_legacy_mode_frames legacy_scene_scan_pairs_baseline
+effect_scene_replay_plan_builds effect_scene_replay_input_rects
+effect_scene_replay_normalized_rects effect_scene_replay_commands_visited
+effect_scene_replay_command_region_tests effect_scene_replay_planned_commands
+effect_scene_replay_clip_pieces effect_scene_replay_texture_binds
+effect_scene_replay_draw_calls effect_scene_replay_legacy_fallbacks
+replay_capture_region_plan_builds replay_capture_region_input_rects
+replay_capture_region_normalized_rects
+replay_capture_actual_scene_commands_visited
+replay_capture_actual_command_region_tests
+replay_capture_actual_planned_commands replay_capture_actual_clip_pieces
+replay_capture_actual_texture_binds replay_capture_actual_draw_calls
+replay_capture_region_legacy_fallbacks
+```
+
+`base_region_commands_visited` is the planner's outer command traversal count;
+`base_region_command_repair_tests` separately reports command/repair geometry
+work. The legacy ordinary baseline remains
+`scene_commands_total * repair_damage_rects` in
+`legacy_scene_scan_pairs_baseline`. `base_region_planned_commands` counts
+unique command references and `base_region_clip_pieces` counts active repair
+clips. On the region path, each planned ordinary command binds its texture and
+sets command uniforms once; draws can still repeat for its active clip pieces.
+
+Effect replay keeps opaque occlusion disabled. Its command-visit counter adds
+the requested-range planner traversal and the planned-command execution
+traversal. Replay capture similarly adds selection-plan visits and planned
+execution visits in `replay_capture_actual_scene_commands_visited`; its
+region-test, clip, texture, and draw fields report the corresponding work.
+`*_legacy_fallbacks` count
+unsafe or bounded-storage fallbacks. `base_region_legacy_mode_frames` records
+frames selected by `TYPHON_SCENE_EXECUTION_MODE=legacy` separately from
+automatic fallbacks. The legacy `*_scene_scan_pairs` effect-profiler fields
+above remain baseline formulas and are not redefined as actual work.
+
+### Region-native scaling benchmark
+
+The ignored optimized-profile benchmark varies scene commands
+`1,4,8,16,32,64,128`, repair rectangles `1,2,4,8,16,32`, opaque coverage
+`none,partial,high`, and effect selection `none,range,sparse`. It reuses plan
+storage, reports deterministic operation counts, and records 31 host timing
+samples per case as p50/p95/p99 nanoseconds. Timing is diagnostic only; the
+structural counters are the regression evidence. Estimated texture binds and
+draw calls in this CPU planner benchmark are planned command count and clip
+piece count, respectively; real GLES submission counts come from the native
+per-frame counters and pixel-equivalence tests.
+
+Run it with the stable Aether build directory:
+
+```bash
+target_dir=$(realpath -m /mnt/Aether/Desktop/GitHub/Typhon-target)
+printf 'CARGO_TARGET_DIR=%s\n' "$target_dir"
+case "$target_dir" in /mnt/Aether/Desktop/GitHub/*) ;; *) exit 2 ;; esac
+CARGO_TARGET_DIR="$target_dir" CARGO_HOME=/mnt/Aether/Desktop/GitHub/Cargo-home \
+  cargo test --locked --release --bin oblivion-one region_native_scaling_benchmark \
+  -- --ignored --nocapture
+```
+
+### Steam-first hardware A/B
+
+Build one release binary and run both modes from separate, intentional native
+TTY sessions with otherwise identical settings. Do not start the compositor
+from an existing graphical session. The first workload is Steam visible with
+continuous scrolling and several ordinary desktop windows; Cyberpunk is not
+needed for this pass. Repeat both modes later with Cyberpunk running. Keep
+final responsiveness/FPS measurements separate from the
+`OBLIVION_ONE_PERF_LOG` and `TYPHON_EFFECT_GPU_TIMING` diagnostic pass if their
+overhead is measurable.
+
+Build command:
+
+```bash
+target_dir=$(realpath -m /mnt/Aether/Desktop/GitHub/Typhon-target)
+printf 'CARGO_TARGET_DIR=%s\n' "$target_dir"
+case "$target_dir" in /mnt/Aether/Desktop/GitHub/*) ;; *) exit 2 ;; esac
+CARGO_TARGET_DIR="$target_dir" CARGO_HOME=/mnt/Aether/Desktop/GitHub/Cargo-home \
+  cargo build --locked --release --bin oblivion-one
+```
+
+Run once with `TYPHON_SCENE_EXECUTION_MODE=auto`, then start the same command
+with the value `legacy`. Each mode uses the same release binary, 165 Hz mode,
+settings, and Steam scroll route:
+
+```bash
+TYPHON_SCENE_EXECUTION_MODE=auto \
+OBLIVION_ONE_PROFILE=release \
+OBLIVION_ONE_BINARY=/mnt/Aether/Desktop/GitHub/Typhon-target/release/oblivion-one \
+OBLIVION_ONE_PERF_LOG=1 \
+TYPHON_EFFECT_GPU_TIMING=1 \
+OBLIVION_ONE_STATE_DIR=/mnt/Aether/Desktop/GitHub/Typhon-region-native-qualification/auto/state \
+OBLIVION_ONE_LOG_FILE=/mnt/Aether/Desktop/GitHub/Typhon-region-native-qualification/auto/session.log \
+  /home/agony/GitHub/Typhon/bin/start-oblivion-one-tty
+```
+
+For the legacy pass, replace both `auto` path components and the mode value
+with `legacy`. Record pageflip interval p50/p95/p99 from the native pacing
+summary, per-frame host `render_us`, compositor CPU from
+`scripts/typhon_cpu_saturation_probe.py`, and the region/effect/capture
+counters listed above. Check `base_region_legacy_fallbacks` and
+`replay_capture_region_legacy_fallbacks` to see whether auto is selecting the
+new path for the tested workload. This source qualification does not prove a
+hardware responsiveness improvement and says nothing about the previously
+observed 500–700 ms off-CPU stalls.
 
 ## Native matrix
 
