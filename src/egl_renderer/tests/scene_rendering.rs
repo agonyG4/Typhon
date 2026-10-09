@@ -1,6 +1,84 @@
 use super::*;
 
 #[test]
+fn real_gles_region_and_legacy_draws_configure_sampling_per_texture() {
+    let mut harness = GlesEffectTestHarness::new(2, 1);
+    let first_key = rgba_to_pixel([255, 0, 0, 255]);
+    let second_key = rgba_to_pixel([0, 255, 0, 255]);
+    let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+    let first_texture = create_effect_test_texture(&harness.gl, 2, 1, &pixels);
+    let second_texture = create_effect_test_texture(&harness.gl, 2, 1, &pixels);
+    set_effect_test_texture_filter(&harness.gl, first_texture, glow::LINEAR);
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(first_key), first_texture);
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(second_key), second_texture);
+
+    let scene = &mut harness.renderer.scene_state;
+    scene.vertices.clear();
+    scene.commands.clear();
+    push_draw_command(
+        &mut scene.vertices,
+        &mut scene.commands,
+        EglDrawLayer::SolidRgba(first_key),
+        EglRect::new(0.0, 0.0, 1.0, 1.0),
+        2,
+        1,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    push_draw_command(
+        &mut scene.vertices,
+        &mut scene.commands,
+        EglDrawLayer::SolidRgba(second_key),
+        EglRect::new(1.0, 0.0, 1.0, 1.0),
+        2,
+        1,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    scene.presentation_opacities = vec![1.0; 2];
+    scene
+        .scene_region_plan
+        .build(&scene.commands, &[OutputRect::new(0, 0, 2, 1)]);
+
+    unsafe {
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    harness
+        .renderer
+        .effect_execution_context()
+        .draw_scene_region_plan()
+        .expect("region-native scene draws");
+    let candidate = read_effect_test_pixels(&harness.gl, 2, 1);
+
+    set_effect_test_texture_filter(&harness.gl, second_texture, glow::NEAREST);
+    unsafe {
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    harness
+        .renderer
+        .draw_command_batch(true, None)
+        .expect("legacy full-current scene draws");
+    let reference = read_effect_test_pixels(&harness.gl, 2, 1);
+
+    assert_eq!(candidate, reference);
+    for x in 0..2 {
+        assert_effect_test_pixel(&candidate, 2, x, 0, [127, 127, 0, 255]);
+    }
+    unsafe {
+        harness.gl.delete_texture(first_texture);
+        harness.gl.delete_texture(second_texture);
+    }
+}
+
+#[test]
 fn lamp_renderer_locates_continuous_motion_uniforms() {
     let harness = GlesEffectTestHarness::new(320, 200);
     assert_eq!(

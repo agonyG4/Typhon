@@ -515,7 +515,6 @@ impl EffectExecutionContext<'_> {
             self.gl.bind_vertex_array(Some(vertex_array));
         }
 
-        let mut current_sampling = None;
         let initial_scissor = scissor;
         let mut current_scissor = scissor;
         let mut commands_considered = 0;
@@ -584,17 +583,14 @@ impl EffectExecutionContext<'_> {
             unsafe {
                 self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 texture_binds += 1;
-                if current_sampling != Some(command.sampling) {
-                    let filter = match command.sampling {
-                        SurfaceSampling::ExactNearest => glow::NEAREST,
-                        SurfaceSampling::ScaledLinear => glow::LINEAR,
-                    } as i32;
-                    self.gl
-                        .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
-                    self.gl
-                        .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
-                    current_sampling = Some(command.sampling);
-                }
+                let filter = match command.sampling {
+                    SurfaceSampling::ExactNearest => glow::NEAREST,
+                    SurfaceSampling::ScaledLinear => glow::LINEAR,
+                } as i32;
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                self.gl
+                    .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
                 if let Some(location) = opacity_location.as_ref() {
                     let presentation_opacity =
                         if self.scene.capture_unattenuated_visual_group == command.visual_group {
