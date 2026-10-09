@@ -2,7 +2,7 @@
 
 ## Status and evidence
 
-The current live checkout is authoritative. CodebaseMCP was refreshed as `home-agony-GitHub-Typhon`, generation `2026-10-09T14:22:54Z`. Its coverage report marked `cycle_dispatch.rs:2019` and `presentation_cycle.rs:301` as parse-partial; those ranges and the required runtime source were read directly. The supplied task's source findings were confirmed, including primary-first disposition, policy modes not being distinguished, refresh-boundary deadlines, EBUSY deadline sliding, scene prediction leaking into PlaneDelta target planning, worker wake pacing, and acquire/prepare preceding cursor presentation.
+The current live checkout is authoritative. CodebaseMCP was refreshed as `home-agony-GitHub-Typhon`, generation `2026-10-09T14:39:31Z`. Its coverage report marked `cycle_dispatch.rs:2019` and `presentation_cycle.rs:301` as parse-partial; those ranges and the required runtime source were read directly. The supplied task's source findings were confirmed, including primary-first disposition, policy modes not being distinguished, refresh-boundary deadlines, EBUSY deadline sliding, scene prediction leaking into PlaneDelta target planning, worker wake pacing, and acquire/prepare preceding cursor presentation.
 
 | Evidence class | Finding |
 |---|---|

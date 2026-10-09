@@ -10,9 +10,9 @@ use super::frame::{
 };
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
-    pacing_mode_for_target, pending_target_for_scanout, plan_cursor_service_opportunity,
-    plan_native_presentation_path, plan_visual_target_for_budget, prepare_presentation_target,
-    reactive_or_commit_timing_target,
+    pacing_mode_for_target, pending_target_for_scanout,
+    plan_cursor_service_opportunity_with_scene_prediction, plan_native_presentation_path,
+    plan_visual_target_for_budget, prepare_presentation_target, reactive_or_commit_timing_target,
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
@@ -442,11 +442,12 @@ impl NativeRuntime {
         };
         let primary_ordering_target =
             cursor_primary_ordering_target(*scheduled_presentation_target, pending_target);
-        let cursor_target_opportunity = plan_cursor_service_opportunity(
+        let cursor_target_opportunity = plan_cursor_service_opportunity_with_scene_prediction(
             presentation_deadline,
             presentation_timing,
             scheduler_now,
             primary_ordering_target,
+            prediction.total_cost_ns,
             prediction.kms_dispatch_budget_ns,
         );
         let cursor_service_opportunity = (*cursor_scheduling_policy

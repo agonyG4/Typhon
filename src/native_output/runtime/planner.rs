@@ -62,6 +62,20 @@ pub(crate) fn plan_cursor_service_opportunity(
     })
 }
 
+/// Plan the cursor opportunity from a scene prediction without borrowing the
+/// primary scene's render cost. Only the prediction's KMS dispatch estimate
+/// is relevant to an independent cursor plane commit.
+pub(crate) fn plan_cursor_service_opportunity_with_scene_prediction(
+    planner: &PresentationDeadlinePlanner,
+    timing: &KmsPresentationTimingModel,
+    now: MonotonicTimestampNs,
+    primary_target: Option<PresentationTarget>,
+    _scene_total_cost_ns: u64,
+    kms_dispatch_budget_ns: u64,
+) -> Option<CursorServiceOpportunity> {
+    plan_cursor_service_opportunity(planner, timing, now, primary_target, kms_dispatch_budget_ns)
+}
+
 pub(crate) fn cursor_primary_ordering_target(
     scheduled_target: Option<PresentationTarget>,
     pending_target: Option<PresentationTarget>,
@@ -828,11 +842,12 @@ mod tests {
 
         let opportunities = scene_predictions.map(|prediction| {
             assert!(prediction.total_cost_ns > 0);
-            plan_cursor_service_opportunity(
+            plan_cursor_service_opportunity_with_scene_prediction(
                 &planner,
                 &timing,
                 now,
                 None,
+                prediction.total_cost_ns,
                 prediction.kms_dispatch_budget_ns,
             )
             .expect("cursor has a reachable KMS opportunity")
@@ -1060,8 +1075,10 @@ mod tests {
         let mut arbitration = NativeCursorOutputArbitration::default();
         let mut input_epoch = 0_u64;
         let mut max_cursor_age_ns = 0_u64;
+        let mut max_unowned_cursor_age_ns = 0_u64;
         let mut independent_services = 0_u64;
         let mut ready_primary_piggybacks = 0_u64;
+        let mut owned_primary_deferrals = 0_u64;
         let mut baseline_primary_misses = 0_u64;
         let mut auto_primary_misses = 0_u64;
         let mut max_worker_queue_depth = 0_usize;
@@ -1087,15 +1104,15 @@ mod tests {
             let pending_since_ns = arbitration.pending_since_ns().unwrap();
             let age_at_decision_ns = service_deadline_ns.saturating_sub(pending_since_ns);
             max_cursor_age_ns = max_cursor_age_ns.max(age_at_decision_ns);
-            assert!(age_at_decision_ns <= REFRESH_NS);
             let latest_epoch = input_epoch;
             assert_eq!(arbitration.desired_epoch(), latest_epoch);
 
-            // Primary frames arriving before or exactly at the decision
-            // deadline can carry the newest cursor state. A frame arriving
-            // just after it missed its own already-reserved target; cursor
-            // planning places an independent target after that reservation.
-            let primary_ready_by_deadline = opportunity % 4 < 2;
+            // Four repeating primary states model frames ready before the
+            // cursor window, unready scene work without a reserved target,
+            // a late frame with a binding target, and a ready carrier after
+            // the prior reservation has completed.
+            let primary_ready_by_deadline = matches!(opportunity % 4, 0 | 3);
+            let primary_target_owned = opportunity % 4 == 2;
             let disposition = cursor_output_disposition_for_primary_state(
                 &mut arbitration,
                 NativeCursorSchedulingPolicy::Auto,
@@ -1103,6 +1120,7 @@ mod tests {
                 NativeCursorPrimaryState {
                     primary_scene_work_pending: true,
                     ready_primary_carrier_attachable: primary_ready_by_deadline,
+                    primary_target_owned,
                     independent_kms_admission: true,
                     ..Default::default()
                 },
@@ -1112,26 +1130,86 @@ mod tests {
             if primary_ready_by_deadline {
                 assert_eq!(disposition, NativeCursorOutputDisposition::PiggybackPrimary);
                 ready_primary_piggybacks += 1;
+            } else if primary_target_owned {
+                assert_eq!(disposition, NativeCursorOutputDisposition::DeferForPrimary);
+                owned_primary_deferrals += 1;
+
+                // Recreate the actual target planning for this case. The
+                // primary becomes ready after the cursor decision but before
+                // its reserved presentation. Auto's independent cursor
+                // target must be strictly after the primary target.
+                let model_now = MonotonicTimestampNs::new(
+                    2_000_000_000_u64.saturating_add(opportunity.saturating_mul(REFRESH_NS)),
+                );
+                let mut target_planner =
+                    PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+                target_planner.note_presented(model_now);
+                let timing = KmsPresentationTimingModel::new(
+                    KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+                    7,
+                );
+                let current_opportunity = plan_cursor_service_opportunity(
+                    &target_planner,
+                    &timing,
+                    model_now,
+                    None,
+                    500_000,
+                )
+                .expect("model cursor target before a primary reservation");
+                let mut primary_target = current_opportunity.target;
+                primary_target.reason = PresentationTargetReason::Normal;
+                assert_eq!(
+                    primary_target.authority(),
+                    PresentationTargetAuthority::Reserved
+                );
+                let ordered_cursor_opportunity = plan_cursor_service_opportunity(
+                    &target_planner,
+                    &timing,
+                    model_now,
+                    Some(primary_target),
+                    500_000,
+                )
+                .expect("model cursor target after the binding primary");
+                assert!(
+                    ordered_cursor_opportunity.target.physical_claim().sequence
+                        > primary_target.physical_claim().sequence
+                );
+                let primary_ready_at = primary_target
+                    .presentation_time
+                    .get()
+                    .saturating_sub(100_000);
+                assert!(primary_ready_at > current_opportunity.service_deadline_ns);
+                assert!(primary_ready_at < primary_target.presentation_time.get());
+                let baseline_miss = primary_ready_at > primary_target.presentation_time.get();
+                let cursor_would_steal_target =
+                    ordered_cursor_opportunity.target.physical_claim().sequence
+                        <= primary_target.physical_claim().sequence;
+                let auto_miss = baseline_miss
+                    || (cursor_would_steal_target
+                        && primary_ready_at <= primary_target.presentation_time.get());
+                baseline_primary_misses += u64::from(baseline_miss);
+                auto_primary_misses += u64::from(auto_miss);
             } else {
                 assert_eq!(disposition, NativeCursorOutputDisposition::SubmitPlaneDelta);
                 independent_services += 1;
+                max_unowned_cursor_age_ns = max_unowned_cursor_age_ns.max(age_at_decision_ns);
             }
 
-            // The model releases the single worker slot at the next physical
-            // opportunity. No second cursor job is admitted for this slot.
-            let worker_queue_depth = 1;
+            // A primary sidecar or independent cursor uses the existing one
+            // job slot. An owned but not yet attachable primary holds its
+            // physical target and defers cursor admission.
+            let worker_queue_depth = usize::from(
+                disposition == NativeCursorOutputDisposition::PiggybackPrimary
+                    || disposition == NativeCursorOutputDisposition::SubmitPlaneDelta,
+            );
             max_worker_queue_depth = max_worker_queue_depth.max(worker_queue_depth);
             assert!(worker_queue_depth <= 1);
-            arbitration.consume(latest_epoch);
-
-            if opportunity % 4 == 2 {
-                // The same late-ready primary would miss before and after
-                // cursor scheduling because its scene was not ready at its
-                // reserved target. The independent cursor target is ordered
-                // after that binding reservation (covered by the target
-                // authority planner regression above).
-                baseline_primary_misses += 1;
-                auto_primary_misses += 1;
+            if matches!(
+                disposition,
+                NativeCursorOutputDisposition::PiggybackPrimary
+                    | NativeCursorOutputDisposition::SubmitPlaneDelta
+            ) {
+                arbitration.consume(latest_epoch);
             }
         }
 
@@ -1152,12 +1230,19 @@ mod tests {
 
         assert_eq!(input_epoch, 1_000);
         assert!(independent_services <= DISPLAY_HZ);
-        assert!(ready_primary_piggybacks > 0);
+        assert_eq!(ready_primary_piggybacks, 83);
         assert!(independent_services > 0);
-        assert_eq!(independent_services + ready_primary_piggybacks, DISPLAY_HZ);
+        assert_eq!(independent_services, 41);
+        assert_eq!(owned_primary_deferrals, 41);
+        assert_eq!(
+            independent_services + ready_primary_piggybacks + owned_primary_deferrals,
+            DISPLAY_HZ
+        );
         assert_eq!(max_worker_queue_depth, 1);
         assert_eq!(auto_primary_misses, baseline_primary_misses);
-        assert!(max_cursor_age_ns <= REFRESH_NS);
+        assert_eq!(baseline_primary_misses, 0);
+        assert!(max_cursor_age_ns <= REFRESH_NS.saturating_mul(2));
+        assert!(max_unowned_cursor_age_ns <= REFRESH_NS);
         assert!(arbitration.pending());
         assert_eq!(arbitration.desired_epoch(), 1_000);
         assert_eq!(arbitration.pending_since_ns(), Some(998_000_000));

@@ -86,7 +86,7 @@ impl NativeRuntime {
             self.presentation_timing.apply_guard_ns(),
         );
         let pending_target = super::planner::pending_target_for_scanout(&self.scanout)?;
-        let candidate = super::planner::plan_cursor_service_opportunity(
+        let candidate = super::planner::plan_cursor_service_opportunity_with_scene_prediction(
             &self.presentation_deadline,
             &self.presentation_timing,
             now,
@@ -94,6 +94,7 @@ impl NativeRuntime {
                 self.scheduled_presentation_target,
                 pending_target,
             ),
+            prediction.total_cost_ns,
             prediction.kms_dispatch_budget_ns,
         );
         if let Some(candidate) = candidate {
