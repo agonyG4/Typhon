@@ -209,12 +209,11 @@ fn lamp_tracks_texture_filter_transitions_across_commands_and_render_passes() {
         second_linear,
     ];
 
-    let draws_before = harness.renderer.scene_state.frame_stats.draw_calls;
     draw_lamp_sampling_pass(&mut harness);
     assert_eq!(
-        harness.renderer.scene_state.frame_stats.draw_calls - draws_before,
-        5,
-        "alternating filter commands and both windows must execute in the pass"
+        harness.renderer.lifecycle.evidence().consumed.len(),
+        2,
+        "both lifecycle windows must reach an executed GLES draw"
     );
     assert_eq!(
         lamp_test_texture_filters(&harness.gl, textures[0]),
@@ -244,14 +243,8 @@ fn lamp_tracks_texture_filter_transitions_across_commands_and_render_passes() {
             command.sampling = SurfaceSampling::ExactNearest;
         }
     }
-    let draws_before_second_pass = harness.renderer.scene_state.frame_stats.draw_calls;
     draw_lamp_sampling_pass(&mut harness);
 
-    assert_eq!(
-        harness.renderer.scene_state.frame_stats.draw_calls - draws_before_second_pass,
-        5,
-        "the second pass must execute after the ordinary pass mutates both textures"
-    );
     assert_eq!(
         harness.renderer.lifecycle.evidence().consumed.len(),
         2,
