@@ -9,6 +9,35 @@ This document records the reproducible procedure for the Typhon effects engine.
 It does not convert unit tests, shader-source inspection, or the dry-run matrix
 into hardware qualification.
 
+## Precomputed synthesized-window blur experiment
+
+The diagnostic environment variable is
+`TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on`; `off` is the default. Keep EGL
+context priority fixed at `medium` for both runs. Compare the same stacked
+15-Kitty workload with Effects timing settings, blur configuration, refresh and
+queue policies unchanged. Save exact and precomputed runs separately, and use
+an `exact, precomputed, exact, precomputed` order when practical.
+
+Before comparing FPS or tails, verify that the exact run reports policy off and
+no shared build, while the precomputed run reports policy on, the expected
+synthesized eligible and selected consumer counts, `built=true`, and
+`fallback=false`. Require materially fewer timed passes, SceneCapture passes,
+Kawase passes, and capture/downsample/upsample pixels. A 15-window frame near
+the old 105-pass shape means the experiment did not reduce the intended work;
+stop and diagnose it before interpreting performance.
+
+For every benchmark window require `dropped_spans=0` and a stable,
+non-saturated GPU-query pool. Record Effects total median/p95/p99/max,
+maximum-pass median/p95/p99/max, rates of passes at least 3 ms and frames at
+least 8 ms, render-fence signal latency percentiles, host GL/query stalls,
+checkpoint-cache hit and zero-copy counts, and the pass kinds responsible for
+GPU spikes above 3 ms. Keep client backdrop effects exact during this test.
+The experiment intentionally lets later eligible synthesized windows reuse
+the scene prefix before the earliest eligible window, so intervening windows
+are absent from those later blur sources. Do not describe it as semantically
+equivalent to exact backdrop blur, and do not change the default policy without
+native qualification.
+
 ## Deterministic gates
 
 Run from the Typhon checkout with Cargo artifacts directed to the stable Aether

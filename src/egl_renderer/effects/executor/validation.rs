@@ -172,7 +172,10 @@ pub(super) fn validate_current_frame_input_regions(
             .iter()
             .find(|texture| texture.id == *input_id)
             .ok_or(EffectExecutionInvariantError::UnknownTexture(*input_id))?;
-        if matches!(input_plan.source, GraphTextureSource::Static(_)) {
+        if matches!(
+            input_plan.source,
+            GraphTextureSource::PrecomputedBackdrop | GraphTextureSource::Static(_)
+        ) {
             continue;
         }
         let required = oblivion_one::effects::required_input_region(

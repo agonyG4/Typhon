@@ -21,6 +21,7 @@ pub(in crate::egl_renderer) struct PreparedEffectGraphExecution<'a> {
     promote_checkpoint_cache: bool,
     lifecycle_trace_summary: Option<FrameTraceSummary>,
     overlay_rects: Vec<OutputRect>,
+    skip_final_scene_replay: bool,
 }
 
 impl PreparedEffectGraphExecution<'_> {
@@ -187,12 +188,106 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         repaint_rects,
         demand,
         selection,
+        false,
     )?;
     let result = execute_prepared_effect_graph_core(renderer, &mut prepared);
     if result.is_ok() {
         renderer.establish_effect_composition_state(targets.composition_draw);
     }
     finish_prepared_effect_graph_execution(renderer, prepared, result)
+}
+
+pub(crate) fn execute_precomputed_backdrop_graph(
+    renderer: &mut EffectExecutionContext<'_>,
+    graph: &CompiledFrameGraph,
+    shared_output: GraphTextureId,
+    baseline_framebuffer: glow::Framebuffer,
+    framebuffer_origin: OutputFramebufferOrigin,
+    output_size: (u32, u32),
+) -> RendererResult<(
+    EffectExecutionStats,
+    super::super::resources::PooledEffectTexture,
+)> {
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1)
+        .ok_or_else(|| io::Error::other("invalid precomputed backdrop output bounds"))?;
+    let full = EffectRegion::from_rect(bounds);
+    let instance = graph
+        .instances
+        .first()
+        .ok_or_else(|| io::Error::other("precomputed backdrop graph has no baseline instance"))?;
+    let demand = EffectExecutionDemand::new(
+        vec![oblivion_one::effects::EffectInstanceExecutionDemand {
+            id: instance.id,
+            presentation_output_region: full.clone(),
+            output_region: full.clone(),
+        }],
+        full,
+    );
+    let mut selection = EffectExecutionSelection::default();
+    selection.executed_instances.push(instance.id);
+    for pass in &graph.passes {
+        if !matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture
+                | RenderPassKind::DualKawaseDownsample
+                | RenderPassKind::DualKawaseUpsample
+        ) {
+            continue;
+        }
+        selection.executed_passes.push(pass.id);
+        for texture_id in pass.inputs.iter().copied().chain(pass.output) {
+            if graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == texture_id)
+                .is_some_and(|texture| texture.source != GraphTextureSource::Output)
+                && !selection.acquired_texture_ids.contains(&texture_id)
+            {
+                selection.acquired_texture_ids.push(texture_id);
+            }
+        }
+    }
+    if !selection.executed_passes.iter().any(|pass_id| {
+        graph
+            .passes
+            .iter()
+            .any(|pass| pass.id == *pass_id && pass.output == Some(shared_output))
+    }) {
+        return Err(
+            io::Error::other("precomputed backdrop output is not produced by its graph").into(),
+        );
+    }
+    let rects = [OutputRect::new(0, 0, output_size.0, output_size.1)];
+    let mut prepared = prepare_lifecycle_effect_graph_execution(
+        renderer,
+        graph,
+        EffectExecutionTargets::ordinary(EffectFramebufferTarget::new(Some(baseline_framebuffer))),
+        framebuffer_origin,
+        &rects,
+        &demand,
+        &selection,
+        true,
+    )?;
+    let result = execute_prepared_effect_graph_core(renderer, &mut prepared);
+    let retained = result
+        .is_ok()
+        .then(|| prepared.textures.remove(&shared_output))
+        .flatten();
+    let result = finish_prepared_effect_graph_execution(renderer, prepared, result);
+    match (
+        result,
+        retained.and_then(GraphTextureBinding::into_transient),
+    ) {
+        (Ok(stats), Some(texture)) => Ok((stats, texture)),
+        (Err(error), Some(texture)) => {
+            let _ = renderer.runtime.effect_resources.release(texture);
+            Err(error)
+        }
+        (Err(error), None) => Err(error),
+        (Ok(_), None) => {
+            Err(io::Error::other("precomputed backdrop output was not retained").into())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -205,6 +300,31 @@ pub(crate) fn prepare_effect_graph_execution<'a>(
     selection: &'a EffectExecutionSelection,
     debug_config: EffectDebugConfig,
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
+) -> RendererResult<PreparedEffectGraphExecution<'a>> {
+    prepare_effect_graph_execution_with_external_bindings(
+        context,
+        graph,
+        framebuffer_origin,
+        repaint_plan,
+        demand,
+        selection,
+        debug_config,
+        scene_replay_work_mode_override,
+        HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_effect_graph_execution_with_external_bindings<'a>(
+    context: &mut EffectExecutionContext<'_>,
+    graph: &'a CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_plan: &'a crate::egl_renderer::damage::RepaintPlan,
+    demand: &'a EffectExecutionDemand,
+    selection: &'a EffectExecutionSelection,
+    debug_config: EffectDebugConfig,
+    scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
+    external_bindings: HashMap<GraphTextureId, GraphTextureBinding>,
 ) -> RendererResult<PreparedEffectGraphExecution<'a>> {
     let compatibility = CheckpointCacheCompatibility {
         output_size: context.scene.current_size,
@@ -228,6 +348,8 @@ pub(crate) fn prepare_effect_graph_execution<'a>(
         .runtime
         .effect_trace
         .frame_boundary("effect_graph_execute", "begin", trace_summary);
+    let mut textures = cached.bindings;
+    textures.extend(external_bindings);
     Ok(PreparedEffectGraphExecution {
         graph,
         framebuffer_origin,
@@ -241,13 +363,14 @@ pub(crate) fn prepare_effect_graph_execution<'a>(
         targets: EffectExecutionTargets::ordinary(EffectFramebufferTarget::new(
             context.scene.active_output_framebuffer,
         )),
-        textures: cached.bindings,
+        textures,
         checkpoint_cache_admission: cached.admission,
         checkpoint_preparations: cached.preparations,
         graph_scope: None,
         promote_checkpoint_cache: true,
         lifecycle_trace_summary: None,
         overlay_rects: Vec::new(),
+        skip_final_scene_replay: false,
     })
 }
 
@@ -259,6 +382,7 @@ pub(crate) fn prepare_lifecycle_effect_graph_execution<'a>(
     repaint_rects: &'a [OutputRect],
     demand: &'a EffectExecutionDemand,
     selection: &'a EffectExecutionSelection,
+    skip_final_scene_replay: bool,
 ) -> RendererResult<PreparedEffectGraphExecution<'a>> {
     let trace_summary = FrameTraceSummary {
         selected_effect_count: Some(selection.executed_instances.len()),
@@ -293,6 +417,7 @@ pub(crate) fn prepare_lifecycle_effect_graph_execution<'a>(
         promote_checkpoint_cache: false,
         lifecycle_trace_summary: Some(trace_summary),
         overlay_rects: Vec::new(),
+        skip_final_scene_replay,
     })
 }
 
@@ -335,6 +460,7 @@ pub(crate) fn execute_prepared_effect_graph_core(
         graph_scope,
         &fusion_plan,
         &mut prepared.overlay_rects,
+        prepared.skip_final_scene_replay,
     );
     if let Ok(stats) = &mut result {
         stats.checkpoint_cache_admission = prepared.checkpoint_cache_admission;

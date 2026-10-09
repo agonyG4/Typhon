@@ -641,6 +641,10 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
         let auto_scene = capture_effect_scene(&commands);
         assert_eq!(auto_scene.instances.len(), 1);
         assert_eq!(
+            auto_scene.instances[0].backdrop_reuse,
+            crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate
+        );
+        assert_eq!(
             auto_scene.instances[0].anchor_scope,
             EffectAnchorScope::VisualGroup
         );
@@ -671,6 +675,10 @@ fn production_wayland_auto_blur_uses_committed_xdg_geometry_and_client_blur_stay
             EffectRect::new(raw_surface_origin.0 - 10, raw_surface_origin.1 - 12, 5, 5).unwrap();
         let client_scene = capture_effect_scene(&commands);
         assert_eq!(client_scene.instances.len(), 1);
+        assert_eq!(
+            client_scene.instances[0].backdrop_reuse,
+            crate::compositor::EffectBackdropReuse::Exact
+        );
         assert_eq!(
             client_scene.instances[0].anchor_scope,
             EffectAnchorScope::Surface

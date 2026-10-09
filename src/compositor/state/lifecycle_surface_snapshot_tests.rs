@@ -184,6 +184,7 @@ fn resolved_effect_lifecycle_source_uses_the_captured_surface_topology() {
         frame_demand: crate::effects::EffectFrameDemand::OnDamage,
         visual_group: None,
         anchor_scope: crate::compositor::EffectAnchorScope::Surface,
+        backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
         scene_order: crate::compositor::EffectSceneOrder::for_anchor(anchor),
     };
     let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));

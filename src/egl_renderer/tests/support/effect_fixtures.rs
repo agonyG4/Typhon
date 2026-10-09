@@ -48,6 +48,7 @@ pub(in crate::egl_renderer::tests) fn moving_blur_scene_with_spec(
         frame_demand: EffectFrameDemand::OnDamage,
         visual_group: None,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+        backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
         scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(
             oblivion_one::compositor::EffectAnchor::OutputPostProcess,
         ),
@@ -105,6 +106,7 @@ pub(in crate::egl_renderer::tests) fn native_backdrop_effect_instance(
         frame_demand: EffectFrameDemand::OnDamage,
         visual_group: spec.visual_group,
         anchor_scope: spec.anchor_scope,
+        backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
         scene_order: spec.scene_order,
     }
 }

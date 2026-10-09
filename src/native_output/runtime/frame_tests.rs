@@ -417,6 +417,7 @@ fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(701)),
         }],
     );

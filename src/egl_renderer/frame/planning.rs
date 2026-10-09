@@ -4,7 +4,10 @@ use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::{
     compositor::{self, RenderableSurface},
-    effects::{EffectExecutionDemand, FrameExecutionPlan, compile_frame_execution_plan},
+    effects::{
+        CompiledPrecomputedBackdropPlan, EffectExecutionDemand, FrameExecutionPlan,
+        compile_frame_execution_variants,
+    },
 };
 
 use super::super::{
@@ -61,6 +64,11 @@ pub(super) enum FramePlanOutcome {
 pub(super) struct PlannedFrame {
     pub(super) plan: RepaintPlan,
     pub(super) execution_plan: FrameExecutionPlan,
+    pub(super) exact_execution_plan: Option<FrameExecutionPlan>,
+    pub(super) precomputed_backdrop: Option<CompiledPrecomputedBackdropPlan>,
+    pub(super) precomputed_eligible_instances: usize,
+    pub(super) exact_effect_execution_demand: Option<EffectExecutionDemand>,
+    pub(super) exact_effect_selection: Option<EffectExecutionSelection>,
     pub(super) damage_state: EglPresentedDamageState,
     pub(super) candidate_scene_key: EglSceneCacheKey,
     pub(super) effect_execution_demand: Option<EffectExecutionDemand>,
@@ -409,7 +417,12 @@ impl FramePipeline<'_> {
             "begin",
             telemetry::effect_trace_summary(self.scene, request.effects, None, None, None),
         );
-        let execution_plan = if self.effects.failed_effect_generation
+        let (
+            execution_plan,
+            exact_execution_plan,
+            precomputed_backdrop,
+            precomputed_eligible_instances,
+        ) = if self.effects.failed_effect_generation
             == Some(self.effects.effect_registry_generation)
             && self.scene.frame_stats.effect_instances_visible != 0
         {
@@ -419,18 +432,34 @@ impl FramePipeline<'_> {
                 self.scene.frame_stats.effect_instances_visible;
             self.scene.frame_stats.effect_failure_reason =
                 Some(super::super::effects::EffectFailureReason::GraphCompile);
-            FrameExecutionPlan::LegacyScene
+            (FrameExecutionPlan::LegacyScene, None, None, 0)
         } else {
-            match compile_frame_execution_plan(
+            match compile_frame_execution_variants(
                 request.effects,
                 &effect_source_damage,
                 output_bounds,
                 &self.effects.effect_registry,
+                self.effects.precomputed_window_blur_policy
+                    == super::super::effects::PrecomputedWindowBlurPolicy::On,
             ) {
-                Ok(FrameExecutionPlan::LegacyScene) => FrameExecutionPlan::LegacyScene,
-                Ok(FrameExecutionPlan::EffectGraph(graph)) => {
-                    telemetry::record_effect_graph_metrics(self.scene, graph_metrics(&graph));
-                    FrameExecutionPlan::EffectGraph(graph)
+                Ok(variants) => {
+                    let has_precomputed = variants.precomputed_backdrop.is_some();
+                    let execution_plan = variants
+                        .precomputed_graph
+                        .map_or_else(|| variants.exact.clone(), FrameExecutionPlan::EffectGraph);
+                    if let FrameExecutionPlan::EffectGraph(graph) = &execution_plan {
+                        telemetry::record_effect_graph_metrics(self.scene, graph_metrics(graph));
+                    }
+                    if has_precomputed {
+                        (
+                            execution_plan,
+                            Some(variants.exact),
+                            variants.precomputed_backdrop,
+                            variants.eligible_instances,
+                        )
+                    } else {
+                        (execution_plan, None, None, variants.eligible_instances)
+                    }
                 }
                 Err(_) => {
                     self.scene.frame_stats.effect_fallbacks =
@@ -441,7 +470,7 @@ impl FramePipeline<'_> {
                         Some(super::super::effects::EffectFailureReason::GraphCompile);
                     self.effects.failed_effect_generation =
                         Some(self.effects.effect_registry_generation);
-                    FrameExecutionPlan::LegacyScene
+                    (FrameExecutionPlan::LegacyScene, None, None, 0)
                 }
             }
         };
@@ -511,6 +540,11 @@ impl FramePipeline<'_> {
         Ok(FramePlanOutcome::Planned(PlannedFrame {
             plan,
             execution_plan,
+            exact_execution_plan,
+            precomputed_backdrop,
+            precomputed_eligible_instances,
+            exact_effect_execution_demand: None,
+            exact_effect_selection: None,
             damage_state: prepared.damage_state,
             candidate_scene_key: prepared.candidate_scene_key,
             effect_execution_demand: None,
@@ -591,6 +625,19 @@ impl FramePipeline<'_> {
                 })
             }
         };
+        let exact_demand = match &planned.exact_execution_plan {
+            Some(FrameExecutionPlan::EffectGraph(graph)) => {
+                let mut exact_repaint_plan = planned.plan.clone();
+                Some(resolve_effect_execution_for_repaint_plan(
+                    &self.scene.repaint_planner,
+                    graph,
+                    &mut exact_repaint_plan,
+                    width,
+                    height,
+                ))
+            }
+            _ => None,
+        };
         let selected_effect_count = demand.as_ref().map(|demand| demand.instances.len());
         let demand_trace_stats = self
             .effects
@@ -644,6 +691,7 @@ impl FramePipeline<'_> {
                 .saturating_sub(demand.instances.len());
         }
         planned.effect_execution_demand = demand;
+        planned.exact_effect_execution_demand = exact_demand;
         planned.selected_effect_count = selected_effect_count;
     }
 
@@ -720,6 +768,58 @@ impl FramePipeline<'_> {
             }
             _ => None,
         };
+        let exact_effect_selection = match (
+            &planned.exact_execution_plan,
+            &planned.exact_effect_execution_demand,
+        ) {
+            (Some(FrameExecutionPlan::EffectGraph(graph)), Some(demand)) => {
+                let selection = super::super::effects::select_effect_execution(graph, demand);
+                consumer_plan.extend(
+                    &super::super::effects::plan_effect_surface_consumers_with_metadata(
+                        graph,
+                        demand,
+                        &selection,
+                        &self.scene.commands,
+                        &self.scene.capture_layers,
+                        &self.scene.capture_visual_groups,
+                        &repair_rects,
+                        (width, height),
+                        *super::super::effects::effect_debug_config(),
+                    ),
+                );
+                Some(selection)
+            }
+            _ => None,
+        };
+        let precomputed_backdrop_demanded =
+            planned
+                .precomputed_backdrop
+                .as_ref()
+                .is_some_and(|precomputed| {
+                    precomputed.consumers.iter().any(|consumer| {
+                        effect_selection.as_ref().is_some_and(|selection| {
+                            selection.executed_instances.contains(&consumer.instance)
+                        })
+                    })
+                });
+        if precomputed_backdrop_demanded && let Some(precomputed) = &planned.precomputed_backdrop {
+            let (draw_end, _) = super::super::effects::composition_range_with_metadata(
+                &self.scene.commands,
+                &self.scene.capture_layers,
+                &self.scene.capture_visual_groups,
+                precomputed.baseline_anchor,
+                precomputed.baseline_visual_group,
+                precomputed.baseline_anchor_scope,
+            );
+            let full_output = [super::super::OutputRect::new(0, 0, width, height)];
+            add_surface_consumers_for_command_range(
+                &mut consumer_plan,
+                &self.scene.commands,
+                0,
+                draw_end,
+                &full_output,
+            );
+        }
         consumer_plan.finish();
         self.scene.frame_stats.surface_resource_candidates = request.surfaces.len();
         self.scene.frame_stats.surface_resource_consumers = consumer_plan
@@ -738,6 +838,7 @@ impl FramePipeline<'_> {
             .surface_resource_candidates
             .saturating_sub(self.scene.frame_stats.surface_resource_consumers);
         planned.effect_selection = effect_selection;
+        planned.exact_effect_selection = exact_effect_selection;
         consumer_plan
     }
 

@@ -317,6 +317,7 @@ pub struct PooledEffectTexture {
 pub(crate) enum GraphTextureBindingOwnership {
     FrameTransient,
     CheckpointCache,
+    PrecomputedBackdropAlias,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,12 +341,23 @@ impl GraphTextureBinding {
         }
     }
 
-    fn into_transient(self) -> Option<PooledEffectTexture> {
+    pub(crate) fn precomputed_backdrop_alias(texture: PooledEffectTexture) -> Self {
+        Self {
+            texture,
+            ownership: GraphTextureBindingOwnership::PrecomputedBackdropAlias,
+        }
+    }
+
+    pub(crate) fn into_transient(self) -> Option<PooledEffectTexture> {
         (self.ownership == GraphTextureBindingOwnership::FrameTransient).then_some(self.texture)
     }
 
     pub(crate) fn is_checkpoint_cache(&self) -> bool {
         self.ownership == GraphTextureBindingOwnership::CheckpointCache
+    }
+
+    pub(crate) fn is_precomputed_backdrop_alias(&self) -> bool {
+        self.ownership == GraphTextureBindingOwnership::PrecomputedBackdropAlias
     }
 }
 
@@ -1177,7 +1189,10 @@ impl EffectGlResourceCache {
     ) -> Result<HashMap<GraphTextureId, GraphTextureBinding>, Box<dyn std::error::Error>> {
         let mut checked_out = HashMap::new();
         for texture in &graph.textures {
-            if texture.source == GraphTextureSource::Output {
+            if matches!(
+                texture.source,
+                GraphTextureSource::Output | GraphTextureSource::PrecomputedBackdrop
+            ) {
                 continue;
             }
             match self.acquire(gl, texture_key(texture)) {
@@ -1408,7 +1423,12 @@ fn graph_texture_is_output(graph: &CompiledFrameGraph, id: GraphTextureId) -> bo
         .textures
         .iter()
         .find(|texture| texture.id == id)
-        .is_some_and(|texture| texture.source == GraphTextureSource::Output)
+        .is_some_and(|texture| {
+            matches!(
+                texture.source,
+                GraphTextureSource::Output | GraphTextureSource::PrecomputedBackdrop
+            )
+        })
 }
 
 pub(crate) fn release_dead_graph_textures(
@@ -1740,6 +1760,7 @@ mod tests {
                     frame_demand: EffectFrameDemand::OnDamage,
                     visual_group: None,
                     anchor_scope: EffectAnchorScope::VisualGroup,
+                    backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                     scene_order: EffectSceneOrder::for_anchor(anchor),
                 }
             })
@@ -2859,6 +2880,30 @@ mod tests {
         cache.clear_checkpoint_capture_cache();
         assert!(!cache.pool.is_checked_out(texture_id));
         assert_eq!(cache.pool.checked_out_bytes(), 0);
+    }
+
+    #[test]
+    fn precomputed_alias_never_releases_the_single_frame_owner() {
+        let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
+        let owner = cache.pool.checkout(key(16, 12)).unwrap();
+        let owner_id = owner.id;
+        let alias = GraphTextureBinding::precomputed_backdrop_alias(owner.clone());
+        assert!(alias.is_precomputed_backdrop_alias());
+        assert!(alias.into_transient().is_none());
+
+        cache
+            .release_graph(HashMap::from([(GraphTextureId::new(9).unwrap(), alias)]))
+            .unwrap();
+        assert!(cache.pool.is_checked_out(owner_id));
+        assert_eq!(cache.pool.checked_out_bytes(), u64::from(16 * 12 * 4));
+
+        cache.release(owner.clone()).unwrap();
+        assert!(!cache.pool.is_checked_out(owner_id));
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+        assert_eq!(
+            cache.release(owner.clone()),
+            Err(EffectResourceError::TextureAlreadyReturned(owner_id))
+        );
     }
 
     #[test]

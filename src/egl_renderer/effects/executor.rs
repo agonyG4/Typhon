@@ -60,6 +60,7 @@ mod session;
 #[cfg(test)]
 pub(crate) use session::checkpoint_capture_cache_candidates;
 pub(crate) use session::execute_effect_graph_for_lifecycle;
+pub(crate) use session::execute_precomputed_backdrop_graph;
 #[cfg(test)]
 pub(crate) use session::{
     execute_effect_graph, execute_effect_graph_with_debug_config,
@@ -67,7 +68,7 @@ pub(crate) use session::{
 };
 pub(in crate::egl_renderer) use session::{
     execute_prepared_effect_graph_core, finish_prepared_effect_graph_execution,
-    prepare_effect_graph_execution,
+    prepare_effect_graph_execution, prepare_effect_graph_execution_with_external_bindings,
 };
 mod graph_runner;
 use graph_runner::*;

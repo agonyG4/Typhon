@@ -454,6 +454,13 @@ pub(super) fn ensure_pass_textures(
 ) -> RendererResult<()> {
     for texture_id in pass.inputs.iter().copied().chain(pass.output) {
         let plan = graph_texture(graph, texture_id)?;
+        if plan.source == GraphTextureSource::PrecomputedBackdrop
+            && !textures.contains_key(&texture_id)
+        {
+            return Err(
+                io::Error::other("precomputed backdrop was not bound for this frame").into(),
+            );
+        }
         if plan.source == GraphTextureSource::Output || textures.contains_key(&texture_id) {
             continue;
         }

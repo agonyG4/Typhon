@@ -89,6 +89,29 @@ previous rendered cache state, including unpresented renders. Existing
 dependency-bearing framebuffer checkpoint candidates retain admission priority
 under the checkpoint soft budget.
 
+## Experimental shared window blur
+
+`TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on` selects an opt-in diagnostic
+experiment. The default is `off`; that mode retains the exact per-instance
+backdrop graph and prefix-causal semantics.
+
+With `on`, Typhon may precompute one shared backdrop blur for compatible
+compositor-synthesized window blur when at least two eligible consumers are
+present. Client-requested `ext-background-effect-v1` blur remains exact.
+Layer-rule blur and custom or trusted effects also remain exact in this
+milestone.
+
+The shared source is the scene prefix immediately before the earliest eligible
+window blur. Later optimized synthesized windows intentionally reuse that same
+prefix, so they do not include intervening windows in their blur source. This
+mode is not semantically equivalent to exact backdrop blur and is not exposed
+as a client policy.
+
+The experiment tests whether reusing one blur pyramid explains part of the
+measured smoothness gap between Typhon and Hyprland. No performance claim is
+valid until native A/B qualification confirms both structural work reduction
+and GPU timing behavior.
+
 When GPU timing is active, `event=effect_gpu_timing` reports
 `replay_capture_cache_hits`, `replay_capture_cache_full_refreshes`,
 `replay_capture_cache_zero_copy_hits`, `replay_capture_cache_update_pixels`,

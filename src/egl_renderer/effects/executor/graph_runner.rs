@@ -50,6 +50,7 @@ pub(super) fn execute_graph_passes_inner(
     graph_scope: Option<super::super::gpu_timing::GraphTimingScope>,
     fusion_plan: &CaptureDownsampleFusionPlan,
     ordinary_overlay_rects: &mut Vec<OutputRect>,
+    skip_final_scene_replay: bool,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
     stats.capture_downsample_fusion_candidates = fusion_plan.candidates;
@@ -722,7 +723,7 @@ pub(super) fn execute_graph_passes_inner(
             scene_work_state.force_baseline();
         }
         let final_scene_cursor_end = renderer.scene.commands.len();
-        if renderer.runtime.effect_trace.enabled() {
+        if !skip_final_scene_replay && renderer.runtime.effect_trace.enabled() {
             let metrics = scene_work_state.work_trace_metrics();
             renderer.runtime.effect_trace.final_scene_replay_boundary(
                 "begin",
@@ -735,14 +736,16 @@ pub(super) fn execute_graph_passes_inner(
                 metrics.4,
             );
         }
-        renderer.draw_effect_scene_range(
-            scene_work_state.active_work(),
-            scene_cursor,
-            final_scene_cursor_end,
-            framebuffer_origin,
-            targets.composition_draw,
-        )?;
-        if renderer.runtime.effect_trace.enabled() {
+        if !skip_final_scene_replay {
+            renderer.draw_effect_scene_range(
+                scene_work_state.active_work(),
+                scene_cursor,
+                final_scene_cursor_end,
+                framebuffer_origin,
+                targets.composition_draw,
+            )?;
+        }
+        if !skip_final_scene_replay && renderer.runtime.effect_trace.enabled() {
             let metrics = scene_work_state.work_trace_metrics();
             renderer.runtime.effect_trace.final_scene_replay_boundary(
                 "end",

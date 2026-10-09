@@ -240,6 +240,9 @@ pub enum GraphTextureSource {
     CapturedScene,
     CapturedTarget,
     Intermediate,
+    /// A frame-owned shared backdrop texture materialized outside ordinary
+    /// per-instance graph ownership.
+    PrecomputedBackdrop,
     Static(super::StaticTextureId),
 }
 
@@ -401,6 +404,42 @@ pub struct CompiledFrameGraph {
     pub instances: Vec<CompiledEffectInstance>,
     pub final_damage: EffectRegion,
     pub stats: RenderGraphCompileStats,
+}
+
+/// Immutable frame-level description of the shared synthesized-window
+/// backdrop experiment. The consumer graph treats its materialized result as
+/// an external source; the frame executor owns the separate capture/blur
+/// lifecycle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledPrecomputedBackdropPlan {
+    pub baseline_instance: EffectInstanceId,
+    pub baseline_effect: ResolvedEffectInstance,
+    pub baseline_anchor: EffectAnchor,
+    pub baseline_scene_order: crate::compositor::EffectSceneOrder,
+    pub baseline_anchor_scope: EffectAnchorScope,
+    pub baseline_visual_group: Option<VisualGroupId>,
+    pub consumers: Vec<CompiledPrecomputedBackdropConsumer>,
+    pub capture_domain: EffectRect,
+    pub blur: DualKawaseBlurSpec,
+    pub working_space: EffectWorkingSpace,
+    /// One full-output capture plus a down/up level for every Kawase pass.
+    pub build_passes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledPrecomputedBackdropConsumer {
+    pub instance: EffectInstanceId,
+    pub texture: GraphTextureId,
+}
+
+/// Exact execution remains available for same-frame fallback. The optional
+/// optimized graph only replaces eligible synthesized backdrop legs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledFrameExecutionVariants {
+    pub exact: FrameExecutionPlan,
+    pub precomputed_graph: Option<CompiledFrameGraph>,
+    pub precomputed_backdrop: Option<CompiledPrecomputedBackdropPlan>,
+    pub eligible_instances: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -973,7 +1012,9 @@ fn texture_producers(graph: &CompiledFrameGraph) -> Vec<TextureProducer> {
         .map(|texture| {
             if matches!(
                 texture.source,
-                GraphTextureSource::Output | GraphTextureSource::Static(_)
+                GraphTextureSource::Output
+                    | GraphTextureSource::PrecomputedBackdrop
+                    | GraphTextureSource::Static(_)
             ) {
                 return TextureProducer {
                     pass_index: None,
@@ -1315,7 +1356,10 @@ fn debug_effect_dependency_coverage(
                 continue;
             };
             let input = &graph.textures[input_index];
-            if matches!(input.source, GraphTextureSource::Static(_)) {
+            if matches!(
+                input.source,
+                GraphTextureSource::PrecomputedBackdrop | GraphTextureSource::Static(_)
+            ) {
                 continue;
             }
             let Some(producer) = producers.get(input_index).copied() else {
@@ -1500,7 +1544,10 @@ fn plan_effect_pass_execution_demand(
                 continue;
             };
             let input_plan = &graph.textures[input_index];
-            if matches!(input_plan.source, GraphTextureSource::Static(_)) {
+            if matches!(
+                input_plan.source,
+                GraphTextureSource::PrecomputedBackdrop | GraphTextureSource::Static(_)
+            ) {
                 continue;
             }
             let Some(producer) = producers.get(input_index).copied() else {
@@ -1952,6 +1999,219 @@ pub fn compile_frame_execution_plan(
     output_bounds: EffectRect,
     registry: &EffectRegistry,
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
+    compile_frame_execution_graph(scene, source_damage, output_bounds, registry, &[])
+}
+
+/// Compile the exact graph and, when explicitly requested and eligible, a
+/// separate optimized graph plus its immutable frame-level preblur plan.
+/// Callers retain `exact` for same-frame fallback until shared preparation has
+/// completed successfully.
+pub fn compile_frame_execution_variants(
+    scene: &ResolvedEffectScene,
+    source_damage: &EffectRegion,
+    output_bounds: EffectRect,
+    registry: &EffectRegistry,
+    precomputed_window_blur_enabled: bool,
+) -> Result<CompiledFrameExecutionVariants, RenderGraphCompileError> {
+    let exact = compile_frame_execution_plan(scene, source_damage, output_bounds, registry)?;
+    let mut eligible = scene
+        .instances
+        .iter()
+        .filter_map(|instance| {
+            if instance.region.is_empty() || !precomputed_window_blur_instance(instance) {
+                return None;
+            }
+            let program = registry.get(instance.program)?;
+            canonical_builtin_blur_spec(program).map(|blur| (instance, blur))
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by_key(|(instance, _)| (instance.scene_order, instance.id));
+    let eligible_instances = eligible.len();
+    if !precomputed_window_blur_enabled || eligible_instances < 2 {
+        return Ok(CompiledFrameExecutionVariants {
+            exact,
+            precomputed_graph: None,
+            precomputed_backdrop: None,
+            eligible_instances,
+        });
+    }
+
+    let (baseline, blur) = eligible[0];
+    let candidates = eligible
+        .iter()
+        .map(|(instance, _)| instance.id)
+        .collect::<Vec<_>>();
+    let precomputed_graph = match compile_frame_execution_graph(
+        scene,
+        source_damage,
+        output_bounds,
+        registry,
+        &candidates,
+    )? {
+        FrameExecutionPlan::LegacyScene => None,
+        FrameExecutionPlan::EffectGraph(graph) => Some(graph),
+    };
+    let Some(graph) = precomputed_graph.as_ref() else {
+        return Ok(CompiledFrameExecutionVariants {
+            exact,
+            precomputed_graph: None,
+            precomputed_backdrop: None,
+            eligible_instances,
+        });
+    };
+    let consumers = candidates
+        .iter()
+        .filter_map(|instance| {
+            graph
+                .textures
+                .iter()
+                .find(|texture| {
+                    texture.source == GraphTextureSource::PrecomputedBackdrop
+                        && graph.passes.iter().any(|pass| {
+                            pass.instance == *instance && pass.inputs.contains(&texture.id)
+                        })
+                })
+                .map(|texture| CompiledPrecomputedBackdropConsumer {
+                    instance: *instance,
+                    texture: texture.id,
+                })
+        })
+        .collect::<Vec<_>>();
+    if consumers.len() != eligible_instances {
+        return Ok(CompiledFrameExecutionVariants {
+            exact,
+            precomputed_graph: None,
+            precomputed_backdrop: None,
+            eligible_instances,
+        });
+    }
+    let build_passes = 1 + usize::from(blur.passes) * 2;
+    Ok(CompiledFrameExecutionVariants {
+        exact,
+        precomputed_graph,
+        precomputed_backdrop: Some(CompiledPrecomputedBackdropPlan {
+            baseline_instance: baseline.id,
+            baseline_effect: baseline.clone(),
+            baseline_anchor: baseline.anchor,
+            baseline_scene_order: baseline.scene_order,
+            baseline_anchor_scope: baseline.anchor_scope,
+            baseline_visual_group: baseline.visual_group,
+            consumers,
+            capture_domain: output_bounds,
+            blur,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            build_passes,
+        }),
+        eligible_instances,
+    })
+}
+
+/// Compile the canonical capture + Dual Kawase build graph described by a
+/// frame-level preblur plan. The returned graph is an executor adapter for the
+/// shared plan, not the ordinary graph consumed by window instances.
+pub fn compile_precomputed_backdrop_materialization_graph(
+    plan: &CompiledPrecomputedBackdropPlan,
+    output_bounds: EffectRect,
+    registry: &EffectRegistry,
+) -> Result<(CompiledFrameGraph, GraphTextureId), RenderGraphCompileError> {
+    let mut baseline = plan.baseline_effect.clone();
+    baseline.region = EffectRegion::from_rect(output_bounds);
+    baseline.target_bounds = output_bounds;
+    baseline.coverage = None;
+    let baseline_id = baseline.id;
+    let scene = ResolvedEffectScene::new(0, vec![baseline]);
+    let FrameExecutionPlan::EffectGraph(mut graph) = compile_frame_execution_plan(
+        &scene,
+        &EffectRegion::from_rect(output_bounds),
+        output_bounds,
+        registry,
+    )?
+    else {
+        return Err(RenderGraphCompileError::InvalidGraph(
+            EffectValidationError::MissingOutputNode,
+        ));
+    };
+    let build_end = graph
+        .passes
+        .iter()
+        .position(|pass| {
+            matches!(
+                pass.kind,
+                RenderPassKind::Fragment | RenderPassKind::Composite
+            )
+        })
+        .unwrap_or(graph.passes.len());
+    graph.passes.truncate(build_end);
+    let shared_output = graph
+        .passes
+        .iter()
+        .rev()
+        .find(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+        .and_then(|pass| pass.output)
+        .ok_or(RenderGraphCompileError::InvalidGraph(
+            EffectValidationError::MissingOutputNode,
+        ))?;
+    if graph.passes.iter().any(|pass| pass.instance != baseline_id) {
+        return Err(RenderGraphCompileError::InvalidGraph(
+            EffectValidationError::MissingOutputNode,
+        ));
+    }
+    if let Some(texture) = graph
+        .textures
+        .iter_mut()
+        .find(|texture| texture.id == shared_output)
+    {
+        texture.last_use = None;
+    }
+    graph.stats.passes = graph.passes.len();
+    graph.stats.peak_live_intermediates = peak_live_intermediates(&graph.passes, &graph.textures);
+    Ok((graph, shared_output))
+}
+
+fn precomputed_window_blur_instance(instance: &ResolvedEffectInstance) -> bool {
+    instance.backdrop_reuse == crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate
+        && matches!(instance.anchor, EffectAnchor::BeforeSurface(_))
+        && instance.anchor_scope == EffectAnchorScope::VisualGroup
+        && instance.visual_group.is_some()
+        && instance.coverage.is_none()
+        && instance.frame_demand == EffectFrameDemand::OnDamage
+}
+
+fn canonical_builtin_blur_spec(program: &ValidatedEffectProgram) -> Option<DualKawaseBlurSpec> {
+    if program.program.id != builtin_background_blur_program_id()
+        || program.program.nodes.len() != 4
+        || program.program.frame_demand != EffectFrameDemand::OnDamage
+        || !program.lowering.uses_backdrop
+    {
+        return None;
+    }
+    let [source, blur, color, noise] = program.program.nodes.as_slice() else {
+        return None;
+    };
+    if !matches!(&source.kind, EffectNodeKind::Source(EffectSource::Backdrop))
+        || !matches!(&blur.kind, EffectNodeKind::DualKawaseBlur(_))
+        || !matches!(&color.kind, EffectNodeKind::ColorMatrix(_))
+        || !matches!(&noise.kind, EffectNodeKind::Noise(_))
+        || blur.inputs != [source.id]
+        || color.inputs != [blur.id]
+        || noise.inputs != [color.id]
+        || program.program.output != noise.id
+    {
+        return None;
+    }
+    match &blur.kind {
+        EffectNodeKind::DualKawaseBlur(spec) if spec.passes == 2 => Some(*spec),
+        _ => None,
+    }
+}
+
+fn compile_frame_execution_graph(
+    scene: &ResolvedEffectScene,
+    source_damage: &EffectRegion,
+    output_bounds: EffectRect,
+    registry: &EffectRegistry,
+    precomputed_consumers: &[EffectInstanceId],
+) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
     #[cfg(test)]
     note_graph_compile();
     let visible_instance_count = scene
@@ -1990,17 +2250,21 @@ pub fn compile_frame_execution_plan(
         }
         final_damage = final_damage.union(&effect_damage.output_damage);
         let (dependencies, dependency_instances) = if program.lowering.uses_backdrop {
-            let mut dependencies = Vec::new();
-            let mut dependency_instances = Vec::new();
-            for (pass, region, instance_id) in &checkpoints {
-                #[cfg(test)]
-                note_checkpoint_intersection_check();
-                if region.intersects(&effect_damage.capture_region) {
-                    dependencies.push(*pass);
-                    dependency_instances.push(*instance_id);
+            if precomputed_consumers.contains(&instance.id) {
+                (Vec::new(), Vec::new())
+            } else {
+                let mut dependencies = Vec::new();
+                let mut dependency_instances = Vec::new();
+                for (pass, region, instance_id) in &checkpoints {
+                    #[cfg(test)]
+                    note_checkpoint_intersection_check();
+                    if region.intersects(&effect_damage.capture_region) {
+                        dependencies.push(*pass);
+                        dependency_instances.push(*instance_id);
+                    }
                 }
+                (dependencies, dependency_instances)
             }
-            (dependencies, dependency_instances)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -2015,6 +2279,7 @@ pub fn compile_frame_execution_plan(
                 output_bounds,
                 checkpoint_dependencies: &dependencies,
                 output_clip_fallback: effect_damage.output_clip_fallback,
+                precomputed_backdrop: precomputed_consumers.contains(&instance.id),
             },
         )?;
         compiled_instances.push(CompiledEffectInstance {
@@ -2225,6 +2490,7 @@ struct InstanceCompilePlan<'a> {
     output_bounds: EffectRect,
     checkpoint_dependencies: &'a [GraphPassId],
     output_clip_fallback: Option<EffectRegionClipFallback>,
+    precomputed_backdrop: bool,
 }
 
 fn resolve_output(
@@ -2270,9 +2536,11 @@ fn compile_instance(
         output_bounds,
         checkpoint_dependencies,
         output_clip_fallback,
+        precomputed_backdrop,
     } = plan;
     let visual_group = instance.visual_group;
     let mut outputs = [None; MAX_EFFECT_PROGRAM_NODES];
+    let mut uses_precomputed_backdrop = false;
 
     for (slot, step) in program.lowering.steps.iter().enumerate() {
         #[cfg(test)]
@@ -2286,11 +2554,20 @@ fn compile_instance(
                     return Err(RenderGraphCompileError::UnsupportedStaticTexture(*id));
                 }
                 let texture_source = match source {
+                    EffectSource::Backdrop if precomputed_backdrop => {
+                        GraphTextureSource::PrecomputedBackdrop
+                    }
                     EffectSource::Backdrop => GraphTextureSource::CapturedScene,
                     EffectSource::TargetContent => GraphTextureSource::CapturedTarget,
                     EffectSource::StaticTexture(id) => GraphTextureSource::Static(*id),
                 };
                 let (domain, width, height, working_space) = match source {
+                    EffectSource::Backdrop if precomputed_backdrop => (
+                        output_bounds,
+                        output_bounds.width,
+                        output_bounds.height,
+                        EffectWorkingSpace::LinearSrgb,
+                    ),
                     EffectSource::Backdrop => {
                         let domain = capture_damage.bounding_rect().unwrap_or(output_bounds);
                         (
@@ -2315,7 +2592,7 @@ fn compile_instance(
                     height,
                     working_space,
                 )?;
-                if !matches!(source, EffectSource::StaticTexture(_)) {
+                if !precomputed_backdrop && !matches!(source, EffectSource::StaticTexture(_)) {
                     let kind = match source {
                         EffectSource::Backdrop => RenderPassKind::SceneCapture,
                         EffectSource::TargetContent => RenderPassKind::SurfaceCapture,
@@ -2349,6 +2626,11 @@ fn compile_instance(
                     )),
                 )?;
                 let input = resolve_output(&outputs, input_slot, node.id)?;
+                if precomputed_backdrop {
+                    uses_precomputed_backdrop = true;
+                    store_output(&mut outputs, slot, input)?;
+                    continue;
+                }
                 let input_plan = builder.texture(input);
                 let processing_width = scaled_dimension(input_plan.width, spec.scale);
                 let processing_height = scaled_dimension(input_plan.height, spec.scale);
@@ -2475,11 +2757,26 @@ fn compile_instance(
                             EffectValidationError::MissingInputNode(node.id),
                         ))?;
                 let input_plan = builder.texture(primary_input);
+                let output_domain = if uses_precomputed_backdrop {
+                    capture_damage.bounding_rect().unwrap_or(output_bounds)
+                } else {
+                    input_plan.domain
+                };
+                let output_width = if uses_precomputed_backdrop {
+                    output_domain.width
+                } else {
+                    input_plan.width
+                };
+                let output_height = if uses_precomputed_backdrop {
+                    output_domain.height
+                } else {
+                    input_plan.height
+                };
                 let output = builder.add_texture_with_layout(
                     GraphTextureSource::Intermediate,
-                    input_plan.domain,
-                    input_plan.width,
-                    input_plan.height,
+                    output_domain,
+                    output_width,
+                    output_height,
                     program.program.working_space,
                 )?;
                 let kind = match node.kind {
@@ -2650,6 +2947,7 @@ mod tests {
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(1)),
         };
         (ResolvedEffectScene::new(1, vec![instance]), registry)
@@ -2682,6 +2980,7 @@ mod tests {
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
         }
     }
@@ -2702,6 +3001,348 @@ mod tests {
         let mut registry = EffectRegistry::empty();
         registry.insert(program).unwrap();
         registry
+    }
+
+    fn synthesized_builtin_blur_scene(count: usize) -> (ResolvedEffectScene, EffectRegistry) {
+        let program = builtin_background_blur_program();
+        let program_id = program.program.id;
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let mut instances = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = u64::try_from(index + 1).unwrap();
+            let surface = u32::try_from(index + 10).unwrap();
+            let region = EffectRegion::from_rect(
+                EffectRect::new(30 + i32::try_from(index).unwrap() * 120, 40, 80, 60).unwrap(),
+            );
+            instances.push(ResolvedEffectInstance {
+                id: EffectInstanceId::new(id).unwrap(),
+                program: program_id,
+                anchor: EffectAnchor::BeforeSurface(surface),
+                target_bounds: region.bounding_rect().unwrap(),
+                region,
+                parameter_block: EffectParameterBlock::default(),
+                coverage: None,
+                signature: id,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: Some(crate::compositor::VisualGroupId::new(1).unwrap()),
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate,
+                scene_order: EffectSceneOrder {
+                    group_order: 0,
+                    surface_order: u32::try_from(index * 10 + 10).unwrap(),
+                    phase: 0,
+                },
+            });
+        }
+        (ResolvedEffectScene::new(1, instances), registry)
+    }
+
+    fn full_test_damage(bounds: EffectRect) -> EffectRegion {
+        EffectRegion::from_rect(bounds)
+    }
+
+    #[test]
+    fn precomputed_policy_off_keeps_exact_per_instance_graph() {
+        let (scene, registry) = synthesized_builtin_blur_scene(15);
+        let bounds = EffectRect::new(0, 0, 2_400, 600).unwrap();
+        let variants = compile_frame_execution_variants(
+            &scene,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            false,
+        )
+        .unwrap();
+        let FrameExecutionPlan::EffectGraph(exact) = variants.exact else {
+            panic!("visible blur instances compile to an effect graph");
+        };
+        assert!(variants.precomputed_graph.is_none());
+        assert!(variants.precomputed_backdrop.is_none());
+        assert_eq!(
+            exact
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                .count(),
+            15
+        );
+        assert_eq!(
+            exact
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
+                .count(),
+            30
+        );
+        assert_eq!(
+            exact
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+                .count(),
+            30
+        );
+        assert_eq!(
+            exact
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Fragment)
+                .count(),
+            15
+        );
+        assert_eq!(
+            exact
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Composite)
+                .count(),
+            15
+        );
+    }
+
+    #[test]
+    fn precomputed_candidates_share_earliest_baseline_and_keep_local_material_domains() {
+        let (scene, registry) = synthesized_builtin_blur_scene(15);
+        let bounds = EffectRect::new(0, 0, 2_400, 600).unwrap();
+        let variants = compile_frame_execution_variants(
+            &scene,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            true,
+        )
+        .unwrap();
+        let plan = variants.precomputed_backdrop.unwrap();
+        let graph = variants.precomputed_graph.unwrap();
+        assert_eq!(plan.baseline_instance, scene.instances[0].id);
+        assert_eq!(plan.baseline_anchor, scene.instances[0].anchor);
+        assert_eq!(plan.baseline_scene_order, scene.instances[0].scene_order);
+        assert_eq!(plan.capture_domain, bounds);
+        assert_eq!(plan.build_passes, 5);
+        assert_eq!(plan.consumers.len(), 15);
+        let (materialization, shared_output) =
+            compile_precomputed_backdrop_materialization_graph(&plan, bounds, &registry).unwrap();
+        assert_eq!(materialization.passes.len(), 5);
+        assert_eq!(materialization.passes[0].kind, RenderPassKind::SceneCapture);
+        assert_eq!(
+            materialization.passes[1].kind,
+            RenderPassKind::DualKawaseDownsample
+        );
+        assert_eq!(
+            materialization.passes[2].kind,
+            RenderPassKind::DualKawaseDownsample
+        );
+        assert_eq!(
+            materialization.passes[3].kind,
+            RenderPassKind::DualKawaseUpsample
+        );
+        assert_eq!(
+            materialization.passes[4].kind,
+            RenderPassKind::DualKawaseUpsample
+        );
+        let shared_texture = materialization
+            .textures
+            .iter()
+            .find(|texture| texture.id == shared_output)
+            .unwrap();
+        assert_eq!(shared_texture.source, GraphTextureSource::Intermediate);
+        assert_eq!(shared_texture.domain, bounds);
+        assert_eq!(shared_texture.working_space, EffectWorkingSpace::LinearSrgb);
+        assert!(plan.consumers.iter().all(|consumer| {
+            graph.textures.iter().any(|texture| {
+                texture.id == consumer.texture
+                    && texture.source == GraphTextureSource::PrecomputedBackdrop
+                    && texture.domain == bounds
+                    && texture.working_space == EffectWorkingSpace::LinearSrgb
+            })
+        }));
+        assert_eq!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                .count(),
+            0
+        );
+        assert_eq!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
+                .count(),
+            0
+        );
+        assert_eq!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+                .count(),
+            0
+        );
+        assert_eq!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Fragment)
+                .count(),
+            15
+        );
+        assert_eq!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Composite)
+                .count(),
+            15
+        );
+        for pass in graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::Fragment)
+        {
+            let output = pass.output.unwrap();
+            let texture = graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == output)
+                .unwrap();
+            assert_ne!(texture.domain, bounds);
+            assert_eq!(texture.domain.width, texture.width);
+            assert_eq!(texture.domain.height, texture.height);
+        }
+    }
+
+    #[test]
+    fn one_candidate_or_client_exact_blur_does_not_create_shared_plan() {
+        let bounds = EffectRect::new(0, 0, 800, 600).unwrap();
+        let (one, registry) = synthesized_builtin_blur_scene(1);
+        let one = compile_frame_execution_variants(
+            &one,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            true,
+        )
+        .unwrap();
+        assert_eq!(one.eligible_instances, 1);
+        assert!(one.precomputed_backdrop.is_none());
+
+        let (mut client, registry) = synthesized_builtin_blur_scene(2);
+        client.instances[0].backdrop_reuse = crate::compositor::EffectBackdropReuse::Exact;
+        let client = compile_frame_execution_variants(
+            &client,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            true,
+        )
+        .unwrap();
+        assert_eq!(client.eligible_instances, 1);
+        assert!(client.precomputed_backdrop.is_none());
+    }
+
+    #[test]
+    fn precomputed_eligibility_rejects_non_window_and_noncanonical_effects() {
+        let (scene, registry) = synthesized_builtin_blur_scene(2);
+        let candidate = &scene.instances[0];
+        let builtin = registry
+            .get(builtin_background_blur_program_id())
+            .expect("test registry contains canonical built-in blur");
+
+        assert!(precomputed_window_blur_instance(candidate));
+        assert!(canonical_builtin_blur_spec(builtin).is_some());
+
+        let mut covered = candidate.clone();
+        covered.coverage = Some(EffectCoverage::default());
+        assert!(!precomputed_window_blur_instance(&covered));
+
+        let mut output_post_process = candidate.clone();
+        output_post_process.anchor = EffectAnchor::OutputPostProcess;
+        assert!(!precomputed_window_blur_instance(&output_post_process));
+
+        let mut target_content = builtin.clone();
+        target_content.program.nodes[0].kind = EffectNodeKind::Source(EffectSource::TargetContent);
+        assert!(canonical_builtin_blur_spec(&target_content).is_none());
+
+        let mut trusted_custom = builtin.clone();
+        trusted_custom.program.id = EffectProgramId::new(900).unwrap();
+        assert!(canonical_builtin_blur_spec(&trusted_custom).is_none());
+
+        let mut continuous = builtin.clone();
+        continuous.program.frame_demand = EffectFrameDemand::Continuous;
+        assert!(canonical_builtin_blur_spec(&continuous).is_none());
+    }
+
+    #[test]
+    fn mixed_client_blur_keeps_its_causal_capture_between_shared_consumers() {
+        let (mut scene, registry) = synthesized_builtin_blur_scene(3);
+        scene.instances[1].backdrop_reuse = crate::compositor::EffectBackdropReuse::Exact;
+        let bounds = EffectRect::new(0, 0, 800, 600).unwrap();
+        let variants = compile_frame_execution_variants(
+            &scene,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            true,
+        )
+        .unwrap();
+        let shared = variants.precomputed_backdrop.unwrap();
+        let graph = variants.precomputed_graph.unwrap();
+        assert_eq!(shared.consumers.len(), 2);
+        let exact_client = scene.instances[1].id;
+        let client_capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.instance == exact_client && pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        assert_eq!(
+            client_capture.checkpoint_dependencies,
+            vec![
+                graph
+                    .passes
+                    .iter()
+                    .find(|pass| {
+                        pass.instance == scene.instances[0].id
+                            && pass.kind == RenderPassKind::Composite
+                    })
+                    .unwrap()
+                    .id
+            ]
+        );
+        assert!(graph.passes.iter().any(|pass| {
+            pass.instance == exact_client && pass.kind == RenderPassKind::DualKawaseDownsample
+        }));
+        assert!(graph.passes.iter().any(|pass| {
+            pass.instance == scene.instances[2].id && pass.kind == RenderPassKind::Composite
+        }));
+        assert!(!graph.passes.iter().any(|pass| {
+            pass.instance == scene.instances[2].id && pass.kind == RenderPassKind::SceneCapture
+        }));
+    }
+
+    #[test]
+    fn precomputed_external_texture_is_not_a_conservative_missing_producer() {
+        let (scene, registry) = synthesized_builtin_blur_scene(2);
+        let bounds = EffectRect::new(0, 0, 800, 600).unwrap();
+        let variants = compile_frame_execution_variants(
+            &scene,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            true,
+        )
+        .unwrap();
+        let graph = variants.precomputed_graph.unwrap();
+        let demand = plan_effect_execution_demand(&graph, &full_test_damage(bounds), false);
+        assert!(!demand.is_conservative_full());
+        assert!(
+            demand
+                .instances
+                .iter()
+                .all(|instance| { !demand.instance_is_conservative_full(instance.id) })
+        );
     }
 
     fn fused_local_stage_scene(instance_count: usize) -> (ResolvedEffectScene, EffectRegistry) {
@@ -2773,6 +3414,7 @@ mod tests {
                     frame_demand: EffectFrameDemand::OnDamage,
                     visual_group: None,
                     anchor_scope: EffectAnchorScope::VisualGroup,
+                    backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
                 }
             })
@@ -3510,6 +4152,7 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
                 anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
@@ -4607,6 +5250,7 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: Some(group),
                 anchor_scope: EffectAnchorScope::Surface,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder {
                     group_order: group.get(),
                     surface_order,
@@ -4903,6 +5547,7 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
                 anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
@@ -4966,6 +5611,7 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
                 anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
@@ -5154,6 +5800,7 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
                 anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
@@ -5341,6 +5988,7 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
                 anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );

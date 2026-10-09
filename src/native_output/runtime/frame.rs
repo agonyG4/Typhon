@@ -207,6 +207,7 @@ mod presentation_effect_influence_tests {
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
             anchor_scope: EffectAnchorScope::Surface,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(anchor),
         }
     }

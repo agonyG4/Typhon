@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use glow::HasContext;
-use oblivion_one::effects::{CompiledFrameGraph, RenderPassKind};
+use oblivion_one::effects::{
+    CompiledFrameGraph, CompiledPrecomputedBackdropPlan, GraphTextureId, RenderPassKind,
+    compile_precomputed_backdrop_materialization_graph,
+};
 
 use super::super::checkpoint::CheckpointEffectCausalState;
 use super::super::{
@@ -9,8 +12,9 @@ use super::super::{
     RendererResult,
     damage::{OutputRect, RenderExecution, RepaintPlan},
     effects::{
-        EffectDebugConfig, EffectExecutionSelection, EffectExecutionStats, SceneReplayWorkMode,
-        composition_range_with_metadata,
+        EffectDebugConfig, EffectExecutionSelection, EffectExecutionStats, EffectTextureFilter,
+        EffectTextureFormat, EffectTextureKey, GraphTextureBinding, PooledEffectTexture,
+        SceneReplayWorkMode, composition_range_with_metadata,
     },
     scene_state::{SceneRenderState, SceneTextureSources},
 };
@@ -20,6 +24,15 @@ use super::{
     telemetry,
     types::{EglFrameOutcome, EglSceneDrawRequest, EglSceneFrameCommit},
 };
+
+#[derive(Default)]
+struct PrecomputedWindowBlurFrameTelemetry {
+    consumers: usize,
+    built: bool,
+    fallback: bool,
+    fallback_reason: &'static str,
+    build_stats: Option<EffectExecutionStats>,
+}
 
 impl FramePipeline<'_> {
     pub(super) fn execute_frame(
@@ -43,6 +56,10 @@ impl FramePipeline<'_> {
                 planned.selected_effect_count,
             ),
         );
+        let mut precomputed_telemetry = PrecomputedWindowBlurFrameTelemetry {
+            fallback_reason: "none",
+            ..PrecomputedWindowBlurFrameTelemetry::default()
+        };
         let draw_result = match &planned.execution_plan {
             oblivion_one::effects::FrameExecutionPlan::LegacyScene => {
                 self.draw_textured_layers(&planned.plan, framebuffer_origin)
@@ -56,13 +73,131 @@ impl FramePipeline<'_> {
                     .effect_selection
                     .as_ref()
                     .expect("effect graph execution must have an execution selection");
-                match self.execute_effect_graph_with_overlays(
-                    graph,
-                    framebuffer_origin,
-                    &planned.plan,
-                    demand,
-                    selection,
-                ) {
+                let selected_precomputed_consumers = planned
+                    .precomputed_backdrop
+                    .as_ref()
+                    .map(|precomputed| {
+                        precomputed
+                            .consumers
+                            .iter()
+                            .filter(|consumer| {
+                                selection.executed_instances.contains(&consumer.instance)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                precomputed_telemetry.consumers = selected_precomputed_consumers;
+                let execution_result = if selected_precomputed_consumers == 0 {
+                    self.execute_effect_graph_with_overlays(
+                        graph,
+                        framebuffer_origin,
+                        &planned.plan,
+                        demand,
+                        selection,
+                    )
+                } else {
+                    let precomputed = planned
+                        .precomputed_backdrop
+                        .as_ref()
+                        .expect("selected optimized consumers require a shared plan");
+                    match self.prepare_precomputed_backdrop(precomputed, framebuffer_origin) {
+                        Ok((shared_texture, build_stats)) => {
+                            precomputed_telemetry.built = true;
+                            precomputed_telemetry.build_stats = Some(build_stats);
+                            if self
+                                .effects
+                                .effect_resources
+                                .prepare_graph(self.gl, graph)
+                                .is_err()
+                            {
+                                precomputed_telemetry.fallback = true;
+                                precomputed_telemetry.fallback_reason =
+                                    "optimized_preflight_failed";
+                                let release = self.effects.effect_resources.release(shared_texture);
+                                if let Err(error) = release {
+                                    return Err(error.into());
+                                }
+                                let exact_graph = match planned.exact_execution_plan.as_ref() {
+                                    Some(
+                                        oblivion_one::effects::FrameExecutionPlan::EffectGraph(
+                                            graph,
+                                        ),
+                                    ) => graph,
+                                    _ => {
+                                        return Err(std::io::Error::other(
+                                            "precomputed fallback has no exact graph",
+                                        )
+                                        .into());
+                                    }
+                                };
+                                let exact_demand = planned
+                                    .exact_effect_execution_demand
+                                    .as_ref()
+                                    .expect("precomputed fallback requires exact demand");
+                                let exact_selection = planned
+                                    .exact_effect_selection
+                                    .as_ref()
+                                    .expect("precomputed fallback requires exact selection");
+                                self.execute_effect_graph_with_overlays(
+                                    exact_graph,
+                                    framebuffer_origin,
+                                    &planned.plan,
+                                    exact_demand,
+                                    exact_selection,
+                                )
+                            } else {
+                                let optimized = self
+                                    .execute_effect_graph_with_precomputed_backdrop(
+                                        graph,
+                                        precomputed,
+                                        &shared_texture,
+                                        framebuffer_origin,
+                                        &planned.plan,
+                                        demand,
+                                        selection,
+                                    );
+                                let release = self.effects.effect_resources.release(shared_texture);
+                                match (optimized, release) {
+                                    (Ok(stats), Ok(())) => Ok(stats),
+                                    (Err(error), _) => Err(error),
+                                    (Ok(_), Err(error)) => Err(error.into()),
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            precomputed_telemetry.fallback = true;
+                            precomputed_telemetry.fallback_reason = "shared_prepare_failed";
+                            let exact_graph = match planned.exact_execution_plan.as_ref() {
+                                Some(oblivion_one::effects::FrameExecutionPlan::EffectGraph(
+                                    graph,
+                                )) => graph,
+                                _ => {
+                                    return Err(std::io::Error::other(
+                                        "precomputed fallback has no exact graph",
+                                    )
+                                    .into());
+                                }
+                            };
+                            let exact_demand = planned
+                                .exact_effect_execution_demand
+                                .as_ref()
+                                .expect("precomputed fallback requires exact demand");
+                            let exact_selection = planned
+                                .exact_effect_selection
+                                .as_ref()
+                                .expect("precomputed fallback requires exact selection");
+                            self.execute_effect_graph_with_overlays(
+                                exact_graph,
+                                framebuffer_origin,
+                                &planned.plan,
+                                exact_demand,
+                                exact_selection,
+                            )
+                        }
+                    }
+                };
+                self.emit_precomputed_window_blur_telemetry(planned, &precomputed_telemetry);
+                match execution_result {
                     Ok(execution_stats) => {
                         self.scene.frame_stats.effect_instances_executed =
                             execution_stats.instances;
@@ -77,6 +212,33 @@ impl FramePipeline<'_> {
                             execution_stats.capture_execution_pixels;
                         self.scene.frame_stats.effect_resource_acquisitions =
                             execution_stats.resource_acquisitions;
+                        if let Some(build_stats) = &precomputed_telemetry.build_stats {
+                            self.scene.frame_stats.effect_passes_executed = self
+                                .scene
+                                .frame_stats
+                                .effect_passes_executed
+                                .saturating_add(build_stats.passes);
+                            self.scene.frame_stats.blur_downsample_passes = self
+                                .scene
+                                .frame_stats
+                                .blur_downsample_passes
+                                .saturating_add(build_stats.blur_downsamples);
+                            self.scene.frame_stats.blur_upsample_passes = self
+                                .scene
+                                .frame_stats
+                                .blur_upsample_passes
+                                .saturating_add(build_stats.blur_upsamples);
+                            self.scene.frame_stats.effect_capture_pixels_executed = self
+                                .scene
+                                .frame_stats
+                                .effect_capture_pixels_executed
+                                .saturating_add(build_stats.capture_execution_pixels);
+                            self.scene.frame_stats.effect_resource_acquisitions = self
+                                .scene
+                                .frame_stats
+                                .effect_resource_acquisitions
+                                .saturating_add(build_stats.resource_acquisitions);
+                        }
                         Ok(())
                     }
                     Err(error) => {
@@ -100,6 +262,12 @@ impl FramePipeline<'_> {
                 }
             }
         };
+        if matches!(
+            &planned.execution_plan,
+            oblivion_one::effects::FrameExecutionPlan::LegacyScene
+        ) {
+            self.emit_precomputed_window_blur_telemetry(planned, &precomputed_telemetry);
+        }
         if let Err(error) = draw_result {
             self.effects.effect_trace.frame_boundary(
                 "renderer_draw_complete",
@@ -186,9 +354,32 @@ impl FramePipeline<'_> {
         debug_config: EffectDebugConfig,
         scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
     ) -> RendererResult<EffectExecutionStats> {
+        self.execute_effect_graph_with_overlays_config_and_bindings(
+            graph,
+            framebuffer_origin,
+            repaint_plan,
+            demand,
+            selection,
+            debug_config,
+            scene_replay_work_mode_override,
+            HashMap::new(),
+        )
+    }
+
+    fn execute_effect_graph_with_overlays_config_and_bindings(
+        &mut self,
+        graph: &CompiledFrameGraph,
+        framebuffer_origin: super::super::OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &EffectExecutionSelection,
+        debug_config: EffectDebugConfig,
+        scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
+        external_bindings: HashMap<GraphTextureId, GraphTextureBinding>,
+    ) -> RendererResult<EffectExecutionStats> {
         let mut prepared = {
             let mut context = self.effect_execution_context();
-            super::super::effects::prepare_effect_graph_execution(
+            super::super::effects::prepare_effect_graph_execution_with_external_bindings(
                 &mut context,
                 graph,
                 framebuffer_origin,
@@ -197,6 +388,7 @@ impl FramePipeline<'_> {
                 selection,
                 debug_config,
                 scene_replay_work_mode_override,
+                external_bindings,
             )?
         };
         let promotes_checkpoint_cache = prepared.promotes_checkpoint_cache();
@@ -241,11 +433,232 @@ impl FramePipeline<'_> {
         result
     }
 
+    fn execute_effect_graph_with_precomputed_backdrop(
+        &mut self,
+        graph: &CompiledFrameGraph,
+        precomputed: &CompiledPrecomputedBackdropPlan,
+        shared_texture: &PooledEffectTexture,
+        framebuffer_origin: super::super::OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &EffectExecutionSelection,
+    ) -> RendererResult<EffectExecutionStats> {
+        let bindings = precomputed
+            .consumers
+            .iter()
+            .filter(|consumer| selection.executed_instances.contains(&consumer.instance))
+            .map(|consumer| {
+                (
+                    consumer.texture,
+                    GraphTextureBinding::precomputed_backdrop_alias(shared_texture.clone()),
+                )
+            })
+            .collect();
+        self.execute_effect_graph_with_overlays_config_and_bindings(
+            graph,
+            framebuffer_origin,
+            repaint_plan,
+            demand,
+            selection,
+            *super::super::effects::effect_debug_config(),
+            None,
+            bindings,
+        )
+    }
+
+    fn prepare_precomputed_backdrop(
+        &mut self,
+        plan: &CompiledPrecomputedBackdropPlan,
+        framebuffer_origin: super::super::OutputFramebufferOrigin,
+    ) -> RendererResult<(PooledEffectTexture, EffectExecutionStats)> {
+        let size = self.scene.current_size;
+        let output_bounds = oblivion_one::effects::EffectRect::new(0, 0, size.0, size.1)
+            .ok_or_else(|| std::io::Error::other("invalid precomputed backdrop output size"))?;
+        let (build_graph, shared_output) = compile_precomputed_backdrop_materialization_graph(
+            plan,
+            output_bounds,
+            &self.effects.effect_registry,
+        )?;
+        let baseline_key = EffectTextureKey::new(
+            size.0,
+            size.1,
+            EffectTextureFormat::Rgba8,
+            EffectTextureFilter::Linear,
+            oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
+        );
+        let baseline = self
+            .effects
+            .effect_resources
+            .acquire(self.gl, baseline_key)?;
+        let result = (|| {
+            let framebuffer = self
+                .effects
+                .effect_resources
+                .bind_draw_target(self.gl, &baseline)?;
+            self.scene
+                .establish_scene_state_for_framebuffer(self.gl, Some(framebuffer));
+            unsafe {
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.gl.disable(glow::BLEND);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            let (prefix_end, _) = composition_range_with_metadata(
+                &self.scene.commands,
+                &self.scene.capture_layers,
+                &self.scene.capture_visual_groups,
+                plan.baseline_anchor,
+                plan.baseline_visual_group,
+                plan.baseline_anchor_scope,
+            );
+            let full_output = [OutputRect::new(0, 0, size.0, size.1)];
+            self.effect_execution_context().draw_effect_scene_range(
+                &full_output,
+                0,
+                prefix_end,
+                framebuffer_origin,
+                super::super::EffectFramebufferTarget::new(Some(framebuffer)),
+            )?;
+            self.effects.effect_resources.unbind_render_target(self.gl);
+            self.scene.establish_scene_state_for_framebuffer(
+                self.gl,
+                self.scene.active_output_framebuffer,
+            );
+            let (stats, texture) = {
+                let mut context = self.effect_execution_context();
+                super::super::effects::execute_precomputed_backdrop_graph(
+                    &mut context,
+                    &build_graph,
+                    shared_output,
+                    framebuffer,
+                    framebuffer_origin,
+                    size,
+                )?
+            };
+            Ok((texture, stats))
+        })();
+        self.effects.effect_resources.unbind_render_target(self.gl);
+        self.scene
+            .establish_scene_state_for_framebuffer(self.gl, self.scene.active_output_framebuffer);
+        let release = self.effects.effect_resources.release(baseline);
+        match (result, release) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok((texture, _)), Err(error)) => {
+                let _ = self.effects.effect_resources.release(texture);
+                Err(error.into())
+            }
+        }
+    }
+
     fn effect_execution_context(&mut self) -> EffectExecutionContext<'_> {
         let texture_sources: SceneTextureSources<'_> = self
             .lifecycle
             .texture_sources(self.resources.texture_view());
         EffectExecutionContext::new(self.gl, self.scene, self.effects, texture_sources)
+    }
+
+    fn emit_precomputed_window_blur_telemetry(
+        &self,
+        planned: &PlannedFrame,
+        state: &PrecomputedWindowBlurFrameTelemetry,
+    ) {
+        if !self.effects.effect_gpu_profiler.cache_telemetry_enabled() {
+            return;
+        }
+        let policy = self.effects.precomputed_window_blur_policy.as_str();
+        let eligible = planned.precomputed_eligible_instances;
+        let baseline = planned.precomputed_backdrop.as_ref().map_or_else(
+            || "none".to_owned(),
+            |plan| plan.baseline_instance.get().to_string(),
+        );
+        let build_passes = if state.built {
+            planned
+                .precomputed_backdrop
+                .as_ref()
+                .map_or(0, |plan| plan.build_passes)
+        } else {
+            0
+        };
+        let frame_id = self.effects.effect_trace.frame_id().unwrap_or_default();
+        let (capture_pixels, downsample_pixels, upsample_pixels) = if state.built {
+            planned
+                .precomputed_backdrop
+                .as_ref()
+                .map(|plan| precomputed_blur_pixel_work(plan, self.scene.current_size))
+                .unwrap_or_default()
+        } else {
+            (0, 0, 0)
+        };
+        let (
+            saved_captures,
+            saved_downsamples,
+            saved_upsamples,
+            saved_capture_pixels,
+            saved_downsample_pixels,
+            saved_upsample_pixels,
+        ) = if state.built && !state.fallback {
+            planned
+                .precomputed_backdrop
+                .as_ref()
+                .and_then(|precomputed| {
+                    let graph = match planned.exact_execution_plan.as_ref()? {
+                        oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) => graph,
+                        oblivion_one::effects::FrameExecutionPlan::LegacyScene => return None,
+                    };
+                    let selected = precomputed
+                        .consumers
+                        .iter()
+                        .filter(|consumer| {
+                            planned.effect_selection.as_ref().is_some_and(|selection| {
+                                selection.executed_instances.contains(&consumer.instance)
+                            })
+                        })
+                        .map(|consumer| consumer.instance)
+                        .collect::<Vec<_>>();
+                    let exact_captures =
+                        graph_pass_work(graph, &selected, RenderPassKind::SceneCapture);
+                    let exact_downsamples =
+                        graph_pass_work(graph, &selected, RenderPassKind::DualKawaseDownsample);
+                    let exact_upsamples =
+                        graph_pass_work(graph, &selected, RenderPassKind::DualKawaseUpsample);
+                    let (shared_capture, shared_down, shared_up) =
+                        precomputed_blur_pixel_work(precomputed, self.scene.current_size);
+                    let shared_down_count = usize::from(precomputed.blur.passes);
+                    Some((
+                        exact_captures.0.saturating_sub(1),
+                        exact_downsamples.0.saturating_sub(shared_down_count),
+                        exact_upsamples.0.saturating_sub(shared_down_count),
+                        exact_captures.1.saturating_sub(shared_capture),
+                        exact_downsamples.1.saturating_sub(shared_down),
+                        exact_upsamples.1.saturating_sub(shared_up),
+                    ))
+                })
+                .unwrap_or_default()
+        } else {
+            (0, 0, 0, 0, 0, 0)
+        };
+        eprintln!(
+            "typhon effect: event=precomputed_window_blur precomputed_window_blur_frame_id={} precomputed_window_blur_policy={} precomputed_window_blur_eligible_instances={} precomputed_window_blur_consumers={} precomputed_window_blur_built={} precomputed_window_blur_fallback={} precomputed_window_blur_fallback_reason={} precomputed_window_blur_baseline_instance={} precomputed_window_blur_build_passes={} precomputed_window_blur_saved_scene_captures={} precomputed_window_blur_saved_kawase_downsamples={} precomputed_window_blur_saved_kawase_upsamples={} precomputed_window_blur_capture_pixels={} precomputed_window_blur_downsample_pixels={} precomputed_window_blur_upsample_pixels={} precomputed_window_blur_saved_capture_pixels={} precomputed_window_blur_saved_downsample_pixels={} precomputed_window_blur_saved_upsample_pixels={}",
+            frame_id,
+            policy,
+            eligible,
+            state.consumers,
+            state.built,
+            state.fallback,
+            state.fallback_reason,
+            baseline,
+            build_passes,
+            saved_captures,
+            saved_downsamples,
+            saved_upsamples,
+            capture_pixels,
+            downsample_pixels,
+            upsample_pixels,
+            saved_capture_pixels,
+            saved_downsample_pixels,
+            saved_upsample_pixels,
+        );
     }
 
     fn draw_textured_layers(
@@ -477,6 +890,58 @@ impl FramePipeline<'_> {
         self.effect_execution_context()
             .draw_command_batch(scene, scissor)
     }
+}
+
+fn graph_pass_work(
+    graph: &CompiledFrameGraph,
+    owners: &[oblivion_one::effects::EffectInstanceId],
+    kind: RenderPassKind,
+) -> (usize, u64) {
+    graph
+        .passes
+        .iter()
+        .filter(|pass| owners.contains(&pass.instance) && pass.kind == kind)
+        .fold((0, 0), |(count, pixels), pass| {
+            let pass_pixels = pass
+                .output
+                .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+                .map_or(0, |texture| {
+                    u64::from(texture.width).saturating_mul(u64::from(texture.height))
+                });
+            (count.saturating_add(1), pixels.saturating_add(pass_pixels))
+        })
+}
+
+fn precomputed_blur_pixel_work(
+    plan: &CompiledPrecomputedBackdropPlan,
+    size: (u32, u32),
+) -> (u64, u64, u64) {
+    let pixels = |width: u32, height: u32| u64::from(width).saturating_mul(u64::from(height));
+    let processing_width = (f64::from(size.0) * f64::from(plan.blur.scale))
+        .ceil()
+        .max(1.0) as u32;
+    let processing_height = (f64::from(size.1) * f64::from(plan.blur.scale))
+        .ceil()
+        .max(1.0) as u32;
+    let ceil_div =
+        |value: u32, divisor: u32| value.saturating_add(divisor.saturating_sub(1)) / divisor.max(1);
+    let mut downsample = 0_u64;
+    for level in 1..=plan.blur.passes {
+        let divisor = 1_u32 << level.min(31);
+        downsample = downsample.saturating_add(pixels(
+            ceil_div(processing_width, divisor),
+            ceil_div(processing_height, divisor),
+        ));
+    }
+    let mut upsample = 0_u64;
+    for level in (0..plan.blur.passes).rev() {
+        let divisor = 1_u32 << level.min(31);
+        upsample = upsample.saturating_add(pixels(
+            ceil_div(processing_width, divisor),
+            ceil_div(processing_height, divisor),
+        ));
+    }
+    (pixels(size.0, size.1), downsample, upsample)
 }
 
 pub(in crate::egl_renderer) fn promote_checkpoint_cache_causal_state(

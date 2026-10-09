@@ -5,6 +5,7 @@ use glow::HasContext;
 use super::super::program::create_capture_copy_program;
 use super::super::*;
 use super::gpu_timing::EffectGpuProfiler;
+use super::precomputed_window_blur::PrecomputedWindowBlurPolicy;
 use super::resources::EffectResourceBudgetConfig;
 use super::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
@@ -25,6 +26,7 @@ pub(in crate::egl_renderer) struct EffectRuntime {
     effect_quad: Option<(GlVertexArray, GlBuffer)>,
     pub(in crate::egl_renderer) effect_trace: EffectExecutionTrace,
     pub(in crate::egl_renderer) effect_gpu_profiler: EffectGpuProfiler,
+    pub(in crate::egl_renderer) precomputed_window_blur_policy: PrecomputedWindowBlurPolicy,
     effect_clock_start: Instant,
     pub(in crate::egl_renderer) effect_time_seconds: f32,
     pub(in crate::egl_renderer) effect_delta_seconds: f32,
@@ -131,6 +133,7 @@ impl EffectRuntime {
             effect_quad: None,
             effect_trace: EffectExecutionTrace::new(None, None, None, None),
             effect_gpu_profiler,
+            precomputed_window_blur_policy: PrecomputedWindowBlurPolicy::from_environment(),
             effect_clock_start: Instant::now(),
             effect_time_seconds: 0.0,
             effect_delta_seconds: 0.0,

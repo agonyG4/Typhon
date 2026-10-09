@@ -1151,6 +1151,7 @@ fn graph_texture_trace(
         GraphTextureSource::CapturedScene => "captured_scene",
         GraphTextureSource::CapturedTarget => "captured_target",
         GraphTextureSource::Intermediate => "intermediate",
+        GraphTextureSource::PrecomputedBackdrop => "precomputed_backdrop",
         GraphTextureSource::Static(_) => "static",
     };
     let physical = match texture.source {

@@ -153,6 +153,7 @@ pub struct ResolvedEffectInstance {
     pub frame_demand: EffectFrameDemand,
     pub visual_group: Option<VisualGroupId>,
     pub anchor_scope: EffectAnchorScope,
+    pub backdrop_reuse: super::EffectBackdropReuse,
     pub scene_order: EffectSceneOrder,
 }
 
@@ -428,6 +429,7 @@ impl super::CompositorState {
                     parameter_block: selected_parameter_block.clone(),
                     coverage,
                     anchor_scope: assignment.anchor_scope,
+                    backdrop_reuse: assignment.source.into(),
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
                         surface.surface_id,
                     )),
@@ -572,6 +574,7 @@ impl super::CompositorState {
             frame_demand,
             visual_group: self.visual_group_for_surface(surface_id),
             anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(anchor),
         };
         if self.internal_surface_effects.get(&surface_id) == Some(&instance) {
@@ -786,6 +789,7 @@ impl super::CompositorState {
             frame_demand: registered.program.program.frame_demand,
             visual_group: self.visual_group_for_surface(surface_id),
             anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(slot.anchor(surface_id)),
         };
         let changed = self
@@ -1188,6 +1192,10 @@ fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64
                 EffectAnchorScope::Surface => 0,
                 EffectAnchorScope::VisualGroup => 1,
             },
+            match instance.backdrop_reuse {
+                super::EffectBackdropReuse::Exact => 0,
+                super::EffectBackdropReuse::PrecomputedWindowCandidate => 1,
+            },
             u64::from(instance.scene_order.group_order),
             u64::from(instance.scene_order.surface_order),
             u64::from(instance.scene_order.phase),
@@ -1240,6 +1248,7 @@ mod tests {
             frame_demand,
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
         }
     }

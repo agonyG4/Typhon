@@ -32,7 +32,12 @@ pub(crate) fn select_effect_execution(
                 .textures
                 .iter()
                 .find(|texture| texture.id == texture_id)
-                .is_some_and(|texture| texture.source == GraphTextureSource::Output);
+                .is_some_and(|texture| {
+                    matches!(
+                        texture.source,
+                        GraphTextureSource::Output | GraphTextureSource::PrecomputedBackdrop
+                    )
+                });
             if !is_output && !selection.acquired_texture_ids.contains(&texture_id) {
                 selection.acquired_texture_ids.push(texture_id);
             }

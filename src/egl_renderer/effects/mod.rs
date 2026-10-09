@@ -3,6 +3,8 @@ mod capture;
 mod executor;
 mod gpu_timing;
 mod metrics;
+mod precomputed_window_blur;
+pub(crate) use precomputed_window_blur::PrecomputedWindowBlurPolicy;
 mod resources;
 mod runtime;
 mod shader_cache;
@@ -27,6 +29,7 @@ pub(crate) use executor::checkpoint_causal_stability_plan;
 pub(super) use executor::composition_range_with_metadata;
 #[cfg(test)]
 pub(crate) use executor::execute_effect_graph_with_debug_config_and_scene_replay_mode;
+pub(crate) use executor::execute_precomputed_backdrop_graph;
 #[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
 pub(crate) use executor::plan_effect_surface_consumers_with_metadata;
@@ -55,6 +58,10 @@ pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics}
 pub(crate) use resources::checkpoint_capture_cache_key;
 pub(crate) use resources::{
     EffectGlResourceCache, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
+    PooledEffectTexture,
+};
+pub(crate) use resources::{
+    EffectTextureFilter, EffectTextureFormat, EffectTextureKey, GraphTextureBinding,
     PooledEffectTexture,
 };
 pub(super) use runtime::{EffectRuntime, EffectRuntimeCaptureSnapshot};

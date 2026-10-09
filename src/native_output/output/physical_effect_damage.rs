@@ -163,6 +163,7 @@ mod tests {
             frame_demand,
             visual_group: None,
             anchor_scope: EffectAnchorScope::Surface,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(anchor),
         }
     }

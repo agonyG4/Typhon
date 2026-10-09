@@ -407,6 +407,7 @@ mod tests {
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: VisualGroupId::new(group),
             anchor_scope,
+            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(anchor),
         }
     }
