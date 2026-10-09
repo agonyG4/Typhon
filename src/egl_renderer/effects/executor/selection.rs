@@ -41,6 +41,7 @@ pub(crate) fn select_effect_execution(
     selection
 }
 
+#[cfg(test)]
 pub(crate) fn plan_effect_surface_consumers(
     graph: &CompiledFrameGraph,
     demand: &EffectExecutionDemand,
@@ -60,6 +61,7 @@ pub(crate) fn plan_effect_surface_consumers(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn plan_effect_surface_consumers_with_debug_config(
     graph: &CompiledFrameGraph,
     demand: &EffectExecutionDemand,
@@ -69,6 +71,44 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
     output_size: (u32, u32),
     debug_config: EffectDebugConfig,
 ) -> SurfaceConsumerPlan {
+    let layers = commands
+        .iter()
+        .map(|command| match command.layer {
+            EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+            _ => capture::CaptureLayer::Other,
+        })
+        .collect::<Vec<_>>();
+    let visual_groups = commands
+        .iter()
+        .map(|command| command.visual_group)
+        .collect::<Vec<_>>();
+    plan_effect_surface_consumers_with_metadata(
+        graph,
+        demand,
+        selection,
+        commands,
+        &layers,
+        &visual_groups,
+        repaint_rects,
+        output_size,
+        debug_config,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_effect_surface_consumers_with_metadata(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    commands: &[EglDrawCommand],
+    layers: &[capture::CaptureLayer],
+    visual_groups: &[Option<oblivion_one::compositor::VisualGroupId>],
+    repaint_rects: &[OutputRect],
+    output_size: (u32, u32),
+    debug_config: EffectDebugConfig,
+) -> SurfaceConsumerPlan {
+    debug_assert_eq!(layers.len(), commands.len());
+    debug_assert_eq!(visual_groups.len(), commands.len());
     let mut plan = SurfaceConsumerPlan::default();
     let scene_work = scene_replay_work_plan(
         repaint_rects,
@@ -86,18 +126,6 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         ),
     );
     let mut scene_cursor = 0;
-    let layers = commands
-        .iter()
-        .map(|command| match command.layer {
-            EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
-            _ => capture::CaptureLayer::Other,
-        })
-        .collect::<Vec<_>>();
-    let visual_groups = commands
-        .iter()
-        .map(|command| command.visual_group)
-        .collect::<Vec<_>>();
-
     for pass in &graph.passes {
         if !selection.executed_passes.contains(&pass.id) {
             continue;
@@ -109,8 +137,14 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
         )
         .is_some()
         {
-            let (draw_end, _) =
-                composition_range(commands, pass.anchor, pass.visual_group, pass.anchor_scope);
+            let (draw_end, _) = composition_range_with_metadata(
+                commands,
+                layers,
+                visual_groups,
+                pass.anchor,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
             add_surface_consumers_for_command_range(
                 &mut plan,
                 commands,
@@ -124,8 +158,14 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
             pass.kind,
             RenderPassKind::Composite | RenderPassKind::OutputPostProcess
         ) {
-            let (draw_end, next_cursor) =
-                composition_range(commands, pass.anchor, pass.visual_group, pass.anchor_scope);
+            let (draw_end, next_cursor) = composition_range_with_metadata(
+                commands,
+                layers,
+                visual_groups,
+                pass.anchor,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
             add_surface_consumers_for_command_range(
                 &mut plan,
                 commands,
@@ -140,8 +180,8 @@ pub(crate) fn plan_effect_surface_consumers_with_debug_config(
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
         ) {
             let indices = capture::indices_for_capture(
-                &layers,
-                &visual_groups,
+                layers,
+                visual_groups,
                 pass.anchor,
                 pass.kind == RenderPassKind::SurfaceCapture,
                 pass.visual_group,

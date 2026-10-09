@@ -373,25 +373,15 @@ pub(super) fn pass_trace_summary(
     )
     .then_some(capture_plan.executed.as_str());
     let capture_command_count = if capture_mode == Some("replay") {
-        let layers = renderer
-            .scene
-            .commands
-            .iter()
-            .map(|command| match command.layer {
-                EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
-                _ => capture::CaptureLayer::Other,
-            })
-            .collect::<Vec<_>>();
-        let visual_groups = renderer
-            .scene
-            .commands
-            .iter()
-            .map(|command| command.visual_group)
-            .collect::<Vec<_>>();
+        debug_assert_eq!(
+            renderer.scene.capture_metadata_generation,
+            renderer.scene.scene_command_topology_generation,
+            "capture telemetry must use current scene command metadata"
+        );
         Some(
             capture::indices_for_capture(
-                &layers,
-                &visual_groups,
+                &renderer.scene.capture_layers,
+                &renderer.scene.capture_visual_groups,
                 pass.anchor,
                 pass.kind == RenderPassKind::SurfaceCapture,
                 pass.visual_group,
@@ -495,8 +485,38 @@ pub(super) fn composition_position(
     }
 }
 
+#[cfg(test)]
 pub(in crate::egl_renderer) fn composition_range(
     commands: &[crate::egl_renderer::geometry::EglDrawCommand],
+    anchor: oblivion_one::compositor::EffectAnchor,
+    visual_group: Option<oblivion_one::compositor::VisualGroupId>,
+    anchor_scope: oblivion_one::compositor::EffectAnchorScope,
+) -> (usize, usize) {
+    let layers = commands
+        .iter()
+        .map(|command| match command.layer {
+            EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+            _ => capture::CaptureLayer::Other,
+        })
+        .collect::<Vec<_>>();
+    let visual_groups = commands
+        .iter()
+        .map(|command| command.visual_group)
+        .collect::<Vec<_>>();
+    composition_range_with_metadata(
+        commands,
+        &layers,
+        &visual_groups,
+        anchor,
+        visual_group,
+        anchor_scope,
+    )
+}
+
+pub(in crate::egl_renderer) fn composition_range_with_metadata(
+    commands: &[crate::egl_renderer::geometry::EglDrawCommand],
+    layers: &[capture::CaptureLayer],
+    visual_groups: &[Option<oblivion_one::compositor::VisualGroupId>],
     anchor: oblivion_one::compositor::EffectAnchor,
     visual_group: Option<oblivion_one::compositor::VisualGroupId>,
     anchor_scope: oblivion_one::compositor::EffectAnchorScope,
@@ -505,16 +525,29 @@ pub(in crate::egl_renderer) fn composition_range(
         let Some(visual_group) = visual_group else {
             return (commands.len(), commands.len());
         };
-        let Some(start) = commands
-            .iter()
-            .position(|command| command.visual_group == Some(visual_group))
-        else {
+        let group_range = if visual_groups.len() == commands.len() {
+            visual_groups
+                .iter()
+                .position(|group| *group == Some(visual_group))
+                .zip(
+                    visual_groups
+                        .iter()
+                        .rposition(|group| *group == Some(visual_group)),
+                )
+        } else {
+            commands
+                .iter()
+                .position(|command| command.visual_group == Some(visual_group))
+                .zip(
+                    commands
+                        .iter()
+                        .rposition(|command| command.visual_group == Some(visual_group)),
+                )
+        };
+        let Some((start, last)) = group_range else {
             return (commands.len(), commands.len());
         };
-        let end = commands
-            .iter()
-            .rposition(|command| command.visual_group == Some(visual_group))
-            .map_or(start, |index| index.saturating_add(1));
+        let end = last.saturating_add(1);
         return match anchor {
             oblivion_one::compositor::EffectAnchor::BeforeSurface(_) => (start, start),
             oblivion_one::compositor::EffectAnchor::ReplaceSurface(_) => (start, end),
@@ -524,16 +557,14 @@ pub(in crate::egl_renderer) fn composition_range(
             }
         };
     }
-    let position = composition_position(
-        &commands
-            .iter()
-            .map(|command| match command.layer {
-                EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
-                _ => capture::CaptureLayer::Other,
-            })
-            .collect::<Vec<_>>(),
-        anchor,
-    );
+    // Renderer-owned execution refreshes this cache when scene commands are
+    // rebuilt. Test/setup paths can still populate commands directly; keep
+    // those paths correct without allocating a projection or panicking.
+    let position = if layers.len() == commands.len() {
+        composition_position(layers, anchor)
+    } else {
+        composition_position_from_commands(commands, anchor)
+    };
     match anchor {
         oblivion_one::compositor::EffectAnchor::BeforeSurface(_) => (position, position),
         oblivion_one::compositor::EffectAnchor::ReplaceSurface(_) => {
@@ -543,6 +574,25 @@ pub(in crate::egl_renderer) fn composition_range(
         oblivion_one::compositor::EffectAnchor::OutputPostProcess => {
             (commands.len(), commands.len())
         }
+    }
+}
+
+fn composition_position_from_commands(
+    commands: &[crate::egl_renderer::geometry::EglDrawCommand],
+    anchor: oblivion_one::compositor::EffectAnchor,
+) -> usize {
+    let matches_anchor = |command: &crate::egl_renderer::geometry::EglDrawCommand, surface_id| matches!(command.layer, EglDrawLayer::Surface(id) if id == surface_id);
+    match anchor {
+        oblivion_one::compositor::EffectAnchor::BeforeSurface(surface_id)
+        | oblivion_one::compositor::EffectAnchor::ReplaceSurface(surface_id) => commands
+            .iter()
+            .position(|command| matches_anchor(command, surface_id))
+            .unwrap_or(commands.len()),
+        oblivion_one::compositor::EffectAnchor::AfterSurface(surface_id) => commands
+            .iter()
+            .rposition(|command| matches_anchor(command, surface_id))
+            .map_or(commands.len(), |index| index.saturating_add(1)),
+        oblivion_one::compositor::EffectAnchor::OutputPostProcess => commands.len(),
     }
 }
 

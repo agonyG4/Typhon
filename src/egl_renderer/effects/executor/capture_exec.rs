@@ -341,24 +341,14 @@ pub(super) fn execute_capture(
         }
     }
     let selection_start = replay_host_timing_enabled.then(Instant::now);
-    let layers = renderer
-        .scene
-        .commands
-        .iter()
-        .map(|command| match command.layer {
-            EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
-            _ => capture::CaptureLayer::Other,
-        })
-        .collect::<Vec<_>>();
-    let visual_groups = renderer
-        .scene
-        .commands
-        .iter()
-        .map(|command| command.visual_group)
-        .collect::<Vec<_>>();
+    debug_assert_eq!(
+        renderer.scene.capture_metadata_generation,
+        renderer.scene.scene_command_topology_generation,
+        "capture metadata must follow scene command rebuilds"
+    );
     let indices = capture::indices_for_capture(
-        &layers,
-        &visual_groups,
+        &renderer.scene.capture_layers,
+        &renderer.scene.capture_visual_groups,
         pass.anchor,
         pass.kind == RenderPassKind::SurfaceCapture,
         pass.visual_group,

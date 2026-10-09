@@ -232,8 +232,10 @@ pub(super) fn execute_graph_passes_inner(
             if let Some(scene_advance_reason) =
                 scene_advance_reason(pass, scene_baseline_authority, framebuffer_capture)
             {
-                let (draw_end, _) = composition_range(
+                let (draw_end, _) = composition_range_with_metadata(
                     &renderer.scene.commands,
+                    &renderer.scene.capture_layers,
+                    &renderer.scene.capture_visual_groups,
                     pass.anchor,
                     pass.visual_group,
                     pass.anchor_scope,
@@ -285,8 +287,10 @@ pub(super) fn execute_graph_passes_inner(
                 pass.kind,
                 RenderPassKind::Composite | RenderPassKind::OutputPostProcess
             ) {
-                let (draw_end, next_cursor) = composition_range(
+                let (draw_end, next_cursor) = composition_range_with_metadata(
                     &renderer.scene.commands,
+                    &renderer.scene.capture_layers,
+                    &renderer.scene.capture_visual_groups,
                     pass.anchor,
                     pass.visual_group,
                     pass.anchor_scope,

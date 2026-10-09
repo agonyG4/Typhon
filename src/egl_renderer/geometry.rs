@@ -1,5 +1,5 @@
 use glow::HasContext;
-use oblivion_one::compositor::ServerFrameColor;
+use oblivion_one::compositor::{ServerFrameColor, VisualGroupId};
 use std::sync::OnceLock;
 
 use super::{OutputFramebufferOrigin, OutputRect};
@@ -97,6 +97,12 @@ const MAX_VISIBLE_REGION_PIECES: usize = MAX_OPAQUE_COVERAGE_PIECES;
 const MAX_SCENE_REGION_REPAIRS: usize = 256;
 const MAX_SCENE_REGION_COMMANDS: usize = 65_536;
 const MAX_SCENE_REGION_CLIP_PIECES: usize = 16_384;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OcclusionPolicy {
+    OrdinaryScene,
+    Disabled,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EglVisibilityDecision {
@@ -235,6 +241,33 @@ pub(super) struct PlannedSceneCommand {
     pub(super) clips_len: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SceneCommandSelection<'a> {
+    All,
+    Range { start: usize, end: usize },
+    Indices(&'a [usize]),
+}
+
+impl SceneCommandSelection<'_> {
+    fn len(self, command_count: usize) -> usize {
+        match self {
+            Self::All => command_count,
+            Self::Range { start, end } => end.saturating_sub(start),
+            Self::Indices(indices) => indices.len(),
+        }
+    }
+
+    fn index_at(self, selected_index: usize, command_count: usize) -> Option<usize> {
+        match self {
+            Self::All => (selected_index < command_count).then_some(selected_index),
+            Self::Range { start, end } => {
+                (selected_index < end.saturating_sub(start)).then_some(start + selected_index)
+            }
+            Self::Indices(indices) => indices.get(selected_index).copied(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SceneRepairVisibility {
     repair: EglRect,
@@ -263,6 +296,68 @@ impl SceneRegionPlan {
     }
 
     pub(super) fn build(&mut self, commands: &[EglDrawCommand], repairs: &[OutputRect]) {
+        self.build_selected(commands, repairs, None, OcclusionPolicy::OrdinaryScene);
+    }
+
+    pub(super) fn build_range(
+        &mut self,
+        commands: &[EglDrawCommand],
+        repairs: &[OutputRect],
+        start: usize,
+        end: usize,
+        occlusion_policy: OcclusionPolicy,
+    ) {
+        let end = end.min(commands.len());
+        let start = start.min(end);
+        self.build_selection(
+            commands,
+            repairs,
+            SceneCommandSelection::Range { start, end },
+            occlusion_policy,
+            &[],
+        );
+    }
+
+    pub(super) fn build_selected(
+        &mut self,
+        commands: &[EglDrawCommand],
+        repairs: &[OutputRect],
+        selected_indices: Option<&[usize]>,
+        occlusion_policy: OcclusionPolicy,
+    ) {
+        self.build_selection(
+            commands,
+            repairs,
+            selected_indices.map_or(SceneCommandSelection::All, SceneCommandSelection::Indices),
+            occlusion_policy,
+            &[],
+        );
+    }
+
+    pub(super) fn build_capture_selected(
+        &mut self,
+        commands: &[EglDrawCommand],
+        repairs: &[OutputRect],
+        selected_indices: &[usize],
+        unclipped_visual_groups: &[VisualGroupId],
+    ) {
+        self.build_selection(
+            commands,
+            repairs,
+            SceneCommandSelection::Indices(selected_indices),
+            OcclusionPolicy::Disabled,
+            unclipped_visual_groups,
+        );
+    }
+
+    fn build_selection(
+        &mut self,
+        commands: &[EglDrawCommand],
+        repairs: &[OutputRect],
+        selection: SceneCommandSelection<'_>,
+        occlusion_policy: OcclusionPolicy,
+        unclipped_visual_groups: &[VisualGroupId],
+    ) {
         self.clear_for_build();
         self.stats.input_rects = repairs.len();
         if repairs.len() > MAX_SCENE_REGION_REPAIRS {
@@ -277,7 +372,9 @@ impl SceneRegionPlan {
             self.fallback = Some(SceneRegionFallback::OverlappingRepairs);
             return;
         }
-        if commands.len() > MAX_SCENE_REGION_COMMANDS {
+        if commands.len() > MAX_SCENE_REGION_COMMANDS
+            || selection.len(commands.len()) > MAX_SCENE_REGION_COMMANDS
+        {
             self.fallback = Some(SceneRegionFallback::TooManyCommands);
             return;
         }
@@ -304,13 +401,28 @@ impl SceneRegionPlan {
             });
         }
 
-        for command_index in (0..commands.len()).rev() {
+        for selection_index in (0..selection.len(commands.len())).rev() {
             if self.repair_scratch.iter().all(|state| state.terminated) {
                 break;
             }
             self.stats.outer_commands_visited += 1;
+            let Some(command_index) = selection.index_at(selection_index, commands.len()) else {
+                self.set_fallback(SceneRegionFallback::TooManyCommands);
+                return;
+            };
+            if command_index >= commands.len() {
+                self.set_fallback(SceneRegionFallback::TooManyCommands);
+                return;
+            }
             let command = &commands[command_index];
-            let visible_bounds = command.visible_bounds();
+            let visible_bounds = if command
+                .visual_group
+                .is_some_and(|group| unclipped_visual_groups.contains(&group))
+            {
+                Some(command.bounds)
+            } else {
+                command.visible_bounds()
+            };
             let clips_start = self.clip_repair_indices.len();
             let mut drawable = false;
             for (repair_index, state) in self.repair_scratch.iter_mut().enumerate() {
@@ -345,7 +457,9 @@ impl SceneRegionPlan {
                     self.consumer_plan.add_surface(surface_id);
                 }
 
-                if state.remaining.occlusion_disabled {
+                if occlusion_policy == OcclusionPolicy::Disabled
+                    || state.remaining.occlusion_disabled
+                {
                     continue;
                 }
                 for opaque_region in &command.opaque_regions {
@@ -389,8 +503,8 @@ impl SceneRegionPlan {
 
         self.commands.reverse();
         for stats in &mut self.stats.repairs {
-            stats.commands_rejected_occluded = commands
-                .len()
+            stats.commands_rejected_occluded = selection
+                .len(commands.len())
                 .saturating_sub(stats.commands_drawable)
                 .saturating_sub(stats.commands_rejected_outside_remaining);
         }
@@ -399,6 +513,7 @@ impl SceneRegionPlan {
         self.stats.clip_pieces = self.clip_repair_indices.len();
     }
 
+    #[cfg(test)]
     pub(super) fn repair_indices_for(&self, command: PlannedSceneCommand) -> &[usize] {
         &self.clip_repair_indices[command.clips_start..command.clips_start + command.clips_len]
     }
@@ -412,6 +527,7 @@ impl SceneRegionPlan {
             && self.clip_repair_indices.len() <= MAX_SCENE_REGION_CLIP_PIECES
     }
 
+    #[cfg(test)]
     pub(super) fn has_command_clip(&self, command_index: usize, repair_index: usize) -> bool {
         self.commands
             .iter()
@@ -1267,7 +1383,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 let repairs = (0..repair_count)
                     .map(|index| {
-                        OutputRect::new((index % 8) as i32 * 40, (index / 8) as i32 * 40, 32, 32)
+                        OutputRect::new(index % 8 * 40, index / 8 * 40, 32, 32)
                     })
                     .collect::<Vec<_>>();
                 let oracle = legacy_repair_plans(&commands, &repairs);
@@ -1316,6 +1432,248 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn range_scene_plan_visits_only_requested_commands_and_reports_pair_work() {
+        let commands = (0..64)
+            .map(|_| test_command(EglRect::new(0.0, 0.0, 64.0, 64.0), Vec::new()))
+            .collect::<Vec<_>>();
+        let repairs = [
+            OutputRect::new(0, 0, 8, 8),
+            OutputRect::new(16, 0, 8, 8),
+            OutputRect::new(32, 0, 8, 8),
+        ];
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build_range(&commands, &repairs, 17, 19, OcclusionPolicy::Disabled);
+
+        assert_eq!(plan.fallback, None);
+        assert_eq!(plan.stats.outer_commands_visited, 2);
+        assert_eq!(plan.stats.command_repair_tests, 6);
+        assert_eq!(
+            plan.commands
+                .iter()
+                .map(|planned| planned.command_index)
+                .collect::<Vec<_>>(),
+            [17, 18]
+        );
+    }
+
+    #[test]
+    #[ignore = "optimized profile scaling benchmark; run with --release --ignored"]
+    fn region_native_scaling_benchmark() {
+        use std::time::Instant;
+
+        fn percentile(sorted: &[u128], percent: usize) -> u128 {
+            let index = sorted
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(percent)
+                .div_ceil(100);
+            sorted[index.min(sorted.len().saturating_sub(1))]
+        }
+
+        let command_counts = [1, 4, 8, 16, 32, 64, 128];
+        let repair_counts = [1, 2, 4, 8, 16, 32];
+        let coverage_modes = [("none", 0_u8), ("partial", 1), ("high", 2)];
+        let selection_modes = ["none", "range", "sparse"];
+        let mut base_plan = SceneRegionPlan::default();
+        let mut selected_plan = SceneRegionPlan::default();
+
+        eprintln!(
+            "commands,repairs,coverage,effect_selection,base_builds,base_outer_commands_visited,base_command_repair_tests,base_planned_commands,base_clip_pieces,base_surface_consumers,base_texture_binds_estimate,base_draw_calls_estimate,legacy_base_scan_baseline,effect_replay_actual_visits,effect_replay_command_region_tests,legacy_effect_scan_baseline,replay_capture_actual_visits,replay_capture_command_region_tests,legacy_capture_scan_baseline,fallbacks,p50_ns,p95_ns,p99_ns"
+        );
+
+        for command_count in command_counts {
+            for repair_count in repair_counts {
+                for (coverage_name, coverage_kind) in coverage_modes {
+                    for selection_mode in selection_modes {
+                        let commands = (0..command_count)
+                            .map(|index| {
+                                let opaque_regions = match coverage_kind {
+                                    0 => Vec::new(),
+                                    1 => vec![EglRect::new(0.0, 0.0, 32.0, 32.0)],
+                                    _ => vec![EglRect::new(0.0, 0.0, 256.0, 256.0)],
+                                };
+                                let mut command = test_command(
+                                    EglRect::new(0.0, 0.0, 256.0, 256.0),
+                                    opaque_regions,
+                                );
+                                command.layer = EglDrawLayer::Surface(index as u32 + 1);
+                                command
+                            })
+                            .collect::<Vec<_>>();
+                        let repairs = (0..repair_count)
+                            .map(|index| {
+                                OutputRect::new(
+                                    (index % 8) as i32 * 12,
+                                    (index / 8) as i32 * 12,
+                                    8,
+                                    8,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let range_start = command_count / 4;
+                        let range_end = (command_count * 3 / 4).max(range_start + 1);
+                        let sparse_indices = (0..command_count).step_by(8).collect::<Vec<_>>();
+
+                        base_plan.build(&commands, &repairs);
+                        match selection_mode {
+                            "range" => selected_plan.build_range(
+                                &commands,
+                                &repairs,
+                                range_start,
+                                range_end.min(command_count),
+                                OcclusionPolicy::Disabled,
+                            ),
+                            "sparse" => selected_plan.build_capture_selected(
+                                &commands,
+                                &repairs,
+                                &sparse_indices,
+                                &[],
+                            ),
+                            _ => selected_plan.clear_for_build(),
+                        }
+
+                        let mut samples = Vec::with_capacity(31);
+                        for _ in 0..31 {
+                            let started = Instant::now();
+                            base_plan.build(&commands, &repairs);
+                            match selection_mode {
+                                "range" => selected_plan.build_range(
+                                    &commands,
+                                    &repairs,
+                                    range_start,
+                                    range_end.min(command_count),
+                                    OcclusionPolicy::Disabled,
+                                ),
+                                "sparse" => selected_plan.build_capture_selected(
+                                    &commands,
+                                    &repairs,
+                                    &sparse_indices,
+                                    &[],
+                                ),
+                                _ => selected_plan.clear_for_build(),
+                            }
+                            std::hint::black_box((
+                                base_plan.stats.outer_commands_visited,
+                                selected_plan.stats.outer_commands_visited,
+                                base_plan.stats.command_repair_tests,
+                                selected_plan.stats.command_repair_tests,
+                            ));
+                            samples.push(started.elapsed().as_nanos());
+                        }
+                        samples.sort_unstable();
+
+                        let effect_replay_visits = if selection_mode == "range" {
+                            selected_plan
+                                .stats
+                                .outer_commands_visited
+                                .saturating_add(selected_plan.stats.planned_commands)
+                        } else {
+                            0
+                        };
+                        let replay_capture_visits = if selection_mode == "sparse" {
+                            selected_plan
+                                .stats
+                                .outer_commands_visited
+                                .saturating_add(selected_plan.stats.planned_commands)
+                        } else {
+                            0
+                        };
+                        let fallback_count = usize::from(base_plan.fallback.is_some())
+                            + usize::from(
+                                selection_mode != "none" && selected_plan.fallback.is_some(),
+                            );
+                        let legacy_scene_scan_baseline = command_count.saturating_mul(repair_count);
+                        let legacy_effect_scan_baseline = if selection_mode == "range" {
+                            legacy_scene_scan_baseline
+                        } else {
+                            0
+                        };
+                        let legacy_capture_scan_baseline = if selection_mode == "sparse" {
+                            legacy_scene_scan_baseline
+                        } else {
+                            0
+                        };
+                        let surface_consumers = base_plan.consumer_plan.surface_ids().len();
+
+                        eprintln!(
+                            "{command_count},{repair_count},{coverage_name},{selection_mode},1,{},{},{},{},{},{},{},{legacy_scene_scan_baseline},{effect_replay_visits},{},{legacy_effect_scan_baseline},{replay_capture_visits},{},{legacy_capture_scan_baseline},{fallback_count},{},{},{}",
+                            base_plan.stats.outer_commands_visited,
+                            base_plan.stats.command_repair_tests,
+                            base_plan.stats.planned_commands,
+                            base_plan.stats.clip_pieces,
+                            surface_consumers,
+                            base_plan.stats.planned_commands,
+                            base_plan.stats.clip_pieces,
+                            if selection_mode == "range" {
+                                selected_plan.stats.command_repair_tests
+                            } else {
+                                0
+                            },
+                            if selection_mode == "sparse" {
+                                selected_plan.stats.command_repair_tests
+                            } else {
+                                0
+                            },
+                            percentile(&samples, 50),
+                            percentile(&samples, 95),
+                            percentile(&samples, 99),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_occlusion_keeps_commands_under_opaque_effect_replay_coverage() {
+        let mut front = test_command(
+            EglRect::new(0.0, 0.0, 32.0, 32.0),
+            vec![EglRect::new(0.0, 0.0, 32.0, 32.0)],
+        );
+        front.layer = EglDrawLayer::Surface(2);
+        let mut back = test_command(EglRect::new(0.0, 0.0, 32.0, 32.0), Vec::new());
+        back.layer = EglDrawLayer::Surface(1);
+        let commands = vec![back, front];
+        let repairs = [OutputRect::new(0, 0, 32, 32)];
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build_range(
+            &commands,
+            &repairs,
+            0,
+            commands.len(),
+            OcclusionPolicy::Disabled,
+        );
+
+        assert_eq!(plan.fallback, None);
+        assert_eq!(plan.commands.len(), 2);
+        assert!(plan.has_command_clip(0, 0));
+        assert!(plan.has_command_clip(1, 0));
+    }
+
+    #[test]
+    fn capture_plan_bypasses_only_the_selected_presentation_owner_clip() {
+        let owner_group = VisualGroupId::new(71).expect("valid visual group");
+        let other_group = VisualGroupId::new(72).expect("valid visual group");
+        let mut owner = test_command(EglRect::new(0.0, 0.0, 32.0, 32.0), Vec::new());
+        owner.visual_group = Some(owner_group);
+        owner.presentation_clip = Some(EglRect::new(0.0, 0.0, 0.0, 32.0));
+        let mut other = test_command(EglRect::new(0.0, 0.0, 32.0, 32.0), Vec::new());
+        other.visual_group = Some(other_group);
+        other.presentation_clip = Some(EglRect::new(0.0, 0.0, 0.0, 32.0));
+        let commands = vec![owner, other];
+        let repairs = [OutputRect::new(0, 0, 32, 32)];
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build_capture_selected(&commands, &repairs, &[0, 1], &[owner_group]);
+
+        assert_eq!(plan.fallback, None);
+        assert!(plan.has_command_clip(0, 0));
+        assert!(!plan.has_command_clip(1, 0));
     }
 
     #[test]

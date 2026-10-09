@@ -56,8 +56,10 @@ pub(super) fn checkpoint_causal_stability_plan_for_owners(
                 })
             });
         let current_composition_boundary = primary_capture.map(|pass| {
-            let (draw_end, _) = composition_range(
+            let (draw_end, _) = composition_range_with_metadata(
                 &scene.commands,
+                &scene.capture_layers,
+                &scene.capture_visual_groups,
                 pass.anchor,
                 pass.visual_group,
                 pass.anchor_scope,
@@ -122,8 +124,10 @@ pub(super) fn checkpoint_causal_stability_plan_for_owners(
                             .is_some_and(|stability| stability.output_unchanged)
                     })
                 });
-            let (draw_end, _) = composition_range(
+            let (draw_end, _) = composition_range_with_metadata(
                 &scene.commands,
+                &scene.capture_layers,
+                &scene.capture_visual_groups,
                 pass.anchor,
                 pass.visual_group,
                 pass.anchor_scope,

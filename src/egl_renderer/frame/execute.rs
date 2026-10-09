@@ -10,7 +10,7 @@ use super::super::{
     damage::{OutputRect, RenderExecution, RepaintPlan},
     effects::{
         EffectDebugConfig, EffectExecutionSelection, EffectExecutionStats, SceneReplayWorkMode,
-        composition_range,
+        composition_range_with_metadata,
     },
     scene_state::{SceneRenderState, SceneTextureSources},
 };
@@ -482,13 +482,20 @@ pub(in crate::egl_renderer) fn promote_checkpoint_cache_causal_state(
     effects: &mut super::super::effects::EffectRuntime,
     graph: &CompiledFrameGraph,
 ) {
+    scene.ensure_capture_command_metadata();
     let frame_serial = effects.effect_resources.checkpoint_frame_serial();
     let candidate_state =
         scene
             .current_checkpoint_scene_causal_snapshot
             .clone()
             .map(|scene_snapshot| {
-                build_checkpoint_causal_state(scene_snapshot, Some(graph), &scene.commands)
+                build_checkpoint_causal_state(
+                    scene_snapshot,
+                    Some(graph),
+                    &scene.commands,
+                    &scene.capture_layers,
+                    &scene.capture_visual_groups,
+                )
             });
     if let Some(state) = candidate_state {
         effects
@@ -505,6 +512,8 @@ fn build_checkpoint_causal_state(
     scene: super::super::EglCheckpointSceneCausalSnapshot,
     graph: Option<&CompiledFrameGraph>,
     commands: &[super::super::geometry::EglDrawCommand],
+    capture_layers: &[super::super::effects::CaptureLayer],
+    capture_visual_groups: &[Option<oblivion_one::compositor::VisualGroupId>],
 ) -> CheckpointCausalState {
     let mut effects = HashMap::new();
     if let Some(graph) = graph {
@@ -547,8 +556,10 @@ fn build_checkpoint_causal_state(
                         scene.presentation_owner_for_visual_group(pass.visual_group)
                     }),
                     composition_boundary: scene_captures.first().map(|pass| {
-                        let (draw_end, _) = composition_range(
+                        let (draw_end, _) = composition_range_with_metadata(
                             commands,
+                            capture_layers,
+                            capture_visual_groups,
                             pass.anchor,
                             pass.visual_group,
                             pass.anchor_scope,

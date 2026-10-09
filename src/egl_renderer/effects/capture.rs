@@ -6,6 +6,7 @@ pub(crate) enum CaptureLayer {
     Other,
 }
 
+#[cfg(test)]
 pub(crate) fn indices_below_anchor(layers: &[CaptureLayer], anchor: EffectAnchor) -> Vec<usize> {
     let cutoff = match anchor {
         EffectAnchor::BeforeSurface(surface_id) | EffectAnchor::ReplaceSurface(surface_id) => {
@@ -31,20 +32,44 @@ pub(crate) fn indices_for_capture(
     visual_group: Option<VisualGroupId>,
     anchor_scope: EffectAnchorScope,
 ) -> Vec<usize> {
+    let mut indices = Vec::new();
+    indices_for_capture_into(
+        layers,
+        visual_groups,
+        anchor,
+        target_content,
+        visual_group,
+        anchor_scope,
+        &mut indices,
+    );
+    indices
+}
+
+pub(crate) fn indices_for_capture_into(
+    layers: &[CaptureLayer],
+    visual_groups: &[Option<VisualGroupId>],
+    anchor: EffectAnchor,
+    target_content: bool,
+    visual_group: Option<VisualGroupId>,
+    anchor_scope: EffectAnchorScope,
+    indices: &mut Vec<usize>,
+) {
+    indices.clear();
     if anchor_scope == EffectAnchorScope::VisualGroup {
         let Some(visual_group) = visual_group else {
-            return if !target_content {
-                indices_below_anchor(layers, anchor)
-            } else {
-                Vec::new()
-            };
+            if !target_content {
+                indices_below_anchor_into(layers, anchor, indices);
+            }
+            return;
         };
         if target_content {
-            return visual_groups
-                .iter()
-                .enumerate()
-                .filter_map(|(index, group)| (*group == Some(visual_group)).then_some(index))
-                .collect();
+            indices.extend(
+                visual_groups
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, group)| (*group == Some(visual_group)).then_some(index)),
+            );
+            return;
         }
         let cutoff = match anchor {
             EffectAnchor::BeforeSurface(_) | EffectAnchor::ReplaceSurface(_) => visual_groups
@@ -57,22 +82,45 @@ pub(crate) fn indices_for_capture(
                 .map_or(visual_groups.len(), |index| index.saturating_add(1)),
             EffectAnchor::OutputPostProcess => visual_groups.len(),
         };
-        return (0..cutoff).collect();
+        indices.extend(0..cutoff);
+        return;
     }
     if !target_content {
-        return indices_below_anchor(layers, anchor);
+        indices_below_anchor_into(layers, anchor, indices);
+        return;
     }
     let target = match anchor {
         EffectAnchor::BeforeSurface(surface_id)
         | EffectAnchor::ReplaceSurface(surface_id)
         | EffectAnchor::AfterSurface(surface_id) => surface_id,
-        EffectAnchor::OutputPostProcess => return Vec::new(),
+        EffectAnchor::OutputPostProcess => return,
     };
-    layers
-        .iter()
-        .enumerate()
-        .filter_map(|(index, layer)| (*layer == CaptureLayer::Surface(target)).then_some(index))
-        .collect()
+    indices.extend(
+        layers.iter().enumerate().filter_map(|(index, layer)| {
+            (*layer == CaptureLayer::Surface(target)).then_some(index)
+        }),
+    );
+}
+
+fn indices_below_anchor_into(
+    layers: &[CaptureLayer],
+    anchor: EffectAnchor,
+    indices: &mut Vec<usize>,
+) {
+    let cutoff = match anchor {
+        EffectAnchor::BeforeSurface(surface_id) | EffectAnchor::ReplaceSurface(surface_id) => {
+            layers
+                .iter()
+                .position(|layer| *layer == CaptureLayer::Surface(surface_id))
+                .unwrap_or(layers.len())
+        }
+        EffectAnchor::AfterSurface(surface_id) => layers
+            .iter()
+            .rposition(|layer| *layer == CaptureLayer::Surface(surface_id))
+            .map_or(layers.len(), |index| index.saturating_add(1)),
+        EffectAnchor::OutputPostProcess => layers.len(),
+    };
+    indices.extend(0..cutoff);
 }
 
 #[cfg(test)]

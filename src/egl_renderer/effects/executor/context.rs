@@ -1,6 +1,16 @@
 use super::*;
 use glow::HasContext;
 
+#[derive(Clone, Copy)]
+enum RegionPlanScissorMode {
+    Framebuffer(OutputFramebufferOrigin),
+    CaptureTarget {
+        framebuffer_origin: OutputFramebufferOrigin,
+        target_domain: EffectRect,
+        target_size: (u32, u32),
+    },
+}
+
 /// Temporary borrowed access to the renderer's authoritative scene and effect
 /// owners. It never owns or clones GL resources, scene commands, or caches.
 pub(in crate::egl_renderer) struct EffectExecutionContext<'a> {
@@ -17,6 +27,7 @@ impl<'a> EffectExecutionContext<'a> {
         runtime: &'a mut EffectRuntime,
         sources: SceneTextureSources<'a>,
     ) -> Self {
+        scene.ensure_capture_command_metadata();
         Self {
             gl,
             scene,
@@ -91,17 +102,69 @@ impl<'a> EffectExecutionContext<'a> {
 }
 
 impl EffectExecutionContext<'_> {
-    /// Execute the persistent ordinary scene plan command-first. The plan
-    /// contains only command and repair indices; scene payloads and textures
-    /// stay owned by their existing renderer state.
+    /// Execute an ordinary or effect scene plan command-first. Plans contain
+    /// only command and repair indices; commands and textures remain owned by
+    /// their existing renderer state.
     pub(in crate::egl_renderer) fn draw_scene_region_plan(&mut self) -> RendererResult<()> {
-        if !self
-            .scene
-            .scene_region_plan
-            .is_executable_for(&self.scene.commands)
-        {
-            return Err(std::io::Error::other("ordinary scene region plan is stale").into());
+        self.draw_command_region_plan(
+            false,
+            RegionPlanScissorMode::Framebuffer(self.scene.current_framebuffer_origin),
+        )
+    }
+
+    fn draw_effect_region_plan(
+        &mut self,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        self.draw_command_region_plan(true, RegionPlanScissorMode::Framebuffer(framebuffer_origin))
+    }
+
+    fn draw_capture_region_plan(
+        &mut self,
+        framebuffer_origin: OutputFramebufferOrigin,
+        target_domain: EffectRect,
+        target_size: (u32, u32),
+    ) -> RendererResult<()> {
+        self.draw_command_region_plan(
+            true,
+            RegionPlanScissorMode::CaptureTarget {
+                framebuffer_origin,
+                target_domain,
+                target_size,
+            },
+        )
+    }
+
+    fn draw_command_region_plan(
+        &mut self,
+        effect_plan: bool,
+        scissor_mode: RegionPlanScissorMode,
+    ) -> RendererResult<()> {
+        let capture_plan = matches!(scissor_mode, RegionPlanScissorMode::CaptureTarget { .. });
+        let framebuffer_origin = match scissor_mode {
+            RegionPlanScissorMode::Framebuffer(origin)
+            | RegionPlanScissorMode::CaptureTarget {
+                framebuffer_origin: origin,
+                ..
+            } => origin,
+        };
+        let plan_is_executable = if effect_plan {
+            self.scene
+                .effect_region_plan
+                .is_executable_for(&self.scene.commands)
+        } else {
+            self.scene
+                .scene_region_plan
+                .is_executable_for(&self.scene.commands)
+        };
+        if !plan_is_executable {
+            return Err(std::io::Error::other("scene region plan is stale").into());
         }
+        let planned_command_count = if effect_plan {
+            self.scene.effect_region_plan.commands.len()
+        } else {
+            self.scene.scene_region_plan.commands.len()
+        };
         let opacity_location = if self.runtime.capture_in_progress
             || self.scene.capture_unattenuated_visual_group.is_some()
         {
@@ -109,6 +172,97 @@ impl EffectExecutionContext<'_> {
         } else {
             self.scene.presentation_opacity_location
         };
+        let (outer_commands_visited, command_repair_tests, planned_commands, clip_pieces) =
+            if effect_plan {
+                let stats = &self.scene.effect_region_plan.stats;
+                (
+                    stats.outer_commands_visited,
+                    stats.command_repair_tests,
+                    stats.planned_commands,
+                    stats.clip_pieces,
+                )
+            } else {
+                let stats = &self.scene.scene_region_plan.stats;
+                (
+                    stats.outer_commands_visited,
+                    stats.command_repair_tests,
+                    stats.planned_commands,
+                    stats.clip_pieces,
+                )
+            };
+        if capture_plan {
+            self.scene
+                .frame_stats
+                .replay_capture_actual_scene_commands_visited = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_scene_commands_visited
+                .saturating_add(outer_commands_visited);
+            self.scene
+                .frame_stats
+                .replay_capture_actual_command_region_tests = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_command_region_tests
+                .saturating_add(command_repair_tests);
+            self.scene
+                .frame_stats
+                .replay_capture_actual_planned_commands = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_planned_commands
+                .saturating_add(planned_commands);
+            self.scene.frame_stats.replay_capture_actual_clip_pieces = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_clip_pieces
+                .saturating_add(clip_pieces);
+        } else if effect_plan {
+            self.scene.frame_stats.effect_scene_replay_commands_visited = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_commands_visited
+                .saturating_add(outer_commands_visited);
+            self.scene
+                .frame_stats
+                .effect_scene_replay_command_region_tests = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_command_region_tests
+                .saturating_add(command_repair_tests);
+            self.scene.frame_stats.effect_scene_replay_planned_commands = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_planned_commands
+                .saturating_add(planned_commands);
+            self.scene.frame_stats.effect_scene_replay_clip_pieces = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_clip_pieces
+                .saturating_add(clip_pieces);
+        }
+        if self.scene.vertices.is_empty() || planned_command_count == 0 {
+            if !effect_plan {
+                self.scene.frame_stats.base_region_texture_binds = 0;
+                self.scene.frame_stats.base_region_draw_calls = 0;
+            }
+            return Ok(());
+        }
+        if capture_plan {
+            self.scene
+                .frame_stats
+                .replay_capture_actual_scene_commands_visited = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_scene_commands_visited
+                .saturating_add(planned_command_count);
+        } else if effect_plan {
+            self.scene.frame_stats.effect_scene_replay_commands_visited = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_commands_visited
+                .saturating_add(planned_command_count);
+        }
         let required_size = self.scene.vertices.len() * std::mem::size_of::<EglTexturedVertex>();
         ensure_vertex_buffer_capacity(
             self.gl,
@@ -141,7 +295,12 @@ impl EffectExecutionContext<'_> {
         let mut missing_required_decoration_resources = 0usize;
         let mut texture_binds = 0usize;
         let mut draw_calls = 0usize;
-        for planned in self.scene.scene_region_plan.commands.iter().copied() {
+        for planned_index in 0..planned_command_count {
+            let planned = if effect_plan {
+                self.scene.effect_region_plan.commands[planned_index]
+            } else {
+                self.scene.scene_region_plan.commands[planned_index]
+            };
             let command = &self.scene.commands[planned.command_index];
             commands_considered += 1;
             let bypass_presentation_clip = self
@@ -165,23 +324,22 @@ impl EffectExecutionContext<'_> {
                 },
                 None => None,
             };
-            let repair_indices = self.scene.scene_region_plan.repair_indices_for(planned);
-            let has_active_clip = repair_indices.iter().copied().any(|repair_index| {
-                let Some(repair) = self
-                    .scene
-                    .scene_region_plan
-                    .repairs
-                    .get(repair_index)
-                    .copied()
-                else {
-                    return false;
+            let has_active_clip = (0..planned.clips_len).any(|clip_offset| {
+                let clip_index = planned.clips_start + clip_offset;
+                let repair = if effect_plan {
+                    let repair_index =
+                        self.scene.effect_region_plan.clip_repair_indices[clip_index];
+                    self.scene.effect_region_plan.repairs[repair_index]
+                } else {
+                    let repair_index = self.scene.scene_region_plan.clip_repair_indices[clip_index];
+                    self.scene.scene_region_plan.repairs[repair_index]
                 };
                 output_clip
                     .map_or(Some(repair), |clip| intersect_output_rect(repair, clip))
                     .is_some_and(|clip| command.bounds.intersects_output_rect(clip))
             });
             if !has_active_clip {
-                commands_rejected_outside_damage += repair_indices.len();
+                commands_rejected_outside_damage += planned.clips_len;
                 continue;
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {
@@ -199,8 +357,7 @@ impl EffectExecutionContext<'_> {
                     SurfaceSampling::ScaledLinear => glow::LINEAR,
                 } as i32;
                 // Texture min/mag filters belong to the bound texture, so set
-                // them for every command binding instead of trusting the
-                // legacy cache that is not keyed by texture.
+                // them for every command binding.
                 self.gl
                     .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
                 self.gl
@@ -220,21 +377,15 @@ impl EffectExecutionContext<'_> {
                 }
             }
 
-            for repair_index in self
-                .scene
-                .scene_region_plan
-                .repair_indices_for(planned)
-                .iter()
-                .copied()
-            {
-                let Some(repair) = self
-                    .scene
-                    .scene_region_plan
-                    .repairs
-                    .get(repair_index)
-                    .copied()
-                else {
-                    continue;
+            for clip_offset in 0..planned.clips_len {
+                let clip_index = planned.clips_start + clip_offset;
+                let repair = if effect_plan {
+                    let repair_index =
+                        self.scene.effect_region_plan.clip_repair_indices[clip_index];
+                    self.scene.effect_region_plan.repairs[repair_index]
+                } else {
+                    let repair_index = self.scene.scene_region_plan.clip_repair_indices[clip_index];
+                    self.scene.scene_region_plan.repairs[repair_index]
                 };
                 let effective_scissor = match output_clip {
                     Some(clip) => intersect_output_rect(repair, clip),
@@ -243,7 +394,24 @@ impl EffectExecutionContext<'_> {
                 let Some(effective_scissor) = effective_scissor else {
                     continue;
                 };
-                self.set_scene_scissor(Some(effective_scissor));
+                match scissor_mode {
+                    RegionPlanScissorMode::Framebuffer(origin) => {
+                        self.set_scene_scissor_with_origin(Some(effective_scissor), origin);
+                    }
+                    RegionPlanScissorMode::CaptureTarget {
+                        target_domain,
+                        target_size,
+                        ..
+                    } => {
+                        self.set_capture_target_scissor(repair, target_domain, target_size);
+                        if output_clip.is_some() && effective_scissor != repair {
+                            self.set_scene_scissor_with_origin(
+                                Some(effective_scissor),
+                                framebuffer_origin,
+                            );
+                        }
+                    }
+                }
                 if !command.bounds.intersects_output_rect(effective_scissor) {
                     commands_rejected_outside_damage += 1;
                     continue;
@@ -259,7 +427,7 @@ impl EffectExecutionContext<'_> {
                 draw_calls += 1;
             }
         }
-        self.set_scene_scissor(None);
+        self.set_scene_scissor_with_origin(None, framebuffer_origin);
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
@@ -289,10 +457,34 @@ impl EffectExecutionContext<'_> {
             .frame_stats
             .texture_binds
             .saturating_add(texture_binds);
-        self.scene.frame_stats.base_region_texture_binds = texture_binds;
+        if capture_plan {
+            self.scene.frame_stats.replay_capture_actual_texture_binds = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_texture_binds
+                .saturating_add(texture_binds);
+            self.scene.frame_stats.replay_capture_actual_draw_calls = self
+                .scene
+                .frame_stats
+                .replay_capture_actual_draw_calls
+                .saturating_add(draw_calls);
+        } else if effect_plan {
+            self.scene.frame_stats.effect_scene_replay_texture_binds = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_texture_binds
+                .saturating_add(texture_binds);
+            self.scene.frame_stats.effect_scene_replay_draw_calls = self
+                .scene
+                .frame_stats
+                .effect_scene_replay_draw_calls
+                .saturating_add(draw_calls);
+        } else {
+            self.scene.frame_stats.base_region_texture_binds = texture_binds;
+            self.scene.frame_stats.base_region_draw_calls = draw_calls;
+        }
         self.scene.frame_stats.draw_calls =
             self.scene.frame_stats.draw_calls.saturating_add(draw_calls);
-        self.scene.frame_stats.base_region_draw_calls = draw_calls;
         self.scene.frame_stats.draw_command_replays = self
             .scene
             .frame_stats
@@ -308,6 +500,64 @@ impl EffectExecutionContext<'_> {
                 .saturating_add(required_size);
         }
         Ok(())
+    }
+
+    fn set_scene_scissor_with_origin(
+        &self,
+        scissor: Option<OutputRect>,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) {
+        unsafe {
+            if let Some(rect) = scissor {
+                let y = match framebuffer_origin {
+                    OutputFramebufferOrigin::BottomLeft => self
+                        .scene
+                        .current_size
+                        .1
+                        .saturating_sub(rect.y.max(0) as u32 + rect.height)
+                        as i32,
+                    OutputFramebufferOrigin::TopLeftScanout => rect.y,
+                };
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl
+                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
+            } else {
+                self.gl.disable(glow::SCISSOR_TEST);
+            }
+        }
+    }
+
+    fn set_capture_target_scissor(
+        &self,
+        output_rect: OutputRect,
+        target_domain: EffectRect,
+        target_size: (u32, u32),
+    ) {
+        let requested = EffectRect::new(
+            output_rect.x,
+            output_rect.y,
+            output_rect.width,
+            output_rect.height,
+        )
+        .and_then(|rect| rect.intersect(target_domain));
+        let Some(requested) = requested else {
+            unsafe { self.gl.disable(glow::SCISSOR_TEST) };
+            return;
+        };
+        let local_x = requested.x.saturating_sub(target_domain.x);
+        let local_y = requested.y.saturating_sub(target_domain.y);
+        let gl_y = i32::try_from(target_size.1)
+            .unwrap_or(i32::MAX)
+            .saturating_sub(local_y.saturating_add(requested.height as i32));
+        unsafe {
+            self.gl.enable(glow::SCISSOR_TEST);
+            self.gl.scissor(
+                local_x,
+                gl_y,
+                requested.width as i32,
+                requested.height as i32,
+            );
+        }
     }
 
     pub(super) fn begin_effect_repaint(
@@ -339,6 +589,53 @@ impl EffectExecutionContext<'_> {
     ) -> RendererResult<()> {
         let end = end.min(self.scene.commands.len());
         let start = start.min(end);
+        let force_legacy = crate::egl_renderer::geometry::scene_execution_mode()
+            == crate::egl_renderer::geometry::SceneExecutionMode::Legacy;
+        let (plan_fallback, plan_executable, attempted_commands_visited, attempted_region_tests) =
+            if force_legacy {
+                (true, false, 0, 0)
+            } else {
+                self.scene.effect_region_plan.build_range(
+                    &self.scene.commands,
+                    rects,
+                    start,
+                    end,
+                    OcclusionPolicy::Disabled,
+                );
+                let plan = &self.scene.effect_region_plan;
+                self.scene.frame_stats.effect_scene_replay_plan_builds = self
+                    .scene
+                    .frame_stats
+                    .effect_scene_replay_plan_builds
+                    .saturating_add(1);
+                self.scene.frame_stats.effect_scene_replay_input_rects = self
+                    .scene
+                    .frame_stats
+                    .effect_scene_replay_input_rects
+                    .saturating_add(plan.stats.input_rects);
+                self.scene.frame_stats.effect_scene_replay_normalized_rects = self
+                    .scene
+                    .frame_stats
+                    .effect_scene_replay_normalized_rects
+                    .saturating_add(plan.stats.normalized_rects);
+                (
+                    plan.fallback.is_some(),
+                    plan.is_executable_for(&self.scene.commands),
+                    plan.stats.outer_commands_visited,
+                    plan.stats.command_repair_tests,
+                )
+            };
+        if !plan_fallback && plan_executable {
+            self.establish_effect_composition_state(composition_draw);
+            return self.draw_effect_region_plan(framebuffer_origin);
+        }
+        self.scene.frame_stats.effect_scene_replay_legacy_fallbacks = self
+            .scene
+            .frame_stats
+            .effect_scene_replay_legacy_fallbacks
+            .saturating_add(1);
+        let texture_binds_before = self.scene.frame_stats.texture_binds;
+        let draw_calls_before = self.scene.frame_stats.draw_calls;
         for rect in rects {
             let y = match framebuffer_origin {
                 OutputFramebufferOrigin::BottomLeft => self
@@ -360,6 +657,42 @@ impl EffectExecutionContext<'_> {
         unsafe {
             self.gl.disable(glow::SCISSOR_TEST);
         }
+        let legacy_scan_pairs = self.scene.commands.len().saturating_mul(rects.len());
+        let command_region_tests = end.saturating_sub(start).saturating_mul(rects.len());
+        self.scene.frame_stats.effect_scene_replay_commands_visited = self
+            .scene
+            .frame_stats
+            .effect_scene_replay_commands_visited
+            .saturating_add(attempted_commands_visited)
+            .saturating_add(legacy_scan_pairs);
+        self.scene
+            .frame_stats
+            .effect_scene_replay_command_region_tests = self
+            .scene
+            .frame_stats
+            .effect_scene_replay_command_region_tests
+            .saturating_add(attempted_region_tests)
+            .saturating_add(command_region_tests);
+        self.scene.frame_stats.effect_scene_replay_texture_binds = self
+            .scene
+            .frame_stats
+            .effect_scene_replay_texture_binds
+            .saturating_add(
+                self.scene
+                    .frame_stats
+                    .texture_binds
+                    .saturating_sub(texture_binds_before),
+            );
+        self.scene.frame_stats.effect_scene_replay_draw_calls = self
+            .scene
+            .frame_stats
+            .effect_scene_replay_draw_calls
+            .saturating_add(
+                self.scene
+                    .frame_stats
+                    .draw_calls
+                    .saturating_sub(draw_calls_before),
+            );
         Ok(())
     }
 
@@ -713,24 +1046,11 @@ impl EffectExecutionContext<'_> {
             output_rect.height as f32,
         );
         let visibility_start = host_timing_enabled.then(Instant::now);
-        let unclipped_visual_groups = self
-            .scene
-            .capture_unclipped_presentation_owner
-            .map(|owner| {
-                self.scene
-                    .presentation_visual_group_owners
-                    .iter()
-                    .filter_map(|(group, command_owner)| {
-                        (*command_owner == owner).then_some(*group)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let capture_stats = plan_capture_visibility(
             &self.scene.commands,
             command_indices,
             repair,
-            &unclipped_visual_groups,
+            &self.scene.capture_unclipped_visual_groups,
             &mut self.scene.scene_visibility_plan,
         );
         let visibility_cpu_ns = monotonic_elapsed_ns(visibility_start);
@@ -781,6 +1101,78 @@ impl EffectExecutionContext<'_> {
         host_timing_enabled: bool,
     ) -> RendererResult<ReplayCaptureExecutionDetail> {
         let layout = replay_capture_region_layout(output_rects);
+        self.scene.capture_execution_rects.clear();
+        self.scene
+            .capture_execution_rects
+            .reserve(layout.execution_regions);
+        for rect in layout.execution_region.rects() {
+            self.scene.capture_execution_rects.push(OutputRect::new(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+            ));
+        }
+        self.scene.capture_unclipped_visual_groups.clear();
+        if let Some(owner) = self.scene.capture_unclipped_presentation_owner {
+            self.scene.capture_unclipped_visual_groups.extend(
+                self.scene
+                    .presentation_visual_group_owners
+                    .iter()
+                    .filter_map(|(group, command_owner)| {
+                        (*command_owner == owner).then_some(*group)
+                    }),
+            );
+        }
+        let visibility_start = host_timing_enabled.then(Instant::now);
+        let force_legacy = crate::egl_renderer::geometry::scene_execution_mode()
+            == crate::egl_renderer::geometry::SceneExecutionMode::Legacy;
+        let (
+            plan_fallback,
+            plan_executable,
+            actual_region_tests,
+            drawable_pairs,
+            plan_commands_visited,
+        ) = if force_legacy {
+            (true, false, 0, 0, 0)
+        } else {
+            self.scene.effect_region_plan.build_capture_selected(
+                &self.scene.commands,
+                &self.scene.capture_execution_rects,
+                command_indices,
+                &self.scene.capture_unclipped_visual_groups,
+            );
+            let plan = &self.scene.effect_region_plan;
+            self.scene.frame_stats.replay_capture_region_plan_builds = self
+                .scene
+                .frame_stats
+                .replay_capture_region_plan_builds
+                .saturating_add(1);
+            self.scene.frame_stats.replay_capture_region_input_rects = self
+                .scene
+                .frame_stats
+                .replay_capture_region_input_rects
+                .saturating_add(plan.stats.input_rects);
+            self.scene
+                .frame_stats
+                .replay_capture_region_normalized_rects = self
+                .scene
+                .frame_stats
+                .replay_capture_region_normalized_rects
+                .saturating_add(plan.stats.normalized_rects);
+            (
+                plan.fallback.is_some(),
+                plan.is_executable_for(&self.scene.commands),
+                plan.stats.command_repair_tests,
+                plan.stats
+                    .repairs
+                    .iter()
+                    .map(|repair| repair.commands_drawable)
+                    .sum::<usize>(),
+                plan.stats.outer_commands_visited,
+            )
+        };
+        let visibility_cpu_ns = monotonic_elapsed_ns(visibility_start);
         let mut detail = ReplayCaptureExecutionDetail {
             execution_pixels: 0,
             materialization_rects: layout.materialization_rects,
@@ -788,15 +1180,68 @@ impl EffectExecutionContext<'_> {
             disjoint_overflowed: layout.disjoint_overflowed,
             candidate_commands: command_indices.len(),
             scene_commands_total: self.scene.commands.len(),
+            command_region_pairs: command_indices
+                .len()
+                .saturating_mul(layout.execution_regions),
+            scene_scan_pairs: self
+                .scene
+                .commands
+                .len()
+                .saturating_mul(layout.execution_regions),
+            visibility_cpu_ns,
             ..Default::default()
         };
-        for output_rect in layout
-            .execution_region
-            .rects()
-            .iter()
-            .copied()
-            .map(|rect| OutputRect::new(rect.x, rect.y, rect.width, rect.height))
-        {
+        if !plan_fallback && plan_executable {
+            let commands_considered_before = self.scene.frame_stats.commands_considered;
+            let commands_executed_before = self.scene.frame_stats.commands_executed;
+            let draw_calls_before = self.scene.frame_stats.draw_calls;
+            let draw_submit_start = host_timing_enabled.then(Instant::now);
+            self.draw_capture_region_plan(
+                self.scene.current_framebuffer_origin,
+                target_domain,
+                target_size,
+            )?;
+            detail.planner_commands_visited = actual_region_tests;
+            detail.planner_commands_drawable = drawable_pairs;
+            detail.commands_considered = self
+                .scene
+                .frame_stats
+                .commands_considered
+                .saturating_sub(commands_considered_before);
+            detail.commands_executed = self
+                .scene
+                .frame_stats
+                .commands_executed
+                .saturating_sub(commands_executed_before);
+            detail.draw_calls = self
+                .scene
+                .frame_stats
+                .draw_calls
+                .saturating_sub(draw_calls_before);
+            detail.draw_submit_cpu_ns = monotonic_elapsed_ns(draw_submit_start);
+            self.scene.frame_stats.planner_commands_visited = self
+                .scene
+                .frame_stats
+                .planner_commands_visited
+                .saturating_add(actual_region_tests);
+            self.scene.frame_stats.commands_drawable = self
+                .scene
+                .frame_stats
+                .commands_drawable
+                .saturating_add(drawable_pairs);
+            return Ok(detail);
+        }
+
+        self.scene
+            .frame_stats
+            .replay_capture_region_legacy_fallbacks = self
+            .scene
+            .frame_stats
+            .replay_capture_region_legacy_fallbacks
+            .saturating_add(1);
+        let texture_binds_before = self.scene.frame_stats.texture_binds;
+        for rect_index in 0..self.scene.capture_execution_rects.len() {
+            let output_rect = self.scene.capture_execution_rects[rect_index];
             let region_detail = self.draw_capture_commands(
                 command_indices,
                 output_rect,
@@ -824,8 +1269,52 @@ impl EffectExecutionContext<'_> {
                 .draw_submit_cpu_ns
                 .saturating_add(region_detail.draw_submit_cpu_ns);
         }
-        detail.command_region_pairs = detail.planner_commands_visited;
-        detail.scene_scan_pairs = detail.commands_considered;
+        self.scene
+            .frame_stats
+            .replay_capture_actual_scene_commands_visited = self
+            .scene
+            .frame_stats
+            .replay_capture_actual_scene_commands_visited
+            .saturating_add(plan_commands_visited)
+            .saturating_add(
+                command_indices
+                    .len()
+                    .saturating_mul(layout.execution_regions),
+            )
+            .saturating_add(
+                self.scene
+                    .commands
+                    .len()
+                    .saturating_mul(layout.execution_regions),
+            );
+        self.scene
+            .frame_stats
+            .replay_capture_actual_command_region_tests = self
+            .scene
+            .frame_stats
+            .replay_capture_actual_command_region_tests
+            .saturating_add(actual_region_tests)
+            .saturating_add(detail.planner_commands_visited)
+            .saturating_add(
+                command_indices
+                    .len()
+                    .saturating_mul(layout.execution_regions),
+            );
+        self.scene.frame_stats.replay_capture_actual_texture_binds = self
+            .scene
+            .frame_stats
+            .replay_capture_actual_texture_binds
+            .saturating_add(
+                self.scene
+                    .frame_stats
+                    .texture_binds
+                    .saturating_sub(texture_binds_before),
+            );
+        self.scene.frame_stats.replay_capture_actual_draw_calls = self
+            .scene
+            .frame_stats
+            .replay_capture_actual_draw_calls
+            .saturating_add(detail.draw_calls);
         Ok(detail)
     }
 

@@ -43,7 +43,7 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
     clear_pbuffer(&harness);
     harness
         .renderer
-        .draw_command_batch_with_visibility(true, None, false)
+        .draw_command_batch_with_visibility_and_range(true, None, false, None, false)
         .expect("clipped scene draw succeeds");
     let clipped = read_effect_test_pixels(&harness.gl, 4, 1);
     assert_effect_test_pixel(&clipped, 4, 0, 0, [0, 0, 0, 0]);
@@ -58,7 +58,7 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
         .capture_unclipped_presentation_owner = Some(7);
     harness
         .renderer
-        .draw_command_batch_with_visibility(true, None, false)
+        .draw_command_batch_with_visibility_and_range(true, None, false, None, false)
         .expect("same-owner unclipped capture draw succeeds");
     harness
         .renderer
@@ -76,7 +76,7 @@ fn real_gles_scene_clip_and_same_owner_capture_bypass() {
         .capture_unclipped_presentation_owner = Some(8);
     harness
         .renderer
-        .draw_command_batch_with_visibility(true, None, false)
+        .draw_command_batch_with_visibility_and_range(true, None, false, None, false)
         .expect("other-owner capture draw succeeds");
     harness
         .renderer
@@ -233,6 +233,102 @@ fn real_gles_region_scene_draw_matches_legacy_inside_disjoint_repairs() {
     }
     assert_effect_test_pixel(&candidate, 4, 0, 0, [0, 0, 255, 255]);
     assert_effect_test_pixel(&candidate, 4, 3, 0, [0, 0, 255, 255]);
+
+    unsafe {
+        harness.gl.delete_texture(red_texture);
+        harness.gl.delete_texture(green_texture);
+    }
+}
+
+#[test]
+fn real_gles_effect_scene_replay_is_command_first_without_ordinary_occlusion() {
+    let mut harness = GlesEffectTestHarness::new(4, 1);
+    harness.install_texture_backed_output();
+    let red_pixel = rgba_to_pixel([255, 0, 0, 255]);
+    let green_pixel = rgba_to_pixel([0, 128, 0, 128]);
+    let red_texture = create_effect_test_texture(&harness.gl, 1, 1, &[255, 0, 0, 255]);
+    let green_texture = create_effect_test_texture(&harness.gl, 1, 1, &[0, 128, 0, 128]);
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(red_pixel), red_texture);
+    harness
+        .renderer
+        .resources
+        .test_install_decoration_texture(EglDrawLayer::SolidRgba(green_pixel), green_texture);
+    let scene = &mut harness.renderer.scene_state;
+    scene.vertices.clear();
+    scene.commands.clear();
+    push_draw_command(
+        &mut scene.vertices,
+        &mut scene.commands,
+        EglDrawLayer::SolidRgba(red_pixel),
+        EglRect::new(0.0, 0.0, 4.0, 1.0),
+        4,
+        1,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    push_draw_command(
+        &mut scene.vertices,
+        &mut scene.commands,
+        EglDrawLayer::SolidRgba(green_pixel),
+        EglRect::new(0.0, 0.0, 4.0, 1.0),
+        4,
+        1,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    scene.presentation_opacities = vec![1.0; 2];
+    let repairs = [OutputRect::new(1, 0, 1, 1), OutputRect::new(2, 0, 1, 1)];
+    let target = EffectFramebufferTarget::new(scene.active_output_framebuffer);
+    unsafe {
+        harness.renderer.establish_ordinary_scene_state();
+        harness.gl.clear_color(0.0, 0.0, 1.0, 1.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    harness
+        .renderer
+        .effect_execution_context()
+        .draw_effect_scene_range(&repairs, 0, 2, OutputFramebufferOrigin::BottomLeft, target)
+        .expect("effect scene replay draws command-first");
+
+    let pixels = read_effect_test_pixels(&harness.gl, 4, 1);
+    for x in 1..=2 {
+        assert_effect_test_pixel(&pixels, 4, x, 0, [127, 128, 0, 255]);
+    }
+    assert_effect_test_pixel(&pixels, 4, 0, 0, [0, 0, 255, 255]);
+    assert_effect_test_pixel(&pixels, 4, 3, 0, [0, 0, 255, 255]);
+    assert_eq!(
+        harness
+            .renderer
+            .scene_state
+            .frame_stats
+            .effect_scene_replay_commands_visited,
+        4
+    );
+    assert_eq!(
+        harness
+            .renderer
+            .scene_state
+            .frame_stats
+            .effect_scene_replay_command_region_tests,
+        4
+    );
+    assert_eq!(
+        harness
+            .renderer
+            .scene_state
+            .frame_stats
+            .effect_scene_replay_texture_binds,
+        2
+    );
+    assert_eq!(
+        harness
+            .renderer
+            .scene_state
+            .frame_stats
+            .effect_scene_replay_draw_calls,
+        4
+    );
 
     unsafe {
         harness.gl.delete_texture(red_texture);

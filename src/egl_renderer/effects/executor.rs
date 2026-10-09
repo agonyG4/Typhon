@@ -20,8 +20,8 @@ use oblivion_one::effects::{
 
 use super::super::damage::{OutputDamage, RepaintPlan};
 use super::super::geometry::{
-    EglDrawCommand, EglDrawLayer, EglTexturedVertex, EglVisibilityDecision, SurfaceConsumerPlan,
-    SurfaceSampling, add_surface_consumers_for_capture_indices,
+    EglDrawCommand, EglDrawLayer, EglTexturedVertex, EglVisibilityDecision, OcclusionPolicy,
+    SurfaceConsumerPlan, SurfaceSampling, add_surface_consumers_for_capture_indices,
     add_surface_consumers_for_command_range, plan_capture_visibility,
 };
 use super::super::{
@@ -51,10 +51,11 @@ mod context;
 pub(in crate::egl_renderer) use context::EffectExecutionContext;
 mod selection;
 #[cfg(test)]
+pub(crate) use selection::plan_effect_surface_consumers;
+#[cfg(test)]
 pub(crate) use selection::plan_effect_surface_consumers_with_debug_config;
-pub(crate) use selection::{
-    EffectExecutionSelection, plan_effect_surface_consumers, select_effect_execution,
-};
+pub(crate) use selection::plan_effect_surface_consumers_with_metadata;
+pub(crate) use selection::{EffectExecutionSelection, select_effect_execution};
 mod session;
 #[cfg(test)]
 pub(crate) use session::checkpoint_capture_cache_candidates;
@@ -77,7 +78,9 @@ pub(crate) use validation::EffectExecutionInvariantError;
 use validation::*;
 mod telemetry;
 pub(crate) use telemetry::EffectExecutionStats;
+#[cfg(test)]
 pub(in crate::egl_renderer) use telemetry::composition_range;
+pub(in crate::egl_renderer) use telemetry::composition_range_with_metadata;
 use telemetry::*;
 mod pass_exec;
 use pass_exec::*;

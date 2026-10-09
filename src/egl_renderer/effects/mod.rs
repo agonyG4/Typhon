@@ -19,15 +19,17 @@ pub(crate) use executor::{
 pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;
 #[cfg(test)]
 pub(crate) const COMPOSITE_FRAGMENT_SHADER: &str = executor::COMPOSITE_FRAGMENT_SHADER;
+pub(super) use capture::CaptureLayer;
 pub(super) use executor::EffectExecutionContext;
 pub(crate) use executor::SceneReplayWorkMode;
 #[cfg(test)]
 pub(crate) use executor::checkpoint_causal_stability_plan;
-pub(super) use executor::composition_range;
+pub(super) use executor::composition_range_with_metadata;
 #[cfg(test)]
 pub(crate) use executor::execute_effect_graph_with_debug_config_and_scene_replay_mode;
 #[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
+pub(crate) use executor::plan_effect_surface_consumers_with_metadata;
 #[cfg(test)]
 pub(crate) use executor::replay_capture_region_layout;
 pub(crate) use executor::{EffectExecutionSelection, EffectExecutionStats};
@@ -43,9 +45,7 @@ pub(crate) use executor::{
 pub(crate) use executor::{capture_scene_work_preservation, restore_scene_work_preservation};
 #[cfg(test)]
 pub(crate) use executor::{execute_effect_graph, execute_effect_graph_with_debug_config};
-pub(crate) use executor::{
-    execute_effect_graph_for_lifecycle, plan_effect_surface_consumers, select_effect_execution,
-};
+pub(crate) use executor::{execute_effect_graph_for_lifecycle, select_effect_execution};
 pub(super) use executor::{
     execute_prepared_effect_graph_core, finish_prepared_effect_graph_execution,
     prepare_effect_graph_execution,

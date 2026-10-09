@@ -39,6 +39,12 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) current_size: (u32, u32),
     pub(in crate::egl_renderer) vertices: Vec<EglTexturedVertex>,
     pub(in crate::egl_renderer) commands: Vec<EglDrawCommand>,
+    pub(in crate::egl_renderer) capture_layers: Vec<super::effects::CaptureLayer>,
+    pub(in crate::egl_renderer) capture_visual_groups: Vec<Option<VisualGroupId>>,
+    pub(in crate::egl_renderer) capture_unclipped_visual_groups: Vec<VisualGroupId>,
+    pub(in crate::egl_renderer) capture_execution_rects: Vec<OutputRect>,
+    pub(in crate::egl_renderer) scene_command_topology_generation: u64,
+    pub(in crate::egl_renderer) capture_metadata_generation: u64,
     pub(in crate::egl_renderer) cursor_vertices: Vec<EglTexturedVertex>,
     pub(in crate::egl_renderer) cursor_commands: Vec<EglDrawCommand>,
     pub(in crate::egl_renderer) presentation_opacities: Vec<f32>,
@@ -48,6 +54,7 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) presentation_visual_group_owners: HashMap<VisualGroupId, u32>,
     pub(in crate::egl_renderer) scene_visibility_plan: Vec<EglVisibilityDecision>,
     pub(in crate::egl_renderer) scene_region_plan: geometry::SceneRegionPlan,
+    pub(in crate::egl_renderer) effect_region_plan: geometry::SceneRegionPlan,
     pub(in crate::egl_renderer) scene_cache_key: Option<EglSceneCacheKey>,
     pub(in crate::egl_renderer) presented_scene_key: Option<EglSceneCacheKey>,
     pub(in crate::egl_renderer) current_checkpoint_scene_causal_snapshot:
@@ -521,6 +528,38 @@ impl SceneRenderState {
                 framebuffer_origin,
             ),
         );
+        self.scene_command_topology_generation =
+            self.scene_command_topology_generation.wrapping_add(1);
+        self.refresh_capture_command_metadata();
+    }
+
+    pub(in crate::egl_renderer) fn ensure_capture_command_metadata(&mut self) {
+        // Generation zero is reserved for renderer/test setup paths that
+        // populate the command vector directly instead of rebuilding it via
+        // `rebuild_scene_commands`. Refresh those small projections on entry
+        // so they cannot observe stale same-length metadata.
+        if self.scene_command_topology_generation == 0
+            || self.capture_metadata_generation != self.scene_command_topology_generation
+            || self.capture_layers.len() != self.commands.len()
+            || self.capture_visual_groups.len() != self.commands.len()
+        {
+            self.refresh_capture_command_metadata();
+        }
+    }
+
+    fn refresh_capture_command_metadata(&mut self) {
+        self.capture_layers.clear();
+        self.capture_visual_groups.clear();
+        self.capture_layers.reserve(self.commands.len());
+        self.capture_visual_groups.reserve(self.commands.len());
+        for command in &self.commands {
+            self.capture_layers.push(match command.layer {
+                EglDrawLayer::Surface(id) => super::effects::CaptureLayer::Surface(id),
+                _ => super::effects::CaptureLayer::Other,
+            });
+            self.capture_visual_groups.push(command.visual_group);
+        }
+        self.capture_metadata_generation = self.scene_command_topology_generation;
     }
 
     #[expect(

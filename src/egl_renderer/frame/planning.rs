@@ -642,6 +642,7 @@ impl FramePipeline<'_> {
         request: &EglSceneDrawRequest<'_>,
         planned: &mut PlannedFrame,
     ) -> SurfaceConsumerPlan {
+        self.scene.ensure_capture_command_metadata();
         let (width, height) = self.scene.current_size;
         let repair_rects = super::super::repaint_plan_output_rects(&planned.plan, width, height);
         let execution_mode = scene_execution_mode();
@@ -687,14 +688,24 @@ impl FramePipeline<'_> {
         let effect_selection = match (&planned.execution_plan, &planned.effect_execution_demand) {
             (FrameExecutionPlan::EffectGraph(graph), Some(demand)) => {
                 let selection = super::super::effects::select_effect_execution(graph, demand);
-                consumer_plan.extend(&super::super::effects::plan_effect_surface_consumers(
-                    graph,
-                    demand,
-                    &selection,
-                    &self.scene.commands,
-                    &repair_rects,
-                    (width, height),
-                ));
+                debug_assert_eq!(
+                    self.scene.capture_metadata_generation,
+                    self.scene.scene_command_topology_generation,
+                    "capture metadata must track the authoritative scene command generation"
+                );
+                consumer_plan.extend(
+                    &super::super::effects::plan_effect_surface_consumers_with_metadata(
+                        graph,
+                        demand,
+                        &selection,
+                        &self.scene.commands,
+                        &self.scene.capture_layers,
+                        &self.scene.capture_visual_groups,
+                        &repair_rects,
+                        (width, height),
+                        *super::super::effects::effect_debug_config(),
+                    ),
+                );
                 Some(selection)
             }
             _ => None,
