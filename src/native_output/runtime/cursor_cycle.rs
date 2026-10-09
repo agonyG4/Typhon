@@ -62,7 +62,11 @@ pub(crate) fn observe_atomic_cursor_output_liveness_with_policy(
                 opportunity,
             );
         } else {
-            arbitration.request_hardware_unplanned(cursor.desired_epoch(), now_ns);
+            arbitration.request_hardware_for_planning_retry(
+                cursor.desired_epoch(),
+                now_ns,
+                frame_scheduler.next_refresh_deadline_ns(now_ns),
+            );
         }
     } else {
         arbitration.request_hardware(

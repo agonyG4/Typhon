@@ -849,7 +849,15 @@ impl NativeRuntime {
             self.last_rendered_scene_generation,
             self.server.scene_render_generation(),
         );
-        if !presentation_work || self.input_epoch.backlog_pending() || visual_scene_debt {
+        let cursor_temporal_work = self
+            .cursor_output_arbitration
+            .has_future_wake_requirement(monotonic_now_ns()?);
+        if super::wake_plan::cycle_tail_requires_runtime_wake_plan(
+            presentation_work,
+            self.input_epoch.backlog_pending(),
+            visual_scene_debt,
+            cursor_temporal_work,
+        ) {
             self.arm_runtime_deadline()?;
         }
         if !cycle.shutdown_requested

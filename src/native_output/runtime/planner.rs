@@ -463,14 +463,21 @@ pub(crate) fn plan_native_presentation_path(
 #[cfg(test)]
 mod tests {
     use super::super::frame::{
-        cursor_output_disposition_at_deadline, plane_delta_allowed_at_deadline,
+        cursor_output_disposition_at_deadline, cursor_output_disposition_for_primary_state,
+        plane_delta_allowed_at_deadline,
+    };
+    use super::super::wake_plan::{
+        NativeDeadline, NativeDeadlineOwner, NativeWakePlanInputs, build_native_wake_plan,
+        cycle_tail_requires_runtime_wake_plan,
     };
     use super::super::{
-        NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorSchedulingPolicy,
+        NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorPrimaryState,
+        NativeCursorSchedulingPolicy,
     };
     use crate::native_output::presentation::kms_timing::{
         KmsModeTiming, KmsPresentationTimingModel,
     };
+    use crate::native_output::runtime::update_cursor_output_arbitration;
     use crate::native_output::{NativeScanoutKind, runtime::NativeCursorPreference};
     use drm_sys::drm_mode_modeinfo;
     use oblivion_one::native::kms::{
@@ -480,6 +487,7 @@ mod tests {
         MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget,
         PresentationTargetReason,
     };
+    use oblivion_one::native::scheduler::NativeFrameScheduler;
 
     use super::*;
 
@@ -898,6 +906,291 @@ mod tests {
     }
 
     #[test]
+    fn auto_idle_cursor_with_valid_opportunity_arms_response_and_settles_epoch() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let now_ns = 1_000_000_000;
+        let now = MonotonicTimestampNs::new(now_ns);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let opportunity = plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000)
+            .expect("valid KMS-timed opportunity");
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            7,
+            6,
+            now_ns,
+            &scheduler,
+            false,
+            true,
+            Some(opportunity),
+        );
+
+        assert!(arbitration.pending());
+        assert!(arbitration.hardware_cursor_pending());
+        assert_eq!(arbitration.desired_epoch(), 7);
+        assert_eq!(arbitration.service_opportunity(), Some(opportunity));
+        assert_eq!(arbitration.pending_since_ns(), Some(now_ns));
+        let wake_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns,
+            cursor_response_deadline_ns: arbitration.wake_deadline_ns(now_ns),
+            cursor_planning_deadline_ns: arbitration.planning_retry_wake_deadline_ns(now_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            wake_plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorResponse,
+                at_ns: opportunity.service_deadline_ns,
+            })
+        );
+        assert!(cycle_tail_requires_runtime_wake_plan(
+            true,
+            false,
+            false,
+            arbitration.has_future_wake_requirement(now_ns),
+        ));
+
+        let disposition = cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            opportunity.service_deadline_ns,
+            NativeCursorPrimaryState {
+                independent_kms_admission: true,
+                ..NativeCursorPrimaryState::default()
+            },
+            true,
+        );
+        assert_eq!(disposition, NativeCursorOutputDisposition::SubmitPlaneDelta);
+        arbitration.note_plane_delta_submission();
+        arbitration.consume_submitted_epoch(
+            7,
+            opportunity.service_deadline_ns,
+            scheduler.next_refresh_deadline_ns(opportunity.service_deadline_ns),
+        );
+
+        assert!(!arbitration.pending());
+        assert_eq!(arbitration.plane_delta_submissions(), 1);
+    }
+
+    #[test]
+    fn auto_idle_cursor_without_initial_opportunity_replans_and_settles_epoch() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let event_ns = 1_000_000_000;
+        let event_time = MonotonicTimestampNs::new(event_ns);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(event_time);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            8,
+            7,
+            event_ns,
+            &scheduler,
+            false,
+            true,
+            None,
+        );
+
+        assert!(arbitration.pending());
+        assert_eq!(arbitration.desired_epoch(), 8);
+        assert_eq!(arbitration.pending_since_ns(), Some(event_ns));
+        assert_eq!(arbitration.service_opportunity(), None);
+        let planning_wake_ns = scheduler.next_refresh_deadline_ns(event_ns);
+        let planning_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: event_ns,
+            cursor_response_deadline_ns: arbitration.wake_deadline_ns(event_ns),
+            cursor_planning_deadline_ns: arbitration.planning_retry_wake_deadline_ns(event_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            planning_plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorPlanningRetry,
+                at_ns: planning_wake_ns,
+            })
+        );
+        assert_eq!(arbitration.retry_not_before_ns(), None);
+        assert_eq!(
+            cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                planning_wake_ns,
+                NativeCursorPrimaryState {
+                    independent_kms_admission: true,
+                    ..NativeCursorPrimaryState::default()
+                },
+                true,
+            ),
+            NativeCursorOutputDisposition::Noop,
+            "the planning timer must not authorize an untimed plane delta"
+        );
+
+        // The timer-only work-domain test verifies this wake enters cursor
+        // presentation planning without scene, client, or KMS completion work.
+        let replanning_time = MonotonicTimestampNs::new(planning_wake_ns);
+        let opportunity =
+            plan_cursor_service_opportunity(&planner, &timing, replanning_time, None, 500_000)
+                .expect("replanning obtains a current KMS opportunity");
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            8,
+            7,
+            planning_wake_ns,
+            &scheduler,
+            false,
+            true,
+            Some(opportunity),
+        );
+
+        assert_eq!(arbitration.pending_since_ns(), Some(event_ns));
+        assert_eq!(arbitration.desired_epoch(), 8);
+        assert_eq!(arbitration.planning_retry_ns(), None);
+        assert_eq!(arbitration.service_opportunity(), Some(opportunity));
+        let response_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: planning_wake_ns,
+            cursor_response_deadline_ns: arbitration.wake_deadline_ns(planning_wake_ns),
+            cursor_planning_deadline_ns: arbitration
+                .planning_retry_wake_deadline_ns(planning_wake_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            response_plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorResponse,
+                at_ns: opportunity.service_deadline_ns,
+            })
+        );
+
+        let disposition = cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            opportunity.service_deadline_ns,
+            NativeCursorPrimaryState {
+                independent_kms_admission: true,
+                ..NativeCursorPrimaryState::default()
+            },
+            true,
+        );
+        assert_eq!(disposition, NativeCursorOutputDisposition::SubmitPlaneDelta);
+        arbitration.note_plane_delta_submission();
+        arbitration.consume_submitted_epoch(
+            8,
+            opportunity.service_deadline_ns,
+            scheduler.next_refresh_deadline_ns(opportunity.service_deadline_ns),
+        );
+        assert!(!arbitration.pending());
+    }
+
+    #[test]
+    fn final_auto_cursor_position_after_1000_hz_burst_settles_without_more_input() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        const INPUT_INTERVAL_NS: u64 = 1_000_000;
+        const INPUT_COUNT: u64 = 100;
+        let burst_start_ns = 2_000_000_000;
+        let mut presentation_planner =
+            PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        presentation_planner.note_presented(MonotonicTimestampNs::new(burst_start_ns));
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        for epoch in 1..=INPUT_COUNT {
+            let event_ns = burst_start_ns + epoch * INPUT_INTERVAL_NS;
+            update_cursor_output_arbitration(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                epoch,
+                0,
+                event_ns,
+                &scheduler,
+                false,
+                true,
+                None,
+            );
+            assert_eq!(arbitration.desired_epoch(), epoch);
+            assert!(arbitration.pending());
+        }
+
+        let final_epoch = INPUT_COUNT;
+        let final_event_ns = burst_start_ns + INPUT_COUNT * INPUT_INTERVAL_NS;
+        assert_eq!(
+            arbitration.pending_since_ns(),
+            Some(burst_start_ns + INPUT_INTERVAL_NS)
+        );
+        assert!(arbitration.hardware_cursor_pending());
+        let planning_wake_ns = arbitration
+            .planning_retry_wake_deadline_ns(final_event_ns)
+            .expect("the final input owns a future planning wake");
+        assert!(planning_wake_ns > final_event_ns);
+
+        // No event calls occur after the final movement. The timer drives the
+        // opportunity replan, then its KMS service deadline drives submission.
+        let opportunity = plan_cursor_service_opportunity(
+            &presentation_planner,
+            &timing,
+            MonotonicTimestampNs::new(planning_wake_ns),
+            None,
+            500_000,
+        )
+        .expect("final pointer movement receives a physical service opportunity");
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            final_epoch,
+            0,
+            planning_wake_ns,
+            &scheduler,
+            false,
+            true,
+            Some(opportunity),
+        );
+        assert_eq!(arbitration.desired_epoch(), final_epoch);
+        assert_eq!(
+            arbitration.pending_since_ns(),
+            Some(burst_start_ns + INPUT_INTERVAL_NS)
+        );
+
+        let disposition = cursor_output_disposition_for_primary_state(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            opportunity.service_deadline_ns,
+            NativeCursorPrimaryState {
+                independent_kms_admission: true,
+                ..NativeCursorPrimaryState::default()
+            },
+            true,
+        );
+        assert_eq!(disposition, NativeCursorOutputDisposition::SubmitPlaneDelta);
+        arbitration.note_plane_delta_submission();
+        arbitration.consume_submitted_epoch(
+            final_epoch,
+            opportunity.service_deadline_ns,
+            scheduler.next_refresh_deadline_ns(opportunity.service_deadline_ns),
+        );
+        assert!(!arbitration.pending());
+        assert_eq!(arbitration.plane_delta_submissions(), 1);
+    }
+
+    #[test]
     fn newly_reserved_primary_invalidates_pending_cursor_target_without_sliding_age() {
         const REFRESH_NS: u64 = 10_000_000;
         let now = MonotonicTimestampNs::new(1_000_000_000);
@@ -940,6 +1233,41 @@ mod tests {
         assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
         assert_eq!(arbitration.deadline_ns(), Some(initial.service_deadline_ns));
         assert_eq!(arbitration.service_opportunity(), Some(after_binding));
+    }
+
+    #[test]
+    fn output_clock_generation_change_replaces_cursor_service_opportunity() {
+        const REFRESH_NS: u64 = 10_000_000;
+        let now = MonotonicTimestampNs::new(1_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let initial = plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000)
+            .expect("initial cursor service opportunity");
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware_for_opportunity(1, now.get(), initial);
+
+        let mut new_generation_target = initial.target;
+        new_generation_target.clock_generation =
+            new_generation_target.clock_generation.saturating_add(1);
+        new_generation_target.physical_claim.clock_generation =
+            new_generation_target.clock_generation;
+        let next_generation = CursorServiceOpportunity {
+            target: new_generation_target,
+            ..initial
+        };
+        arbitration.request_hardware_for_opportunity(
+            2,
+            now.get().saturating_add(100_000),
+            next_generation,
+        );
+
+        assert_eq!(arbitration.service_opportunity(), Some(next_generation));
+        assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
+        assert_eq!(arbitration.deadline_ns(), Some(initial.service_deadline_ns));
     }
 
     #[test]

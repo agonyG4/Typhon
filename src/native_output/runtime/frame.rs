@@ -963,6 +963,7 @@ pub(crate) struct NativeCursorPrimaryState {
 pub(crate) struct NativeCursorOutputArbitration {
     pending_since_ns: Option<u64>,
     deadline_ns: Option<u64>,
+    planning_retry_ns: Option<u64>,
     retry_not_before_ns: Option<u64>,
     service_opportunity: Option<CursorServiceOpportunity>,
     desired_epoch: u64,
@@ -993,8 +994,15 @@ impl NativeCursorOutputArbitration {
         self.request_with_source(epoch, now_ns, Some(deadline_ns), None, true);
     }
 
-    pub(crate) fn request_hardware_unplanned(&mut self, epoch: u64, now_ns: u64) {
+    pub(crate) fn request_hardware_for_planning_retry(
+        &mut self,
+        epoch: u64,
+        now_ns: u64,
+        retry_at_ns: u64,
+    ) {
         self.request_with_source(epoch, now_ns, None, None, true);
+        self.service_opportunity = None;
+        self.planning_retry_ns = Some(retry_at_ns.max(now_ns.saturating_add(1)));
     }
 
     pub(crate) fn request_hardware_for_opportunity(
@@ -1025,6 +1033,7 @@ impl NativeCursorOutputArbitration {
             self.deadline_ns = opportunity
                 .map(|opportunity| opportunity.service_deadline_ns)
                 .or(deadline_ns);
+            self.planning_retry_ns = None;
             self.retry_not_before_ns = None;
             self.service_opportunity = opportunity;
             self.primary_response_window_open = true;
@@ -1034,11 +1043,15 @@ impl NativeCursorOutputArbitration {
                 self.changes_coalesced = self.changes_coalesced.saturating_add(1);
             }
             if let Some(opportunity) = opportunity {
+                self.planning_retry_ns = None;
                 if self.deadline_ns.is_none() {
                     self.deadline_ns = Some(opportunity.service_deadline_ns);
                 }
                 let replace_opportunity = self.service_opportunity.is_none_or(|current| {
                     let current_claim = current.target.physical_claim();
+                    let new_claim = opportunity.target.physical_claim();
+                    let output_generation_changed =
+                        current_claim.clock_generation != new_claim.clock_generation;
                     let new_reservation_invalidates_current =
                         opportunity.ordering_after_primary.is_some_and(|primary| {
                             let primary_claim = primary.physical_claim();
@@ -1048,8 +1061,10 @@ impl NativeCursorOutputArbitration {
                     let current_service_window_matured = current.service_deadline_ns <= now_ns
                         || current.target.presentation_time.get() <= now_ns
                         || current.submit_window.commit_complete_deadline_ns() <= now_ns;
-                    current.target.identity() != opportunity.target.identity()
-                        && (new_reservation_invalidates_current || current_service_window_matured)
+                    output_generation_changed
+                        || (current.target.identity() != opportunity.target.identity()
+                            && (new_reservation_invalidates_current
+                                || current_service_window_matured))
                 });
                 if replace_opportunity {
                     // A later physical target may become necessary when a
@@ -1082,6 +1097,9 @@ impl NativeCursorOutputArbitration {
     /// exact epoch settlement, but its old timestamp must not poll the owner
     /// that now controls progress.
     pub(crate) fn wake_deadline_ns(&self, now_ns: u64) -> Option<u64> {
+        if self.planning_retry_ns.is_some() {
+            return None;
+        }
         let deadline_ns = self
             .deadline_ns
             .into_iter()
@@ -1092,6 +1110,16 @@ impl NativeCursorOutputArbitration {
             .chain(self.retry_not_before_ns)
             .max()?;
         (deadline_ns > now_ns).then_some(deadline_ns)
+    }
+
+    pub(crate) fn planning_retry_wake_deadline_ns(&self, now_ns: u64) -> Option<u64> {
+        self.planning_retry_ns
+            .filter(|deadline_ns| *deadline_ns > now_ns)
+    }
+
+    pub(crate) fn has_future_wake_requirement(&self, now_ns: u64) -> bool {
+        self.wake_deadline_ns(now_ns).is_some()
+            || self.planning_retry_wake_deadline_ns(now_ns).is_some()
     }
 
     pub(crate) const fn desired_epoch(&self) -> u64 {
@@ -1106,6 +1134,10 @@ impl NativeCursorOutputArbitration {
         self.retry_not_before_ns
     }
 
+    pub(crate) const fn planning_retry_ns(&self) -> Option<u64> {
+        self.planning_retry_ns
+    }
+
     pub(crate) fn pending_age_ns(&self, now_ns: u64) -> Option<u64> {
         self.pending_since_ns
             .map(|pending_since_ns| now_ns.saturating_sub(pending_since_ns))
@@ -1115,7 +1147,14 @@ impl NativeCursorOutputArbitration {
         self.pending_since_ns.is_some()
     }
 
+    pub(crate) const fn hardware_cursor_pending(&self) -> bool {
+        self.hardware_cursor_pending
+    }
+
     pub(crate) fn due(&self, now_ns: u64) -> bool {
+        if let Some(planning_retry_ns) = self.planning_retry_ns {
+            return now_ns >= planning_retry_ns;
+        }
         self.deadline_ns.is_some_and(|deadline| now_ns >= deadline)
             && self
                 .service_opportunity
@@ -1274,9 +1313,9 @@ impl NativeCursorOutputArbitration {
         // A newer epoch arrived while the transaction was owned. Preserve
         // its original freshness debt; the next runtime planning pass fills
         // in a new physical KMS target without moving this deadline.
-        let _ = (now_ns, next_deadline_ns);
         self.service_opportunity = None;
         self.retry_not_before_ns = None;
+        self.planning_retry_ns = Some(next_deadline_ns.max(now_ns.saturating_add(1)));
     }
 
     pub(crate) fn set_retry_not_before(&mut self, retry_not_before_ns: u64) {
@@ -1288,6 +1327,7 @@ impl NativeCursorOutputArbitration {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_since_ns = None;
         self.deadline_ns = None;
+        self.planning_retry_ns = None;
         self.retry_not_before_ns = None;
         self.service_opportunity = None;
         self.desired_epoch = 0;
@@ -1312,24 +1352,42 @@ pub(crate) fn update_cursor_output_arbitration(
     let hardware_cursor_changed =
         hardware_cursor_work_pending && cursor_epoch != last_submitted_cursor_epoch;
     let output_cursor_work_changed = hardware_cursor_changed || software_overlay_pending;
-    if output_cursor_work_changed {
-        let deadline_ns = service_opportunity.map_or_else(
-            || match policy {
-                NativeCursorSchedulingPolicy::Auto => None,
-                NativeCursorSchedulingPolicy::Piggyback
-                | NativeCursorSchedulingPolicy::Software => {
-                    Some(frame_scheduler.next_refresh_deadline_ns(now_ns))
-                }
-            },
-            |opportunity| Some(opportunity.service_deadline_ns),
-        );
-        arbitration.request_with_source(
-            cursor_epoch,
-            now_ns,
-            deadline_ns,
-            service_opportunity,
-            hardware_cursor_changed,
-        );
+    let planning_retry_due = policy == NativeCursorSchedulingPolicy::Auto
+        && arbitration
+            .planning_retry_ns()
+            .is_some_and(|deadline_ns| now_ns >= deadline_ns);
+    if output_cursor_work_changed || planning_retry_due {
+        if policy == NativeCursorSchedulingPolicy::Auto
+            && (hardware_cursor_changed || planning_retry_due)
+        {
+            if let Some(opportunity) = service_opportunity {
+                arbitration.request_hardware_for_opportunity(cursor_epoch, now_ns, opportunity);
+            } else {
+                arbitration.request_hardware_for_planning_retry(
+                    cursor_epoch,
+                    now_ns,
+                    frame_scheduler.next_refresh_deadline_ns(now_ns),
+                );
+            }
+        } else {
+            let deadline_ns = service_opportunity.map_or_else(
+                || match policy {
+                    NativeCursorSchedulingPolicy::Auto => None,
+                    NativeCursorSchedulingPolicy::Piggyback
+                    | NativeCursorSchedulingPolicy::Software => {
+                        Some(frame_scheduler.next_refresh_deadline_ns(now_ns))
+                    }
+                },
+                |opportunity| Some(opportunity.service_deadline_ns),
+            );
+            arbitration.request_with_source(
+                cursor_epoch,
+                now_ns,
+                deadline_ns,
+                service_opportunity,
+                hardware_cursor_changed,
+            );
+        }
     }
     let deadline_due = arbitration.due(now_ns);
     (
@@ -1415,6 +1473,13 @@ pub(crate) fn cursor_output_disposition_for_primary_state(
         NativeCursorOutputDisposition::PiggybackPrimary
     } else if primary.ready_primary_carrier_attachable && !primary.primary_kernel_submitted {
         NativeCursorOutputDisposition::PiggybackPrimary
+    } else if policy == NativeCursorSchedulingPolicy::Auto
+        && arbitration.planning_retry_ns.is_some()
+    {
+        // A planning timer authorizes opportunity recomputation only. It is
+        // never authority to submit a cursor plane transaction without a
+        // real KMS service opportunity.
+        NativeCursorOutputDisposition::Noop
     } else if !arbitration.due(now_ns) {
         if arbitration.primary_response_window_open {
             NativeCursorOutputDisposition::DeferForPrimary

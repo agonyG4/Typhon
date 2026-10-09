@@ -972,6 +972,24 @@ mod tests {
     }
 
     #[test]
+    fn timer_only_cursor_planning_wake_enters_presentation_without_scene_work() {
+        let wakeup = wakeup(TIMER);
+        let state = NativeRuntimeState {
+            cursor_only_due: true,
+            ..state()
+        };
+        let domains = NativeWorkDomains::classify(&wakeup, &state);
+        let operation_plan = domains.operation_plan();
+
+        assert!(domains.cursor);
+        assert!(domains.presentation);
+        assert!(!domains.scene);
+        assert!(!domains.wayland_dispatch);
+        assert!(operation_plan.presentation_admitted(false, false, false));
+        assert!(!operation_plan.service_acquire_and_prepare);
+    }
+
+    #[test]
     fn input_with_scene_dirty_or_interaction_is_primary_scene() {
         let decision = NativeWorkDomains::from_wakeup(
             &wakeup(INPUT),

@@ -31,6 +31,7 @@ pub(crate) enum NativeDeadlineOwner {
     ExplicitSyncFallback,
     XwaylandTimeout,
     CursorResponse,
+    CursorPlanningRetry,
     ControlTimeout,
     SystemActionTransport,
     SurfacePacing,
@@ -39,7 +40,7 @@ pub(crate) enum NativeDeadlineOwner {
     KeyboardRepeat,
 }
 
-const DEADLINE_OWNER_COUNT: usize = 12;
+const DEADLINE_OWNER_COUNT: usize = 13;
 
 const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
     match owner {
@@ -55,6 +56,7 @@ const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
         NativeDeadlineOwner::OutputConfiguration => 9,
         NativeDeadlineOwner::KeyboardRepeat => 10,
         NativeDeadlineOwner::SystemActionTransport => 11,
+        NativeDeadlineOwner::CursorPlanningRetry => 12,
     }
 }
 
@@ -102,6 +104,7 @@ pub(crate) struct NativeWakePlanInputs {
     pub(crate) explicit_sync_fallback_deadline_ns: Option<u64>,
     pub(crate) xwayland_timeout_deadline_ns: Option<u64>,
     pub(crate) cursor_response_deadline_ns: Option<u64>,
+    pub(crate) cursor_planning_deadline_ns: Option<u64>,
     pub(crate) control_timeout_deadline_ns: Option<u64>,
     pub(crate) system_action_transport_deadline_ns: Option<u64>,
     pub(crate) surface_pacing_deadline_ns: Option<u64>,
@@ -138,6 +141,7 @@ pub(crate) struct NativeWakeAuthorityMetrics {
     pub(crate) deadline_owner_explicit_sync: u64,
     pub(crate) deadline_owner_xwayland: u64,
     pub(crate) deadline_owner_cursor: u64,
+    pub(crate) deadline_owner_cursor_planning_retry: u64,
     pub(crate) deadline_owner_control: u64,
     pub(crate) deadline_owner_surface_pacing: u64,
     pub(crate) deadline_owner_dmabuf_retry: u64,
@@ -234,6 +238,10 @@ impl NativeWakeAuthorityMetrics {
                     NativeDeadlineOwner::CursorResponse => {
                         self.deadline_owner_cursor = self.deadline_owner_cursor.saturating_add(1)
                     }
+                    NativeDeadlineOwner::CursorPlanningRetry => {
+                        self.deadline_owner_cursor_planning_retry =
+                            self.deadline_owner_cursor_planning_retry.saturating_add(1)
+                    }
                     NativeDeadlineOwner::ControlTimeout => {
                         self.deadline_owner_control = self.deadline_owner_control.saturating_add(1)
                     }
@@ -279,7 +287,7 @@ impl NativeWakeAuthorityMetrics {
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
         format!(
-            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} stale_output_configuration={} stale_keyboard_repeat={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} past_output_configuration={} past_keyboard_repeat={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={} deadline_owner_output_configuration={} deadline_owner_keyboard_repeat={}",
+            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_cursor_planning_retry={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} stale_output_configuration={} stale_keyboard_repeat={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_cursor_planning_retry={} past_control={} past_surface_pacing={} past_dmabuf_retry={} past_output_configuration={} past_keyboard_repeat={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_cursor_planning_retry={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={} deadline_owner_output_configuration={} deadline_owner_keyboard_repeat={}",
             self.runtime_timer_arms,
             self.runtime_timer_disarms,
             event_loop.continuation_requests(),
@@ -308,6 +316,8 @@ impl NativeWakeAuthorityMetrics {
             self.stale_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::CursorResponse)],
             self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::CursorPlanningRetry)],
+            self.stale_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::ControlTimeout)],
             self.stale_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::SurfacePacing)],
@@ -330,6 +340,8 @@ impl NativeWakeAuthorityMetrics {
             self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::CursorResponse)],
             self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::CursorPlanningRetry)],
+            self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::ControlTimeout)],
             self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::SurfacePacing)],
@@ -345,6 +357,7 @@ impl NativeWakeAuthorityMetrics {
             self.deadline_owner_explicit_sync,
             self.deadline_owner_xwayland,
             self.deadline_owner_cursor,
+            self.deadline_owner_cursor_planning_retry,
             self.deadline_owner_control,
             self.deadline_owner_surface_pacing,
             self.deadline_owner_dmabuf_retry,
@@ -431,6 +444,15 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
     deadline = earliest_deadline(
         deadline,
         inputs
+            .cursor_planning_deadline_ns
+            .map(|at_ns| NativeDeadline {
+                owner: NativeDeadlineOwner::CursorPlanningRetry,
+                at_ns,
+            }),
+    );
+    deadline = earliest_deadline(
+        deadline,
+        inputs
             .control_timeout_deadline_ns
             .map(|at_ns| NativeDeadline {
                 owner: NativeDeadlineOwner::ControlTimeout,
@@ -477,6 +499,15 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
         continuation,
         deadline,
     }
+}
+
+pub(crate) const fn cycle_tail_requires_runtime_wake_plan(
+    presentation_work: bool,
+    input_backlog: bool,
+    visual_scene_debt: bool,
+    cursor_temporal_work: bool,
+) -> bool {
+    !presentation_work || input_backlog || visual_scene_debt || cursor_temporal_work
 }
 
 pub(crate) fn native_deadline_from_scheduler(deadline: SchedulerWakeDeadline) -> NativeDeadline {
@@ -629,6 +660,7 @@ mod tests {
         build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
             cursor_response_deadline_ns: arbitration.wake_deadline_ns(now_ns),
+            cursor_planning_deadline_ns: arbitration.planning_retry_wake_deadline_ns(now_ns),
             ..NativeWakePlanInputs::default()
         })
     }
@@ -756,7 +788,7 @@ mod tests {
         metrics.observe_plan(plan, 80, None, None);
         let index = deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat);
 
-        assert_eq!(DEADLINE_OWNER_COUNT, 12);
+        assert_eq!(DEADLINE_OWNER_COUNT, 13);
         assert_eq!(metrics.deadline_owner_keyboard_repeat, 1);
         assert_eq!(metrics.past_deadline_arms_by_owner[index], 1);
         assert_eq!(metrics.stale_deadline_arms_by_owner[index], 0);
@@ -1051,6 +1083,97 @@ mod tests {
                 at_ns: 200,
             })
         );
+    }
+
+    #[test]
+    fn auto_cursor_without_an_opportunity_owns_a_future_planning_wake() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let retry_deadline_ns = scheduler.next_refresh_deadline_ns(1_000);
+
+        crate::native_output::runtime::update_cursor_output_arbitration(
+            &mut arbitration,
+            crate::native_output::runtime::NativeCursorSchedulingPolicy::Auto,
+            7,
+            6,
+            1_000,
+            &scheduler,
+            false,
+            true,
+            None,
+        );
+
+        let plan = cursor_wake_plan(&arbitration, 1_000);
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorPlanningRetry,
+                at_ns: retry_deadline_ns,
+            })
+        );
+    }
+
+    #[test]
+    fn repeated_cursor_planning_failures_rearm_only_future_timers() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        let mut now_ns = 1_000;
+
+        for epoch in 1..=32 {
+            crate::native_output::runtime::update_cursor_output_arbitration(
+                &mut arbitration,
+                crate::native_output::runtime::NativeCursorSchedulingPolicy::Auto,
+                epoch,
+                0,
+                now_ns,
+                &scheduler,
+                false,
+                true,
+                None,
+            );
+            let plan = cursor_wake_plan(&arbitration, now_ns);
+            let deadline = plan.deadline.expect("planning retry remains owned");
+
+            assert_eq!(deadline.owner, NativeDeadlineOwner::CursorPlanningRetry);
+            assert!(deadline.at_ns > now_ns);
+            assert!(deadline.at_ns - now_ns <= 10_000_000);
+            assert!(plan.continuation.is_empty());
+            metrics.observe_plan(plan, now_ns, None, None);
+
+            now_ns = deadline.at_ns;
+            assert!(arbitration.due(now_ns));
+            crate::native_output::runtime::update_cursor_output_arbitration(
+                &mut arbitration,
+                crate::native_output::runtime::NativeCursorSchedulingPolicy::Auto,
+                epoch,
+                0,
+                now_ns,
+                &scheduler,
+                false,
+                true,
+                None,
+            );
+            assert!(!arbitration.due(now_ns));
+            assert!(
+                arbitration
+                    .planning_retry_wake_deadline_ns(now_ns)
+                    .is_some_and(|retry_at_ns| retry_at_ns > now_ns)
+            );
+        }
+
+        assert_eq!(metrics.past_deadline_arms, 0);
+        assert_eq!(metrics.stale_deadline_rearms, 0);
+    }
+
+    #[test]
+    fn presentation_work_keeps_a_future_cursor_owner_in_the_cycle_tail_plan() {
+        assert!(cycle_tail_requires_runtime_wake_plan(
+            true, false, false, true
+        ));
+        assert!(!cycle_tail_requires_runtime_wake_plan(
+            true, false, false, false
+        ));
     }
 
     #[test]
