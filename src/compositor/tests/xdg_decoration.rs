@@ -8,6 +8,7 @@ struct DecorationClient {
     connection: Connection,
     queue: EventQueue<RegistryTestState>,
     manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    advertised_manager_version: u32,
     surface: client_wl_surface::WlSurface,
     xdg_surface: client_xdg_surface::XdgSurface,
     toplevel: client_xdg_toplevel::XdgToplevel,
@@ -21,16 +22,34 @@ impl DecorationClient {
         commands: &Sender<ServerCommand>,
         initial_mode: client_zxdg_toplevel_decoration_v1::Mode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut client = Self::connect_before_initial_map(socket_path, commands, 1, initial_mode)?;
+        client.finish_initial_map(commands)?;
+        Ok(client)
+    }
+
+    fn connect_before_initial_map(
+        socket_path: &PathBuf,
+        commands: &Sender<ServerCommand>,
+        manager_version: u32,
+        initial_mode: client_zxdg_toplevel_decoration_v1::Mode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let connection = Connection::from_socket(UnixStream::connect(socket_path)?)?;
         let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
         let qh = queue.handle();
         let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ())?;
-        let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
-            globals.bind(&qh, 1..=1, ())?;
         let (surface, xdg_surface, toplevel) =
             create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
+        let advertised_manager_version = globals.contents().with_list(|globals| {
+            globals
+                .iter()
+                .find(|global| global.interface == "zxdg_decoration_manager_v1")
+                .map(|global| global.version)
+                .expect("zxdg_decoration_manager_v1 global")
+        });
+        let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+            globals.bind(&qh, 1..=manager_version, ())?;
         let decoration = manager.get_toplevel_decoration(&toplevel, &qh, ());
         decoration.set_mode(initial_mode);
         surface.commit();
@@ -43,26 +62,35 @@ impl DecorationClient {
         };
         wait_for_server_commands(commands);
         queue.roundtrip(&mut state)?;
-        let initial_serial = *state
-            .surface_configure_serials
-            .last()
-            .ok_or("initial xdg configure was not observed")?;
-        xdg_surface.ack_configure(initial_serial);
-        commit_registered_initial_xdg_test_buffer(&xdg_surface);
-        connection.flush()?;
-        wait_for_server_commands(commands);
-        queue.roundtrip(&mut state)?;
 
         Ok(Self {
             connection,
             queue,
             manager,
+            advertised_manager_version,
             surface,
             xdg_surface,
             toplevel,
             decoration,
             state,
         })
+    }
+
+    fn finish_initial_map(
+        &mut self,
+        commands: &Sender<ServerCommand>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let initial_serial = *self
+            .state
+            .surface_configure_serials
+            .last()
+            .ok_or("initial xdg configure was not observed")?;
+        self.xdg_surface.ack_configure(initial_serial);
+        commit_registered_initial_xdg_test_buffer(&self.xdg_surface);
+        self.connection.flush()?;
+        wait_for_server_commands(commands);
+        self.queue.roundtrip(&mut self.state)?;
+        Ok(())
     }
 
     fn pump(&mut self, commands: &Sender<ServerCommand>) -> Result<(), Box<dyn std::error::Error>> {
@@ -101,6 +129,8 @@ struct MappedDecorationClient {
     queue: EventQueue<RegistryTestState>,
     manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     advertised_manager_version: u32,
+    compositor: client_wl_compositor::WlCompositor,
+    subcompositor: client_wl_subcompositor::WlSubcompositor,
     shm: client_wl_shm::WlShm,
     timing_manager: Option<client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1>,
     surface: client_wl_surface::WlSurface,
@@ -128,6 +158,8 @@ impl MappedDecorationClient {
                 .expect("zxdg_decoration_manager_v1 global")
         });
         let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let subcompositor: client_wl_subcompositor::WlSubcompositor =
+            globals.bind(&qh, 1..=1, ())?;
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ())?;
         let dmabuf: Option<client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1> =
@@ -165,6 +197,8 @@ impl MappedDecorationClient {
             queue,
             manager,
             advertised_manager_version,
+            compositor,
+            subcompositor,
             shm,
             timing_manager,
             surface,
@@ -788,6 +822,63 @@ fn initial_map_has_one_coherent_decoration_transaction() {
 }
 
 #[test]
+fn v2_server_preference_before_initial_commit_uses_one_coherent_transaction() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = DecorationClient::connect_before_initial_map(
+        &socket_path,
+        &commands,
+        2,
+        client_zxdg_toplevel_decoration_v1::Mode::ServerSide,
+    )
+    .expect("connect v2 decoration client before initial map");
+
+    assert_eq!(client.advertised_manager_version, 2);
+    assert_eq!(client.manager.version(), 2);
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+    assert_eq!(client.state.surface_configure_count, 1);
+    assert_eq!(client.state.decoration_configure_count, 1);
+    assert_eq!(client.state.decoration_configure_modes, vec![2]);
+    let relevant = client
+        .state
+        .toplevel_event_log
+        .iter()
+        .copied()
+        .filter(|event| {
+            matches!(
+                *event,
+                "decoration_configure" | "toplevel_configure" | "xdg_surface_configure"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relevant,
+        vec![
+            "decoration_configure",
+            "toplevel_configure",
+            "xdg_surface_configure"
+        ]
+    );
+
+    let initial_serial = *client.state.surface_configure_serials.last().unwrap();
+    client.xdg_surface.ack_configure(initial_serial);
+    client.connection.flush().unwrap();
+    client.queue.roundtrip(&mut client.state).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+
+    commit_registered_initial_xdg_test_buffer(&client.xdg_surface);
+    client.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    client.queue.roundtrip(&mut client.state).unwrap();
+
+    assert_eq!(capture_renderable_surface_snapshot(&commands).len(), 1);
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+    assert_eq!(client.state.surface_configure_count, 1);
+    assert_eq!(client.state.decoration_configure_count, 1);
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
 fn destroy_plain_commit_latches_client_side_decoration() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = DecorationClient::connect(
@@ -1005,6 +1096,90 @@ fn v2_decoration_creation_after_mapped_content_keeps_client_side_until_commit() 
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
     assert_eq!(capture_native_decoration_count(&commands), 1);
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn desynchronized_child_commit_does_not_consume_root_decoration_transaction() {
+    let (socket_path, commands, server_thread) = start_server();
+    let mut client = MappedDecorationClient::connect(&socket_path, &commands, 2)
+        .expect("connect v2 decoration client");
+    let decoration =
+        client
+            .manager
+            .get_toplevel_decoration(&client.toplevel, &client.queue.handle(), ());
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+    let server_side_serial = *client.state.surface_configure_serials.last().unwrap();
+    client
+        .commit_configure(&commands, server_side_serial)
+        .unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    let child = client.compositor.create_surface(&client.queue.handle(), ());
+    let subsurface =
+        client
+            .subcompositor
+            .get_subsurface(&child, &client.surface, &client.queue.handle(), ());
+    subsurface.set_desync();
+    client.commit_surface(&commands).unwrap();
+    commit_test_buffered_surface(&child, &client.shm, &client.queue.handle(), 320, 180).unwrap();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert!(
+        capture_renderable_surface_snapshot(&commands)
+            .iter()
+            .any(|surface| surface.parent_surface_id.is_some()),
+        "desynchronized content child should be active under the mapped XDG root"
+    );
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    let surface_configures_before_transition = client.state.surface_configure_count;
+    let decoration_configures_before_transition = client.state.decoration_configure_count;
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(
+        client.state.surface_configure_count,
+        surface_configures_before_transition + 1
+    );
+    assert_eq!(
+        client.state.decoration_configure_count,
+        decoration_configures_before_transition + 1
+    );
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&1));
+    let client_side_serial = *client.state.surface_configure_serials.last().unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    client.xdg_surface.ack_configure(client_side_serial);
+    client.connection.flush().unwrap();
+    client.queue.roundtrip(&mut client.state).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    commit_test_buffered_surface(&child, &client.shm, &client.queue.handle(), 321, 181).unwrap();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(
+        client.state.surface_configure_serials.last(),
+        Some(&client_side_serial),
+        "child-only commit must leave the root configure transaction pending"
+    );
+    assert_eq!(capture_native_decoration_count(&commands), 1);
+
+    client.commit_surface(&commands).unwrap();
+    assert_eq!(capture_native_decoration_count(&commands), 0);
+    assert_eq!(
+        client.state.surface_configure_count,
+        surface_configures_before_transition + 1
+    );
+    assert_eq!(
+        client.state.decoration_configure_count,
+        decoration_configures_before_transition + 1
+    );
+    drop(subsurface);
     drop(client);
     stop_server(commands, server_thread);
 }

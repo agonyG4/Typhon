@@ -152,7 +152,13 @@ impl GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for
         _global_data: &(),
         data_init: &mut DataInit<'_, Self>,
     ) {
-        data_init.init(resource, ());
+        let manager = data_init.init(resource, ());
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: event=xdg_decoration_manager_bind version={}",
+                manager.version(),
+            );
+        }
     }
 }
 
