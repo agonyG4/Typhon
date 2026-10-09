@@ -85,6 +85,76 @@ fn vrr_window_preserves_non_grid_commit_timing_lower_bound() {
     let timing = VrrWindowPlanner::plan(input(1_002_000_000, Some(not_before))).unwrap();
 
     assert_eq!(vrr_fields(timing).1, MonotonicTimestampNs::new(not_before));
+    let PresentationTiming::VrrWindow {
+        presentation_not_before,
+        preferred_present,
+        ..
+    } = timing
+    else {
+        panic!("expected a VRR window");
+    };
+    assert_eq!(
+        presentation_not_before,
+        Some(MonotonicTimestampNs::new(not_before))
+    );
+    assert_eq!(preferred_present.get() - ANCHOR_NS, 10_333_333);
+}
+
+#[test]
+fn vrr_window_keeps_physical_earliest_separate_from_missing_logical_bound() {
+    let timing = VrrWindowPlanner::plan(input(1_002_000_000, None)).unwrap();
+
+    let PresentationTiming::VrrWindow {
+        earliest_present,
+        presentation_not_before,
+        preferred_present,
+        ..
+    } = timing
+    else {
+        panic!("expected a VRR window");
+    };
+
+    assert_eq!(earliest_present.get() - ANCHOR_NS, 6_060_606);
+    assert_eq!(presentation_not_before, None);
+    assert_eq!(preferred_present, earliest_present);
+}
+
+#[test]
+fn vrr_window_keeps_six_ms_physical_and_ten_ms_logical_bounds_distinct() {
+    let mut input = input(ANCHOR_NS, None);
+    input.shortest_interval = Duration::from_millis(6);
+    let physical_only = VrrWindowPlanner::plan(input).unwrap();
+    input.not_before = Some(MonotonicTimestampNs::new(1_010_333_333));
+    let logically_delayed = VrrWindowPlanner::plan(input).unwrap();
+
+    let PresentationTiming::VrrWindow {
+        earliest_present: physical_earliest,
+        presentation_not_before: no_logical_bound,
+        preferred_present: physical_preferred,
+        ..
+    } = physical_only
+    else {
+        panic!("expected a VRR window");
+    };
+    let PresentationTiming::VrrWindow {
+        earliest_present: delayed_earliest,
+        presentation_not_before: logical_bound,
+        preferred_present: delayed_preferred,
+        ..
+    } = logically_delayed
+    else {
+        panic!("expected a VRR window");
+    };
+
+    assert_eq!(physical_earliest.get(), 1_006_000_000);
+    assert_eq!(physical_preferred, physical_earliest);
+    assert_eq!(no_logical_bound, None);
+    assert_eq!(delayed_earliest, physical_earliest);
+    assert_eq!(
+        logical_bound,
+        Some(MonotonicTimestampNs::new(1_010_333_333))
+    );
+    assert_eq!(delayed_preferred, MonotonicTimestampNs::new(1_010_333_333));
 }
 
 #[test]
@@ -95,6 +165,19 @@ fn vrr_window_current_time_dominates_stale_not_before() {
         vrr_fields(timing).1,
         MonotonicTimestampNs::new(1_009_400_000)
     );
+    let PresentationTiming::VrrWindow {
+        presentation_not_before,
+        preferred_present,
+        ..
+    } = timing
+    else {
+        panic!("expected a VRR window");
+    };
+    assert_eq!(
+        presentation_not_before,
+        Some(MonotonicTimestampNs::new(1_003_000_000))
+    );
+    assert!(presentation_not_before.unwrap() <= preferred_present);
 }
 
 #[test]

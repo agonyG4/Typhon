@@ -7,12 +7,14 @@ use oblivion_one::compositor::{
     SurfaceDamagePresentation, SurfacePresentationCommitKey,
 };
 use oblivion_one::core::OutputId;
+use oblivion_one::native::buffering::PresentationOpportunity;
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
     TargetSelectionEvidence,
 };
+use oblivion_one::native::presentation_timing::PresentationTiming;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use super::async_validation::CompositedPresentationValidationKey;
@@ -185,15 +187,59 @@ impl O1PrepareIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VariablePresentationReservation {
+    opportunity: PresentationOpportunity,
+    reason: PresentationTargetReason,
+}
+
+impl VariablePresentationReservation {
+    pub(crate) const fn try_new(
+        opportunity: PresentationOpportunity,
+        reason: PresentationTargetReason,
+    ) -> Option<Self> {
+        match opportunity.timing() {
+            PresentationTiming::VrrWindow { .. } => Some(Self {
+                opportunity,
+                reason,
+            }),
+            PresentationTiming::FixedVsync { .. } | PresentationTiming::AsyncImmediate { .. } => {
+                None
+            }
+        }
+    }
+
+    pub(crate) const fn opportunity(self) -> PresentationOpportunity {
+        self.opportunity
+    }
+
+    pub(crate) const fn timing(self) -> PresentationTiming {
+        self.opportunity.timing()
+    }
+
+    pub(crate) const fn reason(self) -> PresentationTargetReason {
+        self.reason
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FramePresentationReservation {
-    Bound(PresentationTarget),
+    Fixed(PresentationTarget),
+    Variable(VariablePresentationReservation),
     DeferredO1(O1PrepareIntent),
 }
 
 impl FramePresentationReservation {
-    pub(crate) const fn bound_target(self) -> Option<PresentationTarget> {
+    pub(crate) const fn fixed_target(self) -> Option<PresentationTarget> {
         match self {
-            Self::Bound(target) => Some(target),
+            Self::Fixed(target) => Some(target),
+            Self::Variable(_) | Self::DeferredO1(_) => None,
+        }
+    }
+
+    pub(crate) const fn physical_opportunity(self) -> Option<PresentationOpportunity> {
+        match self {
+            Self::Fixed(target) => Some(target.physical_opportunity()),
+            Self::Variable(reservation) => Some(reservation.opportunity()),
             Self::DeferredO1(_) => None,
         }
     }
@@ -470,7 +516,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            FramePresentationReservation::Bound(target),
+            FramePresentationReservation::Fixed(target),
             pacing_mode,
             OutputTransactionContent::Composited {
                 frame_id,
@@ -515,7 +561,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            FramePresentationReservation::Bound(target),
+            FramePresentationReservation::Fixed(target),
             pacing_mode,
             OutputTransactionContent::Direct { frame_id, key },
             OutputPlanePlan::new(
@@ -595,7 +641,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            FramePresentationReservation::Bound(target),
+            FramePresentationReservation::Fixed(target),
             pacing_mode,
             OutputTransactionContent::Composited {
                 frame_id,
@@ -629,7 +675,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            FramePresentationReservation::Bound(target),
+            FramePresentationReservation::Fixed(target),
             pacing_mode,
             OutputTransactionContent::CompatibilityImmediate { frame_id },
             OutputPlanePlan::new(
@@ -690,7 +736,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            FramePresentationReservation::Bound(target),
+            FramePresentationReservation::Fixed(target),
             pacing_mode,
             OutputTransactionContent::PlaneDelta {
                 changed,
@@ -821,7 +867,7 @@ impl OutputTransaction {
     }
 
     pub(crate) const fn bound_target(&self) -> Option<PresentationTarget> {
-        self.reservation.bound_target()
+        self.reservation.fixed_target()
     }
 
     pub(crate) fn replace_bound_target(
@@ -829,10 +875,10 @@ impl OutputTransaction {
         expected: PresentationTarget,
         replacement: PresentationTarget,
     ) -> bool {
-        if self.reservation != FramePresentationReservation::Bound(expected) {
+        if self.reservation != FramePresentationReservation::Fixed(expected) {
             return false;
         }
-        self.reservation = FramePresentationReservation::Bound(replacement);
+        self.reservation = FramePresentationReservation::Fixed(replacement);
         true
     }
 
@@ -850,7 +896,7 @@ impl OutputTransaction {
         if claim.clock_generation != intent.clock_generation {
             return Err(FramePresentationBindingError::ClockGenerationMismatch);
         }
-        self.reservation = FramePresentationReservation::Bound(intent.bind_target(claim, bind_at));
+        self.reservation = FramePresentationReservation::Fixed(intent.bind_target(claim, bind_at));
         Ok(())
     }
 
@@ -1206,6 +1252,8 @@ mod tests {
     use crate::native_output::presentation::ledger::{
         OutputTransactionError, OutputTransactionLedger,
     };
+    use oblivion_one::native::buffering::{PresentationOpportunity, PresentationOpportunityId};
+    use oblivion_one::native::presentation_timing::PresentationTiming;
     use std::time::Duration;
 
     fn target() -> PresentationTarget {
@@ -1227,6 +1275,99 @@ mod tests {
             },
             selection_evidence: TargetSelectionEvidence::default(),
         }
+    }
+
+    fn vrr_opportunity() -> PresentationOpportunity {
+        PresentationOpportunity::new(
+            PresentationOpportunityId::new(5, 12),
+            PresentationTiming::VrrWindow {
+                anchor: MonotonicTimestampNs::new(1_000_000_000),
+                earliest_present: MonotonicTimestampNs::new(1_006_000_000),
+                presentation_not_before: Some(MonotonicTimestampNs::new(1_010_333_333)),
+                preferred_present: MonotonicTimestampNs::new(1_010_333_333),
+                service_deadline: None,
+                shortest_interval: Duration::from_millis(6),
+                longest_interval: Some(Duration::from_millis(20)),
+            },
+        )
+    }
+
+    #[test]
+    fn variable_reservation_rejects_non_vrr_opportunities() {
+        let id = PresentationOpportunityId::new(5, 12);
+
+        assert_eq!(
+            VariablePresentationReservation::try_new(
+                PresentationOpportunity::fixed_vsync(
+                    id,
+                    MonotonicTimestampNs::new(1_006_000_000),
+                    Duration::from_millis(6),
+                ),
+                PresentationTargetReason::CommitTiming,
+            ),
+            None
+        );
+        assert_eq!(
+            VariablePresentationReservation::try_new(
+                PresentationOpportunity::new(
+                    id,
+                    PresentationTiming::AsyncImmediate {
+                        not_before: MonotonicTimestampNs::new(1_010_333_333),
+                    },
+                ),
+                PresentationTargetReason::CommitTiming,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn variable_reservation_preserves_opportunity_identity_and_timing() {
+        let opportunity = vrr_opportunity();
+        let timing = opportunity.timing();
+        let reservation = VariablePresentationReservation::try_new(
+            opportunity,
+            PresentationTargetReason::CommitTiming,
+        )
+        .expect("VRR opportunity is accepted");
+
+        assert_eq!(reservation.opportunity(), opportunity);
+        assert_eq!(
+            reservation.opportunity().id(),
+            PresentationOpportunityId::new(5, 12)
+        );
+        assert_eq!(reservation.timing(), timing);
+        assert_eq!(reservation.reason(), PresentationTargetReason::CommitTiming);
+        let updated_opportunity = PresentationOpportunity::new(
+            opportunity.id(),
+            PresentationTiming::VrrWindow {
+                anchor: MonotonicTimestampNs::new(1_000_000_000),
+                earliest_present: MonotonicTimestampNs::new(1_006_000_000),
+                presentation_not_before: Some(MonotonicTimestampNs::new(1_011_000_000)),
+                preferred_present: MonotonicTimestampNs::new(1_011_000_000),
+                service_deadline: None,
+                shortest_interval: Duration::from_millis(6),
+                longest_interval: Some(Duration::from_millis(20)),
+            },
+        );
+        assert_ne!(updated_opportunity.timing(), reservation.timing());
+        assert_eq!(reservation.timing(), timing);
+
+        let variable = FramePresentationReservation::Variable(reservation);
+        assert_eq!(variable.fixed_target(), None);
+        assert_eq!(variable.physical_opportunity(), Some(opportunity));
+    }
+
+    #[test]
+    fn fixed_reservation_keeps_its_target_and_physical_opportunity() {
+        let target = target();
+        let reservation = FramePresentationReservation::Fixed(target);
+
+        assert_eq!(reservation.fixed_target(), Some(target));
+        assert_eq!(
+            reservation.physical_opportunity(),
+            Some(target.physical_opportunity())
+        );
     }
 
     #[test]
@@ -1263,6 +1404,7 @@ mod tests {
         )
         .expect("deferred transaction");
         assert!(transaction.bound_target().is_none());
+        assert_eq!(transaction.reservation().physical_opportunity(), None);
         assert_eq!(
             transaction
                 .clone()
@@ -1331,6 +1473,15 @@ mod tests {
             frame_batch_id,
         )
         .expect("compatibility transaction");
+        assert_eq!(
+            base.reservation(),
+            FramePresentationReservation::Fixed(target())
+        );
+        assert_eq!(base.reservation().fixed_target(), Some(target()));
+        assert_eq!(
+            base.reservation().physical_opportunity(),
+            Some(target().physical_opportunity())
+        );
 
         for mode in [
             OutputPresentationMode::AdaptiveSync,

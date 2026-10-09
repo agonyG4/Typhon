@@ -17,6 +17,9 @@ pub enum PresentationTiming {
     VrrWindow {
         anchor: MonotonicTimestampNs,
         earliest_present: MonotonicTimestampNs,
+        /// Exact client/presentation lower bound: physical presentation must not precede it.
+        /// This is not a render-start, commit-complete, or refresh-phase deadline.
+        presentation_not_before: Option<MonotonicTimestampNs>,
         preferred_present: MonotonicTimestampNs,
         /// Soft service/starvation target, never an expiry or latest-valid-present time.
         service_deadline: Option<MonotonicTimestampNs>,
@@ -93,6 +96,7 @@ mod tests {
             PresentationTiming::VrrWindow {
                 anchor: MonotonicTimestampNs::new(1_000_000_000),
                 earliest_present: MonotonicTimestampNs::new(1_002_000_000),
+                presentation_not_before: Some(MonotonicTimestampNs::new(1_003_000_000)),
                 preferred_present: MonotonicTimestampNs::new(1_004_000_000),
                 service_deadline: Some(MonotonicTimestampNs::new(1_020_000_000)),
                 shortest_interval: Duration::from_millis(5),
@@ -117,6 +121,7 @@ mod tests {
             PresentationTiming::VrrWindow {
                 anchor: MonotonicTimestampNs::new(1_000_000_000),
                 earliest_present: MonotonicTimestampNs::new(1_002_000_000),
+                presentation_not_before: None,
                 preferred_present: MonotonicTimestampNs::new(1_004_000_000),
                 service_deadline: None,
                 shortest_interval: Duration::from_millis(5),
@@ -150,6 +155,7 @@ mod tests {
         let vrr = PresentationTiming::VrrWindow {
             anchor: MonotonicTimestampNs::new(20),
             earliest_present: MonotonicTimestampNs::new(21),
+            presentation_not_before: None,
             preferred_present: MonotonicTimestampNs::new(22),
             service_deadline: None,
             shortest_interval: Duration::from_millis(5),

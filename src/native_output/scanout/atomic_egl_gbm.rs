@@ -1701,7 +1701,7 @@ impl AtomicEglGbmScanout {
             render_generation,
             pool_generation,
             reservation: prepare_intent.map_or(
-                crate::native_output::presentation::transaction::FramePresentationReservation::Bound(
+                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
                     target,
                 ),
                 crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1,
@@ -1834,7 +1834,7 @@ impl AtomicEglGbmScanout {
             ..
         } = completed_frame;
         let target = reservation
-            .bound_target()
+            .fixed_target()
             .ok_or_else(|| io::Error::other("completed pageflip frame is unbound"))?;
         let (fence_signal, timing_error) = complete_confirmed_pageflip_with_timing(
             timing_result

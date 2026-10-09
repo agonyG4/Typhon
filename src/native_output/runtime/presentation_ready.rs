@@ -717,7 +717,7 @@ mod tests {
                 framebuffer_id: FramebufferId::new(42).unwrap(),
                 render_generation: 1,
                 pool_generation: 1,
-                reservation: FramePresentationReservation::Bound(old_target),
+                reservation: FramePresentationReservation::Fixed(old_target),
                 submit_window: KmsSubmitWindow::try_new(
                     old_target.presentation_time.get(),
                     old_target.submit_not_before().get(),

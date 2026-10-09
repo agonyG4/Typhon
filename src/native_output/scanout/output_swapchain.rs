@@ -230,7 +230,7 @@ pub(crate) struct RenderFenceTimingEvidence {
 
 impl RenderedOutputFrame {
     pub(crate) const fn bound_target(&self) -> Option<PresentationTarget> {
-        self.reservation.bound_target()
+        self.reservation.fixed_target()
     }
 
     pub(crate) const fn is_deferred_o1(&self) -> bool {
@@ -638,7 +638,7 @@ impl AtomicOutputSwapchain {
             framebuffer_id: FramebufferId::new(42).expect("test framebuffer ID is nonzero"),
             render_generation,
             pool_generation: self.pool_generation,
-            reservation: FramePresentationReservation::Bound(target),
+            reservation: FramePresentationReservation::Fixed(target),
             submit_window: KmsSubmitWindow::try_new(
                 target.presentation_time.get(),
                 target.submit_not_before().get(),
@@ -767,7 +767,7 @@ impl AtomicOutputSwapchain {
             framebuffer_id: FramebufferId::new(42).expect("test framebuffer ID is nonzero"),
             render_generation: 1,
             pool_generation: self.pool_generation,
-            reservation: FramePresentationReservation::Bound(PresentationTarget {
+            reservation: FramePresentationReservation::Fixed(PresentationTarget {
                 sequence: frame_id,
                 presentation_time: now,
                 submit_not_before: now,
@@ -1627,7 +1627,7 @@ impl AtomicOutputSwapchain {
             .ready
             .as_mut()
             .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
-        ready.reservation = FramePresentationReservation::Bound(replacement);
+        ready.reservation = FramePresentationReservation::Fixed(replacement);
         ready.submit_window = submit_window;
         Ok(())
     }
@@ -1788,7 +1788,7 @@ impl AtomicOutputSwapchain {
         }
         self.validate_later_primary_target(target)?;
         let ready = self.ready.as_mut().expect("ready frame was observed above");
-        ready.reservation = FramePresentationReservation::Bound(target);
+        ready.reservation = FramePresentationReservation::Fixed(target);
         ready.submit_window = submit_window;
         Ok(())
     }
@@ -2973,7 +2973,7 @@ mod tests {
             .expect("test framebuffer ID is nonzero"),
             render_generation: 1,
             pool_generation: 1,
-            reservation: FramePresentationReservation::Bound(target),
+            reservation: FramePresentationReservation::Fixed(target),
             submit_window: KmsSubmitWindow::try_new(
                 target.presentation_time.get(),
                 target.submit_not_before().get(),

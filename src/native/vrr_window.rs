@@ -43,6 +43,7 @@ impl VrrWindowPlanner {
         Some(PresentationTiming::VrrWindow {
             anchor: input.anchor,
             earliest_present,
+            presentation_not_before: input.not_before,
             preferred_present,
             service_deadline: None,
             shortest_interval: input.shortest_interval,

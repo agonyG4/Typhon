@@ -42,6 +42,7 @@ fn presentation_timing_domains_ids_and_successors_are_typed() {
         PresentationTiming::VrrWindow {
             anchor: MonotonicTimestampNs::new(1_000_000_000),
             earliest_present: MonotonicTimestampNs::new(1_002_000_000),
+            presentation_not_before: Some(MonotonicTimestampNs::new(1_003_000_000)),
             preferred_present: MonotonicTimestampNs::new(1_004_000_000),
             service_deadline: Some(MonotonicTimestampNs::new(1_020_000_000)),
             shortest_interval: Duration::from_millis(5),

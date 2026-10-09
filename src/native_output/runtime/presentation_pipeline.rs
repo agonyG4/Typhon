@@ -591,7 +591,7 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                 && descriptor.output_generation() == output_generation =>
             {
                 match (ready.target, descriptor.reservation()) {
-                    (Some(target), FramePresentationReservation::Bound(bound_target))
+                    (Some(target), FramePresentationReservation::Fixed(bound_target))
                         if target == bound_target =>
                     {
                         validate_state(
