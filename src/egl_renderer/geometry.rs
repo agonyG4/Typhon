@@ -1382,9 +1382,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let repairs = (0..repair_count)
-                    .map(|index| {
-                        OutputRect::new(index % 8 * 40, index / 8 * 40, 32, 32)
-                    })
+                    .map(|index| OutputRect::new(index % 8 * 40, index / 8 * 40, 32, 32))
                     .collect::<Vec<_>>();
                 let oracle = legacy_repair_plans(&commands, &repairs);
                 let legacy_consumers = plan_surface_consumers(&commands, &repairs);
