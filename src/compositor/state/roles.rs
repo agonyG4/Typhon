@@ -480,6 +480,20 @@ impl CompositorState {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let pending_restores = self
+            .pending_xwayland_restores
+            .iter()
+            .filter_map(|(&window_id, pending)| {
+                (pending.handle.generation() == generation).then_some((window_id, *pending))
+            })
+            .collect::<Vec<_>>();
+        for (window_id, pending) in pending_restores {
+            self.pending_xwayland_restores.remove(&window_id);
+            self.trace_pending_xwayland_restore_cancelled(
+                pending,
+                PendingXwaylandRestoreCancellationReason::XwaylandGenerationEnded,
+            );
+        }
         for window_id in windows {
             self.remove_desktop_window(window_id);
         }

@@ -257,11 +257,11 @@ where
                 DecorationRenderPrimitive::SolidRect { color, .. } => {
                     required.insert(DecorationResourceKey::Solid(argb_color_key(*color)));
                 }
-                DecorationRenderPrimitive::Image { asset, .. } => {
+                DecorationRenderPrimitive::Image { asset, .. }
+                | DecorationRenderPrimitive::Text { asset, .. } => {
                     required.insert(DecorationResourceKey::Asset(asset.asset_id()));
                     required_assets.insert(asset.asset_id(), asset);
                 }
-                DecorationRenderPrimitive::Text { .. } => {}
             }
         }
     }

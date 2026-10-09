@@ -231,6 +231,12 @@ impl CompositorState {
         {
             self.pending_x11_activation = None;
         }
+        if let Some(pending) = self.pending_xwayland_restores.remove(&id) {
+            self.trace_pending_xwayland_restore_cancelled(
+                pending,
+                super::PendingXwaylandRestoreCancellationReason::WindowDestroyed,
+            );
+        }
         self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window_group_scene_node_id = self.scene_node_id_for_window_group(id);

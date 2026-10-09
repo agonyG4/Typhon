@@ -134,6 +134,8 @@ impl FramePipeline<'_> {
             f64::from(self.effects.effect_output_scale),
             self.scene.current_size,
         );
+        let frame_survived = !self.lifecycle.has_fallbacks();
+        self.lifecycle.trace_frame_events(frame_survived);
         if self.lifecycle.has_fallbacks() {
             self.scene.repaint_planner.invalidate();
             return EglFrameOutcome::LifecycleFallback {

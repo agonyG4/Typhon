@@ -124,7 +124,25 @@ impl LifecycleRenderState {
             output_size,
             framebuffer_origin,
             &mut self.frame,
-            &mut self.visual_store,
+        );
+    }
+
+    pub(super) fn rebuild_visual_source_commands(
+        &mut self,
+        snapshot: &LifecycleSceneSample,
+        surfaces: &[RenderableSurface],
+        decorations: &[DecorationRenderInstance],
+        output_scale: f64,
+        output_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) {
+        self.visual_store.rebuild_source_commands(
+            snapshot,
+            surfaces,
+            decorations,
+            output_scale,
+            output_size,
+            framebuffer_origin,
         );
     }
 
@@ -187,6 +205,11 @@ impl LifecycleRenderState {
 
     pub(super) fn has_fallbacks(&self) -> bool {
         !self.frame.fallbacks.is_empty()
+    }
+
+    pub(super) fn trace_frame_events(&mut self, frame_survived: bool) {
+        self.visual_store
+            .trace_frame_events(&self.frame, frame_survived);
     }
 
     pub(super) fn evidence(&self) -> LifecycleRenderEvidence {

@@ -5,7 +5,8 @@ use crate::egl_renderer::tests::{
     lifecycle_transfer_color as lifecycle_transfer_test_color,
     lifecycle_transfer_fill_pattern as fill_lifecycle_transfer_test_pattern,
     lifecycle_transfer_read_pixels as read_effect_texture_pixels,
-    lifecycle_transfer_texture_key as lifecycle_transfer_test_texture_key, test_lifecycle_identity,
+    lifecycle_transfer_texture_key as lifecycle_transfer_test_texture_key,
+    test_lifecycle_identity_sequence,
 };
 use oblivion_one::core::SceneNodeId;
 use oblivion_one::presentation_animation::{
@@ -53,7 +54,7 @@ fn frozen_visual_signature_survives_reversal_but_changes_for_fresh_payload() {
     let first_sample = lamp_test_sample(0.5);
     let first_lamp = LifecycleFrameSnapshot::from_sample(&first_sample).samples[0];
     let first_source = &first_sample.samples[0].visual_source;
-    let next_identity = test_lifecycle_identity(first_lamp.window_id, 2);
+    let next_identity = test_lifecycle_identity_sequence(first_lamp.window_id, 2)[1];
     let mut reversed_lamp = first_lamp;
     reversed_lamp.presentation_identity = next_identity;
     let reversed_source = LifecycleVisualSource {
@@ -127,10 +128,6 @@ fn stale_visual_eviction_releases_only_unreferenced_payload_leases() {
         .effect_resources
         .acquire(&harness.gl, texture_key)
         .expect("stale lifecycle visual texture allocates");
-    let source_rect = live_snapshot.samples[0]
-        .visual_group
-        .presented_source_visual_rect;
-
     {
         let store = &mut harness.renderer.lifecycle.visual_store;
         store.source_vertices.insert(live_payload, Vec::new());
@@ -142,7 +139,6 @@ fn stale_visual_eviction_releases_only_unreferenced_payload_leases() {
             LifecycleResolvedVisualResource {
                 texture: live_texture,
                 source_signature: 1,
-                source_visual_rect: source_rect,
             },
         );
         store.resolved_visual_resources.insert(
@@ -150,7 +146,6 @@ fn stale_visual_eviction_releases_only_unreferenced_payload_leases() {
             LifecycleResolvedVisualResource {
                 texture: stale_texture,
                 source_signature: 2,
-                source_visual_rect: source_rect,
             },
         );
         store.begin_frame(&live_snapshot);
@@ -250,7 +245,6 @@ fn capture_snapshot_restores_transient_lifecycle_state_without_replacing_caches_
     let sample = LifecycleFrameSnapshot::from_sample(&lifecycle).samples[0];
     let payload_id = sample.payload_id;
     let source = lifecycle.samples[0].visual_source.clone();
-    let source_rect = sample.visual_group.presented_source_visual_rect;
     let texture = harness
         .renderer
         .effect_runtime
@@ -277,7 +271,6 @@ fn capture_snapshot_restores_transient_lifecycle_state_without_replacing_caches_
         LifecycleResolvedVisualResource {
             texture,
             source_signature: 17,
-            source_visual_rect: source_rect,
         },
     );
     owner

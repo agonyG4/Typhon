@@ -113,8 +113,11 @@ impl FramePipeline<'_> {
         };
         self.effects.effect_time_seconds = effect_time;
         self.effects.effect_output_scale = request.output_scale.max(0.0) as f32;
-        self.ensure_output_size(width, height)?;
+        // Active lifecycle captures are output independent. Retire stale
+        // payloads before size-history cleanup so the cleanup preserves live
+        // checked-out captures while dropping idle textures from old sizes.
         self.lifecycle.release_stale_visual_resources(self.effects);
+        self.ensure_output_size(width, height)?;
         self.scene.frame_stats.effect_instances_visible = request
             .effects
             .instances
@@ -145,7 +148,6 @@ impl FramePipeline<'_> {
             return Ok(());
         }
 
-        self.lifecycle.release_all_visual_resources(self.effects);
         self.scene.current_size = (width, height);
         self.scene.repaint_planner.resize((width, height));
         self.scene.scene_cache_key = None;
@@ -352,6 +354,14 @@ impl FramePipeline<'_> {
                 &self.scene.presentation_opacities,
                 &self.scene.presentation_visual_group_owners,
             ));
+        self.lifecycle.rebuild_visual_source_commands(
+            request.lifecycle,
+            request.lifecycle_surfaces,
+            request.lifecycle_decorations,
+            request.output_scale,
+            self.scene.current_size,
+            framebuffer_origin,
+        );
         self.lifecycle.rebuild_lamp_commands(
             request.lifecycle,
             request.lifecycle_surfaces,

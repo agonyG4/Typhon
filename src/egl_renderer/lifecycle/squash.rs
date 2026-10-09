@@ -1,8 +1,7 @@
 use super::super::*;
-use super::geometry::{
-    ndc_to_output_point, output_point_to_ndc, scaled_presentation_rect,
-    surface_root_for_lifecycle_surface,
-};
+use super::geometry::scaled_presentation_rect;
+#[cfg(test)]
+use super::geometry::{ndc_to_output_point, output_point_to_ndc};
 use super::{frame_state::LifecycleFrameState, visual_store::LifecycleVisualStore};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +54,7 @@ impl SquashRenderState {
     }
 }
 
+#[cfg(test)]
 fn transform_squash_geometry(
     vertices: &mut [EglTexturedVertex],
     commands: &mut [EglDrawCommand],
@@ -64,11 +64,6 @@ fn transform_squash_geometry(
     output_size: (u32, u32),
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> bool {
-    // Raw retained surfaces and frozen SSD are captured in canonical space.
-    // The current rectangle still starts from the physically presented source
-    // so the first Squash frame maps canonical primitives into the geometry
-    // that was visible immediately before minimization. Resolved owned-effect
-    // textures are handled separately in their already-presented visual space.
     let source_client = scaled_presentation_rect(visual_group.canonical_client_rect, output_scale);
     let Some(current_client) =
         oblivion_one::window_lifecycle_animation::squash_client_rect_at_progress(
@@ -129,9 +124,6 @@ fn transform_squash_geometry(
             return false;
         };
         command.bounds = bounds;
-        // Surface sampling is chosen before lifecycle geometry is applied.
-        // Switch only textured Squash primitives whose affine size changes;
-        // exact pixel-aligned 1:1 endpoints retain nearest-neighbor sampling.
         if changes_texture_scale
             && matches!(
                 command.layer,
@@ -160,8 +152,8 @@ impl SquashRenderState {
     pub(super) fn rebuild_commands(
         &mut self,
         lifecycle: &LifecycleSceneSample,
-        lifecycle_surfaces: &[RenderableSurface],
-        lifecycle_decorations: &[DecorationRenderInstance],
+        _lifecycle_surfaces: &[RenderableSurface],
+        _lifecycle_decorations: &[DecorationRenderInstance],
         output_scale: f64,
         output_size: (u32, u32),
         framebuffer_origin: OutputFramebufferOrigin,
@@ -170,8 +162,6 @@ impl SquashRenderState {
         self.vertices.clear();
         self.commands.clear();
         self.geometry_dirty = true;
-        let assignments =
-            compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
         for sample in lifecycle
             .samples
             .iter()
@@ -212,99 +202,38 @@ impl SquashRenderState {
                 direction: sample.direction,
             };
 
-            if sample.visual_source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects {
-                let Some(target_rect) =
-                    oblivion_one::window_lifecycle_animation::squash_visual_rect_at_progress(
-                        sample.visual_group.presented_source_client_rect,
-                        sample.visual_group.anchor_rect,
-                        sample.visual_group.presented_source_visual_rect,
-                        sample.progress,
-                    )
-                else {
-                    frame.record_fallback(
-                        frame_sample,
-                        LifecycleRenderFallbackReason::NoConsumedRepresentation,
-                    );
-                    continue;
-                };
-                let target = scaled_presentation_rect(target_rect, output_scale);
-                let mut vertices = Vec::new();
-                let mut commands = Vec::new();
-                push_draw_command(
-                    &mut vertices,
-                    &mut commands,
-                    EglDrawLayer::LifecycleResolvedVisual(sample.payload_id),
-                    EglRect::new(
-                        target.x() as f32,
-                        target.y() as f32,
-                        target.width() as f32,
-                        target.height() as f32,
-                    ),
-                    output_size.0,
-                    output_size.1,
-                    framebuffer_origin,
+            let Some(target_rect) =
+                oblivion_one::window_lifecycle_animation::squash_visual_rect_at_progress(
+                    sample.visual_group.presented_source_client_rect,
+                    sample.visual_group.anchor_rect,
+                    sample.visual_group.presented_source_visual_rect,
+                    sample.progress,
+                )
+            else {
+                frame.record_fallback(
+                    frame_sample,
+                    LifecycleRenderFallbackReason::NoConsumedRepresentation,
                 );
-                self.append_batch(sample.presentation_identity, vertices, commands);
-            } else {
-                for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
-                    if surface_root_for_lifecycle_surface(surface, lifecycle_surfaces, lifecycle)
-                        != sample.root_surface_id
-                    {
-                        continue;
-                    }
-                    let mut vertices = Vec::new();
-                    let mut commands = Vec::new();
-                    push_egl_surface_commands(
-                        &mut vertices,
-                        &mut commands,
-                        output_size.0,
-                        output_size.1,
-                        surface,
-                        assignment.clone(),
-                        framebuffer_origin,
-                        None,
-                    );
-                    if transform_squash_geometry(
-                        &mut vertices,
-                        &mut commands,
-                        sample.visual_group,
-                        sample.progress,
-                        output_scale,
-                        output_size,
-                        framebuffer_origin,
-                    ) {
-                        self.append_batch(sample.presentation_identity, vertices, commands);
-                    }
-                }
-                for decoration in lifecycle_decorations
-                    .iter()
-                    .filter(|decoration| decoration.root_surface_id() == sample.root_surface_id)
-                {
-                    let mut vertices = Vec::new();
-                    let mut commands = Vec::new();
-                    push_egl_decoration_instance(
-                        &mut vertices,
-                        &mut commands,
-                        output_size.0,
-                        output_size.1,
-                        decoration,
-                        output_scale,
-                        framebuffer_origin,
-                        None,
-                    );
-                    if transform_squash_geometry(
-                        &mut vertices,
-                        &mut commands,
-                        sample.visual_group,
-                        sample.progress,
-                        output_scale,
-                        output_size,
-                        framebuffer_origin,
-                    ) {
-                        self.append_batch(sample.presentation_identity, vertices, commands);
-                    }
-                }
-            }
+                continue;
+            };
+            let target = scaled_presentation_rect(target_rect, output_scale);
+            let mut vertices = Vec::new();
+            let mut commands = Vec::new();
+            push_draw_command(
+                &mut vertices,
+                &mut commands,
+                EglDrawLayer::LifecycleResolvedVisual(sample.payload_id),
+                EglRect::new(
+                    target.x() as f32,
+                    target.y() as f32,
+                    target.width() as f32,
+                    target.height() as f32,
+                ),
+                output_size.0,
+                output_size.1,
+                framebuffer_origin,
+            );
+            self.append_batch(sample.presentation_identity, vertices, commands);
             if self.commands.len() == initial_command_count {
                 frame.record_fallback(
                     frame_sample,
@@ -383,7 +312,7 @@ impl SquashRenderState {
                 glow::ONE_MINUS_SRC_ALPHA,
             );
         }
-        let mut current_sampling = None;
+        let mut current_texture_sampling = None;
         for sample in active {
             let commands = self
                 .commands
@@ -424,7 +353,8 @@ impl SquashRenderState {
                 unsafe {
                     context.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                     texture_binds = texture_binds.saturating_add(1);
-                    if current_sampling != Some(command.sampling) {
+                    let texture_sampling = (texture, command.sampling);
+                    if current_texture_sampling != Some(texture_sampling) {
                         let filter = match command.sampling {
                             SurfaceSampling::ExactNearest => glow::NEAREST,
                             SurfaceSampling::ScaledLinear => glow::LINEAR,
@@ -439,7 +369,7 @@ impl SquashRenderState {
                             glow::TEXTURE_MAG_FILTER,
                             filter,
                         );
-                        current_sampling = Some(command.sampling);
+                        current_texture_sampling = Some(texture_sampling);
                     }
                     if let Some(location) = &context.scene_state.presentation_opacity_location {
                         context

@@ -1,10 +1,5 @@
 use super::super::*;
-use super::geometry::{
-    ndc_to_output_point, output_point_to_ndc, scaled_presentation_rect,
-    surface_root_for_lifecycle_surface,
-};
 use super::{frame_state::LifecycleFrameState, visual_store::LifecycleVisualStore};
-use oblivion_one::compositor::{DecorationRenderPrimitive, clipped_decoration_text_geometry};
 
 pub(super) const MAX_LAMP_VERTICES: usize = 65_536;
 pub(super) const LAMP_TARGET_CELL_PIXELS: f32 = 32.0;
@@ -211,47 +206,6 @@ fn append_lamp_grid(
         presentation_identity,
     });
     true
-}
-
-fn reproject_lifecycle_source_commands(
-    vertices: &mut [EglTexturedVertex],
-    commands: &mut [EglDrawCommand],
-    canonical_client_rect: compositor::PresentationRect,
-    presented_source_client_rect: compositor::PresentationRect,
-    output_scale: f64,
-    output_size: (u32, u32),
-    framebuffer_origin: OutputFramebufferOrigin,
-) {
-    let full = scaled_presentation_rect(canonical_client_rect, output_scale);
-    let source = scaled_presentation_rect(presented_source_client_rect, output_scale);
-    let map_point = |point: [f64; 2]| {
-        [
-            source.x() + (point[0] - full.x()) * source.width() / full.width(),
-            source.y() + (point[1] - full.y()) * source.height() / full.height(),
-        ]
-    };
-    for vertex in vertices {
-        let output_point = ndc_to_output_point(vertex.position, output_size, framebuffer_origin);
-        let mapped = map_point(output_point);
-        vertex.position = output_point_to_ndc(mapped, output_size, framebuffer_origin);
-    }
-    for command in commands {
-        let left = f64::from(command.bounds.x());
-        let top = f64::from(command.bounds.y());
-        let right = left + f64::from(command.bounds.width());
-        let bottom = top + f64::from(command.bounds.height());
-        let mapped_top_left = map_point([left, top]);
-        let mapped_bottom_right = map_point([right, bottom]);
-        command.bounds = EglRect::new(
-            mapped_top_left[0] as f32,
-            mapped_top_left[1] as f32,
-            (mapped_bottom_right[0] - mapped_top_left[0]) as f32,
-            (mapped_bottom_right[1] - mapped_top_left[1]) as f32,
-        );
-        // A lifecycle source is a non-linear visual-group input. It must not
-        // contribute a rectangular opaque region to ordinary occlusion.
-        command.opaque_regions.clear();
-    }
 }
 
 fn lamp_geometry_key(
@@ -463,19 +417,9 @@ fn lifecycle_visual_source_for_lamp(
 fn lifecycle_draw_layer_matches_payload(
     layer: EglDrawLayer,
     payload_id: compositor::PresentationRetainedVisualPayloadId,
-    source_kind: LifecycleVisualSourceKind,
+    _source_kind: LifecycleVisualSourceKind,
 ) -> bool {
-    match (source_kind, layer) {
-        (
-            LifecycleVisualSourceKind::ResolvedOwnedEffects,
-            EglDrawLayer::LifecycleResolvedVisual(layer_payload_id),
-        ) => layer_payload_id == payload_id,
-        (LifecycleVisualSourceKind::ResolvedOwnedEffects, _) => false,
-        (LifecycleVisualSourceKind::NoOwnedEffects, EglDrawLayer::LifecycleResolvedVisual(_)) => {
-            false
-        }
-        (LifecycleVisualSourceKind::NoOwnedEffects, _) => true,
-    }
+    matches!(layer, EglDrawLayer::LifecycleResolvedVisual(layer_payload_id) if layer_payload_id == payload_id)
 }
 
 fn set_lamp_uniform_rect(
@@ -504,10 +448,9 @@ impl LampRenderState {
         lifecycle_surfaces: &[RenderableSurface],
         lifecycle_decorations: &[DecorationRenderInstance],
         output_scale: f64,
-        output_size: (u32, u32),
+        _output_size: (u32, u32),
         framebuffer_origin: OutputFramebufferOrigin,
         frame: &mut LifecycleFrameState,
-        visual_store: &mut LifecycleVisualStore,
     ) {
         let geometry_key = lamp_geometry_key(
             lifecycle,
@@ -532,8 +475,6 @@ impl LampRenderState {
         }
         let mut transition_starts = HashMap::new();
         let mut rejected_transitions = HashSet::new();
-        let assignments =
-            compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
         for lamp in LifecycleFrameSnapshot::from_sample(lifecycle)
             .samples
             .into_iter()
@@ -555,177 +496,23 @@ impl LampRenderState {
                 );
                 continue;
             }
-            let resolved_source =
-                (source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects).then_some(source);
-            if let Some(source) = resolved_source {
-                if !visual_store
-                    .source_vertices
-                    .contains_key(&source.payload_id)
-                {
-                    let mut vertices = Vec::new();
-                    let mut commands = Vec::new();
-                    let visual_group = source
-                        .effect_scene
-                        .instances
-                        .first()
-                        .and_then(|instance| instance.visual_group)
-                        .or_else(|| VisualGroupId::new(1));
-                    for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
-                        if surface_root_for_lifecycle_surface(
-                            surface,
-                            lifecycle_surfaces,
-                            lifecycle,
-                        ) != lamp.root_surface_id
-                        {
-                            continue;
-                        }
-                        push_egl_surface_commands(
-                            &mut vertices,
-                            &mut commands,
-                            output_size.0,
-                            output_size.1,
-                            surface,
-                            assignment.clone(),
-                            framebuffer_origin,
-                            visual_group,
-                        );
-                    }
-                    for decoration in lifecycle_decorations
-                        .iter()
-                        .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
-                    {
-                        push_egl_decoration_instance(
-                            &mut vertices,
-                            &mut commands,
-                            output_size.0,
-                            output_size.1,
-                            decoration,
-                            output_scale,
-                            framebuffer_origin,
-                            visual_group,
-                        );
-                    }
-                    reproject_lifecycle_source_commands(
-                        &mut vertices,
-                        &mut commands,
-                        lamp.visual_group.canonical_client_rect,
-                        lamp.visual_group.presented_source_client_rect,
-                        output_scale,
-                        output_size,
-                        framebuffer_origin,
-                    );
-                    visual_store
-                        .source_vertices
-                        .insert(source.payload_id, vertices);
-                    visual_store
-                        .source_commands
-                        .insert(source.payload_id, commands);
-                }
-                self.append_grid_for_transition(
-                    frame,
-                    lamp,
-                    LampGridSpec {
-                        layer: EglDrawLayer::LifecycleResolvedVisual(source.payload_id),
-                        presentation_identity: lamp.presentation_identity,
-                        bounds: EglRect::new(
-                            (lamp.visual_group.canonical_visual_rect.x() * output_scale) as f32,
-                            (lamp.visual_group.canonical_visual_rect.y() * output_scale) as f32,
-                            (lamp.visual_group.canonical_visual_rect.width() * output_scale) as f32,
-                            (lamp.visual_group.canonical_visual_rect.height() * output_scale)
-                                as f32,
-                        ),
-                        uv: EglUvRect::new(0.0, 1.0, 1.0, 0.0),
-                    },
-                    &mut transition_starts,
-                    &mut rejected_transitions,
-                );
-                continue;
-            }
-
-            for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
-                if surface_root_for_lifecycle_surface(surface, lifecycle_surfaces, lifecycle)
-                    != lamp.root_surface_id
-                {
-                    continue;
-                }
-                for render_plan in compositor::surface_render_plans_with_aperture(
-                    surface,
-                    assignment.target,
-                    assignment.visual_clip.as_ref(),
-                ) {
-                    let target = render_plan.content_target;
-                    if target.width() == 0 || target.height() == 0 {
-                        continue;
-                    }
-                    self.append_grid_for_transition(
-                        frame,
-                        lamp,
-                        LampGridSpec {
-                            layer: EglDrawLayer::Surface(surface.surface_id),
-                            presentation_identity: lamp.presentation_identity,
-                            bounds: EglRect::new(
-                                target.x() as f32,
-                                target.y() as f32,
-                                target.width() as f32,
-                                target.height() as f32,
-                            ),
-                            uv: EglUvRect::from_surface_uv_quad(render_plan.content_uv),
-                        },
-                        &mut transition_starts,
-                        &mut rejected_transitions,
-                    );
-                }
-            }
-            let scale = output_scale.max(1.0) as f32;
-            for decoration in lifecycle_decorations
-                .iter()
-                .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
-            {
-                let (origin_x, origin_y) = decoration.origin();
-                for primitive in decoration.primitives() {
-                    let (rect, uv, layer) = match primitive {
-                        DecorationRenderPrimitive::SolidRect { rect, color } => (
-                            *rect,
-                            EglUvRect::new(0.0, 0.0, 1.0, 1.0),
-                            EglDrawLayer::SolidRgba(rgba_to_pixel(*color)),
-                        ),
-                        DecorationRenderPrimitive::Image { rect, asset } => (
-                            *rect,
-                            EglUvRect::new(0.0, 0.0, 1.0, 1.0),
-                            EglDrawLayer::DecorationAsset(asset.asset_id()),
-                        ),
-                        DecorationRenderPrimitive::Text {
-                            rect, clip, asset, ..
-                        } => {
-                            let Some(crop) = clipped_decoration_text_geometry(*rect, *clip) else {
-                                continue;
-                            };
-                            (
-                                crop.rect,
-                                EglUvRect::new(crop.uv[0], crop.uv[1], crop.uv[2], crop.uv[3]),
-                                EglDrawLayer::DecorationAsset(asset.asset_id()),
-                            )
-                        }
-                    };
-                    self.append_grid_for_transition(
-                        frame,
-                        lamp,
-                        LampGridSpec {
-                            layer,
-                            presentation_identity: lamp.presentation_identity,
-                            bounds: EglRect::new(
-                                origin_x.saturating_add(rect.x) as f32 * scale,
-                                origin_y.saturating_add(rect.y) as f32 * scale,
-                                rect.width as f32 * scale,
-                                rect.height as f32 * scale,
-                            ),
-                            uv,
-                        },
-                        &mut transition_starts,
-                        &mut rejected_transitions,
-                    );
-                }
-            }
+            self.append_grid_for_transition(
+                frame,
+                lamp,
+                LampGridSpec {
+                    layer: EglDrawLayer::LifecycleResolvedVisual(source.payload_id),
+                    presentation_identity: lamp.presentation_identity,
+                    bounds: EglRect::new(
+                        (lamp.visual_group.canonical_visual_rect.x() * output_scale) as f32,
+                        (lamp.visual_group.canonical_visual_rect.y() * output_scale) as f32,
+                        (lamp.visual_group.canonical_visual_rect.width() * output_scale) as f32,
+                        (lamp.visual_group.canonical_visual_rect.height() * output_scale) as f32,
+                    ),
+                    uv: EglUvRect::new(0.0, 1.0, 1.0, 0.0),
+                },
+                &mut transition_starts,
+                &mut rejected_transitions,
+            );
         }
         for lamp in LifecycleFrameSnapshot::from_sample(lifecycle)
             .samples
@@ -823,11 +610,6 @@ impl LampRenderState {
                 {
                     return None;
                 }
-                if visual_store.is_ready(sample.payload_id, context.effect_runtime)
-                    && !matches!(command.layer, EglDrawLayer::LifecycleResolvedVisual(_))
-                {
-                    return None;
-                }
                 Some((*command, sample))
             })
             .collect::<Vec<_>>();
@@ -863,7 +645,7 @@ impl LampRenderState {
             }
         }
         let output_scale = context.effect_runtime.effect_output_scale.max(1.0) as f64;
-        let mut sampling = None;
+        let mut current_texture_sampling = None;
         let missing_required_decoration_resources = samples
             .iter()
             .filter(|(command, _)| {
@@ -889,7 +671,8 @@ impl LampRenderState {
             };
             unsafe {
                 context.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                if sampling != Some(command.sampling) {
+                let texture_sampling = (texture, command.sampling);
+                if current_texture_sampling != Some(texture_sampling) {
                     let filter = match command.sampling {
                         SurfaceSampling::ExactNearest => glow::NEAREST,
                         SurfaceSampling::ScaledLinear => glow::LINEAR,
@@ -904,7 +687,7 @@ impl LampRenderState {
                         glow::TEXTURE_MAG_FILTER,
                         filter,
                     );
-                    sampling = Some(command.sampling);
+                    current_texture_sampling = Some(texture_sampling);
                 }
                 set_lamp_uniform_rect(
                     &context.gl,

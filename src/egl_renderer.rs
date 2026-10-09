@@ -16,6 +16,8 @@ use oblivion_one::effects::{
     TrustedEffectRegistry, compile_frame_execution_plan, plan_effect_execution_demand,
     reload_with_publisher,
 };
+#[cfg(test)]
+use oblivion_one::window_lifecycle_animation::LifecycleVisualGroup;
 use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DesktopVisualState, RenderableSurface, VisualGroupId,
@@ -24,9 +26,9 @@ use oblivion_one::{
     window_lifecycle_animation::{
         LifecycleEffectKind, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleRenderEvidence,
         LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
-        LifecycleRenderFallbacks, LifecycleSceneSample, LifecycleVisualGroup,
-        LifecycleVisualSource, LifecycleVisualSourceKind, lamp_motion_channels,
-        lifecycle_visual_transition_bounds, visible_lifecycle_samples,
+        LifecycleRenderFallbacks, LifecycleSceneSample, LifecycleVisualSource,
+        LifecycleVisualSourceKind, lamp_motion_channels, lifecycle_visual_transition_bounds,
+        visible_lifecycle_samples,
     },
 };
 
@@ -72,10 +74,11 @@ pub(in crate::egl_renderer) use geometry::{
     ensure_vertex_buffer_capacity, gl_scissor_to_output_rect, intersect_output_rect,
     output_rect_for_egl_clip,
 };
+#[cfg(test)]
+pub(in crate::egl_renderer) use scene::rgba_to_pixel;
 pub(in crate::egl_renderer) use scene::{
     EglSceneCacheKey, EglSceneSurfaceSignature, egl_scene_surface_signatures,
     push_egl_decoration_instance, push_egl_surface_commands, push_output_background_command,
-    rgba_to_pixel,
 };
 
 pub(crate) use frame::{
@@ -102,8 +105,8 @@ use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, Pooled
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglLampDrawCommand, EglLampVertex, EglRect, EglTexturedVertex,
     EglUvRect, EglVisibilityDecision, MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan,
-    SurfaceSampling, VERTEX_STRIDE, plan_surface_consumers, push_draw_command,
-    push_draw_command_with_uv, surface_sampling_for_plan,
+    SurfaceSampling, VERTEX_STRIDE, push_draw_command, push_draw_command_with_uv,
+    surface_sampling_for_plan,
 };
 use lifecycle::{
     LifecycleCaptureSnapshot, LifecycleRenderContext, LifecycleRenderState,

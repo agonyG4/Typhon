@@ -1599,6 +1599,138 @@ impl CompositorState {
         true
     }
 
+    fn window_has_active_lifecycle(&self, window_id: WindowId) -> bool {
+        self.scene_node_id_for_window_group(window_id)
+            .and_then(|scene_node_id| {
+                self.presentation_animator.active_retained_visual(
+                    scene_node_id,
+                    crate::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
+                )
+            })
+            .is_some()
+    }
+
+    fn pending_xwayland_restore_source_ready(&self, window_id: WindowId) -> bool {
+        let Some(window) = self.window(window_id) else {
+            return false;
+        };
+        let Some(surface_id) = window.x11_surface_id else {
+            return false;
+        };
+        window.root_surface_id == surface_id
+            && self
+                .lifecycle_client_rect_for_surface(window_id, surface_id, true)
+                .is_some()
+    }
+
+    fn lifecycle_client_rect_for_surface(
+        &self,
+        window_id: WindowId,
+        surface_id: u32,
+        minimized: bool,
+    ) -> Option<PresentationRect> {
+        let source = self.window(window_id).and_then(|window| {
+            if minimized {
+                window.state.minimized_root_surface(surface_id)
+            } else {
+                self.renderable_surface(surface_id)
+            }
+        })?;
+        PresentationRect::new(
+            f64::from(source.x),
+            f64::from(source.y),
+            f64::from(source.width),
+            f64::from(source.height),
+        )
+    }
+
+    pub(in crate::compositor) fn trace_pending_xwayland_restore_cancelled(
+        &self,
+        pending: PendingXwaylandRestore,
+        reason: PendingXwaylandRestoreCancellationReason,
+    ) {
+        if !matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return;
+        }
+        eprintln!(
+            "typhon.lifecycle_xwayland_restore event=cancelled window_id={:?} xid={} generation={} reason={}",
+            pending.window_id,
+            pending.handle.xid(),
+            pending.handle.generation().get(),
+            reason.as_str(),
+        );
+    }
+
+    fn defer_xwayland_restore_until_source(
+        &mut self,
+        window_id: WindowId,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> bool {
+        if self.pending_xwayland_restores.contains_key(&window_id) {
+            return true;
+        }
+        let minimized_target = self
+            .window(window_id)
+            .and_then(|window| window.state.minimized_lifecycle_target());
+        self.pending_xwayland_restores.insert(
+            window_id,
+            PendingXwaylandRestore {
+                window_id,
+                handle,
+                minimized_target,
+            },
+        );
+        self.backend_commands.push(
+            crate::compositor::window_backend::WindowBackendCommand::Map { window: window_id },
+        );
+        if matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            eprintln!(
+                "typhon.lifecycle_xwayland_restore event=pending window_id={window_id:?} xid={} generation={} reason=missing_source_geometry",
+                handle.xid(),
+                handle.generation().get(),
+            );
+        }
+        true
+    }
+
+    pub(in crate::compositor) fn complete_pending_xwayland_restore_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        let Some(pending) = self.pending_xwayland_restores.get(&window_id).copied() else {
+            return false;
+        };
+        let matches_identity = self.window(window_id).is_some_and(|window| {
+            window.id == pending.window_id
+                && window.root_surface_id == surface_id
+                && window.x11_surface_id == Some(surface_id)
+                && window.backend == WindowBackend::X11(pending.handle)
+                && self.window_by_x11_handle.get(&pending.handle) == Some(&window_id)
+        });
+        if !matches_identity {
+            if let Some(pending) = self.pending_xwayland_restores.remove(&window_id) {
+                self.trace_pending_xwayland_restore_cancelled(
+                    pending,
+                    PendingXwaylandRestoreCancellationReason::AssociationIdentityMismatch,
+                );
+            }
+            return false;
+        }
+        if !self.pending_xwayland_restore_source_ready(window_id) {
+            return false;
+        }
+        self.restore_minimized_desktop_window(window_id)
+    }
+
     fn restore_minimized_desktop_window_contents(&mut self, window_id: WindowId) -> bool {
         let Some((root_surface_id, x11_surface_id)) = self
             .window(window_id)
@@ -1606,6 +1738,29 @@ impl CompositorState {
         else {
             return false;
         };
+        if let Some(window) = self.window(window_id)
+            && window.kind == DesktopWindowKind::Managed
+            && window.is_normal_x11_role()
+            && !self.window_has_active_lifecycle(window_id)
+            && !self.pending_xwayland_restore_source_ready(window_id)
+            && let WindowBackend::X11(handle) = window.backend
+        {
+            return self.defer_xwayland_restore_until_source(window_id, handle);
+        }
+        if let Some(pending) = self.pending_xwayland_restores.remove(&window_id) {
+            if self.window(window_id).is_some_and(|window| {
+                window.backend == WindowBackend::X11(pending.handle)
+                    && window.id == pending.window_id
+            }) {
+                if let Some(window) = self.window_mut(window_id) {
+                    window
+                        .state
+                        .set_minimized_lifecycle_target(pending.minimized_target);
+                }
+            } else {
+                return false;
+            }
+        }
         let Some(minimized_surfaces) = self
             .window_mut(window_id)
             .and_then(|window| window.state.restore_minimized())
@@ -1686,6 +1841,9 @@ impl CompositorState {
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
         } else {
             self.lifecycle_window_rect(root_surface_id)
+                .or_else(|| {
+                    self.lifecycle_client_rect_for_surface(window_id, root_surface_id, false)
+                })
                 .and_then(|canonical_client| {
                     let owned_bounds = self
                         .renderable_surfaces

@@ -2,9 +2,181 @@ use super::*;
 use crate::egl_renderer::tests::{
     GlesEffectTestHarness, lifecycle_test_lamp_sample as lamp_test_sample,
     lifecycle_test_surface_fixture as lifecycle_test_surface,
+    lifecycle_transfer_texture_key as lifecycle_transfer_test_texture_key,
+    test_lifecycle_identities_for_windows,
 };
 use oblivion_one::presentation_animation::PresentationRect;
 use oblivion_one::render_backend::buffer::BufferIdAllocator;
+
+fn sampling_test_texture_filters(gl: &glow::Context, texture: glow::Texture) -> (i32, i32) {
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        let filters = (
+            gl.get_tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER),
+            gl.get_tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER),
+        );
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        filters
+    }
+}
+
+fn prepare_two_window_sampling_draw(harness: &mut GlesEffectTestHarness) -> [glow::Texture; 2] {
+    let mut lifecycle = lamp_test_sample(0.5);
+    lifecycle.samples[0].effect = LifecycleEffectKind::Squash;
+    let mut second_sample = lifecycle.samples[0].clone();
+    second_sample.window_id = compositor::WindowId::from_raw(902).expect("second test window");
+    let identities = test_lifecycle_identities_for_windows(&[
+        lifecycle.samples[0].window_id,
+        second_sample.window_id,
+    ]);
+    assert_eq!(identities[0], lifecycle.samples[0].presentation_identity);
+    let second_identity = identities[1];
+    second_sample.presentation_identity = second_identity;
+    second_sample.root_surface_id = 2;
+    second_sample.payload_id =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(second_identity);
+    assert_ne!(second_sample.payload_id, lifecycle.samples[0].payload_id);
+    second_sample.visual_source.presentation_identity = second_identity;
+    second_sample.visual_source.payload_id = second_sample.payload_id;
+    second_sample.visual_source.root_surface_id = second_sample.root_surface_id;
+    lifecycle.samples.push(second_sample);
+    harness.renderer.lifecycle.begin_frame(&lifecycle);
+
+    let texture_key = lifecycle_transfer_test_texture_key(4, 4);
+    let mut textures = Vec::new();
+    for (index, sample) in lifecycle.samples.iter().enumerate() {
+        let texture = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, texture_key)
+            .expect("resolved lifecycle texture allocates");
+        let texture_id = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .texture(&texture)
+            .expect("resolved lifecycle texture is available");
+        unsafe {
+            harness.gl.bind_texture(glow::TEXTURE_2D, Some(texture_id));
+            harness.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                if index == 0 {
+                    glow::LINEAR as i32
+                } else {
+                    glow::NEAREST as i32
+                },
+            );
+            harness.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                if index == 0 {
+                    glow::LINEAR as i32
+                } else {
+                    glow::NEAREST as i32
+                },
+            );
+            harness.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        textures.push(texture_id);
+        harness
+            .renderer
+            .lifecycle
+            .visual_store
+            .resolved_visual_resources
+            .insert(
+                sample.payload_id,
+                LifecycleResolvedVisualResource {
+                    texture,
+                    source_signature: 0,
+                },
+            );
+    }
+    harness.renderer.lifecycle.rebuild_squash_commands(
+        &lifecycle,
+        &[],
+        &[],
+        1.0,
+        (4, 4),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    assert_eq!(
+        harness.renderer.lifecycle.squash.commands.len(),
+        2,
+        "each lifecycle window contributes one textured draw"
+    );
+    assert!(
+        harness
+            .renderer
+            .lifecycle
+            .squash
+            .commands
+            .iter()
+            .all(|command| command.command.sampling == SurfaceSampling::ScaledLinear)
+    );
+    assert_ne!(
+        textures[0], textures[1],
+        "the two windows must use distinct GL texture objects"
+    );
+    assert_ne!(
+        harness.renderer.lifecycle.squash.commands[0].presentation_identity,
+        harness.renderer.lifecycle.squash.commands[1].presentation_identity,
+        "the two draws must belong to distinct lifecycle windows"
+    );
+    assert_eq!(
+        sampling_test_texture_filters(&harness.gl, textures[0]),
+        (glow::LINEAR as i32, glow::LINEAR as i32)
+    );
+    assert_eq!(
+        sampling_test_texture_filters(&harness.gl, textures[1]),
+        (glow::NEAREST as i32, glow::NEAREST as i32)
+    );
+    [textures[0], textures[1]]
+}
+
+fn draw_squash_sampling_pass(harness: &mut GlesEffectTestHarness) {
+    let renderer = &mut harness.renderer;
+    let mut context = LifecycleRenderContext::new(
+        &harness.gl,
+        &mut renderer.scene_state,
+        &mut renderer.effect_runtime,
+        renderer.resources.texture_view(),
+    );
+    renderer
+        .lifecycle
+        .draw_squash_overlay(&mut context, None)
+        .expect("Squash sampling draw succeeds");
+}
+
+fn assert_squash_textures_have_filter(
+    gl: &glow::Context,
+    textures: [glow::Texture; 2],
+    expected_filter: i32,
+) {
+    for (index, texture) in textures.into_iter().enumerate() {
+        assert_eq!(
+            sampling_test_texture_filters(gl, texture),
+            (expected_filter, expected_filter),
+            "resolved Squash texture {index} must carry the requested min/mag filter"
+        );
+    }
+}
+
+#[test]
+fn squash_uses_linear_sampling_for_each_resolved_window_texture() {
+    let mut harness = GlesEffectTestHarness::new(4, 4);
+    let textures = prepare_two_window_sampling_draw(&mut harness);
+
+    draw_squash_sampling_pass(&mut harness);
+
+    assert_eq!(
+        harness.renderer.lifecycle.evidence().consumed.len(),
+        2,
+        "both lifecycle textures must reach an executed GLES draw"
+    );
+    assert_squash_textures_have_filter(&harness.gl, textures, glow::LINEAR as i32);
+}
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
     PresentationRect::new(x, y, width, height).expect("valid test rectangle")
@@ -79,15 +251,33 @@ fn transformed_from_canonical(
     .expect("finite transformed test primitive")
 }
 
-fn command_for_surface(harness: &GlesEffectTestHarness, surface_id: u32) -> &EglDrawCommand {
+fn source_command_for_surface(
+    harness: &GlesEffectTestHarness,
+    payload_id: compositor::PresentationRetainedVisualPayloadId,
+    surface_id: u32,
+) -> &EglDrawCommand {
+    &harness.renderer.lifecycle.visual_store.source_commands[&payload_id]
+        .iter()
+        .find(|command| matches!(command.layer, EglDrawLayer::Surface(id) if id == surface_id))
+        .expect("lifecycle source surface command")
+}
+
+fn resolved_visual_command<'a>(
+    harness: &'a GlesEffectTestHarness,
+    lifecycle: &LifecycleSceneSample,
+) -> &'a EglDrawCommand {
+    let sample = &lifecycle.samples[0];
     &harness
         .renderer
         .lifecycle
         .squash
         .commands
         .iter()
-        .find(|entry| matches!(entry.command.layer, EglDrawLayer::Surface(id) if id == surface_id))
-        .expect("Squash surface command")
+        .find(|entry| {
+            entry.presentation_identity == sample.presentation_identity
+                && matches!(entry.command.layer, EglDrawLayer::LifecycleResolvedVisual(id) if id == sample.payload_id)
+        })
+        .expect("Squash resolved visual command")
         .command
 }
 
@@ -259,6 +449,19 @@ fn squash_raw_root_starts_at_presented_geometry_for_both_framebuffer_origins() {
             &mut BufferIdAllocator::default(),
         );
         surface.placement = compositor::SurfacePlacement::absolute_root_at(0, 0);
+        let sample = &lifecycle.samples[0];
+        harness.renderer.lifecycle.rebuild_visual_source_commands(
+            &lifecycle,
+            std::slice::from_ref(&surface),
+            &[],
+            1.0,
+            (1600, 1200),
+            origin,
+        );
+        assert_rect_close(
+            source_command_for_surface(&harness, sample.payload_id, 1).bounds,
+            presented,
+        );
         harness.renderer.lifecycle.rebuild_squash_commands(
             &lifecycle,
             std::slice::from_ref(&surface),
@@ -268,7 +471,10 @@ fn squash_raw_root_starts_at_presented_geometry_for_both_framebuffer_origins() {
             origin,
         );
 
-        assert_rect_close(command_for_surface(&harness, 1).bounds, presented);
+        assert_rect_close(
+            resolved_visual_command(&harness, &lifecycle).bounds,
+            presented,
+        );
     }
 }
 
@@ -298,11 +504,22 @@ fn squash_raw_subsurface_uses_canonical_affine_mapping_at_start_and_midflight() 
     );
     subsurface.placement = compositor::SurfacePlacement::subsurface(1, 160, 120);
     let surfaces = [root, subsurface];
-    let canonical_subsurface = rect(260.0, 200.0, 200.0, 100.0);
-
     for progress in [0.0, 0.5] {
         let lifecycle = squash_sample(progress, canonical, canonical, presented, anchor);
         let mut harness = GlesEffectTestHarness::new(1600, 1200);
+        let sample = &lifecycle.samples[0];
+        harness.renderer.lifecycle.rebuild_visual_source_commands(
+            &lifecycle,
+            &surfaces,
+            &[],
+            1.0,
+            (1600, 1200),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        assert_rect_close(
+            source_command_for_surface(&harness, sample.payload_id, 2).bounds,
+            rect(360.0, 240.0, 150.0, 75.0),
+        );
         harness.renderer.lifecycle.rebuild_squash_commands(
             &lifecycle,
             &surfaces,
@@ -312,14 +529,14 @@ fn squash_raw_subsurface_uses_canonical_affine_mapping_at_start_and_midflight() 
             OutputFramebufferOrigin::BottomLeft,
         );
 
-        assert_rect_close(
-            command_for_surface(&harness, 2).bounds,
-            transformed_from_canonical(
-                lifecycle.samples[0].visual_group,
-                canonical_subsurface,
-                progress,
-            ),
+        let target = oblivion_one::window_lifecycle_animation::squash_visual_rect_at_progress(
+            sample.visual_group.presented_source_client_rect,
+            sample.visual_group.anchor_rect,
+            sample.visual_group.presented_source_visual_rect,
+            progress,
         );
+        let target = target.expect("finite resolved Squash target");
+        assert_rect_close(resolved_visual_command(&harness, &lifecycle).bounds, target);
     }
 }
 
@@ -471,6 +688,26 @@ fn squash_rescales_exact_nearest_surface_commands_with_linear_sampling_and_keeps
 
         let lifecycle = squash_sample(0.5, canonical, canonical, canonical, anchor);
         let mut harness = GlesEffectTestHarness::new(1600, 1200);
+        let sample = &lifecycle.samples[0];
+        harness.renderer.lifecycle.rebuild_visual_source_commands(
+            &lifecycle,
+            std::slice::from_ref(&surface),
+            &[],
+            1.0,
+            (1600, 1200),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        let source_command = source_command_for_surface(&harness, sample.payload_id, 1);
+        assert_eq!(source_command.sampling, SurfaceSampling::ExactNearest);
+        let source_start = source_command.vertex_start as usize;
+        let source_end = source_start + source_command.vertex_count as usize;
+        let source_uvs = harness.renderer.lifecycle.visual_store.source_vertices
+            [&sample.payload_id][source_start..source_end]
+            .iter()
+            .map(|vertex| vertex.uv)
+            .collect::<Vec<_>>();
+        assert_eq!(source_uvs, ordinary_uvs);
+
         harness.renderer.lifecycle.rebuild_squash_commands(
             &lifecycle,
             std::slice::from_ref(&surface),
@@ -479,24 +716,13 @@ fn squash_rescales_exact_nearest_surface_commands_with_linear_sampling_and_keeps
             (1600, 1200),
             OutputFramebufferOrigin::BottomLeft,
         );
-        let command = command_for_surface(&harness, 1);
+        let command = resolved_visual_command(&harness, &lifecycle);
         assert_eq!(command.sampling, SurfaceSampling::ScaledLinear);
-        assert_eq!(
-            harness
-                .renderer
-                .lifecycle
-                .squash
-                .vertices
-                .iter()
-                .map(|vertex| vertex.uv)
-                .collect::<Vec<_>>(),
-            ordinary_uvs
-        );
     }
 }
 
 #[test]
-fn squash_keeps_exact_nearest_for_a_pixel_aligned_one_to_one_source_endpoint() {
+fn squash_captures_one_to_one_source_nearest_and_samples_retained_visual_linearly() {
     let source = rect(100.0, 80.0, 800.0, 600.0);
     let anchor = rect(900.0, 700.0, 56.0, 40.0);
     let lifecycle = squash_sample(0.0, source, source, source, anchor);
@@ -510,6 +736,19 @@ fn squash_keeps_exact_nearest_for_a_pixel_aligned_one_to_one_source_endpoint() {
         &mut BufferIdAllocator::default(),
     );
     let mut harness = GlesEffectTestHarness::new(1600, 1200);
+    let sample = &lifecycle.samples[0];
+    harness.renderer.lifecycle.rebuild_visual_source_commands(
+        &lifecycle,
+        std::slice::from_ref(&surface),
+        &[],
+        1.0,
+        (1600, 1200),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    assert_eq!(
+        source_command_for_surface(&harness, sample.payload_id, 1).sampling,
+        SurfaceSampling::ExactNearest
+    );
     harness.renderer.lifecycle.rebuild_squash_commands(
         &lifecycle,
         std::slice::from_ref(&surface),
@@ -520,7 +759,7 @@ fn squash_keeps_exact_nearest_for_a_pixel_aligned_one_to_one_source_endpoint() {
     );
 
     assert_eq!(
-        command_for_surface(&harness, 1).sampling,
-        SurfaceSampling::ExactNearest
+        resolved_visual_command(&harness, &lifecycle).sampling,
+        SurfaceSampling::ScaledLinear
     );
 }

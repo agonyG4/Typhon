@@ -80,6 +80,7 @@ impl LifecycleAdmissionFailure {
 
 static LIFECYCLE_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
 static LIFECYCLE_DIAGNOSTICS_LAST_NS: AtomicU64 = AtomicU64::new(0);
+const MAX_LIFECYCLE_RENDER_TERMINAL_DIAGNOSTICS: usize = 65_536;
 
 fn lifecycle_diagnostics_enabled() -> bool {
     *LIFECYCLE_DIAGNOSTICS_ENABLED.get_or_init(|| {
@@ -112,6 +113,46 @@ fn lifecycle_diagnostic_budget_available() -> bool {
 }
 
 impl CompositorState {
+    fn trace_lifecycle_render_terminal_event(
+        &mut self,
+        stage: crate::compositor::LifecycleRenderTerminalEvent,
+        window_id: WindowId,
+        root_surface_id: u32,
+        presentation_identity: crate::presentation_animation::PresentationRetainedVisualIdentity,
+        payload_id: crate::compositor::PresentationRetainedVisualPayloadId,
+        effect: LifecycleEffectKind,
+        direction: LifecycleDirection,
+    ) {
+        if !lifecycle_diagnostics_enabled() {
+            return;
+        }
+        if self.lifecycle_render_diagnostic_events.len()
+            >= MAX_LIFECYCLE_RENDER_TERMINAL_DIAGNOSTICS
+            || !self.lifecycle_render_diagnostic_events.insert((
+                presentation_identity,
+                payload_id,
+                stage,
+            ))
+        {
+            return;
+        }
+        let stage = match stage {
+            crate::compositor::LifecycleRenderTerminalEvent::Presented => "presented",
+            crate::compositor::LifecycleRenderTerminalEvent::Retired => "retired",
+        };
+        let effect = match effect {
+            LifecycleEffectKind::Lamp => "lamp",
+            LifecycleEffectKind::Squash => "squash",
+        };
+        let direction = match direction {
+            LifecycleDirection::Minimize => "minimize",
+            LifecycleDirection::Restore => "restore",
+        };
+        eprintln!(
+            "typhon.lifecycle_render event={stage} window_id={window_id:?} root_surface_id={root_surface_id} presentation_identity={presentation_identity:?} payload_id={payload_id:?} effect={effect} direction={direction} backend=egl-gles"
+        );
+    }
+
     /// Freeze only the compositor-owned effect instances belonging to one
     /// lifecycle visual group before logical minimize removes that group from
     /// the canonical scene. Output-wide effects intentionally do not become a
@@ -1198,6 +1239,15 @@ impl CompositorState {
             {
                 continue;
             }
+            self.trace_lifecycle_render_terminal_event(
+                crate::compositor::LifecycleRenderTerminalEvent::Presented,
+                lifecycle_sample.window_id,
+                lifecycle_sample.root_surface_id,
+                lifecycle_sample.presentation_identity,
+                lifecycle_sample.payload_id,
+                lifecycle_sample.effect,
+                lifecycle_sample.direction,
+            );
             let acknowledged = self.window_lifecycle_animator.acknowledge(
                 lifecycle_sample.presentation_identity,
                 lifecycle_sample.mathematically_settled,
@@ -1209,6 +1259,15 @@ impl CompositorState {
             if retired {
                 self.retained_lifecycle_payloads
                     .retire_exact(lifecycle_sample.presentation_identity);
+                self.trace_lifecycle_render_terminal_event(
+                    crate::compositor::LifecycleRenderTerminalEvent::Retired,
+                    lifecycle_sample.window_id,
+                    lifecycle_sample.root_surface_id,
+                    lifecycle_sample.presentation_identity,
+                    lifecycle_sample.payload_id,
+                    lifecycle_sample.effect,
+                    lifecycle_sample.direction,
+                );
             }
         }
         self.advance_pointer_hit_generation();
@@ -1280,6 +1339,15 @@ impl CompositorState {
         }
         self.retained_lifecycle_payloads
             .retire_exact(fallback.presentation_identity);
+        self.trace_lifecycle_render_terminal_event(
+            crate::compositor::LifecycleRenderTerminalEvent::Retired,
+            fallback.window_id,
+            fallback.root_surface_id,
+            fallback.presentation_identity,
+            fallback.payload_id,
+            fallback.effect,
+            current.direction,
+        );
         true
     }
 

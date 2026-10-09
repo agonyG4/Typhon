@@ -723,6 +723,11 @@ pub struct CompositorState {
         crate::material_program::MaterialProgramParameterControlState,
     pub(in crate::compositor) material_program_rendering_available: bool,
     window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
+    lifecycle_render_diagnostic_events: HashSet<(
+        crate::presentation_animation::PresentationRetainedVisualIdentity,
+        crate::compositor::PresentationRetainedVisualPayloadId,
+        LifecycleRenderTerminalEvent,
+    )>,
     retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,
     window_exit_payloads: state::WindowExitPayloadStore,
     lifecycle_animation_renderer_available: Option<bool>,
@@ -806,6 +811,7 @@ pub struct CompositorState {
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
     pub(in crate::compositor) next_window_id: u64,
     pub(in crate::compositor) pending_x11_activation: Option<PendingX11Activation>,
+    pub(in crate::compositor) pending_xwayland_restores: HashMap<WindowId, PendingXwaylandRestore>,
     pub(in crate::compositor) workspace_manager: WorkspaceManager,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
@@ -1004,6 +1010,37 @@ pub struct CompositorState {
 pub(in crate::compositor) struct PendingX11Activation {
     pub(in crate::compositor) window_id: WindowId,
     pub(in crate::compositor) handle: X11WindowHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::compositor) struct PendingXwaylandRestore {
+    pub(in crate::compositor) window_id: WindowId,
+    pub(in crate::compositor) handle: X11WindowHandle,
+    pub(in crate::compositor) minimized_target:
+        Option<crate::window_lifecycle_animation::ResolvedLifecycleTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum PendingXwaylandRestoreCancellationReason {
+    AssociationIdentityMismatch,
+    WindowDestroyed,
+    XwaylandGenerationEnded,
+}
+
+impl PendingXwaylandRestoreCancellationReason {
+    pub(in crate::compositor) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AssociationIdentityMismatch => "association_identity_mismatch",
+            Self::WindowDestroyed => "window_destroyed",
+            Self::XwaylandGenerationEnded => "xwayland_generation_ended",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::compositor) enum LifecycleRenderTerminalEvent {
+    Presented,
+    Retired,
 }
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

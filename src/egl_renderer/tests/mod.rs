@@ -38,6 +38,33 @@ pub(super) fn test_lifecycle_identity(
         .expect("test retained identity")
 }
 
+pub(super) fn test_lifecycle_identity_sequence(
+    window_id: oblivion_one::compositor::WindowId,
+    count: usize,
+) -> Vec<PresentationRetainedVisualIdentity> {
+    test_lifecycle_identities_for_windows(&vec![window_id; count])
+}
+
+pub(super) fn test_lifecycle_identities_for_windows(
+    window_ids: &[oblivion_one::compositor::WindowId],
+) -> Vec<PresentationRetainedVisualIdentity> {
+    let mut engine = PresentationEngine::enabled();
+    window_ids
+        .iter()
+        .enumerate()
+        .map(|(index, window_id)| {
+            let scene_node_id = SceneNodeId::from_raw(window_id.get()).expect("test scene node");
+            engine
+                .begin_retained_visual(
+                    scene_node_id,
+                    PresentationRetainedVisualKind::WindowLifecycle,
+                    AnimationTime::from_nanos(index as u64 + 1),
+                )
+                .expect("test retained identity sequence")
+        })
+        .collect()
+}
+
 const XR24: u32 = u32::from_le_bytes(*b"XR24");
 const AR24: u32 = u32::from_le_bytes(*b"AR24");
 

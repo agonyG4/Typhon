@@ -215,14 +215,16 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
-        if !self.window(window_id).is_some_and(|window| {
-            matches!(
-                window.backend,
-                WindowBackend::X11(handle) if handle.generation() == surface_generation
-            ) && !window.state.is_minimized()
-        }) {
+        let Some(window) = self.window(window_id) else {
+            return false;
+        };
+        if !matches!(
+            window.backend,
+            WindowBackend::X11(handle) if handle.generation() == surface_generation
+        ) {
             return false;
         }
+        let x11_window_minimized = window.state.is_minimized();
 
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
@@ -259,6 +261,45 @@ impl CompositorState {
         let buffer_size = surface.buffer_size();
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         self.retire_window_exit_for_root(root_surface_id);
+
+        if x11_window_minimized {
+            if self
+                .commit_minimized_surface_buffer(
+                    root_surface_id,
+                    surface_id,
+                    &materialized,
+                    buffer_size,
+                    surface.width,
+                    surface.height,
+                    surface.placement,
+                    generation,
+                    surface.damage.clone(),
+                )
+                .is_err()
+            {
+                if let Some(release) = shm_release {
+                    self.release_materialized_shm(release, copy_to_release_us);
+                }
+                return false;
+            }
+            self.clear_pending_xwayland_visual_content_if_matching(surface_id);
+            self.current_surface_buffers
+                .insert(surface_id, CurrentSurfaceBuffer::Materialized(materialized));
+            if let Some(release) = shm_release {
+                self.release_materialized_shm(release, copy_to_release_us);
+            }
+            self.record_surface_damage_commit_at(
+                surface_id,
+                self.current_surface_buffers
+                    .get(&surface_id)
+                    .map(CurrentSurfaceBuffer::commit_sequence),
+                RenderableSurfaceDamage::Full,
+                buffer_size.width,
+                buffer_size.height,
+            );
+            self.complete_pending_xwayland_restore_for_surface(surface_id);
+            return true;
+        }
 
         if self.renderable_surface_index(surface_id).is_some() {
             self.replace_renderable_surface(surface_id, surface);
@@ -364,6 +405,15 @@ impl CompositorState {
             RenderableSurfaceDamage::Full,
         );
         surface.mark_xwayland();
+        let minimized_source = x11_window_minimized.then(|| {
+            (
+                materialized.clone(),
+                surface.width,
+                surface.height,
+                surface.placement,
+                surface.damage.clone(),
+            )
+        });
         let renderable_index = self.content_renderable_surface_index(surface_id);
         let existing_surface =
             renderable_index.and_then(|index| self.renderable_surfaces.get(index));
@@ -462,6 +512,23 @@ impl CompositorState {
             buffer_size.width,
             buffer_size.height,
         );
+        if let Some((materialized, width, height, placement, damage)) = minimized_source
+            && self
+                .commit_minimized_surface_buffer(
+                    root_surface_id,
+                    surface_id,
+                    &materialized,
+                    buffer_size,
+                    width,
+                    height,
+                    placement,
+                    generation,
+                    damage,
+                )
+                .is_ok()
+        {
+            self.complete_pending_xwayland_restore_for_surface(surface_id);
+        }
         if !x11_window_minimized {
             if reapply_visual_assignment {
                 if !content_replacement_in_place {

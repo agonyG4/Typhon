@@ -249,6 +249,7 @@ impl CompositorState {
             if let Some(surface) = self.surface_resource_by_id(surface_id) {
                 self.reconcile_surface_output_membership(&surface);
             }
+            self.complete_pending_xwayland_restore_for_surface(surface_id);
             return false;
         }
         let committed_damage = if !visual_mapping_changed {
@@ -484,12 +485,12 @@ impl CompositorState {
         if self.remove_renderable_surface(surface_id).is_some() {
             self.invalidate_surface_origin_cache();
         }
-        if self.toplevel_window_state(root_surface_id).is_none() {
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
             return Ok(());
-        }
+        };
         if let Some(existing) = self
-            .toplevel_window_state_mut(root_surface_id)
-            .and_then(|window| window.minimized_surface_mut(surface_id))
+            .window_mut(window_id)
+            .and_then(|window| window.state.minimized_surface_mut(surface_id))
         {
             update_renderable_surface_buffer(
                 existing,
@@ -505,8 +506,8 @@ impl CompositorState {
         } else {
             let surface =
                 materialized.to_renderable_surface(surface_id, placement, generation, damage);
-            if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
-                window.push_minimized_surface(surface);
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.push_minimized_surface(surface);
             }
         }
         Ok(())

@@ -1,6 +1,99 @@
+use super::super::geometry::{EglVisibilityDecision, plan_visibility};
 use super::super::*;
 use super::frame_state::LifecycleFrameState;
-use super::geometry::scaled_presentation_rect;
+use super::geometry::{
+    ndc_to_output_point, output_point_to_ndc, scaled_presentation_rect,
+    surface_root_for_lifecycle_surface,
+};
+use oblivion_one::render_backend::buffer::SurfaceBufferSource;
+use oblivion_one::window_lifecycle_animation::LifecycleDirection;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LifecycleRenderDiagnosticStage {
+    SourceResolved,
+    ResourcesReady,
+    RepresentationCaptured,
+    Drawn,
+    FrameSurvived,
+    Fallback,
+}
+
+impl LifecycleRenderDiagnosticStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceResolved => "source_resolved",
+            Self::ResourcesReady => "resources_ready",
+            Self::RepresentationCaptured => "representation_captured",
+            Self::Drawn => "drawn",
+            Self::FrameSurvived => "frame_survived",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LifecycleVisualSourceMetrics {
+    pub(super) lifecycle_surface_count: usize,
+    pub(super) buffer_source_shm: bool,
+    pub(super) buffer_source_dmabuf: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleDiagnosticLayer {
+    Surface,
+    Decoration,
+    DecorationAsset,
+    ResolvedVisual,
+}
+
+impl LifecycleDiagnosticLayer {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Surface => "surface",
+            Self::Decoration => "decoration",
+            Self::DecorationAsset => "decoration_asset",
+            Self::ResolvedVisual => "resolved_visual",
+        }
+    }
+}
+
+type MissingLifecycleSourceResource = (LifecycleDiagnosticLayer, Option<u32>, Option<u64>);
+
+static LIFECYCLE_RENDER_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn lifecycle_render_diagnostics_enabled() -> bool {
+    *LIFECYCLE_RENDER_DIAGNOSTICS_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        )
+    })
+}
+
+fn diagnostic_layer_for_draw_layer(layer: EglDrawLayer) -> LifecycleDiagnosticLayer {
+    match layer {
+        EglDrawLayer::Surface(_) => LifecycleDiagnosticLayer::Surface,
+        EglDrawLayer::DecorationAsset(_) => LifecycleDiagnosticLayer::DecorationAsset,
+        EglDrawLayer::SolidRgba(_) => LifecycleDiagnosticLayer::Decoration,
+        EglDrawLayer::LifecycleResolvedVisual(_)
+        | EglDrawLayer::Solid(_)
+        | EglDrawLayer::Cursor => LifecycleDiagnosticLayer::ResolvedVisual,
+    }
+}
+
+fn lifecycle_fallback_reason_label(reason: LifecycleRenderFallbackReason) -> &'static str {
+    match reason {
+        LifecycleRenderFallbackReason::ResolvedSourceAllocation => "resolved_source_allocation",
+        LifecycleRenderFallbackReason::ResolvedSourceCapture => "resolved_source_capture",
+        LifecycleRenderFallbackReason::LampProgramUnavailable => "lamp_program_unavailable",
+        LifecycleRenderFallbackReason::LifecycleResourceUnavailable => {
+            "lifecycle_resource_unavailable"
+        }
+        LifecycleRenderFallbackReason::MeshBudget => "mesh_budget",
+        LifecycleRenderFallbackReason::NoConsumedRepresentation => "no_consumed_representation",
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum LifecycleSourceCaptureFailureStage {
@@ -52,8 +145,8 @@ impl LifecycleSourceCaptureFailure {
 
 pub(in crate::egl_renderer) struct LifecycleResolvedVisualResource {
     pub(super) texture: PooledEffectTexture,
+    #[cfg(test)]
     pub(super) source_signature: u64,
-    pub(super) source_visual_rect: compositor::PresentationRect,
 }
 
 impl LifecycleResolvedVisualResource {
@@ -68,8 +161,17 @@ pub(super) struct LifecycleVisualStore {
         HashMap<compositor::PresentationRetainedVisualPayloadId, Vec<EglTexturedVertex>>,
     pub(super) source_commands:
         HashMap<compositor::PresentationRetainedVisualPayloadId, Vec<EglDrawCommand>>,
+    pub(super) source_metrics:
+        HashMap<compositor::PresentationRetainedVisualPayloadId, LifecycleVisualSourceMetrics>,
+    missing_source_layers:
+        HashMap<compositor::PresentationRetainedVisualPayloadId, MissingLifecycleSourceResource>,
+    diagnostics_emitted: HashSet<(
+        compositor::PresentationRetainedVisualPayloadId,
+        LifecycleRenderDiagnosticStage,
+    )>,
     pub(super) resolved_visual_resources:
         HashMap<compositor::PresentationRetainedVisualPayloadId, LifecycleResolvedVisualResource>,
+    captured_payloads: HashSet<compositor::PresentationRetainedVisualPayloadId>,
     pub(super) visual_sources: HashMap<
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,
@@ -77,6 +179,7 @@ pub(super) struct LifecycleVisualStore {
 }
 
 impl LifecycleVisualStore {
+    #[cfg(test)]
     pub(super) fn is_ready(
         &self,
         payload_id: compositor::PresentationRetainedVisualPayloadId,
@@ -103,13 +206,120 @@ impl LifecycleVisualStore {
         );
     }
 
+    pub(super) fn rebuild_source_commands(
+        &mut self,
+        lifecycle: &LifecycleSceneSample,
+        lifecycle_surfaces: &[RenderableSurface],
+        lifecycle_decorations: &[DecorationRenderInstance],
+        output_scale: f64,
+        output_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) {
+        if !lifecycle
+            .samples
+            .iter()
+            .any(|sample| !self.source_vertices.contains_key(&sample.payload_id))
+        {
+            return;
+        }
+        let assignments =
+            compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
+        for sample in &lifecycle.samples {
+            let source = &sample.visual_source;
+            if source.root_surface_id != sample.root_surface_id
+                || source.payload_id != sample.payload_id
+                || source.presentation_identity != sample.presentation_identity
+                || self.source_vertices.contains_key(&source.payload_id)
+            {
+                continue;
+            }
+            let mut vertices = Vec::new();
+            let mut commands = Vec::new();
+            let visual_group = source
+                .effect_scene
+                .instances
+                .first()
+                .and_then(|instance| instance.visual_group)
+                .or_else(|| VisualGroupId::new(1));
+            for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
+                if surface_root_for_lifecycle_surface(surface, lifecycle_surfaces, lifecycle)
+                    != sample.root_surface_id
+                {
+                    continue;
+                }
+                push_egl_surface_commands(
+                    &mut vertices,
+                    &mut commands,
+                    output_size.0,
+                    output_size.1,
+                    surface,
+                    assignment.clone(),
+                    framebuffer_origin,
+                    visual_group,
+                );
+            }
+            for decoration in lifecycle_decorations
+                .iter()
+                .filter(|decoration| decoration.root_surface_id() == sample.root_surface_id)
+            {
+                push_egl_decoration_instance(
+                    &mut vertices,
+                    &mut commands,
+                    output_size.0,
+                    output_size.1,
+                    decoration,
+                    output_scale,
+                    framebuffer_origin,
+                    visual_group,
+                );
+            }
+            reproject_lifecycle_source_commands(
+                &mut vertices,
+                &mut commands,
+                sample.visual_group.canonical_client_rect,
+                sample.visual_group.presented_source_client_rect,
+                output_scale,
+                output_size,
+                framebuffer_origin,
+            );
+            let source_surfaces = lifecycle_surfaces
+                .iter()
+                .filter(|surface| {
+                    surface_root_for_lifecycle_surface(surface, lifecycle_surfaces, lifecycle)
+                        == sample.root_surface_id
+                })
+                .collect::<Vec<_>>();
+            self.source_metrics.insert(
+                source.payload_id,
+                LifecycleVisualSourceMetrics {
+                    lifecycle_surface_count: source_surfaces.len(),
+                    buffer_source_shm: source_surfaces
+                        .iter()
+                        .any(|surface| surface.buffer_source() == SurfaceBufferSource::Shm),
+                    buffer_source_dmabuf: source_surfaces
+                        .iter()
+                        .any(|surface| surface.buffer_source() == SurfaceBufferSource::Dmabuf),
+                },
+            );
+            self.source_vertices.insert(source.payload_id, vertices);
+            self.source_commands.insert(source.payload_id, commands);
+        }
+    }
+
     pub(super) fn extend_surface_consumers(
         &self,
         consumer_plan: &mut SurfaceConsumerPlan,
-        repairs: &[OutputRect],
+        _repairs: &[OutputRect],
     ) {
-        for commands in self.source_commands.values() {
-            consumer_plan.extend(&plan_surface_consumers(commands, repairs));
+        for (&payload_id, commands) in &self.source_commands {
+            if self.captured_payloads.contains(&payload_id) {
+                continue;
+            }
+            for command in commands {
+                if let EglDrawLayer::Surface(surface_id) = command.layer {
+                    consumer_plan.add_surface(surface_id);
+                }
+            }
         }
     }
 
@@ -134,6 +344,14 @@ impl LifecycleVisualStore {
             .retain(|payload_id, _| live_payload_ids.contains(payload_id));
         self.source_commands
             .retain(|payload_id, _| live_payload_ids.contains(payload_id));
+        self.source_metrics
+            .retain(|payload_id, _| live_payload_ids.contains(payload_id));
+        self.missing_source_layers
+            .retain(|payload_id, _| live_payload_ids.contains(payload_id));
+        self.captured_payloads
+            .retain(|payload_id| live_payload_ids.contains(payload_id));
+        self.diagnostics_emitted
+            .retain(|(payload_id, _)| live_payload_ids.contains(payload_id));
     }
 
     pub(super) fn release_all(&mut self, runtime: &mut EffectRuntime) {
@@ -153,12 +371,7 @@ impl LifecycleVisualStore {
     ) -> RendererResult<()> {
         self.release_stale(context.effect_runtime);
         let output_scale = context.effect_runtime.effect_output_scale.max(1.0) as f64;
-        let sources = self
-            .visual_sources
-            .values()
-            .filter(|source| source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects)
-            .cloned()
-            .collect::<Vec<_>>();
+        let sources = self.visual_sources.values().cloned().collect::<Vec<_>>();
 
         for source in sources {
             let Some(lamp) = frame
@@ -173,6 +386,12 @@ impl LifecycleVisualStore {
             else {
                 continue;
             };
+            self.trace_source_event(
+                LifecycleRenderDiagnosticStage::SourceResolved,
+                &source,
+                lamp,
+                None,
+            );
             let source_visual_rect = scaled_presentation_rect(
                 lamp.visual_group.presented_source_visual_rect,
                 output_scale,
@@ -184,30 +403,40 @@ impl LifecycleVisualStore {
                 );
                 continue;
             };
-            let source_signature = lifecycle_visual_source_signature(&source, lamp, output_scale);
             let ready = self
                 .resolved_visual_resources
                 .get(&source.payload_id)
                 .is_some_and(|resource| {
-                    resource.source_signature == source_signature
-                        && resource.source_visual_rect
-                            == lamp.visual_group.presented_source_visual_rect
-                        && context
-                            .effect_runtime
-                            .effect_resources
-                            .texture(&resource.texture)
-                            .is_some()
+                    context
+                        .effect_runtime
+                        .effect_resources
+                        .texture(&resource.texture)
+                        .is_some()
                 });
             if ready {
+                self.trace_source_event(
+                    LifecycleRenderDiagnosticStage::ResourcesReady,
+                    &source,
+                    lamp,
+                    None,
+                );
                 continue;
             }
 
-            if let Some(previous) = self.resolved_visual_resources.remove(&source.payload_id) {
-                let _ = context
-                    .effect_runtime
-                    .effect_resources
-                    .release(previous.texture);
+            if self.captured_payloads.contains(&source.payload_id) {
+                self.missing_source_layers.insert(
+                    source.payload_id,
+                    (LifecycleDiagnosticLayer::ResolvedVisual, None, None),
+                );
+                frame.record_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::LifecycleResourceUnavailable,
+                );
+                continue;
             }
+
+            #[cfg(test)]
+            let source_signature = lifecycle_visual_source_signature(&source, lamp, output_scale);
             let texture_key = EffectTextureKey::new(
                 width,
                 height,
@@ -236,6 +465,18 @@ impl LifecycleVisualStore {
                     continue;
                 }
             };
+            if let Some(missing_layer) =
+                self.first_missing_source_texture(context, &source, lamp, source_visual_rect)
+            {
+                let _ = context.effect_runtime.effect_resources.release(texture);
+                self.missing_source_layers
+                    .insert(source.payload_id, missing_layer);
+                frame.record_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::LifecycleResourceUnavailable,
+                );
+                continue;
+            }
             if let Err(error) = self.capture_visual_source(
                 context,
                 &source,
@@ -261,12 +502,268 @@ impl LifecycleVisualStore {
                 source.payload_id,
                 LifecycleResolvedVisualResource {
                     texture,
+                    #[cfg(test)]
                     source_signature,
-                    source_visual_rect: lamp.visual_group.presented_source_visual_rect,
                 },
+            );
+            self.captured_payloads.insert(source.payload_id);
+            self.trace_source_event(
+                LifecycleRenderDiagnosticStage::RepresentationCaptured,
+                &source,
+                lamp,
+                None,
+            );
+            self.trace_source_event(
+                LifecycleRenderDiagnosticStage::ResourcesReady,
+                &source,
+                lamp,
+                None,
             );
         }
         Ok(())
+    }
+
+    fn first_missing_source_texture(
+        &self,
+        context: &LifecycleRenderContext<'_>,
+        source: &LifecycleVisualSource,
+        lamp: LifecycleFrameSample,
+        source_visual_rect: compositor::PresentationRect,
+    ) -> Option<MissingLifecycleSourceResource> {
+        let Some(commands) = self.source_commands.get(&source.payload_id) else {
+            return Some((LifecycleDiagnosticLayer::ResolvedVisual, None, None));
+        };
+        let Some(vertices) = self.source_vertices.get(&source.payload_id) else {
+            return Some((LifecycleDiagnosticLayer::ResolvedVisual, None, None));
+        };
+        if commands.is_empty() || vertices.is_empty() {
+            return Some((
+                LifecycleDiagnosticLayer::Surface,
+                Some(source.root_surface_id),
+                None,
+            ));
+        }
+        if !commands.iter().any(|command| {
+            matches!(command.layer, EglDrawLayer::Surface(surface_id) if surface_id == source.root_surface_id)
+        }) {
+            return Some((
+                LifecycleDiagnosticLayer::Surface,
+                Some(source.root_surface_id),
+                None,
+            ));
+        }
+        let Some(source_damage) = presentation_rect_to_effect_rect(source_visual_rect) else {
+            return Some((LifecycleDiagnosticLayer::ResolvedVisual, None, None));
+        };
+        let source_bounds = EglRect::new(
+            source_damage.x as f32,
+            source_damage.y as f32,
+            source_damage.width as f32,
+            source_damage.height as f32,
+        );
+        let mut decisions = Vec::new();
+        plan_visibility(commands, source_bounds, &mut decisions);
+        let missing = commands
+            .iter()
+            .zip(decisions)
+            .filter(|(_, decision)| *decision == EglVisibilityDecision::Drawable)
+            .find_map(|(command, _)| {
+                context
+                    .texture_for_layer(command.layer, &self.resolved_visual_resources)
+                    .is_none()
+                    .then(|| {
+                        (
+                            diagnostic_layer_for_draw_layer(command.layer),
+                            match command.layer {
+                                EglDrawLayer::Surface(surface_id) => Some(surface_id),
+                                _ => None,
+                            },
+                            match command.layer {
+                                EglDrawLayer::DecorationAsset(asset_id) => Some(asset_id),
+                                _ => None,
+                            },
+                        )
+                    })
+            })
+            .or_else(|| {
+                (source.root_surface_id != lamp.root_surface_id).then_some((
+                    LifecycleDiagnosticLayer::ResolvedVisual,
+                    None,
+                    None,
+                ))
+            });
+        missing
+    }
+
+    pub(super) fn trace_frame_events(&mut self, frame: &LifecycleFrameState, frame_survived: bool) {
+        if !lifecycle_render_diagnostics_enabled() {
+            return;
+        }
+        let failed_payloads = frame
+            .fallbacks
+            .failed
+            .iter()
+            .map(|entry| entry.payload_id)
+            .collect::<HashSet<_>>();
+        for fallback in &frame.fallbacks.failed {
+            let Some(sample) = frame.sample_for_identity(fallback.presentation_identity) else {
+                continue;
+            };
+            self.trace_diagnostic(
+                LifecycleRenderDiagnosticStage::Fallback,
+                fallback.window_id,
+                fallback.root_surface_id,
+                fallback.presentation_identity,
+                fallback.payload_id,
+                fallback.effect,
+                sample.direction,
+                self.visual_sources
+                    .get(&fallback.presentation_identity)
+                    .cloned(),
+                Some(fallback.reason),
+            );
+        }
+        for evidence in &frame.evidence.consumed {
+            if failed_payloads.contains(&evidence.payload_id) {
+                continue;
+            }
+            let Some(sample) = frame.sample_for_identity(evidence.presentation_identity) else {
+                continue;
+            };
+            let source = self
+                .visual_sources
+                .get(&evidence.presentation_identity)
+                .cloned();
+            self.trace_diagnostic(
+                LifecycleRenderDiagnosticStage::Drawn,
+                evidence.window_id,
+                evidence.root_surface_id,
+                evidence.presentation_identity,
+                evidence.payload_id,
+                sample.effect,
+                sample.direction,
+                source.clone(),
+                None,
+            );
+            if frame_survived {
+                self.trace_diagnostic(
+                    LifecycleRenderDiagnosticStage::FrameSurvived,
+                    evidence.window_id,
+                    evidence.root_surface_id,
+                    evidence.presentation_identity,
+                    evidence.payload_id,
+                    sample.effect,
+                    sample.direction,
+                    source,
+                    None,
+                );
+            }
+        }
+    }
+
+    fn trace_source_event(
+        &mut self,
+        stage: LifecycleRenderDiagnosticStage,
+        source: &LifecycleVisualSource,
+        sample: LifecycleFrameSample,
+        reason: Option<LifecycleRenderFallbackReason>,
+    ) {
+        if !lifecycle_render_diagnostics_enabled() {
+            return;
+        }
+        self.trace_diagnostic(
+            stage,
+            source.window_id,
+            source.root_surface_id,
+            source.presentation_identity,
+            source.payload_id,
+            sample.effect,
+            sample.direction,
+            Some(source.clone()),
+            reason,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_diagnostic(
+        &mut self,
+        stage: LifecycleRenderDiagnosticStage,
+        window_id: compositor::WindowId,
+        root_surface_id: u32,
+        presentation_identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        payload_id: compositor::PresentationRetainedVisualPayloadId,
+        effect: LifecycleEffectKind,
+        direction: LifecycleDirection,
+        source: Option<LifecycleVisualSource>,
+        reason: Option<LifecycleRenderFallbackReason>,
+    ) {
+        if !self.diagnostics_emitted.insert((payload_id, stage)) {
+            return;
+        }
+        let metrics = self.source_metrics.get(&payload_id).copied();
+        let commands = self.source_commands.get(&payload_id);
+        let surface_command_count = commands.map_or(0, |commands| {
+            commands
+                .iter()
+                .filter(|command| matches!(command.layer, EglDrawLayer::Surface(_)))
+                .count()
+        });
+        let decoration_command_count = commands.map_or(0, |commands| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command.layer,
+                        EglDrawLayer::DecorationAsset(_) | EglDrawLayer::SolidRgba(_)
+                    )
+                })
+                .count()
+        });
+        let (missing_layer, missing_surface_id, missing_decoration_asset_id) = self
+            .missing_source_layers
+            .get(&payload_id)
+            .copied()
+            .map_or(("none", "none".to_owned(), "none".to_owned()), |missing| {
+                (
+                    missing.0.as_str(),
+                    missing
+                        .1
+                        .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                    missing
+                        .2
+                        .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                )
+            });
+        let buffer_sources = metrics.map_or_else(String::new, |metrics| {
+            [
+                (metrics.buffer_source_shm, "shm"),
+                (metrics.buffer_source_dmabuf, "dmabuf"),
+            ]
+            .into_iter()
+            .filter_map(|(present, name)| present.then_some(name))
+            .collect::<Vec<_>>()
+            .join(",")
+        });
+        let visual_source_kind = source
+            .as_ref()
+            .map_or("unknown", |source| match source.kind {
+                LifecycleVisualSourceKind::NoOwnedEffects => "no_owned_effects",
+                LifecycleVisualSourceKind::ResolvedOwnedEffects => "resolved_owned_effects",
+            });
+        let reason = reason.map_or("none", lifecycle_fallback_reason_label);
+        let effect = match effect {
+            LifecycleEffectKind::Lamp => "lamp",
+            LifecycleEffectKind::Squash => "squash",
+        };
+        let direction = match direction {
+            LifecycleDirection::Minimize => "minimize",
+            LifecycleDirection::Restore => "restore",
+        };
+        eprintln!(
+            "typhon.lifecycle_render event={} window_id={window_id:?} root_surface_id={root_surface_id} presentation_identity={presentation_identity:?} payload_id={payload_id:?} effect={effect} direction={direction} backend=egl-gles reason={reason} visual_source_kind={visual_source_kind} lifecycle_surface_count={} surface_command_count={surface_command_count} decoration_command_count={decoration_command_count} buffer_sources={buffer_sources} missing_layer={missing_layer} missing_surface_id={missing_surface_id} missing_decoration_asset_id={missing_decoration_asset_id}",
+            stage.as_str(),
+            metrics.map_or(0, |metrics| metrics.lifecycle_surface_count),
+        );
     }
 
     pub(super) fn capture_visual_source(
@@ -351,6 +848,8 @@ impl LifecycleVisualStore {
                 std::mem::replace(&mut context.scene_state.vertices, source_vertices);
             let saved_commands =
                 std::mem::replace(&mut context.scene_state.commands, source_commands);
+            let saved_output_framebuffer = context.scene_state.active_output_framebuffer;
+            let saved_output_texture = context.scene_state.active_output_texture;
             context.scene_state.scene_geometry_dirty = true;
             let draw_result = (|| {
                 let source_damage =
@@ -362,7 +861,7 @@ impl LifecycleVisualStore {
                     context.scene_state.current_size.1.max(1),
                 )
                 .expect("non-zero renderer dimensions must form valid effect bounds");
-                let graph = match compile_frame_execution_plan(
+                let plan = compile_frame_execution_plan(
                     &source.effect_scene,
                     &source_damage,
                     output_bounds,
@@ -373,41 +872,62 @@ impl LifecycleVisualStore {
                         LifecycleSourceCaptureFailureStage::GraphCompile,
                         error,
                     )
-                })? {
-                    FrameExecutionPlan::EffectGraph(graph) => graph,
-                    FrameExecutionPlan::LegacyScene => {
-                        return Err(LifecycleSourceCaptureFailure::new(
-                            LifecycleSourceCaptureFailureStage::GraphCompile,
-                            io::Error::other(
-                                "effect lifecycle source unexpectedly compiled as legacy scene",
-                            ),
-                        ));
-                    }
-                };
-                let demand = plan_effect_execution_demand(&graph, &source_damage, true);
-                let selection = effects::select_effect_execution(&graph, &demand);
-                {
-                    let mut execution_context =
-                        context.effect_execution_context(&self.resolved_visual_resources);
-                    effects::execute_effect_graph_for_lifecycle(
-                        &mut execution_context,
-                        &graph,
-                        targets,
-                        framebuffer_origin,
-                        &[lifecycle_visual_output_rect(
-                            lamp.visual_group.presented_source_visual_rect,
-                            output_bounds,
-                        )],
-                        &demand,
-                        &selection,
-                    )
-                }
-                .map_err(|error| {
-                    LifecycleSourceCaptureFailure::new(
-                        LifecycleSourceCaptureFailureStage::EffectExecution,
-                        error,
-                    )
                 })?;
+                let source_output_rect = lifecycle_visual_output_rect(
+                    lamp.visual_group.presented_source_visual_rect,
+                    output_bounds,
+                );
+                match plan {
+                    FrameExecutionPlan::EffectGraph(graph) => {
+                        let demand = plan_effect_execution_demand(&graph, &source_damage, true);
+                        let selection = effects::select_effect_execution(&graph, &demand);
+                        {
+                            let mut execution_context =
+                                context.effect_execution_context(&self.resolved_visual_resources);
+                            effects::execute_effect_graph_for_lifecycle(
+                                &mut execution_context,
+                                &graph,
+                                targets,
+                                framebuffer_origin,
+                                &[source_output_rect],
+                                &demand,
+                                &selection,
+                            )
+                        }
+                        .map_err(|error| {
+                            LifecycleSourceCaptureFailure::new(
+                                LifecycleSourceCaptureFailureStage::EffectExecution,
+                                error,
+                            )
+                        })?;
+                    }
+                    FrameExecutionPlan::LegacyScene => {
+                        let scratch_texture = context
+                            .effect_runtime
+                            .effect_resources
+                            .texture(&scratch)
+                            .ok_or_else(|| {
+                                LifecycleSourceCaptureFailure::new(
+                                    LifecycleSourceCaptureFailureStage::ScratchTarget,
+                                    io::Error::other("lifecycle scratch texture is unavailable"),
+                                )
+                            })?;
+                        context.scene_state.active_output_framebuffer = Some(scratch_framebuffer);
+                        context.scene_state.active_output_texture = Some(scratch_texture);
+                        context.establish_ordinary_scene_state();
+                        {
+                            let mut execution_context =
+                                context.effect_execution_context(&self.resolved_visual_resources);
+                            execution_context.draw_command_batch(true, Some(source_output_rect))
+                        }
+                        .map_err(|error| {
+                            LifecycleSourceCaptureFailure::new(
+                                LifecycleSourceCaptureFailureStage::EffectExecution,
+                                error,
+                            )
+                        })?;
+                    }
+                }
                 copy_framebuffer_region_to_texture(
                     context,
                     &target,
@@ -424,6 +944,8 @@ impl LifecycleVisualStore {
                 })?;
                 Ok(())
             })();
+            context.scene_state.active_output_framebuffer = saved_output_framebuffer;
+            context.scene_state.active_output_texture = saved_output_texture;
             context.scene_state.vertices = saved_vertices;
             context.scene_state.commands = saved_commands;
             // The temporary source draw replaced the scene VBO contents.
@@ -470,6 +992,48 @@ impl LifecycleVisualStore {
     }
 }
 
+fn reproject_lifecycle_source_commands(
+    vertices: &mut [EglTexturedVertex],
+    commands: &mut [EglDrawCommand],
+    canonical_client_rect: compositor::PresentationRect,
+    presented_source_client_rect: compositor::PresentationRect,
+    output_scale: f64,
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
+    let full = scaled_presentation_rect(canonical_client_rect, output_scale);
+    let source = scaled_presentation_rect(presented_source_client_rect, output_scale);
+    let map_point = |point: [f64; 2]| {
+        [
+            source.x() + (point[0] - full.x()) * source.width() / full.width(),
+            source.y() + (point[1] - full.y()) * source.height() / full.height(),
+        ]
+    };
+    for vertex in vertices {
+        let output_point = ndc_to_output_point(vertex.position, output_size, framebuffer_origin);
+        let mapped = map_point(output_point);
+        vertex.position = output_point_to_ndc(mapped, output_size, framebuffer_origin);
+    }
+    for command in commands {
+        let left = f64::from(command.bounds.x());
+        let top = f64::from(command.bounds.y());
+        let right = left + f64::from(command.bounds.width());
+        let bottom = top + f64::from(command.bounds.height());
+        let mapped_top_left = map_point([left, top]);
+        let mapped_bottom_right = map_point([right, bottom]);
+        command.bounds = EglRect::new(
+            mapped_top_left[0] as f32,
+            mapped_top_left[1] as f32,
+            (mapped_bottom_right[0] - mapped_top_left[0]) as f32,
+            (mapped_bottom_right[1] - mapped_top_left[1]) as f32,
+        );
+        // A lifecycle source is a non-linear visual-group input. It must not
+        // contribute a rectangular opaque region to ordinary occlusion.
+        command.opaque_regions.clear();
+    }
+}
+
+#[cfg(test)]
 fn lifecycle_visual_source_signature(
     source: &LifecycleVisualSource,
     lamp: LifecycleFrameSample,

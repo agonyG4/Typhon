@@ -319,6 +319,8 @@ impl OwnCompositorServer {
                 let _ = self
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
+                self.state
+                    .complete_pending_xwayland_restore_for_surface(surface_id);
                 if was_focused && let Some(surface) = self.state.surface_resource_by_id(surface_id)
                 {
                     self.state.focus_surface(surface);

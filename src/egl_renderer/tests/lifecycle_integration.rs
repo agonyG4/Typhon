@@ -608,8 +608,37 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
         604,
         EffectProgramId::new(0x7fff).expect("unknown test program id is valid"),
     );
-    resolved.lifecycle =
+    let mut failed_lifecycle =
         lifecycle_effect_sample(0.4, LifecycleDirection::Minimize, 604, 2, failed_scene);
+    // Use a fresh identity from the same engine so this is a distinct retained
+    // payload from the successful capture above.
+    let mut identity_engine = PresentationEngine::enabled();
+    let scene_node_id = SceneNodeId::from_raw(1).expect("test scene node");
+    let _first_identity = identity_engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(1),
+        )
+        .expect("first retained identity");
+    let failed_identity = identity_engine
+        .begin_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+            AnimationTime::from_nanos(2),
+        )
+        .expect("second retained identity");
+    let failed_payload =
+        oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+            failed_identity,
+        );
+    failed_lifecycle.samples[0].presentation_identity = failed_identity;
+    failed_lifecycle.samples[0].payload_id = failed_payload;
+    failed_lifecycle.samples[0]
+        .visual_source
+        .presentation_identity = failed_identity;
+    failed_lifecycle.samples[0].visual_source.payload_id = failed_payload;
+    resolved.lifecycle = failed_lifecycle;
     let failed_identity = resolved.lifecycle.samples[0].presentation_identity;
     let failed_payload = resolved.lifecycle.samples[0].payload_id;
     effects::clear_effect_trace_test_events();
@@ -659,6 +688,459 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
     assert!(
         capture_failures[0].contains("error=MissingProgram("),
         "trace must identify the missing-program compile failure: {capture_failures:?}"
+    );
+}
+
+#[test]
+fn egl_lifecycle_lamp_freezes_ordinary_surface_content_for_the_retained_payload() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let background = lifecycle_test_surface(617, 0, 0, 320, 200, 0xff24_4567, &mut buffer_ids);
+    let retained = lifecycle_test_surface(618, 60, 40, 180, 110, 0xffee_8844, &mut buffer_ids);
+    let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+    let socket_name = format!(
+        "typhon-lifecycle-ordinary-source-egl-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone()],
+        &[(background.surface_id, window_id)],
+        None,
+    );
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+    resolved.lifecycle_surfaces = vec![retained];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.45,
+        LifecycleDirection::Minimize,
+        618,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let sample = &resolved.lifecycle.samples[0];
+    let identity = sample.presentation_identity;
+    let payload_id = sample.payload_id;
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("ordinary lifecycle source frame draws");
+    let evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("valid ordinary lifecycle source fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("full-damage ordinary lifecycle source was skipped: {reason:?}")
+        }
+    };
+
+    assert!(evidence.contains(identity, payload_id, 618));
+    assert!(
+        harness
+            .renderer
+            .lifecycle
+            .is_visual_source_ready(payload_id, &harness.renderer.effect_runtime),
+        "ordinary lifecycle surfaces must be captured into a retained visual texture"
+    );
+    assert!(matches!(
+        harness.renderer.lifecycle.lamp_commands(),
+        [EglLampDrawCommand {
+            layer: EglDrawLayer::LifecycleResolvedVisual(layer_payload),
+            ..
+        }] if *layer_payload == payload_id
+    ));
+
+    let source_signature = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_source_signature(payload_id)
+        .expect("ordinary source capture has a signature");
+    let texture = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_texture(payload_id)
+        .expect("ordinary source capture retains its texture")
+        .clone();
+    let captured_pixels = read_effect_texture_pixels(
+        &mut harness,
+        &texture,
+        texture.key.width,
+        texture.key.height,
+    );
+
+    let resized_texture = unsafe {
+        harness
+            .gl
+            .create_texture()
+            .expect("resized output texture creates")
+    };
+    let resized_framebuffer = unsafe {
+        harness
+            .gl
+            .create_framebuffer()
+            .expect("resized output framebuffer creates")
+    };
+    unsafe {
+        harness
+            .gl
+            .bind_texture(glow::TEXTURE_2D, Some(resized_texture));
+        harness.gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::NEAREST as i32,
+        );
+        harness.gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::NEAREST as i32,
+        );
+        harness.gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            640,
+            400,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(None),
+        );
+        harness
+            .gl
+            .bind_framebuffer(glow::FRAMEBUFFER, Some(resized_framebuffer));
+        harness.gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(resized_texture),
+            0,
+        );
+        assert_eq!(
+            harness.gl.check_framebuffer_status(glow::FRAMEBUFFER),
+            glow::FRAMEBUFFER_COMPLETE,
+            "resized output framebuffer is complete"
+        );
+    }
+    let resized_target = EglOutputRenderTarget {
+        framebuffer: resized_framebuffer,
+        sampleable_texture: Some(resized_texture),
+        width: 640,
+        height: 400,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+
+    resolved.lifecycle.sampled_at = AnimationTime::from_nanos(2);
+    resolved.lifecycle.samples[0].direction = LifecycleDirection::Restore;
+    resolved.lifecycle.samples[0].progress = 0.55;
+    resolved.lifecycle_surfaces.clear();
+    let request = frame_renderer.egl_scene_draw_request(
+        640,
+        400,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, resized_target, request)
+        .expect("resized reversal draws without live surfaces");
+    let reverse_evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("retained ordinary lifecycle source fell back after resize: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("full-damage reversed ordinary lifecycle source was skipped: {reason:?}")
+        }
+    };
+
+    assert!(reverse_evidence.contains(identity, payload_id, 618));
+    assert_eq!(
+        harness
+            .renderer
+            .lifecycle
+            .resolved_visual_source_signature(payload_id),
+        Some(source_signature),
+        "reversal must reuse the source representation captured for its payload"
+    );
+    assert_eq!(
+        read_effect_texture_pixels(
+            &mut harness,
+            &texture,
+            texture.key.width,
+            texture.key.height
+        ),
+        captured_pixels,
+        "surface withdrawal must not replace frozen client content during reversal"
+    );
+    unsafe {
+        harness
+            .gl
+            .bind_framebuffer(glow::FRAMEBUFFER, harness.test_output_framebuffer);
+        harness
+            .gl
+            .bind_texture(glow::TEXTURE_2D, harness.test_output_texture);
+        harness.gl.delete_framebuffer(resized_framebuffer);
+        harness.gl.delete_texture(resized_texture);
+    }
+    harness.renderer.scene_state.active_output_framebuffer = harness.test_output_framebuffer;
+    harness.renderer.scene_state.active_output_texture = harness.test_output_texture;
+    harness.renderer.establish_ordinary_scene_state();
+}
+
+#[test]
+fn egl_lifecycle_squash_captures_ordinary_surface_content_for_its_payload() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+    let mut buffer_ids = BufferIdAllocator::default();
+    let background = lifecycle_test_surface(619, 0, 0, 320, 200, 0xff24_4567, &mut buffer_ids);
+    let retained = lifecycle_test_surface(620, 60, 40, 180, 110, 0xffee_8844, &mut buffer_ids);
+    let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+    let socket_name = format!("typhon-lifecycle-squash-egl-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone()],
+        &[(background.surface_id, window_id)],
+        None,
+    );
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+    resolved.lifecycle_surfaces = vec![retained];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.45,
+        LifecycleDirection::Minimize,
+        620,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    resolved.lifecycle.samples[0].effect = LifecycleEffectKind::Squash;
+    resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let identity = resolved.lifecycle.samples[0].presentation_identity;
+    let payload_id = resolved.lifecycle.samples[0].payload_id;
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("ordinary Squash source frame draws");
+    let evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("ordinary Squash source unexpectedly fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("ordinary Squash source frame was skipped: {reason:?}")
+        }
+    };
+    assert!(evidence.contains(identity, payload_id, 620));
+    assert!(
+        harness
+            .renderer
+            .lifecycle
+            .is_visual_source_ready(payload_id, &harness.renderer.effect_runtime)
+    );
+    let texture = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_texture(payload_id)
+        .expect("Squash retains a resolved visual")
+        .clone();
+    let captured_pixels = read_effect_texture_pixels(
+        &mut harness,
+        &texture,
+        texture.key.width,
+        texture.key.height,
+    );
+
+    let mut replacement_ids = BufferIdAllocator::default();
+    resolved.lifecycle_surfaces = vec![lifecycle_test_surface(
+        620,
+        60,
+        40,
+        180,
+        110,
+        0xff10_2030,
+        &mut replacement_ids,
+    )];
+    resolved.lifecycle.sampled_at = AnimationTime::from_nanos(2);
+    resolved.lifecycle.samples[0].direction = LifecycleDirection::Restore;
+    resolved.lifecycle.samples[0].progress = 0.55;
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("reversed Squash source frame draws");
+    let reverse_evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("reversed Squash source unexpectedly fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("reversed Squash source frame was skipped: {reason:?}")
+        }
+    };
+    assert!(reverse_evidence.contains(identity, payload_id, 620));
+    assert_eq!(
+        read_effect_texture_pixels(
+            &mut harness,
+            &texture,
+            texture.key.width,
+            texture.key.height,
+        ),
+        captured_pixels,
+        "Squash reversal reuses the frozen source after live buffer rotation"
+    );
+}
+
+#[test]
+fn egl_lifecycle_missing_root_source_fails_with_renderer_fallback() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+    let mut buffer_ids = BufferIdAllocator::default();
+    let background = lifecycle_test_surface(621, 0, 0, 320, 200, 0xff24_4567, &mut buffer_ids);
+    let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+    let socket_name = format!("typhon-lifecycle-missing-root-egl-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone()],
+        &[(background.surface_id, window_id)],
+        None,
+    );
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+    resolved.lifecycle_surfaces.clear();
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.45,
+        LifecycleDirection::Minimize,
+        622,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let identity = resolved.lifecycle.samples[0].presentation_identity;
+    let payload_id = resolved.lifecycle.samples[0].payload_id;
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("missing lifecycle root source is contained as fallback");
+    let EglFrameOutcome::LifecycleFallback { fallbacks, .. } = outcome else {
+        panic!("missing lifecycle root source must not produce render evidence");
+    };
+    assert_eq!(fallbacks.failed.len(), 1);
+    assert_eq!(fallbacks.failed[0].presentation_identity, identity);
+    assert_eq!(fallbacks.failed[0].payload_id, payload_id);
+    assert_eq!(fallbacks.failed[0].root_surface_id, 622);
+    assert_eq!(
+        fallbacks.failed[0].reason,
+        LifecycleRenderFallbackReason::LifecycleResourceUnavailable
+    );
+    assert!(
+        !harness
+            .renderer
+            .lifecycle
+            .evidence()
+            .contains(identity, payload_id, 622)
     );
 }
 
