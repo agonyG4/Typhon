@@ -15,6 +15,10 @@ use oblivion_one::native::scheduler::NativeFrameScheduler;
 use oblivion_one::private_config::{PrivateConfigError, PrivateConfigFile};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+// Keep native mode mutation unavailable until the coordinated NativeRuntime
+// transition tests qualify publication, rollback, and persistence together.
+const OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED: bool = false;
+
 #[derive(Clone, Copy)]
 pub(crate) enum OutputConfigurationOperation {
     TemporaryApply {
@@ -266,6 +270,9 @@ pub(crate) struct PendingOutputPersistence {
 
 impl NativeRuntime {
     pub(crate) fn mode_selection_supported(&self) -> bool {
+        if !OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED {
+            return false;
+        }
         let rollback_failed =
             self.output_configuration_transactions
                 .active()
@@ -1344,6 +1351,11 @@ struct OutputTransactionArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_selection_stays_unavailable_until_runtime_integration_is_qualified() {
+        assert!(!OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED);
+    }
 
     #[test]
     fn capability_requires_atomic_exact_inventory_replacement_and_persistence() {
